@@ -24,7 +24,7 @@ bincode.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 arrow-array.workspace = true
-arrow-ipc = { version = "58", default-features = false, features = ["lz4", "zstd"] }
+arrow-ipc = { version = "59", default-features = false, features = ["lz4", "zstd"] }
 arrow-schema.workspace = true
 proximadb-raptor-common = { path = "../proximadb-raptor-common" }
 proximadb-storage-ports.workspace = true
