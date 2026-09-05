@@ -687,7 +687,17 @@ async fn create_node_matches_spec() {
                 .json_body_partial(r#"{"node": {"id": "person_1"}}"#);
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!({"id": "person_1"}));
+                .json_body(json!({
+                    "success": true,
+                    "data": {
+                        "id": "person_1",
+                        "labels": ["Person", "Employee"],
+                        "properties": {"active": true},
+                        "embedding": {"vector": [0.5, 0.25]},
+                        "created_at": "2026-09-05T00:00:00Z",
+                        "updated_at": "2026-09-05T00:00:00Z"
+                    }
+                }));
         })
         .await;
 
@@ -717,7 +727,17 @@ async fn get_node_matches_spec() {
                 .path("/api/v2/graphs/knowledge/nodes/person_1");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!({"id": "person_1"}));
+                .json_body(json!({
+                    "success": true,
+                    "data": {
+                        "id": "person_1",
+                        "labels": ["Person", "Employee"],
+                        "properties": {"active": true},
+                        "embedding": {"vector": [0.5, 0.25]},
+                        "created_at": "2026-09-05T00:00:00Z",
+                        "updated_at": "2026-09-05T00:00:00Z"
+                    }
+                }));
         })
         .await;
 
@@ -728,7 +748,11 @@ async fn get_node_matches_spec() {
         .await
         .unwrap();
     assert!(node.is_some());
-    assert_eq!(node.unwrap().id, "person_1");
+    let node = node.unwrap();
+    assert_eq!(node.id, "person_1");
+    assert_eq!(node.label.as_deref(), Some("Person"));
+    assert_eq!(node.properties["active"], json!(true));
+    assert_eq!(node.vector, Some(vec![0.5, 0.25]));
 
     mock.assert_async().await;
 }
@@ -857,7 +881,29 @@ async fn traverse_graph_matches_spec() {
                 .json_body_partial(r#"{"start_node_id": "person_1"}"#);
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!({"nodes": [], "edges": []}));
+                .json_body(json!({
+                    "success": true,
+                    "data": {
+                        "nodes": [{
+                            "id": "person_1",
+                            "labels": ["Person"],
+                            "properties": {"active": true},
+                            "created_at": "2026-09-05T00:00:00Z",
+                            "updated_at": "2026-09-05T00:00:00Z"
+                        }],
+                        "edges": [{
+                            "id": "e1",
+                            "from_node_id": "person_1",
+                            "to_node_id": "person_2",
+                            "edge_type": "KNOWS",
+                            "properties": {"since": 2020},
+                            "weight": 0.75,
+                            "created_at": "2026-09-05T00:00:00Z",
+                            "updated_at": "2026-09-05T00:00:00Z"
+                        }],
+                        "paths": [["person_1", "person_2"]]
+                    }
+                }));
         })
         .await;
 
@@ -869,7 +915,12 @@ async fn traverse_graph_matches_spec() {
         .execute()
         .await
         .unwrap();
-    assert!(result.nodes.is_empty());
+    assert_eq!(result.nodes.len(), 1);
+    assert_eq!(result.nodes[0].label.as_deref(), Some("Person"));
+    assert_eq!(result.edges.len(), 1);
+    assert_eq!(result.edges[0].source, "person_1");
+    assert_eq!(result.edges[0].relationship, "KNOWS");
+    assert_eq!(result.paths, vec![vec!["person_1", "person_2"]]);
 
     mock.assert_async().await;
 }
@@ -897,7 +948,13 @@ async fn batch_create_nodes_matches_spec() {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "success": true,
-                    "data": {"results": [{"id": "person_1"}], "count": 1}
+                    "data": {
+                        "created_count": 0,
+                        "updated_count": 0,
+                        "failed_count": 1,
+                        "results": [],
+                        "errors": [{"id": "person_1", "error": "rejected"}]
+                    }
                 }));
         })
         .await;
@@ -908,7 +965,7 @@ async fn batch_create_nodes_matches_spec() {
         .add_nodes(vec![proximadb_sdk::GraphNode::new("person_1")])
         .await
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 0);
 
     mock.assert_async().await;
 }
@@ -938,7 +995,13 @@ async fn batch_create_edges_matches_spec() {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "success": true,
-                    "data": {"results": [{"id": "person_1-KNOWS-person_2"}], "count": 1}
+                    "data": {
+                        "created_count": 0,
+                        "updated_count": 0,
+                        "failed_count": 1,
+                        "results": [],
+                        "errors": [{"id": "person_1-KNOWS-person_2", "error": "rejected"}]
+                    }
                 }));
         })
         .await;
@@ -951,7 +1014,7 @@ async fn batch_create_edges_matches_spec() {
         )])
         .await
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 0);
 
     mock.assert_async().await;
 }

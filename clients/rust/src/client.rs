@@ -337,16 +337,7 @@ impl ProximaClient {
     pub async fn list_graphs(&self) -> Result<Vec<GraphInfo>> {
         let url = format!("{}/api/v2/graphs", self.inner.config.url);
         let envelope: GraphListEnvelope = self.get(&url).await?;
-        Ok(envelope
-            .data
-            .into_iter()
-            .map(|g| GraphInfo {
-                name: g.name.or(g.graph_id).unwrap_or_default(),
-                node_count: g.node_count.unwrap_or(0),
-                edge_count: g.edge_count.unwrap_or(0),
-                description: g.description,
-            })
-            .collect())
+        Ok(envelope.data.into_iter().map(GraphInfo::from).collect())
     }
 
     /// List all collections
@@ -650,6 +641,38 @@ struct GraphRawInfo {
     node_count: Option<u64>,
     #[serde(default)]
     edge_count: Option<u64>,
+    #[serde(default)]
+    stats: Option<GraphRawStats>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphRawStats {
+    #[serde(default)]
+    total_nodes: Option<u64>,
+    #[serde(default)]
+    total_edges: Option<u64>,
+}
+
+impl From<GraphRawInfo> for GraphInfo {
+    fn from(raw: GraphRawInfo) -> Self {
+        let stats = raw.stats.as_ref();
+        Self {
+            name: raw
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .or(raw.graph_id)
+                .unwrap_or_default(),
+            node_count: raw
+                .node_count
+                .or_else(|| stats.and_then(|value| value.total_nodes))
+                .unwrap_or(0),
+            edge_count: raw
+                .edge_count
+                .or_else(|| stats.and_then(|value| value.total_edges))
+                .unwrap_or(0),
+            description: raw.description,
+        }
+    }
 }
 
 /// Liveness / readiness probe payload.
@@ -1042,23 +1065,20 @@ mod tests {
         let graphs: GraphListEnvelope = serde_json::from_value(json!({
             "success": true,
             "data": [
-                {"name": "kg", "node_count": 2, "edge_count": 1}
+                {
+                    "graph_id": "kg",
+                    "name": "",
+                    "description": "test graph",
+                    "stats": {"total_nodes": 2, "total_edges": 1}
+                }
             ]
         }))
         .unwrap();
-        let lowered: Vec<GraphInfo> = graphs
-            .data
-            .into_iter()
-            .map(|g| GraphInfo {
-                name: g.name.or(g.graph_id).unwrap_or_default(),
-                node_count: g.node_count.unwrap_or(0),
-                edge_count: g.edge_count.unwrap_or(0),
-                description: g.description,
-            })
-            .collect();
+        let lowered: Vec<GraphInfo> = graphs.data.into_iter().map(GraphInfo::from).collect();
         assert_eq!(lowered.len(), 1);
         assert_eq!(lowered[0].name, "kg");
         assert_eq!(lowered[0].node_count, 2);
         assert_eq!(lowered[0].edge_count, 1);
+        assert_eq!(lowered[0].description.as_deref(), Some("test graph"));
     }
 }

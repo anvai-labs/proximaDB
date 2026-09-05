@@ -290,3 +290,19 @@ rejections are plain text.
 * graph branch-merge (wave-4 deferral; free-form response).
 * Legacy 308-redirect shims (`/api/v2/nodes|edges|stats`) — clients
   must use the canonical graph-scoped paths.
+
+**Adversarial-review correction:** the initial wave-6 spec and generated-model
+updates fixed the declared envelopes, but the hand-written TypeScript and Rust
+facades still used flat response mocks. Graph lists exposed serialized
+`GraphCollection` records as if they were SDK-facing `GraphInfo` values; the
+live records use `graph_id`, an optional/possibly-empty display `name`, and
+counts nested under `stats.total_nodes` / `stats.total_edges`. Node lookup and
+traversal likewise consumed the envelope itself as the payload instead of
+lowering `CanonicalNode` / `CanonicalEdge`. Finally, batch helpers read the
+nonexistent `data.count` and could report every requested item as successful
+despite canonical `created_count` / `failed_count` partial results. Both
+facades now explicitly unwrap and lower every public graph result seam, fall
+back from an empty display name to `graph_id`, preserve nested counts and
+embeddings, and return `created_count` for batches. Contract tests pin the real
+list, get, node, traversal, and partial-batch envelopes so flat fake responses
+cannot mask these boundaries again.

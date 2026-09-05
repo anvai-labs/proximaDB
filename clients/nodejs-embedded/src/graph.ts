@@ -35,15 +35,18 @@ export interface GraphHttpClient {
   url(): string;
   // Typed transport seams (route through the generated client).
   createGraphRequest(body: Record<string, unknown>): Promise<unknown>;
-  getGraphRequest(graphId: string): Promise<unknown>;
+  getGraphRequest(graphId: string): Promise<GraphInfo>;
   getGraphStatsRequest(graphId: string): Promise<unknown>;
   createNodeRequest(graphId: string, body: Record<string, unknown>): Promise<unknown>;
   batchCreateNodesRequest(graphId: string, body: Record<string, unknown>): Promise<unknown>;
-  getNodeRequest(graphId: string, nodeId: string): Promise<unknown>;
+  getNodeRequest(graphId: string, nodeId: string): Promise<GraphNode>;
   deleteNodeRequest(graphId: string, nodeId: string): Promise<void>;
   createEdgeRequest(graphId: string, body: Record<string, unknown>): Promise<unknown>;
   batchCreateEdgesRequest(graphId: string, body: Record<string, unknown>): Promise<unknown>;
-  traverseGraphRequest(graphId: string, body: Record<string, unknown>): Promise<unknown>;
+  traverseGraphRequest(
+    graphId: string,
+    body: Record<string, unknown>,
+  ): Promise<TraversalResult>;
 }
 
 // ============================================================================
@@ -471,11 +474,10 @@ export class TraversalBuilder {
     void this.traversalDirection;
     void this.filterExpr;
 
-    const data = await this.handle.getClient().traverseGraphRequest(
+    return this.handle.getClient().traverseGraphRequest(
       this.handle.getName(),
       request,
     );
-    return data as TraversalResult;
   }
 }
 
@@ -549,8 +551,20 @@ export class GraphHandle {
     const response = (await this.client.batchCreateNodesRequest(
       this.graphName,
       request as unknown as Record<string, unknown>,
-    )) as { data?: { count?: number }; count?: number } | null;
-    return response?.data?.count ?? response?.count ?? normalized.length;
+    )) as {
+      data?: { created_count?: number; count?: number };
+      created_count?: number;
+      count?: number;
+      added_count?: number;
+    } | null;
+    return (
+      response?.data?.created_count ??
+      response?.data?.count ??
+      response?.created_count ??
+      response?.count ??
+      response?.added_count ??
+      0
+    );
   }
 
   /**
@@ -574,8 +588,20 @@ export class GraphHandle {
     const response = (await this.client.batchCreateEdgesRequest(
       this.graphName,
       request as unknown as Record<string, unknown>,
-    )) as { data?: { count?: number }; count?: number } | null;
-    return response?.data?.count ?? response?.count ?? normalized.length;
+    )) as {
+      data?: { created_count?: number; count?: number };
+      created_count?: number;
+      count?: number;
+      added_count?: number;
+    } | null;
+    return (
+      response?.data?.created_count ??
+      response?.data?.count ??
+      response?.created_count ??
+      response?.count ??
+      response?.added_count ??
+      0
+    );
   }
 
   /**
@@ -583,8 +609,7 @@ export class GraphHandle {
    */
   async getNode(nodeId: string): Promise<GraphNode | null> {
     try {
-      const data = await this.client.getNodeRequest(this.graphName, nodeId);
-      return data as GraphNode;
+      return await this.client.getNodeRequest(this.graphName, nodeId);
     } catch (e: unknown) {
       // The facade maps a 404 to a ProximaDBError (statusCode 404, message =
       // server body). Treat "not found" as a null result, preserving the
@@ -630,8 +655,7 @@ export class GraphHandle {
    * Wire endpoint: GET /api/v2/graphs/{graph_id} (getGraph)
    */
   async info(): Promise<GraphInfo> {
-    const data = await this.client.getGraphRequest(this.graphName);
-    return data as GraphInfo;
+    return this.client.getGraphRequest(this.graphName);
   }
 }
 

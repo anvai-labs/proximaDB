@@ -21,6 +21,10 @@ import {
   QueryRequest,
   ExplainQueryRequest,
   QueryResponse,
+  GraphNode,
+  GraphEdge,
+  TraversalResult,
+  JsonValue,
 } from "./types";
 import { CollectionBuilder, CollectionHandle, CollectionHttpClient } from "./collection";
 import { GraphBuilder, GraphHandle, GraphHttpClient } from "./graph";
@@ -47,6 +51,98 @@ interface HttpResponse {
   statusText: string;
   json(): Promise<unknown>;
   text(): Promise<string>;
+}
+
+interface GraphCollectionWire {
+  graph_id?: unknown;
+  name?: unknown;
+  description?: unknown;
+  node_count?: unknown;
+  edge_count?: unknown;
+  stats?: {
+    total_nodes?: unknown;
+    total_edges?: unknown;
+  };
+}
+
+function graphInfoFromWire(value: unknown): GraphInfo {
+  const graph =
+    typeof value === "object" && value !== null
+      ? (value as GraphCollectionWire)
+      : {};
+  const displayName = typeof graph.name === "string" ? graph.name : "";
+  const graphId = typeof graph.graph_id === "string" ? graph.graph_id : "";
+  const description =
+    typeof graph.description === "string" ? graph.description : undefined;
+  const topLevelNodeCount =
+    typeof graph.node_count === "number" ? graph.node_count : undefined;
+  const topLevelEdgeCount =
+    typeof graph.edge_count === "number" ? graph.edge_count : undefined;
+  const nestedNodeCount =
+    typeof graph.stats?.total_nodes === "number"
+      ? graph.stats.total_nodes
+      : undefined;
+  const nestedEdgeCount =
+    typeof graph.stats?.total_edges === "number"
+      ? graph.stats.total_edges
+      : undefined;
+
+  return {
+    name: displayName.trim().length > 0 ? displayName : graphId,
+    nodeCount: topLevelNodeCount ?? nestedNodeCount ?? 0,
+    edgeCount: topLevelEdgeCount ?? nestedEdgeCount ?? 0,
+    ...(description === undefined ? {} : { description }),
+  };
+}
+
+function objectFromWire(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function graphNodeFromWire(value: unknown): GraphNode {
+  const node = objectFromWire(value);
+  const labels = Array.isArray(node.labels) ? node.labels : [];
+  const embedding = objectFromWire(node.embedding);
+  const vector = Array.isArray(embedding.vector)
+    ? embedding.vector.filter((entry): entry is number => typeof entry === "number")
+    : undefined;
+  const label = labels.find((entry): entry is string => typeof entry === "string");
+
+  return {
+    id: typeof node.id === "string" ? node.id : "",
+    ...(label === undefined ? {} : { label }),
+    properties: objectFromWire(node.properties) as Record<string, JsonValue>,
+    ...(vector === undefined ? {} : { vector }),
+  };
+}
+
+function graphEdgeFromWire(value: unknown): GraphEdge {
+  const edge = objectFromWire(value);
+  const weight = typeof edge.weight === "number" ? edge.weight : undefined;
+  return {
+    source: typeof edge.from_node_id === "string" ? edge.from_node_id : "",
+    target: typeof edge.to_node_id === "string" ? edge.to_node_id : "",
+    relationship: typeof edge.edge_type === "string" ? edge.edge_type : "",
+    properties: objectFromWire(edge.properties) as Record<string, JsonValue>,
+    ...(weight === undefined ? {} : { weight }),
+  };
+}
+
+function traversalResultFromWire(value: unknown): TraversalResult {
+  const result = objectFromWire(value);
+  const paths = Array.isArray(result.paths)
+    ? result.paths.filter(
+        (path): path is string[] =>
+          Array.isArray(path) && path.every((entry) => typeof entry === "string"),
+      )
+    : [];
+  return {
+    nodes: (Array.isArray(result.nodes) ? result.nodes : []).map(graphNodeFromWire),
+    edges: (Array.isArray(result.edges) ? result.edges : []).map(graphEdgeFromWire),
+    paths,
+  };
 }
 
 /**
@@ -561,7 +657,7 @@ export class ProximaDBClient implements CollectionHttpClient, GraphHttpClient {
     // Wave-6 envelope truth: the wire body is {success, data?} — the
     // collection array rides `data.data` (the old flat `.graphs` field
     // never existed on the wire).
-    return ((data?.data ?? []) as unknown[]) as GraphInfo[];
+    return ((data?.data ?? []) as unknown[]).map(graphInfoFromWire);
   }
 
   // =========================================================================
@@ -588,11 +684,11 @@ export class ProximaDBClient implements CollectionHttpClient, GraphHttpClient {
    * Get a graph collection by id.
    * Wire endpoint: GET /api/v2/graphs/{graph_id} (getGraph)
    */
-  async getGraphRequest(graphId: string): Promise<unknown> {
+  async getGraphRequest(graphId: string): Promise<GraphInfo> {
     const { data } = await this.gen.GET("/api/v2/graphs/{graph_id}", {
       params: { path: { graph_id: graphId } },
     });
-    return data;
+    return graphInfoFromWire(data?.data);
   }
 
   /**
@@ -643,14 +739,14 @@ export class ProximaDBClient implements CollectionHttpClient, GraphHttpClient {
    * Get a node by id.
    * Wire endpoint: GET /api/v2/graphs/{graph_id}/nodes/{node_id} (getNode)
    */
-  async getNodeRequest(graphId: string, nodeId: string): Promise<unknown> {
+  async getNodeRequest(graphId: string, nodeId: string): Promise<GraphNode> {
     const { data } = await this.gen.GET(
       "/api/v2/graphs/{graph_id}/nodes/{node_id}",
       {
         params: { path: { graph_id: graphId, node_id: nodeId } },
       },
     );
-    return data;
+    return graphNodeFromWire(data?.data);
   }
 
   /**
@@ -703,7 +799,7 @@ export class ProximaDBClient implements CollectionHttpClient, GraphHttpClient {
   async traverseGraphRequest(
     graphId: string,
     body: Record<string, unknown>,
-  ): Promise<unknown> {
+  ): Promise<TraversalResult> {
     const { data } = await this.gen.POST(
       "/api/v2/graphs/{graph_id}/traverse",
       {
@@ -711,7 +807,7 @@ export class ProximaDBClient implements CollectionHttpClient, GraphHttpClient {
         body: body as never,
       },
     );
-    return data;
+    return traversalResultFromWire(data?.data);
   }
 
   // =========================================================================
