@@ -398,7 +398,17 @@ describe("OpenAPI contract gate", () => {
   });
 
   it("listGraphs() matches GET /api/v2/graphs (listGraphs)", async () => {
-    const captured = installFetchStub({ graphs: [], count: 0 });
+    const captured = installFetchStub({
+      success: true,
+      data: [
+        {
+          graph_id: "g1",
+          name: "",
+          description: "test graph",
+          stats: { total_nodes: 3, total_edges: 2 },
+        },
+      ],
+    });
     const client = makeClient();
 
     const resp = await client.listGraphs();
@@ -408,14 +418,25 @@ describe("OpenAPI contract gate", () => {
     expect(captured.method).toBe("GET");
     expect(captured.url).toBe("http://contract.test/api/v2/graphs");
     expect(captured.body).toBeNull();
-    expect(Array.isArray(resp)).toBe(true);
+    expect(resp).toEqual([
+      {
+        name: "g1",
+        nodeCount: 3,
+        edgeCount: 2,
+        description: "test graph",
+      },
+    ]);
   });
 
   it("graph(name).info() matches GET /api/v2/graphs/{graph_id} (getGraph)", async () => {
     const captured = installFetchStub({
-      name: "g1",
-      nodeCount: 0,
-      edgeCount: 0,
+      success: true,
+      data: {
+        graph_id: "g1",
+        name: "",
+        description: "test graph",
+        stats: { total_nodes: 4, total_edges: 3 },
+      },
     });
     const client = makeClient();
 
@@ -426,7 +447,12 @@ describe("OpenAPI contract gate", () => {
     expect(captured.method).toBe("GET");
     expect(captured.url).toBe("http://contract.test/api/v2/graphs/g1");
     expect(captured.body).toBeNull();
-    expect(info.name).toBe("g1");
+    expect(info).toEqual({
+      name: "g1",
+      nodeCount: 4,
+      edgeCount: 3,
+      description: "test graph",
+    });
   });
 
   it("deleteGraph(name) matches DELETE /api/v2/graphs/{graph_id} (deleteGraph)", async () => {
@@ -477,9 +503,15 @@ describe("OpenAPI contract gate", () => {
 
   it("getNode(id) matches GET /api/v2/graphs/{graph_id}/nodes/{node_id} (getNode)", async () => {
     const captured = installFetchStub({
-      id: "n1",
-      labels: ["Person"],
-      properties: {},
+      success: true,
+      data: {
+        id: "n1",
+        labels: ["Person", "Employee"],
+        properties: { active: true },
+        embedding: { vector: [0.5, 0.25] },
+        created_at: "2026-09-05T00:00:00Z",
+        updated_at: "2026-09-05T00:00:00Z",
+      },
     });
     const client = makeClient();
 
@@ -496,7 +528,12 @@ describe("OpenAPI contract gate", () => {
       "http://contract.test/api/v2/graphs/g1/nodes/n1",
     );
     expect(captured.body).toBeNull();
-    expect(node).not.toBeNull();
+    expect(node).toEqual({
+      id: "n1",
+      label: "Person",
+      properties: { active: true },
+      vector: [0.5, 0.25],
+    });
   });
 
   it("deleteNode(id) matches DELETE /api/v2/graphs/{graph_id}/nodes/{node_id} (deleteNode)", async () => {
@@ -567,10 +604,41 @@ describe("OpenAPI contract gate", () => {
   // `start_node`), `edge_types` (not `relationships`), no `graph` wrapper,
   // no `direction`.
   it("traverse(...).execute() matches POST /api/v2/graphs/{graph_id}/traverse (traverseGraph)", async () => {
-    const captured = installFetchStub({ nodes: [], edges: [], paths: [] });
+    const captured = installFetchStub({
+      success: true,
+      data: {
+        nodes: [
+          {
+            id: "n1",
+            labels: ["Person"],
+            properties: { active: true },
+            created_at: "2026-09-05T00:00:00Z",
+            updated_at: "2026-09-05T00:00:00Z",
+          },
+        ],
+        edges: [
+          {
+            id: "e1",
+            from_node_id: "n1",
+            to_node_id: "n2",
+            edge_type: "KNOWS",
+            properties: { since: 2020 },
+            weight: 0.75,
+            created_at: "2026-09-05T00:00:00Z",
+            updated_at: "2026-09-05T00:00:00Z",
+          },
+        ],
+        paths: [["n1", "n2"]],
+      },
+    });
     const client = makeClient();
 
-    await client.graph("g1").traverse().start("n1").maxDepth(2).execute();
+    const result = await client
+      .graph("g1")
+      .traverse()
+      .start("n1")
+      .maxDepth(2)
+      .execute();
 
     const op = operationFor(
       SPEC,
@@ -597,6 +665,21 @@ describe("OpenAPI contract gate", () => {
     expect(captured.body).not.toHaveProperty("graph");
     expect(captured.body).not.toHaveProperty("start_node");
     expect(captured.body).not.toHaveProperty("direction");
+    expect(result).toEqual({
+      nodes: [
+        { id: "n1", label: "Person", properties: { active: true } },
+      ],
+      edges: [
+        {
+          source: "n1",
+          target: "n2",
+          relationship: "KNOWS",
+          properties: { since: 2020 },
+          weight: 0.75,
+        },
+      ],
+      paths: [["n1", "n2"]],
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -606,7 +689,13 @@ describe("OpenAPI contract gate", () => {
   it("addNodes(...) matches POST /api/v2/graphs/{graph_id}/nodes/batch (batchCreateNodes)", async () => {
     const captured = installFetchStub({
       success: true,
-      data: { results: [], count: 2 },
+      data: {
+        created_count: 1,
+        updated_count: 0,
+        failed_count: 1,
+        results: [],
+        errors: [{ id: "n2", error: "rejected" }],
+      },
     });
     const client = makeClient();
 
@@ -639,13 +728,19 @@ describe("OpenAPI contract gate", () => {
     const nodes = captured.body!.nodes as Array<Record<string, unknown>>;
     expect(nodes).toHaveLength(2);
     expect(nodes[0].id).toBe("n1");
-    expect(added).toBe(2);
+    expect(added).toBe(1);
   });
 
   it("addEdges(...) matches POST /api/v2/graphs/{graph_id}/edges/batch (batchCreateEdges)", async () => {
     const captured = installFetchStub({
       success: true,
-      data: { results: [], count: 1 },
+      data: {
+        created_count: 0,
+        updated_count: 0,
+        failed_count: 1,
+        results: [],
+        errors: [{ id: "e1", error: "rejected" }],
+      },
     });
     const client = makeClient();
 
@@ -684,6 +779,6 @@ describe("OpenAPI contract gate", () => {
     expect(edges[0].from_node_id).toBe("n1");
     expect(edges[0].to_node_id).toBe("n2");
     expect(edges[0].edge_type).toBe("KNOWS");
-    expect(added).toBe(1);
+    expect(added).toBe(0);
   });
 });
