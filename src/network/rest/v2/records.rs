@@ -90,11 +90,6 @@ fn json_to_sql_value(value: &serde_json::Value) -> crate::proto::proximadb_v1::S
 }
 
 #[cfg(test)]
-/// Canonical rendering alias for the legacy conversion tests (the old
-/// fallible wrapper's error path could no longer fire).
-use proximadb_records::conversions::sql_value_to_json;
-
-#[cfg(test)]
 /// Convert a JSON value to a FilterClause value.
 fn json_to_filter_clause_value(
     value: &serde_json::Value,
@@ -2592,6 +2587,8 @@ pub async fn get_changes(
 
 #[cfg(test)]
 mod tests {
+    use proximadb_records::conversions::sql_value_to_json;
+
     use super::*;
 
     fn rv(value: serde_json::Value) -> RestProximaValue {

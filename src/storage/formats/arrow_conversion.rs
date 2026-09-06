@@ -393,9 +393,7 @@ pub fn filter_to_string(filter: &FilterExpression) -> String {
 // Utility Functions
 // ============================================================================
 
-fn sql_value_to_json(value: &SqlValue) -> JsonValue {
-    proximadb_records::conversions::sql_value_to_json(value)
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 /// Get Arrow DataType for a proto SqlValue
 pub fn sql_value_to_arrow_type(value: &SqlValue) -> DataType {

@@ -125,6 +125,33 @@ pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
     }
 }
 
+/// Canonical JSON *rendering* of a `ProximaValue` for API-facing surfaces —
+/// the ProximaValue-side twin of [`sql_value_to_json`]: Binary/BinaryVector
+/// as base64 (proxima_to_json alone renders them per-byte int-arrays,
+/// INCLUDING nested inside Array/Map/Struct), Uuid/ULID dashed-hex (the
+/// cross-surface text convention). Not inlined into proxima_to_json because
+/// persisted graph canonical-text seams rely on its exact current output.
+pub fn proxima_value_to_json_canonical(value: &ProximaValue) -> serde_json::Value {
+    match value {
+        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
+            serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(b))
+        }
+        ProximaValue::Uuid(u) | ProximaValue::ULID(u) => {
+            serde_json::Value::String(u.iter().map(|x| format!("{x:02x}")).collect::<String>())
+        }
+        ProximaValue::Array(items) => {
+            serde_json::Value::Array(items.iter().map(proxima_value_to_json_canonical).collect())
+        }
+        ProximaValue::Map(fields) | ProximaValue::Struct(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), proxima_value_to_json_canonical(v)))
+                .collect(),
+        ),
+        other => proxima_to_json(other),
+    }
+}
+
 /// Convert a `serde_json::Value` into a `ProximaValue` (natural-JSON mapping).
 ///
 /// Numbers split into `Int64`/`Float64`. This matches the composition

@@ -524,7 +524,7 @@ impl ObservabilityQueryEngine {
             Some(Value::BoolValue(b)) => b.to_string(),
             // Round: deterministic hex for bytes (lossy-UTF-8 text matched by
             // accident of encoding, never deliberately).
-            Some(Value::BytesValue(b)) => b.iter().map(|x| format!("{x:02x}")).collect::<String>(),
+            Some(Value::BytesValue(b)) => hex::encode(b),
             // TD-PROTO-2: raw MessagePack through from_utf8_lossy is mojibake
             // and made key:value attribute filters silently drop matching
             // logs — decode to compact JSON text (canonical representation).

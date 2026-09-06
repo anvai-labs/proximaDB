@@ -5021,14 +5021,12 @@ impl EmbeddedProximaDB {
     fn sql_object_to_json(obj: &proximadb::proto::proximadb_v1::SqlObject) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         for (key, value) in &obj.fields {
-            map.insert(key.clone(), Self::sql_value_to_json(value));
+            map.insert(
+                key.clone(),
+                proximadb_records::conversions::sql_value_to_json(value),
+            );
         }
         serde_json::Value::Object(map)
-    }
-
-    /// Convert SqlValue to serde_json::Value
-    fn sql_value_to_json(value: &proximadb::proto::proximadb_v1::SqlValue) -> serde_json::Value {
-        proximadb_records::conversions::sql_value_to_json(value)
     }
 
     /// Parse a simple filter expression into DocumentFilter conditions
@@ -5282,7 +5280,7 @@ impl EmbeddedProximaDB {
         let service = trace
             .attributes
             .get("service.name")
-            .map(Self::sql_value_to_json)
+            .map(proximadb_records::conversions::sql_value_to_json)
             .and_then(|value| value.as_str().map(|v| v.to_string()));
         let (status_code, status_message) = trace.status.map_or_else(
             || ("UNSET".to_string(), None),
@@ -5308,7 +5306,12 @@ impl EmbeddedProximaDB {
             attributes: trace
                 .attributes
                 .into_iter()
-                .map(|(key, value)| (key, Self::sql_value_to_json(&value)))
+                .map(|(key, value)| {
+                    (
+                        key,
+                        proximadb_records::conversions::sql_value_to_json(&value),
+                    )
+                })
                 .collect(),
         }
     }
@@ -5323,7 +5326,10 @@ impl EmbeddedProximaDB {
                 let mut json_row = serde_json::Map::new();
                 for field in row.fields {
                     if let Some(value) = field.value {
-                        json_row.insert(field.key, Self::sql_value_to_json(&value));
+                        json_row.insert(
+                            field.key,
+                            proximadb_records::conversions::sql_value_to_json(&value),
+                        );
                     } else {
                         json_row.insert(field.key, serde_json::Value::Null);
                     }
@@ -5520,7 +5526,9 @@ impl EmbeddedProximaDB {
                         fields: log
                             .fields
                             .into_iter()
-                            .map(|(k, v)| (k, Self::sql_value_to_json(&v)))
+                            .map(|(k, v)| {
+                                (k, proximadb_records::conversions::sql_value_to_json(&v))
+                            })
                             .collect(),
                     }
                 })

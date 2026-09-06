@@ -678,6 +678,22 @@ decision on the declared field).
   stringifier (lossy-UTF-8 to deterministic hex) canonicalized.
 - kernel base64: in-place from_utf8 (no validate-then-clone double
   allocation on every rendered bytes value).
+**Consolidation review round 3 (2026-09-06):**
+- The filter-lowering copies collapsed: `sql_val_to_json` exported from
+  search-types and `from_v1_simple_filters` delegates — one lowering, the
+  same function the stored side renders through (the round-2 fix had
+  minted two new copies of it).
+- `proxima_value_to_json_canonical` added to records (the
+  ProximaValue-side twin: nested Binary as base64, Uuid/ULID
+  dashed-hex); the SQL-row path delegates — closing the nested-Binary
+  int-array hole and the four-way uuid spelling drift.
+- All eight one-line delegating shims deleted (plain `use` imports) —
+  grep for `fn sql_value_to_json` now finds exactly one definition.
+- Raptor row-group metadata renders only what its typed-column dispatch
+  stores; the observability bytes arm uses `hex::encode` (the crate
+  already depends on it); SST's dead stats fn collapsed to a
+  null-arms + delegate match.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

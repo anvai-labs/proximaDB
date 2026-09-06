@@ -680,9 +680,7 @@ pub fn json_to_sql_value(value: &serde_json::Value) -> SqlValue {
     SqlValue { value: inner }
 }
 
-fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
-    proximadb_records::conversions::sql_value_to_json(value)
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 pub fn sql_object_to_json(obj: &SqlObject) -> serde_json::Value {
     let map: serde_json::Map<String, serde_json::Value> = obj

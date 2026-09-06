@@ -906,41 +906,14 @@ mod block_utils {
                         bloom_filter_enabled: false,
                     });
 
-                // Convert to JSON value for min/max tracking
+                // Convert to JSON value for min/max tracking (canonical
+                // rendering; the null arms carry the only side effect).
                 let value = match &item.1.value {
-                    Some(crate::proto::proximadb_v1::sql_value::Value::StringValue(s)) => {
-                        serde_json::Value::String(s.clone())
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(n)) => {
-                        serde_json::Number::from_f64(*n)
-                            .map_or(serde_json::Value::Null, serde_json::Value::Number)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::BoolValue(b)) => {
-                        serde_json::Value::Bool(*b)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(i)) => {
-                        serde_json::Value::Number(serde_json::Number::from(*i))
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(_)) => {
-                        proximadb_records::conversions::sql_value_to_json(item.1)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::JsonbValue(bytes)) => {
-                        proximadb_data_model::ProximaValue::jsonb_to_json_lossy(bytes)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(_)) => {
+                    None | Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(_)) => {
                         col_stats.null_count += 1;
                         continue;
                     }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::ArrayValue(_)) => {
-                        proximadb_records::conversions::sql_value_to_json(item.1)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::ObjectValue(_)) => {
-                        proximadb_records::conversions::sql_value_to_json(item.1)
-                    }
-                    None => {
-                        col_stats.null_count += 1;
-                        continue;
-                    }
+                    _ => proximadb_records::conversions::sql_value_to_json(item.1),
                 };
 
                 // Update min/max values for this column

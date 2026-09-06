@@ -1319,9 +1319,7 @@ fn parse_distribution_mode(
 }
 
 /// Helper: convert proto SqlValue to serde_json::Value (temporary until full internal refactor)
-fn sql_value_to_json(v: &proximadb_v1::SqlValue) -> serde_json::Value {
-    proximadb_records::conversions::sql_value_to_json(v)
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 // =============================================================================
 // Hybrid Search (BM25 + Vector with RRF Fusion)

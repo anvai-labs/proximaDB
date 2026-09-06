@@ -42,9 +42,7 @@ use crate::storage::document::DocumentService;
 use proximadb_data_model::ProximaType;
 use proximadb_data_model::ProximaValue;
 
-fn sql_value_to_json(value: &crate::proto::proximadb_v1::SqlValue) -> serde_json::Value {
-    proximadb_records::conversions::sql_value_to_json(value)
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 fn sql_object_to_json(obj: &crate::proto::proximadb_v1::SqlObject) -> String {
     let value = serde_json::Value::Object(

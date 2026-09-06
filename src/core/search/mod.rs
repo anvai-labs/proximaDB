@@ -293,52 +293,6 @@ pub mod protocol_conversions {
     }
 
     /// Convert v1 simple filters (map<string, SqlValue>) to FilterExpression
-    /// Lower a nested SqlValue for a v1 simple-filter literal — filter-lowering
-    /// semantics (int-array bytes, real containers, unset-oneof null), matching
-    /// the stored side's `sql_val_to_json` rendering.
-    fn filter_literal_json(
-        value: &crate::proto::proximadb_v1::sql_value::Value,
-    ) -> serde_json::Value {
-        use crate::proto::proximadb_v1::sql_value::Value as V;
-        match value {
-            V::StringValue(s) => serde_json::Value::String(s.clone()),
-            V::NumberValue(n) => serde_json::json!(n),
-            V::BoolValue(b) => serde_json::Value::Bool(*b),
-            V::Int64Value(i) => serde_json::json!(i),
-            V::BytesValue(bytes) => serde_json::Value::Array(
-                bytes
-                    .iter()
-                    .map(|byte| serde_json::Value::Number((*byte as u64).into()))
-                    .collect(),
-            ),
-            V::JsonbValue(bytes) => proximadb_data_model::ProximaValue::jsonb_to_json_lossy(bytes),
-            V::NullValue(_) => serde_json::Value::Null,
-            V::ArrayValue(arr) => serde_json::Value::Array(
-                arr.values
-                    .iter()
-                    .map(|v| {
-                        v.value
-                            .as_ref()
-                            .map_or(serde_json::Value::Null, filter_literal_json)
-                    })
-                    .collect(),
-            ),
-            V::ObjectValue(obj) => serde_json::Value::Object(
-                obj.fields
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            v.value
-                                .as_ref()
-                                .map_or(serde_json::Value::Null, filter_literal_json),
-                        )
-                    })
-                    .collect(),
-            ),
-        }
-    }
-
     pub fn from_v1_simple_filters(
         filters: &std::collections::HashMap<String, crate::proto::proximadb_v1::SqlValue>,
     ) -> Result<FilterExpression, String> {
@@ -349,66 +303,14 @@ pub mod protocol_conversions {
         let conditions: Result<Vec<FilterExpression>, String> = filters
             .iter()
             .map(|(field, sql_value)| {
-                let value = match &sql_value.value {
-                    Some(crate::proto::proximadb_v1::sql_value::Value::StringValue(s)) => {
-                        serde_json::Value::String(s.clone())
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(n)) => {
-                        serde_json::json!(n)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::BoolValue(b)) => {
-                        serde_json::Value::Bool(*b)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(i)) => {
-                        serde_json::json!(*i)
-                    }
-                    // Bytes/arrays/objects lower with the FILTER-LOWERING
-                    // semantics (int-array bytes, real containers) so a
-                    // literal CAN equal the stored side's lowering; the old
-                    // BYTES(N)/empty-container placeholders never matched.
-                    Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(bytes)) => {
-                        serde_json::Value::Array(
-                            bytes
-                                .iter()
-                                .map(|byte| serde_json::Value::Number((*byte as u64).into()))
-                                .collect(),
-                        )
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::JsonbValue(bytes)) => {
-                        proximadb_data_model::ProximaValue::jsonb_to_json_lossy(bytes)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(_)) => {
-                        serde_json::Value::Null
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::ArrayValue(arr)) => {
-                        serde_json::Value::Array(
-                            arr.values
-                                .iter()
-                                .map(|v| {
-                                    v.value.as_ref().map_or(serde_json::Value::Null, |inner| {
-                                        filter_literal_json(inner)
-                                    })
-                                })
-                                .collect(),
-                        )
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::ObjectValue(obj)) => {
-                        serde_json::Value::Object(
-                            obj.fields
-                                .iter()
-                                .map(|(k, v)| {
-                                    (
-                                        k.clone(),
-                                        v.value.as_ref().map_or(serde_json::Value::Null, |inner| {
-                                            filter_literal_json(inner)
-                                        }),
-                                    )
-                                })
-                                .collect(),
-                        )
-                    }
-                    None => serde_json::Value::Null,
-                };
+                // The canonical FILTER LOWERING (same function the stored
+                // side renders through) — a literal built any other way can
+                // never equal the stored rendering.
+                static NULL_SENTINEL: crate::proto::proximadb_v1::sql_value::Value =
+                    crate::proto::proximadb_v1::sql_value::Value::NullValue(0);
+                let value = proximadb_search_types::sql_value_filter::sql_val_to_json(
+                    sql_value.value.as_ref().unwrap_or(&NULL_SENTINEL),
+                );
 
                 Ok(FilterExpression::Comparison {
                     field: field.clone(),

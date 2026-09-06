@@ -21,9 +21,7 @@ pub fn sql_object_to_json(obj: &proximadb_proto::proximadb_v1::SqlObject) -> ser
 }
 
 /// Convert a protobuf `SqlValue` into JSON.
-fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
-    proximadb_records::conversions::sql_value_to_json(value)
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 /// Convert query-IR path filters into the protobuf `DocumentFilter` contract.
 pub fn convert_path_filters_to_document_filter(filters: &[PathFilter]) -> Option<DocumentFilter> {
