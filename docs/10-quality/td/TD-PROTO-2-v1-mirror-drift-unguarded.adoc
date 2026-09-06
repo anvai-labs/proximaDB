@@ -854,6 +854,35 @@ Other round-8/9 fixes:
   dialect-dependent (ISO-8601 text for Postgres-style engines) — needs a
   per-dialect decision, not a silent swap.
 
+**Consolidation review round 11 (2026-09-06):**
+- Build break: deleting the embedded binding's local json fn without a
+  re-export broke the python feature compile (CI's SDK legs are commented
+  out, so only review caught it) — re-export added.
+- The unified-port exotic SQL literal DOUBLE-QUOTED string-rendering
+  exotics (serde_json::to_string embeds the quotes inside sql_quote) —
+  uuid/ulid literals could still never match; strings now come out bare.
+- RAPTOR READ PATH: the canonical switch renders NaN metadata as JSON
+  null and json_to_proto_metadata DROPS nulls — the key silently vanished
+  from point reads. The helper pre-arms non-finite floats as their string
+  spelling ('NaN'/'inf'), the round-trip form this site always had.
+- The embedded binding's Binary arm still rendered a '<N bytes>'
+  placeholder (content unrecoverable, inconsistent with nested base64) —
+  deleted; containers + exotics all flow through the canonical fallback.
+- embedded-common's fn collapsed to a one-line canonical delegation (its
+  arm-for-arm copy was a new split-brain converter).
+- records' proxima_to_json Uuid/ULID hex is single-pass (same fix as
+  search-types; this one sits on the v2 row-render path).
+- The canonical fn's doc now names its FULL caller set — the root crate's
+  legacy v1 REST search path reaches it transitively
+  (proxima_values_to_json_map → embedded-common); the legacy REST exotic
+  rendering changed from Rust-Debug to base64/dashed/epoch with round 10.
+- v2 records read spelling pinned by test (int-array binary + dashed
+  uuid — the intra-version symmetry with v2_row_render was unguarded);
+  v2_row_render's doc no longer overclaims temporal symmetry.
+- Tracked: the converter-count guard script for CI (still not landed);
+  aligning v2 SQL temporal rendering with the records read path's typed
+  objects (a contract change, not a cleanup).
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

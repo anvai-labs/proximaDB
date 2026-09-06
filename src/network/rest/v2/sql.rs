@@ -53,10 +53,14 @@ pub struct SqlResponse {
     pub request_id: String,
 }
 
-/// v2's row rendering policy: `proxima_to_json` (whose Binary spelling is
-/// already the per-byte int-array — read AND write agree, /api/v2/records
-/// parses only arrays for binary) with ONE override applied at ALL depths:
-/// Uuid DASHED, matching /api/v2/records' read rendering.
+/// v2 SQL's row rendering policy: `proxima_to_json` (whose Binary spelling
+/// is already the per-byte int-array — the one form /api/v2/records' typed
+/// write parses, keeping binary SELECT↔write symmetric) with ONE override
+/// applied at ALL depths: Uuid DASHED, matching /api/v2/records' read
+/// rendering. Temporals are NOT symmetric with the records read path's
+/// typed {value, unit} objects — the SQL surface renders bare numbers
+/// (pre-existing); aligning them is a deliberate contract change, not a
+/// rendering cleanup.
 fn v2_row_render(value: &ProximaValue) -> serde_json::Value {
     match value {
         ProximaValue::Uuid(u) => {

@@ -149,14 +149,16 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         ProximaValue::Null => Ok("NULL".to_string()),
         // Typed exotics: the shared filter spelling (dashed Uuid, int-array
         // Binary, canonical sparse object) — the Debug fallback could never
-        // equal a stored rendering. KNOWN GAP (tracked in TD-PROTO-2):
-        // temporals flow through here as quoted epoch-numbers, which a
-        // timestamp-typed column in a federated engine still needs a cast
-        // to compare — the right literal is dialect-dependent (e.g. ISO-8601
-        // text for Postgres-style engines).
-        other => Ok(sql_quote(&serde_json::to_string(&proxima_value_to_json(
-            other,
-        ))?)),
+        // equal a stored rendering. Strings come out BARE (double-quoting
+        // the JSON text embedded the quotes in the literal itself); KNOWN
+        // GAP (tracked in TD-PROTO-2): temporals flow through here as quoted
+        // epoch-numbers, which a timestamp-typed column in a federated
+        // engine still needs a cast to compare — the right literal is
+        // dialect-dependent (e.g. ISO-8601 text for Postgres-style engines).
+        other => match proxima_value_to_json(other) {
+            serde_json::Value::String(s) => Ok(sql_quote(&s)),
+            json => Ok(sql_quote(&serde_json::to_string(&json)?)),
+        },
     }
 }
 

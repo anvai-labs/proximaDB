@@ -501,7 +501,10 @@ impl LogAggregator {
             Some(Value::ArrayValue(arr)) => format!("<array:{}>", arr.values.len()),
             Some(Value::ObjectValue(obj)) => format!("<object:{}>", obj.fields.len()),
             None => "<empty>".to_string(),
-            _ => super::sql_scalar_to_string(value).unwrap_or_else(|| "<empty>".to_string()),
+            // Only the scalar/Jsonb variants remain, all of which the shared
+            // fn covers — unwrap_or_default keeps the match total without
+            // aliasing a bucket spelling.
+            _ => super::sql_scalar_to_string(value).unwrap_or_default(),
         }
     }
 }

@@ -413,39 +413,22 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
         ProximaValue::UInt32(i) => i.to_string(),
         ProximaValue::UInt64(i) => i.to_string(),
         ProximaValue::Boolean(b) => b.to_string(),
-        ProximaValue::Binary(b) => format!("<{} bytes>", b.len()),
         ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v.to_string(),
-        ProximaValue::Map(m) => {
-            let json: serde_json::Map<String, serde_json::Value> = m
-                .into_iter()
-                .map(|(k, v)| (k, proximadb_embedded_common::proxima_value_to_json(v)))
-                .collect();
-            serde_json::to_string(&serde_json::Value::Object(json)).unwrap_or_default()
-        }
-        ProximaValue::Struct(m) => {
-            let json: serde_json::Map<String, serde_json::Value> = m
-                .into_iter()
-                .map(|(k, v)| (k, proximadb_embedded_common::proxima_value_to_json(v)))
-                .collect();
-            serde_json::to_string(&serde_json::Value::Object(json)).unwrap_or_default()
-        }
-        ProximaValue::Array(arr) => {
-            let json: Vec<serde_json::Value> = arr
-                .into_iter()
-                .map(proximadb_embedded_common::proxima_value_to_json)
-                .collect();
-            serde_json::to_string(&serde_json::Value::Array(json)).unwrap_or_default()
-        }
         ProximaValue::Null => String::new(),
-        // Exotics render as canonical text (dashed uuid, base64 binary)
-        // via the shared JSON surface — the Rust-Debug fallback produced
-        // strings no consumer could match or parse.
+        // Everything else — containers AND exotics (dashed uuid, base64
+        // binary, temporals) — renders through the shared canonical JSON
+        // surface: strings come back as bare text, structured values as
+        // their JSON text. The old arms here included a '<N bytes>'
+        // Binary placeholder (content unrecoverable) and the Rust-Debug
+        // fallback for exotics.
         other => match proximadb_embedded_common::proxima_value_to_json(other) {
             serde_json::Value::String(s) => s,
             json => json.to_string(),
         },
     }
 }
+
+pub(crate) use proximadb_embedded_common::proxima_value_to_json;
 
 pub(crate) fn json_to_proxima_value(
     value: serde_json::Value,

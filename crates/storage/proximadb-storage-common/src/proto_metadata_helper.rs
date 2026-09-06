@@ -151,10 +151,22 @@ pub fn sqlvalue_metadata_to_json(
     metadata
         .iter()
         .map(|(key, sql_value)| {
-            (
-                key.clone(),
-                proximadb_records::conversions::sql_value_to_json(sql_value),
-            )
+            // NaN round-trip guard: the canonical rendering maps non-finite
+            // floats to JSON null, and the raptor read path's
+            // json_to_proto_metadata DROPS nulls — the key would silently
+            // vanish from point reads. This site's pre-consolidation
+            // spelling kept it as the STRING "NaN"/"inf" (round-trips as
+            // StringValue); only this arm is a pre-arm, everything else is
+            // the canonical rendering.
+            let json = match sql_value.value.as_ref() {
+                Some(proximadb_proto::proximadb_v1::sql_value::Value::NumberValue(n))
+                    if !n.is_finite() =>
+                {
+                    serde_json::Value::String(n.to_string())
+                }
+                _ => proximadb_records::conversions::sql_value_to_json(sql_value),
+            };
+            (key.clone(), json)
         })
         .collect()
 }

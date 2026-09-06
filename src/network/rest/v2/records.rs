@@ -2596,6 +2596,35 @@ mod tests {
     }
 
     #[test]
+    fn v2_read_spelling_is_pinned_to_the_write_form() {
+        // v2 intra-version symmetry: the read rendering must spell binary as
+        // the per-byte int-array (the ONLY form the typed write path parses)
+        // and uuid DASHED. sql.rs's v2_row_render pins the SQL side; this
+        // pins the records side — the two must not drift apart silently.
+        let RestProximaValue::Typed { type_name, value } =
+            proxima_value_to_rest_value(&ProximaValue::Binary(vec![0, 1, 2]))
+        else {
+            panic!("binary renders typed");
+        };
+        assert_eq!(type_name, "binary");
+        assert_eq!(value, serde_json::json!([0, 1, 2]));
+
+        let RestProximaValue::Typed { type_name, value } =
+            proxima_value_to_rest_value(&ProximaValue::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65, 0x54, 0x40,
+                0x00, 0x00,
+            ]))
+        else {
+            panic!("uuid renders typed");
+        };
+        assert_eq!(type_name, "uuid");
+        assert_eq!(
+            value,
+            serde_json::json!("550e8400-e29b-41d4-a716-446554400000")
+        );
+    }
+
+    #[test]
     fn parse_metadata_filter_object_form_is_equality_and() {
         use crate::core::search::{ComparisonOperator, FilterExpression};
 

@@ -130,10 +130,13 @@ pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
 /// as base64 (proxima_to_json alone renders them per-byte int-arrays,
 /// INCLUDING nested inside Array/Map/Struct), Uuid dashed (the
 /// cross-surface text convention; ULID plain hex — no dash convention
-/// exists). Called by the embedded binding's JSON surface — v2 REST must
-/// NOT delegate here (its binary spelling is the int-array; see
-/// rest/v2's v2_row_render). Not inlined into proxima_to_json because
-/// persisted graph canonical-text seams rely on its exact current output.
+/// exists). Callers: the embedded binding's JSON surface
+/// (embedded-common's one-line delegation — which the root crate's legacy
+/// v1 REST search path ALSO reaches transitively via
+/// proxima_values_to_json_map). v2 REST must NOT delegate here (its binary
+/// spelling is the int-array; see rest/v2's v2_row_render). Not inlined
+/// into proxima_to_json because persisted graph canonical-text seams rely
+/// on its exact current output.
 pub fn proxima_value_to_json_canonical(value: &ProximaValue) -> serde_json::Value {
     match value {
         ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
@@ -224,12 +227,16 @@ pub fn proxima_to_json(value: &ProximaValue) -> serde_json::Value {
         ProximaValue::Time(value, _)
         | ProximaValue::Timestamp(value, _)
         | ProximaValue::TimestampTz(value, _) => Value::Number((*value).into()),
-        ProximaValue::Uuid(value) | ProximaValue::ULID(value) => Value::String(
-            value
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-        ),
+        ProximaValue::Uuid(value) | ProximaValue::ULID(value) => {
+            // Single-pass hex (per-byte format! allocated one intermediate
+            // String per byte — 16 per value — on row-render paths).
+            use std::fmt::Write as _;
+            let mut hex = String::with_capacity(value.len() * 2);
+            for byte in value {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            Value::String(hex)
+        }
         ProximaValue::Json(value) | ProximaValue::Jsonb(value) => value.clone(),
         ProximaValue::Array(values) => Value::Array(values.iter().map(proxima_to_json).collect()),
         ProximaValue::Map(values) | ProximaValue::Struct(values) => Value::Object(
