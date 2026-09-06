@@ -883,6 +883,39 @@ Other round-8/9 fixes:
   aligning v2 SQL temporal rendering with the records read path's typed
   objects (a contract change, not a cleanup).
 
+**Consolidation review round 12 (2026-09-06):**
+- LIVE regression (rounds 1-11 missed it): the exotic ParameterValue::Json
+  params spliced into prepared-statement SQL UNQUOTED (to_sql_string) —
+  bare '[0,1,2]' is a parse error on every engine (develop's Debug string
+  was at least quoted). Structured exotics now map to their JSON TEXT as
+  a String param.
+- The trace-attribute site renders bytes as HEX, not the shared fn's
+  lossy UTF-8 — lossy writes U+FFFD irreversibly into PERSISTED spans;
+  the lossy spelling is for the filter-matching path only.
+- ~22 v2 records.rs converter tests deleted (ten render pins + two
+  roundtrip families duplicating records' canonical contract pins —
+  per-site contract tests duplicating the canonical pins are the drift
+  this TD exists to delete; the v2-local parse-direction tests and the
+  v2 symmetry pin stay).
+- The caller-less evaluate_metadata_filter_with_config (viper) DELETED —
+  it rendered the STORED side through the rendering converter while
+  literals lower through the filter spelling: a pre-conflated
+  never-match trap waiting for its first caller.
+- kernel's Uuid::to_simple_string is single-pass (the per-byte format!
+  pattern).
+- Tracked: (a) raptor NaN has three spellings across its two write
+  layouts (rowgroup columnar 0, Arrow-cache 'NaN' string, canonical
+  null) — the layouts have different consumers, but compaction moving a
+  record between them flips the value; unifying is a raptor-internal
+  layout change. (b) metadata_item::Value has no null variant —
+  explicit-null metadata keys drop on the raptor read path (pre-existing;
+  proto-level gap). (c) ONE parameterized ProximaValue renderer
+  (binary/uuid spelling policy enum) to absorb the four recursions
+  (canonical, filter, v2 REST typed, v2_row_render) — natural companion
+  to the tracked parse-direction consolidation. (d) the four plain-hex
+  formatters (records loop, search-types loop, kernel to_simple_string,
+  data-model jsonb fallback) want one home in kernel.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

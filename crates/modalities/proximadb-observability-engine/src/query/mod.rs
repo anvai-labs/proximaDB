@@ -54,6 +54,9 @@ pub struct ObservabilityQueryEngine {
 /// arms every per-site stringifier AGREED on before the consolidation
 /// (String/Int64/Number/Bool text; Jsonb → canonical JSON text). Everything
 /// else is a per-site policy and returns `None` for the caller to spell:
+/// (the per-site wildcard fallbacks are safe against NEW oneof variants —
+/// the v1 SqlValue oneof is frozen under the TD-PROTO-2 mirror guard; new
+/// rich types land on v2 ProximaValue, not here)
 /// null/unset, containers, and bytes where a site wants a placeholder
 /// (`<bytes:N>`) instead of the content spelling this fn renders for bytes
 /// (lossy UTF-8 — the live attribute-filter matching spelling).

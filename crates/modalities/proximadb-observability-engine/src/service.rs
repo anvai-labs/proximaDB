@@ -508,12 +508,25 @@ impl ObservabilityService {
                     .attributes
                     .iter()
                     .filter_map(|(k, v)| {
-                        // Non-null scalars render through the ONE crate-shared
-                        // fn: bytes as lossy UTF-8 text and Jsonb as JSON text
-                        // (both were silently dropped by the old `_`
-                        // wildcard); null/unset/containers still drop, this
-                        // path's pre-consolidation policy.
-                        crate::query::sql_scalar_to_string(v).map(|s| (k.clone(), s))
+                        // PERSISTED payload: bytes render as deterministic
+                        // HEX — the shared fn's lossy-UTF-8 spelling is for
+                        // the filter-matching path and would write U+FFFD
+                        // replacement chars irreversibly into stored spans.
+                        // Other non-null scalars (incl. Jsonb JSON text)
+                        // render through the shared fn (both were silently
+                        // dropped by the old `_` wildcard); null/unset and
+                        // containers still drop, this path's policy.
+                        match &v.value {
+                            Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(b)) => {
+                                use std::fmt::Write as _;
+                                let mut hex = String::with_capacity(b.len() * 2);
+                                for byte in b {
+                                    let _ = write!(hex, "{byte:02x}");
+                                }
+                                Some((k.clone(), hex))
+                            }
+                            _ => crate::query::sql_scalar_to_string(v).map(|s| (k.clone(), s)),
+                        }
                     })
                     .collect();
 

@@ -428,6 +428,7 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
     }
 }
 
+#[cfg(feature = "python")]
 pub(crate) use proximadb_embedded_common::proxima_value_to_json;
 
 pub(crate) fn json_to_proxima_value(

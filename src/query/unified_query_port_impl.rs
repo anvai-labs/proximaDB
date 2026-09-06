@@ -65,10 +65,13 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         // Typed exotics (Binary/Uuid/ULID/temporals/SparseVector/Decimal)
         // lower through the ONE shared filter spelling — the old Rust-Debug
         // strings ("Binary([1, 2, 3])") could never equal a stored value's
-        // rendering, so such parameters silently matched nothing.
+        // rendering, so such parameters silently matched nothing. Structured
+        // values map to their JSON TEXT as a String param: the
+        // prepared-statement path splices Json params into SQL UNQUOTED
+        // (to_sql_string), and bare `[0,1,2]` is a parse error.
         other => match proxima_value_to_json(other) {
             serde_json::Value::String(s) => ParameterValue::String(s),
-            json => ParameterValue::Json(json),
+            json => ParameterValue::String(serde_json::to_string(&json).unwrap_or_default()),
         },
     }
 }
@@ -150,11 +153,12 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         // Typed exotics: the shared filter spelling (dashed Uuid, int-array
         // Binary, canonical sparse object) — the Debug fallback could never
         // equal a stored rendering. Strings come out BARE (double-quoting
-        // the JSON text embedded the quotes in the literal itself); KNOWN
-        // GAP (tracked in TD-PROTO-2): temporals flow through here as quoted
-        // epoch-numbers, which a timestamp-typed column in a federated
-        // engine still needs a cast to compare — the right literal is
-        // dialect-dependent (e.g. ISO-8601 text for Postgres-style engines).
+        // the JSON text embedded the quotes in the literal itself). KNOWN
+        // GAPS (tracked in TD-PROTO-2, dialect-dependent): temporals splice
+        // as quoted epoch-numbers, and Binary/SparseVector splice as quoted
+        // JSON text — parseable SQL on every engine, but equality against a
+        // native binary/timestamp column needs the per-dialect literal form
+        // (e.g. ISO-8601 text for Postgres-style engines).
         other => match proxima_value_to_json(other) {
             serde_json::Value::String(s) => Ok(sql_quote(&s)),
             json => Ok(sql_quote(&serde_json::to_string(&json)?)),

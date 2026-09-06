@@ -95,7 +95,14 @@ impl Uuid {
 
     /// Converts UUID to a simple hex string (no hyphens)
     pub fn to_simple_string(&self) -> String {
-        self.bytes.iter().map(|b| format!("{:02x}", b)).collect()
+        // Single-pass hex: the per-byte format! form allocated one
+        // intermediate String per byte on every call.
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(self.bytes.len() * 2);
+        for byte in self.bytes {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
     }
 
     /// Parses a UUID from a hyphenated string
