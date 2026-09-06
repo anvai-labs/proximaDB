@@ -1318,7 +1318,6 @@ fn parse_distribution_mode(
     }
 }
 
-/// Helper: convert proto SqlValue to serde_json::Value (temporary until full internal refactor)
 use proximadb_records::conversions::sql_value_to_json;
 
 // =============================================================================

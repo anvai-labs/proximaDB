@@ -303,14 +303,9 @@ pub mod protocol_conversions {
         let conditions: Result<Vec<FilterExpression>, String> = filters
             .iter()
             .map(|(field, sql_value)| {
-                // The canonical FILTER LOWERING (same function the stored
-                // side renders through) — a literal built any other way can
-                // never equal the stored rendering.
-                static NULL_SENTINEL: crate::proto::proximadb_v1::sql_value::Value =
-                    crate::proto::proximadb_v1::sql_value::Value::NullValue(0);
-                let value = proximadb_search_types::sql_value_filter::sql_val_to_json(
-                    sql_value.value.as_ref().unwrap_or(&NULL_SENTINEL),
-                );
+                // The canonical FILTER LOWERING via the one unset-oneof
+                // wrapper (the rule is not re-derived here).
+                let value = proximadb_search_types::sql_value_filter::sql_value_to_json(sql_value);
 
                 Ok(FilterExpression::Comparison {
                     field: field.clone(),

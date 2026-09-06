@@ -136,7 +136,10 @@ pub fn proxima_value_to_json_canonical(value: &ProximaValue) -> serde_json::Valu
         ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
             serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(b))
         }
-        ProximaValue::Uuid(u) | ProximaValue::ULID(u) => {
+        ProximaValue::Uuid(u) => {
+            serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string())
+        }
+        ProximaValue::ULID(u) => {
             serde_json::Value::String(u.iter().map(|x| format!("{x:02x}")).collect::<String>())
         }
         ProximaValue::Array(items) => {
@@ -845,6 +848,20 @@ mod tests {
                 "k".to_string(),
                 ProximaValue::Float64(1.5),
             )]))
+        );
+    }
+
+    #[test]
+    fn canonical_uuid_is_dashed() {
+        // Cross-surface text convention (pgwire pins dashed; /v2/records
+        // dashes) — the canonical wrapper must not drift from it.
+        let u = ProximaValue::Uuid([
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65, 0x54, 0x40,
+            0x00, 0x00,
+        ]);
+        assert_eq!(
+            proxima_value_to_json_canonical(&u),
+            serde_json::json!("550e8400-e29b-41d4-a716-446554400000")
         );
     }
 

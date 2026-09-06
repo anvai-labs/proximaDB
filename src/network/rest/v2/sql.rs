@@ -153,9 +153,13 @@ pub async fn execute_sql(
                     .get(index)
                     .cloned()
                     .unwrap_or_else(|| format!("column_{index}"));
+                // v2's binary spelling is the per-byte int-array (read AND
+                // write agree: /api/v2/records parses only arrays for
+                // binary, so any other spelling breaks the read→write round
+                // trip inside one API version).
                 object.insert(
                     column,
-                    proximadb_records::conversions::proxima_value_to_json_canonical(value),
+                    proximadb_records::conversions::proxima_to_json(value),
                 );
             }
             serde_json::Value::Object(object)

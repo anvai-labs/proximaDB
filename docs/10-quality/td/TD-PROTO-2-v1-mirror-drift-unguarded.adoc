@@ -694,6 +694,23 @@ decision on the declared field).
   already depends on it); SST's dead stats fn collapsed to a
   null-arms + delegate match.
 
+**Consolidation review round 4 (2026-09-06):**
+- v2 API-version binary symmetry restored: /api/v2/sql rows spell binary
+  as the per-byte int-array, matching /api/v2/records' read AND write
+  contract (the round-3 canonical-base64 change broke the SELECT→write
+  round trip inside one API version — base64 stays the v1/pgwire/Arrow
+  convention; v2 keeps its own symmetric int-array spelling until a
+  versioned v3 surface).
+- The canonical Uuid rendering is DASHED (kernel's Uuid helper — one
+  allocation), matching the cross-surface text convention the wrapper's
+  doc names; pinned by canonical_uuid_is_dashed. ULID stays hex (no
+  dash convention exists for it).
+- Raptor's 9-arm match collapsed to one sql_value_to_json call (the
+  round-3 edit had updated 3 arms and left the duplicate standing).
+- from_v1_simple_filters delegates through the exported unset-oneof
+  wrapper (the sentinel re-derived the null rule a third time);
+  orphaned doc comments on the new `use` statements removed.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

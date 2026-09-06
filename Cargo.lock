@@ -8666,6 +8666,7 @@ dependencies = [
  "bincode",
  "half",
  "proximadb-data-model",
+ "proximadb-kernel",
  "proximadb-proto",
  "rmp-serde",
  "serde",

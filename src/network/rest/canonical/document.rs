@@ -655,7 +655,6 @@ fn json_to_sql_value(value: &serde_json::Value) -> SqlValue {
     SqlValue { value: inner }
 }
 
-/// Convert SqlValue to JSON
 use proximadb_records::conversions::sql_value_to_json;
 
 /// Convert SqlObject to JSON

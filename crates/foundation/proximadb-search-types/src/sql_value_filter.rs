@@ -156,7 +156,7 @@ pub fn json_get_path<'a, 'p>(
 /// Lower a whole `SqlValue` (including its unset-oneof null wire form) to
 /// JSON. Single authority for "unset oneof == JSON null" — rounds 11/12 were
 /// each this rule drifting by depth; do not re-derive it per call site.
-fn sql_value_to_json(sql: &SqlValue) -> serde_json::Value {
+pub fn sql_value_to_json(sql: &SqlValue) -> serde_json::Value {
     match sql.value.as_ref() {
         Some(inner) => sql_val_to_json(inner),
         None => serde_json::Value::Null,
