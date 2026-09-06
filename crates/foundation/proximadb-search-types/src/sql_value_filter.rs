@@ -265,7 +265,15 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
             serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*b).to_string())
         }
         ProximaValue::ULID(b) => {
-            serde_json::Value::String(b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+            // Single-pass hex (16 bytes → 32 chars): the per-byte format!
+            // form allocated one intermediate String per byte on the
+            // per-record render path.
+            use std::fmt::Write as _;
+            let mut hex = String::with_capacity(b.len() * 2);
+            for byte in b {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            serde_json::Value::String(hex)
         }
         // Binary — the int-array spelling the SQL-side filter literal lowers
         // to — the old '[binary:N]' placeholder could never equal any literal,

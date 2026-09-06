@@ -7703,6 +7703,7 @@ name = "proximadb-embedded-common"
 version = "0.2.0"
 dependencies = [
  "proximadb-data-model",
+ "proximadb-records",
  "serde_json",
 ]
 

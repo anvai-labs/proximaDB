@@ -437,7 +437,13 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
             serde_json::to_string(&serde_json::Value::Array(json)).unwrap_or_default()
         }
         ProximaValue::Null => String::new(),
-        other => format!("{:?}", other),
+        // Exotics render as canonical text (dashed uuid, base64 binary)
+        // via the shared JSON surface — the Rust-Debug fallback produced
+        // strings no consumer could match or parse.
+        other => match proximadb_embedded_common::proxima_value_to_json(other) {
+            serde_json::Value::String(s) => s,
+            json => json.to_string(),
+        },
     }
 }
 

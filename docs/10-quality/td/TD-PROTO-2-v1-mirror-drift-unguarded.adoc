@@ -833,6 +833,27 @@ Other round-8/9 fixes:
   cycle (pre-existing); fixing it is a graph-format change under the
   mixed-read-safe migration discipline, not a consolidation edit.
 
+**Consolidation review round 10 (2026-09-06):**
+- A parallel session's equivalent null/nested-semantics fix was
+  cherry-picked (its group-by null-bucket + tantivy nested tests kept;
+  authorship preserved on the shared branch).
+- Tantivy's bytes placeholder now PRE-EMPTS the shared fn (the early
+  return rendered bytes as lossy content first, leaving the '<bytes:N>'
+  arm dead — the round-9 restoration had not actually landed for that
+  arm).
+- The embedded binding's two Rust-Debug wildcards (proxima_value_to_string
+  in binding/embedded, proxima_value_to_json in embedded-common) delegate
+  to records' canonical API-facing rendering — re-created for this caller
+  (base64 binary, dashed uuid; v2 REST still must not use it — int-array
+  binary there). Exotic-typed metadata through the Python API previously
+  rendered 'Uuid([85, 14, …])'.
+- ULID hex render is single-pass (the per-byte format! allocated one
+  intermediate String per byte on the per-record filter path).
+- Tracked (federated temporals): the unified-port SQL literal renders
+  temporals as quoted epoch-numbers; the matchable literal is
+  dialect-dependent (ISO-8601 text for Postgres-style engines) — needs a
+  per-dialect decision, not a silent swap.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

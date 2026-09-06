@@ -36,6 +36,10 @@ pub fn proxima_value_to_json(v: proximadb_data_model::ProximaValue) -> serde_jso
             serde_json::Value::Array(arr.into_iter().map(proxima_value_to_json).collect())
         }
         ProximaValue::Null => serde_json::Value::Null,
-        other => serde_json::Value::String(format!("{:?}", other)),
+        // Exotics (Binary/Uuid/ULID/temporals/SparseVector) render through
+        // records' canonical API-facing spelling (base64 binary, dashed
+        // uuid) — the Rust-Debug fallback produced text no consumer could
+        // match or parse.
+        other => proximadb_records::conversions::proxima_value_to_json_canonical(&other),
     }
 }

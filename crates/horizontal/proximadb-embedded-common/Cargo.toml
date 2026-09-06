@@ -11,4 +11,5 @@ description = "Reusable embedded-mode support types for ProximaDB workspace crat
 
 [dependencies]
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
+proximadb-records = { path = "../../foundation/proximadb-records" }
 serde_json = "1.0"
