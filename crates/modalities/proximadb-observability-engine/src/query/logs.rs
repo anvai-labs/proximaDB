@@ -898,6 +898,42 @@ mod tests {
     }
 
     #[test]
+    fn aggregation_keeps_null_distinct_from_empty_string() {
+        use crate::proto::proximadb_v1::sql_value::Value;
+
+        let null_fields = [(
+            "status".to_string(),
+            SqlValue {
+                value: Some(Value::NullValue(0)),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let empty_fields = [(
+            "status".to_string(),
+            SqlValue {
+                value: Some(Value::StringValue(String::new())),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let logs = vec![
+            make_log_with_fields("null", Severity::Info, "api", 0, null_fields),
+            make_log_with_fields("empty", Severity::Info, "api", 0, empty_fields),
+        ];
+
+        let result =
+            LogAggregator::aggregate(&logs, &LogAggregation::GroupBy("status".to_string()));
+        let keys: std::collections::BTreeSet<_> = result
+            .buckets
+            .iter()
+            .map(|bucket| bucket.key.as_str())
+            .collect();
+
+        assert_eq!(keys, ["", "<null>"].into_iter().collect());
+    }
+
+    #[test]
     fn aggregation_groups_jsonb_by_document_not_byte_length() {
         use crate::proto::proximadb_v1::sql_value::Value;
 

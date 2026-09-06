@@ -508,8 +508,8 @@ impl ObservabilityService {
                     .attributes
                     .iter()
                     .filter_map(|(k, v)| {
-                        // Scalars render through the ONE crate-shared fn:
-                        // bytes as lossy UTF-8 text and Jsonb as JSON text
+                        // Non-null scalars render through the ONE crate-shared
+                        // fn: bytes as lossy UTF-8 text and Jsonb as JSON text
                         // (both were silently dropped by the old `_`
                         // wildcard); null/unset/containers still drop, this
                         // path's pre-consolidation policy.
