@@ -922,7 +922,7 @@ mod block_utils {
                         serde_json::Value::Number(serde_json::Number::from(*i))
                     }
                     Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(_)) => {
-                        serde_json::Value::String("[binary]".to_string())
+                        proximadb_records::conversions::sql_value_to_json(item.1)
                     }
                     Some(crate::proto::proximadb_v1::sql_value::Value::JsonbValue(bytes)) => {
                         proximadb_data_model::ProximaValue::jsonb_to_json_lossy(bytes)
@@ -932,10 +932,10 @@ mod block_utils {
                         continue;
                     }
                     Some(crate::proto::proximadb_v1::sql_value::Value::ArrayValue(_)) => {
-                        serde_json::Value::String("[array]".to_string())
+                        proximadb_records::conversions::sql_value_to_json(item.1)
                     }
                     Some(crate::proto::proximadb_v1::sql_value::Value::ObjectValue(_)) => {
-                        serde_json::Value::String("[object]".to_string())
+                        proximadb_records::conversions::sql_value_to_json(item.1)
                     }
                     None => {
                         col_stats.null_count += 1;

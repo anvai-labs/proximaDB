@@ -664,6 +664,27 @@ is correct, but the render is now O(metadata) per record for discarded
 output — dropping the unread column is a follow-up (needs a schema
 decision on the declared field).
 
+**Consolidation review round 2 (2026-09-06):** further census + fixes —
+- v1 simple-filter literals lowered bytes/arrays/objects to
+  BYTES(N)/empty-container placeholders that could never equal the stored
+  side's rendering — equality filters on those types silently matched
+  nothing; literals now lower with the filter-lowering semantics.
+- REST v2 SQL rows rendered Binary as a per-byte int-array (via
+  proxima_to_json) while every other row surface rendered base64 — SQL
+  rows now apply the canonical binary spelling.
+- Raptor row-group metadata: NaN-to-0 is now NaN-to-null; array/object
+  arms use the canonical converter (was the tagged prost envelope).
+- SST column-stats (dead code, zero callers) and the observability bytes
+  stringifier (lossy-UTF-8 to deterministic hex) canonicalized.
+- kernel base64: in-place from_utf8 (no validate-then-clone double
+  allocation on every rendered bytes value).
+- Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
+  has 4+ hand-rolled copies with divergent number fallbacks (nullify /
+  stringify / drop) — the render consolidation's mirror image, needs its
+  own canonical home; per-site contract tests duplicating records' pinned
+  contract (delete as touched); the owned-input converter entry point
+  (executor/log-response clone-per-field).
+
 **Round 19 follow-up (2026-09-05, PR fix/dot-walker-consolidation):** the
 two unconsolidated dot-path walkers now delegate to the shared
 `json_get_path` — auth `oidc.rs claim_at_path` (OIDC claim traversal) and

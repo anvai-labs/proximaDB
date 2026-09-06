@@ -5,6 +5,7 @@
 //! canonical typed SQL authority also used by authenticated gRPC. Values stay
 //! as `ProximaValue` until this module projects them to JSON at the HTTP edge.
 
+use proximadb_data_model::ProximaValue;
 use std::time::Duration;
 
 use axum::{Extension, Json, extract::State};
@@ -153,10 +154,19 @@ pub async fn execute_sql(
                     .get(index)
                     .cloned()
                     .unwrap_or_else(|| format!("column_{index}"));
-                object.insert(
-                    column,
-                    proximadb_records::conversions::proxima_to_json(value),
-                );
+                // Canonical REST rendering: bytes are base64 (proxima_to_json
+                // alone renders Binary as a per-byte int-array — the
+                // cross-surface drift class TD-PROTO-2's consolidation
+                // killed; compose it with the canonical binary spelling).
+                let json = match value {
+                    ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
+                        serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(
+                            b,
+                        ))
+                    }
+                    other => proximadb_records::conversions::proxima_to_json(other),
+                };
+                object.insert(column, json);
             }
             serde_json::Value::Object(object)
         })

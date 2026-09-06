@@ -295,10 +295,8 @@ impl RowGroups {
                                 ) => serde_json::Value::String(s.clone()),
                                 Some(
                                     crate::proto::proximadb_v1::sql_value::Value::NumberValue(n),
-                                ) => serde_json::Value::Number(
-                                    serde_json::Number::from_f64(*n)
-                                        .unwrap_or_else(|| serde_json::Number::from(0)),
-                                ),
+                                ) => serde_json::Number::from_f64(*n)
+                                    .map_or(serde_json::Value::Null, serde_json::Value::Number),
                                 Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(
                                     i,
                                 )) => serde_json::Value::Number(serde_json::Number::from(*i)),
@@ -319,12 +317,14 @@ impl RowGroups {
                                 Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(
                                     _,
                                 )) => serde_json::Value::Null,
+                                // Canonical containers (serde on the prost
+                                // struct emits the tagged envelope shape).
                                 Some(crate::proto::proximadb_v1::sql_value::Value::ArrayValue(
-                                    arr,
-                                )) => serde_json::to_value(arr).unwrap_or(serde_json::Value::Null),
+                                    _,
+                                )) => proximadb_records::conversions::sql_value_to_json(value),
                                 Some(
-                                    crate::proto::proximadb_v1::sql_value::Value::ObjectValue(obj),
-                                ) => serde_json::to_value(obj).unwrap_or(serde_json::Value::Null),
+                                    crate::proto::proximadb_v1::sql_value::Value::ObjectValue(_),
+                                ) => proximadb_records::conversions::sql_value_to_json(value),
                                 None => serde_json::Value::Null,
                             },
                         )
