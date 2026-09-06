@@ -82,7 +82,7 @@ pub fn evaluate_filter(expr: &FilterExpression, metadata: &HashMap<String, SqlVa
             // Round 12: a top-level unset oneof is the SAME wire form of null
             // as the nested one the round-11 fix handles — `a = null` must
             // match, not drop the row.
-            return Some(sql_value_to_json(sql_value));
+            return Some(sql_value_to_filter_literal(sql_value));
         }
         // Dot traversal for JSON(B) roots — mirrors `resolve_proxima_value`
         // so the SqlValue and ProximaTree paths agree for nested fields:
@@ -156,7 +156,7 @@ pub fn json_get_path<'a, 'p>(
 /// Lower a whole `SqlValue` (including its unset-oneof null wire form) to
 /// JSON. Single authority for "unset oneof == JSON null" — rounds 11/12 were
 /// each this rule drifting by depth; do not re-derive it per call site.
-pub fn sql_value_to_json(sql: &SqlValue) -> serde_json::Value {
+pub fn sql_value_to_filter_literal(sql: &SqlValue) -> serde_json::Value {
     match sql.value.as_ref() {
         Some(inner) => sql_val_to_json(inner),
         None => serde_json::Value::Null,
@@ -261,7 +261,15 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
         }
         // Binary — base64-ish string
         ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
-            serde_json::Value::String(format!("[binary:{}]", b.len()))
+            // Round 5: the int-array spelling the SQL-side filter literal
+            // lowers to — the old '[binary:N]' placeholder could never equal
+            // any literal, so bytes equality filters silently matched
+            // nothing.
+            serde_json::Value::Array(
+                b.iter()
+                    .map(|x| serde_json::Value::Number((*x as u64).into()))
+                    .collect(),
+            )
         }
         ProximaValue::DenseVector(v) => serde_json::Value::Array(
             v.iter()

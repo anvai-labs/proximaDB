@@ -642,7 +642,7 @@ impl TantivyLogIndex {
             Some(SqlValueVariant::NumberValue(f)) => f.to_string(),
             Some(SqlValueVariant::BoolValue(b)) => b.to_string(),
             Some(SqlValueVariant::NullValue(_)) => String::new(),
-            Some(SqlValueVariant::BytesValue(b)) => format!("<bytes:{}>", b.len()),
+            Some(SqlValueVariant::BytesValue(b)) => hex::encode(b),
             // TD-PROTO-2 round 4: the _all fulltext field indexes the decoded
             // JSON text — a byte-length placeholder made fulltext search over
             // JSONB attributes return zero hits while the structured filter

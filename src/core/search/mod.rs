@@ -305,7 +305,9 @@ pub mod protocol_conversions {
             .map(|(field, sql_value)| {
                 // The canonical FILTER LOWERING via the one unset-oneof
                 // wrapper (the rule is not re-derived here).
-                let value = proximadb_search_types::sql_value_filter::sql_value_to_json(sql_value);
+                let value = proximadb_search_types::sql_value_filter::sql_value_to_filter_literal(
+                    sql_value,
+                );
 
                 Ok(FilterExpression::Comparison {
                     field: field.clone(),

@@ -287,13 +287,24 @@ impl RowGroups {
                     .metadata
                     .iter()
                     .map(|(key, value)| {
-                        (
-                            key.clone(),
-                            // Canonical rendering, one home (the old 9-arm
-                            // match was an arm-for-arm duplicate of
-                            // sql_value_to_json, including a second base64).
-                            proximadb_records::conversions::sql_value_to_json(value),
-                        )
+                        // Canonical rendering, one home (the old 9-arm match
+                        // was an arm-for-arm duplicate of sql_value_to_json,
+                        // including a second base64). EXCEPT NumberValue:
+                        // this columnar layout is POSITIONAL per key, and the
+                        // canonical NaN→null would re-route NaN rows from
+                        // numeric_columns into the string `_` arm — shifting
+                        // every later numeric entry one row (round-5
+                        // finding). Numbers keep their numeric JSON identity
+                        // here (NaN included); this is the only deliberate
+                        // local arm.
+                        let json = match &value.value {
+                            Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(n)) => {
+                                serde_json::Number::from_f64(*n)
+                                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
+                            }
+                            _ => proximadb_records::conversions::sql_value_to_json(value),
+                        };
+                        (key.clone(), json)
                     })
                     .collect();
                 // Inline metadata addition to avoid borrow conflict

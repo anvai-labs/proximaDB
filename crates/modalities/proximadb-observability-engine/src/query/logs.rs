@@ -498,7 +498,7 @@ impl LogAggregator {
             Some(Value::Int64Value(i)) => i.to_string(),
             Some(Value::NumberValue(f)) => f.to_string(),
             Some(Value::StringValue(s)) => s.clone(),
-            Some(Value::BytesValue(b)) => format!("<bytes:{}>", b.len()),
+            Some(Value::BytesValue(b)) => hex::encode(b),
             // TD-PROTO-2 round 4: group-by keys decode canonical JSON — a
             // byte-length placeholder collapsed distinct documents into
             // length buckets.

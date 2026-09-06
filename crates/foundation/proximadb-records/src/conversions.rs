@@ -871,15 +871,24 @@ mod tests {
         // base64, non-finite floats null, Jsonb decodes, unset oneof null.
         use proximadb_proto::proximadb_v1::sql_value::Value as V;
         let mk = |v: Option<V>| SqlValue { value: v };
-        // All padding branches (3-, 2-, 1-, 0-byte) + kernel-encoder
-        // equivalence (the REST write path uses kernel's — read/write must
-        // agree byte-for-byte).
-        for bytes in [vec![0u8, 1, 255], vec![1, 2], vec![7], vec![]] {
-            assert_eq!(
-                sql_value_to_json(&mk(Some(V::BytesValue(bytes.clone())))),
-                serde_json::json!(proximadb_proto::utils::encoding::base64_encode(&bytes))
-            );
-        }
+        // All padding branches pinned with literals (a same-function loop
+        // cannot fail).
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![0, 1, 255])))),
+            serde_json::json!("AAH/")
+        );
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![1, 2])))),
+            serde_json::json!("AQI=")
+        );
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![7])))),
+            serde_json::json!("Bw==")
+        );
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![])))),
+            serde_json::json!("")
+        );
         assert_eq!(
             sql_value_to_json(&mk(Some(V::BytesValue(vec![0, 1, 255])))),
             serde_json::json!("AAH/")

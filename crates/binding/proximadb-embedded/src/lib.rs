@@ -418,50 +418,26 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
         ProximaValue::Map(m) => {
             let json: serde_json::Map<String, serde_json::Value> = m
                 .into_iter()
-                .map(|(k, v)| (k, proxima_value_to_json(v)))
+                .map(|(k, v)| (k, proximadb_embedded_common::proxima_value_to_json(v)))
                 .collect();
             serde_json::to_string(&serde_json::Value::Object(json)).unwrap_or_default()
         }
         ProximaValue::Struct(m) => {
             let json: serde_json::Map<String, serde_json::Value> = m
                 .into_iter()
-                .map(|(k, v)| (k, proxima_value_to_json(v)))
+                .map(|(k, v)| (k, proximadb_embedded_common::proxima_value_to_json(v)))
                 .collect();
             serde_json::to_string(&serde_json::Value::Object(json)).unwrap_or_default()
         }
         ProximaValue::Array(arr) => {
-            let json: Vec<serde_json::Value> = arr.into_iter().map(proxima_value_to_json).collect();
+            let json: Vec<serde_json::Value> = arr
+                .into_iter()
+                .map(proximadb_embedded_common::proxima_value_to_json)
+                .collect();
             serde_json::to_string(&serde_json::Value::Array(json)).unwrap_or_default()
         }
         ProximaValue::Null => String::new(),
         other => format!("{:?}", other),
-    }
-}
-
-pub(crate) fn proxima_value_to_json(v: proximadb_data_model::ProximaValue) -> serde_json::Value {
-    use proximadb_data_model::ProximaValue;
-    match v {
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => serde_json::Value::String(s),
-        ProximaValue::Float32(f) => serde_json::Number::from_f64(f as f64)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        ProximaValue::Float64(f) => serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        ProximaValue::Int64(i) => serde_json::Value::Number(serde_json::Number::from(i)),
-        ProximaValue::Int32(i) => serde_json::Value::Number(serde_json::Number::from(i)),
-        ProximaValue::Boolean(b) => serde_json::Value::Bool(b),
-        ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v,
-        ProximaValue::Map(m) | ProximaValue::Struct(m) => serde_json::Value::Object(
-            m.into_iter()
-                .map(|(k, v)| (k, proxima_value_to_json(v)))
-                .collect(),
-        ),
-        ProximaValue::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(proxima_value_to_json).collect())
-        }
-        ProximaValue::Null => serde_json::Value::Null,
-        other => serde_json::Value::String(format!("{:?}", other)),
     }
 }
 

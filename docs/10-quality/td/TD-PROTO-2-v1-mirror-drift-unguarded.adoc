@@ -688,7 +688,7 @@ decision on the declared field).
   dashed-hex); the SQL-row path delegates — closing the nested-Binary
   int-array hole and the four-way uuid spelling drift.
 - All eight one-line delegating shims deleted (plain `use` imports) —
-  grep for `fn sql_value_to_json` now finds exactly one definition.
+  the production `fn sql_value_to_json` count is one (records); the filter-lowering wrapper is separately named `sql_value_to_filter_literal`, and a pre-existing dead copy sits behind `#![cfg(any())]` in the parity test (revival must import the canonical).
 - Raptor row-group metadata renders only what its typed-column dispatch
   stores; the observability bytes arm uses `hex::encode` (the crate
   already depends on it); SST's dead stats fn collapsed to a
@@ -710,6 +710,34 @@ decision on the declared field).
 - from_v1_simple_filters delegates through the exported unset-oneof
   wrapper (the sentinel re-derived the null rule a third time);
   orphaned doc comments on the new `use` statements removed.
+
+**Consolidation review round 5 (2026-09-06) — 10 findings: 7 fixed,
+3 dispositioned:**
+- Raptor NaN: the canonical NaN→null would have re-routed NaN rows from
+  numeric_columns into the string `_` arm — shifting every later numeric
+  entry one row in the POSITIONAL columnar layout. Numbers keep their
+  numeric identity in that one local arm (the only deliberate one).
+- v2 SQL rows: Uuid now renders DASHED (the canonical wrapper) matching
+  /api/v2/records' read; Binary stays the v2 int-array spelling (the
+  versioned-surface split) — composed at the one call site.
+- The observability crate's OTHER two bytes stringifiers (group-by keys,
+  tantivy _all) aligned to the same hex as the filter path (was
+  `<bytes:N>` length buckets collapsing distinct values — the exact bug
+  their adjacent JsonbValue comments say was fixed).
+- The stored-side Binary rendering in the filter evaluator aligned to
+  the int-array spelling (was `[binary:N]` — bytes equality filters
+  silently matched nothing on the ProximaTree seam).
+- The exported filter-lowering wrapper renamed
+  sql_value_to_filter_literal (no silent wrong-import trap against
+  records' canonical sql_value_to_json, whose bytes semantics differ).
+- The embedded binding's ProximaValue→JSON twin deleted (delegates to
+  proximadb-embedded-common's existing helper).
+- The contract test's padding loop replaced with hardcoded literals (the
+  loop asserted the same function against itself).
+- Dispositioned: the api observability clone-per-field and the 5-copy
+  sql_object_to_json walk are the tracked owned-entry/object-walk
+  follow-ups; the v2-vs-v1 binary spelling split is the documented
+  versioned-surface policy.
 
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /

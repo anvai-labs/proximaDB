@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use axum::{Extension, Json, extract::State};
+use proximadb_data_model::ProximaValue;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use utoipa::ToSchema;
@@ -157,10 +158,24 @@ pub async fn execute_sql(
                 // write agree: /api/v2/records parses only arrays for
                 // binary, so any other spelling breaks the read→write round
                 // trip inside one API version).
-                object.insert(
-                    column,
-                    proximadb_records::conversions::proxima_to_json(value),
-                );
+                // v2's binary spelling is the per-byte int-array (read AND
+                // write agree: /api/v2/records parses only arrays for
+                // binary). Uuid is DASHED here via the canonical wrapper —
+                // matching /api/v2/records' read rendering (one API
+                // version, one id spelling); the wrapper keeps Binary
+                // int-array only for nested containers, so the top level
+                // composes both rules.
+                let json = match value {
+                    ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
+                        serde_json::Value::Array(
+                            b.iter()
+                                .map(|x| serde_json::Value::Number((*x as u64).into()))
+                                .collect(),
+                        )
+                    }
+                    other => proximadb_records::conversions::proxima_value_to_json_canonical(other),
+                };
+                object.insert(column, json);
             }
             serde_json::Value::Object(object)
         })
