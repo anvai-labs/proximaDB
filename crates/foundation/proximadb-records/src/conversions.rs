@@ -87,6 +87,68 @@ pub fn sql_value_to_proxima(sql: &SqlValue) -> ProximaValue {
     }
 }
 
+/// Canonical JSON *rendering* of a proto `SqlValue` — THE one converter for
+/// API-facing surfaces (REST rows, pgwire, Arrow, hybrid, document adapter,
+/// metadata helper). TD-PROTO-2 consolidation: these sites carried seven
+/// hand-rolled copies whose bytes/NaN/Jsonb renderings had drifted (hex vs
+/// base64 vs int-array; NaN→0 vs Null). Rendering contract:
+///
+/// - bytes → base64 string (data-preserving, matches pgwire/Arrow)
+/// - non-finite floats → null (JSON has no NaN/∞)
+/// - JsonbValue → canonical MessagePack decode (jsonb_to_json_lossy)
+/// - unset oneof / NullValue → null
+///
+/// Distinct from `sql_value_filter::sql_val_to_json` (search-types), the
+/// FILTER LOWERING — it renders bytes as an int-array for comparison
+/// semantics and must not be conflated with rendering.
+pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
+    match value.value.as_ref() {
+        None | Some(sql_value::Value::NullValue(_)) => serde_json::Value::Null,
+        Some(sql_value::Value::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(sql_value::Value::Int64Value(i)) => serde_json::Value::Number((*i).into()),
+        Some(sql_value::Value::NumberValue(f)) => serde_json::Number::from_f64(*f)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Some(sql_value::Value::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(sql_value::Value::BytesValue(b)) => serde_json::Value::String(base64_encode(b)),
+        Some(sql_value::Value::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
+        Some(sql_value::Value::ArrayValue(arr)) => {
+            serde_json::Value::Array(arr.values.iter().map(sql_value_to_json).collect())
+        }
+        Some(sql_value::Value::ObjectValue(obj)) => serde_json::Value::Object(
+            obj.fields
+                .iter()
+                .map(|(k, v)| (k.clone(), sql_value_to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Minimal standard-alphabet base64 encoder (no padding config, no external
+/// dep) — matches `proximadb_kernel::encoding::base64_encode` output.
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Convert a `serde_json::Value` into a `ProximaValue` (natural-JSON mapping).
 ///
 /// Numbers split into `Int64`/`Float64`. This matches the composition
@@ -780,6 +842,30 @@ mod tests {
                 "k".to_string(),
                 ProximaValue::Float64(1.5),
             )]))
+        );
+    }
+
+    #[test]
+    fn canonical_rendering_contract_is_pinned() {
+        // TD-PROTO-2 consolidation: the ONE API-facing rendering — bytes are
+        // base64, non-finite floats null, Jsonb decodes, unset oneof null.
+        use proximadb_proto::proximadb_v1::sql_value::Value as V;
+        let mk = |v: Option<V>| SqlValue { value: v };
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![0, 1, 255])))),
+            serde_json::json!("AAH/")
+        );
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::NumberValue(f64::NAN)))),
+            serde_json::json!(null)
+        );
+        assert_eq!(sql_value_to_json(&mk(None)), serde_json::json!(null));
+        let doc = serde_json::json!({"a": 1});
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::JsonbValue(
+                ProximaValue::to_jsonb_vec(&doc).unwrap()
+            )))),
+            doc
         );
     }
 

@@ -633,6 +633,22 @@ inherent:**
 * Fixed: the Not null-probe resolves once (probe only when the inner
   comparison denied — was double-resolution per record).
 
+**Consolidation landing (2026-09-06, PR fix/sqlvalue-converter-home):**
+the canonical `SqlValue`→JSON *rendering* now lives in ONE place —
+`proximadb_records::conversions::sql_value_to_json` (foundation tier,
+reachable from every crate). Eight sites delegate: arrow_conversion (compat
+re-export), pgwire protocol, REST canonical handlers + document, REST v2
+records (its NaN 500-error path becomes the canonical null rendering),
+query document_adapter, api hybrid, and the storage-common metadata helper
+(its "[binary data]"/"[jsonb data]" placeholders become the canonical
+base64/JSON — REST-visible, deliberate). The contract is pinned by a test
+in records (bytes→base64 "AAH/", NaN→null, Jsonb decode, unset-oneof→null).
+Deliberately NOT consolidated: `sql_value_filter::sql_val_to_json`
+(search-types) — the FILTER LOWERING renders bytes as an int-array for
+comparison semantics; conflating it with rendering would change filter
+behavior. The v1-conformance round-17 note's "two-authority" drift is
+closed for every rendering surface.
+
 **Round 19 follow-up (2026-09-05, PR fix/dot-walker-consolidation):** the
 two unconsolidated dot-path walkers now delegate to the shared
 `json_get_path` — auth `oidc.rs claim_at_path` (OIDC claim traversal) and

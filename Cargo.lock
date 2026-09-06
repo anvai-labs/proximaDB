@@ -8441,6 +8441,7 @@ dependencies = [
  "proximadb-proto",
  "proximadb-query-filter",
  "proximadb-query-fusion",
+ "proximadb-records",
  "proximadb-runtime-common",
  "proximadb-search-types",
  "proximadb-uql",

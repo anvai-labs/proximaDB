@@ -94,43 +94,10 @@ fn json_to_sql_value(value: &serde_json::Value) -> crate::proto::proximadb_v1::S
 fn sql_value_to_json(
     value: &crate::proto::proximadb_v1::SqlValue,
 ) -> Result<serde_json::Value, ApiError> {
-    use crate::proto::proximadb_v1::sql_value::Value;
-
-    Ok(match value.value.as_ref() {
-        Some(Value::NullValue(_)) => serde_json::Value::Null,
-        Some(Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Value::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-        Some(Value::NumberValue(f)) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| {
-                ApiError::Internal(format!(
-                    "Failed to convert f64 to serde_json::Number: {}",
-                    f
-                ))
-            })?,
-        Some(Value::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(Value::BytesValue(b)) => serde_json::Value::Array(
-            b.iter()
-                .map(|x| serde_json::Value::Number((*x as u64).into()))
-                .collect(),
-        ),
-        Some(Value::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
-        Some(Value::ArrayValue(arr)) => serde_json::Value::Array(
-            arr.values
-                .iter()
-                .map(sql_value_to_json)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Some(Value::ObjectValue(obj)) => {
-            let map: serde_json::Map<String, serde_json::Value> = obj
-                .fields
-                .iter()
-                .map(|(k, v)| Ok((k.clone(), sql_value_to_json(v)?)))
-                .collect::<Result<_, ApiError>>()?;
-            serde_json::Value::Object(map)
-        }
-        None => serde_json::Value::Null,
-    })
+    // TD-PROTO-2 consolidation: delegates to the canonical rendering
+    // (non-finite floats render as null — the old 500-error path is gone;
+    // pinned in records' contract test).
+    Ok(proximadb_records::conversions::sql_value_to_json(value))
 }
 
 #[cfg(test)]

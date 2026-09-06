@@ -657,9 +657,7 @@ fn json_to_sql_value(value: &serde_json::Value) -> SqlValue {
 
 /// Convert SqlValue to JSON
 fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
-    // Round 14: delegate to the shared converter — this hand-rolled copy had
-    // already drifted (hex bytes vs the helper's base64).
-    crate::storage::formats::arrow_conversion::sql_value_to_json(value)
+    proximadb_records::conversions::sql_value_to_json(value)
 }
 
 /// Convert SqlObject to JSON

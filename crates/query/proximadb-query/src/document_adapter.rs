@@ -1,6 +1,6 @@
 //! Pure document-query adaptation helpers shared across query surfaces.
 
-use proximadb_data_model::{DataModel, ProximaValue};
+use proximadb_data_model::DataModel;
 use proximadb_document_query::PathFilter;
 use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
 use proximadb_proto::proximadb_v1::{
@@ -22,25 +22,7 @@ pub fn sql_object_to_json(obj: &proximadb_proto::proximadb_v1::SqlObject) -> ser
 
 /// Convert a protobuf `SqlValue` into JSON.
 pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
-    match &value.value {
-        Some(SqlValueVariant::NullValue(_)) => serde_json::Value::Null,
-        Some(SqlValueVariant::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(SqlValueVariant::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-        Some(SqlValueVariant::NumberValue(f)) => serde_json::Number::from_f64(*f)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        Some(SqlValueVariant::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(SqlValueVariant::BytesValue(b)) => {
-            let encoded: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-            serde_json::Value::String(encoded)
-        }
-        Some(SqlValueVariant::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
-        Some(SqlValueVariant::ArrayValue(arr)) => {
-            let items: Vec<serde_json::Value> = arr.values.iter().map(sql_value_to_json).collect();
-            serde_json::Value::Array(items)
-        }
-        Some(SqlValueVariant::ObjectValue(obj)) => sql_object_to_json(obj),
-        None => serde_json::Value::Null,
-    }
+    proximadb_records::conversions::sql_value_to_json(value)
 }
 
 /// Convert query-IR path filters into the protobuf `DocumentFilter` contract.

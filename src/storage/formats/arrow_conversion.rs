@@ -318,31 +318,10 @@ pub fn record_batch_to_vector_records(batch: &RecordBatch) -> Result<Vec<VectorR
 
 /// Convert proto SqlValue to JSON Value
 pub fn sql_value_to_json(value: &SqlValue) -> JsonValue {
-    match &value.value {
-        None => JsonValue::Null,
-        Some(inner) => match inner {
-            ProtoSqlValueInner::NullValue(_) => JsonValue::Null,
-            ProtoSqlValueInner::BoolValue(b) => JsonValue::Bool(*b),
-            ProtoSqlValueInner::Int64Value(i) => JsonValue::Number((*i).into()),
-            ProtoSqlValueInner::NumberValue(f) => {
-                serde_json::Number::from_f64(*f).map_or(JsonValue::Null, JsonValue::Number)
-            }
-            ProtoSqlValueInner::StringValue(s) => JsonValue::String(s.clone()),
-            ProtoSqlValueInner::BytesValue(b) => JsonValue::String(base64_helper::encode(b)),
-            ProtoSqlValueInner::JsonbValue(b) => {
-                proximadb_data_model::ProximaValue::jsonb_to_json_lossy(b)
-            }
-            ProtoSqlValueInner::ArrayValue(arr) => {
-                JsonValue::Array(arr.values.iter().map(sql_value_to_json).collect())
-            }
-            ProtoSqlValueInner::ObjectValue(obj) => JsonValue::Object(
-                obj.fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), sql_value_to_json(v)))
-                    .collect(),
-            ),
-        },
-    }
+    // TD-PROTO-2 consolidation: the canonical rendering moved to
+    // proximadb-records (foundation-reachable from every crate); this is the
+    // compat re-export for existing root-crate callers.
+    proximadb_records::conversions::sql_value_to_json(value)
 }
 
 /// Convert JSON Value to proto SqlValue
@@ -421,20 +400,6 @@ pub fn filter_to_string(filter: &FilterExpression) -> String {
 // ============================================================================
 // Utility Functions
 // ============================================================================
-
-/// Encode bytes as base64
-mod base64_helper {
-    use ::base64::{Engine, engine::general_purpose::STANDARD};
-
-    pub fn encode(data: &[u8]) -> String {
-        STANDARD.encode(data)
-    }
-
-    #[allow(dead_code)]
-    pub fn decode(s: &str) -> Result<Vec<u8>, ::base64::DecodeError> {
-        STANDARD.decode(s)
-    }
-}
 
 /// Get Arrow DataType for a proto SqlValue
 pub fn sql_value_to_arrow_type(value: &SqlValue) -> DataType {

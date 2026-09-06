@@ -43,9 +43,7 @@ use proximadb_data_model::ProximaType;
 use proximadb_data_model::ProximaValue;
 
 fn sql_value_to_json(value: &crate::proto::proximadb_v1::SqlValue) -> serde_json::Value {
-    // Round 7: delegate to the shared converter — this local copy duplicated
-    // it arm-for-arm (the family the consolidation follow-up collapses).
-    crate::storage::formats::arrow_conversion::sql_value_to_json(value)
+    proximadb_records::conversions::sql_value_to_json(value)
 }
 
 fn sql_object_to_json(obj: &crate::proto::proximadb_v1::SqlObject) -> String {
