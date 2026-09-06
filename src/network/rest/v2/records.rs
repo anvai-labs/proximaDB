@@ -90,15 +90,9 @@ fn json_to_sql_value(value: &serde_json::Value) -> crate::proto::proximadb_v1::S
 }
 
 #[cfg(test)]
-/// Convert SqlValue back to JSON for legacy conversion tests.
-fn sql_value_to_json(
-    value: &crate::proto::proximadb_v1::SqlValue,
-) -> Result<serde_json::Value, ApiError> {
-    // TD-PROTO-2 consolidation: delegates to the canonical rendering
-    // (non-finite floats render as null — the old 500-error path is gone;
-    // pinned in records' contract test).
-    Ok(proximadb_records::conversions::sql_value_to_json(value))
-}
+/// Canonical rendering alias for the legacy conversion tests (the old
+/// fallible wrapper's error path could no longer fire).
+use proximadb_records::conversions::sql_value_to_json;
 
 #[cfg(test)]
 /// Convert a JSON value to a FilterClause value.
@@ -3381,7 +3375,7 @@ mod tests {
         let sv = SqlValue {
             value: Some(Value::NullValue(0)),
         };
-        let result = sql_value_to_json(&sv).expect("Should convert null");
+        let result = sql_value_to_json(&sv);
         assert!(result.is_null());
     }
 
@@ -3391,7 +3385,7 @@ mod tests {
         let sv = SqlValue {
             value: Some(Value::BoolValue(true)),
         };
-        let result = sql_value_to_json(&sv).expect("Should convert bool");
+        let result = sql_value_to_json(&sv);
         assert_eq!(result, serde_json::json!(true));
     }
 
@@ -3401,7 +3395,7 @@ mod tests {
         let sv = SqlValue {
             value: Some(Value::Int64Value(999)),
         };
-        let result = sql_value_to_json(&sv).expect("Should convert int64");
+        let result = sql_value_to_json(&sv);
         assert_eq!(result, serde_json::json!(999));
     }
 
@@ -3411,7 +3405,7 @@ mod tests {
         let sv = SqlValue {
             value: Some(Value::NumberValue(2.5)),
         };
-        let result = sql_value_to_json(&sv).expect("Should convert number");
+        let result = sql_value_to_json(&sv);
         assert!((result.as_f64().expect("Should be f64") - 2.5).abs() < 0.001);
     }
 
@@ -3421,7 +3415,7 @@ mod tests {
         let sv = SqlValue {
             value: Some(Value::StringValue("test_str".to_string())),
         };
-        let result = sql_value_to_json(&sv).expect("Should convert string");
+        let result = sql_value_to_json(&sv);
         assert_eq!(result, serde_json::json!("test_str"));
     }
 
@@ -3431,7 +3425,7 @@ mod tests {
         let sv = SqlValue {
             value: Some(Value::BytesValue(vec![0, 1, 255])),
         };
-        let result = sql_value_to_json(&sv).expect("Should convert bytes");
+        let result = sql_value_to_json(&sv);
         // Canonical rendering — bytes are base64 (was int-array).
         assert_eq!(result, serde_json::json!("AAH/"));
     }
@@ -3451,7 +3445,7 @@ mod tests {
                 ],
             })),
         };
-        let result = sql_value_to_json(&sv).expect("Should convert array");
+        let result = sql_value_to_json(&sv);
         assert_eq!(result, serde_json::json!([1, 2]));
     }
 
@@ -3468,7 +3462,7 @@ mod tests {
         let sv = SqlValue {
             value: Some(Value::ObjectValue(SqlObject { fields })),
         };
-        let result = sql_value_to_json(&sv).expect("Should convert object");
+        let result = sql_value_to_json(&sv);
         assert_eq!(result["name"], serde_json::json!("alice"));
     }
 
@@ -3476,23 +3470,18 @@ mod tests {
     fn test_sql_value_to_json_none_value() {
         use crate::proto::proximadb_v1::SqlValue;
         let sv = SqlValue { value: None };
-        let result = sql_value_to_json(&sv).expect("Should convert None to null");
+        let result = sql_value_to_json(&sv);
         assert!(result.is_null());
     }
 
     #[test]
-    fn test_sql_value_to_json_nan_returns_error() {
+    fn test_sql_value_to_json_nan_renders_null() {
         use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
         let sv = SqlValue {
             value: Some(Value::NumberValue(f64::NAN)),
         };
-        let result = sql_value_to_json(&sv);
-        // Canonical rendering — non-finite floats render as null (the old
-        // 500-error path is gone; pinned in records' contract test).
-        assert_eq!(
-            result.expect("canonical rendering is infallible"),
-            serde_json::json!(null)
-        );
+        // Canonical rendering — non-finite floats render as null.
+        assert_eq!(sql_value_to_json(&sv), serde_json::json!(null));
     }
 
     // =========================================================================
@@ -3503,7 +3492,7 @@ mod tests {
     fn test_json_sql_value_roundtrip_string() {
         let original = serde_json::json!("roundtrip_test");
         let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
+        let result = sql_value_to_json(&sql_val);
         assert_eq!(original, result);
     }
 
@@ -3511,7 +3500,7 @@ mod tests {
     fn test_json_sql_value_roundtrip_integer() {
         let original = serde_json::json!(42);
         let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
+        let result = sql_value_to_json(&sql_val);
         assert_eq!(original, result);
     }
 
@@ -3519,7 +3508,7 @@ mod tests {
     fn test_json_sql_value_roundtrip_bool() {
         let original = serde_json::json!(true);
         let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
+        let result = sql_value_to_json(&sql_val);
         assert_eq!(original, result);
     }
 
@@ -3527,7 +3516,7 @@ mod tests {
     fn test_json_sql_value_roundtrip_null() {
         let original = serde_json::json!(null);
         let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
+        let result = sql_value_to_json(&sql_val);
         assert_eq!(original, result);
     }
 
@@ -3535,7 +3524,7 @@ mod tests {
     fn test_json_sql_value_roundtrip_nested_object() {
         let original = serde_json::json!({"a": 1, "b": "two", "c": [true, null]});
         let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
+        let result = sql_value_to_json(&sql_val);
         assert_eq!(original, result);
     }
 
@@ -3667,7 +3656,7 @@ mod tests {
     #[test]
     fn test_sql_to_json_roundtrip_null() {
         let sv = json_to_sql_value(&serde_json::Value::Null);
-        let json = sql_value_to_json(&sv).unwrap();
+        let json = sql_value_to_json(&sv);
         assert!(json.is_null());
     }
 
@@ -3675,7 +3664,7 @@ mod tests {
     fn test_sql_to_json_roundtrip_bool() {
         let original = serde_json::json!(false);
         let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
+        let json = sql_value_to_json(&sv);
         assert_eq!(json, original);
     }
 
@@ -3683,7 +3672,7 @@ mod tests {
     fn test_sql_to_json_roundtrip_integer() {
         let original = serde_json::json!(12345);
         let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
+        let json = sql_value_to_json(&sv);
         assert_eq!(json, original);
     }
 
@@ -3691,7 +3680,7 @@ mod tests {
     fn test_sql_to_json_roundtrip_string() {
         let original = serde_json::json!("test_value");
         let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
+        let json = sql_value_to_json(&sv);
         assert_eq!(json, original);
     }
 
@@ -3699,7 +3688,7 @@ mod tests {
     fn test_sql_to_json_roundtrip_array() {
         let original = serde_json::json!(["a", "b", "c"]);
         let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
+        let json = sql_value_to_json(&sv);
         assert_eq!(json, original);
     }
 
@@ -3707,7 +3696,7 @@ mod tests {
     fn test_sql_to_json_roundtrip_nested_object() {
         let original = serde_json::json!({"nested": {"deep": true}});
         let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
+        let json = sql_value_to_json(&sv);
         assert_eq!(json, original);
     }
 
@@ -3715,7 +3704,7 @@ mod tests {
     fn test_sql_to_json_none_value() {
         use crate::proto::proximadb_v1::SqlValue;
         let sv = SqlValue { value: None };
-        let json = sql_value_to_json(&sv).unwrap();
+        let json = sql_value_to_json(&sv);
         assert!(json.is_null());
     }
 

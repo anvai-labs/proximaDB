@@ -120,7 +120,7 @@ pub struct SqlQueryRequest {
 
 // ── Helper: proto SqlValue → serde_json::Value ────────────────────────────────
 
-pub fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
+fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
     proximadb_records::conversions::sql_value_to_json(v)
 }
 

@@ -680,7 +680,7 @@ pub fn json_to_sql_value(value: &serde_json::Value) -> SqlValue {
     SqlValue { value: inner }
 }
 
-pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
+fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
     proximadb_records::conversions::sql_value_to_json(value)
 }
 

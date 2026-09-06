@@ -21,7 +21,7 @@ pub fn sql_object_to_json(obj: &proximadb_proto::proximadb_v1::SqlObject) -> ser
 }
 
 /// Convert a protobuf `SqlValue` into JSON.
-pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
+fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
     proximadb_records::conversions::sql_value_to_json(value)
 }
 

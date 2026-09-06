@@ -656,6 +656,13 @@ stale contract tests re-pinned, and the storage-common helper's
 key-PRESENCE flip documented: an unset oneof previously OMITTED the key;
 it now renders as an explicit null (raptor's experimental-gated Arrow
 cache bytes change shape; consumers see keys they did not before).
+ Correction (review round): the helper's consumers are NOT REST paths —
+raptor's experimental-gated convert_to_arrow_batch (whose "metadata" Utf8
+column nothing reads: only the vector column is consumed) and VIPER's
+caller-less evaluate_metadata_filter_with_config. The placeholder removal
+is correct, but the render is now O(metadata) per record for discarded
+output — dropping the unread column is a follow-up (needs a schema
+decision on the declared field).
 
 **Round 19 follow-up (2026-09-05, PR fix/dot-walker-consolidation):** the
 two unconsolidated dot-path walkers now delegate to the shared
