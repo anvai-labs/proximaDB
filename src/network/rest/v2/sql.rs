@@ -154,26 +154,18 @@ pub async fn execute_sql(
                     .get(index)
                     .cloned()
                     .unwrap_or_else(|| format!("column_{index}"));
-                // v2's binary spelling is the per-byte int-array (read AND
-                // write agree: /api/v2/records parses only arrays for
-                // binary, so any other spelling breaks the read→write round
-                // trip inside one API version).
-                // v2's binary spelling is the per-byte int-array (read AND
-                // write agree: /api/v2/records parses only arrays for
-                // binary). Uuid is DASHED here via the canonical wrapper —
-                // matching /api/v2/records' read rendering (one API
-                // version, one id spelling); the wrapper keeps Binary
-                // int-array only for nested containers, so the top level
-                // composes both rules.
+                // v2's binary spelling is the per-byte int-array at ALL
+                // depths (read AND write agree: /api/v2/records parses only
+                // arrays for binary; proxima_to_json renders int-arrays
+                // recursively). Uuid stays DASHED here to match
+                // /api/v2/records' read rendering — one id spelling per API
+                // version; both rules composed via the canonical wrapper's
+                // Uuid arm with the int-array fallthrough.
                 let json = match value {
-                    ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
-                        serde_json::Value::Array(
-                            b.iter()
-                                .map(|x| serde_json::Value::Number((*x as u64).into()))
-                                .collect(),
-                        )
-                    }
-                    other => proximadb_records::conversions::proxima_value_to_json_canonical(other),
+                    ProximaValue::Uuid(u) => serde_json::Value::String(
+                        proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string(),
+                    ),
+                    other => proximadb_records::conversions::proxima_to_json(other),
                 };
                 object.insert(column, json);
             }

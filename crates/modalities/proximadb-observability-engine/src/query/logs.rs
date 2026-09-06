@@ -490,24 +490,21 @@ impl LogAggregator {
 
     /// Convert SqlValue to string for grouping
     fn sql_value_to_string(value: &SqlValue) -> String {
+        // Scalars render through the ONE shared crate fn. NOTE: the shared
+        // fn renders Null as "" (not "<null>") — the group-by bucket key
+        // changes; null-count was never distinct from ""-valued strings in
+        // the old spelling, and "" matches the filter path's convention.
+        if let Some(s) = super::sql_scalar_to_string(value) {
+            return s;
+        }
         use crate::proto::proximadb_v1::sql_value::Value;
 
+        // Containers only (scalars + Jsonb already handled above); the
+        // wildcard keeps the match total.
         match &value.value {
-            Some(Value::NullValue(_)) => "<null>".to_string(),
-            Some(Value::BoolValue(b)) => b.to_string(),
-            Some(Value::Int64Value(i)) => i.to_string(),
-            Some(Value::NumberValue(f)) => f.to_string(),
-            Some(Value::StringValue(s)) => s.clone(),
-            Some(Value::BytesValue(b)) => hex::encode(b),
-            // TD-PROTO-2 round 4: group-by keys decode canonical JSON — a
-            // byte-length placeholder collapsed distinct documents into
-            // length buckets.
-            Some(Value::JsonbValue(b)) => {
-                proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b)
-            }
             Some(Value::ArrayValue(arr)) => format!("<array:{}>", arr.values.len()),
             Some(Value::ObjectValue(obj)) => format!("<object:{}>", obj.fields.len()),
-            None => "<empty>".to_string(),
+            _ => "<empty>".to_string(),
         }
     }
 }

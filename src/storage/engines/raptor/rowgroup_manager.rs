@@ -287,20 +287,19 @@ impl RowGroups {
                     .metadata
                     .iter()
                     .map(|(key, value)| {
-                        // Canonical rendering, one home (the old 9-arm match
-                        // was an arm-for-arm duplicate of sql_value_to_json,
-                        // including a second base64). EXCEPT NumberValue:
-                        // this columnar layout is POSITIONAL per key, and the
-                        // canonical NaN→null would re-route NaN rows from
-                        // numeric_columns into the string `_` arm — shifting
-                        // every later numeric entry one row (round-5
-                        // finding). Numbers keep their numeric JSON identity
-                        // here (NaN included); this is the only deliberate
-                        // local arm.
+                        // Canonical rendering, one home. NUMBER dispatch is
+                        // proto-variant-driven (not JSON-type-driven): this
+                        // columnar layout is POSITIONAL per key, and any
+                        // Number→non-Number rendering change (e.g. NaN→null)
+                        // would re-route rows between column families and
+                        // shift every later entry — dispatch on the variant
+                        // so numeric identity holds by construction.
                         let json = match &value.value {
                             Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(n)) => {
-                                serde_json::Number::from_f64(*n)
-                                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
+                                serde_json::Value::Number(
+                                    serde_json::Number::from_f64(*n)
+                                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                                )
                             }
                             _ => proximadb_records::conversions::sql_value_to_json(value),
                         };

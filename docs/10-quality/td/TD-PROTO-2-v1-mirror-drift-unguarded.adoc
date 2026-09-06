@@ -739,6 +739,27 @@ decision on the declared field).
   follow-ups; the v2-vs-v1 binary spelling split is the documented
   versioned-surface policy.
 
+**Consolidation review round 6 (2026-09-06):**
+- Raptor NaN→0 restored (the round-5 'numeric identity' arm was
+  token-identical to the canonical NaN→null — the positional misalignment
+  it claimed to prevent was still live).
+- v2 SQL rows: whole-cell delegation to proxima_to_json (int-array
+  binary at ALL depths — the round-5 composition made nested Binary
+  base64 inside one row) with the Uuid dashed arm composed on top.
+- The observability crate's three stringifiers now share ONE scalar
+  rendering fn (sql_scalar_to_string); container arms stay per-site with
+  comments. The shared Null→"" unifies the group-by bucket spelling with
+  the filter path's convention ("<null>"/"<empty>" no longer diverge from
+  the filter's ""); this changes group-by KEYS for null-valued fields.
+- The document-adapter filter literals lower through
+  sql_value_to_filter_literal (was the RENDERING converter — latent
+  bytes never-match once wired).
+- ULID arm deleted from the canonical wrapper (a no-op duplicate of the
+  fallthrough); its doc corrected (Uuid dashed; ULID hex). Duplicate
+  contract assert removed.
+- Tracked: the Binary stored-side render's per-record allocation
+  (allocation-free native comparison path pending).
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

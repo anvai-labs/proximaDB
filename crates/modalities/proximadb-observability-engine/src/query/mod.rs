@@ -50,6 +50,26 @@ pub struct ObservabilityQueryEngine {
     log_indexes: tokio::sync::RwLock<HashMap<String, Arc<TantivyLogIndex>>>,
 }
 
+/// The crate-wide SCALAR SqlValue→string rendering (one home; the three
+/// per-site stringifiers delegate these arms — container arms differ
+/// legitimately per consumer: group-by keys, attribute matching, tantivy
+/// tokens). Bytes → deterministic hex; Jsonb → canonical JSON text;
+/// unset-oneof/Null → "".
+pub(crate) fn sql_scalar_to_string(value: &crate::proto::proximadb_v1::SqlValue) -> Option<String> {
+    use crate::proto::proximadb_v1::sql_value::Value as V;
+    match value.value.as_ref() {
+        Some(V::StringValue(s)) => Some(s.clone()),
+        Some(V::Int64Value(i)) => Some(i.to_string()),
+        Some(V::NumberValue(f)) => Some(f.to_string()),
+        Some(V::BoolValue(b)) => Some(b.to_string()),
+        Some(V::BytesValue(b)) => Some(hex::encode(b)),
+        Some(V::JsonbValue(b)) => {
+            Some(proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b))
+        }
+        Some(V::NullValue(_)) | None => Some(String::new()),
+        _ => None, // containers: per-site policy
+    }
+}
 impl ObservabilityQueryEngine {
     /// Create a new query engine
     pub fn new(storage: Arc<dyn ObservabilityStoragePort>) -> Self {
@@ -516,15 +536,13 @@ impl ObservabilityQueryEngine {
 
     /// Convert SqlValue to string for comparison
     fn sql_value_to_string(&self, value: &crate::proto::proximadb_v1::SqlValue) -> String {
+        // Scalars render through the ONE shared crate fn (per-site scalar
+        // arms drifted before).
+        if let Some(s) = sql_scalar_to_string(value) {
+            return s;
+        }
         use crate::proto::proximadb_v1::sql_value::Value;
         match &value.value {
-            Some(Value::StringValue(s)) => s.clone(),
-            Some(Value::Int64Value(i)) => i.to_string(),
-            Some(Value::NumberValue(f)) => f.to_string(),
-            Some(Value::BoolValue(b)) => b.to_string(),
-            // Round: deterministic hex for bytes (lossy-UTF-8 text matched by
-            // accident of encoding, never deliberately).
-            Some(Value::BytesValue(b)) => hex::encode(b),
             // TD-PROTO-2: raw MessagePack through from_utf8_lossy is mojibake
             // and made key:value attribute filters silently drop matching
             // logs — decode to compact JSON text (canonical representation).
@@ -535,6 +553,7 @@ impl ObservabilityQueryEngine {
             Some(Value::ArrayValue(_)) => "[array]".to_string(),
             Some(Value::ObjectValue(_)) => "{object}".to_string(),
             None => String::new(),
+            _ => String::new(),
         }
     }
 

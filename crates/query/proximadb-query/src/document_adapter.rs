@@ -170,14 +170,19 @@ fn doc_filter_condition_to_expression(cond: &DocFilterCondition) -> Option<Filte
         DocFilterOperator::Type => ComparisonOperator::Equals,
     };
 
-    // For IN/NOT_IN, use the multi-value list; otherwise use the single value.
+    // For IN/NOT_IN, use the multi-value list; otherwise use the single
+    // value. Literals lower through the FILTER LOWERING (int-array bytes),
+    // NOT the rendering converter (base64 bytes) — the lowering-vs-rendering
+    // distinction the records doc forbids conflating; evaluators render the
+    // stored side with the same lowering.
+    let literal = proximadb_search_types::sql_value_filter::sql_value_to_filter_literal;
     let value = if !cond.values.is_empty() {
-        let arr: Vec<serde_json::Value> = cond.values.iter().map(sql_value_to_json).collect();
+        let arr: Vec<serde_json::Value> = cond.values.iter().map(&literal).collect();
         serde_json::Value::Array(arr)
     } else {
         cond.value
             .as_ref()
-            .map(sql_value_to_json)
+            .map(literal)
             .unwrap_or(serde_json::Value::Null)
     };
 
