@@ -675,9 +675,10 @@ mod tests {
             sql_value_to_json(&sql_value(Value::Int64Value(42))),
             serde_json::json!(42)
         );
+        // Round: canonical rendering — bytes are base64 (was int-array).
         assert_eq!(
             sql_value_to_json(&sql_value(Value::BytesValue(vec![1, 2]))),
-            serde_json::json!([1, 2])
+            serde_json::json!("AQI=")
         );
         assert_eq!(
             sql_value_to_json(&sql_value(Value::NullValue(0))),

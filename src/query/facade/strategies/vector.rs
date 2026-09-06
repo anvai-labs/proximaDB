@@ -274,7 +274,7 @@ impl QueryStrategy for VectorSearchStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::formats::sql_value_to_json;
+    use proximadb_records::conversions::sql_value_to_json;
 
     #[test]
     fn test_sql_value_to_json_string() {

@@ -123,7 +123,6 @@ pub use arrow_conversion::{
     record_batch_to_vector_batch,
     record_batch_to_vector_records,
     sql_value_to_arrow_type,
-    sql_value_to_json,
     // Conversions
     vector_batch_to_record_batch,
     vector_records_to_record_batch,

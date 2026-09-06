@@ -3432,7 +3432,8 @@ mod tests {
             value: Some(Value::BytesValue(vec![0, 1, 255])),
         };
         let result = sql_value_to_json(&sv).expect("Should convert bytes");
-        assert_eq!(result, serde_json::json!([0, 1, 255]));
+        // Canonical rendering — bytes are base64 (was int-array).
+        assert_eq!(result, serde_json::json!("AAH/"));
     }
 
     #[test]
@@ -3486,7 +3487,12 @@ mod tests {
             value: Some(Value::NumberValue(f64::NAN)),
         };
         let result = sql_value_to_json(&sv);
-        assert!(result.is_err());
+        // Canonical rendering — non-finite floats render as null (the old
+        // 500-error path is gone; pinned in records' contract test).
+        assert_eq!(
+            result.expect("canonical rendering is infallible"),
+            serde_json::json!(null)
+        );
     }
 
     // =========================================================================

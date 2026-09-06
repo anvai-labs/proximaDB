@@ -647,7 +647,15 @@ Deliberately NOT consolidated: `sql_value_filter::sql_val_to_json`
 (search-types) — the FILTER LOWERING renders bytes as an int-array for
 comparison semantics; conflating it with rendering would change filter
 behavior. The v1-conformance round-17 note's "two-authority" drift is
-closed for every rendering surface.
+closed for every rendering surface. Review round: two MISSED live copies
+delegated too (api document.rs — bare-hex bytes; the embedded binding —
+"0x"-hex bytes: a THIRD spelling), the hand-rolled base64 replaced by
+kernel's encoder via proto's re-export (equivalence pinned for all padding
+lengths), the arrow_conversion re-export deleted (one import path), all
+stale contract tests re-pinned, and the storage-common helper's
+key-PRESENCE flip documented: an unset oneof previously OMITTED the key;
+it now renders as an explicit null (raptor's experimental-gated Arrow
+cache bytes change shape; consumers see keys they did not before).
 
 **Round 19 follow-up (2026-09-05, PR fix/dot-walker-consolidation):** the
 two unconsolidated dot-path walkers now delegate to the shared

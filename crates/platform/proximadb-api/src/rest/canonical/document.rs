@@ -13,7 +13,6 @@ use axum::{
     response::Json as JsonResponse,
     routing::{get, post},
 };
-use proximadb_data_model::ProximaValue;
 use proximadb_proto::v1::{
     AggregateDocumentsRequest, AggregationStage, CreateDocumentCollectionRequest,
     DeleteDocumentCollectionRequest, DeleteDocumentRequest, DocIndexType, DocumentCollectionConfig,
@@ -682,31 +681,7 @@ pub fn json_to_sql_value(value: &serde_json::Value) -> SqlValue {
 }
 
 pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
-    use proximadb_proto::v1::sql_value::Value;
-
-    match &value.value {
-        Some(Value::NullValue(_)) => serde_json::Value::Null,
-        Some(Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Value::Int64Value(i)) => serde_json::json!(*i),
-        Some(Value::NumberValue(f)) => serde_json::json!(*f),
-        Some(Value::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(Value::BytesValue(b)) => {
-            serde_json::Value::String(b.iter().map(|byte| format!("{:02x}", byte)).collect())
-        }
-        Some(Value::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
-        Some(Value::ArrayValue(arr)) => {
-            serde_json::Value::Array(arr.values.iter().map(sql_value_to_json).collect())
-        }
-        Some(Value::ObjectValue(obj)) => {
-            let map: serde_json::Map<String, serde_json::Value> = obj
-                .fields
-                .iter()
-                .map(|(k, v)| (k.clone(), sql_value_to_json(v)))
-                .collect();
-            serde_json::Value::Object(map)
-        }
-        None => serde_json::Value::Null,
-    }
+    proximadb_records::conversions::sql_value_to_json(value)
 }
 
 pub fn sql_object_to_json(obj: &SqlObject) -> serde_json::Value {
@@ -946,7 +921,8 @@ mod tests {
                 0xab, 0xcd,
             ])),
         };
-        assert_eq!(sql_value_to_json(&bytes), serde_json::json!("abcd"));
+        // Canonical rendering — bytes are base64 (was bare hex).
+        assert_eq!(sql_value_to_json(&bytes), serde_json::json!("q80="));
         assert!(matches!(
             json_to_sql_object(&serde_json::json!(["not", "object"])),
             Err(RestError::InvalidArgument(_))

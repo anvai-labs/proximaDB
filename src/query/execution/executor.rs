@@ -31,7 +31,7 @@ static TEST_GRAPH_RESULTS: std::sync::OnceLock<
 
 fn sql_value_to_query_json(value: &crate::proto::proximadb_v1::SqlValue) -> serde_json::Value {
     // Round 7: delegate to the shared converter (was an arm-for-arm copy).
-    crate::storage::formats::arrow_conversion::sql_value_to_json(value)
+    proximadb_records::conversions::sql_value_to_json(value)
 }
 
 /// Memory pool for reusing vectors to reduce allocations

@@ -317,12 +317,6 @@ pub fn record_batch_to_vector_records(batch: &RecordBatch) -> Result<Vec<VectorR
 // ============================================================================
 
 /// Convert proto SqlValue to JSON Value
-pub fn sql_value_to_json(value: &SqlValue) -> JsonValue {
-    // TD-PROTO-2 consolidation: the canonical rendering moved to
-    // proximadb-records (foundation-reachable from every crate); this is the
-    // compat re-export for existing root-crate callers.
-    proximadb_records::conversions::sql_value_to_json(value)
-}
 
 /// Convert JSON Value to proto SqlValue
 pub fn json_to_sql_value(value: &JsonValue) -> SqlValue {
@@ -400,6 +394,10 @@ pub fn filter_to_string(filter: &FilterExpression) -> String {
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+fn sql_value_to_json(value: &SqlValue) -> JsonValue {
+    proximadb_records::conversions::sql_value_to_json(value)
+}
 
 /// Get Arrow DataType for a proto SqlValue
 pub fn sql_value_to_arrow_type(value: &SqlValue) -> DataType {

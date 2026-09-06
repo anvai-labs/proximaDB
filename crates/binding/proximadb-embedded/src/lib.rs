@@ -5028,29 +5028,7 @@ impl EmbeddedProximaDB {
 
     /// Convert SqlValue to serde_json::Value
     fn sql_value_to_json(value: &proximadb::proto::proximadb_v1::SqlValue) -> serde_json::Value {
-        use proximadb::proto::proximadb_v1::sql_value::Value;
-
-        match &value.value {
-            None | Some(Value::NullValue(_)) => serde_json::Value::Null,
-            Some(Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-            Some(Value::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-            Some(Value::NumberValue(f)) => serde_json::Number::from_f64(*f)
-                .map_or(serde_json::Value::Null, serde_json::Value::Number),
-            Some(Value::StringValue(s)) => serde_json::Value::String(s.clone()),
-            Some(Value::ArrayValue(arr)) => {
-                serde_json::Value::Array(arr.values.iter().map(Self::sql_value_to_json).collect())
-            }
-            Some(Value::ObjectValue(obj)) => Self::sql_object_to_json(obj),
-            Some(Value::BytesValue(b)) => {
-                // Encode binary as hex string
-                let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-                serde_json::Value::String(format!("0x{}", hex))
-            }
-            Some(Value::JsonbValue(b)) => {
-                use proximadb_data_model::ProximaValue;
-                ProximaValue::jsonb_to_json_lossy(b)
-            }
-        }
+        proximadb_records::conversions::sql_value_to_json(value)
     }
 
     /// Parse a simple filter expression into DocumentFilter conditions

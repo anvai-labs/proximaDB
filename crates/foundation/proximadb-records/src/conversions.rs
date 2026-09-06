@@ -109,7 +109,9 @@ pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
         Some(sql_value::Value::NumberValue(f)) => serde_json::Number::from_f64(*f)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
         Some(sql_value::Value::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(sql_value::Value::BytesValue(b)) => serde_json::Value::String(base64_encode(b)),
+        Some(sql_value::Value::BytesValue(b)) => {
+            serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(b))
+        }
         Some(sql_value::Value::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
         Some(sql_value::Value::ArrayValue(arr)) => {
             serde_json::Value::Array(arr.values.iter().map(sql_value_to_json).collect())
@@ -121,32 +123,6 @@ pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
                 .collect(),
         ),
     }
-}
-
-/// Minimal standard-alphabet base64 encoder (no padding config, no external
-/// dep) — matches `proximadb_kernel::encoding::base64_encode` output.
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// Convert a `serde_json::Value` into a `ProximaValue` (natural-JSON mapping).
@@ -851,6 +827,15 @@ mod tests {
         // base64, non-finite floats null, Jsonb decodes, unset oneof null.
         use proximadb_proto::proximadb_v1::sql_value::Value as V;
         let mk = |v: Option<V>| SqlValue { value: v };
+        // All padding branches (3-, 2-, 1-, 0-byte) + kernel-encoder
+        // equivalence (the REST write path uses kernel's — read/write must
+        // agree byte-for-byte).
+        for bytes in [vec![0u8, 1, 255], vec![1, 2], vec![7], vec![]] {
+            assert_eq!(
+                sql_value_to_json(&mk(Some(V::BytesValue(bytes.clone())))),
+                serde_json::json!(proximadb_proto::utils::encoding::base64_encode(&bytes))
+            );
+        }
         assert_eq!(
             sql_value_to_json(&mk(Some(V::BytesValue(vec![0, 1, 255])))),
             serde_json::json!("AAH/")
