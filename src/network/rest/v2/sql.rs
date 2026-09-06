@@ -53,17 +53,12 @@ pub struct SqlResponse {
     pub request_id: String,
 }
 
-/// v2's row rendering policy (one spelling per type at ALL depths):
-/// Binary/BinaryVector as the per-byte int-array (read AND write agree —
-/// /api/v2/records parses only arrays for binary), Uuid DASHED (matching
-/// /api/v2/records' read rendering), ULID plain hex.
+/// v2's row rendering policy: `proxima_to_json` (whose Binary spelling is
+/// already the per-byte int-array — read AND write agree, /api/v2/records
+/// parses only arrays for binary) with ONE override applied at ALL depths:
+/// Uuid DASHED, matching /api/v2/records' read rendering.
 fn v2_row_render(value: &ProximaValue) -> serde_json::Value {
     match value {
-        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => serde_json::Value::Array(
-            b.iter()
-                .map(|x| serde_json::Value::Number((*x as u64).into()))
-                .collect(),
-        ),
         ProximaValue::Uuid(u) => {
             serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string())
         }
@@ -79,6 +74,7 @@ fn v2_row_render(value: &ProximaValue) -> serde_json::Value {
         other => proximadb_records::conversions::proxima_to_json(other),
     }
 }
+
 fn validate_request(request: &SqlRequest) -> ApiResult<u64> {
     if request.query.trim().is_empty() {
         return Err(ApiError::InvalidArgument(
@@ -200,6 +196,47 @@ pub async fn execute_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_row_render_is_depth_consistent() {
+        // One spelling per type at ALL depths: nested uuids stay dashed,
+        // nested binary stays the int-array (the /api/v2/records write
+        // form). A top-level-only composition left nested uuids undashed
+        // inside one response (round-6/7 review findings).
+        let row = ProximaValue::Map(
+            [
+                (
+                    "id".to_string(),
+                    ProximaValue::Uuid([
+                        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65,
+                        0x54, 0x40, 0x00, 0x00,
+                    ]),
+                ),
+                (
+                    "payload".to_string(),
+                    ProximaValue::Array(vec![
+                        ProximaValue::Binary(vec![0x00, 0x01, 0x02]),
+                        ProximaValue::Uuid([
+                            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65,
+                            0x54, 0x40, 0x00, 0x00,
+                        ]),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            v2_row_render(&row),
+            serde_json::json!({
+                "id": "550e8400-e29b-41d4-a716-446554400000",
+                "payload": [
+                    [0, 1, 2],
+                    "550e8400-e29b-41d4-a716-446554400000"
+                ]
+            })
+        );
+    }
 
     #[test]
     fn validates_single_statement_and_deadline_bounds() {

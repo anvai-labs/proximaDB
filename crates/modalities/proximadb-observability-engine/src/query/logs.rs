@@ -490,21 +490,18 @@ impl LogAggregator {
 
     /// Convert SqlValue to string for grouping
     fn sql_value_to_string(value: &SqlValue) -> String {
-        // Scalars render through the ONE shared crate fn. NOTE: the shared
-        // fn renders Null as "" (not "<null>") — the group-by bucket key
-        // changes; null-count was never distinct from ""-valued strings in
-        // the old spelling, and "" matches the filter path's convention.
-        if let Some(s) = super::sql_scalar_to_string(value) {
-            return s;
-        }
+        // Group-by keys keep THIS site's distinct null/unset/bytes bucket
+        // spellings (a null dimension counts separately from an explicitly
+        // empty one — collapsing them changed bucket counts); scalars +
+        // Jsonb render through the ONE shared crate fn.
         use crate::proto::proximadb_v1::sql_value::Value;
-
-        // Containers only (scalars + Jsonb already handled above); the
-        // wildcard keeps the match total.
         match &value.value {
+            Some(Value::NullValue(_)) => "<null>".to_string(),
+            Some(Value::BytesValue(b)) => format!("<bytes:{}>", b.len()),
             Some(Value::ArrayValue(arr)) => format!("<array:{}>", arr.values.len()),
             Some(Value::ObjectValue(obj)) => format!("<object:{}>", obj.fields.len()),
-            _ => "<empty>".to_string(),
+            None => "<empty>".to_string(),
+            _ => super::sql_scalar_to_string(value).unwrap_or_else(|| "<empty>".to_string()),
         }
     }
 }

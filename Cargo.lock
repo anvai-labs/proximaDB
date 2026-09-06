@@ -8260,7 +8260,6 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "futures",
- "hex",
  "lettre",
  "num_cpus",
  "object_store",

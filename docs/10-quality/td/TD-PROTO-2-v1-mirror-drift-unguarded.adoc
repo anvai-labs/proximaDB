@@ -784,6 +784,55 @@ decision on the declared field).
   the dashed form (pgwire also dashes ULIDs — a live cross-surface
   disagreement); a converter-count guard script for CI.
 
+**Consolidation review round 8 + round 9 (2026-09-06):**
+Round 8 (9 confirmed findings) corrected the round-6/7 unification — it had
+over-consolidated arms the four observability stringifier sites never agreed
+on. The shared scalar fn now covers EXACTLY the pre-consolidation agreement
+(String/Int64/Number/Bool text; Jsonb → JSON text; bytes → lossy UTF-8, the
+live attribute-filter matching spelling); null/unset/containers return None
+and every site spells its own policy, restored verbatim from develop:
+- mod.rs (attribute matching): null 'null', unset '', '[array]'/'{object}'.
+- logs.rs (group-by keys): '<null>'/'<empty>'/'<bytes:N>' buckets — three
+  DISTINCT buckets (the round-7 comment claiming they were never distinct
+  was wrong; collapsing null with '' changed bucket counts).
+- tantivy: bytes '<bytes:N>' placeholder, null/unset '', containers
+  RECURSED (the round-7 scalar-only flattening dropped depth-2+ tokens
+  from the _all index — caught by review, regression test added).
+- service.rs (trace attrs): null/unset/containers still DROP (persisting
+  '' made null indistinguishable from empty and created new matches);
+  bytes/Jsonb render (deliberate round-6 improvement, kept).
+Other round-8/9 fixes:
+- SparseVector filter literal: canonical {indices, values} object (was a
+  '[sparse_vector]' placeholder no literal could match — same bug class
+  rounds 5-7 fixed for Binary/Uuid).
+- The unified-query-port literal family (proxima_value_to_sql_literal /
+  _to_param / _to_json) delegated to the shared filter spelling — its
+  Rust-Debug wildcards ('Binary([1, 2, 3])') bound literals that could
+  never equal a stored rendering.
+- records' proxima_value_to_json_canonical DELETED (zero production
+  callers since round 7's v2_row_render; its doc invited a future
+  delegation that would re-break the v2 binary round-trip). v2_row_render
+  trimmed to the single dashed-Uuid-at-depth override over proxima_to_json;
+  depth-consistency pinned by test.
+- New pins: search-types exotic_filter_literals_render_matchably (bytes
+  int-array, Uuid dashed, ULID hex, sparse object), v2_row_render depth
+  test, tantivy nested-container test.
+- Tracked (cross-seam): the dashed-Uuid literal spelling holds on the
+  ProximaTree seam only — crossing the v1 SqlValue bridge
+  (proxima_to_sql_value → BytesValue) loses the type and the SqlValue
+  seam renders raw bytes, so the same stored uuid needs a different
+  literal per engine until the bridge is type-preserving.
+- Tracked (perf): the Binary stored-side int-array render allocates one
+  serde_json::Value per byte per record on scans; an allocation-free
+  native bytes comparison needs the resolved-field contract to carry
+  bytes natively (evaluate_filter_resolved's resolver returns a rendered
+  Value today) — its own PR now that the renderings share one home.
+- Tracked (on-disk): the ArrowBlock SST bridge's private
+  proxima_value_to_json falls through to serde-of-enum
+  ({'Uuid': [...]}), losing exotic type identity across a write→read
+  cycle (pre-existing); fixing it is a graph-format change under the
+  mixed-read-safe migration discipline, not a consolidation edit.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

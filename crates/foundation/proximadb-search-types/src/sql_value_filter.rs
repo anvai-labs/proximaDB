@@ -255,25 +255,29 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
         }
         ProximaValue::Date(d) => serde_json::Value::Number((*d as i64).into()),
         ProximaValue::Time(t, _) => serde_json::Value::Number((*t).into()),
-        // UUID/ULID — string representation
+        // UUID/ULID — string representation. SEAM NOTE: this dashed spelling
+        // holds on the ProximaTree seam only; when a Uuid crosses the v1
+        // `SqlValue` bridge (`proxima_to_sql_value` → BytesValue) the type is
+        // lost and the SqlValue seam renders raw bytes (int-array), so the
+        // same stored uuid needs a different literal per seam until the bridge
+        // is type-preserving (tracked in TD-PROTO-2).
         ProximaValue::Uuid(b) => {
             serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*b).to_string())
         }
         ProximaValue::ULID(b) => {
             serde_json::Value::String(b.iter().map(|x| format!("{x:02x}")).collect::<String>())
         }
-        // Binary — base64-ish string
-        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
-            // Round 5: the int-array spelling the SQL-side filter literal
-            // lowers to — the old '[binary:N]' placeholder could never equal
-            // any literal, so bytes equality filters silently matched
-            // nothing.
-            serde_json::Value::Array(
-                b.iter()
-                    .map(|x| serde_json::Value::Number((*x as u64).into()))
-                    .collect(),
-            )
-        }
+        // Binary — the int-array spelling the SQL-side filter literal lowers
+        // to — the old '[binary:N]' placeholder could never equal any literal,
+        // so bytes equality filters silently matched nothing (round 5). The
+        // render allocates one serde_json::Value per byte per record on scans;
+        // an allocation-free native bytes comparison needs the resolved-field
+        // contract to carry bytes natively (tracked in TD-PROTO-2).
+        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => serde_json::Value::Array(
+            b.iter()
+                .map(|x| serde_json::Value::Number((*x as u64).into()))
+                .collect(),
+        ),
         ProximaValue::DenseVector(v) => serde_json::Value::Array(
             v.iter()
                 .map(|f| {
@@ -283,9 +287,15 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
                 })
                 .collect(),
         ),
-        ProximaValue::SparseVector { .. } => {
-            serde_json::Value::String("[sparse_vector]".to_string())
-        }
+        // Canonical {indices, values} object — the same shape records'
+        // proxima_to_json renders (and the read path returns), so an object
+        // literal CAN match. The old "[sparse_vector]" placeholder never
+        // equaled any literal, and a string literal of the placeholder itself
+        // degenerately matched every sparse value.
+        ProximaValue::SparseVector { indices, values } => serde_json::json!({
+            "indices": indices,
+            "values": values,
+        }),
     }
 }
 
@@ -873,6 +883,64 @@ mod tests {
 
     fn make_sql_value(value: SqlVal) -> SqlValue {
         SqlValue { value: Some(value) }
+    }
+
+    #[test]
+    fn exotic_filter_literals_render_matchably() {
+        // Pins the literal spellings the ProximaTree seam renders for typed
+        // exotics: bytes as the int-array, Uuid dashed, ULID plain hex,
+        // sparse as the canonical {indices, values} object. Each previously
+        // rendered a placeholder or Rust Debug string no literal could ever
+        // match (TD-PROTO-2 rounds 5-9).
+        let mut props: ProximaTree = HashMap::new();
+        props.insert(
+            "blob".to_string(),
+            ProximaTreeNode::Value(ProximaValue::Binary(vec![0x00, 0x01, 0x02])),
+        );
+        props.insert(
+            "correlation_id".to_string(),
+            ProximaTreeNode::Value(ProximaValue::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65, 0x54, 0x40,
+                0x00, 0x00,
+            ])),
+        );
+        props.insert(
+            "trace_id".to_string(),
+            ProximaTreeNode::Value(ProximaValue::ULID([
+                0x01, 0xab, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00,
+            ])),
+        );
+        props.insert(
+            "embedding_sparse".to_string(),
+            ProximaTreeNode::Value(ProximaValue::SparseVector {
+                indices: vec![1, 3],
+                values: vec![0.5, 2.5],
+            }),
+        );
+
+        let eval = |field: &str, value: serde_json::Value| {
+            evaluate_filter_proxima(
+                &FilterExpression::Comparison {
+                    field: field.to_string(),
+                    operator: ComparisonOperator::Equals,
+                    value,
+                },
+                &props,
+            )
+        };
+
+        assert!(eval("blob", json!([0, 1, 2])));
+        assert!(!eval("blob", json!("AAEC"))); // base64 is the RENDERING spelling, not the filter's
+        assert!(eval(
+            "correlation_id",
+            json!("550e8400-e29b-41d4-a716-446554400000")
+        ));
+        assert!(eval("trace_id", json!("01ab0000000000000000000000000000")));
+        assert!(eval(
+            "embedding_sparse",
+            json!({"indices": [1, 3], "values": [0.5, 2.5]})
+        ));
     }
 
     #[test]

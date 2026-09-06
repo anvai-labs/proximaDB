@@ -62,39 +62,23 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
             ))
         }
         ProximaValue::Null => ParameterValue::Null,
-        other => ParameterValue::String(format!("{other:?}")),
+        // Typed exotics (Binary/Uuid/ULID/temporals/SparseVector/Decimal)
+        // lower through the ONE shared filter spelling — the old Rust-Debug
+        // strings ("Binary([1, 2, 3])") could never equal a stored value's
+        // rendering, so such parameters silently matched nothing.
+        other => match proxima_value_to_json(other) {
+            serde_json::Value::String(s) => ParameterValue::String(s),
+            json => ParameterValue::Json(json),
+        },
     }
 }
 
+/// Thin alias over the ONE shared ProximaValue→JSON filter spelling
+/// (search-types) — literals bound into federated SQL must render exactly
+/// what the filter evaluator renders on the stored side, or equality
+/// parameters silently match nothing.
 fn proxima_value_to_json(value: &ProximaValue) -> serde_json::Value {
-    match value {
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => serde_json::Value::String(s.clone()),
-        ProximaValue::Int8(v) => serde_json::json!(v),
-        ProximaValue::Int16(v) => serde_json::json!(v),
-        ProximaValue::Int32(v) => serde_json::json!(v),
-        ProximaValue::Int64(v) => serde_json::json!(v),
-        ProximaValue::UInt8(v) => serde_json::json!(v),
-        ProximaValue::UInt16(v) => serde_json::json!(v),
-        ProximaValue::UInt32(v) => serde_json::json!(v),
-        ProximaValue::UInt64(v) => serde_json::json!(v),
-        ProximaValue::Float16(v) => serde_json::json!(*v as f64),
-        ProximaValue::Float32(v) => serde_json::json!(*v as f64),
-        ProximaValue::Float64(v) => serde_json::json!(v),
-        ProximaValue::Boolean(v) => serde_json::json!(v),
-        ProximaValue::Json(value) | ProximaValue::Jsonb(value) => value.clone(),
-        ProximaValue::Array(values) => {
-            serde_json::Value::Array(values.iter().map(proxima_value_to_json).collect())
-        }
-        ProximaValue::Map(values) | ProximaValue::Struct(values) => serde_json::Value::Object(
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), proxima_value_to_json(value)))
-                .collect(),
-        ),
-        ProximaValue::DenseVector(values) => serde_json::json!(values),
-        ProximaValue::Null => serde_json::Value::Null,
-        other => serde_json::Value::String(format!("{other:?}")),
-    }
+    proximadb_search_types::sql_value_filter::proxima_value_to_json(value)
 }
 
 fn proxima_values_to_params(values: Option<Vec<ProximaValue>>) -> Vec<ParameterValue> {
@@ -163,7 +147,12 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
             &proxima_value_to_json(value),
         )?)),
         ProximaValue::Null => Ok("NULL".to_string()),
-        other => Ok(sql_quote(&format!("{other:?}"))),
+        // Typed exotics: the shared filter spelling (dashed Uuid, int-array
+        // Binary, canonical sparse object) — the Debug fallback could never
+        // equal a stored rendering.
+        other => Ok(sql_quote(&serde_json::to_string(&proxima_value_to_json(
+            other,
+        ))?)),
     }
 }
 

@@ -125,34 +125,6 @@ pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
     }
 }
 
-/// Canonical JSON *rendering* of a `ProximaValue` for API-facing surfaces —
-/// the ProximaValue-side twin of [`sql_value_to_json`]: Binary/BinaryVector
-/// as base64 (proxima_to_json alone renders them per-byte int-arrays,
-/// INCLUDING nested inside Array/Map/Struct), Uuid dashed (the
-/// cross-surface text convention; ULID plain hex — no dash convention
-/// exists). Not inlined into proxima_to_json because
-/// persisted graph canonical-text seams rely on its exact current output.
-pub fn proxima_value_to_json_canonical(value: &ProximaValue) -> serde_json::Value {
-    match value {
-        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
-            serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(b))
-        }
-        ProximaValue::Uuid(u) => {
-            serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string())
-        }
-        ProximaValue::Array(items) => {
-            serde_json::Value::Array(items.iter().map(proxima_value_to_json_canonical).collect())
-        }
-        ProximaValue::Map(fields) | ProximaValue::Struct(fields) => serde_json::Value::Object(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), proxima_value_to_json_canonical(v)))
-                .collect(),
-        ),
-        other => proxima_to_json(other),
-    }
-}
-
 /// Convert a `serde_json::Value` into a `ProximaValue` (natural-JSON mapping).
 ///
 /// Numbers split into `Int64`/`Float64`. This matches the composition
@@ -846,20 +818,6 @@ mod tests {
                 "k".to_string(),
                 ProximaValue::Float64(1.5),
             )]))
-        );
-    }
-
-    #[test]
-    fn canonical_uuid_is_dashed() {
-        // Cross-surface text convention (pgwire pins dashed; /v2/records
-        // dashes) — the canonical wrapper must not drift from it.
-        let u = ProximaValue::Uuid([
-            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65, 0x54, 0x40,
-            0x00, 0x00,
-        ]);
-        assert_eq!(
-            proxima_value_to_json_canonical(&u),
-            serde_json::json!("550e8400-e29b-41d4-a716-446554400000")
         );
     }
 

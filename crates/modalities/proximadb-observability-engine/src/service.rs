@@ -508,9 +508,11 @@ impl ObservabilityService {
                     .attributes
                     .iter()
                     .filter_map(|(k, v)| {
-                        // Scalars render through the ONE crate-shared fn
-                        // (bytes hex, Jsonb JSON text — were silently
-                        // dropped by the `_` wildcard).
+                        // Scalars render through the ONE crate-shared fn:
+                        // bytes as lossy UTF-8 text and Jsonb as JSON text
+                        // (both were silently dropped by the old `_`
+                        // wildcard); null/unset/containers still drop, this
+                        // path's pre-consolidation policy.
                         crate::query::sql_scalar_to_string(v).map(|s| (k.clone(), s))
                     })
                     .collect();

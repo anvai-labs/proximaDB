@@ -50,11 +50,13 @@ pub struct ObservabilityQueryEngine {
     log_indexes: tokio::sync::RwLock<HashMap<String, Arc<TantivyLogIndex>>>,
 }
 
-/// The crate-wide SCALAR SqlValue→string rendering (one home; the three
-/// per-site stringifiers delegate these arms — container arms differ
-/// legitimately per consumer: group-by keys, attribute matching, tantivy
-/// tokens). Bytes → deterministic hex; Jsonb → canonical JSON text;
-/// unset-oneof/Null → "".
+/// The crate-wide SCALAR SqlValue→string rendering — ONE home for exactly the
+/// arms every per-site stringifier AGREED on before the consolidation
+/// (String/Int64/Number/Bool text; Jsonb → canonical JSON text). Everything
+/// else is a per-site policy and returns `None` for the caller to spell:
+/// null/unset, containers, and bytes where a site wants a placeholder
+/// (`<bytes:N>`) instead of the content spelling this fn renders for bytes
+/// (lossy UTF-8 — the live attribute-filter matching spelling).
 pub(crate) fn sql_scalar_to_string(value: &crate::proto::proximadb_v1::SqlValue) -> Option<String> {
     use crate::proto::proximadb_v1::sql_value::Value as V;
     match value.value.as_ref() {
@@ -62,12 +64,11 @@ pub(crate) fn sql_scalar_to_string(value: &crate::proto::proximadb_v1::SqlValue)
         Some(V::Int64Value(i)) => Some(i.to_string()),
         Some(V::NumberValue(f)) => Some(f.to_string()),
         Some(V::BoolValue(b)) => Some(b.to_string()),
-        Some(V::BytesValue(b)) => Some(hex::encode(b)),
+        Some(V::BytesValue(b)) => Some(String::from_utf8_lossy(b).to_string()),
         Some(V::JsonbValue(b)) => {
             Some(proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b))
         }
-        Some(V::NullValue(_)) | None => Some(String::new()),
-        _ => None, // containers: per-site policy
+        _ => None, // null/unset/containers: per-site policy
     }
 }
 impl ObservabilityQueryEngine {
@@ -536,15 +537,20 @@ impl ObservabilityQueryEngine {
 
     /// Convert SqlValue to string for comparison
     fn sql_value_to_string(&self, value: &crate::proto::proximadb_v1::SqlValue) -> String {
-        // Scalars + Jsonb render through the ONE shared crate fn; only
-        // containers carry a per-site spelling.
+        // Scalars + Jsonb render through the ONE shared crate fn; the
+        // null/container spellings below are THIS site's pre-consolidation
+        // policy (attribute matching), restored verbatim.
         if let Some(s) = crate::query::sql_scalar_to_string(value) {
             return s;
         }
         use crate::proto::proximadb_v1::sql_value::Value;
         match &value.value {
-            Some(Value::ArrayValue(arr)) => format!("<array:{}>", arr.values.len()),
-            Some(Value::ObjectValue(obj)) => format!("<object:{}>", obj.fields.len()),
+            Some(Value::NullValue(_)) => "null".to_string(),
+            Some(Value::ArrayValue(_)) => "[array]".to_string(),
+            Some(Value::ObjectValue(_)) => "{object}".to_string(),
+            None => String::new(),
+            // Scalars + bytes + Jsonb returned via the shared fn above; the
+            // wildcard only keeps the match total.
             _ => String::new(),
         }
     }
