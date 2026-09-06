@@ -316,8 +316,6 @@ pub fn record_batch_to_vector_records(batch: &RecordBatch) -> Result<Vec<VectorR
 // SqlValue ↔ JSON Conversions
 // ============================================================================
 
-/// Convert proto SqlValue to JSON Value
-
 /// Convert JSON Value to proto SqlValue
 pub fn json_to_sql_value(value: &JsonValue) -> SqlValue {
     let inner = match value {
