@@ -508,21 +508,10 @@ impl ObservabilityService {
                     .attributes
                     .iter()
                     .filter_map(|(k, v)| {
-                        v.value.as_ref().and_then(|val| match val {
-                            crate::proto::proximadb_v1::sql_value::Value::StringValue(s) => {
-                                Some((k.clone(), s.clone()))
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::Int64Value(i) => {
-                                Some((k.clone(), i.to_string()))
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::NumberValue(f) => {
-                                Some((k.clone(), f.to_string()))
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::BoolValue(b) => {
-                                Some((k.clone(), b.to_string()))
-                            }
-                            _ => None,
-                        })
+                        // Scalars render through the ONE crate-shared fn
+                        // (bytes hex, Jsonb JSON text — were silently
+                        // dropped by the `_` wildcard).
+                        crate::query::sql_scalar_to_string(v).map(|s| (k.clone(), s))
                     })
                     .collect();
 

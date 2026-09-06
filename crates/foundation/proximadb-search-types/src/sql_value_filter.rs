@@ -256,8 +256,11 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
         ProximaValue::Date(d) => serde_json::Value::Number((*d as i64).into()),
         ProximaValue::Time(t, _) => serde_json::Value::Number((*t).into()),
         // UUID/ULID — string representation
-        ProximaValue::Uuid(b) | ProximaValue::ULID(b) => {
-            serde_json::Value::String(format!("{b:?}"))
+        ProximaValue::Uuid(b) => {
+            serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*b).to_string())
+        }
+        ProximaValue::ULID(b) => {
+            serde_json::Value::String(b.iter().map(|x| format!("{x:02x}")).collect::<String>())
         }
         // Binary — base64-ish string
         ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {

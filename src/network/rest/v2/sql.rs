@@ -53,6 +53,32 @@ pub struct SqlResponse {
     pub request_id: String,
 }
 
+/// v2's row rendering policy (one spelling per type at ALL depths):
+/// Binary/BinaryVector as the per-byte int-array (read AND write agree —
+/// /api/v2/records parses only arrays for binary), Uuid DASHED (matching
+/// /api/v2/records' read rendering), ULID plain hex.
+fn v2_row_render(value: &ProximaValue) -> serde_json::Value {
+    match value {
+        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => serde_json::Value::Array(
+            b.iter()
+                .map(|x| serde_json::Value::Number((*x as u64).into()))
+                .collect(),
+        ),
+        ProximaValue::Uuid(u) => {
+            serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string())
+        }
+        ProximaValue::Array(items) => {
+            serde_json::Value::Array(items.iter().map(v2_row_render).collect())
+        }
+        ProximaValue::Map(fields) | ProximaValue::Struct(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), v2_row_render(v)))
+                .collect(),
+        ),
+        other => proximadb_records::conversions::proxima_to_json(other),
+    }
+}
 fn validate_request(request: &SqlRequest) -> ApiResult<u64> {
     if request.query.trim().is_empty() {
         return Err(ApiError::InvalidArgument(
@@ -154,20 +180,7 @@ pub async fn execute_sql(
                     .get(index)
                     .cloned()
                     .unwrap_or_else(|| format!("column_{index}"));
-                // v2's binary spelling is the per-byte int-array at ALL
-                // depths (read AND write agree: /api/v2/records parses only
-                // arrays for binary; proxima_to_json renders int-arrays
-                // recursively). Uuid stays DASHED here to match
-                // /api/v2/records' read rendering — one id spelling per API
-                // version; both rules composed via the canonical wrapper's
-                // Uuid arm with the int-array fallthrough.
-                let json = match value {
-                    ProximaValue::Uuid(u) => serde_json::Value::String(
-                        proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string(),
-                    ),
-                    other => proximadb_records::conversions::proxima_to_json(other),
-                };
-                object.insert(column, json);
+                object.insert(column, v2_row_render(value));
             }
             serde_json::Value::Object(object)
         })

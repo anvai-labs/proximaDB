@@ -128,8 +128,9 @@ pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
 /// Canonical JSON *rendering* of a `ProximaValue` for API-facing surfaces —
 /// the ProximaValue-side twin of [`sql_value_to_json`]: Binary/BinaryVector
 /// as base64 (proxima_to_json alone renders them per-byte int-arrays,
-/// INCLUDING nested inside Array/Map/Struct), Uuid/ULID dashed-hex (the
-/// cross-surface text convention). Not inlined into proxima_to_json because
+/// INCLUDING nested inside Array/Map/Struct), Uuid dashed (the
+/// cross-surface text convention; ULID plain hex — no dash convention
+/// exists). Not inlined into proxima_to_json because
 /// persisted graph canonical-text seams rely on its exact current output.
 pub fn proxima_value_to_json_canonical(value: &ProximaValue) -> serde_json::Value {
     match value {
@@ -138,9 +139,6 @@ pub fn proxima_value_to_json_canonical(value: &ProximaValue) -> serde_json::Valu
         }
         ProximaValue::Uuid(u) => {
             serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string())
-        }
-        ProximaValue::ULID(u) => {
-            serde_json::Value::String(u.iter().map(|x| format!("{x:02x}")).collect::<String>())
         }
         ProximaValue::Array(items) => {
             serde_json::Value::Array(items.iter().map(proxima_value_to_json_canonical).collect())
@@ -889,10 +887,7 @@ mod tests {
             sql_value_to_json(&mk(Some(V::BytesValue(vec![])))),
             serde_json::json!("")
         );
-        assert_eq!(
-            sql_value_to_json(&mk(Some(V::BytesValue(vec![0, 1, 255])))),
-            serde_json::json!("AAH/")
-        );
+
         assert_eq!(
             sql_value_to_json(&mk(Some(V::NumberValue(f64::NAN)))),
             serde_json::json!(null)

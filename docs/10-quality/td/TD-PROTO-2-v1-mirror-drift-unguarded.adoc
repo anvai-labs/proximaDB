@@ -760,6 +760,30 @@ decision on the declared field).
 - Tracked: the Binary stored-side render's per-record allocation
   (allocation-free native comparison path pending).
 
+**Consolidation review round 7 (2026-09-06):**
+- v2 SQL rows: one recursive local renderer (v2_row_render) — int-array
+  Binary and dashed Uuid at ALL depths (the round-6 compose left nested
+  uuids undashed inside one response).
+- The filter evaluator's Uuid/ULID arm rendered the Rust Debug string
+  '[85, 14, …]' — no literal could ever match; Uuid now renders dashed
+  (kernel helper), ULID hex.
+- The observability REST log response's wire shape changed with the
+  round-6 delegation (bytes/arrays/objects were clamped to null; now
+  base64/real containers) — recorded here as deliberate: null-clamping
+  was the silent-data-loss bug class, the new shapes match every other
+  surface.
+- The attribute-filter null spelling changed 'null' → '' with the shared
+  scalar fn (filter and group-by now agree; recorded).
+- Dead post-early-return arms removed from the stringifiers (mod,
+  tantivy); service.rs's trace-attribute stringifier delegates to the
+  shared fn (bytes/Jsonb were silently dropped by its wildcard).
+- Round-6 residue fixed: the ULID no-op arm, doc, and duplicate assert
+  (the round-6 TD entry recorded edits that had not landed — this round
+  landed them).
+- Tracked: pgwire text_encode and proxima_arrow format_uuid hand-roll
+  the dashed form (pgwire also dashes ULIDs — a live cross-surface
+  disagreement); a converter-count guard script for CI.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

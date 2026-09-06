@@ -636,33 +636,30 @@ impl TantivyLogIndex {
 
     /// Convert SqlValue to string for indexing
     fn sql_value_to_string(&self, value: &SqlValue) -> String {
-        // Scalars render through the ONE shared crate fn (bytes hex, Jsonb
-        // JSON text, Null ""); container arms stay per-site (token text).
+        // Scalars + Jsonb render through the ONE shared crate fn; only
+        // containers need the per-site token spelling.
         if let Some(s) = super::sql_scalar_to_string(value) {
             return s;
         }
         match &value.value {
-            // TD-PROTO-2 round 4: the _all fulltext field indexes the decoded
-            // JSON text — a byte-length placeholder made fulltext search over
-            // JSONB attributes return zero hits while the structured filter
-            // path matched. (No legacy-index concern: the variant became
-            // producible in this change.)
-            Some(SqlValueVariant::JsonbValue(b)) => {
-                proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b)
-            }
             Some(SqlValueVariant::ArrayValue(arr)) => arr
                 .values
                 .iter()
-                .map(|v| self.sql_value_to_string(v))
+                .map(|v| super::sql_scalar_to_string(v).unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join(" "),
             Some(SqlValueVariant::ObjectValue(obj)) => obj
                 .fields
                 .iter()
-                .map(|(k, v)| format!("{}:{}", k, self.sql_value_to_string(v)))
+                .map(|(k, v)| {
+                    format!(
+                        "{}:{}",
+                        k,
+                        super::sql_scalar_to_string(v).unwrap_or_default()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" "),
-            None => String::new(),
             _ => String::new(),
         }
     }

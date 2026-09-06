@@ -536,23 +536,15 @@ impl ObservabilityQueryEngine {
 
     /// Convert SqlValue to string for comparison
     fn sql_value_to_string(&self, value: &crate::proto::proximadb_v1::SqlValue) -> String {
-        // Scalars render through the ONE shared crate fn (per-site scalar
-        // arms drifted before).
-        if let Some(s) = sql_scalar_to_string(value) {
+        // Scalars + Jsonb render through the ONE shared crate fn; only
+        // containers carry a per-site spelling.
+        if let Some(s) = crate::query::sql_scalar_to_string(value) {
             return s;
         }
         use crate::proto::proximadb_v1::sql_value::Value;
         match &value.value {
-            // TD-PROTO-2: raw MessagePack through from_utf8_lossy is mojibake
-            // and made key:value attribute filters silently drop matching
-            // logs — decode to compact JSON text (canonical representation).
-            Some(Value::JsonbValue(b)) => {
-                proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b)
-            }
-            Some(Value::NullValue(_)) => "null".to_string(),
-            Some(Value::ArrayValue(_)) => "[array]".to_string(),
-            Some(Value::ObjectValue(_)) => "{object}".to_string(),
-            None => String::new(),
+            Some(Value::ArrayValue(arr)) => format!("<array:{}>", arr.values.len()),
+            Some(Value::ObjectValue(obj)) => format!("<object:{}>", obj.fields.len()),
             _ => String::new(),
         }
     }
