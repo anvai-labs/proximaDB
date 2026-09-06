@@ -400,19 +400,16 @@ pub struct EmbeddedCollectionInfo {
 /// Rich types (Map, Array, Json, Jsonb) are JSON-serialised so no data is lost.
 pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> String {
     use proximadb_data_model::ProximaValue;
+    // Only arms that DIFFER from the canonical fallback (or that move
+    // instead of clone) are spelled; numbers/bools render identically
+    // through it.
     match v {
         ProximaValue::String(s) | ProximaValue::Symbol(s) => s,
+        // Non-finite floats render as their TEXT here (canonical nulls
+        // them — 'NaN' is more informative than 'null' for a Python
+        // reader).
         ProximaValue::Float32(f) => f.to_string(),
         ProximaValue::Float64(f) => f.to_string(),
-        ProximaValue::Int8(i) => i.to_string(),
-        ProximaValue::Int16(i) => i.to_string(),
-        ProximaValue::Int32(i) => i.to_string(),
-        ProximaValue::Int64(i) => i.to_string(),
-        ProximaValue::UInt8(i) => i.to_string(),
-        ProximaValue::UInt16(i) => i.to_string(),
-        ProximaValue::UInt32(i) => i.to_string(),
-        ProximaValue::UInt64(i) => i.to_string(),
-        ProximaValue::Boolean(b) => b.to_string(),
         ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v.to_string(),
         ProximaValue::Null => String::new(),
         // Everything else — containers AND exotics (dashed uuid, base64
@@ -427,9 +424,6 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
         },
     }
 }
-
-#[cfg(feature = "python")]
-pub(crate) use proximadb_embedded_common::proxima_value_to_json;
 
 pub(crate) fn json_to_proxima_value(
     value: serde_json::Value,

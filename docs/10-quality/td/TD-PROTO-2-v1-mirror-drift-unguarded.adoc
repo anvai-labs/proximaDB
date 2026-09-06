@@ -916,6 +916,34 @@ Other round-8/9 fixes:
   formatters (records loop, search-types loop, kernel to_simple_string,
   data-model jsonb fallback) want one home in kernel.
 
+**Consolidation review round 13 (2026-09-06):**
+- The round-12 param-splice fix was at the wrong altitude: Json/Jsonb/
+  Array/Map params (and the REST multimodal producer) still spliced
+  UNQUOTED. Fixed at the one splice point every producer flows through:
+  ParameterValue::to_sql_string's Json arm quotes; non-finite Float
+  params splice NULL (bare 'NaN' text is a parse error on Postgres-style
+  engines).
+- The SST/RAPTOR extractor rendered API metadata through the
+  FILTER-lowering converter (binary int-array where every other v1 API
+  surface returns base64) — now the canonical rendering, including a
+  canonical tree walk for Object subtrees.
+- Bytes moved OUT of the observability shared scalar fn (the one scalar
+  arm the four sites disagree on): attribute matching spells lossy
+  content, group-by/tantivy placeholders, trace persistence hex — no
+  destructive default for future call sites.
+- records gained proxima_value_to_json_canonical_owned (moves String/
+  Json/container contents; the by-ref fn deep-cloned per call — embedded
+  search results paid it per result × per field); embedded-common uses
+  it. sql_val_to_json re-privatized (zero external callers; the export
+  invited bypassing the unset-oneof wrapper). The embedded stringifier
+  cut to its load-bearing arms; python.rs imports embedded-common
+  directly (the cfg-gated re-export aliased a name CI never compiles).
+- Tracked (added to the resolved-field-contract item): bytes filter
+  OP-SEMANTICS — rendered as arrays, bytes flow into compare_json_op's
+  array arms, so IN/NOT-IN/CONTAINS take byte-level element-membership
+  semantics that can contradict Equals; op-aware bytes routing needs the
+  same contract change as the allocation-free path.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

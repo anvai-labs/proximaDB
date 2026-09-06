@@ -151,6 +151,12 @@ impl ParameterValue {
         match self {
             ParameterValue::String(s) => format!("'{}'", s.replace('\'', "''")),
             ParameterValue::Int(i) => i.to_string(),
+            // Non-finite floats have no SQL literal — bare 'NaN'/'inf'
+            // text is a parse error on Postgres-style engines ("column
+            // does not exist"). NULL is valid everywhere and, per SQL
+            // 3VL, compares to nothing — matching the canonical JSON
+            // rendering's null.
+            ParameterValue::Float(f) if !f.is_finite() => "NULL".to_string(),
             ParameterValue::Float(f) => f.to_string(),
             ParameterValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ParameterValue::Null => "NULL".to_string(),
@@ -158,7 +164,10 @@ impl ParameterValue {
                 let formatted: Vec<String> = v.iter().map(|f| f.to_string()).collect();
                 format!("[{}]", formatted.join(","))
             }
-            ParameterValue::Json(v) => v.to_string(),
+            // JSON splices QUOTED: bare '[0,1,2]' / '{"x":1}' is a parse
+            // error on every engine (the text may still need a cast to
+            // compare — see the TD-tracked federated literal dialect gap).
+            ParameterValue::Json(v) => format!("'{}'", v.to_string().replace('\'', "''")),
         }
     }
 }

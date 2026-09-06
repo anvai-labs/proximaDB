@@ -44,9 +44,10 @@ use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 
 use super::{
     AccessMode, EmbeddedConfig, EmbeddedProximaDB, EmbeddedSqlQueryResult, StorageLocationConfig,
-    json_to_proxima_value, proxima_value_to_json,
+    json_to_proxima_value,
 };
 use proximadb::core::config::{AdvancedPruneConfig, PruneModeConfig};
+use proximadb_embedded_common::proxima_value_to_json;
 
 /// Python wrapper for disk configuration
 #[pyclass(name = "DiskConfig", from_py_object)]

@@ -67,11 +67,15 @@ pub(crate) fn sql_scalar_to_string(value: &crate::proto::proximadb_v1::SqlValue)
         Some(V::Int64Value(i)) => Some(i.to_string()),
         Some(V::NumberValue(f)) => Some(f.to_string()),
         Some(V::BoolValue(b)) => Some(b.to_string()),
-        Some(V::BytesValue(b)) => Some(String::from_utf8_lossy(b).to_string()),
         Some(V::JsonbValue(b)) => {
             Some(proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b))
         }
-        _ => None, // null/unset/containers: per-site policy
+        // Bytes TOO is per-site policy (the one scalar arm the sites
+        // disagree on): attribute matching renders lossy content, group-by
+        // and tantivy want the '<bytes:N>' placeholder, trace persistence
+        // wants non-destructive hex. A default here would hand the
+        // destructive lossy spelling to every future call site.
+        _ => None, // bytes/null/unset/containers: per-site policy
     }
 }
 impl ObservabilityQueryEngine {
@@ -549,10 +553,15 @@ impl ObservabilityQueryEngine {
         use crate::proto::proximadb_v1::sql_value::Value;
         match &value.value {
             Some(Value::NullValue(_)) => "null".to_string(),
+            // THIS site's bytes policy: lossy UTF-8 CONTENT — attribute
+            // matching is text-based and develop matched bytes payloads
+            // this way (lossy is acceptable on a transient comparison,
+            // unlike the persisted trace path which uses hex).
+            Some(Value::BytesValue(b)) => String::from_utf8_lossy(b).to_string(),
             Some(Value::ArrayValue(_)) => "[array]".to_string(),
             Some(Value::ObjectValue(_)) => "{object}".to_string(),
             None => String::new(),
-            // Scalars + bytes + Jsonb returned via the shared fn above; the
+            // Scalars + Jsonb returned via the shared fn above; the
             // wildcard only keeps the match total.
             _ => String::new(),
         }

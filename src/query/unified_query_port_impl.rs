@@ -66,12 +66,12 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         // lower through the ONE shared filter spelling — the old Rust-Debug
         // strings ("Binary([1, 2, 3])") could never equal a stored value's
         // rendering, so such parameters silently matched nothing. Structured
-        // values map to their JSON TEXT as a String param: the
-        // prepared-statement path splices Json params into SQL UNQUOTED
-        // (to_sql_string), and bare `[0,1,2]` is a parse error.
+        // values map to their JSON TEXT as a String param so the direct
+        // path and the literal path render byte-identical SQL text
+        // (to_sql_string quotes both String and Json params).
         other => match proxima_value_to_json(other) {
             serde_json::Value::String(s) => ParameterValue::String(s),
-            json => ParameterValue::String(serde_json::to_string(&json).unwrap_or_default()),
+            json => ParameterValue::String(json.to_string()),
         },
     }
 }
@@ -130,8 +130,18 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         ProximaValue::UInt16(value) => Ok(value.to_string()),
         ProximaValue::UInt32(value) => Ok(value.to_string()),
         ProximaValue::UInt64(value) => Ok(value.to_string()),
-        ProximaValue::Float16(value) | ProximaValue::Float32(value) => Ok(value.to_string()),
-        ProximaValue::Float64(value) => Ok(value.to_string()),
+        // Non-finite floats have no SQL literal (bare 'NaN' text is a
+        // parse error) — NULL, matching the canonical JSON rendering.
+        ProximaValue::Float16(value) | ProximaValue::Float32(value) => Ok(if value.is_finite() {
+            value.to_string()
+        } else {
+            "NULL".to_string()
+        }),
+        ProximaValue::Float64(value) => Ok(if value.is_finite() {
+            value.to_string()
+        } else {
+            "NULL".to_string()
+        }),
         ProximaValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
         ProximaValue::DenseVector(values) => Ok(sql_quote(&serde_json::to_string(values)?)),
         ProximaValue::Array(values) => {
@@ -161,7 +171,7 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         // (e.g. ISO-8601 text for Postgres-style engines).
         other => match proxima_value_to_json(other) {
             serde_json::Value::String(s) => Ok(sql_quote(&s)),
-            json => Ok(sql_quote(&serde_json::to_string(&json)?)),
+            json => Ok(sql_quote(&json.to_string())),
         },
     }
 }

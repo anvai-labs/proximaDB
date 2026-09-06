@@ -158,6 +158,35 @@ pub fn proxima_value_to_json_canonical(value: &ProximaValue) -> serde_json::Valu
     }
 }
 
+/// Owned twin of [`proxima_value_to_json_canonical`] — moves String/Json/
+/// container contents instead of deep-cloning every leaf (the by-ref fn
+/// clones per call; embedded search results pay it per result × per field).
+pub fn proxima_value_to_json_canonical_owned(value: ProximaValue) -> serde_json::Value {
+    match value {
+        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
+            serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(&b))
+        }
+        ProximaValue::Uuid(u) => {
+            serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(u).to_string())
+        }
+        ProximaValue::String(s) => serde_json::Value::String(s),
+        ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v,
+        ProximaValue::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(proxima_value_to_json_canonical_owned)
+                .collect(),
+        ),
+        ProximaValue::Map(fields) | ProximaValue::Struct(fields) => serde_json::Value::Object(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k, proxima_value_to_json_canonical_owned(v)))
+                .collect(),
+        ),
+        other => proxima_to_json(&other),
+    }
+}
+
 /// Convert a `serde_json::Value` into a `ProximaValue` (natural-JSON mapping).
 ///
 /// Numbers split into `Int64`/`Float64`. This matches the composition

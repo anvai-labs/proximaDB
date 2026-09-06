@@ -167,7 +167,7 @@ pub fn sql_value_to_filter_literal(sql: &SqlValue) -> serde_json::Value {
 /// metadata path shares the canonical operator semantics (the seam compares on
 /// `serde_json::Value`). Numbers stay numeric (so `compare_json_numbers` keeps
 /// integer precision); bytes become a JSON array of byte values.
-pub fn sql_val_to_json(value: &SqlVal) -> serde_json::Value {
+fn sql_val_to_json(value: &SqlVal) -> serde_json::Value {
     match value {
         SqlVal::StringValue(s) => serde_json::Value::String(s.clone()),
         SqlVal::NumberValue(n) => serde_json::Number::from_f64(*n)
@@ -280,7 +280,11 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
         // so bytes equality filters silently matched nothing (round 5). The
         // render allocates one serde_json::Value per byte per record on scans;
         // an allocation-free native bytes comparison needs the resolved-field
-        // contract to carry bytes natively (tracked in TD-PROTO-2).
+        // contract to carry bytes natively (tracked in TD-PROTO-2). The SAME
+        // tracked item covers bytes op-semantics: rendered as an array, bytes
+        // flow into compare_json_op's array arms, so IN/NOT-IN/CONTAINS take
+        // element-membership semantics (byte-level) that can contradict
+        // Equals — op-aware bytes routing needs the same contract change.
         ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => serde_json::Value::Array(
             b.iter()
                 .map(|x| serde_json::Value::Number((*x as u64).into()))

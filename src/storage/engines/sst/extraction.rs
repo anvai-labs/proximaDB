@@ -27,6 +27,21 @@ pub struct SstExtractor {
     filesystem: Arc<UnifiedCachingFilesystem>,
 }
 
+/// Canonical rendering of a props tree node for extracted API metadata
+/// (mirrors records' canonical converter's recursion for Object subtrees).
+fn canonical_tree_node_json(node: &proximadb_records::ProximaTreeNode) -> serde_json::Value {
+    match node {
+        proximadb_records::ProximaTreeNode::Value(value) => {
+            proximadb_records::conversions::proxima_value_to_json_canonical(value)
+        }
+        proximadb_records::ProximaTreeNode::Object(subtree) => serde_json::Value::Object(
+            subtree
+                .iter()
+                .map(|(k, node)| (k.clone(), canonical_tree_node_json(node)))
+                .collect(),
+        ),
+    }
+}
 impl SstExtractor {
     /// Create a new SST extractor
     pub fn new(filesystem: Arc<UnifiedCachingFilesystem>) -> Self {
@@ -176,16 +191,25 @@ impl VectorExtractor for SstExtractor {
                     .props
                     .iter()
                     .map(|(k, node)| {
+                        // API-facing metadata: the canonical RENDERING
+                        // (base64 binary, dashed uuid) — the filter-lowering
+                        // converter spells binary as the int-array, which no
+                        // other v1 API surface returns.
                         let value = match node {
                             proximadb_records::ProximaTreeNode::Value(value) => {
-                                crate::core::search::sql_value_filter::proxima_value_to_json(value)
+                                proximadb_records::conversions::proxima_value_to_json_canonical(
+                                    value,
+                                )
                             }
                             proximadb_records::ProximaTreeNode::Object(subtree) => {
-                                let object =
-                                    crate::core::search::sql_value_filter::proxima_tree_to_json_map(
-                                        subtree,
-                                    );
-                                serde_json::Value::Object(object.into_iter().collect())
+                                serde_json::Value::Object(
+                                    subtree
+                                        .iter()
+                                        .map(|(k, node)| {
+                                            (k.clone(), canonical_tree_node_json(node))
+                                        })
+                                        .collect(),
+                                )
                             }
                         };
                         (k.clone(), value)

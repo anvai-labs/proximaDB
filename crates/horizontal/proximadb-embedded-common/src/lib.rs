@@ -19,5 +19,5 @@ pub use search_filter::parse_vector_filter;
 /// share ONE import surface; do not re-add arm-for-arm copies here — they
 /// drift from the canonical spelling the moment any arm changes upstream.
 pub fn proxima_value_to_json(v: proximadb_data_model::ProximaValue) -> serde_json::Value {
-    proximadb_records::conversions::proxima_value_to_json_canonical(&v)
+    proximadb_records::conversions::proxima_value_to_json_canonical_owned(v)
 }
