@@ -185,7 +185,12 @@ impl VectorExtractor for SstExtractor {
                         // both sides; the canonical base64 string would
                         // rehydrate as String and silently diverge). Display
                         // surfaces read through the canonical converter, not
-                        // this extractor.
+                        // this extractor. KNOWN family divergence (tracked
+                        // in TD-PROTO-2): helix/swift still render the
+                        // canonical spelling and raptor its raw prost
+                        // envelope — all feed the same AXIS rehydration, so
+                        // recovered-record filtering diverges per engine
+                        // until the family converges here.
                         let value = match node {
                             proximadb_records::ProximaTreeNode::Value(value) => {
                                 crate::core::search::sql_value_filter::proxima_value_to_json(value)

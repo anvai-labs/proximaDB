@@ -559,9 +559,9 @@ impl ObservabilityQueryEngine {
             Some(Value::BytesValue(b)) => String::from_utf8_lossy(b).to_string(),
             Some(Value::ArrayValue(_)) => "[array]".to_string(),
             Some(Value::ObjectValue(_)) => "{object}".to_string(),
-            None => String::new(),
-            // Scalars + Jsonb returned via the shared fn above; the
-            // wildcard only keeps the match total.
+            // Unset oneof AND the scalars/Jsonb the shared fn covers (its
+            // arms always return) land here as "" — the wildcard keeps the
+            // match total.
             _ => String::new(),
         }
     }

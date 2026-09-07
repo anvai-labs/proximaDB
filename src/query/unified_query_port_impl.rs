@@ -14,12 +14,18 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
 use proximadb_runtime::UnifiedQueryPort;
+// The FILTER spelling, imported under a FILTER-named alias: an
+// identically-named canonical (base64) renderer exists in records — a bare
+// `proxima_value_to_json` import here is the wrong-spelling trap the
+// round-3 renames eliminated.
+use proximadb_search_types::sql_value_filter::proxima_value_to_json as proxima_filter_json;
 use tracing::{debug, info};
 
 use crate::catalog::CatalogManager;
 use crate::query::authority_context::{AuthoritySource, resolve_catalog_authority_context};
 use crate::query::explain::StorageAuthorityExplanation;
 use crate::query::multimodal::plan::PlanContext;
+use crate::query::prepared::statement::sql_quote;
 use crate::query::unified::uql::{
     ComparisonOperator, Condition, SelectStatement, UQLParser, UQLStatement, Value,
 };
@@ -78,12 +84,6 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
     }
 }
 
-// The FILTER spelling, imported under a FILTER-named alias: an
-// identically-named canonical (base64) renderer exists in records — a bare
-// `proxima_value_to_json` import here is the wrong-spelling trap the
-// round-3 renames eliminated.
-use proximadb_search_types::sql_value_filter::proxima_value_to_json as proxima_filter_json;
-
 fn proxima_values_to_params(values: Option<Vec<ProximaValue>>) -> Vec<ParameterValue> {
     values
         .unwrap_or_default()
@@ -115,10 +115,6 @@ fn proxima_value_to_f32_vector(value: &ProximaValue) -> Option<Vec<f32>> {
     }
 }
 
-fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
     match value {
         ProximaValue::String(value) | ProximaValue::Symbol(value) => Ok(sql_quote(value)),
@@ -144,13 +140,11 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         }),
         ProximaValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
         ProximaValue::DenseVector(values) => Ok(sql_quote(&serde_json::to_string(values)?)),
-        ProximaValue::Array(values) => {
+        ProximaValue::Array(_) => {
             if let Some(vector) = proxima_value_to_f32_vector(value) {
                 Ok(sql_quote(&serde_json::to_string(&vector)?))
             } else {
-                Ok(sql_quote(&serde_json::to_string(&proxima_filter_json(
-                    &ProximaValue::Array(values.clone()),
-                ))?))
+                Ok(sql_quote(&proxima_filter_json(value).to_string()))
             }
         }
         ProximaValue::Json(value) | ProximaValue::Jsonb(value) => {

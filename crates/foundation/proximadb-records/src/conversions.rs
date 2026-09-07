@@ -134,33 +134,10 @@ pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
 /// (embedded-common's one-line delegation — which the root crate's legacy
 /// v1 REST search path ALSO reaches transitively via
 /// proxima_values_to_json_map). v2 REST must NOT delegate here (its binary
-/// spelling is the int-array; see rest/v2's v2_row_render). Not inlined
-/// into proxima_to_json because persisted graph canonical-text seams rely
-/// on its exact current output.
-pub fn proxima_value_to_json_canonical(value: &ProximaValue) -> serde_json::Value {
-    match value {
-        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
-            serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(b))
-        }
-        ProximaValue::Uuid(u) => {
-            serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string())
-        }
-        ProximaValue::Array(items) => {
-            serde_json::Value::Array(items.iter().map(proxima_value_to_json_canonical).collect())
-        }
-        ProximaValue::Map(fields) | ProximaValue::Struct(fields) => serde_json::Value::Object(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), proxima_value_to_json_canonical(v)))
-                .collect(),
-        ),
-        other => proxima_to_json(other),
-    }
-}
-
-/// Owned twin of [`proxima_value_to_json_canonical`] — moves String/Json/
-/// container contents instead of deep-cloning every leaf (the by-ref fn
-/// clones per call; embedded search results pay it per result × per field).
+/// spelling is the int-array; see rest/v2's v2_row_render). OWNED: moves
+/// String/Symbol/Decimal/Json/container contents instead of deep-cloning
+/// every leaf. Not inlined into proxima_to_json because persisted graph
+/// canonical-text seams rely on its exact current output.
 pub fn proxima_value_to_json_canonical_owned(value: ProximaValue) -> serde_json::Value {
     match value {
         ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
@@ -169,7 +146,9 @@ pub fn proxima_value_to_json_canonical_owned(value: ProximaValue) -> serde_json:
         ProximaValue::Uuid(u) => {
             serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(u).to_string())
         }
-        ProximaValue::String(s) => serde_json::Value::String(s),
+        ProximaValue::String(s) | ProximaValue::Symbol(s) | ProximaValue::Decimal(s) => {
+            serde_json::Value::String(s)
+        }
         ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v,
         ProximaValue::Array(items) => serde_json::Value::Array(
             items
@@ -896,7 +875,7 @@ mod tests {
             0x00, 0x00,
         ]);
         assert_eq!(
-            proxima_value_to_json_canonical(&u),
+            proxima_value_to_json_canonical_owned(u),
             serde_json::json!("550e8400-e29b-41d4-a716-446554400000")
         );
     }

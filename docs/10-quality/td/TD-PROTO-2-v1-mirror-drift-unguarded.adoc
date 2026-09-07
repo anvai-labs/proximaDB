@@ -972,6 +972,33 @@ Other round-8/9 fixes:
   read back as StringValue — shape divergence recorded here (strictly
   better than the old silent drop; REST trace endpoints are 501).
 
+**Consolidation review round 15 (2026-09-06):**
+- Round 14's Vector quoting dropped the '[...]' brackets — the branch's
+  own test_parameter_value_to_sql proved it (both internal vector
+  parsers require '[' after quote-stripping). Now sql_quote of the
+  bracketed text, matching the literal path; ONE shared sql_quote
+  (query::prepared::statement, pub(crate)) replaces four inline copies
+  across the two paths.
+- The by-ref proxima_value_to_json_canonical deleted (zero production
+  callers once embedded-common moved to the owned twin — the dead-twin
+  class rounds 8/9 deleted, re-shipped by round 10). The owned twin is
+  THE canonical; the dashed-uuid pin points at it; Symbol/Decimal got
+  move arms.
+- Tantivy's stringifier flattened to the early-return shape; mod.rs's
+  dead unset arm merged into the wildcard; the filter-spelling import
+  moved to the top import block; the literal Array arm stopped
+  deep-cloning the array to re-wrap it by reference.
+- Tracked: v2 SQL rows key by BARE column name — duplicate result
+  columns (self-joins) collapse silently in the row objects while
+  response.columns lists both (pre-existing keying on the line this PR
+  rewrote; positional pgwire unaffected; fixing means a response-shape
+  decision — disambiguated keys vs array rows). Extractor-family
+  rehydration divergence: helix/swift render the canonical spelling and
+  raptor a raw prost envelope while SST renders the filter spelling —
+  all feed the same AXIS rehydration, so recovered-record filtering
+  diverges per engine until the family converges (pre-existing,
+  byte-identical to develop).
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

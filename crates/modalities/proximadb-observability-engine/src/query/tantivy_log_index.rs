@@ -642,29 +642,27 @@ impl TantivyLogIndex {
         // through the ONE shared crate fn; containers RECURSE (nested
         // arrays/objects contribute their tokens to the _all field — a
         // scalar-only flattening dropped depth-2+ content from the index).
+        if let Some(s) = super::sql_scalar_to_string(value) {
+            return s;
+        }
         match &value.value {
             Some(SqlValueVariant::BytesValue(b)) => format!("<bytes:{}>", b.len()),
-            _ => match super::sql_scalar_to_string(value) {
-                Some(s) => s,
-                None => match &value.value {
-                    Some(SqlValueVariant::NullValue(_)) | None => String::new(),
-                    Some(SqlValueVariant::ArrayValue(arr)) => arr
-                        .values
-                        .iter()
-                        .map(|v| self.sql_value_to_string(v))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    Some(SqlValueVariant::ObjectValue(obj)) => obj
-                        .fields
-                        .iter()
-                        .map(|(k, v)| format!("{}:{}", k, self.sql_value_to_string(v)))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    // Unreachable for the variants the shared fn covers; the
-                    // wildcard only keeps the match total.
-                    _ => String::new(),
-                },
-            },
+            Some(SqlValueVariant::NullValue(_)) | None => String::new(),
+            Some(SqlValueVariant::ArrayValue(arr)) => arr
+                .values
+                .iter()
+                .map(|v| self.sql_value_to_string(v))
+                .collect::<Vec<_>>()
+                .join(" "),
+            Some(SqlValueVariant::ObjectValue(obj)) => obj
+                .fields
+                .iter()
+                .map(|(k, v)| format!("{}:{}", k, self.sql_value_to_string(v)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            // Unreachable for the variants the shared fn covers; the
+            // wildcard only keeps the match total.
+            _ => String::new(),
         }
     }
 }
