@@ -87,6 +87,7 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_DRIFT_INTERVAL_SECS` | Discovery drift-watcher poll interval (secs). | 60 (DEFAULT_DRIFT_INTERVAL) | opt-in; — | src/services/discovery/drift.rs
 | `PROXIMADB_DRIFT_THRESHOLD_WRITES` | Writes-since-recluster count that signals drift. | 10000 (DEFAULT_DRIFT_THRESHOLD_WRITES) | opt-in; — | src/services/discovery/drift.rs
 | `PROXIMADB_DUCKDB_ROUTE` | Force DuckDB-local as PRIMARY engine for join/agg parquet SELECTs (DataFusion stays floor). | OFF | opt-in; ADR-054 | src/query/execution/duckdb_engine.rs
+| `PROXIMADB_MLFLOW_COMPAT_ENABLE` | TD-MLOPS-1 slice 2: mount the MLflow-compatible tracking wire at `/api/2.0/mlflow/*` (experiments/runs/params/metrics/tags over the tenant-scoped RunStore). Unset ⇒ the routes never mount — gate-off is indistinguishable from absent (platform 404). MLflow's REST 2.x is the external contract (pgwire-class), NOT our OpenAPI. | OFF | opt-in; TD-MLOPS-1 | src/network/rest/mlflow/mod.rs
 | `PROXIMADB_EMBED_ASYNC_QUEUE_CAP` | Async embedding pool queue capacity. | 4096 | config-mirror; — | crates/modalities/proximadb-embedding/src/scheduler.rs
 | `PROXIMADB_EMBED_ASYNC_WORKERS` | Async embedding pool worker-thread count. | 8 | config-mirror; — | crates/modalities/proximadb-embedding/src/scheduler.rs
 | `PROXIMADB_EMBED_DRAINER_PARTITIONS` | Partition range this pod's embedding drainer owns (e.g. "0..16", "8,3..6"). | 0..16 (all) | config-mirror; — | src/database.rs

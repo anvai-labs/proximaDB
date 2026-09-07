@@ -148,6 +148,10 @@ impl SubstrateRunStore {
     }
 
     async fn get_payload<T: serde::de::DeserializeOwned>(&self, id: &str) -> Result<Option<T>> {
+        // Reads by a tenant whose collection was never written must look
+        // EMPTY, not error (a foreign-tenant probe is a not-found, never a
+        // 500). ensure() is an in-memory registry hit after the first call.
+        self.ensure().await?;
         let Some(record) = self
             .document
             .get_document(&self.collection, id, None)
