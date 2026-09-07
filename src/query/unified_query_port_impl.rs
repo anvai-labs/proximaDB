@@ -113,11 +113,14 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         ProximaValue::UInt16(value) => Ok(value.to_string()),
         ProximaValue::UInt32(value) => Ok(value.to_string()),
         ProximaValue::UInt64(value) => Ok(value.to_string()),
-        // One shared non-finite rule (float_sql_literal); Float64 stays a
-        // separate arm only because its binding type differs.
-        ProximaValue::Float16(value) | ProximaValue::Float32(value) => {
-            Ok(float_sql_literal(*value as f64))
-        }
+        // One shared non-finite rule; the f32-width arms render NATIVE
+        // precision (widening to f64 changes the literal: 0.1f32 ->
+        // 0.10000000149011612, silently unmatching equality filters).
+        ProximaValue::Float16(value) | ProximaValue::Float32(value) => Ok(if value.is_finite() {
+            value.to_string()
+        } else {
+            "NULL".to_string()
+        }),
         ProximaValue::Float64(value) => Ok(float_sql_literal(*value)),
         ProximaValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
         ProximaValue::DenseVector(values) => vector_to_sql_literal(values),
@@ -576,8 +579,9 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
         // Convert the JSON multi-model request to a federated SQL string.
-        // The root-crate logic is in multimodal_query::convert_multi_model_to_sql.
-        // We replicate a simplified version here so we don't import the handler module.
+        // Sibling of multimodal_query::convert_multi_model_to_sql (it already
+        // shares inject_graph_target_into_cypher; tracked: consolidate the
+        // twins — their defaults and limit handling still diverge).
         let sql = match json_to_multi_model_sql(&request)? {
             Some(sql) => sql,
             None => {
@@ -774,6 +778,11 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                             "components[{component_index}].config.query_vector must be an array"
                         )
                     })?;
+                if query_values.is_empty() {
+                    return Err(anyhow!(
+                        "components[{component_index}].config.query_vector must be non-empty"
+                    ));
+                }
                 let query_vec = query_values
                     .iter()
                     .enumerate()

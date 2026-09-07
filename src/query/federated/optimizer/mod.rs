@@ -21,7 +21,7 @@ use crate::storage::multimodel::ModelType;
 use proximadb_kernel::error::VectorDBError;
 
 mod sql_parsing;
-mod vector_query_parsing;
+pub(crate) mod vector_query_parsing;
 
 pub mod cached_plan_builder;
 pub mod filter_strategy;

@@ -2454,28 +2454,11 @@ impl FederatedExecutor {
         }
     }
 
+    // Delegate to the ONE filtered parser (non-finite components reject)
+    // — the local unfiltered copy re-admitted the values the optimizer's
+    // parse rejects whenever the Expression fallback re-parsed raw SQL.
     fn parse_vector_literal(raw: &str) -> Option<Vec<f32>> {
-        let trimmed = raw.trim();
-        let without_cast = trimmed
-            .strip_suffix("::vector")
-            .or_else(|| trimmed.strip_suffix("::VECTOR"))
-            .unwrap_or(trimmed)
-            .trim();
-        let unquoted = without_cast.trim_matches('\'').trim_matches('"').trim();
-
-        if !(unquoted.starts_with('[') && unquoted.ends_with(']')) {
-            return None;
-        }
-
-        let inner = &unquoted[1..unquoted.len() - 1];
-        if inner.trim().is_empty() {
-            return Some(Vec::new());
-        }
-
-        inner
-            .split(',')
-            .map(|value| value.trim().parse::<f32>().ok())
-            .collect()
+        crate::query::federated::optimizer::vector_query_parsing::parse_vector_literal(raw)
     }
 
     fn merge_batches(&self, result: &FederatedExecutionResult) -> Result<RecordBatch> {

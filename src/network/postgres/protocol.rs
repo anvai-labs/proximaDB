@@ -1369,15 +1369,19 @@ impl PostgresProtocol {
             .unwrap_or(rest)
             .trim_start();
 
-        // '='-split first, but a NAME never legitimately contains ' TO ' —
-        // that shape means TO-syntax whose VALUE held '=' (e.g. a padded
-        // base64 tenant id); mis-splitting it silently skips the tenant
-        // assertion gate below.
+        // '='-split first. An UNQUOTED name never legitimately contains
+        // ' TO ' — that shape means TO-syntax whose VALUE held '=' (e.g. a
+        // padded base64 tenant id); mis-splitting it silently skips the
+        // tenant assertion gate below. QUOTED names may contain anything
+        // ("time TO live"), so they keep the plain '='-split.
         let (name, value) = if let Some(eq_index) = rest.find('=') {
             let candidate = &rest[..eq_index];
-            if find_ascii_ci(candidate, " TO ").is_some() {
-                let to_index = find_ascii_ci(rest, " TO ").unwrap_or(eq_index);
-                (&rest[..to_index], &rest[to_index + " TO ".len()..])
+            let quoted = candidate.trim_start().starts_with('"');
+            if !quoted && find_ascii_ci(candidate, " TO ").is_some() {
+                match find_ascii_ci(rest, " TO ") {
+                    Some(to_index) => (&rest[..to_index], &rest[to_index + " TO ".len()..]),
+                    None => (candidate, &rest[eq_index + 1..]),
+                }
             } else {
                 (candidate, &rest[eq_index + 1..])
             }

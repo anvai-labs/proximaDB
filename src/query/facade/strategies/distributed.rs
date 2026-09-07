@@ -298,13 +298,19 @@ impl DistributedQueryStrategy {
         trimmed
             .split(',')
             .map(|value| {
-                value.trim().parse::<f32>().map_err(|error| {
+                let f = value.trim().parse::<f32>().map_err(|error| {
                     anyhow!(
                         "Failed to parse vector literal value '{}' for distributed query: {}",
                         value.trim(),
                         error
                     )
-                })
+                })?;
+                // The ONE non-finite policy (an inf/NaN reaches the
+                // distance kernels).
+                if !f.is_finite() {
+                    return Err(anyhow!("query vector components must be finite"));
+                }
+                Ok(f)
             })
             .collect()
     }

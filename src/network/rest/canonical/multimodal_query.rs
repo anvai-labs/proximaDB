@@ -727,6 +727,11 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                             "vector component config.query_vector must be an array".to_string(),
                         )
                     })?;
+                if query_values.is_empty() {
+                    return Err(ApiError::InvalidArgument(
+                        "vector component config.query_vector must be non-empty".to_string(),
+                    ));
+                }
                 let query_vector = query_values
                     .iter()
                     .enumerate()

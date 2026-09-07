@@ -14,7 +14,13 @@ pub(crate) fn vector_source_from_literal(raw: &str) -> VectorSource {
 
 pub(crate) fn vector_source_from_expression(expr: &str) -> VectorSource {
     let trimmed = expr.trim();
-    if let Some((table, column)) = split_qualified_reference(trimmed) {
+    // A single-quoted STRING is never a column reference — literal-shaped
+    // text (including vector literals the filtered parser rejects, e.g.
+    // '[0.5,NaN]') must stay Expression so the executor reports the
+    // validation error instead of a bogus correlation split at the first
+    // '.' inside the literal.
+    let is_string_literal = trimmed.starts_with('\'') && trimmed.ends_with('\'');
+    if !is_string_literal && let Some((table, column)) = split_qualified_reference(trimmed) {
         VectorSource::ColumnRef {
             table: table.trim().to_string(),
             column: column.trim().to_string(),

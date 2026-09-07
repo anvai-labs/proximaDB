@@ -1188,6 +1188,32 @@ Other round-8/9 fixes:
   'observability' accepted) fold into the tracked twin-consolidation
   item. v2_row_render's 4th-walker shape folds into the tracked
   parameterized-renderer item.
+
+**Consolidation review round 23 (2026-09-07):**
+- Round 22's float_sql_literal consolidation WIDENED f32 params (0.1 →
+  0.10000000149011612 — silently unmatching equality filters): the f32
+  arms render native precision again; the shared rule covers f64 only.
+- The parallel fail-closed commit's non-finite filter covered 2 of ~6
+  vector parsers: the federated EXECUTOR's unfiltered copy re-admitted
+  inf/NaN whenever the Expression fallback re-parsed raw SQL (it now
+  delegates to the ONE filtered parser), and the planner/distributed
+  copies filter too. base64_encode restored zero-copy (from_utf8 moves
+  the buffer; the lossy form always cloned).
+- A single-quoted string is never a ColumnRef — the optimizer's
+  dot-split misread rejected vector literals ('[0.5,NaN]' split at the
+  '.') as a bogus correlation, erroring plain queries and silently
+  dropping lateral rows. The fusion scanner no longer treats backslash
+  as an in-quote escape (SQL literals escape by doubling — a value
+  ending in a backslash desynchronized the arg splitter).
+- SET '='-vs-' TO ' retry skipped for QUOTED names ("time TO live");
+  empty query_vector arrays now 400 at both twins (were deferred 500s
+  from the executor).
+- Tracked: the v2 unified surface maps the new validation errors to 500
+  (the api handler funnels anyhow → Internal; v1 returns 400) — needs a
+  typed error channel on UnifiedQueryPort. The non-finite vector rule
+  still lives at five boundaries with divergent error spellings — one
+  validate home (data-model/kernel) pending; ParameterValue::Vector's
+  to_sql_string guard lives only in its caller.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

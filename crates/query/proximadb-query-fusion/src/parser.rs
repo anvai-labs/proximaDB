@@ -614,15 +614,17 @@ impl FederatedParser {
         let mut paren_depth = 0;
         let mut bracket_depth = 0;
         let mut in_quote = None;
-        let mut escaped = false;
 
         for c in s.chars() {
             if let Some(quote) = in_quote {
                 current.push(c);
-                if c == quote && !escaped {
+                // SQL string literals escape by QUOTE DOUBLING (decoded by
+                // unquote_sql_string) — treating backslash as an escape
+                // desyncs this scanner when a value ends in one (a
+                // Windows-style path absorbed the remaining arguments).
+                if c == quote {
                     in_quote = None;
                 }
-                escaped = c == '\\' && !escaped;
                 continue;
             }
 
@@ -655,8 +657,6 @@ impl FederatedParser {
                 }
                 _ => current.push(c),
             }
-
-            escaped = false;
         }
 
         if !current.trim().is_empty() {

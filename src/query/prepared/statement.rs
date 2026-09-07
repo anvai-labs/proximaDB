@@ -150,7 +150,8 @@ impl From<serde_json::Value> for ParameterValue {
 /// `unified_query_port_impl` (the direct and literal paths must agree on
 /// quoting for federated equality to be possible at all).
 /// Non-finite floats have no SQL literal — NULL (bare 'NaN'/'inf' text is
-/// a parse error on Postgres-style engines). ONE rule for every float arm.
+/// a parse error on Postgres-style engines). ONE rule for every f64 arm
+/// (the f32 arms render native precision beside it).
 pub(crate) fn float_sql_literal(value: f64) -> String {
     if value.is_finite() {
         value.to_string()
