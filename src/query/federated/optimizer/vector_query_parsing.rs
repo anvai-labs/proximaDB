@@ -79,7 +79,33 @@ fn is_identifier(part: &str) -> bool {
 }
 
 fn is_dotted_identifier_path(part: &str) -> bool {
-    part.split('.').all(is_identifier)
+    // Quote-aware split: a quoted segment may CONTAIN dots
+    // (p."doc.embedding" is one column, not a nested path).
+    let mut segment = String::new();
+    let mut in_quotes = false;
+    let mut chars = part.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes && matches!(chars.peek(), Some('"')) {
+                    chars.next();
+                    segment.push('"');
+                    segment.push('"');
+                    continue;
+                }
+                in_quotes = !in_quotes;
+                segment.push('"');
+            }
+            '.' if !in_quotes => {
+                if !is_identifier(&segment) {
+                    return false;
+                }
+                segment.clear();
+            }
+            _ => segment.push(ch),
+        }
+    }
+    !in_quotes && is_identifier(&segment)
 }
 
 fn stripped_quoted_ident(part: &str) -> Option<&str> {

@@ -1296,6 +1296,27 @@ Other round-8/9 fixes:
   ad-hoc identifier predicate (validation.rs, executor's
   quoted_identifier_contents, fusion's token parsers) — one foundation
   home; non-ASCII identifiers rejected (Postgres accepts them).
+
+**Consolidation review round 27 (2026-09-07, completed by late-arriving
+angles after the main agent hit a rate limit):**
+- The port twin's VECTOR_SEARCH builder still hand-rolled the f64 join
+  (round 26 fixed only the REST twin) — both now render through the ONE
+  vector-text home; angle-B verified the f64→f32 narrowing is
+  bit-identical through the parsers (f32 parse rounds either way).
+- JSON params splice by shape on EVERY route (the round-26 fix covered
+  only the From<Value> arm): the ProximaValue catch-all maps JSON
+  scalars to SEMANTIC param types (Bool/Int/Float — bare splice), the
+  Jsonb(Null) '?'-literal route splices SQL NULL (was the string
+  'null' — the route REST actually uses had the regression).
+- The dotted-path validator is quote-aware (p."doc.embedding" is ONE
+  column containing a dot, not a nested path). Non-string document
+  filters fail closed at both twins (an object-shaped filter silently
+  widened to match-all 'true'). source_executors' parse_vector — the
+  one boundary the fail-closed sweep missed — joins the ONE empty +
+  non-finite policy; its permissive pin flipped.
+- STRICT pins added for the most-rechurned spellings (Json by-shape:
+  null/scalars/containers; the quoted vector splice) — the substring
+  forms passed under every prior spelling.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

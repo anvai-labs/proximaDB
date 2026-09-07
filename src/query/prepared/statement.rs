@@ -804,6 +804,24 @@ mod tests {
             ParameterValue::Vector(vec![0.1, 0.2]).to_sql_string(),
             "'[0.1,0.2]'"
         );
+        // Json splices BY SHAPE: null → SQL NULL (3VL), scalars BARE,
+        // containers quoted — the most-rechurned spelling of this PR,
+        // pinned strictly.
+        assert_eq!(
+            ParameterValue::Json(serde_json::json!(null)).to_sql_string(),
+            "NULL"
+        );
+        assert_eq!(
+            ParameterValue::Json(serde_json::json!(true)).to_sql_string(),
+            "true"
+        );
+        assert_eq!(
+            ParameterValue::Json(serde_json::json!(42)).to_sql_string(),
+            "42"
+        );
+        let object_sql = ParameterValue::Json(serde_json::json!({"k": "v"})).to_sql_string();
+        assert!(object_sql.starts_with('\'') && object_sql.ends_with('\''));
+        assert!(object_sql.contains("k") && object_sql.contains("v"));
     }
 
     #[test]

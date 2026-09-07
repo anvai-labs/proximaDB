@@ -70,7 +70,21 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         // literal paths agree on QUOTING (numeric-array text and
         // UInt64>i64::MAX spellings still differ between them; the literal
         // path's f32 vector coercion is pre-existing).
-        other => ParameterValue::String(filter_literal_text(&proxima_filter_literal(other))),
+        other => match proxima_filter_literal(other) {
+            serde_json::Value::String(text) => ParameterValue::String(text),
+            // JSON scalars keep their SEMANTIC param type — bool/number
+            // splice BARE like the From<Value> route (a String param would
+            // quote them into string-vs-numeric no-matches).
+            serde_json::Value::Bool(b) => ParameterValue::Bool(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    ParameterValue::Int(i)
+                } else {
+                    ParameterValue::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            json => ParameterValue::String(json.to_string()),
+        },
     }
 }
 
@@ -151,9 +165,19 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
 /// column needs the per-dialect literal form (ISO-8601 text for
 /// Postgres-style engines).
 fn exotic_literal(value: &ProximaValue) -> Result<String> {
-    Ok(sql_quote(&filter_literal_text(&proxima_filter_literal(
-        value,
-    ))))
+    // Splice by SHAPE, in agreement with the param route's semantic types
+    // and to_sql_string's Json arm: a JSON-null document is SQL NULL
+    // (3VL), bool/number scalars BARE (quoting them is a string-vs-numeric
+    // no-match), strings and containers quoted (bare '[...]'/'{...}' is a
+    // parse error; root-string docs lower to bare text per the
+    // filter-literal spelling).
+    match proxima_filter_literal(value) {
+        serde_json::Value::Null => Ok("NULL".to_string()),
+        scalar @ (serde_json::Value::Bool(_) | serde_json::Value::Number(_)) => {
+            Ok(scalar.to_string())
+        }
+        json => Ok(sql_quote(&filter_literal_text(&json))),
+    }
 }
 
 fn vector_to_sql_literal(values: &[f32]) -> Result<String> {
@@ -790,7 +814,10 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                         "components[{component_index}].config.query_vector must be non-empty"
                     ));
                 }
-                let query_vec = query_values
+                // Validate then render through the ONE vector-text home
+                // (f64 Display splices a different literal than the REST
+                // twin for values outside exact f32 range).
+                let f32_vec: Result<Vec<f32>> = query_values
                     .iter()
                     .enumerate()
                     .map(|(value_index, value)| {
@@ -799,18 +826,19 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                                 "components[{component_index}].config.query_vector[{value_index}] must be numeric"
                             )
                         })?;
-                        if !(number as f32).is_finite() {
+                        let f = number as f32;
+                        if !f.is_finite() {
                             return Err(anyhow!(
                                 "components[{component_index}].config.query_vector[{value_index}] must be a finite f32"
                             ));
                         }
-                        Ok(number.to_string())
+                        Ok(f)
                     })
-                    .collect::<Result<Vec<_>>>()?
-                    .join(",");
+                    .collect();
+                let query_vec = vector_literal_text(&f32_vec?);
                 let top_k = config.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10);
                 format!(
-                    "SELECT * FROM VECTOR_SEARCH('{}', '[{}]', {})",
+                    "SELECT * FROM VECTOR_SEARCH('{}', '{}', {})",
                     escape_sql_text(collection),
                     query_vec,
                     top_k
@@ -823,7 +851,12 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                     .unwrap_or("default");
                 let filter = config
                     .get("filter")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!("components[{component_index}].config.filter must be a string")
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("1=1");
                 format!(
                     "SELECT * FROM DOCUMENT_QUERY('{}', '{}')",

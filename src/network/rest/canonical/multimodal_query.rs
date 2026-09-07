@@ -778,7 +778,14 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 let filter = component
                     .config
                     .get("filter")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "document component config.filter must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("true");
 
                 format!(
