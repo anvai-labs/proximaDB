@@ -83,13 +83,16 @@ pub fn mlflow_routes() -> Router<MlflowState> {
         .route("/runs/delete-tag", post(runs_delete_tag))
 }
 
-async fn store_for(tenant: &TenantContext, state: &MlflowState) -> SubstrateRunStore {
-    // for_tenant validates the tenant; a validated request tenant cannot
-    // fail here, but fail closed rather than unwrap (mandate 4).
-    match SubstrateRunStore::for_tenant(state.document.clone(), &tenant.tenant_id) {
-        Ok(store) => store,
-        Err(e) => unreachable!("validated tenant produced an invalid scoped collection: {e}"),
-    }
+fn store_for(
+    tenant: &TenantContext,
+    state: &MlflowState,
+) -> Result<SubstrateRunStore, MlflowError> {
+    SubstrateRunStore::for_tenant(state.document.clone(), &tenant.tenant_id).map_err(|e| {
+        MlflowError::internal(format!(
+            "tenant '{}' cannot be scoped to a tracking collection: {e}",
+            tenant.tenant_id
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -162,9 +165,24 @@ struct RunsCreateRequest {
 #[derive(Serialize)]
 struct MetricOut {
     key: String,
+    /// Proto3-JSON convention: non-finite floats serialize as STRINGS
+    /// ("NaN" / "Infinity" / "-Infinity") — serde_json's default f64 path
+    /// cannot encode them, which would 500 the whole search response.
+    #[serde(serialize_with = "ser_f64_lossy")]
     value: f64,
     timestamp: i64,
     step: i64,
+}
+
+fn ser_f64_lossy<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::Error as _;
+    match v {
+        f if f.is_finite() => s.serialize_f64(*f),
+        f if f.is_nan() => s.serialize_str("NaN"),
+        f if *f == f64::INFINITY => s.serialize_str("Infinity"),
+        f if *f == f64::NEG_INFINITY => s.serialize_str("-Infinity"),
+        _ => Err(S::Error::custom("unreachable float class")),
+    }
 }
 
 #[derive(Serialize)]
@@ -237,7 +255,7 @@ struct LogParameterRequest {
 struct MetricInput {
     #[serde(default)]
     key: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_f64_lossy")]
     value: f64,
     #[serde(default)]
     timestamp: i64,
@@ -245,12 +263,45 @@ struct MetricInput {
     step: i64,
 }
 
+/// MLflow's runs/log-metric body is FLAT: {run_id, key, value, timestamp,
+/// step} — the proto's LogMetric message has direct fields, no nested Metric
+/// (verified against mlflow/protos/service.proto).
 #[derive(Default, Deserialize)]
 struct LogMetricRequest {
     #[serde(default)]
     run_id: String,
     #[serde(default)]
-    metric: Option<MetricInput>,
+    key: String,
+    /// Proto3 JSON sends non-finite floats as STRINGS ("NaN", "Infinity",
+    /// "-Infinity") — accept both so diverged-loss metrics stay within the
+    /// MLflow error envelope.
+    #[serde(default, deserialize_with = "de_f64_lossy")]
+    value: f64,
+    #[serde(default)]
+    timestamp: i64,
+    #[serde(default)]
+    step: i64,
+}
+
+fn de_f64_lossy<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    use serde::de::Error as _;
+    let raw = serde_json::Value::deserialize(d)?;
+    match raw {
+        serde_json::Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| D::Error::custom("metric value out of f64 range")),
+        serde_json::Value::String(s) => match s.as_str() {
+            "NaN" => Ok(f64::NAN),
+            "Infinity" => Ok(f64::INFINITY),
+            "-Infinity" => Ok(f64::NEG_INFINITY),
+            other => other
+                .parse::<f64>()
+                .map_err(|_| D::Error::custom(format!("invalid metric value '{other}'"))),
+        },
+        other => Err(D::Error::custom(format!(
+            "metric value must be a number or numeric string, got {other}"
+        ))),
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -287,11 +338,15 @@ struct RunsSearchRequest {
     max_results: Option<u32>,
     #[serde(default)]
     order_by: Vec<String>,
+    #[serde(default)]
+    page_token: Option<String>,
 }
 
 #[derive(Serialize)]
 struct RunsSearchResponse {
     runs: Vec<RunOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_page_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +446,9 @@ impl From<RunStoreError> for MlflowError {
             RunStoreError::Empty { field } => {
                 MlflowError::invalid(format!("{field} must not be empty"))
             }
+            RunStoreError::NotTerminal => {
+                MlflowError::internal("terminal status required (wire never sends Running here)")
+            }
             RunStoreError::Internal { message } => MlflowError::internal(message),
         }
     }
@@ -446,6 +504,8 @@ fn run_out(record: &RunRecord) -> RunOut {
             status: match record.status {
                 RunStatus::Running => "RUNNING",
                 RunStatus::Finished => "FINISHED",
+                RunStatus::Failed => "FAILED",
+                RunStatus::Killed => "KILLED",
             },
             start_time: record.start_time_ms,
             end_time: record.end_time_ms,
@@ -504,7 +564,7 @@ async fn experiments_create(
     if req.name.is_empty() {
         return Err(MlflowError::invalid("experiment name must not be empty"));
     }
-    let store = store_for(&tenant, &state).await;
+    let store = store_for(&tenant, &state)?;
     let record = store
         .create_experiment(
             &req.name,
@@ -523,7 +583,7 @@ async fn experiments_get(
     Json(req): Json<ExperimentIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     let id = parse_id(&req.experiment_id, "experiment")?;
-    let store = store_for(&tenant, &state).await;
+    let store = store_for(&tenant, &state)?;
     let record = store.get_experiment(id).await?;
     Ok(Json(serde_json::json!({
         "experiment": experiment_out(&record),
@@ -535,21 +595,57 @@ async fn experiments_search(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<ExperimentsSearchRequest>,
 ) -> MlflowResult<Json<ExperimentsSearchResponse>> {
-    let include_deleted = match req.filter.as_deref() {
-        None => false,
-        // Slice-2 subset: `name = 'x'` equality and
-        // `attributes.lifecycle_stage = 'deleted'`; anything else is an
-        // explicit INVALID_PARAMETER_VALUE (never silently ignored).
-        Some(f) => match parse_lifecycle_filter(f) {
-            LifecycleFilter::Deleted => true,
-            LifecycleFilter::Active => false,
-        },
-    };
-    let store = store_for(&tenant, &state).await;
+    // Slice-2 subset, honestly enforced: `name = 'v'` / `name LIKE '%v%'`,
+    // `tags.k = 'v'`, `attributes.lifecycle_stage = 'deleted'`, ANDed.
+    // Anything else is INVALID_PARAMETER_VALUE — never silently ignored.
+    let mut include_deleted = false;
+    let mut name_eq: Option<String> = None;
+    let mut name_like: Option<String> = None;
+    let mut tag_clauses: Vec<(String, String)> = Vec::new();
+    if let Some(f) = &req.filter {
+        for clause in f.split(" AND ") {
+            let clause = clause.trim();
+            if clause == "attributes.lifecycle_stage = 'deleted'" {
+                include_deleted = true;
+            } else if let Some(rest) = clause.strip_prefix("name ") {
+                let (op, value) = split_quoted(rest)?;
+                match op.as_str() {
+                    "=" => name_eq = Some(value),
+                    "LIKE" => name_like = Some(value),
+                    other => {
+                        return Err(MlflowError::invalid(format!(
+                            "name filter supports = / LIKE, got '{other}'"
+                        )));
+                    }
+                }
+            } else if let Some(rest) = clause.strip_prefix("tags.") {
+                let (op, value) = split_quoted(rest)?;
+                let key = field_key_quoted(rest, &op)?;
+                if op != "=" {
+                    return Err(MlflowError::invalid(
+                        "experiment tag filter supports = only",
+                    ));
+                }
+                tag_clauses.push((key, value));
+            } else {
+                return Err(MlflowError::invalid(format!(
+                    "unsupported experiment filter clause '{clause}'"
+                )));
+            }
+        }
+    }
+    let store = store_for(&tenant, &state)?;
     let mut experiments: Vec<ExperimentOut> = store
         .list_experiments(include_deleted)
         .await?
         .iter()
+        .filter(|e| {
+            name_eq.as_ref().is_none_or(|v| &e.name == v)
+                && name_like
+                    .as_ref()
+                    .is_none_or(|pat| like_match(&e.name, pat))
+                && tag_clauses.iter().all(|(k, v)| e.tags.get(k) == Some(v))
+        })
         .map(experiment_out)
         .collect();
     if let Some(limit) = req.max_results {
@@ -558,29 +654,13 @@ async fn experiments_search(
     Ok(Json(ExperimentsSearchResponse { experiments }))
 }
 
-enum LifecycleFilter {
-    Active,
-    Deleted,
-}
-
-fn parse_lifecycle_filter(filter: &str) -> LifecycleFilter {
-    if filter.contains("deleted") {
-        LifecycleFilter::Deleted
-    } else {
-        LifecycleFilter::Active
-    }
-}
-
 async fn experiments_delete(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<ExperimentIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     let id = parse_id(&req.experiment_id, "experiment")?;
-    store_for(&tenant, &state)
-        .await
-        .delete_experiment(id)
-        .await?;
+    store_for(&tenant, &state)?.delete_experiment(id).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -590,10 +670,7 @@ async fn experiments_restore(
     Json(req): Json<ExperimentIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     let id = parse_id(&req.experiment_id, "experiment")?;
-    store_for(&tenant, &state)
-        .await
-        .restore_experiment(id)
-        .await?;
+    store_for(&tenant, &state)?.restore_experiment(id).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -604,7 +681,7 @@ async fn runs_create(
 ) -> MlflowResult<Json<serde_json::Value>> {
     let experiment_id = parse_id(&req.experiment_id, "experiment")?;
     let run_id = uuid_like_id();
-    let store = store_for(&tenant, &state).await;
+    let store = store_for(&tenant, &state)?;
     let record = store
         .create_run(
             experiment_id,
@@ -636,7 +713,7 @@ async fn runs_get(
     if req.run_id.is_empty() {
         return Err(MlflowError::invalid("run_id must not be empty"));
     }
-    let store = store_for(&tenant, &state).await;
+    let store = store_for(&tenant, &state)?;
     let record = store.get_run(&req.run_id).await?;
     Ok(Json(serde_json::json!({ "run": run_out(&record) })))
 }
@@ -649,21 +726,29 @@ async fn runs_update(
     if req.run_id.is_empty() {
         return Err(MlflowError::invalid("run_id must not be empty"));
     }
-    let store = store_for(&tenant, &state).await;
-    let end_time = match req.status.as_deref() {
-        None | Some("RUNNING") => req.end_time,
-        Some("FINISHED") | Some("FAILED") | Some("KILLED") => Some(
-            req.end_time
-                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
-        ),
+    let store = store_for(&tenant, &state)?;
+    let terminal = match req.status.as_deref() {
+        None => None,
+        // UpdateRun -> RUNNING reopens a terminal run (end time cleared).
+        Some("RUNNING") => Some(None),
+        Some("FINISHED") => Some(Some(RunStatus::Finished)),
+        Some("FAILED") => Some(Some(RunStatus::Failed)),
+        Some("KILLED") => Some(Some(RunStatus::Killed)),
         Some(other) => {
             return Err(MlflowError::invalid(format!(
-                "unsupported run status '{other}' (slice 2: RUNNING | FINISHED | FAILED | KILLED)"
+                "unsupported run status '{other}' (RUNNING | FINISHED | FAILED | KILLED)"
             )));
         }
     };
-    if let Some(end) = end_time {
-        store.finish_run(&req.run_id, end).await?;
+    match terminal {
+        Some(None) => store.reopen_run(&req.run_id).await?,
+        Some(Some(status)) => {
+            let end = req
+                .end_time
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+            store.finish_run(&req.run_id, status, end).await?;
+        }
+        None => {}
     }
     let record = store.get_run(&req.run_id).await?;
     Ok(Json(RunInfoResponse {
@@ -676,8 +761,7 @@ async fn runs_log_parameter(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<LogParameterRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
-    store_for(&tenant, &state)
-        .await
+    store_for(&tenant, &state)?
         .log_param(&req.run_id, &req.key, &req.value)
         .await?;
     Ok(Json(serde_json::json!({})))
@@ -688,17 +772,13 @@ async fn runs_log_metric(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<LogMetricRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
-    let metric = req.metric.ok_or_else(|| {
-        MlflowError::invalid("log-metric requires a `metric` object (key/value/timestamp/step)")
-    })?;
     let point = MetricPoint {
-        key: metric.key,
-        value: metric.value,
-        timestamp_ms: metric.timestamp,
-        step: metric.step,
+        key: req.key,
+        value: req.value,
+        timestamp_ms: req.timestamp,
+        step: req.step,
     };
-    store_for(&tenant, &state)
-        .await
+    store_for(&tenant, &state)?
         .log_metric(&req.run_id, point)
         .await?;
     Ok(Json(serde_json::json!({})))
@@ -709,8 +789,16 @@ async fn runs_log_batch(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<LogBatchRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
-    let store = store_for(&tenant, &state).await;
+    if req.metrics.len() > 1000 || req.params.len() > 100 || req.tags.len() > 100 {
+        return Err(MlflowError::invalid(
+            "log-batch caps: 1000 metrics, 100 params, 100 tags (MLflow limits)",
+        ));
+    }
+    let store = store_for(&tenant, &state)?;
     for p in &req.params {
+        if p.run_id.is_empty() || p.key.is_empty() {
+            return Err(MlflowError::invalid("log-batch param needs run_id and key"));
+        }
         store.log_param(&req.run_id, &p.key, &p.value).await?;
     }
     for m in &req.metrics {
@@ -737,8 +825,7 @@ async fn runs_set_tag(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<SetTagRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
-    store_for(&tenant, &state)
-        .await
+    store_for(&tenant, &state)?
         .set_tag(&req.run_id, &req.key, &req.value)
         .await?;
     Ok(Json(serde_json::json!({})))
@@ -749,8 +836,7 @@ async fn runs_delete_tag(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<SetTagRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
-    store_for(&tenant, &state)
-        .await
+    store_for(&tenant, &state)?
         .delete_tag(&req.run_id, &req.key)
         .await?;
     Ok(Json(serde_json::json!({})))
@@ -761,10 +847,7 @@ async fn runs_delete(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<RunIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
-    store_for(&tenant, &state)
-        .await
-        .delete_run(&req.run_id)
-        .await?;
+    store_for(&tenant, &state)?.delete_run(&req.run_id).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -773,10 +856,7 @@ async fn runs_restore(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<RunIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
-    store_for(&tenant, &state)
-        .await
-        .restore_run(&req.run_id)
-        .await?;
+    store_for(&tenant, &state)?.restore_run(&req.run_id).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -821,7 +901,7 @@ async fn runs_search(
             }
         }
     }
-    let store = store_for(&tenant, &state).await;
+    let store = store_for(&tenant, &state)?;
     let mut runs: Vec<RunOut> = Vec::new();
     for exp in &req.experiment_ids {
         let id = parse_id(exp, "experiment")?;
@@ -839,10 +919,29 @@ async fn runs_search(
     } else {
         runs.sort_by_key(|r| r.info.start_time);
     }
-    if let Some(limit) = req.max_results {
-        runs.truncate(limit as usize);
-    }
-    Ok(Json(RunsSearchResponse { runs }))
+    // Offset pagination: page_token is the offset (opaque to the client),
+    // next_page_token is emitted only when MORE results exist past the page.
+    let page_size = req.max_results.map(|n| n.max(1) as usize);
+    let offset = req
+        .page_token
+        .as_deref()
+        .map(|t| t.parse::<usize>().unwrap_or(0))
+        .unwrap_or(0);
+    let total = runs.len();
+    let page: Vec<RunOut> = match page_size {
+        Some(size) => runs.into_iter().skip(offset).take(size).collect(),
+        None => runs.into_iter().skip(offset).collect(),
+    };
+    let consumed = offset + page.len();
+    let next_page_token = if consumed < total {
+        Some(consumed.to_string())
+    } else {
+        None
+    };
+    Ok(Json(RunsSearchResponse {
+        runs: page,
+        next_page_token,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +953,7 @@ async fn runs_search(
 enum FieldFilter {
     ParamEq(String, String),
     ParamNe(String, String),
+    ParamLike(String, String),
     TagEq(String, String),
     TagNe(String, String),
     TagLike(String, String),
@@ -865,6 +965,10 @@ impl FieldFilter {
         match self {
             FieldFilter::ParamEq(k, v) => run.params.get(k) == Some(v),
             FieldFilter::ParamNe(k, v) => run.params.get(k) != Some(v),
+            FieldFilter::ParamLike(k, pattern) => match run.params.get(k) {
+                Some(actual) => like_match(actual, pattern),
+                None => false,
+            },
             FieldFilter::TagEq(k, v) => run.tags.get(k) == Some(v),
             FieldFilter::TagNe(k, v) => run.tags.get(k) != Some(v),
             FieldFilter::TagLike(k, pattern) => match run.tags.get(k) {
@@ -1101,10 +1205,12 @@ mod tests {
             serde_json::json!({"run_id": run_id, "key": "lr", "value": "0.01"}),
         )
         .await;
+        // FLAT body — the real MLflow wire shape (proto LogMetric has
+        // direct fields; no nested metric object).
         post_json(
             &mut router,
             "/runs/log-metric",
-            serde_json::json!({"run_id": run_id, "metric": {"key": "rmse", "value": 0.9, "timestamp": 1000, "step": 0}}),
+            serde_json::json!({"run_id": run_id, "key": "rmse", "value": 0.9, "timestamp": 1000, "step": 0}),
         )
         .await;
         let (status, _) = post_json(
@@ -1171,11 +1277,117 @@ mod tests {
         let (status, body) = post_json(
             &mut router,
             "/runs/log-metric",
-            serde_json::json!({"run_id": run_id, "metric": {"key": "rmse", "value": 0.1, "timestamp": 9500, "step": 2}}),
+            serde_json::json!({"run_id": run_id, "key": "rmse", "value": 0.1, "timestamp": 9500, "step": 2}),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error_code"], "INVALID_STATE");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["error_code"], "INVALID_STATE", "body: {body}");
+
+        // Reopen (UpdateRun -> RUNNING) accepts writes again, then FAILED
+        // terminal status round-trips.
+        post_json(
+            &mut router,
+            "/runs/update",
+            serde_json::json!({"run_id": run_id, "status": "RUNNING"}),
+        )
+        .await;
+        post_json(
+            &mut router,
+            "/runs/log-metric",
+            serde_json::json!({"run_id": run_id, "key": "rmse", "value": 0.2, "timestamp": 9600, "step": 3}),
+        )
+        .await;
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/update",
+            serde_json::json!({"run_id": run_id, "status": "FAILED", "end_time": 9700}),
+        )
+        .await;
+        assert_eq!(body["run_info"]["status"], "FAILED");
+
+        // Non-finite metric values arrive as proto3-JSON strings.
+        let (status, _) = post_json(
+            &mut router,
+            "/runs/update",
+            serde_json::json!({"run_id": run_id, "status": "RUNNING"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(
+            &mut router,
+            "/runs/log-metric",
+            serde_json::json!({"run_id": run_id, "key": "diverged", "value": "Infinity", "timestamp": 9800, "step": 0}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Infinity-as-string must be accepted"
+        );
+
+        // Experiment search: name predicate applied; garbage filter
+        // rejected (never silently ignored).
+        let (_, body) = post_json(
+            &mut router,
+            "/experiments/search",
+            serde_json::json!({"filter": "name = 'iris'"}),
+        )
+        .await;
+        let found = body["experiments"].as_array().unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["name"], "iris");
+
+        let (_, body) = post_json(
+            &mut router,
+            "/experiments/search",
+            serde_json::json!({"filter": "name = 'no-such-experiment'"}),
+        )
+        .await;
+        assert_eq!(body["experiments"].as_array().unwrap().len(), 0);
+
+        let (_, body) = post_json(
+            &mut router,
+            "/experiments/search",
+            serde_json::json!({"filter": "garbage clause"}),
+        )
+        .await;
+        assert_eq!(body["error_code"], "INVALID_PARAMETER_VALUE");
+
+        // A second run so pagination has two results to page through.
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/create",
+            serde_json::json!({"experiment_id": experiment_id, "run_name": "second", "start_time": 2000}),
+        )
+        .await;
+        assert_eq!(body["run"]["info"]["run_name"], "second", "body: {body}");
+
+        // Pagination: max_results truncation carries next_page_token.
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": [experiment_id], "max_results": 1}),
+        )
+        .await;
+        eprintln!("SEARCH1 BODY: {body}");
+        let token = body["next_page_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no token; body: {body}"))
+            .to_string();
+        assert_eq!(body["runs"].as_array().unwrap().len(), 1, "body: {body}");
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": [experiment_id], "page_token": token}),
+        )
+        .await;
+        // Page 2 (unbounded) holds the remaining run and carries NO further
+        // token — pagination terminates.
+        assert_eq!(body["runs"].as_array().unwrap().len(), 1);
+        assert!(
+            body.get("next_page_token").is_none(),
+            "exhausted pagination must omit the token; body: {body}"
+        );
 
         // Duplicate experiment name -> RESOURCE_ALREADY_EXISTS (MLflow code).
         let (status, body) = post_json(

@@ -149,9 +149,17 @@ impl SubstrateRunStore {
 
     async fn get_payload<T: serde::de::DeserializeOwned>(&self, id: &str) -> Result<Option<T>> {
         // Reads by a tenant whose collection was never written must look
-        // EMPTY, not error (a foreign-tenant probe is a not-found, never a
-        // 500). ensure() is an in-memory registry hit after the first call.
-        self.ensure().await?;
+        // EMPTY — without materializing anything (a read must not create
+        // catalog/billing state; MLflow garbage-probes must not provision).
+        if self
+            .document
+            .get_collection(&self.collection)
+            .await
+            .map_err(Self::err)?
+            .is_none()
+        {
+            return Ok(None);
+        }
         let Some(record) = self
             .document
             .get_document(&self.collection, id, None)
@@ -312,9 +320,15 @@ impl RunStore for SubstrateRunStore {
         &self,
         include_deleted: bool,
     ) -> Result<Vec<ExperimentRecord>, RunStoreError> {
-        self.ensure()
+        if self
+            .document
+            .get_collection(&self.collection)
             .await
-            .map_err(|e| Self::err(e.context("ensure collection")))?;
+            .map_err(Self::err)?
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
         Ok(self
             .experiments()
             .await
@@ -379,9 +393,15 @@ impl RunStore for SubstrateRunStore {
             return Err(RunStoreError::Empty { field: "run_id" });
         }
         let _guard = self.mutation_lock.lock().await;
-        self.ensure()
+        if self
+            .document
+            .get_collection(&self.collection)
             .await
-            .map_err(|e| Self::err(e.context("ensure collection")))?;
+            .map_err(Self::err)?
+            .is_none()
+        {
+            return Err(RunStoreError::UnknownExperiment { experiment_id });
+        }
         let experiment = self.get_experiment(experiment_id).await?;
         if experiment.stage == ExperimentStage::Deleted {
             return Err(RunStoreError::ExperimentDeleted { experiment_id });
@@ -442,11 +462,27 @@ impl RunStore for SubstrateRunStore {
             .collect())
     }
 
-    async fn finish_run(&self, run_id: &str, end_time_ms: i64) -> Result<(), RunStoreError> {
+    async fn finish_run(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        end_time_ms: i64,
+    ) -> Result<(), RunStoreError> {
+        if !status.is_terminal() {
+            return Err(RunStoreError::NotTerminal);
+        }
         let _guard = self.mutation_lock.lock().await;
         let (mut run, counters) = self.run_with_counters(run_id).await?;
-        run.status = RunStatus::Finished;
+        run.status = status;
         run.end_time_ms = Some(end_time_ms);
+        self.put_run(&run, &counters).await.map_err(Self::err)
+    }
+
+    async fn reopen_run(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let _guard = self.mutation_lock.lock().await;
+        let (mut run, counters) = self.run_with_counters(run_id).await?;
+        run.status = RunStatus::Running;
+        run.end_time_ms = None;
         self.put_run(&run, &counters).await.map_err(Self::err)
     }
 
@@ -467,7 +503,7 @@ impl RunStore for SubstrateRunStore {
     async fn log_param(&self, run_id: &str, key: &str, value: &str) -> Result<(), RunStoreError> {
         let _guard = self.mutation_lock.lock().await;
         let (mut run, counters) = self.run_with_counters(run_id).await?;
-        if run.status == RunStatus::Finished {
+        if run.status.is_terminal() {
             return Err(RunStoreError::RunFinished {
                 run_id: run_id.to_string(),
             });
@@ -492,7 +528,7 @@ impl RunStore for SubstrateRunStore {
     ) -> Result<MetricAppend, RunStoreError> {
         let _guard = self.mutation_lock.lock().await;
         let (mut run, mut counters) = self.run_with_counters(run_id).await?;
-        if run.status == RunStatus::Finished {
+        if run.status.is_terminal() {
             return Err(RunStoreError::RunFinished {
                 run_id: run_id.to_string(),
             });
@@ -527,9 +563,6 @@ impl RunStore for SubstrateRunStore {
         key: &str,
     ) -> Result<Vec<MetricPoint>, RunStoreError> {
         self.get_run(run_id).await?;
-        self.ensure()
-            .await
-            .map_err(|e| Self::err(e.context("ensure collection")))?;
         let filter = filter_of(&[
             eq_cond("kind", "metric"),
             eq_cond("run_id", run_id),
@@ -609,9 +642,6 @@ impl RunStore for SubstrateRunStore {
 
     async fn dataset_inputs(&self, run_id: &str) -> Result<Vec<RunDatasetInput>, RunStoreError> {
         self.get_run(run_id).await?;
-        self.ensure()
-            .await
-            .map_err(|e| Self::err(e.context("ensure collection")))?;
         let filter = filter_of(&[eq_cond("kind", "dataset"), eq_cond("run_id", run_id)]);
         let params = crate::storage::document::DocumentQueryParams {
             filter: Some(filter),
