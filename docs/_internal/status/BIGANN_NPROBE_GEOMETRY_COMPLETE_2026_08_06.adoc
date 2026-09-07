@@ -1,0 +1,114 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= BIGANN PAX nprobe geometry: complete same-binary five-scale matrix (2026-08-06)
+:toc:
+
+This artifact closes the incomplete-10M measurement gate in
+`BIGANN_NPROBE_GEOMETRY_100K_10M_2026_08_04.adoc`. It does not authorize a
+global policy change. Cross-corpus review refuted the bounded process-global
+candidate; this document preserves the measurement as evidence, not as a
+production configuration recommendation.
+
+== Provenance and validity
+
+All five natural-cell matrices used the same release-server binary:
+
+* binary source revision: `aed724fc533dac595e6ac31894ea3e505e1bcdfd`;
+* binary SHA-256: `62677fb41686015569f7de408fbe8c9758dd7a469de582cb33c8c9d17d1efdae`;
+* harness revision: `e2d09165da3694942d9323b75392819a1a1f371f`;
+* 128-dimensional BIGANN/SIFT prefixes, one fully materialized PAX v3 segment
+  per scale, exact prefix-matched ground truth, query range `0..1000`;
+* production Azure HTTP backend against localhost Azurite, fresh process per
+  point, no persistent local tier;
+* every matrix has `status=pass`, complete checkpoint coverage, and zero
+  measurement failures.
+
+[cols="1,1,1,2", options="header"]
+|===
+| Rows | `k_c` | Matrix points | Matrix SHA-256
+
+| 100K | 3 | 6/6 | `babe8b082330f192e2c07e50bed3dd2e2a13c1d7fcf0c9903f61cd5fdcb12dda`
+| 330K | 10 | 18/18 | `3bdf31e706c93b458662886df527117e85d31439ed310edca492682a02214e71`
+| 1M | 30 | 26/26 | `2b80cbec448f0af6d83e4c2a622cea07e0e3e26ff272e58ea7c40af8e872c577`
+| 3.3M | 100 | 30/30 | `3dc67e396dfd36fecdfb0935e4afa0ff7bf3295c4b1ad4cdf21f2966438effe5`
+| 10M | 305 | 24/24 | `306c149d44802c790953cff642c8be358127a88743758de282b241c199cf3019`
+|===
+
+The generated `pax_nprobe_geometry_analysis_v2` JSON is SHA-256
+`5af8d53b5b22165c01e0274b7e797f6bc05ddd097800d0315c368ddc0ac518e3`.
+The raw artifacts were checksum-verified after relocation and remain outside
+git at
+`vsingh@dataserver2:/data/proximadb/proximadb-bench-data/runs/bigann*-matrix-aed724fc5/`
+and
+`vsingh@dataserver2:/data/proximadb/proximadb-bench-data/runs/bigann10M-consistent-aed724fc5/`;
+this checked-in record and the evidence ledger retain their immutable
+identities.
+
+== Result
+
+[cols="1,1,1,1,1", options="header"]
+|===
+| Rows | `k_c` | top-10 economy / quality | top-20 economy / quality | max/mean cell rows
+
+| 100K | 3 | 2 / 3 | 2 / 3 | 1.17
+| 330K | 10 | 3 / 5 | 3 / 5 | 1.66
+| 1M | 30 | 5 / 6 | 6 / 7 | 1.48
+| 3.3M | 100 | 8 / 16 | 8 / 16 | 1.73
+| 10M | 305 | 22 / 22 | 26 / 26 | 2.63
+|===
+
+The sampled floor-minus-one points are negative controls, not inferred
+thresholds: top-10 recall moved 0.9778→0.9887 at `k_c=3` (nprobe 2→3),
+0.9767→0.9838 at `k_c=10` (4→5), and 0.9678→0.9809 at `k_c=30`
+(5→6). Top-20 moved 0.9771→0.9898, 0.97355→0.9823, and
+0.9777→0.98495 at the same three anchors. The `k_c=100` and `k_c=305`
+matrices did not sample exact floor-minus-one points; no such claim is made.
+
+"Economy" is the natural physical-GET knee. "Quality" is the first measured
+point with recall at or above 0.98. They are different objectives even where
+the same point happens to satisfy both. At 10M the quality points measured:
+
+* top-10, nprobe 22: recall 0.9804, 52.902 physical GET/query,
+  130.86 MB/query, 416.76 ms p50;
+* top-20, nprobe 26: recall 0.98285, 64.340 physical GET/query,
+  163.39 MB/query, 511.19 ms p50.
+
+The fitted quality curves are descriptive within `k_c=3..305`:
+
+* top-10: `1.7202765 * k_c^0.4466996` (log R-squared 0.9608,
+  leave-one-scale-out MAPE 16.89%);
+* top-20: `1.6639694 * k_c^0.4751678` (log R-squared 0.9858,
+  leave-one-scale-out MAPE 11.86%).
+
+The fit is not itself a recall proof: it under-predicts the measured
+`k_c=100` floor. More importantly, interpolation between these anchors is not
+portable across corpora. At `k_c=90`, both BIGANN anchor interpolations produce
+nprobe 15, while repository BGE measurements at 384 and 768 dimensions require
+nprobe 25 for top-10 and approximately 30 for top-20; nprobe 20 was still below
+recall 0.98. The production segment path is process-global and has no
+collection, corpus-family, dimension, projection-width, seed, metric, or
+calibration identity with which to distinguish those workloads.
+
+The proposed `measured_quality_v1` configuration surface is therefore
+**REFUTED and removed**. Default-OFF would not have made it correct for a
+mixed-collection process. The benchmark binary also predates the rejected PR
+head by 433 commits, and selector-unit tests did not exercise
+Config→global-settings→real-PAX recall. A future policy must be
+collection-scoped, fail closed on calibration-identity mismatch, and pass a
+current-head production-route recall matrix covering anchors, interpolation
+boundaries, top-k buckets, metrics, dimensions, and representative corpus
+families. The shipped geometric behavior remains unchanged; this artifact does
+not assert that it is cross-corpus optimal or recall-safe.
+
+== Co-design interpretation
+
+Cell-count tuning alone does not meet the object-storage operation target:
+even the 10M quality point costs 52.9 GET/query. Region-A and Region-B fetches,
+survivor locality, segment count, and RTT waves remain multiplicative terms.
+The cell imbalance rising to 2.63 max/mean makes row/byte-aware stopping a
+promising successor, but this matrix does not measure such a policy and does
+not authorize one.
+
+Azurite supports relative operation/byte conclusions, not Azure WAN latency
+SLAs. A later default flip still requires current-binary, provider-realistic
+paired evidence and the repository recall ratchet.
