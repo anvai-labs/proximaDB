@@ -732,24 +732,30 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                         "vector component config.query_vector must be non-empty".to_string(),
                     ));
                 }
-                let query_vector = query_values
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        let number = value.as_f64().ok_or_else(|| {
-                            ApiError::InvalidArgument(format!(
-                                "vector component config.query_vector[{index}] must be numeric"
-                            ))
-                        })?;
-                        if !(number as f32).is_finite() {
-                            return Err(ApiError::InvalidArgument(format!(
-                                "vector component config.query_vector[{index}] must be a finite f32"
-                            )));
-                        }
-                        Ok(number.to_string())
-                    })
-                    .collect::<ApiResult<Vec<_>>>()?
-                    .join(",");
+                // Validate then render through the ONE vector-text home
+                // (f64 Display would splice a different literal than the
+                // port path for values outside exact f32 range).
+                let query_vector = {
+                    let f32_vec: ApiResult<Vec<f32>> = query_values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            let number = value.as_f64().ok_or_else(|| {
+                                ApiError::InvalidArgument(format!(
+                                    "vector component config.query_vector[{index}] must be numeric"
+                                ))
+                            })?;
+                            let f = number as f32;
+                            if !f.is_finite() {
+                                return Err(ApiError::InvalidArgument(format!(
+                                    "vector component config.query_vector[{index}] must be a finite f32"
+                                )));
+                            }
+                            Ok(f)
+                        })
+                        .collect();
+                    crate::query::prepared::statement::vector_literal_text(&f32_vec?)
+                };
                 let top_k = component
                     .config
                     .get("top_k")
@@ -757,7 +763,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .unwrap_or(10);
 
                 format!(
-                    "SELECT * FROM VECTOR_SEARCH('{}', '[{}]', {})",
+                    "SELECT * FROM VECTOR_SEARCH('{}', '{}', {})",
                     escape_sql_text(collection),
                     query_vector,
                     top_k

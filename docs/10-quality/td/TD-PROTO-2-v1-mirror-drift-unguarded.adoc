@@ -1266,6 +1266,36 @@ Other round-8/9 fixes:
   amplification — hundreds of MB transient on 10k × 1KB batches). The
   quote-doubling close-scan now has three spellings (core::utils,
   collect_quoted_first_args, pgwire) — one close_quote helper pending.
+
+**Consolidation review round 26 (2026-09-07):**
+- Round 25's identifier validation broke 19 lateral tests — the dotted
+  COLUMN half IS the documented LATERAL correlation form
+  (p.document.embedding); the table half validates as an identifier,
+  the column half as a dotted path, and doubled quotes inside quoted
+  identifiers are the escaped spelling (the scanner already honored
+  them; the validator now does too). LESSON: a never-tested gate on a
+  hot path needs its suite run in the SAME commit, not the next round.
+- JSON params splice BY SHAPE: null → SQL NULL (3VL), bool/number
+  scalars BARE (quoting regressed public From<Value> bindings to
+  string-vs-numeric no-matches), strings/containers quoted.
+  Json(Null) through the param catch-all maps to ParameterValue::Null
+  (was the string 'null' — the two construction routes disagreed).
+- SET splits at whichever of '='/' TO ' comes first OUTSIDE QUOTES
+  (both separators quote-aware — the quoted-name + '='-in-quoted-value
+  combination still garbled the name and skipped the tenant gate).
+- The REST VECTOR_SEARCH builder renders through the ONE vector-text
+  home (f64 Display spliced different literals than the port path for
+  values outside exact f32 range). The port EXPLAIN extractor skips
+  GRAPH_QUERY (its cypher arg always yielded a bogus target; REST
+  omits it).
+- Tracked: '[]' now fails closed but the executor's diagnostic says
+  'provide a literal vector' when the user did (empty one) — diagnostic
+  attribution at the parse boundary. Five DECODE spellings of quote-
+  doubling (fusion unquote, REST, port, pgwire ×2) want one
+  unescape_sql_text beside escape_sql_text. is_identifier is the Nth
+  ad-hoc identifier predicate (validation.rs, executor's
+  quoted_identifier_contents, fusion's token parsers) — one foundation
+  home; non-ASCII identifiers rejected (Postgres accepts them).
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

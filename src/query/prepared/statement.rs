@@ -218,9 +218,14 @@ impl ParameterValue {
             // JSON splices QUOTED: bare '[0,1,2]' / '{"x":1}' is a parse
             // error on every engine (the text may still need a cast to
             // compare — see the TD-tracked federated literal dialect gap).
-            // A JSON-null document is SQL NULL (3VL) — the string
-            // 'null' would only match a column holding that literal text.
+            // JSON docs splice by SHAPE: null is SQL NULL (3VL), bool/
+            // number scalars are valid BARE SQL (quoting them regressed
+            // public From<Value> bindings to string-vs-numeric no-matches),
+            // strings and containers quote (bare '[...]'/'{...}' is a
+            // parse error; root-string docs lower to bare text per the
+            // filter-literal spelling).
             ParameterValue::Json(v) if v.is_null() => "NULL".to_string(),
+            ParameterValue::Json(v) if v.is_boolean() || v.is_number() => v.to_string(),
             ParameterValue::Json(v) => sql_quote(&filter_literal_text(v)),
         }
     }

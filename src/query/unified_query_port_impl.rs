@@ -57,6 +57,9 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         // Json/Array/Map flow through the exotic catch-all below — one
         // spelling of 'structured value → JSON-text param' (the deleted
         // per-variant arms re-derived it and drifted from the catch-all).
+        // A JSON-null DOCUMENT is the SQL NULL param (3VL), not the string
+        // 'null' the catch-all would splice — matching From<Value>'s arm.
+        ProximaValue::Json(v) | ProximaValue::Jsonb(v) if v.is_null() => ParameterValue::Null,
         ProximaValue::Null => ParameterValue::Null,
         // Typed exotics (Binary/Uuid/ULID/temporals/SparseVector/Decimal)
         // lower through the ONE shared filter spelling — the old Rust-Debug
@@ -506,7 +509,8 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     for function in [
         "VECTOR_SEARCH",
         "DOCUMENT_QUERY",
-        "GRAPH_QUERY",
+        // GRAPH_QUERY omitted: its first arg is CYPHER, which always
+        // yields a bogus target (the REST twin omits it too).
         "LOGS",
         "METRICS",
     ] {

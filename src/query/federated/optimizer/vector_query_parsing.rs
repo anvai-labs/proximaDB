@@ -52,10 +52,11 @@ pub(crate) fn split_qualified_reference(expr: &str) -> Option<(&str, &str)> {
         return None;
     }
     let (table, column) = split?;
-    // Both halves must be IDENTIFIER-shaped — vector literals (quoted,
-    // cast-suffixed, or bare) reaching this splitter must not be misread
-    // as bogus column references.
-    if !is_identifier(table) || !is_identifier(column) {
+    // The table half must be IDENTIFIER-shaped; the COLUMN half may be a
+    // dotted nested path (the documented LATERAL correlation form
+    // `p.document.embedding`). Literal-shaped text (quoted, cast-suffixed,
+    // bare) must not be misread as column references.
+    if !is_identifier(table) || !is_dotted_identifier_path(column) {
         return None;
     }
     Some((table, column))
@@ -64,7 +65,10 @@ pub(crate) fn split_qualified_reference(expr: &str) -> Option<(&str, &str)> {
 fn is_identifier(part: &str) -> bool {
     let trimmed = part.trim();
     if let Some(inner) = stripped_quoted_ident(trimmed) {
-        return !inner.is_empty() && !inner.contains('"');
+        // Doubled quotes are the escaped-quote spelling INSIDE a quoted
+        // identifier (the scan loop above already honors them).
+        let unescaped = inner.replace("\"\"", "");
+        return !inner.is_empty() && !unescaped.contains('"');
     }
     let mut chars = trimmed.chars();
     match chars.next() {
@@ -72,6 +76,10 @@ fn is_identifier(part: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_dotted_identifier_path(part: &str) -> bool {
+    part.split('.').all(is_identifier)
 }
 
 fn stripped_quoted_ident(part: &str) -> Option<&str> {

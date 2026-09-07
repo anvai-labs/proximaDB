@@ -25,7 +25,6 @@ use super::translator::QueryTranslator;
 use super::types::{FieldDescription, PgType};
 use crate::catalog::CatalogManager;
 use crate::core::utils::find_ascii_ci;
-use crate::core::utils::find_ascii_ci_outside_quotes;
 use crate::graph::GraphService;
 use crate::network::arrow_ipc::ArrowProtoCodec;
 use crate::observability::ObservabilityService;
@@ -1370,29 +1369,19 @@ impl PostgresProtocol {
             .unwrap_or(rest)
             .trim_start();
 
-        // '='-split first. An UNQUOTED name never legitimately contains
-        // ' TO ' — that shape means TO-syntax whose VALUE held '=' (e.g. a
-        // padded base64 tenant id); mis-splitting it silently skips the
-        // tenant assertion gate below. QUOTED names may contain anything
-        // ("time TO live"), so they keep the plain '='-split.
-        let (name, value) = if let Some(eq_index) = rest.find('=') {
-            let candidate = &rest[..eq_index];
-            let quoted = candidate.trim_start().starts_with('"');
-            // An unquoted candidate containing ' TO ' implies rest has one
-            // too (the candidate is a prefix) — the guard is structural.
-            if !quoted
-                && find_ascii_ci(candidate, " TO ").is_some()
-                && let Some(to_index) = find_ascii_ci(rest, " TO ")
-            {
-                (&rest[..to_index], &rest[to_index + " TO ".len()..])
-            } else {
-                (candidate, &rest[eq_index + 1..])
-            }
-        } else {
-            let Some(to_index) = find_ascii_ci_outside_quotes(rest, " TO ") else {
+        // Both separators found OUTSIDE quotes (a quoted name may contain
+        // ' TO '; a quoted value may contain '='), then split at whichever
+        // comes first — mis-splitting garbles the name and silently skips
+        // the tenant assertion gate below.
+        let eq_pos = crate::core::utils::find_ascii_ci_outside_quotes(rest, "=");
+        let to_pos = crate::core::utils::find_ascii_ci_outside_quotes(rest, " TO ");
+        let (name, value) = match (eq_pos, to_pos) {
+            (Some(eq), Some(to)) if eq < to => (&rest[..eq], &rest[eq + 1..]),
+            (_, Some(to)) => (&rest[..to], &rest[to + " TO ".len()..]),
+            (Some(eq), None) => (&rest[..eq], &rest[eq + 1..]),
+            (None, None) => {
                 return Err(anyhow!("expected SET name = value or SET name TO value"));
-            };
-            (&rest[..to_index], &rest[to_index + " TO ".len()..])
+            }
         };
 
         let name = name.trim().trim_matches('"').to_ascii_lowercase();
