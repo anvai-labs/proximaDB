@@ -39,6 +39,14 @@ pub enum RunLifecycle {
 pub enum RunStatus {
     Running,
     Finished,
+    Failed,
+    Killed,
+}
+
+impl RunStatus {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, RunStatus::Running)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,9 +82,51 @@ pub struct RunRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricPoint {
     pub key: String,
+    /// Proto3-JSON convention both ways: serde_json writes non-finite f64
+    /// as `null` (unreadable on the way back), so non-finite values
+    /// serialize as the strings "NaN" / "Infinity" / "-Infinity" and the
+    /// deserializer accepts numbers or those strings. Without this, one
+    /// diverged-loss metric corrupts the whole run document.
+    #[serde(with = "metric_value_lossy")]
     pub value: f64,
     pub timestamp_ms: i64,
     pub step: i64,
+}
+
+mod metric_value_lossy {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        if v.is_nan() {
+            "NaN".serialize(s)
+        } else if *v == f64::INFINITY {
+            "Infinity".serialize(s)
+        } else if *v == f64::NEG_INFINITY {
+            "-Infinity".serialize(s)
+        } else {
+            s.serialize_f64(*v)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        let raw = serde_json::Value::deserialize(d)?;
+        match raw {
+            serde_json::Value::Number(n) => n
+                .as_f64()
+                .ok_or_else(|| serde::de::Error::custom("metric value out of f64 range")),
+            serde_json::Value::String(s) => match s.as_str() {
+                "NaN" => Ok(f64::NAN),
+                "Infinity" => Ok(f64::INFINITY),
+                "-Infinity" => Ok(f64::NEG_INFINITY),
+                other => other.parse::<f64>().map_err(|_| {
+                    serde::de::Error::custom(format!("invalid metric value '{other}'"))
+                }),
+            },
+            other => Err(serde::de::Error::custom(format!(
+                "metric value must be a number or numeric string, got {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,6 +151,8 @@ pub enum RunStoreError {
     ParamImmutable { key: String, run_id: String },
     #[error("run '{run_id}' is finished; metric/param writes are rejected")]
     RunFinished { run_id: String },
+    #[error("finish_run requires a terminal status, got Running")]
+    NotTerminal,
     #[error("experiment {experiment_id} is deleted; run creation is rejected")]
     ExperimentDeleted { experiment_id: u64 },
     #[error("names and ids must be non-empty")]
@@ -165,8 +217,17 @@ pub trait RunStore: Send + Sync {
         include_deleted: bool,
     ) -> Result<Vec<RunRecord>, RunStoreError>;
 
-    /// One-way terminal transition.
-    async fn finish_run(&self, run_id: &str, end_time_ms: i64) -> Result<(), RunStoreError>;
+    /// Terminal transition with the MLflow status (Finished/Failed/Killed);
+    /// any terminal status freezes param/metric writes.
+    async fn finish_run(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        end_time_ms: i64,
+    ) -> Result<(), RunStoreError>;
+
+    /// Reopen a terminal run (MLflow UpdateRun -> RUNNING).
+    async fn reopen_run(&self, run_id: &str) -> Result<(), RunStoreError>;
 
     /// Soft-delete a run (hides from listing; direct get still works).
     async fn delete_run(&self, run_id: &str) -> Result<(), RunStoreError>;
@@ -396,7 +457,15 @@ pub mod conformance_tests {
                 .collect())
         }
 
-        async fn finish_run(&self, run_id: &str, end_time_ms: i64) -> Result<(), RunStoreError> {
+        async fn finish_run(
+            &self,
+            run_id: &str,
+            status: RunStatus,
+            end_time_ms: i64,
+        ) -> Result<(), RunStoreError> {
+            if !status.is_terminal() {
+                return Err(RunStoreError::NotTerminal);
+            }
             let mut runs = self.runs.lock().unwrap();
             let run = runs
                 .iter_mut()
@@ -404,8 +473,21 @@ pub mod conformance_tests {
                 .ok_or_else(|| RunStoreError::UnknownRun {
                     run_id: run_id.to_string(),
                 })?;
-            run.status = RunStatus::Finished;
+            run.status = status;
             run.end_time_ms = Some(end_time_ms);
+            Ok(())
+        }
+
+        async fn reopen_run(&self, run_id: &str) -> Result<(), RunStoreError> {
+            let mut runs = self.runs.lock().unwrap();
+            let run = runs
+                .iter_mut()
+                .find(|r| r.run_id == run_id)
+                .ok_or_else(|| RunStoreError::UnknownRun {
+                    run_id: run_id.to_string(),
+                })?;
+            run.status = RunStatus::Running;
+            run.end_time_ms = None;
             Ok(())
         }
 
@@ -446,7 +528,7 @@ pub mod conformance_tests {
                         run_id: run_id.to_string(),
                     }
                 })?;
-                if run.status == RunStatus::Finished {
+                if run.status.is_terminal() {
                     return Err(RunStoreError::RunFinished {
                         run_id: run_id.to_string(),
                     });
@@ -483,7 +565,7 @@ pub mod conformance_tests {
                         run_id: run_id.to_string(),
                     }
                 })?;
-                if run.status == RunStatus::Finished {
+                if run.status.is_terminal() {
                     return Err(RunStoreError::RunFinished {
                         run_id: run_id.to_string(),
                     });
@@ -502,7 +584,15 @@ pub mod conformance_tests {
                     .ok_or_else(|| RunStoreError::UnknownRun {
                         run_id: run_id.to_string(),
                     })?;
-                run.latest_metrics.insert(point.key.clone(), point.clone());
+                let advances_projection =
+                    run.latest_metrics.get(&point.key).is_none_or(|current| {
+                        point.timestamp_ms > current.timestamp_ms
+                            || (point.timestamp_ms == current.timestamp_ms
+                                && point.value > current.value)
+                    });
+                if advances_projection {
+                    run.latest_metrics.insert(point.key.clone(), point.clone());
+                }
                 history_len = self
                     .history
                     .lock()
@@ -682,16 +772,33 @@ pub mod conformance_tests {
             timestamp_ms: 2_000,
             step: 1,
         };
+        let older = MetricPoint {
+            key: "rmse".to_string(),
+            value: 0.1,
+            timestamp_ms: 1_500,
+            step: 2,
+        };
+        let same_time_higher = MetricPoint {
+            key: "rmse".to_string(),
+            value: 0.8,
+            timestamp_ms: 2_000,
+            step: 3,
+        };
         store.log_metric("run-0001", p1.clone()).await.unwrap();
         let append = store.log_metric("run-0001", p2.clone()).await.unwrap();
         assert_eq!(append.history_len, 2);
+        store.log_metric("run-0001", older.clone()).await.unwrap();
+        store
+            .log_metric("run-0001", same_time_higher.clone())
+            .await
+            .unwrap();
         assert_eq!(
             store.metric_history("run-0001", "rmse").await.unwrap(),
-            vec![p1.clone(), p2.clone()]
+            vec![p1.clone(), p2, older, same_time_higher.clone()]
         );
         assert_eq!(
             store.get_run("run-0001").await.unwrap().latest_metrics["rmse"],
-            p2
+            same_time_higher
         );
 
         // Tags are mutable.
@@ -720,7 +827,10 @@ pub mod conformance_tests {
             }
         );
         assert_eq!(
-            store.finish_run("no-such-run", 1).await.unwrap_err(),
+            store
+                .finish_run("no-such-run", RunStatus::Finished, 1)
+                .await
+                .unwrap_err(),
             RunStoreError::UnknownRun {
                 run_id: "no-such-run".to_string()
             }
@@ -749,7 +859,7 @@ pub mod conformance_tests {
                 .await
                 .unwrap()
                 .len(),
-            3,
+            5,
             "seq must survive tag rewrites — history docs must never be overwritten"
         );
 
@@ -765,7 +875,10 @@ pub mod conformance_tests {
         assert_eq!(store.dataset_inputs("run-0001").await.unwrap(), vec![ds]);
 
         // Finish is one-way and freezes param writes too (port contract).
-        store.finish_run("run-0001", 9_000).await.unwrap();
+        store
+            .finish_run("run-0001", RunStatus::Finished, 9_000)
+            .await
+            .unwrap();
         assert_eq!(
             store.log_param("run-0001", "late", "1").await.unwrap_err(),
             RunStoreError::RunFinished {
@@ -780,6 +893,45 @@ pub mod conformance_tests {
         let restored = store.get_run("run-0001").await.unwrap();
         assert_eq!(restored.lifecycle, RunLifecycle::Active);
         assert_eq!(restored.status, RunStatus::Finished);
+
+        // Reopen (MLflow UpdateRun -> RUNNING): writes accepted again, end
+        // time cleared; re-finish with a FAILED terminal status.
+        store.reopen_run("run-0001").await.unwrap();
+        let reopened = store.get_run("run-0001").await.unwrap();
+        assert_eq!(reopened.status, RunStatus::Running);
+        assert_eq!(reopened.end_time_ms, None);
+        store
+            .log_metric(
+                "run-0001",
+                MetricPoint {
+                    key: "rmse".to_string(),
+                    value: 0.05,
+                    timestamp_ms: 9_600,
+                    step: 4,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .finish_run("run-0001", RunStatus::Failed, 9_700)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_run("run-0001").await.unwrap().status,
+            RunStatus::Failed
+        );
+        assert_eq!(
+            store
+                .finish_run("run-0001", RunStatus::Running, 9_800)
+                .await
+                .unwrap_err(),
+            RunStoreError::NotTerminal
+        );
+        store.reopen_run("run-0001").await.unwrap();
+        store
+            .finish_run("run-0001", RunStatus::Finished, 9_000)
+            .await
+            .unwrap();
         assert_eq!(
             store
                 .log_metric(
@@ -829,8 +981,8 @@ pub mod conformance_tests {
                 .await
                 .unwrap()
                 .len(),
-            3,
-            "run-0001 history: two early points + the post-tag-rewrite append"
+            6,
+            "run-0001 history: four early points + post-tag-rewrite + post-reopen appends"
         );
         assert_eq!(
             store

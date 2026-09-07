@@ -535,9 +535,17 @@ impl RestServer {
         // `[server.admin_ui] enabled`. This legacy multi-port path never serves it.
 
         // Add V2 API router with ProximaRecord support
-        let v2_router = super::v2::create_v2_router().with_state(state_for_v2);
+        let v2_router = super::v2::create_v2_router().with_state(state_for_v2.clone());
         base_router = base_router.nest("/api/v2", v2_router);
         tracing::info!("✅ V2 API enabled at /api/v2 (ProximaRecord, typed schema)");
+
+        // TD-MLOPS-1 slice 2: MLflow-compatible tracking wire, default OFF.
+        if super::mlflow::enabled() {
+            let mlflow_state = super::mlflow::MlflowState::new(state.document_service.clone());
+            let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state);
+            base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
+            tracing::info!("✅ MLflow compatibility wire enabled at /api/2.0/mlflow");
+        }
 
         // Unmatched routes (incl. the removed v1 surfaces) return the canonical
         // error envelope with a migration hint pointing at the v2 replacement.
@@ -911,9 +919,17 @@ impl RestServer {
         }
 
         // Add V2 API router with ProximaRecord support
-        let v2_router = super::v2::create_v2_router().with_state(state_for_v2);
+        let v2_router = super::v2::create_v2_router().with_state(state_for_v2.clone());
         base_router = base_router.nest("/api/v2", v2_router);
         tracing::info!("✅ V2 API enabled at /api/v2 (unified mode)");
+
+        // TD-MLOPS-1 slice 2: MLflow-compatible tracking wire, default OFF.
+        if super::mlflow::enabled() {
+            let mlflow_state = super::mlflow::MlflowState::new(state.document_service.clone());
+            let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state);
+            base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
+            tracing::info!("✅ MLflow compatibility wire enabled at /api/2.0/mlflow");
+        }
 
         // Unmatched routes (incl. removed v1 surfaces) → canonical 404 + hint.
         base_router = base_router.fallback(not_found_fallback);

@@ -170,6 +170,24 @@ execution; MLflow auth pass-through (tenant identity stays ours).
 
 == Implementation log
 
+* **Slice 2 (2026-09-07)**: the MLflow tracking wire at `/api/2.0/mlflow/*`
+  (`src/network/rest/mlflow/`) — 16 endpoints over the RunStore port:
+  experiments create/get/search/delete/restore, runs
+  create/get/update/search/delete/restore, log-parameter, log-metric,
+  log-batch, set-tag, delete-tag. MLflow REST 2.x shapes (string ids,
+  info/data split, `mlflow.runName` tag) and the native error envelope
+  (`{error_code, message}` — RESOURCE_DOES_NOT_EXIST / ALREADY_EXISTS /
+  INVALID_PARAMETER_VALUE / INVALID_STATE / INTERNAL_ERROR). Tenant from
+  the shared `Extension<TenantContext>` plane, never body fields;
+  cross-tenant probes are byte-identical to missing-id probes. Search
+  subset: params/tags = != LIKE, metrics < <= > >= = !=, ANDed;
+  unparseable filters are INVALID_PARAMETER_VALUE (never silently
+  ignored); non-matching filters return EMPTY (negative control pinned).
+  Gate `PROXIMADB_MLFLOW_COMPAT_ENABLE` (opt-in, default OFF; registry
+  row added) mounts the router in BOTH server modes. Wire tests in the
+  unit lane: full workflow, tenant-uniformity, gate default. The
+  real-client (mlflow-skinny, pinned) conformance lane follows as this
+  slice's closing commit.
 * **Slice 1 (2026-09-06)**: `RunStore` port + in-memory reference +
   `port_conformance` battery (`crates/control/proximadb-catalog/src/run_store.rs`);
   `SubstrateRunStore` over the document substrate
