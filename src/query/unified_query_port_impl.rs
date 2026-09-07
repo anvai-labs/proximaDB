@@ -535,11 +535,7 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     // and trim_matches destroyed trailing doubled quotes before the
     // decode. GRAPH_QUERY stays omitted (its cypher arg never resolves).
     for function in ["VECTOR_SEARCH", "DOCUMENT_QUERY", "LOGS", "METRICS"] {
-        crate::network::rest::canonical::multimodal_query::collect_quoted_first_args(
-            sql,
-            function,
-            &mut targets,
-        );
+        crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
     }
 
     targets
@@ -1096,8 +1092,13 @@ mod tests {
             ]
         });
         let sql = json_to_multi_model_sql(&req).unwrap().unwrap();
-        assert!(sql.contains("VECTOR_SEARCH('embeddings'"));
-        assert!(sql.contains(", 5)"));
+        // STRICT vector pin: the splice is QUOTED (the bare '[...]'
+        // spelling was the round-15/20 churn — substring pins passed
+        // under both).
+        assert_eq!(
+            sql,
+            "SELECT * FROM VECTOR_SEARCH('embeddings', '[0.1,0.2,0.3]', 5)"
+        );
     }
 
     #[test]

@@ -28,6 +28,27 @@ pub(crate) fn vector_source_from_expression(expr: &str) -> VectorSource {
     }
 }
 
+/// Strip a trailing `::vector` cast (any ASCII case, optional `(dim)`),
+/// returning the input unchanged when no cast is present.
+fn strip_vector_cast_suffix(input: &str) -> &str {
+    let lower = input.to_ascii_lowercase();
+    let Some(cast_start) = lower.rfind("::vector") else {
+        return input;
+    };
+    let after = &input[cast_start + 8..];
+    let dimension_ok = after.is_empty()
+        || (after.starts_with('(')
+            && after.ends_with(')')
+            && after[1..after.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_digit()));
+    if dimension_ok {
+        &input[..cast_start]
+    } else {
+        input
+    }
+}
+
 pub(crate) fn split_qualified_reference(expr: &str) -> Option<(&str, &str)> {
     let mut in_quotes = false;
     let mut chars = expr.char_indices().peekable();
@@ -117,11 +138,11 @@ fn stripped_quoted_ident(part: &str) -> Option<&str> {
 
 pub(crate) fn parse_vector_literal(raw: &str) -> Option<Vec<f32>> {
     let trimmed = raw.trim();
-    let without_cast = trimmed
-        .strip_suffix("::vector")
-        .or_else(|| trimmed.strip_suffix("::VECTOR"))
-        .unwrap_or(trimmed)
-        .trim();
+    // Case-insensitive, optionally dimensioned cast suffix ('::vector',
+    // '::Vector', '::vector(3)') — the fusion front parser accepts all of
+    // these (strip_vector_cast); the executor's re-parse must agree or a
+    // front-accepted literal fails here as an 'unsupported expression'.
+    let without_cast = strip_vector_cast_suffix(trimmed).trim();
     let unquoted = without_cast.trim_matches('\'').trim_matches('"').trim();
 
     if !(unquoted.starts_with('[') && unquoted.ends_with(']')) {

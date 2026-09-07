@@ -453,11 +453,19 @@ impl FederatedParser {
         }
 
         if let Some(rest) = trimmed.strip_prefix('\'') {
+            let mut in_doubled_pair = false;
             for (idx, ch) in rest.char_indices() {
+                if in_doubled_pair {
+                    // second char of a doubled close-quote — the pair is
+                    // literal content, NOT the close.
+                    in_doubled_pair = false;
+                    continue;
+                }
                 // POSTGRES dialect: a DOUBLED close-quote is an escaped
                 // quote inside the literal; backslash is a literal.
                 if ch == '\'' && rest[(idx + ch.len_utf8())..].starts_with('\'') {
-                    continue; // the pair stays inside the literal
+                    in_doubled_pair = true;
+                    continue;
                 }
                 if ch == '\'' {
                     let literal_end = 1 + idx + ch.len_utf8();
@@ -1087,8 +1095,8 @@ mod tests {
         let query = path_arg.expect("trailing backslash does not break parsing");
         assert!(
             matches!(&query.extensions[0], SqlExtension::Logs { namespace }
-                if namespace.contains("dir")),
-            "namespace should contain the path: {:?}",
+                if namespace == "C:\\dir\\"),
+            "namespace must keep the backslashes exactly: {:?}",
             query.extensions[0]
         );
 

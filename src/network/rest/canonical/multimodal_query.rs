@@ -952,84 +952,12 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
 
     for function_name in ["VECTOR_SEARCH", "DOCUMENT_QUERY", "LOGS", "METRICS"] {
-        collect_quoted_first_args(sql, function_name, &mut targets);
+        crate::core::utils::collect_quoted_first_args(sql, function_name, &mut targets);
     }
 
     collect_from_targets(sql, &mut targets);
     targets.dedup();
     targets
-}
-
-pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
-    // ASCII-case search on the original (shared helper — offsets in a
-    // to_uppercase copy can slice mid-character).
-    let mut search_start = 0;
-
-    while let Some(relative_pos) =
-        crate::core::utils::find_ascii_ci(&sql[search_start..], function_name)
-    {
-        let name_start = search_start + relative_pos;
-        let after_name = name_start + function_name.len();
-        let Some(open_relative) = sql[after_name..].find('(') else {
-            break;
-        };
-        let mut arg_start = after_name + open_relative + 1;
-        while let Some(ch) = sql[arg_start..].chars().next() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            arg_start += ch.len_utf8();
-        }
-        // Unquoted and DOUBLE-QUOTED first args are collection targets
-        // too (the fusion parser accepts them); '$'-prefixed bind params
-        // are not. The old port-side loop handled these; the delegation
-        // must not narrow extraction to single-quoted args.
-        if !sql[arg_start..].starts_with('\'') {
-            let candidate_end = sql[arg_start..]
-                .find([',', ')'])
-                .map(|rel| arg_start + rel)
-                .unwrap_or(sql.len());
-            let candidate = sql[arg_start..candidate_end].trim();
-            let decoded = candidate.trim_matches('"').replace("\"\"", "\"");
-            if !decoded.is_empty() && !decoded.starts_with('$') {
-                push_unique_target(targets, &decoded);
-            }
-            search_start = candidate_end;
-            continue;
-        }
-        if sql[arg_start..].starts_with('\'') {
-            let value_start = arg_start + 1;
-            // Quote-doubling aware close scan — this PR's own generators
-            // emit doubled quotes (escape_sql_text), and the plain find
-            // truncated at the first one, extracting the wrong target.
-            let mut scan = value_start;
-            let mut closed = None;
-            let bytes = sql.as_bytes();
-            while scan < bytes.len() {
-                if bytes[scan] == b'\'' {
-                    if scan + 1 < bytes.len() && bytes[scan + 1] == b'\'' {
-                        scan += 2; // doubled quote: stays inside the literal
-                        continue;
-                    }
-                    closed = Some(scan);
-                    break;
-                }
-                scan += 1;
-            }
-            if let Some(close) = closed {
-                let value = sql[value_start..close]
-                    .replace("''", "'")
-                    .trim()
-                    .to_string();
-                if !value.is_empty() {
-                    push_unique_target(targets, &value);
-                }
-                search_start = close + 1;
-                continue;
-            }
-        }
-        search_start = after_name;
-    }
 }
 
 fn collect_from_targets(sql: &str, targets: &mut Vec<String>) {
@@ -1973,10 +1901,11 @@ fn json_to_parameter_value(v: &serde_json::Value) -> ParameterValue {
         serde_json::Value::Bool(b) => ParameterValue::Bool(*b),
         serde_json::Value::Null => ParameterValue::Null,
         serde_json::Value::Array(arr) => {
-            // Try to parse as vector of f32
+            // Try to parse as a vector of FINITE f32 (the ONE narrowing
+            // guard — f32 overflow would dispatch inf to the kernels).
             let floats: Vec<f32> = arr
                 .iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .filter_map(|v| v.as_f64().and_then(crate::core::utils::finite_f32))
                 .collect();
             if floats.len() == arr.len() {
                 ParameterValue::Vector(floats)

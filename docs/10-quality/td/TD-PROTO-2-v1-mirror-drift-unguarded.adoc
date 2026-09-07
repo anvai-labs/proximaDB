@@ -1370,6 +1370,35 @@ angles after the main agent hit a rate limit):**
   delegation had narrowed extraction to single-quoted only). The DML
   string-arm parse is lazy again (intermediate Vec = ~36KB/row on
   1536-dim INSERT coercion).
+
+**Consolidation review round 30 (2026-09-07):**
+- The parallel session's UTF-8-offset fix missed extract_select_items
+  in the same file (rfind on the uppercased copy sliced the original
+  mid-character — a reachable panic on 'ﬀ'-class literals) — ASCII-case
+  on the original now. parse_vector_distance_rhs got the pair-skip its
+  five siblings received (round 29's 'all six' claim was wrong for it
+  — the doubled pair's SECOND quote re-closed the literal).
+- The root parse_vector_literal strips case-insensitive, optionally
+  dimensioned cast suffixes ('::Vector', '::vector(3)') — the fusion
+  front parser accepts them, so the executor's re-parse had to agree
+  (front-accepts-then-execute-fails was the divergence).
+- finite_f32 homed in core::utils as the ONE f64→f32 narrowing guard;
+  the multimodal JSON-param converter guarded (the metric data-point
+  narrowing at execution/mod.rs:1858 is a rendering path, left
+  deliberately). collect_quoted_first_args MOVED to core::utils — the
+  query layer was importing the NETWORK layer's scanner (layering
+  inversion); both EXPLAIN twins now consume the neutral home.
+- Pins made exact: the dialect test asserts namespace == "C:\dir\"
+  (contains("dir") passed under mangled spellings); the multimodal
+  vector splice pinned assert_eq (substring pins passed under the bare
+  spelling). The unquoted-arg arm ends with continue (clippy: dead
+  assignment).
+- Tracked: the postgres quote-dialect state machine is hand-encoded
+  EIGHT times across three mechanisms (parser ×3, sql_parsing ×3,
+  core::utils ×2) — rounds 23/24/28/29/30 each fixed a different
+  subset; one shared scanner consumable from both crates is the
+  terminal fix. Same for the ~11-site finite_f32 swap-in (the
+  chokepoint exists; the sites migrate incrementally).
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

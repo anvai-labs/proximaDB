@@ -165,8 +165,15 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
     split_top_level_list(clause)
         .into_iter()
         .map(|item| {
-            let upper = item.to_uppercase();
-            if let Some(as_pos) = upper.rfind(" AS ") {
+            // ASCII-case search on the ORIGINAL — an offset into a
+            // to_uppercase() copy can slice the original mid-character
+            // (uppercase changes UTF-8 byte lengths; the sibling scanners
+            // in this file were fixed for the same class).
+            let bytes = item.as_bytes();
+            let as_pos = bytes
+                .windows(4)
+                .rposition(|w| w.eq_ignore_ascii_case(b" AS "));
+            if let Some(as_pos) = as_pos {
                 SelectItem {
                     expression: item[..as_pos].trim().to_string(),
                     alias: Some(item[as_pos + 4..].trim().to_string()),

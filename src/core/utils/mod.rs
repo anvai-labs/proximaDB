@@ -97,3 +97,84 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
     }
     None
 }
+
+/// The ONE f64→f32 narrowing guard: the narrowing can overflow to inf
+/// (1e300), and non-finite components must never dispatch to the distance
+/// kernels — every narrowing site funnels through here so the policy is
+/// auditable in one place.
+pub fn finite_f32(value: f64) -> Option<f32> {
+    let narrowed = value as f32;
+    narrowed.is_finite().then_some(narrowed)
+}
+
+pub fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
+    // ASCII-case search on the original (shared helper — offsets in a
+    // to_uppercase copy can slice mid-character).
+    let mut search_start = 0;
+
+    while let Some(relative_pos) = find_ascii_ci(&sql[search_start..], function_name) {
+        let name_start = search_start + relative_pos;
+        let after_name = name_start + function_name.len();
+        let Some(open_relative) = sql[after_name..].find('(') else {
+            break;
+        };
+        let mut arg_start = after_name + open_relative + 1;
+        while let Some(ch) = sql[arg_start..].chars().next() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            arg_start += ch.len_utf8();
+        }
+        // Unquoted and DOUBLE-QUOTED first args are collection targets
+        // too (the fusion parser accepts them); '$'-prefixed bind params
+        // are not. The old port-side loop handled these; the delegation
+        // must not narrow extraction to single-quoted args.
+        if !sql[arg_start..].starts_with('\'') {
+            let candidate_end = sql[arg_start..]
+                .find([',', ')'])
+                .map(|rel| arg_start + rel)
+                .unwrap_or(sql.len());
+            let candidate = sql[arg_start..candidate_end].trim();
+            let decoded = candidate.trim_matches('"').replace("\"\"", "\"");
+            if !decoded.is_empty()
+                && !decoded.starts_with('$')
+                && !targets.iter().any(|existing| existing == &decoded)
+            {
+                targets.push(decoded.clone());
+            }
+            search_start = candidate_end;
+            continue;
+        } else if sql[arg_start..].starts_with('\'') {
+            let value_start = arg_start + 1;
+            // Quote-doubling aware close scan — this PR's own generators
+            // emit doubled quotes (escape_sql_text), and the plain find
+            // truncated at the first one, extracting the wrong target.
+            let mut scan = value_start;
+            let mut closed = None;
+            let bytes = sql.as_bytes();
+            while scan < bytes.len() {
+                if bytes[scan] == b'\'' {
+                    if scan + 1 < bytes.len() && bytes[scan + 1] == b'\'' {
+                        scan += 2; // doubled quote: stays inside the literal
+                        continue;
+                    }
+                    closed = Some(scan);
+                    break;
+                }
+                scan += 1;
+            }
+            if let Some(close) = closed {
+                let value = sql[value_start..close]
+                    .replace("''", "'")
+                    .trim()
+                    .to_string();
+                if !value.is_empty() && !targets.iter().any(|existing| existing == &value) {
+                    targets.push(value.clone());
+                }
+                search_start = close + 1;
+                continue;
+            }
+        }
+        search_start = after_name;
+    }
+}
