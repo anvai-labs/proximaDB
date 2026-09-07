@@ -1970,8 +1970,10 @@ jobs:
         run: |
           set -euo pipefail
           DATA_DIR="$(mktemp -d)"
-          PORT=45789
-          ./target/debug/proximadb-server -d "$DATA_DIR" -p "$PORT" &
+          # The unified server binds its configured port (5678 by default);
+          # `-p` does not override it — probe the port it actually serves.
+          PORT=5678
+          ./target/debug/proximadb-server -d "$DATA_DIR" &
           SERVER_PID=$!
           trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
           for i in $(seq 1 60); do
