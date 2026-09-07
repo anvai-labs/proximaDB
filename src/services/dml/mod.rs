@@ -5998,28 +5998,40 @@ impl DmlService {
             }
         };
         match val {
-            SqlValueLiteral::Array(arr) => arr
-                .iter()
-                .map(|v| match v {
-                    SqlValueLiteral::Float(f) => ensure_finite(*f as f32),
-                    SqlValueLiteral::Integer(i) => ensure_finite(*i as f32),
-                    _ => Err(anyhow!("Vector elements must be numeric")),
-                })
-                .collect(),
-            SqlValueLiteral::String(value) => value
-                .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(',')
-                .filter(|part| !part.trim().is_empty())
-                .map(|part| {
-                    let f = part
-                        .trim()
-                        .parse::<f32>()
-                        .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))?;
-                    ensure_finite(f)
-                })
-                .collect(),
+            SqlValueLiteral::Array(arr) => {
+                if arr.is_empty() {
+                    return Err(anyhow!("vector elements must be non-empty"));
+                }
+                arr.iter()
+                    .map(|v| match v {
+                        SqlValueLiteral::Float(f) => ensure_finite(*f as f32),
+                        SqlValueLiteral::Integer(i) => ensure_finite(*i as f32),
+                        _ => Err(anyhow!("Vector elements must be numeric")),
+                    })
+                    .collect()
+            }
+            SqlValueLiteral::String(value) => {
+                let parts: Vec<&str> = value
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .filter(|part| !part.trim().is_empty())
+                    .collect();
+                if parts.is_empty() {
+                    return Err(anyhow!("vector elements must be non-empty"));
+                }
+                parts
+                    .iter()
+                    .map(|part| {
+                        let f = part
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))?;
+                        ensure_finite(f)
+                    })
+                    .collect()
+            }
             _ => Err(anyhow!("Vector column expects array value")),
         }
     }

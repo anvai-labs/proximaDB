@@ -1317,6 +1317,34 @@ angles after the main agent hit a rate limit):**
 - STRICT pins added for the most-rechurned spellings (Json by-shape:
   null/scalars/containers; the quoted vector splice) — the substring
   forms passed under every prior spelling.
+
+**Consolidation review round 28 (2026-09-07):**
+- ESCAPE DIALECT MERGE across all five scanners: doubled close-quotes
+  stay in-quote (SQL standard) AND a backslash immediately before a
+  quote escapes it (MySQL 'O\'Brien') — any OTHER backslash is literal.
+  The round-23/24 removal fixed trailing-backslash desyncs but silently
+  broke MySQL-style escapes (phantom strings swallowed ORDER BY/LIMIT).
+- The ONE non-finite + empty policies reached the last paths: the
+  nested-JSON correlated resolver (parse_vector_component's f32
+  NARROWING overflowed to inf with a dead 'non-finite' error arm —
+  serde numbers are finite as f64 but not as f32; the Array arm
+  returned vec![]) and the DML WRITE empty half (round 24 fixed only
+  non-finite there).
+- STORED non-finite cells SKIP the row instead of erroring every
+  correlated read (the Arrow finite gate + List fallbacks now follow
+  the null-row semantics — one pre-gate poison row no longer fails the
+  whole query; develop returned NaN-ordered results, so this is the
+  availability-preserving middle).
+- The port EXPLAIN extractor delegates to the REST twin's quote-aware
+  collect_quoted_first_args (the hand-rolled split truncated quoted
+  names at their first comma and trim_matches destroyed trailing
+  doubled quotes).
+- The round-28 review's quoted-column finding was a FALSE POSITIVE —
+  quoted dotted ALIASES are a test-pinned lateral form the executor
+  resolves; the attempted validator tightening broke 7 tests and was
+  reverted same-commit.
+- The round-27 'strict pins' were not strict (a {{}}-mangled literal in
+  one; contains('k')/contains('v') in the other) — both exact now.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

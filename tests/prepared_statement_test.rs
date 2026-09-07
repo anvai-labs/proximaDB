@@ -266,7 +266,11 @@ fn test_bind_json_parameter() {
     // STRICT pin of the Json splice shape (substring checks passed under
     // every prior spelling the branch cycled through): a JSON OBJECT
     // splices as QUOTED compact JSON text.
-    assert!(sql.contains("'{{\"category\":\"electronics\"}}'") || sql.contains("category"));
+    assert!(
+        sql.contains("'{{\"category\":\"electronics\"")
+            || sql.contains("'{\"category\":\"electronics\""),
+        "json container param must splice as quoted compact JSON, got: {sql}"
+    );
 }
 
 /// Test binding multiple mixed-type parameters

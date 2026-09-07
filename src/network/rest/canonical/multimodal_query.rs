@@ -960,7 +960,7 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     targets
 }
 
-fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
+pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
     // ASCII-case search on the original (shared helper — offsets in a
     // to_uppercase copy can slice mid-character).
     let mut search_start = 0;

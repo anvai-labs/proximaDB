@@ -819,9 +819,10 @@ mod tests {
             ParameterValue::Json(serde_json::json!(42)).to_sql_string(),
             "42"
         );
-        let object_sql = ParameterValue::Json(serde_json::json!({"k": "v"})).to_sql_string();
-        assert!(object_sql.starts_with('\'') && object_sql.ends_with('\''));
-        assert!(object_sql.contains("k") && object_sql.contains("v"));
+        assert_eq!(
+            ParameterValue::Json(serde_json::json!({"k": "v"})).to_sql_string(),
+            "'{\"k\":\"v\"}'"
+        );
     }
 
     #[test]

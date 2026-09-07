@@ -453,9 +453,15 @@ impl FederatedParser {
         }
 
         if let Some(rest) = trimmed.strip_prefix('\'') {
+            let mut skip_next = false;
             for (idx, ch) in rest.char_indices() {
-                // Quote-doubling escapes; backslash is not an escape.
-                if ch == '\'' {
+                if skip_next {
+                    // the quote after a backslash-escape (MySQL dialect)
+                    skip_next = false;
+                    continue;
+                }
+                skip_next = ch == '\\' && rest[(idx + ch.len_utf8())..].starts_with('\'');
+                if !skip_next && ch == '\'' {
                     let literal_end = 1 + idx + ch.len_utf8();
                     let mut end = literal_end;
                     let suffix = trimmed[literal_end..].trim_start();
@@ -615,14 +621,22 @@ impl FederatedParser {
         let mut bracket_depth = 0;
         let mut in_quote = None;
 
-        for c in s.chars() {
+        let mut chars = s.chars().peekable();
+        let mut skip_next = false;
+        while let Some(c) = chars.next() {
             if let Some(quote) = in_quote {
                 current.push(c);
-                // SQL string literals escape by QUOTE DOUBLING (decoded by
-                // unquote_sql_string) — treating backslash as an escape
-                // desyncs this scanner when a value ends in one (a
-                // Windows-style path absorbed the remaining arguments).
-                if c == quote {
+                if skip_next {
+                    // the quote after a backslash-escape (MySQL dialect)
+                    skip_next = false;
+                    continue;
+                }
+                // Dialect merge: doubled close-quote stays in-quote; a
+                // backslash immediately before a quote escapes it; any
+                // OTHER backslash is literal (the old stateful escape
+                // desynced when a value ENDED in one).
+                skip_next = c == '\\' && chars.peek() == Some(&quote);
+                if !skip_next && c == quote {
                     in_quote = None;
                 }
                 continue;
@@ -676,11 +690,18 @@ impl FederatedParser {
         let mut depth = 1;
         let mut in_quote = None;
 
+        let mut skip_next = false;
         for (i, c) in content.char_indices() {
             if let Some(quote) = in_quote {
-                // Quote-doubling escapes; backslash is not an escape (a
-                // value ending in one desynced this extent scanner).
-                if c == quote {
+                if skip_next {
+                    // the quote after a backslash-escape (MySQL dialect)
+                    skip_next = false;
+                    continue;
+                }
+                // Dialect merge: doubled close-quote stays in-quote; a
+                // backslash immediately before a quote escapes it.
+                skip_next = c == '\\' && content[(i + c.len_utf8())..].starts_with(quote);
+                if !skip_next && c == quote {
                     in_quote = None;
                 }
                 continue;

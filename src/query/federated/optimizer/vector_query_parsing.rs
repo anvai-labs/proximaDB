@@ -66,7 +66,10 @@ fn is_identifier(part: &str) -> bool {
     let trimmed = part.trim();
     if let Some(inner) = stripped_quoted_ident(trimmed) {
         // Doubled quotes are the escaped-quote spelling INSIDE a quoted
-        // identifier (the scan loop above already honors them).
+        // identifier (the scan loop above already honors them). Dots ARE
+        // allowed: quoted dotted ALIASES are a test-pinned lateral form
+        // ("Right.Alias".document.embedding) and the executor's alias
+        // resolution handles quoted names.
         let unescaped = inner.replace("\"\"", "");
         return !inner.is_empty() && !unescaped.contains('"');
     }

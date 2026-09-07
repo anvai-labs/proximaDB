@@ -19,12 +19,20 @@ pub(crate) fn find_top_level_keyword_from(
     let mut depth = 0usize;
     let mut in_quote = None;
 
+    let mut skip_next = false;
     for (index, ch) in sql.char_indices() {
         if let Some(quote) = in_quote {
-            // SQL literals escape by QUOTE DOUBLING (a doubled close-quote
-            // stays in-quote); backslash is not an escape — treating it as
-            // one desyncs the scanner when a value ends in a backslash.
-            if ch == quote {
+            if skip_next {
+                // the quote after a backslash-escape (MySQL dialect)
+                skip_next = false;
+                continue;
+            }
+            // Escape dialect merge: a doubled close-quote stays in-quote
+            // (SQL standard) AND a backslash immediately before a quote
+            // escapes it (MySQL) — any OTHER backslash is literal (the
+            // old stateful escape desynced on values ENDING in one).
+            skip_next = ch == '\\' && sql[(index + ch.len_utf8())..].starts_with(quote);
+            if !skip_next && ch == quote {
                 in_quote = None;
             }
             continue;
@@ -73,12 +81,21 @@ pub(crate) fn split_top_level_list(input: &str) -> Vec<String> {
     let mut depth = 0usize;
     let mut in_quote = None;
 
-    for ch in input.chars() {
+    let mut chars = input.chars().peekable();
+    let mut skip_next = false;
+    while let Some(ch) = chars.next() {
         if let Some(quote) = in_quote {
             current.push(ch);
-            // Quote-doubling escapes; backslash is not an escape (see the
-            // scanners above).
-            if ch == quote {
+            if skip_next {
+                // the quote after a backslash-escape (MySQL dialect)
+                skip_next = false;
+                continue;
+            }
+            // Dialect merge: doubled close-quote stays in-quote; a
+            // backslash immediately before a quote escapes it; any other
+            // backslash is literal (see the scanners above).
+            skip_next = ch == '\\' && chars.peek() == Some(&quote);
+            if !skip_next && ch == quote {
                 in_quote = None;
             }
             continue;
@@ -320,12 +337,19 @@ pub(crate) fn find_top_level_operator(input: &str, operator: &str) -> Option<usi
     let mut depth = 0usize;
     let mut in_quote = None;
 
+    let mut skip_next = false;
     for (index, ch) in input.char_indices() {
         if let Some(quote) = in_quote {
-            // SQL literals escape by QUOTE DOUBLING (a doubled close-quote
-            // stays in-quote); backslash is not an escape — treating it as
-            // one desyncs the scanner when a value ends in a backslash.
-            if ch == quote {
+            if skip_next {
+                // the quote after a backslash-escape (MySQL dialect)
+                skip_next = false;
+                continue;
+            }
+            // Dialect merge: doubled close-quote stays in-quote; a
+            // backslash immediately before a quote escapes it; any other
+            // backslash is literal.
+            skip_next = ch == '\\' && input[(index + ch.len_utf8())..].starts_with(quote);
+            if !skip_next && ch == quote {
                 in_quote = None;
             }
             continue;

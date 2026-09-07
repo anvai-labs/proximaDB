@@ -2077,11 +2077,12 @@ impl FederatedExecutor {
                 }
             }
             DataType::FixedSizeList(_, _) | DataType::List(_) => {
-                // Arrow extraction was already attempted above; if it didn't work then error
-                Err(anyhow!(
-                    "Correlated vector source '{}' has Arrow list type but could not extract Float32 values",
-                    requested
-                ))
+                // Arrow extraction was already attempted above. A stored
+                // non-finite cell (written pre-gate or via raw gRPC) SKIPS
+                // the row — the null-row semantics above — instead of one
+                // poison row failing every correlated read; genuinely
+                // wrong inner dtypes skip identically.
+                Ok(None)
             }
             other => Err(anyhow!(
                 "Correlated vector source '{}' uses unsupported outer column type {:?}",
@@ -2280,10 +2281,12 @@ impl FederatedExecutor {
                 Self::parse_vector_from_serialized_value(raw, source, &[])
                     .map(DirectVectorResolution::Resolved)
             }
-            DataType::FixedSizeList(_, _) | DataType::List(_) => Err(anyhow!(
-                "Correlated vector source '{}' has Arrow list type but could not extract Float32 values",
-                source
-            )),
+            DataType::FixedSizeList(_, _) | DataType::List(_) => {
+                // Stored non-finite/unextractable cells SKIP the row (the
+                // null-row semantics above) instead of one poison row
+                // failing every correlated read.
+                Ok(DirectVectorResolution::SkipRow)
+            }
             other => Err(anyhow!(
                 "Correlated vector source '{}' uses unsupported outer column type {:?}",
                 source,
@@ -2369,10 +2372,21 @@ impl FederatedExecutor {
         nested_path: &[&str],
     ) -> Result<Vec<f32>> {
         match value {
-            serde_json::Value::Array(values) => values
-                .iter()
-                .map(|value| Self::parse_vector_component(value, source, nested_path))
-                .collect(),
+            serde_json::Value::Array(values) => {
+                // The ONE empty-vector policy (a 0-dimension query is a
+                // deferred kernel error or garbage scores).
+                if values.is_empty() {
+                    return Err(anyhow!(
+                        "Nested vector source '{}.{}' is empty",
+                        source,
+                        nested_path.join(".")
+                    ));
+                }
+                values
+                    .iter()
+                    .map(|value| Self::parse_vector_component(value, source, nested_path))
+                    .collect()
+            }
             serde_json::Value::String(value) => {
                 Self::parse_vector_literal(value).ok_or_else(|| {
                     anyhow!(
@@ -2427,13 +2441,19 @@ impl FederatedExecutor {
     ) -> Result<f32> {
         match value {
             serde_json::Value::Number(number) => {
-                number.as_f64().map(|number| number as f32).ok_or_else(|| {
-                    anyhow!(
-                        "Nested vector source '{}.{}' contains a non-finite number",
+                // The ONE non-finite policy: serde_json numbers are always
+                // finite as f64, but the f32 NARROWING can overflow to inf
+                // (1e300) — the old ok_or_else 'non-finite' arm was dead
+                // code and inf reached the kernels on this path.
+                let narrowed = number.as_f64().unwrap_or(f64::NAN) as f32;
+                if !narrowed.is_finite() {
+                    return Err(anyhow!(
+                        "Nested vector source '{}.{}' contains a component outside the finite f32 range",
                         source,
                         nested_path.join(".")
-                    )
-                })
+                    ));
+                }
+                Ok(narrowed)
             }
             serde_json::Value::Object(object) => {
                 if let Some(inner) = object

@@ -530,36 +530,16 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
         }
     }
 
-    for function in [
-        "VECTOR_SEARCH",
-        "DOCUMENT_QUERY",
-        // GRAPH_QUERY omitted: its first arg is CYPHER, which always
-        // yields a bogus target (the REST twin omits it too).
-        "LOGS",
-        "METRICS",
-    ] {
-        let needle = format!("{function}(");
-        let mut search_from = 0;
-        while let Some(offset) = sql[search_from..].to_ascii_uppercase().find(&needle) {
-            let start = search_from + offset + needle.len();
-            let Some(rest) = sql.get(start..) else {
-                break;
-            };
-            let candidate = rest
-                .split([',', ')'])
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches('\'')
-                .trim_matches('"')
-                // Decode quote-doubling — the generators escape embedded
-                // quotes that way (the REST twin agrees).
-                .replace("''", "'");
-            if !candidate.is_empty() && !candidate.starts_with('$') {
-                targets.push(candidate.to_string());
-            }
-            search_from = start;
-        }
+    // The REST twin's QUOTE-AWARE first-arg scanner — the hand-rolled
+    // split([',', ')']) here truncated quoted names at their first comma
+    // and trim_matches destroyed trailing doubled quotes before the
+    // decode. GRAPH_QUERY stays omitted (its cypher arg never resolves).
+    for function in ["VECTOR_SEARCH", "DOCUMENT_QUERY", "LOGS", "METRICS"] {
+        crate::network::rest::canonical::multimodal_query::collect_quoted_first_args(
+            sql,
+            function,
+            &mut targets,
+        );
     }
 
     targets
