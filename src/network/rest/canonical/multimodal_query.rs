@@ -729,7 +729,9 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
 
                 format!(
                     "SELECT * FROM VECTOR_SEARCH('{}', '[{}]', {})",
-                    collection, query_vector, top_k
+                    collection.replace('\'', "''"),
+                    query_vector,
+                    top_k
                 )
             }
             "document" => {
@@ -746,7 +748,8 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
 
                 format!(
                     "SELECT * FROM DOCUMENT_QUERY('{}', '{}')",
-                    collection, filter
+                    collection.replace('\'', "''"),
+                    filter.replace('\'', "''")
                 )
             }
             "graph" => {
@@ -774,7 +777,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
 
-                format!("SELECT * FROM LOGS('{}')", namespace)
+                format!("SELECT * FROM LOGS('{}')", namespace.replace('\'', "''"))
             }
             "metric" => {
                 let namespace = component
@@ -783,7 +786,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
 
-                format!("SELECT * FROM METRICS('{}')", namespace)
+                format!("SELECT * FROM METRICS('{}')", namespace.replace('\'', "''"))
             }
             unknown => {
                 return Err(ApiError::InvalidArgument(format!(

@@ -65,8 +65,11 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         ProximaValue::Float64(v) => ParameterValue::Float(*v),
         ProximaValue::Boolean(v) => ParameterValue::Bool(*v),
         ProximaValue::DenseVector(values) => ParameterValue::Vector(values.clone()),
+        // Json params lower to the same filter-literal TEXT as the
+        // literal path (a root-string Json is BARE — the serde spelling
+        // embedded double quotes and could never match).
         ProximaValue::Json(value) | ProximaValue::Jsonb(value) => {
-            ParameterValue::Json(value.clone())
+            ParameterValue::String(filter_literal_text(value.clone()))
         }
         ProximaValue::Array(values) => ParameterValue::Json(serde_json::Value::Array(
             values.iter().map(proxima_filter_literal).collect(),
@@ -376,11 +379,18 @@ fn uql_to_federated_sql(
             if vector.is_empty() {
                 return Err(anyhow!("UQL vector query parameter cannot be empty"));
             }
-            let vector_json = serde_json::to_string(&vector)?;
+            // Float text, not serde_json (serde nulls non-finite
+            // elements and parse_vector_literal rejects null — 'NaN'
+            // text parses; matches the literal and param paths).
+            let vector_text = vector
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             Ok(Some(format!(
                 "SELECT * FROM VECTOR_SEARCH({}, {}, {})",
                 sql_quote(&select.from.collection),
-                sql_quote(&vector_json),
+                sql_quote(&format!("[{vector_text}]")),
                 limit
             )))
         }

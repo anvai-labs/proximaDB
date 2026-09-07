@@ -60,6 +60,7 @@ use crate::storage::traits::UnifiedStorageFormat;
 
 use crate::compute::quantization::types::UnifiedQuantizationLevel;
 use crate::core::search::FilterExpression;
+use crate::core::search::sql_value_filter::proxima_value_to_filter_literal;
 use crate::proto::proximadb_v1::Collection;
 use crate::query::query_optimizer::{
     ExecutionStep, OptimizationGoal, QuantizationStrategy, QuantizationType, UnifiedExecutionPlan,
@@ -264,13 +265,13 @@ pub(crate) fn rich_filters_to_filter_expression(
                 conditions.push(FilterExpression::Comparison {
                     field: field.clone(),
                     operator: ComparisonOperator::GreaterThanOrEqual,
-                    value: proxima_value_to_json(&filter.value),
+                    value: proxima_value_to_filter_literal(&filter.value),
                 });
                 if let Some(upper) = &filter.value_upper {
                     conditions.push(FilterExpression::Comparison {
                         field,
                         operator: ComparisonOperator::LessThanOrEqual,
-                        value: proxima_value_to_json(upper),
+                        value: proxima_value_to_filter_literal(upper),
                     });
                 }
             }
@@ -283,8 +284,9 @@ pub(crate) fn rich_filters_to_filter_expression(
                 } else {
                     filter.value_list.clone()
                 };
-                let array =
-                    serde_json::Value::Array(values.iter().map(proxima_value_to_json).collect());
+                let array = serde_json::Value::Array(
+                    values.iter().map(proxima_value_to_filter_literal).collect(),
+                );
                 conditions.push(FilterExpression::Comparison {
                     field,
                     operator: if matches!(filter.operator, RichFilterOperator::In) {
@@ -313,7 +315,7 @@ pub(crate) fn rich_filters_to_filter_expression(
                 conditions.push(FilterExpression::Comparison {
                     field,
                     operator,
-                    value: proxima_value_to_json(&filter.value),
+                    value: proxima_value_to_filter_literal(&filter.value),
                 });
             }
         }
@@ -334,15 +336,6 @@ pub(crate) fn rich_filters_to_filter_expression(
 /// the same flag value.
 fn cached_precision_config() -> &'static EmbeddingPrecisionConfig {
     EmbeddingPrecisionConfig::cached()
-}
-
-/// Lower a filter operand `ProximaValue` to JSON for `FilterExpression` literals.
-///
-/// Delegates to the canonical converter so a filter literal and a record's
-/// property value are lowered identically — the comparison in
-/// `evaluate_filter_proxima` then sees both sides in the same representation.
-fn proxima_value_to_json(value: &proximadb_data_model::ProximaValue) -> serde_json::Value {
-    crate::core::search::sql_value_filter::proxima_value_to_filter_literal(value)
 }
 
 /// TD-064(a): Authoritative predicate-shortfall **after** the
@@ -1122,7 +1115,6 @@ impl VectorOperationsService {
         auth_class: proximadb_tenant::AuthClass,
         collection_id: &str,
     ) -> Option<RichSearchResult> {
-        use crate::core::search::sql_value_filter::proxima_value_to_filter_literal as proxima_value_to_json;
         use crate::security::rls::filter_lattice::admits_with_security;
 
         match self
@@ -1140,7 +1132,7 @@ impl VectorOperationsService {
                     .and_then(|enforcer| enforcer.security_filter_for_context(&ctx));
                 record.filter(|r| match &security {
                     Some(security) => admits_with_security(None, Some(security), &|field: &str| {
-                        r.props.get(field).map(proxima_value_to_json)
+                        r.props.get(field).map(proxima_value_to_filter_literal)
                     }),
                     // Admitted with no row predicate ⇒ the record is visible.
                     None => true,

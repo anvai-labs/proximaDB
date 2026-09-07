@@ -1057,6 +1057,39 @@ Other round-8/9 fixes:
   service.rs trace-hex loop is a FIFTH hex site — added to the tracked
   kernel-unification inventory.
 
+**Consolidation review round 18 (2026-09-06):**
+- The REST TWIN of the multimodal SQL builder (convert_multi_model_to_sql,
+  /api/v1/unified/multi-model) escaped at all four unescaped arms — the
+  round-17 fix covered only the port-side builder; the two 'mirrors'
+  disagreed on escaping.
+- Json PARAMS lower to the same filter-literal text as the literal path
+  (the ParameterValue::Json splice embedded double quotes for root-string
+  documents — the exact never-match spelling round 17 folded out of the
+  literal path).
+- The UQL VECTOR_SEARCH splice renders vector text via floats (was
+  serde_json — nulls non-finite elements, our parser rejects null).
+- Embedded's Float16 joined the deliberate Rust-Display float arms (it
+  fell to the canonical fallback and widened differently than its
+  sibling floats on the same surface).
+- legacy.rs's alias+shim indirection dropped (the in-method 'as
+  proxima_value_to_json' alias recreated the wrong-import trap the
+  round-16 rename eliminated).
+- Tracked (security note): fixing the never-match exotic spellings flips
+  DEPLOYED ABAC/RLS predicates on exotic-typed attributes from constant
+  (never matched ⇒ deny) to value-dependent — the rule author's intent,
+  but an access-posture change with no migration note. Same class: NDV
+  statistics for binary/sparse columns (same-length values previously
+  collapsed to one distinct count; now per-content) — join-plan
+  cardinalities change with no data change. The documents() props-column
+  spelling (pax provider + cross_modal) changed with the arm fixes —
+  recorded here, pinned nowhere. The REST/gRPC parity harness carries a
+  TENTH converter (int-array bytes, NaN→0) that now disagrees with both
+  surfaces it reconciles — latent (mock strategies return only
+  strings/numbers). filter_literal_text vs the embedded catch-all unwrap
+  remain two homes (policies intentionally differ: Json stays
+  JSON-quoted on the Python surface) — folds into the tracked
+  parameterized-renderer item.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

@@ -410,6 +410,7 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
         // AND for finite f32s (Display prints the f32; canonical JSON
         // widens to f64, e.g. 0.1 → 0.10000000149011612). Deliberate
         // surface spelling — do not delete these arms as redundant.
+        ProximaValue::Float16(f) => f.to_string(),
         ProximaValue::Float32(f) => f.to_string(),
         ProximaValue::Float64(f) => f.to_string(),
         // JSON values keep their JSON TEXT (quotes included) — a root-
