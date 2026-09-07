@@ -128,7 +128,7 @@ pub fn base64_encode_config(data: &[u8], config: Base64Config) -> String {
         _ => {}
     }
 
-    String::from_utf8(result).unwrap_or_default()
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 /// Decode base64 string using specified configuration

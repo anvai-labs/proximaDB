@@ -65,6 +65,25 @@ pub(crate) fn parse_vector_literal(raw: &str) -> Option<Vec<f32>> {
 
     inner
         .split(',')
-        .map(|value| value.trim().parse::<f32>().ok())
+        .map(|value| {
+            value
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|component| component.is_finite())
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_vector_literal;
+
+    #[test]
+    fn vector_literals_reject_non_finite_components() {
+        assert!(parse_vector_literal("'[NaN]'").is_none());
+        assert!(parse_vector_literal("'[inf]'").is_none());
+        assert!(parse_vector_literal("'[-inf]'").is_none());
+        assert!(parse_vector_literal("'[1e300]'").is_none());
+    }
 }

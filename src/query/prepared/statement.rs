@@ -210,9 +210,9 @@ impl ParameterValue {
             ParameterValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ParameterValue::Null => "NULL".to_string(),
             // Quoted JSON-array TEXT (brackets kept — both internal
-            // vector parsers require '[' after quote-stripping; non-finite
-            // elements splice as their text inside the quotes — valid SQL,
-            // needs a cast to compare).
+            // vector parsers require '[' after quote-stripping). Query
+            // execution validates that every component is finite before
+            // calling this renderer.
             ParameterValue::Vector(v) => sql_quote(&vector_literal_text(v)),
             // JSON splices QUOTED: bare '[0,1,2]' / '{"x":1}' is a parse
             // error on every engine (the text may still need a cast to
@@ -421,6 +421,14 @@ impl PreparedStatement {
         // Replace from the end to avoid position shifts
         for (param_idx, _binding) in &bindings_with_params {
             let param_value = &params[*param_idx];
+            if let ParameterValue::Vector(vector) = param_value
+                && vector.iter().any(|component| !component.is_finite())
+            {
+                return Err(PreparedStatementError::InvalidParameter(format!(
+                    "vector parameter {} contains a non-finite component",
+                    *param_idx + 1
+                )));
+            }
             let placeholder = format!("${}", *param_idx + 1);
             result = result.replace(&placeholder, &param_value.to_sql_string());
         }
@@ -790,6 +798,20 @@ mod tests {
             ParameterValue::Vector(vec![0.1, 0.2]).to_sql_string(),
             "'[0.1,0.2]'"
         );
+    }
+
+    #[test]
+    fn prepared_vector_parameters_reject_non_finite_components() {
+        let cache = PreparedStatementCache::with_defaults();
+        let id = cache
+            .prepare("SELECT * FROM VECTOR_SEARCH('vectors', $1, 1)")
+            .expect("prepare should succeed");
+
+        let error = cache
+            .execute_sql(&id, &[ParameterValue::Vector(vec![f32::NAN])])
+            .expect_err("non-finite vectors must fail closed");
+        assert!(matches!(error, PreparedStatementError::InvalidParameter(_)));
+        assert!(error.to_string().contains("finite"));
     }
 
     #[test]

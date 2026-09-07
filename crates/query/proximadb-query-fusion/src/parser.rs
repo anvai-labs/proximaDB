@@ -338,8 +338,8 @@ impl FederatedParser {
         if parts.len() < 3 {
             return None;
         }
-        let collection = Self::unquote_sql_string(&parts[0]).to_string();
-        let query_text = Self::unquote_sql_string(&parts[1]).to_string();
+        let collection = Self::unquote_sql_string(&parts[0]);
+        let query_text = Self::unquote_sql_string(&parts[1]);
         let query_vector = self.parse_vector_argument(&parts[2])?;
         let k = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
         // Empty rank_profile string → None (retrieval-only path); a
@@ -350,7 +350,7 @@ impl FederatedParser {
             if unquoted.is_empty() {
                 None
             } else {
-                Some(unquoted.to_string())
+                Some(unquoted)
             }
         });
         Some(SqlExtension::RerankSearch {
@@ -369,7 +369,7 @@ impl FederatedParser {
             return None;
         }
 
-        let collection = Self::unquote_sql_string(&parts[0]).to_string();
+        let collection = Self::unquote_sql_string(&parts[0]);
         let query_vector = self.parse_vector_argument(&parts[1])?;
         let top_k = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
 
@@ -382,35 +382,33 @@ impl FederatedParser {
 
     /// Parse GRAPH_QUERY('cypher')
     fn parse_graph_query_args(&self, args: &str) -> Option<SqlExtension> {
-        let cypher = Self::unquote_sql_string(args).to_string();
+        let cypher = Self::unquote_sql_string(args);
         Some(SqlExtension::GraphQuery { cypher })
     }
 
     /// Parse DOCUMENT_QUERY(collection, filter)
     fn parse_document_query_args(&self, args: &str) -> Option<SqlExtension> {
         let parts = self.split_function_args(args);
-        let collection = Self::unquote_sql_string(parts.first()?).to_string();
-        let filter = parts
-            .get(1)
-            .map(|s| Self::unquote_sql_string(s).to_string());
+        let collection = Self::unquote_sql_string(parts.first()?);
+        let filter = parts.get(1).map(|s| Self::unquote_sql_string(s));
         Some(SqlExtension::DocumentQuery { collection, filter })
     }
 
     /// Parse LOGS(namespace)
     fn parse_logs_query_args(&self, args: &str) -> Option<SqlExtension> {
-        let namespace = Self::unquote_sql_string(args).to_string();
+        let namespace = Self::unquote_sql_string(args);
         Some(SqlExtension::Logs { namespace })
     }
 
     /// Parse METRICS(namespace)
     fn parse_metrics_query_args(&self, args: &str) -> Option<SqlExtension> {
-        let namespace = Self::unquote_sql_string(args).to_string();
+        let namespace = Self::unquote_sql_string(args);
         Some(SqlExtension::Metrics { namespace })
     }
 
     /// Parse TRACES(namespace)
     fn parse_traces_query_args(&self, args: &str) -> Option<SqlExtension> {
-        let namespace = Self::unquote_sql_string(args).to_string();
+        let namespace = Self::unquote_sql_string(args);
         Some(SqlExtension::Traces { namespace })
     }
 
@@ -707,16 +705,19 @@ impl FederatedParser {
         None
     }
 
-    fn unquote_sql_string(s: &str) -> &str {
+    fn unquote_sql_string(s: &str) -> String {
         let trimmed = s.trim();
         if trimmed.len() >= 2 {
             let first = trimmed.as_bytes()[0];
             let last = trimmed.as_bytes()[trimmed.len() - 1];
             if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-                return &trimmed[1..trimmed.len() - 1];
+                let inner = &trimmed[1..trimmed.len() - 1];
+                let escaped = if first == b'\'' { "''" } else { "\"\"" };
+                let quote = if first == b'\'' { "'" } else { "\"" };
+                return inner.replace(escaped, quote);
             }
         }
-        trimmed
+        trimmed.to_string()
     }
 
     fn parse_extension_alias(&self, sql: &str, mut position: usize) -> Option<String> {
@@ -825,7 +826,13 @@ impl FederatedParser {
 
         inner
             .split(',')
-            .map(|value| value.trim().parse::<f32>().ok())
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|component| component.is_finite())
+            })
             .collect()
     }
 
@@ -1047,6 +1054,54 @@ mod tests {
             }
             _ => panic!("Expected GraphQuery extension"),
         }
+    }
+
+    #[test]
+    fn sql_string_escapes_are_decoded_for_extension_arguments() {
+        let parser = FederatedParser::new();
+
+        let vector = parser
+            .parse("SELECT * FROM VECTOR_SEARCH('team''s-vectors', '[0.1]', 1)")
+            .unwrap();
+        assert!(matches!(
+            &vector.extensions[0],
+            SqlExtension::VectorSearch { collection, .. } if collection == "team's-vectors"
+        ));
+
+        let document = parser
+            .parse("SELECT * FROM DOCUMENT_QUERY('team''s-docs', 'owner = \"O''Brien\"')")
+            .unwrap();
+        assert!(matches!(
+            &document.extensions[0],
+            SqlExtension::DocumentQuery {
+                collection,
+                filter: Some(filter),
+            } if collection == "team's-docs" && filter == "owner = \"O'Brien\""
+        ));
+
+        let graph = parser
+            .parse("SELECT * FROM GRAPH_QUERY('MATCH (n) RETURN ''label''')")
+            .unwrap();
+        assert!(matches!(
+            &graph.extensions[0],
+            SqlExtension::GraphQuery { cypher } if cypher == "MATCH (n) RETURN 'label'"
+        ));
+
+        let logs = parser
+            .parse("SELECT * FROM LOGS('team''s-production')")
+            .unwrap();
+        assert!(matches!(
+            &logs.extensions[0],
+            SqlExtension::Logs { namespace } if namespace == "team's-production"
+        ));
+    }
+
+    #[test]
+    fn vector_literals_reject_non_finite_components() {
+        assert!(FederatedParser::parse_vector_literal("'[NaN]'").is_none());
+        assert!(FederatedParser::parse_vector_literal("'[inf]'").is_none());
+        assert!(FederatedParser::parse_vector_literal("'[-inf]'").is_none());
+        assert!(FederatedParser::parse_vector_literal("'[1e300]'").is_none());
     }
 
     #[test]

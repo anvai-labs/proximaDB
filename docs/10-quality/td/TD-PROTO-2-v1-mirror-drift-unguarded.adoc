@@ -1188,6 +1188,18 @@ Other round-8/9 fixes:
   'observability' accepted) fold into the tracked twin-consolidation
   item. v2_row_render's 4th-walker shape folds into the tracked
   parameterized-renderer item.
+- SQL-standard doubled single quotes are now decoded at the federated
+  extension-parser boundary. Round 16/17 escaped the four programmatic
+  multimodal SQL producers, but the parser returned the doubled form to
+  VECTOR_SEARCH, DOCUMENT_QUERY, GRAPH_QUERY, and LOGS consumers, corrupting
+  collection names, filters, Cypher, and namespaces containing apostrophes.
+- Programmatic multi-model vectors now fail closed on missing, non-array,
+  nonnumeric, or out-of-f32-range components instead of silently dropping
+  elements and changing vector dimensionality.
+- Raw SQL, UQL lowering, direct `?` binding, and prepared `$N` binding now
+  reject non-finite vector components. This aligns the federated compatibility
+  path with the canonical `VectorSearchExpr::validate` contract instead of
+  forwarding NaN or infinity into distance kernels.
 
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /

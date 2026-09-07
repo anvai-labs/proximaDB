@@ -120,9 +120,9 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         }
         ProximaValue::Float64(value) => Ok(float_sql_literal(*value)),
         ProximaValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
-        ProximaValue::DenseVector(values) => Ok(sql_quote(&vector_literal_text(values))),
+        ProximaValue::DenseVector(values) => vector_to_sql_literal(values),
         ProximaValue::Array(_) => match proxima_value_to_f32_vector(value) {
-            Some(vector) => Ok(sql_quote(&vector_literal_text(&vector))),
+            Some(vector) => vector_to_sql_literal(&vector),
             None => exotic_literal(value),
         },
         // Json/Jsonb and Map/Struct flow through the exotic catch-all:
@@ -148,6 +148,13 @@ fn exotic_literal(value: &ProximaValue) -> Result<String> {
     Ok(sql_quote(&filter_literal_text(&proxima_filter_literal(
         value,
     ))))
+}
+
+fn vector_to_sql_literal(values: &[f32]) -> Result<String> {
+    if values.iter().any(|component| !component.is_finite()) {
+        return Err(anyhow!("query vector components must be finite"));
+    }
+    Ok(sql_quote(&vector_literal_text(values)))
 }
 
 fn bind_federated_sql_parameters(query: &str, parameters: &[ProximaValue]) -> Result<String> {
@@ -330,10 +337,11 @@ fn uql_to_federated_sql(
             if vector.is_empty() {
                 return Err(anyhow!("UQL vector query parameter cannot be empty"));
             }
+            let vector_literal = vector_to_sql_literal(&vector)?;
             Ok(Some(format!(
                 "SELECT * FROM VECTOR_SEARCH({}, {}, {})",
                 sql_quote(&select.from.collection),
-                sql_quote(&vector_literal_text(&vector)),
+                vector_literal,
                 limit
             )))
         }
@@ -570,22 +578,16 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // Convert the JSON multi-model request to a federated SQL string.
         // The root-crate logic is in multimodal_query::convert_multi_model_to_sql.
         // We replicate a simplified version here so we don't import the handler module.
-        let sql = match json_to_multi_model_sql(&request) {
+        let sql = match json_to_multi_model_sql(&request)? {
             Some(sql) => sql,
-            // Components WERE present but could not be lowered (missing or
-            // unknown component_type) — error, don't fall through to the
-            // raw-query/SELECT 1 fallback (that returned 200-OK garbage).
-            None if request.get("components").is_some() => {
-                return Err(anyhow!(
-                    "multi-model request contained a component that could not be lowered (missing or unknown component_type)"
-                ));
+            None => {
+                // Fallback: treat "query" field as raw SQL, or use a SELECT 1.
+                request
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("SELECT 1")
+                    .to_string()
             }
-            // No components: query-style request — raw SQL or SELECT 1.
-            None => request
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("SELECT 1")
-                .to_string(),
         };
         // chars().take — a byte-indexed slice can land mid-character in
         // the user-controlled cypher/collection text now spliced verbatim.
@@ -734,15 +736,26 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
 /// Convert a multi-model query JSON to a federated SQL string.
 ///
 /// Mirrors the logic in `src/network/rest/canonical/multimodal_query::convert_multi_model_to_sql`.
-/// Returns `None` when the request cannot be converted.
-fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
-    let components = req.get("components")?.as_array()?;
+/// Returns `None` when no component request is present and fails closed when
+/// a supplied component is malformed.
+fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
+    let Some(components_value) = req.get("components") else {
+        return Ok(None);
+    };
+    let components = components_value
+        .as_array()
+        .ok_or_else(|| anyhow!("components must be an array"))?;
     if components.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut parts = Vec::new();
-    for component in components {
-        let ctype = component.get("component_type")?.as_str()?;
+    for (component_index, component) in components.iter().enumerate() {
+        let ctype = component
+            .get("component_type")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                anyhow!("components[{component_index}].component_type must be a string")
+            })?;
         let config = component.get("config").cloned().unwrap_or_default();
         let sql_part = match ctype {
             "vector" => {
@@ -750,17 +763,35 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                     .get("collection")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
-                let query_vec = config
+                let query_values = config
                     .get("query_vector")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_f64())
-                            .map(|f| f.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
+                    .ok_or_else(|| {
+                        anyhow!("components[{component_index}].config.query_vector is required")
+                    })?
+                    .as_array()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "components[{component_index}].config.query_vector must be an array"
+                        )
+                    })?;
+                let query_vec = query_values
+                    .iter()
+                    .enumerate()
+                    .map(|(value_index, value)| {
+                        let number = value.as_f64().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.query_vector[{value_index}] must be numeric"
+                            )
+                        })?;
+                        if !(number as f32).is_finite() {
+                            return Err(anyhow!(
+                                "components[{component_index}].config.query_vector[{value_index}] must be a finite f32"
+                            ));
+                        }
+                        Ok(number.to_string())
                     })
-                    .unwrap_or_default();
+                    .collect::<Result<Vec<_>>>()?
+                    .join(",");
                 let top_k = config.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10);
                 format!(
                     "SELECT * FROM VECTOR_SEARCH('{}', '[{}]', {})",
@@ -812,23 +843,24 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                 };
                 format!("SELECT * FROM {table}('{}')", escape_sql_text(namespace))
             }
-            // Unknown component types fail the whole conversion (None →
-            // the caller errors) — silently skipping produced a 200-OK
-            // partial UNION (the v1 twin 400s on the same body).
-            _ => return None,
+            unknown => {
+                return Err(anyhow!(
+                    "components[{component_index}].component_type '{unknown}' is unsupported"
+                ));
+            }
         };
         parts.push(sql_part);
     }
 
     if parts.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Single component: use directly; multiple: UNION ALL
     if parts.len() == 1 {
-        Some(parts.remove(0))
+        Ok(Some(parts.remove(0)))
     } else {
-        Some(parts.join(" UNION ALL "))
+        Ok(Some(parts.join(" UNION ALL ")))
     }
 }
 
@@ -907,6 +939,18 @@ mod tests {
     }
 
     #[test]
+    fn uql_vector_select_rejects_non_finite_components() {
+        let error = uql_to_federated_sql(
+            "SELECT * FROM vectors.products WHERE VECTOR_SIMILAR(embedding, ?, 0.8)",
+            &[ProximaValue::DenseVector(vec![f32::NAN])],
+            None,
+        )
+        .expect_err("non-finite UQL vector must fail closed");
+
+        assert!(error.to_string().contains("finite"));
+    }
+
+    #[test]
     fn test_uql_document_select_lowers_to_document_query() {
         let sql = uql_to_federated_sql(
             "SELECT * FROM docs.orders WHERE $.status = 'pending' LIMIT 5",
@@ -950,6 +994,17 @@ mod tests {
             sql,
             "SELECT * FROM VECTOR_SEARCH('products', '[0.1,0.2,0.3]', 5)"
         );
+    }
+
+    #[test]
+    fn bind_federated_sql_parameters_rejects_non_finite_vectors() {
+        let error = bind_federated_sql_parameters(
+            "SELECT * FROM VECTOR_SEARCH('products', ?, 5)",
+            &[ProximaValue::DenseVector(vec![f32::NAN])],
+        )
+        .expect_err("non-finite vectors must fail closed");
+
+        assert!(error.to_string().contains("finite"));
     }
 
     #[test]
@@ -1011,21 +1066,77 @@ mod tests {
                 }
             ]
         });
-        let sql = json_to_multi_model_sql(&req).unwrap();
+        let sql = json_to_multi_model_sql(&req).unwrap().unwrap();
         assert!(sql.contains("VECTOR_SEARCH('embeddings'"));
         assert!(sql.contains(", 5)"));
     }
 
     #[test]
+    fn json_to_multi_model_sql_escapes_every_text_argument() {
+        let req = serde_json::json!({
+            "components": [
+                {
+                    "component_type": "vector",
+                    "config": {"collection": "team's-vectors", "query_vector": [0.1]}
+                },
+                {
+                    "component_type": "document",
+                    "config": {"collection": "team's-docs", "filter": "owner = \"O'Brien\""}
+                },
+                {
+                    "component_type": "graph",
+                    "config": {"cypher": "MATCH (n) RETURN 'label'"}
+                },
+                {
+                    "component_type": "observability",
+                    "config": {"namespace": "team's-production"}
+                }
+            ]
+        });
+
+        let sql = json_to_multi_model_sql(&req).unwrap().unwrap();
+        assert!(sql.contains("VECTOR_SEARCH('team''s-vectors'"));
+        assert!(sql.contains("DOCUMENT_QUERY('team''s-docs', 'owner = \"O''Brien\"')"));
+        assert!(sql.contains("GRAPH_QUERY('MATCH (n) RETURN ''label''')"));
+        assert!(sql.contains("LOGS('team''s-production')"));
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_rejects_non_numeric_vector_elements() {
+        let req = serde_json::json!({
+            "components": [{
+                "component_type": "vector",
+                "config": {"collection": "vectors", "query_vector": [0.1, "bad", 0.3]}
+            }]
+        });
+
+        let error = json_to_multi_model_sql(&req).expect_err("invalid vector must fail closed");
+        assert!(error.to_string().contains("query_vector[1]"));
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_rejects_values_outside_f32_range() {
+        let req = serde_json::json!({
+            "components": [{
+                "component_type": "vector",
+                "config": {"collection": "vectors", "query_vector": [1e300]}
+            }]
+        });
+
+        let error = json_to_multi_model_sql(&req).expect_err("infinite f32 must fail closed");
+        assert!(error.to_string().contains("finite f32"));
+    }
+
+    #[test]
     fn test_json_to_multi_model_sql_empty_components() {
         let req = serde_json::json!({ "components": [] });
-        assert!(json_to_multi_model_sql(&req).is_none());
+        assert!(json_to_multi_model_sql(&req).unwrap().is_none());
     }
 
     #[test]
     fn test_json_to_multi_model_sql_no_components_field() {
         let req = serde_json::json!({ "query": "SELECT 1" });
-        assert!(json_to_multi_model_sql(&req).is_none());
+        assert!(json_to_multi_model_sql(&req).unwrap().is_none());
     }
 
     #[test]

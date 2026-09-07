@@ -713,18 +713,38 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .get("collection")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
-                let query_vector = component
+                let query_values = component
                     .config
                     .get("query_vector")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_f64())
-                            .map(|f| f.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "vector component config.query_vector is required".to_string(),
+                        )
+                    })?
+                    .as_array()
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "vector component config.query_vector must be an array".to_string(),
+                        )
+                    })?;
+                let query_vector = query_values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let number = value.as_f64().ok_or_else(|| {
+                            ApiError::InvalidArgument(format!(
+                                "vector component config.query_vector[{index}] must be numeric"
+                            ))
+                        })?;
+                        if !(number as f32).is_finite() {
+                            return Err(ApiError::InvalidArgument(format!(
+                                "vector component config.query_vector[{index}] must be a finite f32"
+                            )));
+                        }
+                        Ok(number.to_string())
                     })
-                    .unwrap_or_default();
+                    .collect::<ApiResult<Vec<_>>>()?
+                    .join(",");
                 let top_k = component
                     .config
                     .get("top_k")
@@ -2248,6 +2268,61 @@ mod tests {
             sql,
             "SELECT * FROM GRAPH_QUERY('MATCH (a)-[:KNOWS]->(b) FROM social RETURN b.name') LIMIT 100"
         );
+    }
+
+    #[test]
+    fn multi_model_sql_conversion_rejects_malformed_vectors() {
+        let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+            "components": [{
+                "component_type": "vector",
+                "config": {
+                    "collection": "vectors",
+                    "query_vector": [0.1, "bad", 0.3]
+                }
+            }]
+        }))
+        .expect("request should parse");
+
+        let error = convert_multi_model_to_sql(&request)
+            .expect_err("nonnumeric vector elements must fail closed");
+        assert!(matches!(error, ApiError::InvalidArgument(_)));
+        assert!(error.to_string().contains("query_vector[1]"));
+    }
+
+    #[test]
+    fn multi_model_sql_conversion_escapes_all_text_arguments() {
+        let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+            "components": [
+                {
+                    "component_type": "vector",
+                    "config": {"collection": "team's-vectors", "query_vector": [0.1]}
+                },
+                {
+                    "component_type": "document",
+                    "config": {"collection": "team's-docs", "filter": "owner = \"O'Brien\""}
+                },
+                {
+                    "component_type": "graph",
+                    "config": {"cypher": "MATCH (n) RETURN 'label'"}
+                },
+                {
+                    "component_type": "log",
+                    "config": {"namespace": "team's-production"}
+                },
+                {
+                    "component_type": "metric",
+                    "config": {"namespace": "team's-metrics"}
+                }
+            ]
+        }))
+        .expect("request should parse");
+
+        let sql = convert_multi_model_to_sql(&request).expect("conversion should succeed");
+        assert!(sql.contains("VECTOR_SEARCH('team''s-vectors'"));
+        assert!(sql.contains("DOCUMENT_QUERY('team''s-docs', 'owner = \"O''Brien\"')"));
+        assert!(sql.contains("GRAPH_QUERY('MATCH (n) RETURN ''label''')"));
+        assert!(sql.contains("LOGS('team''s-production')"));
+        assert!(sql.contains("METRICS('team''s-metrics')"));
     }
 
     #[test]
