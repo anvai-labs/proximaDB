@@ -188,6 +188,19 @@ execution; MLflow auth pass-through (tenant identity stays ours).
   unit lane: full workflow, tenant-uniformity, gate default. The
   real-client (mlflow-skinny, pinned) conformance lane follows as this
   slice's closing commit.
+* **Slice 2 closing (2026-09-07)**: the conformance lane shipped —
+  `clients/python/tests/mlflow_conformance.py` drives the canonical
+  workflow (experiment lifecycle incl. get-by-name, run lifecycle,
+  params/metrics/tags, log-batch, history order, search match AND
+  non-match, terminate semantics, soft delete/restore) through the REAL
+  `mlflow` client against a spawned gated server; the
+  `mlflow-conformance` CI lane (mlflow-skinny==2.14.3, pinned) counts
+  passing steps against the checked-in ratchet
+  (`mlflow_conformance_steps.txt`, counts only go up). The wire gained
+  `experiments/get-by-name` (real clients resolve set_experiment by
+  name). Follow-up hardening from the parallel-session round — latest-
+  metric projection semantics ((timestamp, value) ordering) and
+  quote-aware filter clause splitting — landed with the slice-2 merge.
 * **Slice 1 (2026-09-06)**: `RunStore` port + in-memory reference +
   `port_conformance` battery (`crates/control/proximadb-catalog/src/run_store.rs`);
   `SubstrateRunStore` over the document substrate

@@ -280,6 +280,9 @@ rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1.10"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
+# MLflow read endpoints take GET + query-string params (proto HTTP annotation)
+# while writes are POST + JSON — the dual extractor needs urlencoded parsing.
+serde_urlencoded = "0.7"
 # On-demand stack growth for the plan-tree recursions (planner lowering, executor
 # build, native lowering) — grows the stack instead of overflowing on deeply
 # nested plans (TD-EXEC-2 §1.a). Same primitive rustc/Servo use.
@@ -398,6 +401,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_urlencoded.workspace = true
 
 # Sandhi neutral usage parsers (TD-SANDHI-2 / ADR-0047 D10a): single-sourced, fixture-proven
 # (Sandhi TD-0001 W1) usage/cache-split extraction adopted by the generation LLM path — not a
