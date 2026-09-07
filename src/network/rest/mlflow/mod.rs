@@ -17,10 +17,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::network::middleware::tenant::TenantContext;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use proximadb_catalog::run_store::{
     ExperimentRecord, ExperimentStage, MetricPoint, RunLifecycle, RunRecord, RunStatus, RunStore,
@@ -66,12 +66,12 @@ fn is_enabled(value: Option<&str>) -> bool {
 pub fn mlflow_routes() -> Router<MlflowState> {
     Router::new()
         .route("/experiments/create", post(experiments_create))
-        .route("/experiments/get", post(experiments_get))
+        .route("/experiments/get", get(experiments_get))
         .route("/experiments/search", post(experiments_search))
         .route("/experiments/delete", post(experiments_delete))
         .route("/experiments/restore", post(experiments_restore))
         .route("/runs/create", post(runs_create))
-        .route("/runs/get", post(runs_get))
+        .route("/runs/get", get(runs_get))
         .route("/runs/update", post(runs_update))
         .route("/runs/search", post(runs_search))
         .route("/runs/delete", post(runs_delete))
@@ -83,14 +83,10 @@ pub fn mlflow_routes() -> Router<MlflowState> {
         .route("/runs/delete-tag", post(runs_delete_tag))
 }
 
-fn store_for(
-    tenant: &TenantContext,
-    state: &MlflowState,
-) -> Result<SubstrateRunStore, MlflowError> {
-    SubstrateRunStore::for_tenant(state.document.clone(), &tenant.tenant_id).map_err(|e| {
+fn store_for(tenant: &TenantContext, state: &MlflowState) -> MlflowResult<SubstrateRunStore> {
+    SubstrateRunStore::for_tenant(state.document.clone(), &tenant.tenant_id).map_err(|error| {
         MlflowError::internal(format!(
-            "tenant '{}' cannot be scoped to a tracking collection: {e}",
-            tenant.tenant_id
+            "failed to construct tenant-scoped tracking store: {error}"
         ))
     })
 }
@@ -144,11 +140,17 @@ struct ExperimentsSearchRequest {
     max_results: Option<u32>,
     #[serde(default)]
     filter: Option<String>,
+    #[serde(default)]
+    view_type: Option<String>,
+    #[serde(default)]
+    page_token: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ExperimentsSearchResponse {
     experiments: Vec<ExperimentOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -165,23 +167,24 @@ struct RunsCreateRequest {
 #[derive(Serialize)]
 struct MetricOut {
     key: String,
-    /// Proto3-JSON convention: non-finite floats serialize as STRINGS
-    /// ("NaN" / "Infinity" / "-Infinity") — serde_json's default f64 path
-    /// cannot encode them, which would 500 the whole search response.
-    #[serde(serialize_with = "ser_f64_lossy")]
+    #[serde(serialize_with = "serialize_metric_value")]
     value: f64,
     timestamp: i64,
     step: i64,
 }
 
-fn ser_f64_lossy<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
-    use serde::ser::Error as _;
-    match v {
-        f if f.is_finite() => s.serialize_f64(*f),
-        f if f.is_nan() => s.serialize_str("NaN"),
-        f if *f == f64::INFINITY => s.serialize_str("Infinity"),
-        f if *f == f64::NEG_INFINITY => s.serialize_str("-Infinity"),
-        _ => Err(S::Error::custom("unreachable float class")),
+fn serialize_metric_value<S: serde::Serializer>(
+    value: &f64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if value.is_nan() {
+        serializer.serialize_str("NaN")
+    } else if *value == f64::INFINITY {
+        serializer.serialize_str("Infinity")
+    } else if *value == f64::NEG_INFINITY {
+        serializer.serialize_str("-Infinity")
+    } else {
+        serializer.serialize_f64(*value)
     }
 }
 
@@ -255,7 +258,7 @@ struct LogParameterRequest {
 struct MetricInput {
     #[serde(default)]
     key: String,
-    #[serde(default, deserialize_with = "de_f64_lossy")]
+    #[serde(default, deserialize_with = "deserialize_metric_value")]
     value: f64,
     #[serde(default)]
     timestamp: i64,
@@ -263,19 +266,13 @@ struct MetricInput {
     step: i64,
 }
 
-/// MLflow's runs/log-metric body is FLAT: {run_id, key, value, timestamp,
-/// step} — the proto's LogMetric message has direct fields, no nested Metric
-/// (verified against mlflow/protos/service.proto).
 #[derive(Default, Deserialize)]
 struct LogMetricRequest {
     #[serde(default)]
     run_id: String,
     #[serde(default)]
     key: String,
-    /// Proto3 JSON sends non-finite floats as STRINGS ("NaN", "Infinity",
-    /// "-Infinity") — accept both so diverged-loss metrics stay within the
-    /// MLflow error envelope.
-    #[serde(default, deserialize_with = "de_f64_lossy")]
+    #[serde(default, deserialize_with = "deserialize_metric_value")]
     value: f64,
     #[serde(default)]
     timestamp: i64,
@@ -283,14 +280,16 @@ struct LogMetricRequest {
     step: i64,
 }
 
-fn de_f64_lossy<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+fn deserialize_metric_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
     use serde::de::Error as _;
-    let raw = serde_json::Value::deserialize(d)?;
+    let raw = serde_json::Value::deserialize(deserializer)?;
     match raw {
-        serde_json::Value::Number(n) => n
+        serde_json::Value::Number(number) => number
             .as_f64()
             .ok_or_else(|| D::Error::custom("metric value out of f64 range")),
-        serde_json::Value::String(s) => match s.as_str() {
+        serde_json::Value::String(value) => match value.as_str() {
             "NaN" => Ok(f64::NAN),
             "Infinity" => Ok(f64::INFINITY),
             "-Infinity" => Ok(f64::NEG_INFINITY),
@@ -447,7 +446,7 @@ impl From<RunStoreError> for MlflowError {
                 MlflowError::invalid(format!("{field} must not be empty"))
             }
             RunStoreError::NotTerminal => {
-                MlflowError::internal("terminal status required (wire never sends Running here)")
+                MlflowError::internal("tracking store requires a terminal run status")
             }
             RunStoreError::Internal { message } => MlflowError::internal(message),
         }
@@ -552,6 +551,34 @@ fn tags_map(tags: &[KeyValue]) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn paginate<T>(
+    items: Vec<T>,
+    max_results: Option<u32>,
+    page_token: Option<&str>,
+) -> MlflowResult<(Vec<T>, Option<String>)> {
+    let limit = max_results.unwrap_or(1_000) as usize;
+    if limit == 0 {
+        return Err(MlflowError::invalid(
+            "max_results must be greater than zero",
+        ));
+    }
+    let offset = match page_token {
+        None | Some("") => 0,
+        Some(token) => token
+            .parse::<usize>()
+            .map_err(|_| MlflowError::invalid("invalid page_token"))?,
+    };
+    if offset > items.len() {
+        return Err(MlflowError::invalid("page_token is past the result set"));
+    }
+    let end = offset.saturating_add(limit).min(items.len());
+    let next_page_token = (end < items.len()).then(|| end.to_string());
+    Ok((
+        items.into_iter().skip(offset).take(limit).collect(),
+        next_page_token,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -580,7 +607,7 @@ async fn experiments_create(
 async fn experiments_get(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
-    Json(req): Json<ExperimentIdRequest>,
+    Query(req): Query<ExperimentIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     let id = parse_id(&req.experiment_id, "experiment")?;
     let store = store_for(&tenant, &state)?;
@@ -595,63 +622,109 @@ async fn experiments_search(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<ExperimentsSearchRequest>,
 ) -> MlflowResult<Json<ExperimentsSearchResponse>> {
-    // Slice-2 subset, honestly enforced: `name = 'v'` / `name LIKE '%v%'`,
-    // `tags.k = 'v'`, `attributes.lifecycle_stage = 'deleted'`, ANDed.
-    // Anything else is INVALID_PARAMETER_VALUE — never silently ignored.
-    let mut include_deleted = false;
-    let mut name_eq: Option<String> = None;
-    let mut name_like: Option<String> = None;
-    let mut tag_clauses: Vec<(String, String)> = Vec::new();
-    if let Some(f) = &req.filter {
-        for clause in f.split(" AND ") {
-            let clause = clause.trim();
-            if clause == "attributes.lifecycle_stage = 'deleted'" {
-                include_deleted = true;
-            } else if let Some(rest) = clause.strip_prefix("name ") {
-                let (op, value) = split_quoted(rest)?;
-                match op.as_str() {
-                    "=" => name_eq = Some(value),
-                    "LIKE" => name_like = Some(value),
-                    other => {
-                        return Err(MlflowError::invalid(format!(
-                            "name filter supports = / LIKE, got '{other}'"
-                        )));
-                    }
-                }
-            } else if let Some(rest) = clause.strip_prefix("tags.") {
-                let (op, value) = split_quoted(rest)?;
-                let key = field_key_quoted(rest, &op)?;
-                if op != "=" {
+    let lifecycle = match req.view_type.as_deref() {
+        None | Some("ACTIVE_ONLY") => Some(ExperimentStage::Active),
+        Some("DELETED_ONLY") => Some(ExperimentStage::Deleted),
+        Some("ALL") => None,
+        Some(other) => {
+            return Err(MlflowError::invalid(format!(
+                "invalid view_type '{other}' (ACTIVE_ONLY | DELETED_ONLY | ALL)"
+            )));
+        }
+    };
+    let filters = req
+        .filter
+        .as_deref()
+        .map(parse_experiment_filter)
+        .transpose()?
+        .unwrap_or_default();
+    let include_deleted = lifecycle != Some(ExperimentStage::Active)
+        || filters.iter().any(|filter| {
+            matches!(
+                filter,
+                ExperimentFilter::Lifecycle(ExperimentStage::Deleted)
+            )
+        });
+    let store = store_for(&tenant, &state)?;
+    let experiments: Vec<ExperimentOut> = store
+        .list_experiments(include_deleted)
+        .await?
+        .iter()
+        .filter(|record| lifecycle.is_none_or(|stage| record.stage == stage))
+        .filter(|record| filters.iter().all(|predicate| predicate.matches(record)))
+        .map(experiment_out)
+        .collect();
+    let (experiments, next_page_token) =
+        paginate(experiments, req.max_results, req.page_token.as_deref())?;
+    Ok(Json(ExperimentsSearchResponse {
+        experiments,
+        next_page_token,
+    }))
+}
+
+enum ExperimentFilter {
+    NameEq(String),
+    NameLike(String),
+    TagEq(String, String),
+    Lifecycle(ExperimentStage),
+}
+
+impl ExperimentFilter {
+    fn matches(&self, experiment: &ExperimentRecord) -> bool {
+        match self {
+            Self::NameEq(name) => experiment.name == *name,
+            Self::NameLike(pattern) => like_match(&experiment.name, pattern),
+            Self::TagEq(key, value) => experiment.tags.get(key) == Some(value),
+            Self::Lifecycle(stage) => experiment.stage == *stage,
+        }
+    }
+}
+
+fn parse_experiment_filter(filter: &str) -> MlflowResult<Vec<ExperimentFilter>> {
+    let mut predicates = Vec::new();
+    for clause in split_filter_clauses(filter)? {
+        let clause = clause.trim();
+        if let Some(rest) = clause.strip_prefix("tags.") {
+            let (key, op, value) = parse_filter_parts(rest, true)?;
+            if op != "=" {
+                return Err(MlflowError::invalid(
+                    "experiment tag filter supports = only",
+                ));
+            }
+            predicates.push(ExperimentFilter::TagEq(key, value));
+            continue;
+        }
+        let (field, op, value) = parse_filter_parts(clause, true)?;
+        match field.to_ascii_lowercase().as_str() {
+            "name" | "attributes.name" => match op.as_str() {
+                "=" => predicates.push(ExperimentFilter::NameEq(value)),
+                "LIKE" => predicates.push(ExperimentFilter::NameLike(value)),
+                _ => {
                     return Err(MlflowError::invalid(
-                        "experiment tag filter supports = only",
+                        "experiment name filter supports = / LIKE",
                     ));
                 }
-                tag_clauses.push((key, value));
-            } else {
+            },
+            "attributes.lifecycle_stage" if op == "=" => {
+                let stage = match value.to_ascii_lowercase().as_str() {
+                    "active" => ExperimentStage::Active,
+                    "deleted" => ExperimentStage::Deleted,
+                    _ => {
+                        return Err(MlflowError::invalid(format!(
+                            "invalid experiment lifecycle_stage '{value}'"
+                        )));
+                    }
+                };
+                predicates.push(ExperimentFilter::Lifecycle(stage));
+            }
+            other => {
                 return Err(MlflowError::invalid(format!(
-                    "unsupported experiment filter clause '{clause}'"
+                    "unsupported experiment filter field '{other}'"
                 )));
             }
         }
     }
-    let store = store_for(&tenant, &state)?;
-    let mut experiments: Vec<ExperimentOut> = store
-        .list_experiments(include_deleted)
-        .await?
-        .iter()
-        .filter(|e| {
-            name_eq.as_ref().is_none_or(|v| &e.name == v)
-                && name_like
-                    .as_ref()
-                    .is_none_or(|pat| like_match(&e.name, pat))
-                && tag_clauses.iter().all(|(k, v)| e.tags.get(k) == Some(v))
-        })
-        .map(experiment_out)
-        .collect();
-    if let Some(limit) = req.max_results {
-        experiments.truncate(limit as usize);
-    }
-    Ok(Json(ExperimentsSearchResponse { experiments }))
+    Ok(predicates)
 }
 
 async fn experiments_delete(
@@ -708,7 +781,7 @@ fn uuid_like_id() -> String {
 async fn runs_get(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
-    Json(req): Json<RunIdRequest>,
+    Query(req): Query<RunIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     if req.run_id.is_empty() {
         return Err(MlflowError::invalid("run_id must not be empty"));
@@ -727,26 +800,25 @@ async fn runs_update(
         return Err(MlflowError::invalid("run_id must not be empty"));
     }
     let store = store_for(&tenant, &state)?;
-    let terminal = match req.status.as_deref() {
+    let transition = match req.status.as_deref() {
         None => None,
-        // UpdateRun -> RUNNING reopens a terminal run (end time cleared).
         Some("RUNNING") => Some(None),
         Some("FINISHED") => Some(Some(RunStatus::Finished)),
         Some("FAILED") => Some(Some(RunStatus::Failed)),
         Some("KILLED") => Some(Some(RunStatus::Killed)),
         Some(other) => {
             return Err(MlflowError::invalid(format!(
-                "unsupported run status '{other}' (RUNNING | FINISHED | FAILED | KILLED)"
+                "unsupported run status '{other}' (slice 2: RUNNING | FINISHED | FAILED | KILLED)"
             )));
         }
     };
-    match terminal {
+    match transition {
         Some(None) => store.reopen_run(&req.run_id).await?,
         Some(Some(status)) => {
-            let end = req
+            let end_time = req
                 .end_time
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-            store.finish_run(&req.run_id, status, end).await?;
+            store.finish_run(&req.run_id, status, end_time).await?;
         }
         None => {}
     }
@@ -789,16 +861,13 @@ async fn runs_log_batch(
     Extension(tenant): Extension<TenantContext>,
     Json(req): Json<LogBatchRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
-    if req.metrics.len() > 1000 || req.params.len() > 100 || req.tags.len() > 100 {
+    if req.metrics.len() > 1_000 || req.params.len() > 100 || req.tags.len() > 100 {
         return Err(MlflowError::invalid(
-            "log-batch caps: 1000 metrics, 100 params, 100 tags (MLflow limits)",
+            "log-batch caps: 1000 metrics, 100 params, 100 tags",
         ));
     }
     let store = store_for(&tenant, &state)?;
     for p in &req.params {
-        if p.run_id.is_empty() || p.key.is_empty() {
-            return Err(MlflowError::invalid("log-batch param needs run_id and key"));
-        }
         store.log_param(&req.run_id, &p.key, &p.value).await?;
     }
     for m in &req.metrics {
@@ -870,12 +939,13 @@ async fn runs_search(
             "experiment_ids must list at least one experiment",
         ));
     }
-    let include_deleted = match req.run_view_type.as_deref() {
-        None | Some("ACTIVE_ONLY") => false,
-        Some("ALL") => true,
+    let lifecycle = match req.run_view_type.as_deref() {
+        None | Some("ACTIVE_ONLY") => Some(RunLifecycle::Active),
+        Some("DELETED_ONLY") => Some(RunLifecycle::Deleted),
+        Some("ALL") => None,
         Some(other) => {
             return Err(MlflowError::invalid(format!(
-                "invalid run_view_type '{other}' (ACTIVE_ONLY | ALL)"
+                "invalid run_view_type '{other}' (ACTIVE_ONLY | DELETED_ONLY | ALL)"
             )));
         }
     };
@@ -885,7 +955,7 @@ async fn runs_search(
     };
     // Slice 2 orders by start_time. Any other order_by key is an explicit
     // INVALID_PARAMETER_VALUE — never silently ignored.
-    let mut descending = false;
+    let mut descending = true;
     for clause in &req.order_by {
         let clause = clause.trim();
         let (field, dir) = clause
@@ -905,41 +975,33 @@ async fn runs_search(
     let mut runs: Vec<RunOut> = Vec::new();
     for exp in &req.experiment_ids {
         let id = parse_id(exp, "experiment")?;
-        for record in store.list_runs(id, include_deleted).await? {
-            if let Some(clauses) = &filter {
-                if !clauses.iter().all(|c| c.matches(&record)) {
-                    continue;
-                }
+        for record in store
+            .list_runs(id, lifecycle != Some(RunLifecycle::Active))
+            .await?
+        {
+            if lifecycle.is_some_and(|stage| record.lifecycle != stage) {
+                continue;
+            }
+            if filter
+                .as_ref()
+                .is_some_and(|clauses| !clauses.iter().all(|clause| clause.matches(&record)))
+            {
+                continue;
             }
             runs.push(run_out(&record));
         }
     }
-    if descending {
-        runs.sort_by_key(|r| std::cmp::Reverse(r.info.start_time));
-    } else {
-        runs.sort_by_key(|r| r.info.start_time);
-    }
-    // Offset pagination: page_token is the offset (opaque to the client),
-    // next_page_token is emitted only when MORE results exist past the page.
-    let page_size = req.max_results.map(|n| n.max(1) as usize);
-    let offset = req
-        .page_token
-        .as_deref()
-        .map(|t| t.parse::<usize>().unwrap_or(0))
-        .unwrap_or(0);
-    let total = runs.len();
-    let page: Vec<RunOut> = match page_size {
-        Some(size) => runs.into_iter().skip(offset).take(size).collect(),
-        None => runs.into_iter().skip(offset).collect(),
-    };
-    let consumed = offset + page.len();
-    let next_page_token = if consumed < total {
-        Some(consumed.to_string())
-    } else {
-        None
-    };
+    runs.sort_by(|left, right| {
+        let time_order = if descending {
+            right.info.start_time.cmp(&left.info.start_time)
+        } else {
+            left.info.start_time.cmp(&right.info.start_time)
+        };
+        time_order.then_with(|| left.info.run_id.cmp(&right.info.run_id))
+    });
+    let (runs, next_page_token) = paginate(runs, req.max_results, req.page_token.as_deref())?;
     Ok(Json(RunsSearchResponse {
-        runs: page,
+        runs,
         next_page_token,
     }))
 }
@@ -965,10 +1027,10 @@ impl FieldFilter {
         match self {
             FieldFilter::ParamEq(k, v) => run.params.get(k) == Some(v),
             FieldFilter::ParamNe(k, v) => run.params.get(k) != Some(v),
-            FieldFilter::ParamLike(k, pattern) => match run.params.get(k) {
-                Some(actual) => like_match(actual, pattern),
-                None => false,
-            },
+            FieldFilter::ParamLike(k, pattern) => run
+                .params
+                .get(k)
+                .is_some_and(|actual| like_match(actual, pattern)),
             FieldFilter::TagEq(k, v) => run.tags.get(k) == Some(v),
             FieldFilter::TagNe(k, v) => run.tags.get(k) != Some(v),
             FieldFilter::TagLike(k, pattern) => match run.tags.get(k) {
@@ -978,8 +1040,7 @@ impl FieldFilter {
             FieldFilter::MetricCmp(k, v, cmp) => run
                 .latest_metrics
                 .get(k)
-                .map(|p| cmp(p.value, *v))
-                .unwrap_or(false),
+                .is_some_and(|point| cmp(point.value, *v)),
         }
     }
 }
@@ -1002,31 +1063,32 @@ fn like_match(value: &str, pattern: &str) -> bool {
 
 fn parse_run_filter(filter: &str) -> MlflowResult<Vec<FieldFilter>> {
     let mut out = Vec::new();
-    for clause in filter.split(" AND ") {
+    for clause in split_filter_clauses(filter)? {
         let clause = clause.trim();
         let field = if let Some(rest) = clause.strip_prefix("metrics.") {
-            let (op, value) = split_cmp(rest)?;
+            let (key, op, value) = parse_filter_parts(rest, false)?;
             let number: f64 = value.parse().map_err(|_| {
                 MlflowError::invalid(format!("metric filter needs a number, got {value}"))
             })?;
+            if !number.is_finite() {
+                return Err(MlflowError::invalid("metric filter value must be finite"));
+            }
             let cmp = cmp_fn(&op)?;
-            let key = field_key(rest, &op)?;
             FieldFilter::MetricCmp(key, number, cmp)
         } else if let Some(rest) = clause.strip_prefix("params.") {
-            let (op, value) = split_quoted(rest)?;
-            let key = field_key_quoted(rest, &op)?;
+            let (key, op, value) = parse_filter_parts(rest, true)?;
             match op.as_str() {
                 "=" => FieldFilter::ParamEq(key, value),
                 "!=" => FieldFilter::ParamNe(key, value),
+                "LIKE" => FieldFilter::ParamLike(key, value),
                 other => {
                     return Err(MlflowError::invalid(format!(
-                        "params filter supports = / != , got '{other}'"
+                        "params filter supports = / != / LIKE, got '{other}'"
                     )));
                 }
             }
         } else if let Some(rest) = clause.strip_prefix("tags.") {
-            let (op, value) = split_quoted(rest)?;
-            let key = field_key_quoted(rest, &op)?;
+            let (key, op, value) = parse_filter_parts(rest, true)?;
             match op.as_str() {
                 "=" => FieldFilter::TagEq(key, value),
                 "!=" => FieldFilter::TagNe(key, value),
@@ -1050,57 +1112,97 @@ fn parse_run_filter(filter: &str) -> MlflowResult<Vec<FieldFilter>> {
     Ok(out)
 }
 
-fn split_cmp(rest: &str) -> MlflowResult<(String, String)> {
-    for op in ["!=", "<=", ">=", "<", ">", "="] {
-        if let Some(idx) = rest.find(op) {
-            return Ok((op.to_string(), rest[idx + op.len()..].trim().to_string()));
+fn split_filter_clauses(filter: &str) -> MlflowResult<Vec<&str>> {
+    let bytes = filter.as_bytes();
+    let mut clauses = Vec::new();
+    let mut quote = None;
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                if bytes.get(index + 1) == Some(&active_quote) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
         }
-    }
-    Err(MlflowError::invalid(format!(
-        "metric filter needs a comparison operator: '{rest}'"
-    )))
-}
-
-fn split_quoted(rest: &str) -> MlflowResult<(String, String)> {
-    for op in ["!=", "="] {
-        if let Some(idx) = rest.find(op) {
-            let raw = rest[idx + op.len()..].trim();
-            let value = raw
-                .strip_prefix('\'')
-                .and_then(|v| v.strip_suffix('\''))
-                .ok_or_else(|| {
-                    MlflowError::invalid(format!(
-                        "string filter values must be single-quoted: '{raw}'"
-                    ))
-                })?;
-            return Ok((op.to_string(), value.to_string()));
+        if matches!(byte, b'\'' | b'`' | b'"') {
+            quote = Some(byte);
+            index += 1;
+            continue;
         }
+        let is_and = bytes
+            .get(index..index.saturating_add(3))
+            .is_some_and(|word| word.eq_ignore_ascii_case(b"and"));
+        let left_space = index > start && bytes[index - 1].is_ascii_whitespace();
+        let right_space = bytes
+            .get(index + 3)
+            .is_some_and(|byte| byte.is_ascii_whitespace());
+        if is_and && left_space && right_space {
+            clauses.push(filter[start..index].trim());
+            index += 3;
+            start = index;
+            continue;
+        }
+        index += 1;
     }
-    if rest.contains("LIKE") {
-        let idx = rest.find("LIKE").unwrap();
-        let raw = rest[idx + 4..].trim();
-        let value = raw
-            .strip_prefix('\'')
-            .and_then(|v| v.strip_suffix('\''))
-            .ok_or_else(|| {
-                MlflowError::invalid(format!("LIKE pattern must be single-quoted: '{raw}'"))
-            })?;
-        return Ok(("LIKE".to_string(), value.to_string()));
+    if quote.is_some() {
+        return Err(MlflowError::invalid("unterminated quote in filter"));
     }
-    Err(MlflowError::invalid(format!(
-        "filter needs = / != / LIKE: '{rest}'"
-    )))
+    clauses.push(filter[start..].trim());
+    if clauses.iter().any(|clause| clause.is_empty()) {
+        return Err(MlflowError::invalid("empty filter clause"));
+    }
+    Ok(clauses)
 }
 
-fn field_key(rest: &str, op: &str) -> MlflowResult<String> {
-    let idx = rest
-        .find(op)
-        .ok_or_else(|| MlflowError::internal("operator vanished"))?;
-    Ok(rest[..idx].trim().to_string())
+fn parse_filter_parts(rest: &str, string_value: bool) -> MlflowResult<(String, String, String)> {
+    let identifier = r#"(?:`(?:``|[^`])+`|"(?:""|[^"])+"|[^\s!<>=]+)"#;
+    let pattern = if string_value {
+        format!(r#"(?i)^\s*({identifier})\s*(!=|=|LIKE)\s*'((?:''|[^'])*)'\s*$"#)
+    } else {
+        format!(r#"(?i)^\s*({identifier})\s*(!=|<=|>=|<|>|=)\s*([^\s]+)\s*$"#)
+    };
+    let regex = regex::Regex::new(&pattern).map_err(|error| {
+        MlflowError::internal(format!("invalid built-in filter regex: {error}"))
+    })?;
+    let captures = regex
+        .captures(rest)
+        .ok_or_else(|| MlflowError::invalid(format!("invalid filter clause '{rest}'")))?;
+    let key = captures
+        .get(1)
+        .map(|capture| decode_identifier(capture.as_str()))
+        .ok_or_else(|| MlflowError::invalid("filter is missing an identifier"))?;
+    let op = captures
+        .get(2)
+        .map(|capture| capture.as_str().to_ascii_uppercase())
+        .ok_or_else(|| MlflowError::invalid("filter is missing an operator"))?;
+    let value = captures
+        .get(3)
+        .map(|capture| capture.as_str().replace("''", "'"))
+        .ok_or_else(|| MlflowError::invalid("filter is missing a value"))?;
+    Ok((key, op, value))
 }
 
-fn field_key_quoted(rest: &str, op: &str) -> MlflowResult<String> {
-    field_key(rest, op)
+fn decode_identifier(raw: &str) -> String {
+    if let Some(inner) = raw
+        .strip_prefix('`')
+        .and_then(|value| value.strip_suffix('`'))
+    {
+        inner.replace("``", "`")
+    } else if let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        inner.replace("\"\"", "\"")
+    } else {
+        raw.to_string()
+    }
 }
 
 fn cmp_fn(op: &str) -> MlflowResult<fn(f64, f64) -> bool> {
@@ -1109,8 +1211,8 @@ fn cmp_fn(op: &str) -> MlflowResult<fn(f64, f64) -> bool> {
         "<=" => |a, b| a <= b,
         ">" => |a, b| a > b,
         ">=" => |a, b| a >= b,
-        "=" => |a, b| (a - b).abs() == 0.0,
-        "!=" => |a, b| (a - b).abs() != 0.0,
+        "=" => |a, b| a == b,
+        "!=" => |a, b| a != b,
         other => {
             return Err(MlflowError::invalid(format!(
                 "unsupported comparison '{other}'"
@@ -1166,6 +1268,26 @@ mod tests {
         (status, json)
     }
 
+    async fn get_json(router: &mut Router, path: &str) -> (StatusCode, Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should answer");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should buffer");
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
     #[tokio::test]
     async fn mlflow_workflow_over_the_wire() {
         let mut router = test_router("default").await;
@@ -1180,11 +1302,73 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let experiment_id = body["experiment_id"].as_str().unwrap().to_string();
 
+        // Experiment filters must actually filter, and malformed filters
+        // must fail closed instead of silently selecting every active row.
+        let (status, other_body) = post_json(
+            &mut router,
+            "/experiments/create",
+            serde_json::json!({"name": "other"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let other_experiment_id = other_body["experiment_id"]
+            .as_str()
+            .expect("other experiment id")
+            .to_string();
+        let (status, body) = post_json(
+            &mut router,
+            "/experiments/search",
+            serde_json::json!({"filter": "name = 'iris'"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["experiments"].as_array().unwrap().len(), 1);
+        let (status, body) = post_json(
+            &mut router,
+            "/experiments/search",
+            serde_json::json!({"filter": "bogus = 'iris'"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error_code"], "INVALID_PARAMETER_VALUE");
+
+        // Search pagination is stable and never silently drops the tail.
+        let (status, first_page) = post_json(
+            &mut router,
+            "/experiments/search",
+            serde_json::json!({"max_results": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first_page}");
+        assert_eq!(first_page["experiments"].as_array().unwrap().len(), 1);
+        let page_token = first_page["next_page_token"]
+            .as_str()
+            .expect("first page must advertise the remaining experiment");
+        let (status, second_page) = post_json(
+            &mut router,
+            "/experiments/search",
+            serde_json::json!({"max_results": 1, "page_token": page_token}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second_page}");
+        assert_eq!(second_page["experiments"].as_array().unwrap().len(), 1);
+        assert_ne!(
+            first_page["experiments"][0]["experiment_id"],
+            second_page["experiments"][0]["experiment_id"]
+        );
+        assert!(
+            [experiment_id.as_str(), other_experiment_id.as_str()].contains(
+                &second_page["experiments"][0]["experiment_id"]
+                    .as_str()
+                    .expect("experiment id")
+            )
+        );
+
         // Run create -> MLflow run shape (info/data split, mlflow.runName).
         let (status, body) = post_json(
             &mut router,
             "/runs/create",
-            serde_json::json!({"experiment_id": experiment_id, "run_name": "baseline"}),
+            serde_json::json!({"experiment_id": experiment_id, "run_name": "baseline", "start_time": 1000}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1198,6 +1382,18 @@ mod tests {
             .any(|t| t["key"] == "mlflow.runName" && t["value"] == "baseline");
         assert!(has_run_name_tag, "mlflow.runName tag must round-trip");
 
+        let (status, newer_body) = post_json(
+            &mut router,
+            "/runs/create",
+            serde_json::json!({"experiment_id": experiment_id, "run_name": "newer", "start_time": 2000}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{newer_body}");
+        let newer_run_id = newer_body["run"]["info"]["run_id"]
+            .as_str()
+            .expect("newer run id")
+            .to_string();
+
         // Params + metrics + batch.
         post_json(
             &mut router,
@@ -1205,37 +1401,69 @@ mod tests {
             serde_json::json!({"run_id": run_id, "key": "lr", "value": "0.01"}),
         )
         .await;
-        // FLAT body — the real MLflow wire shape (proto LogMetric has
-        // direct fields; no nested metric object).
         post_json(
             &mut router,
             "/runs/log-metric",
             serde_json::json!({"run_id": run_id, "key": "rmse", "value": 0.9, "timestamp": 1000, "step": 0}),
         )
         .await;
+        post_json(
+            &mut router,
+            "/runs/log-parameter",
+            serde_json::json!({"run_id": run_id, "key": "model class", "value": "linear"}),
+        )
+        .await;
         let (status, _) = post_json(
             &mut router,
             "/runs/log-batch",
-            serde_json::json!({"run_id": run_id, "metrics": [{"key": "rmse", "value": 0.7, "timestamp": 2000, "step": 1}], "tags": [{"key": "phase", "value": "tune"}]}),
+            serde_json::json!({"run_id": run_id, "metrics": [{"key": "rmse", "value": 0.7, "timestamp": 2000, "step": 1}], "params": [{"key": "batch-param", "value": "ok"}], "tags": [{"key": "phase", "value": "tune"}]}),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-
-        // Get run: latest metric + params + tags present.
-        let (status, body) = post_json(
+        post_json(
             &mut router,
-            "/runs/get",
-            serde_json::json!({"run_id": run_id}),
+            "/runs/log-metric",
+            serde_json::json!({"run_id": run_id, "key": "rmse", "value": 0.1, "timestamp": 1500, "step": 2}),
         )
         .await;
+        post_json(
+            &mut router,
+            "/runs/log-metric",
+            serde_json::json!({"run_id": run_id, "key": "rmse", "value": 0.8, "timestamp": 2000, "step": 3}),
+        )
+        .await;
+
+        // Get run: latest metric + params + tags present.
+        let (status, body) = get_json(&mut router, &format!("/runs/get?run_id={run_id}")).await;
         assert_eq!(status, StatusCode::OK);
         let metrics = body["run"]["data"]["metrics"].as_array().unwrap();
         assert_eq!(metrics.len(), 1);
         assert_eq!(
             metrics[0]["value"],
-            serde_json::json!(0.7),
-            "latest projection"
+            serde_json::json!(0.8),
+            "latest projection uses timestamp, then maximum value on a tie"
         );
+
+        // Default run order is newest-first and pagination reaches the tail.
+        let (status, first_page) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": [experiment_id], "max_results": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first_page}");
+        assert_eq!(first_page["runs"][0]["info"]["run_id"], newer_run_id);
+        let page_token = first_page["next_page_token"]
+            .as_str()
+            .expect("first run page must advertise the remaining run");
+        let (status, second_page) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": [experiment_id], "max_results": 1, "page_token": page_token}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second_page}");
+        assert_eq!(second_page["runs"][0]["info"]["run_id"], run_id);
 
         // Search: matching filter finds the run; NON-MATCHING returns empty
         // (the negative control — an ignored filter must not pass silently).
@@ -1244,6 +1472,16 @@ mod tests {
             "filter": "params.lr = '0.01' AND metrics.rmse < 0.95"
         });
         let (status, body) = post_json(&mut router, "/runs/search", matching).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["runs"].as_array().unwrap().len(), 1);
+
+        // The documented MLflow filter grammar accepts quoted identifiers
+        // and lowercase AND (the form emitted by real clients).
+        let quoted_key = serde_json::json!({
+            "experiment_ids": [experiment_id],
+            "filter": "params.`model class` = 'linear' and tags.phase = 'tune'"
+        });
+        let (status, body) = post_json(&mut router, "/runs/search", quoted_key).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["runs"].as_array().unwrap().len(), 1);
 
@@ -1280,114 +1518,40 @@ mod tests {
             serde_json::json!({"run_id": run_id, "key": "rmse", "value": 0.1, "timestamp": 9500, "step": 2}),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-        assert_eq!(body["error_code"], "INVALID_STATE", "body: {body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error_code"], "INVALID_STATE");
 
-        // Reopen (UpdateRun -> RUNNING) accepts writes again, then FAILED
-        // terminal status round-trips.
-        post_json(
+        // Terminal states must round-trip instead of all being rewritten as
+        // FINISHED by the substrate.
+        let (status, body) = post_json(
             &mut router,
             "/runs/update",
-            serde_json::json!({"run_id": run_id, "status": "RUNNING"}),
+            serde_json::json!({"run_id": newer_run_id, "status": "FAILED", "end_time": 9100}),
         )
         .await;
-        post_json(
-            &mut router,
-            "/runs/log-metric",
-            serde_json::json!({"run_id": run_id, "key": "rmse", "value": 0.2, "timestamp": 9600, "step": 3}),
-        )
-        .await;
-        let (_, body) = post_json(
-            &mut router,
-            "/runs/update",
-            serde_json::json!({"run_id": run_id, "status": "FAILED", "end_time": 9700}),
-        )
-        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["run_info"]["status"], "FAILED");
 
-        // Non-finite metric values arrive as proto3-JSON strings.
-        let (status, _) = post_json(
+        // Reopening is an explicit MLflow transition. Non-finite metric
+        // values use proto3 JSON strings and must survive the wire round-trip.
+        let (status, body) = post_json(
             &mut router,
             "/runs/update",
-            serde_json::json!({"run_id": run_id, "status": "RUNNING"}),
+            serde_json::json!({"run_id": newer_run_id, "status": "RUNNING"}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        let (status, _) = post_json(
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post_json(
             &mut router,
             "/runs/log-metric",
-            serde_json::json!({"run_id": run_id, "key": "diverged", "value": "Infinity", "timestamp": 9800, "step": 0}),
+            serde_json::json!({"run_id": newer_run_id, "key": "diverged", "value": "Infinity", "timestamp": 9800, "step": 0}),
         )
         .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "Infinity-as-string must be accepted"
-        );
-
-        // Experiment search: name predicate applied; garbage filter
-        // rejected (never silently ignored).
-        let (_, body) = post_json(
-            &mut router,
-            "/experiments/search",
-            serde_json::json!({"filter": "name = 'iris'"}),
-        )
-        .await;
-        let found = body["experiments"].as_array().unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0]["name"], "iris");
-
-        let (_, body) = post_json(
-            &mut router,
-            "/experiments/search",
-            serde_json::json!({"filter": "name = 'no-such-experiment'"}),
-        )
-        .await;
-        assert_eq!(body["experiments"].as_array().unwrap().len(), 0);
-
-        let (_, body) = post_json(
-            &mut router,
-            "/experiments/search",
-            serde_json::json!({"filter": "garbage clause"}),
-        )
-        .await;
-        assert_eq!(body["error_code"], "INVALID_PARAMETER_VALUE");
-
-        // A second run so pagination has two results to page through.
-        let (_, body) = post_json(
-            &mut router,
-            "/runs/create",
-            serde_json::json!({"experiment_id": experiment_id, "run_name": "second", "start_time": 2000}),
-        )
-        .await;
-        assert_eq!(body["run"]["info"]["run_name"], "second", "body: {body}");
-
-        // Pagination: max_results truncation carries next_page_token.
-        let (_, body) = post_json(
-            &mut router,
-            "/runs/search",
-            serde_json::json!({"experiment_ids": [experiment_id], "max_results": 1}),
-        )
-        .await;
-        eprintln!("SEARCH1 BODY: {body}");
-        let token = body["next_page_token"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no token; body: {body}"))
-            .to_string();
-        assert_eq!(body["runs"].as_array().unwrap().len(), 1, "body: {body}");
-        let (_, body) = post_json(
-            &mut router,
-            "/runs/search",
-            serde_json::json!({"experiment_ids": [experiment_id], "page_token": token}),
-        )
-        .await;
-        // Page 2 (unbounded) holds the remaining run and carries NO further
-        // token — pagination terminates.
-        assert_eq!(body["runs"].as_array().unwrap().len(), 1);
-        assert!(
-            body.get("next_page_token").is_none(),
-            "exhausted pagination must omit the token; body: {body}"
-        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) =
+            get_json(&mut router, &format!("/runs/get?run_id={newer_run_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["run"]["data"]["metrics"][0]["value"], "Infinity");
 
         // Duplicate experiment name -> RESOURCE_ALREADY_EXISTS (MLflow code).
         let (status, body) = post_json(
@@ -1415,21 +1579,16 @@ mod tests {
 
         // Cross-tenant probe: RESOURCE_DOES_NOT_EXIST — identical to a
         // missing id (no distinguishing 403 that confirms existence).
-        let (status, body) = post_json(
+        let (status, body) = get_json(
             &mut bob,
-            "/experiments/get",
-            serde_json::json!({"experiment_id": experiment_id}),
+            &format!("/experiments/get?experiment_id={experiment_id}"),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error_code"], "RESOURCE_DOES_NOT_EXIST");
 
-        let (missing_status, missing_body) = post_json(
-            &mut bob,
-            "/experiments/get",
-            serde_json::json!({"experiment_id": "999999"}),
-        )
-        .await;
+        let (missing_status, missing_body) =
+            get_json(&mut bob, "/experiments/get?experiment_id=999999").await;
         // Uniform in status + error_code (the message echoes the requester's
         // own id, which leaks nothing — the attacker supplied it).
         assert_eq!(missing_status, status);

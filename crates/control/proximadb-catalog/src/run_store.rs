@@ -584,7 +584,15 @@ pub mod conformance_tests {
                     .ok_or_else(|| RunStoreError::UnknownRun {
                         run_id: run_id.to_string(),
                     })?;
-                run.latest_metrics.insert(point.key.clone(), point.clone());
+                let advances_projection =
+                    run.latest_metrics.get(&point.key).is_none_or(|current| {
+                        point.timestamp_ms > current.timestamp_ms
+                            || (point.timestamp_ms == current.timestamp_ms
+                                && point.value > current.value)
+                    });
+                if advances_projection {
+                    run.latest_metrics.insert(point.key.clone(), point.clone());
+                }
                 history_len = self
                     .history
                     .lock()
@@ -764,16 +772,33 @@ pub mod conformance_tests {
             timestamp_ms: 2_000,
             step: 1,
         };
+        let older = MetricPoint {
+            key: "rmse".to_string(),
+            value: 0.1,
+            timestamp_ms: 1_500,
+            step: 2,
+        };
+        let same_time_higher = MetricPoint {
+            key: "rmse".to_string(),
+            value: 0.8,
+            timestamp_ms: 2_000,
+            step: 3,
+        };
         store.log_metric("run-0001", p1.clone()).await.unwrap();
         let append = store.log_metric("run-0001", p2.clone()).await.unwrap();
         assert_eq!(append.history_len, 2);
+        store.log_metric("run-0001", older.clone()).await.unwrap();
+        store
+            .log_metric("run-0001", same_time_higher.clone())
+            .await
+            .unwrap();
         assert_eq!(
             store.metric_history("run-0001", "rmse").await.unwrap(),
-            vec![p1.clone(), p2.clone()]
+            vec![p1.clone(), p2, older, same_time_higher.clone()]
         );
         assert_eq!(
             store.get_run("run-0001").await.unwrap().latest_metrics["rmse"],
-            p2
+            same_time_higher
         );
 
         // Tags are mutable.
@@ -834,7 +859,7 @@ pub mod conformance_tests {
                 .await
                 .unwrap()
                 .len(),
-            3,
+            5,
             "seq must survive tag rewrites — history docs must never be overwritten"
         );
 
@@ -956,8 +981,8 @@ pub mod conformance_tests {
                 .await
                 .unwrap()
                 .len(),
-            4,
-            "run-0001 history: two early points + post-tag-rewrite + post-reopen appends"
+            6,
+            "run-0001 history: four early points + post-tag-rewrite + post-reopen appends"
         );
         assert_eq!(
             store

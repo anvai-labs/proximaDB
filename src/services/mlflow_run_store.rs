@@ -538,7 +538,13 @@ impl RunStore for SubstrateRunStore {
         let counter_key = counter_key(&point.key);
         let next_seq = counters.get(&counter_key).copied().unwrap_or(0) + 1;
         counters.insert(counter_key, next_seq);
-        run.latest_metrics.insert(point.key.clone(), point.clone());
+        let advances_projection = run.latest_metrics.get(&point.key).is_none_or(|current| {
+            point.timestamp_ms > current.timestamp_ms
+                || (point.timestamp_ms == current.timestamp_ms && point.value > current.value)
+        });
+        if advances_projection {
+            run.latest_metrics.insert(point.key.clone(), point.clone());
+        }
         self.put_run(&run, &counters).await.map_err(Self::err)?;
         self.put_payload(
             &format!("mtr-{run_id}-{next_seq}"),
