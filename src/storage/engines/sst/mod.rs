@@ -344,7 +344,6 @@ use proximadb_compression::CompressionAlgorithm;
 // SortingStats now comes from utils module
 // Unified search engine removed - using direct search methods
 // MetadataItem is part of VectorRecord proto
-use std::collections::HashMap;
 use tracing::debug;
 
 use self::error::{Result, SstError};
@@ -355,8 +354,7 @@ use self::error::{Result, SstError};
 
 // Import Proxima common structures (shared with SWIFT)
 use crate::storage::engines::core::formats::proximablocks::block_structures::{
-    BlockCompressionConfig, BlockStatistics, ColumnStatistics, ProximaBlockMetadata,
-    ProximaDataBlock,
+    BlockCompressionConfig, BlockStatistics, ProximaBlockMetadata, ProximaDataBlock,
 };
 
 // SST filename operations are handled by unified FilenameCodec from compaction_orchestrator
@@ -848,130 +846,6 @@ mod block_utils {
 
     // NOTE: encode_with_proxima and decode_with_proxima removed in consolidation
     // ProximaDataBlock now handles encoding internally via serialize_with_bloom_sync()
-
-    /// Calculate metadata statistics for intelligent block filtering
-    pub fn calculate_metadata_stats(records: &[VectorRecord]) -> ProximaBlockMetadata {
-        let mut stats = ProximaBlockMetadata::default();
-
-        if records.is_empty() {
-            return stats;
-        }
-
-        // Initialize key and timestamp ranges
-        let mut min_key = String::new();
-        let mut max_key = String::new();
-        let mut min_timestamp = u32::MAX;
-        let mut max_timestamp = u32::MIN;
-
-        if let Some(first) = records.first() {
-            min_key = first.id.clone();
-            max_key = first.id.clone();
-            min_timestamp = first.timestamp.unwrap_or(0) as u32;
-            max_timestamp = first.timestamp.unwrap_or(0) as u32;
-        }
-
-        // Process all records for statistics
-        let mut metadata_columns = HashMap::new();
-
-        for record in records {
-            let record_id = &record.id;
-            // Update key range
-            if record_id < &min_key {
-                min_key = record_id.clone();
-            }
-            if record_id > &max_key {
-                max_key = record_id.clone();
-            }
-
-            // Update timestamp range
-            min_timestamp = min_timestamp.min(record.timestamp.unwrap_or(0) as u32);
-            max_timestamp = max_timestamp.max(record.timestamp.unwrap_or(0) as u32);
-
-            // Process metadata
-            for item in &record.metadata {
-                let col_name = item.0.clone();
-                metadata_columns.insert(col_name.clone(), ());
-
-                // Get or create column stats
-                let col_stats = stats
-                    .column_stats
-                    .entry(col_name.clone())
-                    .or_insert_with(|| ColumnStatistics {
-                        name: col_name.clone(),
-                        null_count: 0,
-                        distinct_count: 0,
-                        min_value: None,
-                        max_value: None,
-                        avg_size_bytes: 0,
-                        bloom_filter_enabled: false,
-                    });
-
-                // Convert to JSON value for min/max tracking (canonical
-                // rendering; the null arms carry the only side effect).
-                let value = match &item.1.value {
-                    None | Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(_)) => {
-                        col_stats.null_count += 1;
-                        continue;
-                    }
-                    _ => proximadb_records::conversions::sql_value_to_json(item.1),
-                };
-
-                // Update min/max values for this column
-                if col_stats.min_value.is_none() {
-                    col_stats.min_value = Some(value.clone());
-                } else if let Some(ref mut min_val) = col_stats.min_value
-                    && compare_json_values(&value, min_val) == std::cmp::Ordering::Less
-                {
-                    *min_val = value.clone();
-                }
-
-                if col_stats.max_value.is_none() {
-                    col_stats.max_value = Some(value.clone());
-                } else if let Some(ref mut max_val) = col_stats.max_value
-                    && compare_json_values(&value, max_val) == std::cmp::Ordering::Greater
-                {
-                    *max_val = value;
-                }
-            }
-        }
-
-        // Store key range and timestamp range in column stats
-        stats.column_stats.insert(
-            "__id".to_string(),
-            ColumnStatistics {
-                name: "__id".to_string(),
-                null_count: 0,
-                distinct_count: records.len() as u32,
-                min_value: Some(serde_json::Value::String(min_key)),
-                max_value: Some(serde_json::Value::String(max_key)),
-                avg_size_bytes: 0,
-                bloom_filter_enabled: false,
-            },
-        );
-
-        stats.column_stats.insert(
-            "__timestamp".to_string(),
-            ColumnStatistics {
-                name: "__timestamp".to_string(),
-                null_count: 0,
-                distinct_count: 0,
-                min_value: Some(serde_json::Value::Number(serde_json::Number::from(
-                    min_timestamp,
-                ))),
-                max_value: Some(serde_json::Value::Number(serde_json::Number::from(
-                    max_timestamp,
-                ))),
-                avg_size_bytes: 8,
-                bloom_filter_enabled: false,
-            },
-        );
-
-        stats.record_count = records.len() as u32;
-        stats.timestamp = max_timestamp as i64;
-        stats.version_range = (min_timestamp as i64, max_timestamp as i64);
-
-        stats
-    }
 
     /// Compare JSON values for ordering
     #[allow(dead_code)]

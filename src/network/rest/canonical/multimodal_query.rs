@@ -82,6 +82,7 @@ use crate::query::federated::{
     FederatedParser, FederatedQueryContext, QueryType as FederatedQueryType,
 };
 use crate::query::multimodal::plan::PlanContext;
+use crate::query::prepared::statement::escape_sql_text;
 use crate::query::prepared::{ParameterValue, PreparedStatementCache, PreparedStatementConfig};
 use crate::query::unified::executor::ParallelExecutor;
 use crate::query::unified::{
@@ -681,14 +682,27 @@ fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
         return cypher.to_string();
     }
 
-    let upper = cypher.to_uppercase();
-    if upper.contains(" FROM ") {
+    // ASCII-case search directly on the original — to_uppercase() can
+    // change UTF-8 byte lengths, and offsets found in the copy can slice
+    // the original mid-character (panic) or past its end.
+    let contains_kw = |needle: &str| {
+        cypher
+            .as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    };
+    if contains_kw(" FROM ") {
         return cypher.to_string();
     }
 
     let insertion_index = [" WHERE ", " RETURN ", " ORDER BY ", " LIMIT ", " SKIP "]
         .iter()
-        .filter_map(|needle| upper.find(needle))
+        .filter_map(|needle| {
+            cypher
+                .as_bytes()
+                .windows(needle.len())
+                .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+        })
         .min();
 
     if let Some(index) = insertion_index {
@@ -729,7 +743,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
 
                 format!(
                     "SELECT * FROM VECTOR_SEARCH('{}', '[{}]', {})",
-                    collection.replace('\'', "''"),
+                    escape_sql_text(collection),
                     query_vector,
                     top_k
                 )
@@ -748,8 +762,8 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
 
                 format!(
                     "SELECT * FROM DOCUMENT_QUERY('{}', '{}')",
-                    collection.replace('\'', "''"),
-                    filter.replace('\'', "''")
+                    escape_sql_text(collection),
+                    escape_sql_text(filter)
                 )
             }
             "graph" => {
@@ -765,10 +779,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .unwrap_or("MATCH (n) RETURN n");
                 let cypher = inject_graph_target_into_cypher(graph, cypher);
 
-                format!(
-                    "SELECT * FROM GRAPH_QUERY('{}')",
-                    cypher.replace('\'', "''")
-                )
+                format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(&cypher))
             }
             "log" => {
                 let namespace = component
@@ -777,7 +788,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
 
-                format!("SELECT * FROM LOGS('{}')", namespace.replace('\'', "''"))
+                format!("SELECT * FROM LOGS('{}')", escape_sql_text(namespace))
             }
             "metric" => {
                 let namespace = component
@@ -786,7 +797,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
 
-                format!("SELECT * FROM METRICS('{}')", namespace.replace('\'', "''"))
+                format!("SELECT * FROM METRICS('{}')", escape_sql_text(namespace))
             }
             unknown => {
                 return Err(ApiError::InvalidArgument(format!(
@@ -922,10 +933,15 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
 }
 
 fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
-    let upper = sql.to_uppercase();
+    // ASCII-case search on the original (offsets in a to_uppercase copy
+    // can slice mid-character — see inject_graph_target_into_cypher).
     let mut search_start = 0;
 
-    while let Some(relative_pos) = upper[search_start..].find(function_name) {
+    let sql_bytes = sql.as_bytes();
+    while let Some(relative_pos) = sql_bytes[search_start..]
+        .windows(function_name.len())
+        .position(|w| w.eq_ignore_ascii_case(function_name.as_bytes()))
+    {
         let name_start = search_start + relative_pos;
         let after_name = name_start + function_name.len();
         let Some(open_relative) = sql[after_name..].find('(') else {

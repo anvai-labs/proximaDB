@@ -153,6 +153,34 @@ pub(crate) fn escape_sql_text(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+/// Vector literal text '[f,f,...]' via float Display — serde_json nulls
+/// non-finite elements and the internal vector parsers reject null ('NaN'
+/// text parses). ONE home for every vector splice (param, literal, UQL).
+pub(crate) fn vector_literal_text(values: &[f32]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(values.len() * 8 + 2);
+    let _ = write!(text, "[");
+    for (i, f) in values.iter().enumerate() {
+        if i > 0 {
+            let _ = write!(text, ",");
+        }
+        let _ = write!(text, "{f}");
+    }
+    let _ = write!(text, "]");
+    text
+}
+
+/// Filter-lowering JSON as SQL param/literal TEXT: strings come out BARE
+/// (double-quoting the JSON text would embed the quotes in the literal
+/// itself), structured values as their JSON text. Applied at the SPLICE
+/// layer so every ParameterValue constructor is safe by construction.
+pub(crate) fn filter_literal_text(json: serde_json::Value) -> String {
+    match json {
+        serde_json::Value::String(s) => s,
+        json => json.to_string(),
+    }
+}
+
 pub(crate) fn sql_quote(value: &str) -> String {
     format!("'{}'", escape_sql_text(value))
 }
@@ -176,14 +204,11 @@ impl ParameterValue {
             // vector parsers require '[' after quote-stripping; non-finite
             // elements splice as their text inside the quotes — valid SQL,
             // needs a cast to compare).
-            ParameterValue::Vector(v) => {
-                let formatted: Vec<String> = v.iter().map(|f| f.to_string()).collect();
-                sql_quote(&format!("[{}]", formatted.join(",")))
-            }
+            ParameterValue::Vector(v) => sql_quote(&vector_literal_text(v)),
             // JSON splices QUOTED: bare '[0,1,2]' / '{"x":1}' is a parse
             // error on every engine (the text may still need a cast to
             // compare — see the TD-tracked federated literal dialect gap).
-            ParameterValue::Json(v) => sql_quote(&v.to_string()),
+            ParameterValue::Json(v) => sql_quote(&filter_literal_text(v.clone())),
         }
     }
 }

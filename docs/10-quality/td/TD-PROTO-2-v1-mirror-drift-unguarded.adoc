@@ -1090,6 +1090,31 @@ Other round-8/9 fixes:
   JSON-quoted on the Python surface) — folds into the tracked
   parameterized-renderer item.
 
+**Consolidation review round 19 (2026-09-07):**
+- The port-side multimodal builder handles 'log'/'metric' component
+  types (the v1 REST twin's vocabulary) — they previously hit
+  `_ => continue` and the caller's 'SELECT 1' fallback returned a
+  200-OK wrong result.
+- inject_graph_target_into_cypher and collect_quoted_first_args search
+  ASCII-case on the ORIGINAL string — offsets found in a
+  to_uppercase() copy can slice mid-character (panic) or past the end
+  (uppercase can change UTF-8 byte lengths; demonstrated with 'ﬀ'/'ŉ').
+- The vector-literal text ('[f,f]' via float Display) homed as ONE
+  vector_literal_text beside sql_quote — six hand-copies (param,
+  literal ×2, UQL, splice layer, twin producer); filter_literal_text
+  homed there too and applied AT THE SPLICE LAYER (to_sql_string's Json
+  arm) so the public From<Value> constructors are safe by construction.
+- The param fn's Json/Array/Map arms deleted (byte-identical to the
+  catch-all — four spellings of one lowering); the literal Array
+  else-branch now calls the same exotic_literal helper as the
+  catch-all. The REST twin's six inline quote-doubling replaces use the
+  homed escape_sql_text. Dead calculate_metadata_stats deleted (the
+  round-2 'dead, canonicalize' disposition predates the dead-converter-
+  trap precedent rounds 12/16 set).
+- Tracked: the REST twin router (create_router, /api/v1/unified/*) is
+  mounted nowhere — the v2 endpoint routes to the port twin; the twins
+  want consolidation (one builder, one vocabulary).
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its
