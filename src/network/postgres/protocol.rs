@@ -44,6 +44,16 @@ use proximadb_data_model::ProximaValue;
 
 use proximadb_records::conversions::sql_value_to_json;
 
+/// ASCII-case-insensitive find returning a byte offset into the ORIGINAL
+/// string — offsets found in a `to_uppercase()` copy can slice the original
+/// mid-character (uppercase changes UTF-8 byte lengths, e.g. 'ﬀ' 3→2 bytes).
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 fn sql_object_to_json(obj: &crate::proto::proximadb_v1::SqlObject) -> String {
     let value = serde_json::Value::Object(
         obj.fields
@@ -1371,8 +1381,7 @@ impl PostgresProtocol {
         let (name, value) = if let Some(eq_index) = rest.find('=') {
             (&rest[..eq_index], &rest[eq_index + 1..])
         } else {
-            let upper = rest.to_ascii_uppercase();
-            let Some(to_index) = upper.find(" TO ") else {
+            let Some(to_index) = find_ascii_ci(query, " TO ") else {
                 return Err(anyhow!("expected SET name = value or SET name TO value"));
             };
             (&rest[..to_index], &rest[to_index + " TO ".len()..])
@@ -1760,8 +1769,7 @@ impl PostgresProtocol {
     }
 
     fn extract_create_table_name(&self, query: &str) -> Option<String> {
-        let upper = query.to_ascii_uppercase();
-        let table_pos = upper.find("CREATE TABLE")?;
+        let table_pos = find_ascii_ci(query, "CREATE TABLE")?;
         let after_table = query[table_pos + "CREATE TABLE".len()..].trim_start();
         let after_table = after_table
             .strip_prefix("IF NOT EXISTS")
@@ -2358,8 +2366,7 @@ impl PostgresProtocol {
         // `ns.table` for cross-namespace routing (dropping the qualifier, as
         // `clean_identifier` does for column refs, broke
         // `pgwire_enforces_cross_namespace_fk_referential_actions`).
-        let upper = query.to_ascii_uppercase();
-        let from_pos = upper.find("FROM ")?;
+        let from_pos = find_ascii_ci(query, "FROM ")?;
         let after_from = &query[from_pos + 5..];
         let table_end = after_from
             .find(|c: char| c.is_whitespace() || c == ';')
@@ -2387,8 +2394,7 @@ impl PostgresProtocol {
 
     /// Extract LIMIT value from query
     fn extract_limit(&self, query: &str) -> Option<usize> {
-        let upper = query.to_uppercase();
-        let limit_pos = upper.find("LIMIT ")?;
+        let limit_pos = find_ascii_ci(query, "LIMIT ")?;
         let after_limit = &query[limit_pos + 6..];
         let limit_end = after_limit
             .find(|c: char| !c.is_ascii_digit())
@@ -2417,11 +2423,10 @@ impl PostgresProtocol {
     }
 
     fn extract_selected_column_names(query: &str) -> Vec<String> {
-        let upper = query.to_ascii_uppercase();
-        let Some(select_pos) = upper.find("SELECT ") else {
+        let Some(select_pos) = find_ascii_ci(query, "SELECT ") else {
             return Vec::new();
         };
-        let Some(from_pos) = upper.find(" FROM ") else {
+        let Some(from_pos) = find_ascii_ci(query, " FROM ") else {
             return Vec::new();
         };
 
@@ -2719,8 +2724,7 @@ impl PostgresProtocol {
     }
 
     fn extract_select_where_clause(query: &str) -> Option<&str> {
-        let upper = query.to_ascii_uppercase();
-        let where_pos = upper.find(" WHERE ")?;
+        let where_pos = find_ascii_ci(query, " WHERE ")?;
         let mut predicate = query[where_pos + 7..].trim();
         for terminator in [" ORDER BY ", " GROUP BY ", " LIMIT ", " OFFSET "] {
             if let Some(pos) = Self::find_keyword_outside_literals(predicate, terminator) {
@@ -3182,8 +3186,7 @@ impl PostgresProtocol {
     ) -> Option<crate::proto::proximadb_v1::DocumentFilter> {
         use crate::proto::proximadb_v1::DocumentFilter;
 
-        let upper = query.to_uppercase();
-        let where_pos = upper.find("WHERE")?;
+        let where_pos = find_ascii_ci(query, "WHERE")?;
         let where_clause = &query[where_pos + 5..];
 
         // Simple parsing: look for $.field op value patterns
@@ -3527,10 +3530,8 @@ impl PostgresProtocol {
         default_start: i64,
         default_range: i64,
     ) -> (i64, i64) {
-        let upper = query.to_uppercase();
-
         // Look for BETWEEN ... AND ...
-        if let Some(_between_pos) = upper.find("BETWEEN") {
+        if let Some(_between_pos) = find_ascii_ci(query, "BETWEEN") {
             // Complex parsing - for now use defaults
             return (default_start - default_range, default_start);
         }
@@ -3565,10 +3566,9 @@ impl PostgresProtocol {
 
     /// Extract service filter from query
     fn extract_service_filter(&self, query: &str) -> Vec<String> {
-        let upper = query.to_uppercase();
         let mut services = Vec::new();
 
-        if let Some(service_pos) = upper.find("SERVICE") {
+        if let Some(service_pos) = find_ascii_ci(query, "SERVICE") {
             let after = &query[service_pos..];
             // Look for = 'value' pattern
             if let Some(eq_pos) = after.find('=') {
@@ -3586,9 +3586,7 @@ impl PostgresProtocol {
 
     /// Extract metric name from WHERE clause
     fn extract_metric_name(&self, query: &str) -> Option<String> {
-        let upper = query.to_uppercase();
-
-        if let Some(name_pos) = upper.find("METRIC_NAME") {
+        if let Some(name_pos) = find_ascii_ci(query, "METRIC_NAME") {
             let after = &query[name_pos..];
             if let Some(eq_pos) = after.find('=') {
                 let value_start = after[eq_pos + 1..].trim();
@@ -3663,9 +3661,9 @@ impl PostgresProtocol {
 
         // Extract table name: CREATE TABLE [IF NOT EXISTS] name
         let table_start = if if_not_exists {
-            upper.find("EXISTS").map(|p| p + 6)
+            find_ascii_ci(query, "EXISTS").map(|p| p + 6)
         } else {
-            upper.find("TABLE").map(|p| p + 5)
+            find_ascii_ci(query, "TABLE").map(|p| p + 5)
         };
 
         let Some(start) = table_start else {
@@ -4306,9 +4304,9 @@ impl PostgresProtocol {
 
         // Extract table name
         let table_start = if upper.contains("IF EXISTS") {
-            upper.find("EXISTS").map(|p| p + 6)
+            find_ascii_ci(query, "EXISTS").map(|p| p + 6)
         } else {
-            upper.find("TABLE").map(|p| p + 5)
+            find_ascii_ci(query, "TABLE").map(|p| p + 5)
         };
 
         let Some(start) = table_start else {

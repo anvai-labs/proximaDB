@@ -846,24 +846,6 @@ mod block_utils {
 
     // NOTE: encode_with_proxima and decode_with_proxima removed in consolidation
     // ProximaDataBlock now handles encoding internally via serialize_with_bloom_sync()
-
-    /// Compare JSON values for ordering
-    #[allow(dead_code)]
-    fn compare_json_values(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
-        use serde_json::Value;
-        match (a, b) {
-            (Value::Number(a), Value::Number(b)) => {
-                let a_f64 = a.as_f64();
-                let b_f64 = b.as_f64();
-                a_f64
-                    .partial_cmp(&b_f64)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
-            (Value::String(a), Value::String(b)) => a.cmp(b),
-            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            _ => std::cmp::Ordering::Equal,
-        }
-    }
 } // End of block_utils module
 
 // Local marker functions removed - now using centralized functions from unified_enable_vector_compression::markers

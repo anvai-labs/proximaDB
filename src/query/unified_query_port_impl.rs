@@ -336,18 +336,10 @@ fn uql_to_federated_sql(
             if vector.is_empty() {
                 return Err(anyhow!("UQL vector query parameter cannot be empty"));
             }
-            // Float text, not serde_json (serde nulls non-finite
-            // elements and parse_vector_literal rejects null — 'NaN'
-            // text parses; matches the literal and param paths).
-            let vector_text = vector
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
             Ok(Some(format!(
                 "SELECT * FROM VECTOR_SEARCH({}, {}, {})",
                 sql_quote(&select.from.collection),
-                sql_quote(&format!("[{vector_text}]")),
+                sql_quote(&vector_literal_text(&vector)),
                 limit
             )))
         }
@@ -584,17 +576,32 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // Convert the JSON multi-model request to a federated SQL string.
         // The root-crate logic is in multimodal_query::convert_multi_model_to_sql.
         // We replicate a simplified version here so we don't import the handler module.
-        let sql = json_to_multi_model_sql(&request).unwrap_or_else(|| {
-            // Fallback: treat "query" field as raw SQL, or use a SELECT 1.
-            request
+        let sql = match json_to_multi_model_sql(&request) {
+            Some(sql) => sql,
+            // Components WERE present but could not be lowered (missing or
+            // unknown component_type) — error, don't fall through to the
+            // raw-query/SELECT 1 fallback (that returned 200-OK garbage).
+            None if request
+                .get("components")
+                .and_then(|c| c.as_array())
+                .is_some_and(|a| !a.is_empty()) =>
+            {
+                return Err(anyhow!(
+                    "multi-model request contained a component that could not be lowered (missing or unknown component_type)"
+                ));
+            }
+            // No components: query-style request — raw SQL or SELECT 1.
+            None => request
                 .get("query")
                 .and_then(|v| v.as_str())
                 .unwrap_or("SELECT 1")
-                .to_string()
-        });
+                .to_string(),
+        };
+        // chars().take — a byte-indexed slice can land mid-character in
+        // the user-controlled cypher/collection text now spliced verbatim.
         info!(
             "execute_multi_model_query SQL: {}",
-            &sql[..sql.len().min(200)]
+            sql.chars().take(200).collect::<String>()
         );
         let result = self
             .adapter
@@ -792,7 +799,13 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                     .get("cypher")
                     .and_then(|v| v.as_str())
                     .unwrap_or("MATCH (n) RETURN n LIMIT 10");
-                format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(cypher))
+                // Honor config.graph like the v1 twin — without the
+                // injection the query silently targets the DEFAULT graph.
+                let cypher = crate::network::rest::canonical::multimodal_query::inject_graph_target_into_cypher(
+                    config.get("graph").and_then(|v| v.as_str()).unwrap_or("default"),
+                    cypher,
+                );
+                format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(&cypher))
             }
             // 'log'/'metric' are the v1 REST twin's component vocabulary
             // for the same observability arms — accepting them here stops
@@ -809,7 +822,10 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                 };
                 format!("SELECT * FROM {table}('{}')", escape_sql_text(namespace))
             }
-            _ => continue,
+            // Unknown component types fail the whole conversion (None →
+            // the caller errors) — silently skipping produced a 200-OK
+            // partial UNION (the v1 twin 400s on the same body).
+            _ => return None,
         };
         parts.push(sql_part);
     }
@@ -855,10 +871,12 @@ mod tests {
 
     #[test]
     fn test_proxima_value_to_param_composites() {
+        // Structured values flow through the catch-all as their JSON-text
+        // String param (the deleted per-variant Json arms re-derived it).
         let value = ProximaValue::Array(vec![ProximaValue::Int64(1), ProximaValue::Int64(2)]);
         assert!(matches!(
             proxima_value_to_param(&value),
-            ParameterValue::Json(_)
+            ParameterValue::String(s) if s == "[1,2]"
         ));
     }
 

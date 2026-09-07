@@ -674,7 +674,7 @@ async fn execute_multi_model_via_adapter(
 ///
 /// Generates SQL with multi-model extensions (VECTOR_SEARCH, GRAPH_QUERY, etc.)
 /// that can be executed through the federated query engine.
-fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
+pub(crate) fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
     let graph = graph.trim();
     let cypher = cypher.trim().trim_end_matches(';').trim();
 

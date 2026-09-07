@@ -1115,6 +1115,36 @@ Other round-8/9 fixes:
   mounted nowhere — the v2 endpoint routes to the port twin; the twins
   want consolidation (one builder, one vocabulary).
 
+**Consolidation review round 20 (2026-09-07):**
+- TWO RED TESTS on the branch head (caught before CI): the
+  prepared-statement integration pin still asserted the pre-round-15
+  UNQUOTED vector splice; the param-composites unit pin still expected
+  Json for Array input after round 19's arm fold. Both repinned. NOTE
+  for future rounds: run the touched TEST BINARIES, not just --lib.
+- The port twin's multimodal builder: unknown component_type now FAILS
+  the conversion and the caller ERRORS when components were present
+  (the None → 'SELECT 1' fallback returned 200-OK garbage for malformed
+  requests); the graph arm honors config.graph via
+  inject_graph_target_into_cypher (was silently querying the default
+  graph).
+- The to_uppercase-offset panic class SWEPT in pgwire: one find_ascii_ci
+  helper replaces every upper.find whose offset slices the ORIGINAL
+  query (16 sites; uppercase changes UTF-8 byte lengths — 'ﬀ' 3→2). The
+  multi-model info! log truncates via chars().take (byte slice could
+  land mid-character in spliced cypher text).
+- Json(Value::Null) params splice SQL NULL (3VL) — the quoted 'null'
+  string only matched columns holding that literal text. The UQL vector
+  splice uses the homed vector_literal_text (the round-19 'ONE home'
+  claim was false for this site). The orphaned compare_json_values
+  deleted from sst's block_utils.
+- Verified NOT ours: the five datafusion env-gated failures under plain
+  cargo test reproduce WITHOUT the branch's changes and pass in fresh
+  single-test processes — the shared-process env-gate race the nextest
+  profiles exist to serialize.
+- Tracked: json_to_parameter_value exists as two verbatim copies (REST
+  + embedded binding) whose Vector-vs-Json sniff now decides spliced
+  text — hoist one constructor beside ParameterValue.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

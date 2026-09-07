@@ -904,7 +904,7 @@ fn test_parameter_value_to_sql_string() {
     assert_eq!(ParameterValue::Null.to_sql_string(), "NULL");
     assert_eq!(
         ParameterValue::Vector(vec![1.0, 2.0, 3.0]).to_sql_string(),
-        "[1,2,3]"
+        "'[1,2,3]'"
     );
 }
 
