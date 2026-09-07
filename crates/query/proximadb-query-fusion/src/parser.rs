@@ -453,15 +453,13 @@ impl FederatedParser {
         }
 
         if let Some(rest) = trimmed.strip_prefix('\'') {
-            let mut skip_next = false;
             for (idx, ch) in rest.char_indices() {
-                if skip_next {
-                    // the quote after a backslash-escape (MySQL dialect)
-                    skip_next = false;
-                    continue;
+                // POSTGRES dialect: a DOUBLED close-quote is an escaped
+                // quote inside the literal; backslash is a literal.
+                if ch == '\'' && rest[(idx + ch.len_utf8())..].starts_with('\'') {
+                    continue; // the pair stays inside the literal
                 }
-                skip_next = ch == '\\' && rest[(idx + ch.len_utf8())..].starts_with('\'');
-                if !skip_next && ch == '\'' {
+                if ch == '\'' {
                     let literal_end = 1 + idx + ch.len_utf8();
                     let mut end = literal_end;
                     let suffix = trimmed[literal_end..].trim_start();
@@ -622,21 +620,18 @@ impl FederatedParser {
         let mut in_quote = None;
 
         let mut chars = s.chars().peekable();
-        let mut skip_next = false;
         while let Some(c) = chars.next() {
             if let Some(quote) = in_quote {
                 current.push(c);
-                if skip_next {
-                    // the quote after a backslash-escape (MySQL dialect)
-                    skip_next = false;
-                    continue;
-                }
-                // Dialect merge: doubled close-quote stays in-quote; a
-                // backslash immediately before a quote escapes it; any
-                // OTHER backslash is literal (the old stateful escape
-                // desynced when a value ENDED in one).
-                skip_next = c == '\\' && chars.peek() == Some(&quote);
-                if !skip_next && c == quote {
+                // POSTGRES dialect (standard_conforming_strings=on): the
+                // only in-literal escape is a DOUBLED close-quote (both
+                // chars stay); backslash is a LITERAL character.
+                if c == quote {
+                    if chars.peek() == Some(&quote) {
+                        chars.next();
+                        current.push(quote);
+                        continue;
+                    }
                     in_quote = None;
                 }
                 continue;
@@ -690,18 +685,21 @@ impl FederatedParser {
         let mut depth = 1;
         let mut in_quote = None;
 
-        let mut skip_next = false;
+        let mut in_doubled_pair = false;
         for (i, c) in content.char_indices() {
             if let Some(quote) = in_quote {
-                if skip_next {
-                    // the quote after a backslash-escape (MySQL dialect)
-                    skip_next = false;
+                if in_doubled_pair {
+                    // second char of a doubled close-quote — literal content
+                    in_doubled_pair = false;
                     continue;
                 }
-                // Dialect merge: doubled close-quote stays in-quote; a
-                // backslash immediately before a quote escapes it.
-                skip_next = c == '\\' && content[(i + c.len_utf8())..].starts_with(quote);
-                if !skip_next && c == quote {
+                // POSTGRES dialect: doubled close-quote stays in-quote;
+                // backslash is a literal.
+                if c == quote {
+                    if content[(i + c.len_utf8())..].starts_with(quote) {
+                        in_doubled_pair = true;
+                        continue;
+                    }
                     in_quote = None;
                 }
                 continue;
@@ -1075,6 +1073,33 @@ mod tests {
             }
             _ => panic!("Expected GraphQuery extension"),
         }
+    }
+
+    #[test]
+    fn postgres_string_dialect_is_pinned() {
+        // The ONLY in-literal escape is quote-doubling; backslash is a
+        // LITERAL (standard_conforming_strings=on). A trailing backslash
+        // does not escape the close-quote (rounds 23/24/28 churned this).
+        let parser = FederatedParser::new();
+        let path_arg = parser.parse("SELECT * FROM LOGS('C:\\dir\\') ORDER BY ts LIMIT 5");
+        // The extension is recognized and the namespace keeps the
+        // backslashes (no phantom literal swallowing ORDER BY/LIMIT).
+        let query = path_arg.expect("trailing backslash does not break parsing");
+        assert!(
+            matches!(&query.extensions[0], SqlExtension::Logs { namespace }
+                if namespace.contains("dir")),
+            "namespace should contain the path: {:?}",
+            query.extensions[0]
+        );
+
+        // Doubled quotes stay INSIDE the literal (one arg, decoded).
+        let doubled = parser
+            .parse("SELECT * FROM LOGS('team''s-prod')")
+            .expect("doubled quote is one literal");
+        assert!(
+            matches!(&doubled.extensions[0], SqlExtension::Logs { namespace }
+                if namespace == "team's-prod")
+        );
     }
 
     #[test]

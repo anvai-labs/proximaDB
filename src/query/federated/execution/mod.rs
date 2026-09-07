@@ -1670,7 +1670,11 @@ impl FederatedExecutor {
             serde_json::Value::Array(items) => items
                 .iter()
                 .map(|item| match item {
-                    serde_json::Value::Number(n) => n.as_f64().map(|f| f as f32),
+                    // The ONE non-finite policy: the f32 narrowing can
+                    // overflow (1e300 → inf) — reject, don't dispatch.
+                    serde_json::Value::Number(n) => {
+                        n.as_f64().map(|f| f as f32).filter(|f| f.is_finite())
+                    }
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()
@@ -1707,8 +1711,14 @@ impl FederatedExecutor {
                 .values
                 .iter()
                 .map(|value| match value.value.as_ref()? {
-                    sql_value::Value::NumberValue(number) => Some(*number as f32),
-                    sql_value::Value::Int64Value(number) => Some(*number as f32),
+                    sql_value::Value::NumberValue(number) => {
+                        let f = *number as f32;
+                        f.is_finite().then_some(f)
+                    }
+                    sql_value::Value::Int64Value(number) => {
+                        let f = *number as f32;
+                        f.is_finite().then_some(f)
+                    }
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()
@@ -1730,8 +1740,14 @@ impl FederatedExecutor {
                 .values
                 .iter()
                 .map(|value| match value.value.as_ref()? {
-                    property_value::Value::DoubleValue(number) => Some(*number as f32),
-                    property_value::Value::IntValue(number) => Some(*number as f32),
+                    property_value::Value::DoubleValue(number) => {
+                        let f = *number as f32;
+                        f.is_finite().then_some(f)
+                    }
+                    property_value::Value::IntValue(number) => {
+                        let f = *number as f32;
+                        f.is_finite().then_some(f)
+                    }
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()
@@ -2077,12 +2093,17 @@ impl FederatedExecutor {
                 }
             }
             DataType::FixedSizeList(_, _) | DataType::List(_) => {
-                // Arrow extraction was already attempted above. A stored
-                // non-finite cell (written pre-gate or via raw gRPC) SKIPS
-                // the row — the null-row semantics above — instead of one
-                // poison row failing every correlated read; genuinely
-                // wrong inner dtypes skip identically.
-                Ok(None)
+                // LOUD error, symmetric with the Utf8 arm below: the same
+                // poison value must not behave differently by storage
+                // layout, and a silent Ok(None) here returned 0 rows for
+                // typo-class nested paths (try_extract is gated on
+                // nested_path.is_empty()). A poison-row SKIP policy is
+                // TD-tracked — it needs a distinguishing signal between
+                // stored-data poison and user typos.
+                Err(anyhow!(
+                    "Correlated vector source '{}' has Arrow list type but could not extract finite, non-empty Float32 values",
+                    requested
+                ))
             }
             other => Err(anyhow!(
                 "Correlated vector source '{}' uses unsupported outer column type {:?}",
@@ -2099,7 +2120,11 @@ impl FederatedExecutor {
         // The ONE non-finite policy: the string-decode arm of the resolver
         // rejects inf/NaN text — the binary fast path must not re-admit
         // them (NaN similarities order arbitrarily downstream).
-        let finite = |values: Vec<f32>| values.iter().all(|v| v.is_finite()).then_some(values);
+        // The ONE non-finite AND empty policies (a 0-dimension or inf
+        // vector must not dispatch to the kernels).
+        let finite = |values: Vec<f32>| {
+            (!values.is_empty() && values.iter().all(|v| v.is_finite())).then_some(values)
+        };
         // Try FixedSizeList<Float32> first (most common for embeddings)
         if let Some(fsl) = array.as_any().downcast_ref::<FixedSizeListArray>()
             && !fsl.is_null(row)
@@ -2281,12 +2306,10 @@ impl FederatedExecutor {
                 Self::parse_vector_from_serialized_value(raw, source, &[])
                     .map(DirectVectorResolution::Resolved)
             }
-            DataType::FixedSizeList(_, _) | DataType::List(_) => {
-                // Stored non-finite/unextractable cells SKIP the row (the
-                // null-row semantics above) instead of one poison row
-                // failing every correlated read.
-                Ok(DirectVectorResolution::SkipRow)
-            }
+            DataType::FixedSizeList(_, _) | DataType::List(_) => Err(anyhow!(
+                "Correlated vector source '{}' has Arrow list type but could not extract finite, non-empty Float32 values",
+                source
+            )),
             other => Err(anyhow!(
                 "Correlated vector source '{}' uses unsupported outer column type {:?}",
                 source,

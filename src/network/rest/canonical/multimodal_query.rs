@@ -980,6 +980,23 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
             }
             arg_start += ch.len_utf8();
         }
+        // Unquoted and DOUBLE-QUOTED first args are collection targets
+        // too (the fusion parser accepts them); '$'-prefixed bind params
+        // are not. The old port-side loop handled these; the delegation
+        // must not narrow extraction to single-quoted args.
+        if !sql[arg_start..].starts_with('\'') {
+            let candidate_end = sql[arg_start..]
+                .find([',', ')'])
+                .map(|rel| arg_start + rel)
+                .unwrap_or(sql.len());
+            let candidate = sql[arg_start..candidate_end].trim();
+            let decoded = candidate.trim_matches('"').replace("\"\"", "\"");
+            if !decoded.is_empty() && !decoded.starts_with('$') {
+                push_unique_target(targets, &decoded);
+            }
+            search_start = candidate_end;
+            continue;
+        }
         if sql[arg_start..].starts_with('\'') {
             let value_start = arg_start + 1;
             // Quote-doubling aware close scan — this PR's own generators

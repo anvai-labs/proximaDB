@@ -6011,18 +6011,15 @@ impl DmlService {
                     .collect()
             }
             SqlValueLiteral::String(value) => {
-                let parts: Vec<&str> = value
+                // Lazy iterator (an intermediate Vec cost ~36KB per
+                // 1536-dim row on the INSERT coercion path); emptiness is
+                // checked on the RESULT.
+                let parsed: Result<Vec<f32>> = value
                     .trim()
                     .trim_start_matches('[')
                     .trim_end_matches(']')
                     .split(',')
                     .filter(|part| !part.trim().is_empty())
-                    .collect();
-                if parts.is_empty() {
-                    return Err(anyhow!("vector elements must be non-empty"));
-                }
-                parts
-                    .iter()
                     .map(|part| {
                         let f = part
                             .trim()
@@ -6030,7 +6027,12 @@ impl DmlService {
                             .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))?;
                         ensure_finite(f)
                     })
-                    .collect()
+                    .collect();
+                let parsed = parsed?;
+                if parsed.is_empty() {
+                    return Err(anyhow!("vector elements must be non-empty"));
+                }
+                Ok(parsed)
             }
             _ => Err(anyhow!("Vector column expects array value")),
         }

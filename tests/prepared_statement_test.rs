@@ -267,8 +267,7 @@ fn test_bind_json_parameter() {
     // every prior spelling the branch cycled through): a JSON OBJECT
     // splices as QUOTED compact JSON text.
     assert!(
-        sql.contains("'{{\"category\":\"electronics\"")
-            || sql.contains("'{\"category\":\"electronics\""),
+        sql.contains("'{\"category\":\"electronics\""),
         "json container param must splice as quoted compact JSON, got: {sql}"
     );
 }

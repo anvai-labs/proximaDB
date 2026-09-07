@@ -1345,6 +1345,31 @@ angles after the main agent hit a rate limit):**
   reverted same-commit.
 - The round-27 'strict pins' were not strict (a {{}}-mangled literal in
   one; contains('k')/contains('v') in the other) — both exact now.
+
+**Consolidation review round 29 (2026-09-07):**
+- Round 28's escape 'dialect merge' was WRONG FOR THIS DATABASE: pgwire
+  runs standard_conforming_strings=on — backslash is NOT an escape, so
+  the MySQL half re-broke 'C:\dir\' (phantom literals swallowed ORDER
+  BY/LIMIT; no internal producer emits \' anyway). All six scanners now
+  speak the POSTGRES dialect: doubled close-quote stays in-quote (with
+  a pair-skip flag in the index-based scanners — the first attempt
+  re-closed at the pair's second quote), backslash literal. PINNED by a
+  fusion test at both endpoints (trailing-backslash path arg; doubled
+  quotes decode).
+- The ONE non-finite policy reached the last narrowings: the JSONB-doc
+  and SqlValue/PropertyValue extraction arms (f64→f32 overflow behind
+  dead error arms) and the Arrow fast path's empty cell (vacuous
+  all(is_finite)).
+- The round-28 poison-row SKIP was REVERTED to symmetric LOUD errors —
+  the skip was asymmetric by storage layout (Arrow skipped, serialized
+  errored) and silently returned 0 rows for typo-class nested paths.
+  A real skip policy needs a signal distinguishing stored poison from
+  user typos — TD-tracked.
+- collect_quoted_first_args (now shared by both EXPLAIN twins) accepts
+  unquoted and double-quoted first args and skips '$'-binds (the
+  delegation had narrowed extraction to single-quoted only). The DML
+  string-arm parse is lazy again (intermediate Vec = ~36KB/row on
+  1536-dim INSERT coercion).
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

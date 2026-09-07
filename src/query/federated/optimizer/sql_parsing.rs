@@ -19,20 +19,24 @@ pub(crate) fn find_top_level_keyword_from(
     let mut depth = 0usize;
     let mut in_quote = None;
 
-    let mut skip_next = false;
+    let mut in_doubled_pair = false;
     for (index, ch) in sql.char_indices() {
         if let Some(quote) = in_quote {
-            if skip_next {
-                // the quote after a backslash-escape (MySQL dialect)
-                skip_next = false;
+            if in_doubled_pair {
+                // second char of a doubled close-quote — literal content
+                in_doubled_pair = false;
                 continue;
             }
-            // Escape dialect merge: a doubled close-quote stays in-quote
-            // (SQL standard) AND a backslash immediately before a quote
-            // escapes it (MySQL) — any OTHER backslash is literal (the
-            // old stateful escape desynced on values ENDING in one).
-            skip_next = ch == '\\' && sql[(index + ch.len_utf8())..].starts_with(quote);
-            if !skip_next && ch == quote {
+            // POSTGRES dialect (standard_conforming_strings=on): the ONLY
+            // in-literal escape is a DOUBLED close-quote (both chars stay
+            // in the literal); backslash is a LITERAL character — treating
+            // it as an escape desyncs the scanner on values ending in one
+            // ('C:\dir\' is a complete literal).
+            if ch == quote {
+                if sql[(index + ch.len_utf8())..].starts_with(quote) {
+                    in_doubled_pair = true;
+                    continue;
+                }
                 in_quote = None;
             }
             continue;
@@ -82,20 +86,17 @@ pub(crate) fn split_top_level_list(input: &str) -> Vec<String> {
     let mut in_quote = None;
 
     let mut chars = input.chars().peekable();
-    let mut skip_next = false;
     while let Some(ch) = chars.next() {
         if let Some(quote) = in_quote {
             current.push(ch);
-            if skip_next {
-                // the quote after a backslash-escape (MySQL dialect)
-                skip_next = false;
-                continue;
-            }
-            // Dialect merge: doubled close-quote stays in-quote; a
-            // backslash immediately before a quote escapes it; any other
-            // backslash is literal (see the scanners above).
-            skip_next = ch == '\\' && chars.peek() == Some(&quote);
-            if !skip_next && ch == quote {
+            // POSTGRES dialect: a DOUBLED close-quote stays in-quote;
+            // backslash is a literal (see the scanners above).
+            if ch == quote {
+                if chars.peek() == Some(&quote) {
+                    chars.next();
+                    current.push(quote);
+                    continue;
+                }
                 in_quote = None;
             }
             continue;
@@ -337,19 +338,21 @@ pub(crate) fn find_top_level_operator(input: &str, operator: &str) -> Option<usi
     let mut depth = 0usize;
     let mut in_quote = None;
 
-    let mut skip_next = false;
+    let mut in_doubled_pair = false;
     for (index, ch) in input.char_indices() {
         if let Some(quote) = in_quote {
-            if skip_next {
-                // the quote after a backslash-escape (MySQL dialect)
-                skip_next = false;
+            if in_doubled_pair {
+                // second char of a doubled close-quote — literal content
+                in_doubled_pair = false;
                 continue;
             }
-            // Dialect merge: doubled close-quote stays in-quote; a
-            // backslash immediately before a quote escapes it; any other
-            // backslash is literal.
-            skip_next = ch == '\\' && input[(index + ch.len_utf8())..].starts_with(quote);
-            if !skip_next && ch == quote {
+            // POSTGRES dialect: doubled close-quote stays in-quote;
+            // backslash is a literal.
+            if ch == quote {
+                if input[(index + ch.len_utf8())..].starts_with(quote) {
+                    in_doubled_pair = true;
+                    continue;
+                }
                 in_quote = None;
             }
             continue;
