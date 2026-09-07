@@ -47,8 +47,10 @@ fn strip_vector_cast_suffix(input: &str) -> &str {
         .and_then(|r| r.strip_suffix(')'));
     // Whitespace-tolerant ('::vector (3)') like every sibling stripper;
     // digits-only dimension or no dimension at all.
-    let dimension_ok = after.trim().is_empty()
-        || inner.is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
+    // Empty parens are vacuously all-digits — the sibling strippers
+    // accept '::vector()' (the !d.is_empty() rejection diverged them).
+    let dimension_ok =
+        after.trim().is_empty() || inner.is_some_and(|d| d.chars().all(|c| c.is_ascii_digit()));
     if dimension_ok {
         &input[..cast_start]
     } else {

@@ -711,8 +711,19 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 let collection = component
                     .config
                     .get("collection")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "vector component config.collection must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "vector component config.collection is required".to_string(),
+                        )
+                    })?;
                 let query_values = component
                     .config
                     .get("query_vector")
@@ -756,10 +767,20 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                         .collect();
                     crate::query::prepared::statement::vector_literal_text(&f32_vec?)
                 };
+                // Typed: a string top_k silently baked the default (the
+                // silent-default class rounds 19-20 fixed for siblings).
                 let top_k = component
                     .config
                     .get("top_k")
-                    .and_then(|v| v.as_u64())
+                    .map(|v| {
+                        v.as_u64().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "vector component config.top_k must be a non-negative integer"
+                                    .to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or(10);
 
                 format!(
@@ -773,8 +794,19 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 let collection = component
                     .config
                     .get("collection")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "vector component config.collection must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "vector component config.collection is required".to_string(),
+                        )
+                    })?;
                 let filter = component
                     .config
                     .get("filter")
@@ -1902,10 +1934,10 @@ fn json_to_parameter_value(v: &serde_json::Value) -> ParameterValue {
         serde_json::Value::Null => ParameterValue::Null,
         serde_json::Value::Array(arr) => {
             // Try to parse as a vector of FINITE f32 (the ONE narrowing
-            // guard — f32 overflow would dispatch inf to the kernels). A
-            // NUMERIC-but-non-finite element ERRORS: falling through to
-            // the Json arm spliced it as quoted text, silently accepted,
-            // and made the prepared non-finite guard dead code here.
+            // guard — f32 overflow would dispatch inf to the kernels).
+            // KNOWN GAP (tracked): a numeric-but-f32-overflowing element
+            // falls through to the Json arm below (quoted text, silently
+            // accepted) — fixing needs an error channel on this fn.
             let floats: Vec<f32> = arr
                 .iter()
                 .filter_map(|v| v.as_f64().and_then(crate::core::utils::finite_f32))

@@ -865,6 +865,11 @@ impl FederatedParser {
 
     fn strip_vector_cast(value: &str) -> &str {
         let trimmed = value.trim();
+        // Cheap gate (the lowercase scan allocated a full copy of large
+        // literals per parse — see the optimizer sibling).
+        if !trimmed.contains("::") {
+            return trimmed;
+        }
         let lower = trimmed.to_ascii_lowercase();
         let Some(cast_start) = lower.rfind("::vector") else {
             return trimmed;

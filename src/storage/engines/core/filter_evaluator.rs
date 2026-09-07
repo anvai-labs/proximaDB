@@ -163,22 +163,6 @@ pub fn is_filterable_field(field: &str, filterable_columns: &[String]) -> bool {
     filterable_columns.contains(&field.to_string())
 }
 
-/// Evaluate a field value considering both filterable columns and extra_meta
-pub fn get_field_value(
-    field: &str,
-    metadata: &HashMap<String, Value>,
-    extra_meta: Option<&HashMap<String, String>>,
-    filterable_columns: &[String],
-) -> Option<Value> {
-    if is_filterable_field(field, filterable_columns) {
-        // Fast path: direct column access
-        metadata.get(field).cloned()
-    } else {
-        // Slow path: check extra_meta Map
-        extra_meta.and_then(|map| map.get(field).map(|s| Value::String(s.clone())))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

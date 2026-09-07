@@ -1424,6 +1424,30 @@ angles after the main agent hit a rate limit):**
   (three of the eight dialect copies) can never import the root
   crate; the shared home must be a foundation crate, and the
   scanner's only behavioral test lives 2300 lines from the fn.
+
+**Consolidation review round 32 (2026-09-07):**
+- Round 31 introduced a PANIC CLASS: the ends_ci closures byte-sliced
+  STR tails as the match check — a multi-byte char straddling the cut
+  panicked on the live /api/v2/query federated surface (the class the
+  commit claimed to fix). Byte compares on as_bytes now. The DISTINCT
+  strip needed a WORD BOUNDARY ('distinct_id' is a column — the strip
+  ate its first 8 bytes while the detector disagreed). The cast
+  stripper's !d.is_empty() rejected '::vector()' the siblings accept.
+- The quote-aware EXPLAIN scan skips '--' line comments (an
+  apostrophe inside a comment opened quote state and swallowed every
+  target after it); bare '?' binds skip like '$N' (one
+  is_bind_placeholder beside the scanner).
+- The multi-model vector arms type their config at BOTH twins
+  (collection required + string-checked; a string top_k silently
+  baked 10 — the silent-default class rounds 19-20 fixed). The
+  contradictory 'ERRORS' comment corrected to the tracked KNOWN GAP.
+  exotic_literal delegates to ParameterValue::Json's arm (the third
+  byte-identical splice copy). The fusion stripper got the '::' gate;
+  orphaned get_field_value deleted (the filterable-columns machinery
+  the PR's own deletions stranded — dead-converter-trap class).
+- Tracked: the fusion parser's per-loop uppercase copies (~42-98KB
+  transient per request on 14KB literals — hoist one copy; the
+  eq_ignore_ascii_case window scan already landed in sql_parsing).
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

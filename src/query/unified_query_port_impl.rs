@@ -25,7 +25,7 @@ use crate::query::authority_context::{AuthoritySource, resolve_catalog_authority
 use crate::query::explain::StorageAuthorityExplanation;
 use crate::query::multimodal::plan::PlanContext;
 use crate::query::prepared::statement::{
-    escape_sql_text, filter_literal_text, float_sql_literal, sql_quote, vector_literal_text,
+    escape_sql_text, float_sql_literal, sql_quote, vector_literal_text,
 };
 use crate::query::unified::uql::{
     ComparisonOperator, Condition, SelectStatement, UQLParser, UQLStatement, Value,
@@ -165,19 +165,10 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
 /// column needs the per-dialect literal form (ISO-8601 text for
 /// Postgres-style engines).
 fn exotic_literal(value: &ProximaValue) -> Result<String> {
-    // Splice by SHAPE, in agreement with the param route's semantic types
-    // and to_sql_string's Json arm: a JSON-null document is SQL NULL
-    // (3VL), bool/number scalars BARE (quoting them is a string-vs-numeric
-    // no-match), strings and containers quoted (bare '[...]'/'{...}' is a
-    // parse error; root-string docs lower to bare text per the
-    // filter-literal spelling).
-    match proxima_filter_literal(value) {
-        serde_json::Value::Null => Ok("NULL".to_string()),
-        scalar @ (serde_json::Value::Bool(_) | serde_json::Value::Number(_)) => {
-            Ok(scalar.to_string())
-        }
-        json => Ok(sql_quote(&filter_literal_text(&json))),
-    }
+    // ONE splice definition: delegate to ParameterValue::Json's arm (the
+    // shape rule — null→SQL NULL, scalars bare, strings/containers
+    // quoted — lived here as a byte-identical third copy).
+    Ok(ParameterValue::Json(proxima_filter_literal(value)).to_sql_string())
 }
 
 fn vector_to_sql_literal(values: &[f32]) -> Result<String> {
@@ -772,8 +763,17 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
             "vector" => {
                 let collection = config
                     .get("collection")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.collection must be a string"
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        anyhow!("components[{component_index}].config.collection is required")
+                    })?;
                 let query_values = config
                     .get("query_vector")
                     .ok_or_else(|| {
@@ -812,7 +812,18 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                     })
                     .collect();
                 let query_vec = vector_literal_text(&f32_vec?);
-                let top_k = config.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10);
+                // Typed: a string top_k silently baked the default.
+                let top_k = config
+                    .get("top_k")
+                    .map(|v| {
+                        v.as_u64().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.top_k must be a non-negative integer"
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(10);
                 format!(
                     "SELECT * FROM VECTOR_SEARCH('{}', '{}', {})",
                     escape_sql_text(collection),

@@ -163,9 +163,18 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
         // Fully case-insensitive ('Distinct ') — select_has_distinct
         // matches any case; a leaked keyword becomes a projected column.
         .or_else(|| {
+            // Word boundary required: 'distinct_id' is a COLUMN, not the
+            // keyword (select_has_distinct requires the trailing space —
+            // the two detectors must agree).
             clause
                 .get(..8)
                 .filter(|head| head.eq_ignore_ascii_case("DISTINCT"))
+                .filter(|_| {
+                    clause
+                        .as_bytes()
+                        .get(8)
+                        .is_none_or(|b| b.is_ascii_whitespace())
+                })
                 .map(|_| &clause[8..])
         })
         .unwrap_or(clause);
@@ -313,8 +322,10 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
             // change UTF-8 byte lengths, making len()-needle subtraction
             // slice mid-character (the class the sibling scanners fixed).
             let ends_ci = |needle: &str| {
+                // BYTE compare (a str slice could cut mid-character)
                 entry.len() >= needle.len()
-                    && entry[entry.len() - needle.len()..].eq_ignore_ascii_case(needle)
+                    && entry.as_bytes()[entry.len() - needle.len()..]
+                        .eq_ignore_ascii_case(needle.as_bytes())
             };
             let strip_ci = |needle: &str| entry[..entry.len() - needle.len()].trim();
             let trimmed = if ends_ci(" NULLS FIRST") {
@@ -327,7 +338,8 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
 
             let ends_trim_ci = |needle: &str| {
                 trimmed.len() >= needle.len()
-                    && trimmed[trimmed.len() - needle.len()..].eq_ignore_ascii_case(needle)
+                    && trimmed.as_bytes()[trimmed.len() - needle.len()..]
+                        .eq_ignore_ascii_case(needle.as_bytes())
             };
             let ascending = !ends_trim_ci(" DESC");
             let column = if ends_trim_ci(" ASC") || ends_trim_ci(" DESC") {
@@ -479,7 +491,8 @@ pub(crate) fn extract_where_predicate(sql: &str) -> Option<Predicate> {
     // ASCII-case tail checks on the ORIGINAL (uppercase-offset class).
     let ends_ci = |needle: &str| {
         clause.len() >= needle.len()
-            && clause[clause.len() - needle.len()..].eq_ignore_ascii_case(needle)
+            && clause.as_bytes()[clause.len() - needle.len()..]
+                .eq_ignore_ascii_case(needle.as_bytes())
     };
     if ends_ci(" IS NOT NULL") {
         return Some(Predicate {

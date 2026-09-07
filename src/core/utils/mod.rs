@@ -81,6 +81,15 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
                 i += 1;
             }
             None => {
+                // Line comments: an apostrophe INSIDE '-- don't' must not
+                // open quote state (it swallowed every target after it).
+                if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
                 if bytes[i] == b'\'' || bytes[i] == b'"' {
                     quote = Some(bytes[i]);
                     i += 1;
@@ -119,6 +128,12 @@ mod tests {
         assert_eq!(finite_f32(f64::INFINITY), None);
         assert_eq!(finite_f32(1e300), None);
     }
+}
+
+/// Bind placeholders ('$N' and bare '?') cannot resolve during EXPLAIN —
+/// they are not catalog targets.
+fn is_bind_placeholder(value: &str) -> bool {
+    value.starts_with('$') || value == "?"
 }
 
 pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
@@ -173,7 +188,7 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
                 // '$'-binds skip on the QUOTED arm too (consistent with
                 // the unquoted arm below).
                 if !value.is_empty()
-                    && !value.starts_with('$')
+                    && !is_bind_placeholder(&value)
                     && !targets.iter().any(|existing| existing == &value)
                 {
                     targets.push(value.clone());
@@ -190,7 +205,7 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
                 .unwrap_or(sql.len());
             let candidate = sql[arg_start..candidate_end].trim();
             if !candidate.is_empty()
-                && !candidate.starts_with('$')
+                && !is_bind_placeholder(candidate)
                 && !targets.iter().any(|existing| existing == candidate)
             {
                 targets.push(candidate.to_string());
