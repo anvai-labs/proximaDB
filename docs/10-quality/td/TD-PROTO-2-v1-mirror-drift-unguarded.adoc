@@ -1032,6 +1032,31 @@ Other round-8/9 fixes:
   overflow bare/quoted) — extends the tracked parameterized-renderer
   item.
 
+**Consolidation review round 17 (2026-09-06):**
+- Round 16's escaping covered only 2 of the 4 multimodal splice arms —
+  VECTOR_SEARCH collection and LOGS namespace now escaped too.
+- Vector LITERALS render via float text (serde_json nulls non-finite
+  elements and parse_vector_literal rejects null — '[NaN]' text parses;
+  both binding paths now agree; the round-13 'valid SQL' comment was
+  false on the ?-path).
+- The literal path's Json/Jsonb + Map/Struct arms folded into the exotic
+  catch-all — their serde_json spellings could never match the stored
+  filter rendering (a root-string Json lowers to BARE text there).
+- Embedded's Json arm RESTORED (round 16 deleted it as 'byte-identical'
+  — false for a root-string Json document: the bare unwrap returned
+  hello where every consumer expects '"hello"'; Python json.loads broke).
+- Tracked: (a) the escaped splices round-trip LOSSY — no downstream
+  consumer un-escapes '' (DocumentStrategy's trim_matches eats trailing
+  escaped quotes; the federated quote-toggle splitter mis-phases on '');
+  escaping closed the injection vector, the unescape is a parser change
+  on those two consumers. (b) query_vector's filter_map silently drops
+  non-numeric elements (dimension mismatch downstream instead of a
+  rejected request). (c) the v1 hybrid REST SQL bytes cell ALSO changed
+  (int-array → base64, test re-pinned to 'AQI=') — the round-16 note
+  recorded only the NaN half of this surface's wire change. (d) the
+  service.rs trace-hex loop is a FIFTH hex site — added to the tracked
+  kernel-unification inventory.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

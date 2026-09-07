@@ -412,6 +412,11 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
         // surface spelling — do not delete these arms as redundant.
         ProximaValue::Float32(f) => f.to_string(),
         ProximaValue::Float64(f) => f.to_string(),
+        // JSON values keep their JSON TEXT (quotes included) — a root-
+        // string document renders as '"hello"', parseable by json.loads;
+        // the bare-text unwrap of the fallback is for STRING-KIND exotics
+        // (uuid/ulid), not Json payloads.
+        ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v.to_string(),
         ProximaValue::Null => String::new(),
         // Everything else — containers AND exotics (dashed uuid, base64
         // binary, temporals) — renders through the shared canonical JSON

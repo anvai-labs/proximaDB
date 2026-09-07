@@ -37,8 +37,10 @@ use crate::query::{
 
 /// The filter-lowering JSON as param/literal TEXT: strings come out BARE
 /// (double-quoting the JSON text would embed the quotes in the literal
-/// itself), structured values as their JSON text. ONE home — the param path
-/// and the literal path must render the same text for federated equality.
+/// itself), structured values as their JSON text. One home for BOTH SQL
+/// binding paths (they must render the same text for federated equality);
+/// the embedded Python TEXT surface keeps its own policy (Json payloads
+/// stay JSON-quoted there — see binding's proxima_value_to_string).
 fn filter_literal_text(json: serde_json::Value) -> String {
     match json {
         serde_json::Value::String(s) => s,
@@ -146,20 +148,38 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
             "NULL".to_string()
         }),
         ProximaValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
-        ProximaValue::DenseVector(values) => Ok(sql_quote(&serde_json::to_string(values)?)),
+        // Vector literals render via float text (serde_json nulls
+        // non-finite elements and our own parse_vector_literal rejects
+        // null — 'NaN' text parses fine; both binding paths agree).
+        ProximaValue::DenseVector(values) => Ok(sql_quote(&format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))),
         ProximaValue::Array(_) => {
             if let Some(vector) = proxima_value_to_f32_vector(value) {
-                Ok(sql_quote(&serde_json::to_string(&vector)?))
+                Ok(sql_quote(&format!(
+                    "[{}]",
+                    vector
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )))
             } else {
-                Ok(sql_quote(&proxima_filter_literal(value).to_string()))
+                Ok(sql_quote(&filter_literal_text(proxima_filter_literal(
+                    value,
+                ))))
             }
         }
-        ProximaValue::Json(value) | ProximaValue::Jsonb(value) => {
-            Ok(sql_quote(&serde_json::to_string(value)?))
-        }
-        ProximaValue::Map(_) | ProximaValue::Struct(_) => Ok(sql_quote(&serde_json::to_string(
-            &proxima_filter_literal(value),
-        )?)),
+        // Json/Jsonb and Map/Struct flow through the exotic catch-all:
+        // their literals must render exactly what the filter evaluator
+        // renders on the stored side (a root-string Json lowers to BARE
+        // text there — the old serde_json spelling embedded the quotes
+        // and could never match).
         ProximaValue::Null => Ok("NULL".to_string()),
         // Typed exotics: the shared filter spelling (dashed Uuid, int-array
         // Binary, canonical sparse object) — the Debug fallback could never
@@ -780,7 +800,9 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                 let top_k = config.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10);
                 format!(
                     "SELECT * FROM VECTOR_SEARCH('{}', '[{}]', {})",
-                    collection, query_vec, top_k
+                    escape_sql_text(collection),
+                    query_vec,
+                    top_k
                 )
             }
             "document" => {
@@ -810,7 +832,7 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                     .get("namespace")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
-                format!("SELECT * FROM LOGS('{}')", namespace)
+                format!("SELECT * FROM LOGS('{}')", escape_sql_text(namespace))
             }
             _ => continue,
         };
