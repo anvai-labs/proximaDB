@@ -686,13 +686,13 @@ pub(crate) fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> Stri
     // to_uppercase() can change UTF-8 byte lengths, and offsets found in
     // the copy can slice the original mid-character (panic) or past its
     // end.
-    if crate::network::postgres::protocol::find_ascii_ci(cypher, " FROM ").is_some() {
+    if crate::core::utils::find_ascii_ci(cypher, " FROM ").is_some() {
         return cypher.to_string();
     }
 
     let insertion_index = [" WHERE ", " RETURN ", " ORDER BY ", " LIMIT ", " SKIP "]
         .iter()
-        .filter_map(|needle| crate::network::postgres::protocol::find_ascii_ci(cypher, needle))
+        .filter_map(|needle| crate::core::utils::find_ascii_ci(cypher, needle))
         .min();
 
     if let Some(index) = insertion_index {
@@ -928,7 +928,7 @@ fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<S
     let mut search_start = 0;
 
     while let Some(relative_pos) =
-        crate::network::postgres::protocol::find_ascii_ci(&sql[search_start..], function_name)
+        crate::core::utils::find_ascii_ci(&sql[search_start..], function_name)
     {
         let name_start = search_start + relative_pos;
         let after_name = name_start + function_name.len();

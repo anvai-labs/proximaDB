@@ -240,14 +240,7 @@ pub fn proxima_to_json(value: &ProximaValue) -> serde_json::Value {
         | ProximaValue::Timestamp(value, _)
         | ProximaValue::TimestampTz(value, _) => Value::Number((*value).into()),
         ProximaValue::Uuid(value) | ProximaValue::ULID(value) => {
-            // Single-pass hex (per-byte format! allocated one intermediate
-            // String per byte — 16 per value — on row-render paths).
-            use std::fmt::Write as _;
-            let mut hex = String::with_capacity(value.len() * 2);
-            for byte in value {
-                let _ = write!(hex, "{byte:02x}");
-            }
-            Value::String(hex)
+            Value::String(proximadb_kernel::hex_lower(value))
         }
         ProximaValue::Json(value) | ProximaValue::Jsonb(value) => value.clone(),
         ProximaValue::Array(values) => Value::Array(values.iter().map(proxima_to_json).collect()),

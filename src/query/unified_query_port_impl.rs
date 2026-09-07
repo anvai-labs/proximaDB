@@ -25,7 +25,7 @@ use crate::query::authority_context::{AuthoritySource, resolve_catalog_authority
 use crate::query::explain::StorageAuthorityExplanation;
 use crate::query::multimodal::plan::PlanContext;
 use crate::query::prepared::statement::{
-    escape_sql_text, filter_literal_text, sql_quote, vector_literal_text,
+    escape_sql_text, filter_literal_text, float_sql_literal, sql_quote, vector_literal_text,
 };
 use crate::query::unified::uql::{
     ComparisonOperator, Condition, SelectStatement, UQLParser, UQLStatement, Value,
@@ -67,7 +67,7 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         // literal paths agree on QUOTING (numeric-array text and
         // UInt64>i64::MAX spellings still differ between them; the literal
         // path's f32 vector coercion is pre-existing).
-        other => ParameterValue::String(filter_literal_text(proxima_filter_literal(other))),
+        other => ParameterValue::String(filter_literal_text(&proxima_filter_literal(other))),
     }
 }
 
@@ -113,20 +113,12 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         ProximaValue::UInt16(value) => Ok(value.to_string()),
         ProximaValue::UInt32(value) => Ok(value.to_string()),
         ProximaValue::UInt64(value) => Ok(value.to_string()),
-        // Non-finite floats have no SQL literal (bare 'NaN' text is a
-        // parse error) — NULL, matching the canonical JSON rendering.
-        // (Float64 stays a separate arm only because its binding type
-        // differs — the bodies MUST stay in lockstep.)
-        ProximaValue::Float16(value) | ProximaValue::Float32(value) => Ok(if value.is_finite() {
-            value.to_string()
-        } else {
-            "NULL".to_string()
-        }),
-        ProximaValue::Float64(value) => Ok(if value.is_finite() {
-            value.to_string()
-        } else {
-            "NULL".to_string()
-        }),
+        // One shared non-finite rule (float_sql_literal); Float64 stays a
+        // separate arm only because its binding type differs.
+        ProximaValue::Float16(value) | ProximaValue::Float32(value) => {
+            Ok(float_sql_literal(*value as f64))
+        }
+        ProximaValue::Float64(value) => Ok(float_sql_literal(*value)),
         ProximaValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
         ProximaValue::DenseVector(values) => Ok(sql_quote(&vector_literal_text(values))),
         ProximaValue::Array(_) => match proxima_value_to_f32_vector(value) {
@@ -153,7 +145,7 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
 /// column needs the per-dialect literal form (ISO-8601 text for
 /// Postgres-style engines).
 fn exotic_literal(value: &ProximaValue) -> Result<String> {
-    Ok(sql_quote(&filter_literal_text(proxima_filter_literal(
+    Ok(sql_quote(&filter_literal_text(&proxima_filter_literal(
         value,
     ))))
 }
@@ -583,10 +575,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             // Components WERE present but could not be lowered (missing or
             // unknown component_type) — error, don't fall through to the
             // raw-query/SELECT 1 fallback (that returned 200-OK garbage).
-            None if request
-                .get("components")
-                .is_some_and(|c| c.as_array().is_none_or(|a| !a.is_empty())) =>
-            {
+            None if request.get("components").is_some() => {
                 return Err(anyhow!(
                     "multi-model request contained a component that could not be lowered (missing or unknown component_type)"
                 ));

@@ -24,6 +24,7 @@ use super::session::{Session, SessionManager};
 use super::translator::QueryTranslator;
 use super::types::{FieldDescription, PgType};
 use crate::catalog::CatalogManager;
+use crate::core::utils::find_ascii_ci;
 use crate::graph::GraphService;
 use crate::network::arrow_ipc::ArrowProtoCodec;
 use crate::observability::ObservabilityService;
@@ -43,16 +44,6 @@ use proximadb_data_model::ProximaType;
 use proximadb_data_model::ProximaValue;
 
 use proximadb_records::conversions::sql_value_to_json;
-
-/// ASCII-case-insensitive find returning a byte offset into the ORIGINAL
-/// string — offsets found in a `to_uppercase()` copy can slice the original
-/// mid-character (uppercase changes UTF-8 byte lengths, e.g. 'ﬀ' 3→2 bytes).
-pub(crate) fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-}
 
 fn sql_object_to_json(obj: &crate::proto::proximadb_v1::SqlObject) -> String {
     let value = serde_json::Value::Object(
@@ -1378,8 +1369,18 @@ impl PostgresProtocol {
             .unwrap_or(rest)
             .trim_start();
 
+        // '='-split first, but a NAME never legitimately contains ' TO ' —
+        // that shape means TO-syntax whose VALUE held '=' (e.g. a padded
+        // base64 tenant id); mis-splitting it silently skips the tenant
+        // assertion gate below.
         let (name, value) = if let Some(eq_index) = rest.find('=') {
-            (&rest[..eq_index], &rest[eq_index + 1..])
+            let candidate = &rest[..eq_index];
+            if find_ascii_ci(candidate, " TO ").is_some() {
+                let to_index = find_ascii_ci(rest, " TO ").unwrap_or(eq_index);
+                (&rest[..to_index], &rest[to_index + " TO ".len()..])
+            } else {
+                (candidate, &rest[eq_index + 1..])
+            }
         } else {
             let Some(to_index) = find_ascii_ci(rest, " TO ") else {
                 return Err(anyhow!("expected SET name = value or SET name TO value"));

@@ -149,6 +149,16 @@ impl From<serde_json::Value> for ParameterValue {
 /// every parameter splice (String/Vector/Json) and the literal path in
 /// `unified_query_port_impl` (the direct and literal paths must agree on
 /// quoting for federated equality to be possible at all).
+/// Non-finite floats have no SQL literal — NULL (bare 'NaN'/'inf' text is
+/// a parse error on Postgres-style engines). ONE rule for every float arm.
+pub(crate) fn float_sql_literal(value: f64) -> String {
+    if value.is_finite() {
+        value.to_string()
+    } else {
+        "NULL".to_string()
+    }
+}
+
 pub(crate) fn escape_sql_text(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -174,10 +184,10 @@ pub(crate) fn vector_literal_text(values: &[f32]) -> String {
 /// (double-quoting the JSON text would embed the quotes in the literal
 /// itself), structured values as their JSON text. Applied at the SPLICE
 /// layer so every ParameterValue constructor is safe by construction.
-pub(crate) fn filter_literal_text(json: serde_json::Value) -> String {
+pub(crate) fn filter_literal_text(json: &serde_json::Value) -> String {
     match json {
-        serde_json::Value::String(s) => s,
-        json => json.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -196,8 +206,7 @@ impl ParameterValue {
             // does not exist"). NULL is valid everywhere and, per SQL
             // 3VL, compares to nothing — matching the canonical JSON
             // rendering's null.
-            ParameterValue::Float(f) if !f.is_finite() => "NULL".to_string(),
-            ParameterValue::Float(f) => f.to_string(),
+            ParameterValue::Float(f) => float_sql_literal(*f),
             ParameterValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ParameterValue::Null => "NULL".to_string(),
             // Quoted JSON-array TEXT (brackets kept — both internal
@@ -211,14 +220,7 @@ impl ParameterValue {
             // A JSON-null document is SQL NULL (3VL) — the string
             // 'null' would only match a column holding that literal text.
             ParameterValue::Json(v) if v.is_null() => "NULL".to_string(),
-            ParameterValue::Json(v) => {
-                // By-ref spelling — the by-value helper would deep-clone
-                // the whole document per splice.
-                sql_quote(&match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-            }
+            ParameterValue::Json(v) => sql_quote(&filter_literal_text(v)),
         }
     }
 }

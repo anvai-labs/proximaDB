@@ -518,12 +518,7 @@ impl ObservabilityService {
                         // containers still drop, this path's policy.
                         match &v.value {
                             Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(b)) => {
-                                use std::fmt::Write as _;
-                                let mut hex = String::with_capacity(b.len() * 2);
-                                for byte in b {
-                                    let _ = write!(hex, "{byte:02x}");
-                                }
-                                Some((k.clone(), hex))
+                                Some((k.clone(), proximadb_kernel::hex_lower(b)))
                             }
                             _ => crate::query::sql_scalar_to_string(v).map(|s| (k.clone(), s)),
                         }

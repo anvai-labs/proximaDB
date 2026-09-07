@@ -1169,6 +1169,26 @@ Other round-8/9 fixes:
   mechanical class-sweep must verify EACH site's searched-string ==
   sliced-string, or it manufactures exactly the bug it hunts.
 
+**Consolidation review round 22 (2026-09-07):**
+- SET parse disambiguation: the '='-first split mis-took TO-syntax whose
+  VALUE held '=' (a padded base64 tenant id garbled the name and
+  silently skipped the TD-TENANT-1 assertion gate) — a name never
+  legitimately contains ' TO ', so that shape now retries the TO-split.
+- The malformed-components guard covers components present at ANY shape
+  (empty arrays still fell to the SELECT 1 fallback).
+- filter_literal_text takes &Value (the Json splice had inlined a copy
+  of its body); float_sql_literal ONE rule for all three float arms +
+  the param path; kernel gained hex_lower (module-level) — the three
+  hand-inlined hex loops (records, search-types, observability service)
+  now call it; find_ascii_ci homed in core::utils (was pgwire-internal,
+  REST reached it via a fully-qualified protocol-module path).
+- Tracked (added to the uppercase-offset inventory): facade/strategies/
+  observability.rs extract_promql_expression (4th file). Twin
+  divergences (limit dropped, default filter/cypher spellings,
+  'observability' accepted) fold into the tracked twin-consolidation
+  item. v2_row_render's 4th-walker shape folds into the tracked
+  parameterized-renderer item.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

@@ -48,3 +48,14 @@ pub use validation::{
     validate_batch_size, validate_collection_name, validate_dimension, validate_distance_metric,
     validate_field_name, validate_storage_engine, validate_top_k, validate_vector_id,
 };
+
+/// ASCII-case-insensitive find returning a byte offset into the ORIGINAL
+/// string — offsets found in a `to_uppercase()` copy can slice the original
+/// mid-character (uppercase changes UTF-8 byte lengths, e.g. 'ﬀ' 3→2 bytes).
+/// Shared by the pgwire protocol parser and the multi-model SQL builders.
+pub fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
