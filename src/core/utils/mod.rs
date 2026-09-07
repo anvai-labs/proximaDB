@@ -112,9 +112,7 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
     // to_uppercase copy can slice mid-character).
     let mut search_start = 0;
 
-    while let Some(relative_pos) =
-        find_ascii_ci(&sql[search_start..], function_name)
-    {
+    while let Some(relative_pos) = find_ascii_ci(&sql[search_start..], function_name) {
         let name_start = search_start + relative_pos;
         let after_name = name_start + function_name.len();
         let Some(open_relative) = sql[after_name..].find('(') else {
@@ -181,4 +179,3 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
         search_start = after_name;
     }
 }
-
