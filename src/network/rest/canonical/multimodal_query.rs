@@ -1902,7 +1902,10 @@ fn json_to_parameter_value(v: &serde_json::Value) -> ParameterValue {
         serde_json::Value::Null => ParameterValue::Null,
         serde_json::Value::Array(arr) => {
             // Try to parse as a vector of FINITE f32 (the ONE narrowing
-            // guard — f32 overflow would dispatch inf to the kernels).
+            // guard — f32 overflow would dispatch inf to the kernels). A
+            // NUMERIC-but-non-finite element ERRORS: falling through to
+            // the Json arm spliced it as quoted text, silently accepted,
+            // and made the prepared non-finite guard dead code here.
             let floats: Vec<f32> = arr
                 .iter()
                 .filter_map(|v| v.as_f64().and_then(crate::core::utils::finite_f32))
@@ -1910,6 +1913,12 @@ fn json_to_parameter_value(v: &serde_json::Value) -> ParameterValue {
             if floats.len() == arr.len() {
                 ParameterValue::Vector(floats)
             } else {
+                // KNOWN GAP (tracked): a NUMERIC-but-f32-overflowing
+                // element falls through to the Json arm (quoted text —
+                // silently accepted; the prepared non-finite guard never
+                // sees it). Fixing needs an error channel on this
+                // converter — folds into the tracked json_to_parameter_value
+                // twins item.
                 ParameterValue::Json(v.clone())
             }
         }

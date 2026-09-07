@@ -160,6 +160,14 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
     let clause = clause
         .strip_prefix("DISTINCT ")
         .or_else(|| clause.strip_prefix("distinct "))
+        // Fully case-insensitive ('Distinct ') — select_has_distinct
+        // matches any case; a leaked keyword becomes a projected column.
+        .or_else(|| {
+            clause
+                .get(..8)
+                .filter(|head| head.eq_ignore_ascii_case("DISTINCT"))
+                .map(|_| &clause[8..])
+        })
         .unwrap_or(clause);
 
     split_top_level_list(clause)
@@ -301,20 +309,28 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
     split_top_level_list(clause)
         .into_iter()
         .filter_map(|entry| {
-            let upper = entry.to_uppercase();
-            let nulls_first = upper.ends_with(" NULLS FIRST");
-            let nulls_last = upper.ends_with(" NULLS LAST");
-            let trimmed = if nulls_first {
-                entry[..entry.len() - "NULLS FIRST".len()].trim()
-            } else if nulls_last {
-                entry[..entry.len() - "NULLS LAST".len()].trim()
+            // ASCII-case tail checks on the ORIGINAL — uppercase can
+            // change UTF-8 byte lengths, making len()-needle subtraction
+            // slice mid-character (the class the sibling scanners fixed).
+            let ends_ci = |needle: &str| {
+                entry.len() >= needle.len()
+                    && entry[entry.len() - needle.len()..].eq_ignore_ascii_case(needle)
+            };
+            let strip_ci = |needle: &str| entry[..entry.len() - needle.len()].trim();
+            let trimmed = if ends_ci(" NULLS FIRST") {
+                strip_ci(" NULLS FIRST")
+            } else if ends_ci(" NULLS LAST") {
+                strip_ci(" NULLS LAST")
             } else {
                 entry.trim()
             };
 
-            let upper_trimmed = trimmed.to_uppercase();
-            let ascending = !upper_trimmed.ends_with(" DESC");
-            let column = if upper_trimmed.ends_with(" ASC") || upper_trimmed.ends_with(" DESC") {
+            let ends_trim_ci = |needle: &str| {
+                trimmed.len() >= needle.len()
+                    && trimmed[trimmed.len() - needle.len()..].eq_ignore_ascii_case(needle)
+            };
+            let ascending = !ends_trim_ci(" DESC");
+            let column = if ends_trim_ci(" ASC") || ends_trim_ci(" DESC") {
                 trimmed[..trimmed.rfind(' ').unwrap_or(trimmed.len())]
                     .trim()
                     .to_string()
@@ -328,9 +344,9 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
                 Some(OrderByClause {
                     column,
                     ascending,
-                    nulls_first: if nulls_first {
+                    nulls_first: if ends_ci(" NULLS FIRST") {
                         true
-                    } else if nulls_last {
+                    } else if ends_ci(" NULLS LAST") {
                         false
                     } else {
                         !ascending
@@ -456,19 +472,23 @@ pub(crate) fn extract_where_predicate(sql: &str) -> Option<Predicate> {
         return None;
     }
 
-    let upper = clause.to_uppercase();
-    if upper.ends_with(" IS NOT NULL") {
+    // ASCII-case tail checks on the ORIGINAL (uppercase-offset class).
+    let ends_ci = |needle: &str| {
+        clause.len() >= needle.len()
+            && clause[clause.len() - needle.len()..].eq_ignore_ascii_case(needle)
+    };
+    if ends_ci(" IS NOT NULL") {
         return Some(Predicate {
-            column: clause[..clause.len() - "IS NOT NULL".len()]
+            column: clause[..clause.len() - " IS NOT NULL".len()]
                 .trim()
                 .to_string(),
             op: PredicateOp::IsNotNull,
             value: PredicateValue::Null,
         });
     }
-    if upper.ends_with(" IS NULL") {
+    if ends_ci(" IS NULL") {
         return Some(Predicate {
-            column: clause[..clause.len() - "IS NULL".len()].trim().to_string(),
+            column: clause[..clause.len() - " IS NULL".len()].trim().to_string(),
             op: PredicateOp::IsNull,
             value: PredicateValue::Null,
         });

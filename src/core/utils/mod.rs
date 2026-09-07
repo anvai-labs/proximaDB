@@ -112,7 +112,10 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
     // to_uppercase copy can slice mid-character).
     let mut search_start = 0;
 
-    while let Some(relative_pos) = find_ascii_ci(&sql[search_start..], function_name) {
+    // Quote-aware: names inside string literals or longer identifiers
+    // must not mint catalog targets (find_ascii_ci matched both).
+    while let Some(relative_pos) = find_ascii_ci_outside_quotes(&sql[search_start..], function_name)
+    {
         let name_start = search_start + relative_pos;
         let after_name = name_start + function_name.len();
         let Some(open_relative) = sql[after_name..].find('(') else {
@@ -153,7 +156,12 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
                     .replace(escaped, replacement)
                     .trim()
                     .to_string();
-                if !value.is_empty() && !targets.iter().any(|existing| existing == &value) {
+                // '$'-binds skip on the QUOTED arm too (consistent with
+                // the unquoted arm below).
+                if !value.is_empty()
+                    && !value.starts_with('$')
+                    && !targets.iter().any(|existing| existing == &value)
+                {
                     targets.push(value.clone());
                 }
                 search_start = close + 1;

@@ -1399,6 +1399,31 @@ angles after the main agent hit a rate limit):**
   subset; one shared scanner consumable from both crates is the
   terminal fix. Same for the ~11-site finite_f32 swap-in (the
   chokepoint exists; the sites migrate incrementally).
+
+**Consolidation review round 31 (2026-09-07):**
+- extract_order_by and extract_where_predicate still sliced the
+  ORIGINAL by needle-length subtraction after matching on an
+  uppercased COPY (the class round 30 claimed swept — 'the last
+  twin' was not); ascii-case tail checks on the original now, and
+  the DISTINCT strip is fully case-insensitive ('Distinct ' leaked
+  into projected column names).
+- strip_vector_cast_suffix: whitespace-tolerant dimension
+  ('::vector (3)') like every sibling stripper, and gated on a
+  cheap '::' check (the lowercase scan allocated a full copy of
+  14KB-class literals per outer row).
+- The shared EXPLAIN scanner searches names OUTSIDE QUOTES
+  (find_ascii_ci_outside_quotes — names inside string literals minted
+  bogus catalog targets) and skips '$'-binds on the QUOTED arm too.
+- Tracked: the REST json_to_parameter_value fallthrough splices a
+  numeric-but-f32-overflowing array as quoted Json text (silently
+  accepted; the prepared non-finite guard never sees it) — needs an
+  error channel, folds into the json_to_parameter_value twins item.
+  The FROM-target extractors remain divergent twins (port scans
+  FROM|JOIN|INTO|UPDATE; REST takes only the token after FROM).
+  core::utils cannot be the TERMINAL scanner home — the fusion crate
+  (three of the eight dialect copies) can never import the root
+  crate; the shared home must be a foundation crate, and the
+  scanner's only behavioral test lives 2300 lines from the fn.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

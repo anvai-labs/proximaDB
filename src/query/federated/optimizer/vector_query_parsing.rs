@@ -31,17 +31,24 @@ pub(crate) fn vector_source_from_expression(expr: &str) -> VectorSource {
 /// Strip a trailing `::vector` cast (any ASCII case, optional `(dim)`),
 /// returning the input unchanged when no cast is present.
 fn strip_vector_cast_suffix(input: &str) -> &str {
+    // Cheap gate: the lowercase scan allocated a full copy of 14KB-class
+    // literals on every per-row call just to discover no cast.
+    if !input.contains("::") {
+        return input;
+    }
     let lower = input.to_ascii_lowercase();
     let Some(cast_start) = lower.rfind("::vector") else {
         return input;
     };
     let after = &input[cast_start + 8..];
-    let dimension_ok = after.is_empty()
-        || (after.starts_with('(')
-            && after.ends_with(')')
-            && after[1..after.len() - 1]
-                .chars()
-                .all(|c| c.is_ascii_digit()));
+    let inner = after
+        .trim()
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'));
+    // Whitespace-tolerant ('::vector (3)') like every sibling stripper;
+    // digits-only dimension or no dimension at all.
+    let dimension_ok = after.trim().is_empty()
+        || inner.is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
     if dimension_ok {
         &input[..cast_start]
     } else {
