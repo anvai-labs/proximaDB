@@ -682,27 +682,17 @@ pub(crate) fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> Stri
         return cypher.to_string();
     }
 
-    // ASCII-case search directly on the original — to_uppercase() can
-    // change UTF-8 byte lengths, and offsets found in the copy can slice
-    // the original mid-character (panic) or past its end.
-    let contains_kw = |needle: &str| {
-        cypher
-            .as_bytes()
-            .windows(needle.len())
-            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-    };
-    if contains_kw(" FROM ") {
+    // ASCII-case search directly on the original (shared helper) —
+    // to_uppercase() can change UTF-8 byte lengths, and offsets found in
+    // the copy can slice the original mid-character (panic) or past its
+    // end.
+    if crate::network::postgres::protocol::find_ascii_ci(cypher, " FROM ").is_some() {
         return cypher.to_string();
     }
 
     let insertion_index = [" WHERE ", " RETURN ", " ORDER BY ", " LIMIT ", " SKIP "]
         .iter()
-        .filter_map(|needle| {
-            cypher
-                .as_bytes()
-                .windows(needle.len())
-                .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-        })
+        .filter_map(|needle| crate::network::postgres::protocol::find_ascii_ci(cypher, needle))
         .min();
 
     if let Some(index) = insertion_index {
@@ -933,14 +923,12 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
 }
 
 fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
-    // ASCII-case search on the original (offsets in a to_uppercase copy
-    // can slice mid-character — see inject_graph_target_into_cypher).
+    // ASCII-case search on the original (shared helper — offsets in a
+    // to_uppercase copy can slice mid-character).
     let mut search_start = 0;
 
-    let sql_bytes = sql.as_bytes();
-    while let Some(relative_pos) = sql_bytes[search_start..]
-        .windows(function_name.len())
-        .position(|w| w.eq_ignore_ascii_case(function_name.as_bytes()))
+    while let Some(relative_pos) =
+        crate::network::postgres::protocol::find_ascii_ci(&sql[search_start..], function_name)
     {
         let name_start = search_start + relative_pos;
         let after_name = name_start + function_name.len();

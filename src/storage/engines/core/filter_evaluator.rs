@@ -179,24 +179,6 @@ pub fn get_field_value(
     }
 }
 
-/// Evaluate filter with awareness of filterable columns
-/// This function optimizes metadata filtering by checking filterable columns first
-pub fn evaluate_filter_with_config(
-    expr: &FilterExpression,
-    metadata: &HashMap<String, Value>,
-    extra_meta: Option<&HashMap<String, String>>,
-    filterable_columns: &[String],
-) -> bool {
-    // Route through the canonical seam; the ONLY specialization here is field
-    // resolution (filterable-column fast path, then the `extra_meta` fallback).
-    // All operator semantics — including SQL null-on-absence — come from the
-    // shared spine, so this engine path matches every other evaluator.
-    let normalized = normalize_in_values(expr);
-    evaluate_filter_resolved(&normalized, &|field| {
-        get_field_value(field, metadata, extra_meta, filterable_columns)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

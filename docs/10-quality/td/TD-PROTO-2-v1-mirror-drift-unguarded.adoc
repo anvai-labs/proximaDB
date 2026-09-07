@@ -1145,6 +1145,30 @@ Other round-8/9 fixes:
   + embedded binding) whose Vector-vs-Json sniff now decides spliced
   text — hoist one constructor beside ParameterValue.
 
+**Consolidation review round 21 (2026-09-07):**
+- ROUND-20 REGRESSION fixed: the sweep converted parse_set_parameter —
+  an ALREADY-SAFE to_ascii_uppercase site — and pointed it at `query`
+  while it slices `rest`: every `SET name TO value` mis-parsed or
+  PANICKED, and a garbled name silently skipped the TD-TENANT-1
+  assertion gate. Third red test (protocol_tests' TO-syntax pin)
+  caught by review. execute_copy (same file, genuinely unsafe
+  to_uppercase) now converted too.
+- The caller's malformed-components guard extended to non-array
+  components values (present-but-non-array still hit the SELECT 1
+  200-OK fallback).
+- The Json to_sql_string splice is by-ref (the by-value helper
+  deep-cloned the document per execution); find_ascii_ci shared with
+  multimodal_query's three inline ASCII loops (pub(crate)).
+- Dead evaluate_filter_with_config deleted (orphaned when round 12
+  deleted its sole caller).
+- Tracked (uppercase-offset class, never-touched files — each needs an
+  upper/original pair audit): materialized_view/definition.rs
+  (WITH REFRESH/INTERVAL/DEBOUNCE pairs), ai/natural_language/
+  sql_validator.rs (LIMIT), federated/optimizer/sql_parsing.rs
+  (char_indices of original vs sql_upper slices). LESSON recorded: a
+  mechanical class-sweep must verify EACH site's searched-string ==
+  sliced-string, or it manufactures exactly the bug it hunts.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

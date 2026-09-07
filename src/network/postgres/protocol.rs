@@ -47,7 +47,7 @@ use proximadb_records::conversions::sql_value_to_json;
 /// ASCII-case-insensitive find returning a byte offset into the ORIGINAL
 /// string — offsets found in a `to_uppercase()` copy can slice the original
 /// mid-character (uppercase changes UTF-8 byte lengths, e.g. 'ﬀ' 3→2 bytes).
-fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+pub(crate) fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
     haystack
         .as_bytes()
         .windows(needle.len())
@@ -1381,7 +1381,7 @@ impl PostgresProtocol {
         let (name, value) = if let Some(eq_index) = rest.find('=') {
             (&rest[..eq_index], &rest[eq_index + 1..])
         } else {
-            let Some(to_index) = find_ascii_ci(query, " TO ") else {
+            let Some(to_index) = find_ascii_ci(rest, " TO ") else {
                 return Err(anyhow!("expected SET name = value or SET name TO value"));
             };
             (&rest[..to_index], &rest[to_index + " TO ".len()..])
@@ -4377,9 +4377,8 @@ impl PostgresProtocol {
         }
 
         // Extract table name
-        let copy_pos = upper
-            .find("COPY ")
-            .ok_or_else(|| anyhow::anyhow!("Invalid COPY syntax"))?;
+        let copy_pos =
+            find_ascii_ci(query, "COPY ").ok_or_else(|| anyhow::anyhow!("Invalid COPY syntax"))?;
         let after_copy = query[copy_pos + 5..].trim();
         let table_end = after_copy
             .find(|c: char| c.is_whitespace() || c == '(')

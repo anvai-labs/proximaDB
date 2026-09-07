@@ -211,7 +211,14 @@ impl ParameterValue {
             // A JSON-null document is SQL NULL (3VL) — the string
             // 'null' would only match a column holding that literal text.
             ParameterValue::Json(v) if v.is_null() => "NULL".to_string(),
-            ParameterValue::Json(v) => sql_quote(&filter_literal_text(v.clone())),
+            ParameterValue::Json(v) => {
+                // By-ref spelling — the by-value helper would deep-clone
+                // the whole document per splice.
+                sql_quote(&match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+            }
         }
     }
 }

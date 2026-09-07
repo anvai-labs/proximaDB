@@ -115,6 +115,8 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         ProximaValue::UInt64(value) => Ok(value.to_string()),
         // Non-finite floats have no SQL literal (bare 'NaN' text is a
         // parse error) — NULL, matching the canonical JSON rendering.
+        // (Float64 stays a separate arm only because its binding type
+        // differs — the bodies MUST stay in lockstep.)
         ProximaValue::Float16(value) | ProximaValue::Float32(value) => Ok(if value.is_finite() {
             value.to_string()
         } else {
@@ -583,8 +585,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             // raw-query/SELECT 1 fallback (that returned 200-OK garbage).
             None if request
                 .get("components")
-                .and_then(|c| c.as_array())
-                .is_some_and(|a| !a.is_empty()) =>
+                .is_some_and(|c| c.as_array().is_none_or(|a| !a.is_empty())) =>
             {
                 return Err(anyhow!(
                     "multi-model request contained a component that could not be lowered (missing or unknown component_type)"
