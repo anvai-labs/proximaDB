@@ -160,9 +160,12 @@ impl ParameterValue {
             ParameterValue::Float(f) => f.to_string(),
             ParameterValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ParameterValue::Null => "NULL".to_string(),
+            // Quoted like Json: bare '[0.1,0.2]' is the same parse-error
+            // class the Json arm fixes (non-finite elements splice as their
+            // text inside the quotes — valid SQL, needs a cast to compare).
             ParameterValue::Vector(v) => {
                 let formatted: Vec<String> = v.iter().map(|f| f.to_string()).collect();
-                format!("[{}]", formatted.join(","))
+                format!("'{}'", formatted.join(",").replace('\'', "''"))
             }
             // JSON splices QUOTED: bare '[0,1,2]' / '{"x":1}' is a parse
             // error on every engine (the text may still need a cast to

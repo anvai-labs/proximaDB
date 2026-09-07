@@ -2108,7 +2108,7 @@ impl PyProximaDB {
         vector_id: &str,
     ) -> PyResult<Option<Py<PyAny>>> {
         match self.db()?.get_vector(collection, vector_id) {
-            Ok(Some(record)) => {
+            Ok(Some(mut record)) => {
                 let dict = PyDict::new(py);
                 dict.set_item("id", &record.oid)?;
                 let vector = record
@@ -2119,7 +2119,10 @@ impl PyProximaDB {
                 dict.set_item("vector", vector)?;
 
                 let props_dict = PyDict::new(py);
-                for (key, node) in &record.props {
+                // props are MOVED out (the record is owned and props are
+                // dead after this loop) — each leaf flows into the owned
+                // canonical converter without the per-field deep clone.
+                for (key, node) in std::mem::take(&mut record.props) {
                     let value = proxima_tree_node_to_json(node);
                     let py_value = json_to_python(py, &value)?;
                     props_dict.set_item(key, py_value)?;
@@ -4272,13 +4275,14 @@ fn python_to_proxima_record(
     })
 }
 
-/// Convert serde_json::Value to Python object
-fn proxima_tree_node_to_json(node: &proximadb_records::ProximaTreeNode) -> serde_json::Value {
+/// Convert a props tree node to serde_json (OWNED — leaves flow into the
+/// owned canonical converter without a deep clone).
+fn proxima_tree_node_to_json(node: proximadb_records::ProximaTreeNode) -> serde_json::Value {
     match node {
-        proximadb_records::ProximaTreeNode::Value(value) => proxima_value_to_json(value.clone()),
+        proximadb_records::ProximaTreeNode::Value(value) => proxima_value_to_json(value),
         proximadb_records::ProximaTreeNode::Object(tree) => serde_json::Value::Object(
-            tree.iter()
-                .map(|(key, value)| (key.clone(), proxima_tree_node_to_json(value)))
+            tree.into_iter()
+                .map(|(key, value)| (key, proxima_tree_node_to_json(value)))
                 .collect(),
         ),
     }

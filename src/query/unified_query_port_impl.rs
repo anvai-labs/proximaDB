@@ -51,13 +51,13 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
             ParameterValue::Json(value.clone())
         }
         ProximaValue::Array(values) => ParameterValue::Json(serde_json::Value::Array(
-            values.iter().map(proxima_value_to_json).collect(),
+            values.iter().map(proxima_filter_json).collect(),
         )),
         ProximaValue::Map(values) | ProximaValue::Struct(values) => {
             ParameterValue::Json(serde_json::Value::Object(
                 values
                     .iter()
-                    .map(|(key, value)| (key.clone(), proxima_value_to_json(value)))
+                    .map(|(key, value)| (key.clone(), proxima_filter_json(value)))
                     .collect(),
             ))
         }
@@ -66,23 +66,23 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         // lower through the ONE shared filter spelling — the old Rust-Debug
         // strings ("Binary([1, 2, 3])") could never equal a stored value's
         // rendering, so such parameters silently matched nothing. Structured
-        // values map to their JSON TEXT as a String param so the direct
-        // path and the literal path render byte-identical SQL text
-        // (to_sql_string quotes both String and Json params).
-        other => match proxima_value_to_json(other) {
+        // values map to their JSON TEXT as a String param — with
+        // to_sql_string quoting both String and Json params, the direct and
+        // literal paths agree on QUOTING (numeric-array text and
+        // UInt64>i64::MAX spellings still differ between them; the literal
+        // path's f32 vector coercion is pre-existing).
+        other => match proxima_filter_json(other) {
             serde_json::Value::String(s) => ParameterValue::String(s),
             json => ParameterValue::String(json.to_string()),
         },
     }
 }
 
-/// Thin alias over the ONE shared ProximaValue→JSON filter spelling
-/// (search-types) — literals bound into federated SQL must render exactly
-/// what the filter evaluator renders on the stored side, or equality
-/// parameters silently match nothing.
-fn proxima_value_to_json(value: &ProximaValue) -> serde_json::Value {
-    proximadb_search_types::sql_value_filter::proxima_value_to_json(value)
-}
+// The FILTER spelling, imported under a FILTER-named alias: an
+// identically-named canonical (base64) renderer exists in records — a bare
+// `proxima_value_to_json` import here is the wrong-spelling trap the
+// round-3 renames eliminated.
+use proximadb_search_types::sql_value_filter::proxima_value_to_json as proxima_filter_json;
 
 fn proxima_values_to_params(values: Option<Vec<ProximaValue>>) -> Vec<ParameterValue> {
     values
@@ -148,7 +148,7 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
             if let Some(vector) = proxima_value_to_f32_vector(value) {
                 Ok(sql_quote(&serde_json::to_string(&vector)?))
             } else {
-                Ok(sql_quote(&serde_json::to_string(&proxima_value_to_json(
+                Ok(sql_quote(&serde_json::to_string(&proxima_filter_json(
                     &ProximaValue::Array(values.clone()),
                 ))?))
             }
@@ -157,7 +157,7 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
             Ok(sql_quote(&serde_json::to_string(value)?))
         }
         ProximaValue::Map(_) | ProximaValue::Struct(_) => Ok(sql_quote(&serde_json::to_string(
-            &proxima_value_to_json(value),
+            &proxima_filter_json(value),
         )?)),
         ProximaValue::Null => Ok("NULL".to_string()),
         // Typed exotics: the shared filter spelling (dashed Uuid, int-array
@@ -169,7 +169,7 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         // JSON text — parseable SQL on every engine, but equality against a
         // native binary/timestamp column needs the per-dialect literal form
         // (e.g. ISO-8601 text for Postgres-style engines).
-        other => match proxima_value_to_json(other) {
+        other => match proxima_filter_json(other) {
             serde_json::Value::String(s) => Ok(sql_quote(&s)),
             json => Ok(sql_quote(&json.to_string())),
         },

@@ -944,6 +944,34 @@ Other round-8/9 fixes:
   semantics that can contradict Equals; op-aware bytes routing needs the
   same contract change as the allocation-free path.
 
+**Consolidation review round 14 (2026-09-06):**
+- REVERTED round 13's extractor switch: the SST/RAPTOR extractor's JSON
+  is a REHYDRATION format (the AXIS consumer re-parses it into
+  ProximaValue), so the FILTER spelling keeps extraction-recovered
+  records filtering identically to live ones — the canonical base64
+  string rehydrated as String and silently diverged (Binary → int-array
+  on live records vs 'AAEC' on recovered ones). Display surfaces read
+  the canonical converter; this extractor does not.
+- ParameterValue::to_sql_string's Vector arm quotes (the same
+  unquoted-array parse-error class the Json-arm fix closed).
+- The Python binding's get_vector props walk is OWNED (mem::take +
+  into_iter) — each leaf flowed into the owned canonical converter via
+  a full deep clone, the exact cost the owned twin exists to remove.
+- Doc corrections: the unified-port paths agree on QUOTING, not
+  byte-identity (numeric-array text and UInt64>i64::MAX spellings still
+  differ — the literal path's f32 coercion is pre-existing); the Python
+  float arms keep Rust Display text (finite f32s differ from canonical
+  JSON's f64 widening — deliberate surface spelling); the observability
+  shared fn's doc no longer claims a bytes default; the filter-spelling
+  import in the unified port is aliased proxima_filter_json (an
+  identically-named canonical renderer exists — the wrong-import trap).
+- Tracked: substitute_parameters does a global '$N' str::replace — it
+  rewrites placeholders inside single-quoted literals and can clobber
+  $10 via $1's prefix (pre-existing; needs a tokenizer, its own test
+  surface). Span attributes persisted as text (hex bytes, JSON text)
+  read back as StringValue — shape divergence recorded here (strictly
+  better than the old silent drop; REST trace endpoints are 501).
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

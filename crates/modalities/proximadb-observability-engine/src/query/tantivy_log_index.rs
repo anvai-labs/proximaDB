@@ -637,8 +637,8 @@ impl TantivyLogIndex {
     /// Convert SqlValue to string for indexing
     fn sql_value_to_string(&self, value: &SqlValue) -> String {
         // Tokens keep THIS site's spellings: bytes as the length placeholder
-        // (pre-empting the shared fn, which renders bytes as lossy content)
-        // and null/unset as the empty token; other scalars + Jsonb render
+        // and null/unset as the empty token (the shared fn returns None for
+        // all three — per-site policy); other scalars + Jsonb render
         // through the ONE shared crate fn; containers RECURSE (nested
         // arrays/objects contribute their tokens to the _all field — a
         // scalar-only flattening dropped depth-2+ content from the index).
