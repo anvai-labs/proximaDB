@@ -2383,4 +2383,23 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn explain_target_scanner_preserves_quoted_delimiters_and_skips_binds() {
+        let mut targets = Vec::new();
+        crate::core::utils::collect_quoted_first_args(
+            r#"VECTOR_SEARCH("tenant,west", '[0.5]', 5)"#,
+            "VECTOR_SEARCH",
+            &mut targets,
+        );
+        crate::core::utils::collect_quoted_first_args(
+            r#"DOCUMENT_QUERY("team""docs", '$.kind = article')"#,
+            "DOCUMENT_QUERY",
+            &mut targets,
+        );
+        crate::core::utils::collect_quoted_first_args("LOGS(unquoted_logs)", "LOGS", &mut targets);
+        crate::core::utils::collect_quoted_first_args("METRICS($1)", "METRICS", &mut targets);
+
+        assert_eq!(targets, ["tenant,west", "team\"docs", "unquoted_logs"]);
+    }
 }

@@ -107,12 +107,14 @@ pub fn finite_f32(value: f64) -> Option<f32> {
     narrowed.is_finite().then_some(narrowed)
 }
 
-pub fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
+pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
     // ASCII-case search on the original (shared helper — offsets in a
     // to_uppercase copy can slice mid-character).
     let mut search_start = 0;
 
-    while let Some(relative_pos) = find_ascii_ci(&sql[search_start..], function_name) {
+    while let Some(relative_pos) =
+        find_ascii_ci(&sql[search_start..], function_name)
+    {
         let name_start = search_start + relative_pos;
         let after_name = name_start + function_name.len();
         let Some(open_relative) = sql[after_name..].find('(') else {
@@ -125,37 +127,20 @@ pub fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut V
             }
             arg_start += ch.len_utf8();
         }
-        // Unquoted and DOUBLE-QUOTED first args are collection targets
-        // too (the fusion parser accepts them); '$'-prefixed bind params
-        // are not. The old port-side loop handled these; the delegation
-        // must not narrow extraction to single-quoted args.
-        if !sql[arg_start..].starts_with('\'') {
-            let candidate_end = sql[arg_start..]
-                .find([',', ')'])
-                .map(|rel| arg_start + rel)
-                .unwrap_or(sql.len());
-            let candidate = sql[arg_start..candidate_end].trim();
-            let decoded = candidate.trim_matches('"').replace("\"\"", "\"");
-            if !decoded.is_empty()
-                && !decoded.starts_with('$')
-                && !targets.iter().any(|existing| existing == &decoded)
-            {
-                targets.push(decoded.clone());
-            }
-            search_start = candidate_end;
-            continue;
-        } else if sql[arg_start..].starts_with('\'') {
+        // Quoted first args may contain delimiter characters. Match the
+        // fusion parser's SQL quote-doubling rules before considering the
+        // simpler unquoted form.
+        let opening_quote = sql.as_bytes().get(arg_start).copied();
+        if matches!(opening_quote, Some(b'\'' | b'"')) {
+            let quote = opening_quote.unwrap_or_default();
             let value_start = arg_start + 1;
-            // Quote-doubling aware close scan — this PR's own generators
-            // emit doubled quotes (escape_sql_text), and the plain find
-            // truncated at the first one, extracting the wrong target.
             let mut scan = value_start;
             let mut closed = None;
             let bytes = sql.as_bytes();
             while scan < bytes.len() {
-                if bytes[scan] == b'\'' {
-                    if scan + 1 < bytes.len() && bytes[scan + 1] == b'\'' {
-                        scan += 2; // doubled quote: stays inside the literal
+                if bytes[scan] == quote {
+                    if scan + 1 < bytes.len() && bytes[scan + 1] == quote {
+                        scan += 2;
                         continue;
                     }
                     closed = Some(scan);
@@ -164,8 +149,10 @@ pub fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut V
                 scan += 1;
             }
             if let Some(close) = closed {
+                let escaped = if quote == b'\'' { "''" } else { "\"\"" };
+                let replacement = if quote == b'\'' { "'" } else { "\"" };
                 let value = sql[value_start..close]
-                    .replace("''", "'")
+                    .replace(escaped, replacement)
                     .trim()
                     .to_string();
                 if !value.is_empty() && !targets.iter().any(|existing| existing == &value) {
@@ -174,7 +161,24 @@ pub fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut V
                 search_start = close + 1;
                 continue;
             }
+        } else {
+            // Unquoted first args are targets too; '$'-prefixed bind params
+            // cannot be resolved during EXPLAIN and are deliberately skipped.
+            let candidate_end = sql[arg_start..]
+                .find([',', ')'])
+                .map(|rel| arg_start + rel)
+                .unwrap_or(sql.len());
+            let candidate = sql[arg_start..candidate_end].trim();
+            if !candidate.is_empty()
+                && !candidate.starts_with('$')
+                && !targets.iter().any(|existing| existing == candidate)
+            {
+                targets.push(candidate.to_string());
+            }
+            search_start = candidate_end;
+            continue;
         }
         search_start = after_name;
     }
 }
+
