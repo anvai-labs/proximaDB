@@ -12,10 +12,9 @@ pub(crate) fn find_top_level_keyword_from(
     keyword: &str,
     start_at: usize,
 ) -> Option<usize> {
-    let sql_upper = sql.to_uppercase();
-    let keyword_upper = keyword.to_uppercase();
-    let bytes = sql_upper.as_bytes();
-    let keyword_len = keyword_upper.len();
+    let bytes = sql.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let keyword_len = keyword_bytes.len();
     let mut depth = 0usize;
     let mut in_quote = None;
 
@@ -52,11 +51,14 @@ pub(crate) fn find_top_level_keyword_from(
             _ => {}
         }
 
-        if index < start_at || depth != 0 || index + keyword_len > sql_upper.len() {
+        if index < start_at || depth != 0 {
             continue;
         }
 
-        if &sql_upper[index..index + keyword_len] == keyword_upper.as_str() {
+        if bytes
+            .get(index..index.saturating_add(keyword_len))
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword_bytes))
+        {
             let before_ok = index == 0
                 || (!bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_');
             let after_index = index + keyword_len;
@@ -333,8 +335,8 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
 }
 
 pub(crate) fn find_top_level_operator(input: &str, operator: &str) -> Option<usize> {
-    let upper = input.to_uppercase();
-    let operator_upper = operator.to_uppercase();
+    let bytes = input.as_bytes();
+    let operator_bytes = operator.as_bytes();
     let mut depth = 0usize;
     let mut in_quote = None;
 
@@ -369,8 +371,9 @@ pub(crate) fn find_top_level_operator(input: &str, operator: &str) -> Option<usi
         }
 
         if depth == 0
-            && index + operator_upper.len() <= upper.len()
-            && &upper[index..index + operator_upper.len()] == operator_upper.as_str()
+            && bytes
+                .get(index..index.saturating_add(operator_bytes.len()))
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(operator_bytes))
         {
             return Some(index);
         }
@@ -404,6 +407,31 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
         return Some(PredicateValue::Float(value));
     }
     None
+}
+
+#[cfg(test)]
+mod scanner_tests {
+    use super::{find_top_level_keyword, find_top_level_operator};
+
+    #[test]
+    fn top_level_scanners_keep_original_utf8_offsets() {
+        // U+FB00 uppercases to two ASCII bytes. Building an uppercased copy
+        // and indexing it with offsets from the original UTF-8 string shifts
+        // every token that follows this literal.
+        let sql = "SELECT 'ﬀ' AS label FROM documents";
+        assert_eq!(
+            find_top_level_keyword(sql, "FROM"),
+            sql.find("FROM"),
+            "keyword offsets must refer to the original SQL"
+        );
+
+        let predicate = "label = 'ﬀ' AND score >= 0.5";
+        assert_eq!(
+            find_top_level_operator(predicate, ">="),
+            predicate.find(">="),
+            "operator offsets must refer to the original predicate"
+        );
+    }
 }
 
 pub(crate) fn extract_where_predicate(sql: &str) -> Option<Predicate> {
