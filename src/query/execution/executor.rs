@@ -10,7 +10,6 @@ use crate::query::execution::{
 use crate::services::operations::vectors::VectorOperationsService;
 use crate::storage::cache::orchestrator::CrossCacheOrchestrator;
 use anyhow::{Result, anyhow};
-use proximadb_data_model::ProximaValue;
 use proximadb_graph_query::service::GraphExecutionService;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -1597,23 +1596,6 @@ impl MultiModalQueryExecutor {
         }
     }
 
-    /// Convert canonical metadata to a field map for result formatting.
-    #[allow(dead_code)]
-    fn convert_metadata_to_fields(
-        &self,
-        metadata: &std::collections::HashMap<String, ProximaValue>,
-    ) -> std::collections::HashMap<String, serde_json::Value> {
-        metadata
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    crate::core::search::sql_value_filter::proxima_value_to_json(value),
-                )
-            })
-            .collect()
-    }
-
     /// Extract result ID for fusion algorithms
     fn extract_result_id(&self, row: &QueryRow) -> String {
         row.fields
@@ -1633,6 +1615,7 @@ mod executor_tests {
         CsrRelationsStore, InMemoryProvenanceRegistry, ProximaEntityStore,
     };
     use async_trait::async_trait;
+    use proximadb_data_model::ProximaValue;
 
     #[test]
     fn query_rows_preserve_jsonb_metadata_as_json() {

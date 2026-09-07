@@ -144,7 +144,11 @@ pub fn proxima_value_to_json_canonical_owned(value: ProximaValue) -> serde_json:
             serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(&b))
         }
         ProximaValue::Uuid(u) => {
-            serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(u).to_string())
+            // to_hyphenated_string: one allocation (Display wraps it in a
+            // second fmt allocation).
+            serde_json::Value::String(
+                proximadb_kernel::uuid::Uuid::from_bytes(u).to_hyphenated_string(),
+            )
         }
         ProximaValue::String(s) | ProximaValue::Symbol(s) | ProximaValue::Decimal(s) => {
             serde_json::Value::String(s)

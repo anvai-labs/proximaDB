@@ -193,7 +193,7 @@ impl VectorExtractor for SstExtractor {
                         // until the family converges here.
                         let value = match node {
                             proximadb_records::ProximaTreeNode::Value(value) => {
-                                crate::core::search::sql_value_filter::proxima_value_to_json(value)
+                                crate::core::search::sql_value_filter::proxima_value_to_filter_literal(value)
                             }
                             proximadb_records::ProximaTreeNode::Object(subtree) => {
                                 let object =

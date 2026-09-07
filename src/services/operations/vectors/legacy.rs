@@ -342,7 +342,7 @@ fn cached_precision_config() -> &'static EmbeddingPrecisionConfig {
 /// property value are lowered identically — the comparison in
 /// `evaluate_filter_proxima` then sees both sides in the same representation.
 fn proxima_value_to_json(value: &proximadb_data_model::ProximaValue) -> serde_json::Value {
-    crate::core::search::sql_value_filter::proxima_value_to_json(value)
+    crate::core::search::sql_value_filter::proxima_value_to_filter_literal(value)
 }
 
 /// TD-064(a): Authoritative predicate-shortfall **after** the
@@ -1122,7 +1122,7 @@ impl VectorOperationsService {
         auth_class: proximadb_tenant::AuthClass,
         collection_id: &str,
     ) -> Option<RichSearchResult> {
-        use crate::core::search::sql_value_filter::proxima_value_to_json;
+        use crate::core::search::sql_value_filter::proxima_value_to_filter_literal as proxima_value_to_json;
         use crate::security::rls::filter_lattice::admits_with_security;
 
         match self

@@ -404,7 +404,6 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
     // instead of clone) are spelled; numbers/bools render identically
     // through it.
     match v {
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => s,
         // Floats keep RUST DISPLAY text on this Python-text surface —
         // it differs from the canonical JSON spelling for non-finite values
         // (null there, 'NaN' here — more informative for a Python reader)
@@ -413,7 +412,6 @@ pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> 
         // surface spelling — do not delete these arms as redundant.
         ProximaValue::Float32(f) => f.to_string(),
         ProximaValue::Float64(f) => f.to_string(),
-        ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v.to_string(),
         ProximaValue::Null => String::new(),
         // Everything else — containers AND exotics (dashed uuid, base64
         // binary, temporals) — renders through the shared canonical JSON

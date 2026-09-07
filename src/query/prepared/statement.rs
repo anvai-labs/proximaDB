@@ -149,8 +149,12 @@ impl From<serde_json::Value> for ParameterValue {
 /// every parameter splice (String/Vector/Json) and the literal path in
 /// `unified_query_port_impl` (the direct and literal paths must agree on
 /// quoting for federated equality to be possible at all).
+pub(crate) fn escape_sql_text(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 pub(crate) fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", escape_sql_text(value))
 }
 
 impl ParameterValue {

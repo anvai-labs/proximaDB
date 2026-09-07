@@ -999,6 +999,39 @@ Other round-8/9 fixes:
   diverges per engine until the family converges (pre-existing,
   byte-identical to develop).
 
+**Consolidation review round 16 (2026-09-06):**
+- The filter renderer RENAMED proxima_value_to_json →
+  proxima_value_to_filter_literal (the ProximaValue twin of round 3's
+  sql_value_to_filter_literal rename) — the generic name collided with
+  embedded-common's canonical fn of the same name, the wrong-import
+  trap six unaliased importers carried.
+- The multimodal UQL producers ESCAPE the spliced DOCUMENT_QUERY filter
+  and GRAPH_QUERY cypher (a single quote in either broke out of the SQL
+  string literal — pre-existing injection vector in the file this PR
+  brought sql_quote into; escape_sql_text split out beside it).
+- Dashed uuids render via to_hyphenated_string directly (one
+  allocation; Display wrapped it in a second fmt allocation) at the
+  three sites the PR introduced.
+- Dead convert_metadata_to_fields (executor) deleted (round-12
+  precedent: a dead fn rendering DISPLAY through the filter spelling is
+  a pre-conflated trap for its first future caller). The embedded
+  stringifier's redundant String/Json arms deleted (byte-identical to
+  the canonical fallback). The bare-text unwrap hoisted to ONE in-file
+  helper (filter_literal_text) for the param + literal paths.
+- Tracked: (a) the v1 unversioned hybrid REST SQL surface changed its
+  NaN/inf cell spelling Number(0) → null with the canonical delegation
+  — a wire-shape change on a surface with no version boundary; recorded
+  here, clients doing non-null-checked numeric arithmetic see null.
+  (b) group-by sentinel spellings ('<null>', '<bytes:N>', …) collide
+  with real StringValues of the same text (inherent to the develop
+  spellings; untracked until now). (c) sql_quote wants a foundation-crate
+  home — four other splice sites (pgwire $N substitution,
+  information_schema, two cypher splices) still hand-roll the rule.
+  (d) the literal lowering wants derivation from the param lowering
+  (two ~25-arm matches with documented drift: bool TRUE/true, UInt64
+  overflow bare/quoted) — extends the tracked parameterized-renderer
+  item.
+
 - Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
   has 4+ hand-rolled copies with divergent number fallbacks (nullify /
   stringify / drop) — the render consolidation's mirror image, needs its

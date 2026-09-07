@@ -63,9 +63,9 @@ pub struct SqlResponse {
 /// rendering cleanup.
 fn v2_row_render(value: &ProximaValue) -> serde_json::Value {
     match value {
-        ProximaValue::Uuid(u) => {
-            serde_json::Value::String(proximadb_kernel::uuid::Uuid::from_bytes(*u).to_string())
-        }
+        ProximaValue::Uuid(u) => serde_json::Value::String(
+            proximadb_kernel::uuid::Uuid::from_bytes(*u).to_hyphenated_string(),
+        ),
         ProximaValue::Array(items) => {
             serde_json::Value::Array(items.iter().map(v2_row_render).collect())
         }

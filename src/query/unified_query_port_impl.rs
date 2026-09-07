@@ -14,18 +14,17 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
 use proximadb_runtime::UnifiedQueryPort;
-// The FILTER spelling, imported under a FILTER-named alias: an
-// identically-named canonical (base64) renderer exists in records — a bare
-// `proxima_value_to_json` import here is the wrong-spelling trap the
-// round-3 renames eliminated.
-use proximadb_search_types::sql_value_filter::proxima_value_to_json as proxima_filter_json;
+// The FILTER-lowering spelling (int-array binary, ns temporals) — named
+// for what it IS, mirroring the SqlValue twin sql_value_to_filter_literal;
+// the canonical (base64) renderer lives in records under a different name.
+use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal as proxima_filter_literal;
 use tracing::{debug, info};
 
 use crate::catalog::CatalogManager;
 use crate::query::authority_context::{AuthoritySource, resolve_catalog_authority_context};
 use crate::query::explain::StorageAuthorityExplanation;
 use crate::query::multimodal::plan::PlanContext;
-use crate::query::prepared::statement::sql_quote;
+use crate::query::prepared::statement::{escape_sql_text, sql_quote};
 use crate::query::unified::uql::{
     ComparisonOperator, Condition, SelectStatement, UQLParser, UQLStatement, Value,
 };
@@ -35,6 +34,17 @@ use crate::query::{
 };
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
+
+/// The filter-lowering JSON as param/literal TEXT: strings come out BARE
+/// (double-quoting the JSON text would embed the quotes in the literal
+/// itself), structured values as their JSON text. ONE home — the param path
+/// and the literal path must render the same text for federated equality.
+fn filter_literal_text(json: serde_json::Value) -> String {
+    match json {
+        serde_json::Value::String(s) => s,
+        json => json.to_string(),
+    }
+}
 
 fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
     match value {
@@ -57,13 +67,13 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
             ParameterValue::Json(value.clone())
         }
         ProximaValue::Array(values) => ParameterValue::Json(serde_json::Value::Array(
-            values.iter().map(proxima_filter_json).collect(),
+            values.iter().map(proxima_filter_literal).collect(),
         )),
         ProximaValue::Map(values) | ProximaValue::Struct(values) => {
             ParameterValue::Json(serde_json::Value::Object(
                 values
                     .iter()
-                    .map(|(key, value)| (key.clone(), proxima_filter_json(value)))
+                    .map(|(key, value)| (key.clone(), proxima_filter_literal(value)))
                     .collect(),
             ))
         }
@@ -77,10 +87,7 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         // literal paths agree on QUOTING (numeric-array text and
         // UInt64>i64::MAX spellings still differ between them; the literal
         // path's f32 vector coercion is pre-existing).
-        other => match proxima_filter_json(other) {
-            serde_json::Value::String(s) => ParameterValue::String(s),
-            json => ParameterValue::String(json.to_string()),
-        },
+        other => ParameterValue::String(filter_literal_text(proxima_filter_literal(other))),
     }
 }
 
@@ -144,14 +151,14 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
             if let Some(vector) = proxima_value_to_f32_vector(value) {
                 Ok(sql_quote(&serde_json::to_string(&vector)?))
             } else {
-                Ok(sql_quote(&proxima_filter_json(value).to_string()))
+                Ok(sql_quote(&proxima_filter_literal(value).to_string()))
             }
         }
         ProximaValue::Json(value) | ProximaValue::Jsonb(value) => {
             Ok(sql_quote(&serde_json::to_string(value)?))
         }
         ProximaValue::Map(_) | ProximaValue::Struct(_) => Ok(sql_quote(&serde_json::to_string(
-            &proxima_filter_json(value),
+            &proxima_filter_literal(value),
         )?)),
         ProximaValue::Null => Ok("NULL".to_string()),
         // Typed exotics: the shared filter spelling (dashed Uuid, int-array
@@ -163,10 +170,9 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         // JSON text — parseable SQL on every engine, but equality against a
         // native binary/timestamp column needs the per-dialect literal form
         // (e.g. ISO-8601 text for Postgres-style engines).
-        other => match proxima_filter_json(other) {
-            serde_json::Value::String(s) => Ok(sql_quote(&s)),
-            json => Ok(sql_quote(&json.to_string())),
-        },
+        other => Ok(sql_quote(&filter_literal_text(proxima_filter_literal(
+            other,
+        )))),
     }
 }
 
@@ -788,7 +794,8 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                     .unwrap_or("1=1");
                 format!(
                     "SELECT * FROM DOCUMENT_QUERY('{}', '{}')",
-                    collection, filter
+                    escape_sql_text(collection),
+                    escape_sql_text(filter)
                 )
             }
             "graph" => {
@@ -796,7 +803,7 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                     .get("cypher")
                     .and_then(|v| v.as_str())
                     .unwrap_or("MATCH (n) RETURN n LIMIT 10");
-                format!("SELECT * FROM GRAPH_QUERY('{}')", cypher)
+                format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(cypher))
             }
             "observability" => {
                 let namespace = config

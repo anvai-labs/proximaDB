@@ -228,7 +228,7 @@ pub(crate) fn publish_ndv_statistics(
     schema: &CatalogTableSchema,
     records: &[ProximaRecord],
 ) {
-    use proximadb_search_types::sql_value_filter::proxima_value_to_json;
+    use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
 
     let mut summary = crate::core::statistics::StatisticsSummary::new(table_name);
     summary.set_record_count(records.len() as u64);
@@ -251,7 +251,7 @@ pub(crate) fn publish_ndv_statistics(
             // Same leaf extraction as `cluster_sort_key`: NULL/absent/object
             // nodes observe as `None` (counted in the null rate, not the HLL).
             let json_val = rec.props.get(*name).and_then(|node| match node {
-                ProximaTreeNode::Value(v) => Some(proxima_value_to_json(v)),
+                ProximaTreeNode::Value(v) => Some(proxima_value_to_filter_literal(v)),
                 _ => None,
             });
             summary.observe_field(name, ty, json_val.as_ref());
