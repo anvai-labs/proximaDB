@@ -187,4 +187,14 @@ mod tests {
         assert!(parse_vector_literal("'[-inf]'").is_none());
         assert!(parse_vector_literal("'[1e300]'").is_none());
     }
+
+    #[test]
+    fn vector_literals_accept_case_insensitive_dimensioned_casts() {
+        assert_eq!(
+            parse_vector_literal("'[0.25, -0.5]'::Vector(2)"),
+            Some(vec![0.25, -0.5])
+        );
+        assert_eq!(parse_vector_literal("'[0.25]'::VeCtOr"), Some(vec![0.25]));
+        assert!(parse_vector_literal("'[0.25]'::vector(x)").is_none());
+    }
 }

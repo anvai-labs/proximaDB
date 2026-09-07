@@ -434,7 +434,7 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
 
 #[cfg(test)]
 mod scanner_tests {
-    use super::{find_top_level_keyword, find_top_level_operator};
+    use super::{extract_select_items, find_top_level_keyword, find_top_level_operator};
 
     #[test]
     fn top_level_scanners_keep_original_utf8_offsets() {
@@ -447,6 +447,10 @@ mod scanner_tests {
             sql.find("FROM"),
             "keyword offsets must refer to the original SQL"
         );
+        let items = extract_select_items(sql);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].expression, "'ﬀ'");
+        assert_eq!(items[0].alias.as_deref(), Some("label"));
 
         let predicate = "label = 'ﬀ' AND score >= 0.5";
         assert_eq!(

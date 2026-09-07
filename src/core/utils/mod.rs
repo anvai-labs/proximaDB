@@ -98,13 +98,27 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
     None
 }
 
-/// The ONE f64→f32 narrowing guard: the narrowing can overflow to inf
+/// Shared f64→f32 narrowing guard: the narrowing can overflow to inf
 /// (1e300), and non-finite components must never dispatch to the distance
-/// kernels — every narrowing site funnels through here so the policy is
-/// auditable in one place.
+/// kernels. Call sites migrate here incrementally so the policy has one
+/// auditable implementation.
 pub fn finite_f32(value: f64) -> Option<f32> {
     let narrowed = value as f32;
     narrowed.is_finite().then_some(narrowed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finite_f32;
+
+    #[test]
+    fn finite_f32_rejects_non_finite_and_overflowed_values() {
+        assert_eq!(finite_f32(1.25), Some(1.25));
+        assert_eq!(finite_f32(f32::MAX as f64), Some(f32::MAX));
+        assert_eq!(finite_f32(f64::NAN), None);
+        assert_eq!(finite_f32(f64::INFINITY), None);
+        assert_eq!(finite_f32(1e300), None);
+    }
 }
 
 pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {

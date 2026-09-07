@@ -1108,6 +1108,12 @@ mod tests {
             matches!(&doubled.extensions[0], SqlExtension::Logs { namespace }
                 if namespace == "team's-prod")
         );
+
+        assert_eq!(
+            FederatedParser::parse_vector_distance_rhs("'[0.1]''tag'::vector LIMIT 1"),
+            Some("'[0.1]''tag'::vector".to_string()),
+            "a doubled quote pair must not close the RHS literal early"
+        );
     }
 
     #[test]
