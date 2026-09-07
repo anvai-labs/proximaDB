@@ -431,8 +431,9 @@ impl FederatedParser {
                 .unwrap_or("embedding")
                 .to_string();
 
-            let right_literal =
-                Self::parse_vector_distance_rhs(after).unwrap_or_else(|| "[]".to_string());
+            // A missing/unparseable RHS is an ERROR, not a silent empty
+            // vector (a 0-dimension query dispatched to the kernels).
+            let right_literal = Self::parse_vector_distance_rhs(after)?;
 
             return Some((
                 SqlExtension::VectorDistance {
@@ -452,9 +453,9 @@ impl FederatedParser {
         }
 
         if let Some(rest) = trimmed.strip_prefix('\'') {
-            let mut escaped = false;
             for (idx, ch) in rest.char_indices() {
-                if ch == '\'' && !escaped {
+                // Quote-doubling escapes; backslash is not an escape.
+                if ch == '\'' {
                     let literal_end = 1 + idx + ch.len_utf8();
                     let mut end = literal_end;
                     let suffix = trimmed[literal_end..].trim_start();
@@ -466,7 +467,6 @@ impl FederatedParser {
                     }
                     return Some(trimmed[..end].trim().to_string());
                 }
-                escaped = ch == '\\' && !escaped;
             }
             return None;
         }
@@ -675,14 +675,14 @@ impl FederatedParser {
         let content = &sql[start + function_name.len() + 1..];
         let mut depth = 1;
         let mut in_quote = None;
-        let mut escaped = false;
 
         for (i, c) in content.char_indices() {
             if let Some(quote) = in_quote {
-                if c == quote && !escaped {
+                // Quote-doubling escapes; backslash is not an escape (a
+                // value ending in one desynced this extent scanner).
+                if c == quote {
                     in_quote = None;
                 }
-                escaped = c == '\\' && !escaped;
                 continue;
             }
 
@@ -698,8 +698,6 @@ impl FederatedParser {
                 }
                 _ => {}
             }
-
-            escaped = false;
         }
 
         None

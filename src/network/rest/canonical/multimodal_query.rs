@@ -969,12 +969,32 @@ fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<S
         }
         if sql[arg_start..].starts_with('\'') {
             let value_start = arg_start + 1;
-            if let Some(close_relative) = sql[value_start..].find('\'') {
-                let value = sql[value_start..value_start + close_relative].trim();
-                if !value.is_empty() {
-                    push_unique_target(targets, value);
+            // Quote-doubling aware close scan — this PR's own generators
+            // emit doubled quotes (escape_sql_text), and the plain find
+            // truncated at the first one, extracting the wrong target.
+            let mut scan = value_start;
+            let mut closed = None;
+            let bytes = sql.as_bytes();
+            while scan < bytes.len() {
+                if bytes[scan] == b'\'' {
+                    if scan + 1 < bytes.len() && bytes[scan + 1] == b'\'' {
+                        scan += 2; // doubled quote: stays inside the literal
+                        continue;
+                    }
+                    closed = Some(scan);
+                    break;
                 }
-                search_start = value_start + close_relative + 1;
+                scan += 1;
+            }
+            if let Some(close) = closed {
+                let value = sql[value_start..close]
+                    .replace("''", "'")
+                    .trim()
+                    .to_string();
+                if !value.is_empty() {
+                    push_unique_target(targets, &value);
+                }
+                search_start = close + 1;
                 continue;
             }
         }

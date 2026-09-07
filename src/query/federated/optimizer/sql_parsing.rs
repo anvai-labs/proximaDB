@@ -18,21 +18,21 @@ pub(crate) fn find_top_level_keyword_from(
     let keyword_len = keyword_upper.len();
     let mut depth = 0usize;
     let mut in_quote = None;
-    let mut escaped = false;
 
     for (index, ch) in sql.char_indices() {
         if let Some(quote) = in_quote {
-            if ch == quote && !escaped {
+            // SQL literals escape by QUOTE DOUBLING (a doubled close-quote
+            // stays in-quote); backslash is not an escape — treating it as
+            // one desyncs the scanner when a value ends in a backslash.
+            if ch == quote {
                 in_quote = None;
             }
-            escaped = ch == '\\' && !escaped;
             continue;
         }
 
         match ch {
             '\'' | '"' => {
                 in_quote = Some(ch);
-                escaped = false;
                 continue;
             }
             '(' => depth += 1,
@@ -41,7 +41,6 @@ pub(crate) fn find_top_level_keyword_from(
         }
 
         if index < start_at || depth != 0 || index + keyword_len > sql_upper.len() {
-            escaped = false;
             continue;
         }
 
@@ -55,8 +54,6 @@ pub(crate) fn find_top_level_keyword_from(
                 return Some(index);
             }
         }
-
-        escaped = false;
     }
 
     None
@@ -75,15 +72,15 @@ pub(crate) fn split_top_level_list(input: &str) -> Vec<String> {
     let mut current = String::new();
     let mut depth = 0usize;
     let mut in_quote = None;
-    let mut escaped = false;
 
     for ch in input.chars() {
         if let Some(quote) = in_quote {
             current.push(ch);
-            if ch == quote && !escaped {
+            // Quote-doubling escapes; backslash is not an escape (see the
+            // scanners above).
+            if ch == quote {
                 in_quote = None;
             }
-            escaped = ch == '\\' && !escaped;
             continue;
         }
 
@@ -108,8 +105,6 @@ pub(crate) fn split_top_level_list(input: &str) -> Vec<String> {
             }
             _ => current.push(ch),
         }
-
-        escaped = false;
     }
 
     if !current.trim().is_empty() {
@@ -324,21 +319,21 @@ pub(crate) fn find_top_level_operator(input: &str, operator: &str) -> Option<usi
     let operator_upper = operator.to_uppercase();
     let mut depth = 0usize;
     let mut in_quote = None;
-    let mut escaped = false;
 
     for (index, ch) in input.char_indices() {
         if let Some(quote) = in_quote {
-            if ch == quote && !escaped {
+            // SQL literals escape by QUOTE DOUBLING (a doubled close-quote
+            // stays in-quote); backslash is not an escape — treating it as
+            // one desyncs the scanner when a value ends in a backslash.
+            if ch == quote {
                 in_quote = None;
             }
-            escaped = ch == '\\' && !escaped;
             continue;
         }
 
         match ch {
             '\'' | '"' => {
                 in_quote = Some(ch);
-                escaped = false;
                 continue;
             }
             '(' => depth += 1,
@@ -352,8 +347,6 @@ pub(crate) fn find_top_level_operator(input: &str, operator: &str) -> Option<usi
         {
             return Some(index);
         }
-
-        escaped = false;
     }
 
     None

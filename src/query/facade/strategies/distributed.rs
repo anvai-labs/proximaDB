@@ -292,7 +292,7 @@ impl DistributedQueryStrategy {
             .trim_start_matches('[')
             .trim_end_matches(']');
         if trimmed.is_empty() {
-            return Ok(Vec::new());
+            return Err(anyhow!("query vector must be non-empty"));
         }
 
         trimmed

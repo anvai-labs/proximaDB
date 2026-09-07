@@ -59,3 +59,41 @@ pub fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
         .windows(needle.len())
         .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
+
+/// [`find_ascii_ci`], but matches only OUTSIDE single/double-quoted
+/// segments (quote-doubling aware) — SET-style name/value splits must not
+/// fire inside a quoted identifier such as "time TO live".
+pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match quote {
+            Some(q) => {
+                if bytes[i] == q {
+                    // doubled quote stays inside the literal
+                    if i + 1 < bytes.len() && bytes[i + 1] == q {
+                        i += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                    quote = Some(bytes[i]);
+                    i += 1;
+                    continue;
+                }
+                if i + needle.len() <= bytes.len()
+                    && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+                {
+                    return Some(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}

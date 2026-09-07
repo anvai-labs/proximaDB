@@ -1214,6 +1214,36 @@ Other round-8/9 fixes:
   still lives at five boundaries with divergent error spellings — one
   validate home (data-model/kernel) pending; ParameterValue::Vector's
   to_sql_string guard lives only in its caller.
+
+**Consolidation review round 24 (2026-09-07):**
+- The round-23 backslash fix covered one of FIVE scanners: the fusion
+  extent scanner (extract_function_args_at — the motivating input
+  desynced THERE first), the fusion vector-RHS scanner, and the
+  optimizer's three top-level scanners all still treated backslash as
+  an in-quote escape — all five now quote-doubling only.
+- split_qualified_reference validates IDENTIFIER-shaped halves — the
+  round-23 string-literal guard missed cast-suffixed ('[0.5,NaN]'::
+  vector) and unquoted literals, which still dot-split into bogus
+  correlations.
+- The ONE non-finite policy completed: the federated Arrow fast path
+  (binary-encoded correlated vectors bypassed every text filter) and
+  the DML WRITE path (literal_to_vector persisted inf/NaN rows no query
+  boundary can express — poison rows surfacing only as NaN scores).
+- Empty vector literals reject at the SQL surfaces too (canonical
+  parser returns None for '[]'; distributed errors; the fusion parser
+  no longer silently defaults an unparseable vector-RHS to '[]').
+- SET's TO-branch is quote-aware (a quoted name containing ' TO '
+  mis-split there after the round-23 fix covered only the '='-branch) —
+  via find_ascii_ci_outside_quotes in core::utils.
+- collect_quoted_first_args is quote-doubling aware (this PR's own
+  generators emit doubled quotes; the plain find truncated EXPLAIN
+  catalog targets at the first one).
+- Tracked: f32 params still WIDEN on the prepared path (ParameterValue::
+  Float is f64-only — the ?-literal path renders native precision; the
+  two paths disagree for Float32 inputs; needs an f32-aware param form
+  or a documented coercion). Parser cast-shape disagreement (mixed-case
+  '::Vector', typed '::vector(3)', the planner's bracket-trim) folds
+  into the tracked validate-home item.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

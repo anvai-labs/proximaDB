@@ -25,6 +25,7 @@ use super::translator::QueryTranslator;
 use super::types::{FieldDescription, PgType};
 use crate::catalog::CatalogManager;
 use crate::core::utils::find_ascii_ci;
+use crate::core::utils::find_ascii_ci_outside_quotes;
 use crate::graph::GraphService;
 use crate::network::arrow_ipc::ArrowProtoCodec;
 use crate::observability::ObservabilityService;
@@ -1386,7 +1387,7 @@ impl PostgresProtocol {
                 (candidate, &rest[eq_index + 1..])
             }
         } else {
-            let Some(to_index) = find_ascii_ci(rest, " TO ") else {
+            let Some(to_index) = find_ascii_ci_outside_quotes(rest, " TO ") else {
                 return Err(anyhow!("expected SET name = value or SET name TO value"));
             };
             (&rest[..to_index], &rest[to_index + " TO ".len()..])

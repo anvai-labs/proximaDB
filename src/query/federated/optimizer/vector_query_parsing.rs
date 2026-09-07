@@ -66,7 +66,10 @@ pub(crate) fn parse_vector_literal(raw: &str) -> Option<Vec<f32>> {
 
     let inner = &unquoted[1..unquoted.len() - 1];
     if inner.trim().is_empty() {
-        return Some(Vec::new());
+        // An empty vector is not a queryable literal (the JSON twins 400
+        // on it; the SQL surface must not silently dispatch a
+        // 0-dimension vector).
+        return None;
     }
 
     inner

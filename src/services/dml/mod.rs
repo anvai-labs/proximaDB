@@ -5986,14 +5986,23 @@ impl DmlService {
         }
     }
 
-    /// Convert SqlValueLiteral to vector
+    /// Convert SqlValueLiteral to vector — the ONE non-finite policy:
+    /// every query boundary rejects inf/NaN literals, so persisting one
+    /// here writes a poison row no query can ever express.
     fn literal_to_vector(&self, val: &SqlValueLiteral) -> Result<Vec<f32>> {
+        let ensure_finite = |f: f32| {
+            if f.is_finite() {
+                Ok(f)
+            } else {
+                Err(anyhow!("vector elements must be finite"))
+            }
+        };
         match val {
             SqlValueLiteral::Array(arr) => arr
                 .iter()
                 .map(|v| match v {
-                    SqlValueLiteral::Float(f) => Ok(*f as f32),
-                    SqlValueLiteral::Integer(i) => Ok(*i as f32),
+                    SqlValueLiteral::Float(f) => ensure_finite(*f as f32),
+                    SqlValueLiteral::Integer(i) => ensure_finite(*i as f32),
                     _ => Err(anyhow!("Vector elements must be numeric")),
                 })
                 .collect(),
@@ -6004,9 +6013,11 @@ impl DmlService {
                 .split(',')
                 .filter(|part| !part.trim().is_empty())
                 .map(|part| {
-                    part.trim()
+                    let f = part
+                        .trim()
                         .parse::<f32>()
-                        .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))
+                        .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))?;
+                    ensure_finite(f)
                 })
                 .collect(),
             _ => Err(anyhow!("Vector column expects array value")),

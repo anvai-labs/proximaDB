@@ -2095,17 +2095,21 @@ impl FederatedExecutor {
     /// Returns Some(Vec<f32>) if the column contains native Arrow list/fixed-size-list data,
     /// or None if it needs to fall through to the JSON parsing path.
     fn try_extract_vector_from_arrow(array: &dyn Array, row: usize) -> Option<Vec<f32>> {
+        // The ONE non-finite policy: the string-decode arm of the resolver
+        // rejects inf/NaN text — the binary fast path must not re-admit
+        // them (NaN similarities order arbitrarily downstream).
+        let finite = |values: Vec<f32>| values.iter().all(|v| v.is_finite()).then_some(values);
         // Try FixedSizeList<Float32> first (most common for embeddings)
         if let Some(fsl) = array.as_any().downcast_ref::<FixedSizeListArray>()
             && !fsl.is_null(row)
         {
             let values = fsl.value(row);
             if let Some(float_array) = values.as_any().downcast_ref::<Float32Array>() {
-                return Some(float_array.values().to_vec());
+                return finite(float_array.values().to_vec());
             }
             // Try Float64 list and convert to f32
             if let Some(f64_array) = values.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                return Some(f64_array.values().iter().map(|&v| v as f32).collect());
+                return finite(f64_array.values().iter().map(|&v| v as f32).collect());
             }
         }
 
@@ -2115,11 +2119,11 @@ impl FederatedExecutor {
         {
             let values = list.value(row);
             if let Some(float_array) = values.as_any().downcast_ref::<Float32Array>() {
-                return Some(float_array.values().to_vec());
+                return finite(float_array.values().to_vec());
             }
             // Try Float64 list and convert to f32
             if let Some(f64_array) = values.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                return Some(f64_array.values().iter().map(|&v| v as f32).collect());
+                return finite(f64_array.values().iter().map(|&v| v as f32).collect());
             }
         }
 
