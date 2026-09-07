@@ -28,11 +28,6 @@ static TEST_GRAPH_RESULTS: std::sync::OnceLock<
     Mutex<std::collections::HashMap<String, Vec<QueryRow>>>,
 > = std::sync::OnceLock::new();
 
-fn sql_value_to_query_json(value: &crate::proto::proximadb_v1::SqlValue) -> serde_json::Value {
-    // Round 7: delegate to the shared converter (was an arm-for-arm copy).
-    proximadb_records::conversions::sql_value_to_json(value)
-}
-
 /// Memory pool for reusing vectors to reduce allocations
 pub struct VectorPool {
     query_row_pool: Arc<Mutex<Vec<Vec<QueryRow>>>>,
@@ -871,7 +866,8 @@ impl MultiModalQueryExecutor {
 
                     // Add metadata fields with "metadata." prefix
                     for (key, sql_value) in &record.metadata {
-                        let json_value = sql_value_to_query_json(sql_value);
+                        let json_value =
+                            proximadb_records::conversions::sql_value_to_json(sql_value);
                         // Prefix with "metadata." for SQL projection compatibility
                         fields.insert(format!("metadata.{}", key), json_value);
                     }
@@ -1627,7 +1623,10 @@ mod executor_tests {
             )),
         };
 
-        assert_eq!(super::sql_value_to_query_json(&value), document);
+        assert_eq!(
+            proximadb_records::conversions::sql_value_to_json(&value),
+            document
+        );
     }
 
     #[test]

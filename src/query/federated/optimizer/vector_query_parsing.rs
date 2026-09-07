@@ -14,13 +14,11 @@ pub(crate) fn vector_source_from_literal(raw: &str) -> VectorSource {
 
 pub(crate) fn vector_source_from_expression(expr: &str) -> VectorSource {
     let trimmed = expr.trim();
-    // A single-quoted STRING is never a column reference — literal-shaped
-    // text (including vector literals the filtered parser rejects, e.g.
-    // '[0.5,NaN]') must stay Expression so the executor reports the
-    // validation error instead of a bogus correlation split at the first
-    // '.' inside the literal.
-    let is_string_literal = trimmed.starts_with('\'') && trimmed.ends_with('\'');
-    if !is_string_literal && let Some((table, column)) = split_qualified_reference(trimmed) {
+    // Identifier-validated (see split_qualified_reference): literal-shaped
+    // text — quoted, cast-suffixed, or bare — stays Expression so the
+    // executor reports the validation error instead of a bogus
+    // correlation split at the first '.' inside the literal.
+    if let Some((table, column)) = split_qualified_reference(trimmed) {
         VectorSource::ColumnRef {
             table: table.trim().to_string(),
             column: column.trim().to_string(),
@@ -33,6 +31,7 @@ pub(crate) fn vector_source_from_expression(expr: &str) -> VectorSource {
 pub(crate) fn split_qualified_reference(expr: &str) -> Option<(&str, &str)> {
     let mut in_quotes = false;
     let mut chars = expr.char_indices().peekable();
+    let mut split: Option<(&str, &str)> = None;
 
     while let Some((idx, ch)) = chars.next() {
         match ch {
@@ -43,12 +42,40 @@ pub(crate) fn split_qualified_reference(expr: &str) -> Option<(&str, &str)> {
                 }
                 in_quotes = !in_quotes;
             }
-            '.' if !in_quotes => return Some((&expr[..idx], &expr[idx + ch.len_utf8()..])),
+            '.' if !in_quotes && split.is_none() => {
+                split = Some((&expr[..idx], &expr[idx + ch.len_utf8()..]));
+            }
             _ => {}
         }
     }
+    if in_quotes {
+        return None;
+    }
+    let (table, column) = split?;
+    // Both halves must be IDENTIFIER-shaped — vector literals (quoted,
+    // cast-suffixed, or bare) reaching this splitter must not be misread
+    // as bogus column references.
+    if !is_identifier(table) || !is_identifier(column) {
+        return None;
+    }
+    Some((table, column))
+}
 
-    None
+fn is_identifier(part: &str) -> bool {
+    let trimmed = part.trim();
+    if let Some(inner) = stripped_quoted_ident(trimmed) {
+        return !inner.is_empty() && !inner.contains('"');
+    }
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn stripped_quoted_ident(part: &str) -> Option<&str> {
+    part.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
 }
 
 pub(crate) fn parse_vector_literal(raw: &str) -> Option<Vec<f32>> {

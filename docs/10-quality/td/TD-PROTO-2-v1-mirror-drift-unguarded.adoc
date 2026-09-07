@@ -1244,6 +1244,28 @@ Other round-8/9 fixes:
   or a documented coercion). Parser cast-shape disagreement (mixed-case
   '::Vector', typed '::vector(3)', the planner's bracket-trim) folds
   into the tracked validate-home item.
+
+**Consolidation review round 25 (2026-09-07):**
+- CORRECTION: round 24's commit message and TD entry claimed the
+  split_qualified_reference identifier validation had landed — it HAD
+  NOT (the edit script asserted on a second change, failed, and wrote
+  nothing; only part of the round survived). Landed NOW, verified in
+  tree: identifier-validated halves, cast-suffixed/unquoted literals
+  stay Expression. LESSON (the round-21 one, again): verify-in-tree
+  after multi-part scripted edits, not the script's print output.
+- The fusion parser's own '[]' arm still returned Some(vec![]) — an
+  empty prepared Vector param spliced '[]' and the RERANK pipeline
+  silently degraded to TEXT-ONLY ranking; rejects now.
+- The port twin's EXPLAIN extractor decodes quote-doubling (the REST
+  twin did after round 24; the twins disagreed on this PR's own escaped
+  output). The SET TO-recovery's unreachable arm removed; the executor's
+  last one-line converter wrapper inlined.
+- Tracked: NDV publish allocates the per-byte Binary render per record
+  per column where the accumulator needs only a hash key (the tracked
+  NDV item covers semantics; this is the write-path allocation
+  amplification — hundreds of MB transient on 10k × 1KB batches). The
+  quote-doubling close-scan now has three spellings (core::utils,
+  collect_quoted_first_args, pgwire) — one close_quote helper pending.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

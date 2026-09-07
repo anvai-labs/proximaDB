@@ -819,7 +819,9 @@ impl FederatedParser {
 
         let inner = &unquoted[1..unquoted.len() - 1];
         if inner.trim().is_empty() {
-            return Some(Vec::new());
+            // An empty vector is not a queryable literal (the optimizer twin
+            // and the JSON twins reject it — do not dispatch a 0-dimension query).
+            return None;
         }
 
         inner

@@ -1378,11 +1378,13 @@ impl PostgresProtocol {
         let (name, value) = if let Some(eq_index) = rest.find('=') {
             let candidate = &rest[..eq_index];
             let quoted = candidate.trim_start().starts_with('"');
-            if !quoted && find_ascii_ci(candidate, " TO ").is_some() {
-                match find_ascii_ci(rest, " TO ") {
-                    Some(to_index) => (&rest[..to_index], &rest[to_index + " TO ".len()..]),
-                    None => (candidate, &rest[eq_index + 1..]),
-                }
+            // An unquoted candidate containing ' TO ' implies rest has one
+            // too (the candidate is a prefix) — the guard is structural.
+            if !quoted
+                && find_ascii_ci(candidate, " TO ").is_some()
+                && let Some(to_index) = find_ascii_ci(rest, " TO ")
+            {
+                (&rest[..to_index], &rest[to_index + " TO ".len()..])
             } else {
                 (candidate, &rest[eq_index + 1..])
             }

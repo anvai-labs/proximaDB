@@ -523,7 +523,10 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 .unwrap_or_default()
                 .trim()
                 .trim_matches('\'')
-                .trim_matches('"');
+                .trim_matches('"')
+                // Decode quote-doubling — the generators escape embedded
+                // quotes that way (the REST twin agrees).
+                .replace("''", "'");
             if !candidate.is_empty() && !candidate.starts_with('$') {
                 targets.push(candidate.to_string());
             }
