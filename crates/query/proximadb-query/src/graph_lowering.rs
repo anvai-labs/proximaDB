@@ -154,14 +154,75 @@ pub fn parse_supported_graph_query(
 
 fn strip_from_clause(query: &str) -> Result<(String, Option<String>)> {
     let trimmed = query.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
 
-    let Some(from_pos) = upper.find(" FROM ") else {
+    // WHITESPACE-CLASS, QUOTE-AWARE keyword scan — the injector preserves
+    // the caller's newline/tab padding before FROM, and a FROM inside a
+    // Cypher string literal (its own tests use exactly that shape) must
+    // not hijack the split.
+    let bytes = trimmed.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    let mut from_pos: Option<usize> = None;
+    while i < bytes.len() {
+        match quote {
+            Some(q) => {
+                if bytes[i] == q {
+                    if i + 1 < bytes.len() && bytes[i + 1] == q {
+                        i += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                // Cypher line comments (//), block comments, and backtick
+                // symbolic names — a FROM inside any of them hijacked the
+                // split (the injector's scanner handles all three; this
+                // crate cannot import the root's shared home — the
+                // terminal-scanner TD item).
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(bytes.len());
+                    continue;
+                }
+                if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
+                    quote = Some(bytes[i]);
+                    i += 1;
+                    continue;
+                }
+                let boundary_before = i == 0 || bytes[i - 1].is_ascii_whitespace();
+                if boundary_before
+                    && i + 4 <= bytes.len()
+                    && bytes[i..i + 4].eq_ignore_ascii_case(b"FROM")
+                {
+                    let after = i + 4;
+                    let boundary_after = after >= bytes.len() || bytes[after].is_ascii_whitespace();
+                    if boundary_after {
+                        from_pos = Some(i);
+                        break;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    let Some(from_pos) = from_pos else {
         return Ok((trimmed.to_string(), None));
     };
 
     let before_from = trimmed[..from_pos].trim_end();
-    let after_from = trimmed[from_pos + 6..].trim_start();
+    let after_from = trimmed[from_pos + 4..].trim_start();
     let graph_name_len = after_from
         .chars()
         .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')

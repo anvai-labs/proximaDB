@@ -1,6 +1,5 @@
 // Helper functions for proto metadata conversion with repeated MetadataItem
 
-use proximadb_data_model::ProximaValue;
 use proximadb_proto::proximadb_v1::{MetadataItem, SqlValue, metadata_item};
 use std::collections::HashMap;
 
@@ -151,42 +150,25 @@ pub fn sqlvalue_metadata_to_json(
 ) -> HashMap<String, serde_json::Value> {
     metadata
         .iter()
-        .filter_map(|(key, sql_value)| {
-            sql_value.value.as_ref().map(|v| {
-                let json_value = match v {
-                    proximadb_proto::proximadb_v1::sql_value::Value::StringValue(s) => {
-                        serde_json::Value::String(s.clone())
-                    }
-                    proximadb_proto::proximadb_v1::sql_value::Value::NumberValue(n) => {
-                        serde_json::Number::from_f64(*n).map_or_else(
-                            || serde_json::Value::String(n.to_string()),
-                            serde_json::Value::Number,
-                        )
-                    }
-                    proximadb_proto::proximadb_v1::sql_value::Value::BoolValue(b) => {
-                        serde_json::Value::Bool(*b)
-                    }
-                    proximadb_proto::proximadb_v1::sql_value::Value::Int64Value(i) => {
-                        serde_json::Value::Number(serde_json::Number::from(*i))
-                    }
-                    proximadb_proto::proximadb_v1::sql_value::Value::BytesValue(_) => {
-                        serde_json::Value::String("[binary data]".to_string())
-                    }
-                    proximadb_proto::proximadb_v1::sql_value::Value::JsonbValue(bytes) => {
-                        ProximaValue::jsonb_to_json_lossy(bytes)
-                    }
-                    proximadb_proto::proximadb_v1::sql_value::Value::NullValue(_) => {
-                        serde_json::Value::Null
-                    }
-                    proximadb_proto::proximadb_v1::sql_value::Value::ArrayValue(_) => {
-                        serde_json::Value::String("[array]".to_string())
-                    }
-                    proximadb_proto::proximadb_v1::sql_value::Value::ObjectValue(_) => {
-                        serde_json::Value::String("[object]".to_string())
-                    }
-                };
-                (key.clone(), json_value)
-            })
+        .map(|(key, sql_value)| {
+            // NaN round-trip guard: the canonical rendering maps non-finite
+            // floats to JSON null, and the raptor read path's
+            // json_to_proto_metadata DROPS nulls (metadata_item::Value has
+            // no null variant — explicit-null keys drop there too, exactly
+            // as they did pre-consolidation; tracked in TD-PROTO-2 as a
+            // proto-level gap) — the key would silently vanish from point
+            // reads. This site's pre-consolidation spelling kept it as the
+            // STRING "NaN"/"inf" (round-trips as StringValue); only this
+            // arm is a pre-arm, everything else is the canonical rendering.
+            let json = match sql_value.value.as_ref() {
+                Some(proximadb_proto::proximadb_v1::sql_value::Value::NumberValue(n))
+                    if !n.is_finite() =>
+                {
+                    serde_json::Value::String(n.to_string())
+                }
+                _ => proximadb_records::conversions::sql_value_to_json(sql_value),
+            };
+            (key.clone(), json)
         })
         .collect()
 }

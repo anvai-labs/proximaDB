@@ -1283,8 +1283,16 @@ impl FederatedExecutor {
             });
 
         if let Some(value) = unquoted {
+            // Decode SQL-standard doubled quotes (round 33 added this to
+            // the sibling parse_predicate_value — the filter value with an
+            // apostrophe silently matched 0 rows here).
+            let decoded = if trimmed.starts_with('\'') {
+                value.replace("''", "'")
+            } else {
+                value.replace("\"\"", "\"")
+            };
             return Ok(SqlValue {
-                value: Some(sql_value::Value::StringValue(value.to_string())),
+                value: Some(sql_value::Value::StringValue(decoded)),
             });
         }
 
@@ -1670,7 +1678,11 @@ impl FederatedExecutor {
             serde_json::Value::Array(items) => items
                 .iter()
                 .map(|item| match item {
-                    serde_json::Value::Number(n) => n.as_f64().map(|f| f as f32),
+                    // The ONE non-finite policy: the f32 narrowing can
+                    // overflow (1e300 → inf) — reject, don't dispatch.
+                    serde_json::Value::Number(n) => {
+                        n.as_f64().and_then(crate::core::utils::finite_f32)
+                    }
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()
@@ -1707,8 +1719,12 @@ impl FederatedExecutor {
                 .values
                 .iter()
                 .map(|value| match value.value.as_ref()? {
-                    sql_value::Value::NumberValue(number) => Some(*number as f32),
-                    sql_value::Value::Int64Value(number) => Some(*number as f32),
+                    sql_value::Value::NumberValue(number) => {
+                        crate::core::utils::finite_f32(*number)
+                    }
+                    sql_value::Value::Int64Value(number) => {
+                        crate::core::utils::finite_f32(*number as f64)
+                    }
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()
@@ -1730,8 +1746,12 @@ impl FederatedExecutor {
                 .values
                 .iter()
                 .map(|value| match value.value.as_ref()? {
-                    property_value::Value::DoubleValue(number) => Some(*number as f32),
-                    property_value::Value::IntValue(number) => Some(*number as f32),
+                    property_value::Value::DoubleValue(number) => {
+                        crate::core::utils::finite_f32(*number)
+                    }
+                    property_value::Value::IntValue(number) => {
+                        crate::core::utils::finite_f32(*number as f64)
+                    }
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()
@@ -2077,9 +2097,15 @@ impl FederatedExecutor {
                 }
             }
             DataType::FixedSizeList(_, _) | DataType::List(_) => {
-                // Arrow extraction was already attempted above; if it didn't work then error
+                // LOUD error, symmetric with the Utf8 arm below: the same
+                // poison value must not behave differently by storage
+                // layout, and a silent Ok(None) here returned 0 rows for
+                // typo-class nested paths (try_extract is gated on
+                // nested_path.is_empty()). A poison-row SKIP policy is
+                // TD-tracked — it needs a distinguishing signal between
+                // stored-data poison and user typos.
                 Err(anyhow!(
-                    "Correlated vector source '{}' has Arrow list type but could not extract Float32 values",
+                    "Correlated vector source '{}' has Arrow list type but could not extract finite, non-empty Float32 values",
                     requested
                 ))
             }
@@ -2095,17 +2121,25 @@ impl FederatedExecutor {
     /// Returns Some(Vec<f32>) if the column contains native Arrow list/fixed-size-list data,
     /// or None if it needs to fall through to the JSON parsing path.
     fn try_extract_vector_from_arrow(array: &dyn Array, row: usize) -> Option<Vec<f32>> {
+        // The ONE non-finite policy: the string-decode arm of the resolver
+        // rejects inf/NaN text — the binary fast path must not re-admit
+        // them (NaN similarities order arbitrarily downstream).
+        // The ONE non-finite AND empty policies (a 0-dimension or inf
+        // vector must not dispatch to the kernels).
+        let finite = |values: Vec<f32>| {
+            (!values.is_empty() && values.iter().all(|v| v.is_finite())).then_some(values)
+        };
         // Try FixedSizeList<Float32> first (most common for embeddings)
         if let Some(fsl) = array.as_any().downcast_ref::<FixedSizeListArray>()
             && !fsl.is_null(row)
         {
             let values = fsl.value(row);
             if let Some(float_array) = values.as_any().downcast_ref::<Float32Array>() {
-                return Some(float_array.values().to_vec());
+                return finite(float_array.values().to_vec());
             }
             // Try Float64 list and convert to f32
             if let Some(f64_array) = values.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                return Some(f64_array.values().iter().map(|&v| v as f32).collect());
+                return finite(f64_array.values().iter().map(|&v| v as f32).collect());
             }
         }
 
@@ -2115,11 +2149,11 @@ impl FederatedExecutor {
         {
             let values = list.value(row);
             if let Some(float_array) = values.as_any().downcast_ref::<Float32Array>() {
-                return Some(float_array.values().to_vec());
+                return finite(float_array.values().to_vec());
             }
             // Try Float64 list and convert to f32
             if let Some(f64_array) = values.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                return Some(f64_array.values().iter().map(|&v| v as f32).collect());
+                return finite(f64_array.values().iter().map(|&v| v as f32).collect());
             }
         }
 
@@ -2277,7 +2311,7 @@ impl FederatedExecutor {
                     .map(DirectVectorResolution::Resolved)
             }
             DataType::FixedSizeList(_, _) | DataType::List(_) => Err(anyhow!(
-                "Correlated vector source '{}' has Arrow list type but could not extract Float32 values",
+                "Correlated vector source '{}' has Arrow list type but could not extract finite, non-empty Float32 values",
                 source
             )),
             other => Err(anyhow!(
@@ -2365,10 +2399,21 @@ impl FederatedExecutor {
         nested_path: &[&str],
     ) -> Result<Vec<f32>> {
         match value {
-            serde_json::Value::Array(values) => values
-                .iter()
-                .map(|value| Self::parse_vector_component(value, source, nested_path))
-                .collect(),
+            serde_json::Value::Array(values) => {
+                // The ONE empty-vector policy (a 0-dimension query is a
+                // deferred kernel error or garbage scores).
+                if values.is_empty() {
+                    return Err(anyhow!(
+                        "Nested vector source '{}.{}' is empty",
+                        source,
+                        nested_path.join(".")
+                    ));
+                }
+                values
+                    .iter()
+                    .map(|value| Self::parse_vector_component(value, source, nested_path))
+                    .collect()
+            }
             serde_json::Value::String(value) => {
                 Self::parse_vector_literal(value).ok_or_else(|| {
                     anyhow!(
@@ -2400,13 +2445,14 @@ impl FederatedExecutor {
                     object
                 ))
             }
-            serde_json::Value::Number(number) => Ok(vec![number.as_f64().ok_or_else(|| {
-                anyhow!(
-                    "Nested vector source '{}.{}' contains a non-finite number",
-                    source,
-                    nested_path.join(".")
-                )
-            })? as f32]),
+            // Delegate to the ONE Number-arm policy (the raw `as f32`
+            // overflowed to inf — the same value wrapped in an array was
+            // rejected).
+            serde_json::Value::Number(_) => Ok(vec![Self::parse_vector_component(
+                value,
+                source,
+                nested_path,
+            )?]),
             other => Err(anyhow!(
                 "Nested vector source '{}.{}' resolved to unsupported JSON value {:?}",
                 source,
@@ -2423,13 +2469,19 @@ impl FederatedExecutor {
     ) -> Result<f32> {
         match value {
             serde_json::Value::Number(number) => {
-                number.as_f64().map(|number| number as f32).ok_or_else(|| {
-                    anyhow!(
-                        "Nested vector source '{}.{}' contains a non-finite number",
-                        source,
-                        nested_path.join(".")
-                    )
-                })
+                // The ONE non-finite policy (shared finite_f32 helper):
+                // serde_json numbers are always finite as f64, but the f32
+                // NARROWING can overflow to inf (1e300).
+                number
+                    .as_f64()
+                    .and_then(crate::core::utils::finite_f32)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Nested vector source '{}.{}' contains a component outside the finite f32 range",
+                            source,
+                            nested_path.join(".")
+                        )
+                    })
             }
             serde_json::Value::Object(object) => {
                 if let Some(inner) = object
@@ -2454,28 +2506,11 @@ impl FederatedExecutor {
         }
     }
 
+    // Delegate to the ONE filtered parser (non-finite components reject)
+    // — the local unfiltered copy re-admitted the values the optimizer's
+    // parse rejects whenever the Expression fallback re-parsed raw SQL.
     fn parse_vector_literal(raw: &str) -> Option<Vec<f32>> {
-        let trimmed = raw.trim();
-        let without_cast = trimmed
-            .strip_suffix("::vector")
-            .or_else(|| trimmed.strip_suffix("::VECTOR"))
-            .unwrap_or(trimmed)
-            .trim();
-        let unquoted = without_cast.trim_matches('\'').trim_matches('"').trim();
-
-        if !(unquoted.starts_with('[') && unquoted.ends_with(']')) {
-            return None;
-        }
-
-        let inner = &unquoted[1..unquoted.len() - 1];
-        if inner.trim().is_empty() {
-            return Some(Vec::new());
-        }
-
-        inner
-            .split(',')
-            .map(|value| value.trim().parse::<f32>().ok())
-            .collect()
+        crate::query::federated::optimizer::vector_query_parsing::parse_vector_literal(raw)
     }
 
     fn merge_batches(&self, result: &FederatedExecutionResult) -> Result<RecordBatch> {

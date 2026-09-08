@@ -1,6 +1,6 @@
 //! Pure document-query adaptation helpers shared across query surfaces.
 
-use proximadb_data_model::{DataModel, ProximaValue};
+use proximadb_data_model::DataModel;
 use proximadb_document_query::PathFilter;
 use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
 use proximadb_proto::proximadb_v1::{
@@ -20,28 +20,7 @@ pub fn sql_object_to_json(obj: &proximadb_proto::proximadb_v1::SqlObject) -> ser
     serde_json::Value::Object(map)
 }
 
-/// Convert a protobuf `SqlValue` into JSON.
-pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
-    match &value.value {
-        Some(SqlValueVariant::NullValue(_)) => serde_json::Value::Null,
-        Some(SqlValueVariant::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(SqlValueVariant::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-        Some(SqlValueVariant::NumberValue(f)) => serde_json::Number::from_f64(*f)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        Some(SqlValueVariant::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(SqlValueVariant::BytesValue(b)) => {
-            let encoded: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-            serde_json::Value::String(encoded)
-        }
-        Some(SqlValueVariant::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
-        Some(SqlValueVariant::ArrayValue(arr)) => {
-            let items: Vec<serde_json::Value> = arr.values.iter().map(sql_value_to_json).collect();
-            serde_json::Value::Array(items)
-        }
-        Some(SqlValueVariant::ObjectValue(obj)) => sql_object_to_json(obj),
-        None => serde_json::Value::Null,
-    }
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 /// Convert query-IR path filters into the protobuf `DocumentFilter` contract.
 pub fn convert_path_filters_to_document_filter(filters: &[PathFilter]) -> Option<DocumentFilter> {
@@ -191,14 +170,19 @@ fn doc_filter_condition_to_expression(cond: &DocFilterCondition) -> Option<Filte
         DocFilterOperator::Type => ComparisonOperator::Equals,
     };
 
-    // For IN/NOT_IN, use the multi-value list; otherwise use the single value.
+    // For IN/NOT_IN, use the multi-value list; otherwise use the single
+    // value. Literals lower through the FILTER LOWERING (int-array bytes),
+    // NOT the rendering converter (base64 bytes) — the lowering-vs-rendering
+    // distinction the records doc forbids conflating; evaluators render the
+    // stored side with the same lowering.
+    let literal = proximadb_search_types::sql_value_filter::sql_value_to_filter_literal;
     let value = if !cond.values.is_empty() {
-        let arr: Vec<serde_json::Value> = cond.values.iter().map(sql_value_to_json).collect();
+        let arr: Vec<serde_json::Value> = cond.values.iter().map(&literal).collect();
         serde_json::Value::Array(arr)
     } else {
         cond.value
             .as_ref()
-            .map(sql_value_to_json)
+            .map(literal)
             .unwrap_or(serde_json::Value::Null)
     };
 

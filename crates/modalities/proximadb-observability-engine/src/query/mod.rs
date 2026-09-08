@@ -50,6 +50,33 @@ pub struct ObservabilityQueryEngine {
     log_indexes: tokio::sync::RwLock<HashMap<String, Arc<TantivyLogIndex>>>,
 }
 
+/// The crate-wide SCALAR SqlValue→string rendering — ONE home for exactly the
+/// arms every per-site stringifier AGREED on before the consolidation
+/// (String/Int64/Number/Bool text; Jsonb → canonical JSON text). Everything
+/// else returns `None` for the caller to spell as ITS policy: bytes (lossy
+/// content at attribute matching, `<bytes:N>` placeholders at group-by and
+/// tantivy, hex at trace persistence), null/unset, containers. The per-site
+/// wildcard fallbacks are safe against NEW oneof variants — the v1 SqlValue
+/// oneof is frozen under the TD-PROTO-2 mirror guard; new rich types land on
+/// v2 ProximaValue, not here.
+pub(crate) fn sql_scalar_to_string(value: &crate::proto::proximadb_v1::SqlValue) -> Option<String> {
+    use crate::proto::proximadb_v1::sql_value::Value as V;
+    match value.value.as_ref() {
+        Some(V::StringValue(s)) => Some(s.clone()),
+        Some(V::Int64Value(i)) => Some(i.to_string()),
+        Some(V::NumberValue(f)) => Some(f.to_string()),
+        Some(V::BoolValue(b)) => Some(b.to_string()),
+        Some(V::JsonbValue(b)) => {
+            Some(proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b))
+        }
+        // Bytes TOO is per-site policy (the one scalar arm the sites
+        // disagree on): attribute matching renders lossy content, group-by
+        // and tantivy want the '<bytes:N>' placeholder, trace persistence
+        // wants non-destructive hex. A default here would hand the
+        // destructive lossy spelling to every future call site.
+        _ => None, // bytes/null/unset/containers: per-site policy
+    }
+}
 impl ObservabilityQueryEngine {
     /// Create a new query engine
     pub fn new(storage: Arc<dyn ObservabilityStoragePort>) -> Self {
@@ -516,23 +543,26 @@ impl ObservabilityQueryEngine {
 
     /// Convert SqlValue to string for comparison
     fn sql_value_to_string(&self, value: &crate::proto::proximadb_v1::SqlValue) -> String {
+        // Scalars + Jsonb render through the ONE shared crate fn; the
+        // null/container spellings below are THIS site's pre-consolidation
+        // policy (attribute matching), restored verbatim.
+        if let Some(s) = crate::query::sql_scalar_to_string(value) {
+            return s;
+        }
         use crate::proto::proximadb_v1::sql_value::Value;
         match &value.value {
-            Some(Value::StringValue(s)) => s.clone(),
-            Some(Value::Int64Value(i)) => i.to_string(),
-            Some(Value::NumberValue(f)) => f.to_string(),
-            Some(Value::BoolValue(b)) => b.to_string(),
-            Some(Value::BytesValue(b)) => String::from_utf8_lossy(b).to_string(),
-            // TD-PROTO-2: raw MessagePack through from_utf8_lossy is mojibake
-            // and made key:value attribute filters silently drop matching
-            // logs — decode to compact JSON text (canonical representation).
-            Some(Value::JsonbValue(b)) => {
-                proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b)
-            }
             Some(Value::NullValue(_)) => "null".to_string(),
+            // THIS site's bytes policy: lossy UTF-8 CONTENT — attribute
+            // matching is text-based and develop matched bytes payloads
+            // this way (lossy is acceptable on a transient comparison,
+            // unlike the persisted trace path which uses hex).
+            Some(Value::BytesValue(b)) => String::from_utf8_lossy(b).to_string(),
             Some(Value::ArrayValue(_)) => "[array]".to_string(),
             Some(Value::ObjectValue(_)) => "{object}".to_string(),
-            None => String::new(),
+            // Unset oneof AND the scalars/Jsonb the shared fn covers (its
+            // arms always return) land here as "" — the wildcard keeps the
+            // match total.
+            _ => String::new(),
         }
     }
 

@@ -12,27 +12,38 @@ pub(crate) fn find_top_level_keyword_from(
     keyword: &str,
     start_at: usize,
 ) -> Option<usize> {
-    let sql_upper = sql.to_uppercase();
-    let keyword_upper = keyword.to_uppercase();
-    let bytes = sql_upper.as_bytes();
-    let keyword_len = keyword_upper.len();
+    let bytes = sql.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let keyword_len = keyword_bytes.len();
     let mut depth = 0usize;
     let mut in_quote = None;
-    let mut escaped = false;
 
+    let mut in_doubled_pair = false;
     for (index, ch) in sql.char_indices() {
         if let Some(quote) = in_quote {
-            if ch == quote && !escaped {
+            if in_doubled_pair {
+                // second char of a doubled close-quote — literal content
+                in_doubled_pair = false;
+                continue;
+            }
+            // POSTGRES dialect (standard_conforming_strings=on): the ONLY
+            // in-literal escape is a DOUBLED close-quote (both chars stay
+            // in the literal); backslash is a LITERAL character — treating
+            // it as an escape desyncs the scanner on values ending in one
+            // ('C:\dir\' is a complete literal).
+            if ch == quote {
+                if sql[(index + ch.len_utf8())..].starts_with(quote) {
+                    in_doubled_pair = true;
+                    continue;
+                }
                 in_quote = None;
             }
-            escaped = ch == '\\' && !escaped;
             continue;
         }
 
         match ch {
             '\'' | '"' => {
                 in_quote = Some(ch);
-                escaped = false;
                 continue;
             }
             '(' => depth += 1,
@@ -40,23 +51,25 @@ pub(crate) fn find_top_level_keyword_from(
             _ => {}
         }
 
-        if index < start_at || depth != 0 || index + keyword_len > sql_upper.len() {
-            escaped = false;
+        if index < start_at || depth != 0 {
             continue;
         }
 
-        if &sql_upper[index..index + keyword_len] == keyword_upper.as_str() {
-            let before_ok = index == 0
-                || (!bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_');
+        if bytes
+            .get(index..index.saturating_add(keyword_len))
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword_bytes))
+        {
+            // Identifier boundary via the ONE shared byte class
+            // ('$' and non-ASCII continue an identifier — b$from / éfrom
+            // must not match FROM).
+            let before_ok = index == 0 || !crate::core::utils::is_identifier_byte(bytes[index - 1]);
             let after_index = index + keyword_len;
             let after_ok = after_index == bytes.len()
-                || (!bytes[after_index].is_ascii_alphanumeric() && bytes[after_index] != b'_');
+                || !crate::core::utils::is_identifier_byte(bytes[after_index]);
             if before_ok && after_ok {
                 return Some(index);
             }
         }
-
-        escaped = false;
     }
 
     None
@@ -75,15 +88,21 @@ pub(crate) fn split_top_level_list(input: &str) -> Vec<String> {
     let mut current = String::new();
     let mut depth = 0usize;
     let mut in_quote = None;
-    let mut escaped = false;
 
-    for ch in input.chars() {
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
         if let Some(quote) = in_quote {
             current.push(ch);
-            if ch == quote && !escaped {
+            // POSTGRES dialect: a DOUBLED close-quote stays in-quote;
+            // backslash is a literal (see the scanners above).
+            if ch == quote {
+                if chars.peek() == Some(&quote) {
+                    chars.next();
+                    current.push(quote);
+                    continue;
+                }
                 in_quote = None;
             }
-            escaped = ch == '\\' && !escaped;
             continue;
         }
 
@@ -108,8 +127,6 @@ pub(crate) fn split_top_level_list(input: &str) -> Vec<String> {
             }
             _ => current.push(ch),
         }
-
-        escaped = false;
     }
 
     if !current.trim().is_empty() {
@@ -117,6 +134,50 @@ pub(crate) fn split_top_level_list(input: &str) -> Vec<String> {
     }
 
     items
+}
+
+fn strip_distinct_prefix(clause: &str) -> Option<&str> {
+    let keyword = clause.get(.."DISTINCT".len())?;
+    if !keyword.eq_ignore_ascii_case("DISTINCT") {
+        return None;
+    }
+    let rest = clause.get("DISTINCT".len()..)?;
+    // Whitespace (any amount) and/or parens that WRAP the whole operand —
+    // the Postgres-legal DISTINCT id / DISTINCT(id) / DISTINCT (id)
+    // spellings. The whitespace test is on the UNTRIMMED rest
+    // (trim_start-then-check was always false — every unparenthesized
+    // spelling silently lost its dedup).
+    let paren_form = rest.starts_with('(');
+    if !paren_form && !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let trimmed_rest = rest.trim_start();
+    if let Some(inner) = trimmed_rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .filter(|inner| !inner.is_empty())
+        .filter(|inner| {
+            // Only strip when the leading paren CLOSES at the end —
+            // '(price), (tax)' and 'DISTINCT(a)-(b)' were gutted.
+            let mut depth = 0i32;
+            for (i, b) in inner.bytes().enumerate() {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 && i + 1 < inner.len() {
+                            return false; // closed mid-operand
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            depth == 0
+        })
+    {
+        return Some(inner.trim());
+    }
+    Some(trimmed_rest)
 }
 
 pub(crate) fn select_has_distinct(sql: &str) -> bool {
@@ -127,10 +188,7 @@ pub(crate) fn select_has_distinct(sql: &str) -> bool {
         return false;
     };
 
-    sql[select_pos + 6..from_pos]
-        .trim_start()
-        .to_uppercase()
-        .starts_with("DISTINCT ")
+    strip_distinct_prefix(sql[select_pos + 6..from_pos].trim_start()).is_some()
 }
 
 pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
@@ -142,19 +200,32 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
     };
 
     let clause = sql[select_pos + 6..from_pos].trim();
-    let clause = clause
-        .strip_prefix("DISTINCT ")
-        .or_else(|| clause.strip_prefix("distinct "))
-        .unwrap_or(clause);
+    // Fully case-insensitive and token-boundary-aware: a projected column
+    // named `Distinctive` must not lose its prefix.
+    let clause = strip_distinct_prefix(clause).unwrap_or(clause);
 
     split_top_level_list(clause)
         .into_iter()
         .map(|item| {
-            let upper = item.to_uppercase();
-            if let Some(as_pos) = upper.rfind(" AS ") {
+            // Use the shared top-level scanner: CAST(price AS INT) and
+            // literals containing ' AS ' are not alias separators, while
+            // every SQL whitespace class is accepted around a real alias.
+            let mut as_pos: Option<usize> = None;
+            let mut search_from = 0usize;
+            while let Some(position) = find_top_level_keyword_from(&item, "AS", search_from) {
+                as_pos = Some(position); // keep scanning: LAST wins
+                search_from = position + "AS".len();
+            }
+            if let Some(as_pos) = as_pos {
+                // An end-of-item AS ('id AS' with FROM terminating the
+                // clause) yields an EMPTY alias — treat as no alias (the
+                // old inline scanner required a following whitespace byte
+                // and never matched at end-of-string).
+                let alias_text = item[as_pos + "AS".len()..].trim().to_string();
+                let alias = (!alias_text.is_empty()).then_some(alias_text);
                 SelectItem {
                     expression: item[..as_pos].trim().to_string(),
-                    alias: Some(item[as_pos + 4..].trim().to_string()),
+                    alias,
                 }
             } else {
                 SelectItem {
@@ -206,10 +277,10 @@ pub(crate) fn parse_aggregate_expr(item: &SelectItem) -> Option<AggregateExpr> {
                     column: None,
                     alias,
                 })
-            } else if let Some(distinct_column) = inner
-                .strip_prefix("DISTINCT ")
-                .or_else(|| inner.strip_prefix("distinct "))
-            {
+            } else if let Some(distinct_column) = strip_distinct_prefix(inner) {
+                // The ONE distinct predicate (any case + any whitespace —
+                // 'DISTINCT\tid' silently fell to a non-distinct count
+                // with a phantom column).
                 Some(AggregateExpr {
                     function: AggregateFunction::CountDistinct,
                     column: Some(distinct_column.trim().to_string()),
@@ -279,23 +350,61 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
     split_top_level_list(clause)
         .into_iter()
         .filter_map(|entry| {
-            let upper = entry.to_uppercase();
-            let nulls_first = upper.ends_with(" NULLS FIRST");
-            let nulls_last = upper.ends_with(" NULLS LAST");
-            let trimmed = if nulls_first {
-                entry[..entry.len() - "NULLS FIRST".len()].trim()
-            } else if nulls_last {
-                entry[..entry.len() - "NULLS LAST".len()].trim()
+            // ASCII-case tail checks on the ORIGINAL — uppercase can
+            // change UTF-8 byte lengths, making len()-needle subtraction
+            // slice mid-character (the class the sibling scanners fixed).
+            // Whitespace-class tails: the needle's LEADING space is any
+            // ASCII whitespace (tab/newline padding flipped sort
+            // direction silently).
+            let ends_ci = |needle: &str| {
+                let nb = needle.as_bytes();
+                let lead_ws = nb[0].is_ascii_whitespace();
+                let kw = if lead_ws { &nb[1..] } else { nb };
+                entry.len() >= needle.len() && {
+                    let tail = &entry.as_bytes()[entry.len() - kw.len()..];
+                    tail.eq_ignore_ascii_case(kw)
+                        && (!lead_ws
+                            || entry.as_bytes()[entry.len() - kw.len() - 1].is_ascii_whitespace())
+                }
+            };
+            let strip_ci = |needle: &str| {
+                let nb = needle.as_bytes();
+                let kw_len = if nb[0].is_ascii_whitespace() {
+                    nb.len() - 1
+                } else {
+                    nb.len()
+                };
+                entry[..entry.len() - kw_len].trim()
+            };
+            let trimmed = if ends_ci(" NULLS FIRST") {
+                strip_ci(" NULLS FIRST")
+            } else if ends_ci(" NULLS LAST") {
+                strip_ci(" NULLS LAST")
             } else {
                 entry.trim()
             };
 
-            let upper_trimmed = trimmed.to_uppercase();
-            let ascending = !upper_trimmed.ends_with(" DESC");
-            let column = if upper_trimmed.ends_with(" ASC") || upper_trimmed.ends_with(" DESC") {
-                trimmed[..trimmed.rfind(' ').unwrap_or(trimmed.len())]
-                    .trim()
-                    .to_string()
+            // Whitespace-class (the NULLS tails above got the same fix —
+            // tab-padded DESC silently ran ascending on a phantom column).
+            let ends_trim_ci = |needle: &str| {
+                let nb = needle.as_bytes();
+                let kw = &nb[1..]; // needle starts with a space
+                trimmed.len() > kw.len()
+                    && trimmed.as_bytes()[trimmed.len() - kw.len()..].eq_ignore_ascii_case(kw)
+                    && trimmed.as_bytes()[trimmed.len() - kw.len() - 1].is_ascii_whitespace()
+            };
+            let strip_trim_ci = |needle: &str| {
+                let kw_len = needle.len() - 1; // the leading space
+                trimmed[..trimmed.len() - kw_len].trim()
+            };
+            let ascending = !ends_trim_ci(" DESC");
+            let column = if ends_trim_ci(" ASC") || ends_trim_ci(" DESC") {
+                strip_trim_ci(if ends_trim_ci(" ASC") {
+                    " ASC"
+                } else {
+                    " DESC"
+                })
+                .to_string()
             } else {
                 trimmed.to_string()
             };
@@ -306,9 +415,9 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
                 Some(OrderByClause {
                     column,
                     ascending,
-                    nulls_first: if nulls_first {
+                    nulls_first: if ends_ci(" NULLS FIRST") {
                         true
-                    } else if nulls_last {
+                    } else if ends_ci(" NULLS LAST") {
                         false
                     } else {
                         !ascending
@@ -320,25 +429,34 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
 }
 
 pub(crate) fn find_top_level_operator(input: &str, operator: &str) -> Option<usize> {
-    let upper = input.to_uppercase();
-    let operator_upper = operator.to_uppercase();
+    let bytes = input.as_bytes();
+    let operator_bytes = operator.as_bytes();
     let mut depth = 0usize;
     let mut in_quote = None;
-    let mut escaped = false;
 
+    let mut in_doubled_pair = false;
     for (index, ch) in input.char_indices() {
         if let Some(quote) = in_quote {
-            if ch == quote && !escaped {
+            if in_doubled_pair {
+                // second char of a doubled close-quote — literal content
+                in_doubled_pair = false;
+                continue;
+            }
+            // POSTGRES dialect: doubled close-quote stays in-quote;
+            // backslash is a literal.
+            if ch == quote {
+                if input[(index + ch.len_utf8())..].starts_with(quote) {
+                    in_doubled_pair = true;
+                    continue;
+                }
                 in_quote = None;
             }
-            escaped = ch == '\\' && !escaped;
             continue;
         }
 
         match ch {
             '\'' | '"' => {
                 in_quote = Some(ch);
-                escaped = false;
                 continue;
             }
             '(' => depth += 1,
@@ -347,13 +465,12 @@ pub(crate) fn find_top_level_operator(input: &str, operator: &str) -> Option<usi
         }
 
         if depth == 0
-            && index + operator_upper.len() <= upper.len()
-            && &upper[index..index + operator_upper.len()] == operator_upper.as_str()
+            && bytes
+                .get(index..index.saturating_add(operator_bytes.len()))
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(operator_bytes))
         {
             return Some(index);
         }
-
-        escaped = false;
     }
 
     None
@@ -370,12 +487,20 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
     if trimmed.eq_ignore_ascii_case("FALSE") {
         return Some(PredicateValue::Bool(false));
     }
-    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"')))
     {
-        return Some(PredicateValue::String(
-            trimmed[1..trimmed.len() - 1].to_string(),
-        ));
+        let inner = &trimmed[1..trimmed.len() - 1];
+        // Decode SQL-standard doubled quotes — this PR's own producers
+        // (sql_quote) emit them, and a WHERE literal containing an
+        // apostrophe silently matched nothing undecoded.
+        let decoded = if trimmed.starts_with('\'') {
+            inner.replace("''", "'")
+        } else {
+            inner.replace("\"\"", "\"")
+        };
+        return Some(PredicateValue::String(decoded));
     }
     if let Ok(value) = trimmed.parse::<i64>() {
         return Some(PredicateValue::Int(value));
@@ -384,6 +509,88 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
         return Some(PredicateValue::Float(value));
     }
     None
+}
+
+#[cfg(test)]
+mod scanner_tests {
+    use super::{
+        AggregateFunction, extract_order_by, extract_select_items, extract_where_predicate,
+        find_top_level_keyword, find_top_level_operator, parse_aggregate_expr,
+        parse_predicate_value, select_has_distinct,
+    };
+
+    #[test]
+    fn top_level_scanners_keep_original_utf8_offsets() {
+        // U+FB00 uppercases to two ASCII bytes. Building an uppercased copy
+        // and indexing it with offsets from the original UTF-8 string shifts
+        // every token that follows this literal.
+        let sql = "SELECT 'ﬀ' AS label FROM documents";
+        assert_eq!(
+            find_top_level_keyword(sql, "FROM"),
+            sql.find("FROM"),
+            "keyword offsets must refer to the original SQL"
+        );
+        let items = extract_select_items(sql);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].expression, "'ﬀ'");
+        assert_eq!(items[0].alias.as_deref(), Some("label"));
+
+        let order = extract_order_by("SELECT label FROM documents ORDER BY 'ﬀ' DESC NULLS LAST");
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].column, "'ﬀ'");
+        assert!(!order[0].ascending);
+        assert!(!order[0].nulls_first);
+
+        let predicate = extract_where_predicate("SELECT * FROM documents WHERE 'ﬀ' IS NOT NULL")
+            .expect("simple predicate");
+        assert_eq!(predicate.column, "'ﬀ'");
+
+        let predicate = "label = 'ﬀ' AND score >= 0.5";
+        assert_eq!(
+            find_top_level_operator(predicate, ">="),
+            predicate.find(">="),
+            "operator offsets must refer to the original predicate"
+        );
+    }
+
+    #[test]
+    fn distinct_keyword_requires_a_token_boundary() {
+        let sql = "SELECT Distinctive FROM documents";
+        assert!(!select_has_distinct(sql));
+        let items = extract_select_items(sql);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].expression, "Distinctive");
+    }
+
+    #[test]
+    fn malformed_single_quote_predicate_fails_closed() {
+        assert!(parse_predicate_value("'").is_none());
+        assert!(parse_predicate_value("\"").is_none());
+    }
+
+    #[test]
+    fn select_alias_scanner_accepts_whitespace_classes_only_at_top_level() {
+        let items = extract_select_items(
+            "SELECT CAST(price AS INT)\tAS\tprice_int, 'kept AS literal'\nAS\nlabel FROM sales",
+        );
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].expression, "CAST(price AS INT)");
+        assert_eq!(items[0].alias.as_deref(), Some("price_int"));
+        assert_eq!(items[1].expression, "'kept AS literal'");
+        assert_eq!(items[1].alias.as_deref(), Some("label"));
+
+        let aggregate_items = extract_select_items(
+            "SELECT COUNT(DISTINCT(customer_id)) AS unique_customers FROM sales",
+        );
+        let aggregate = parse_aggregate_expr(&aggregate_items[0])
+            .expect("parenthesized distinct operand must parse");
+        assert!(matches!(
+            aggregate.function,
+            AggregateFunction::CountDistinct
+        ));
+        assert_eq!(aggregate.column.as_deref(), Some("customer_id"));
+    }
 }
 
 pub(crate) fn extract_where_predicate(sql: &str) -> Option<Predicate> {
@@ -401,19 +608,24 @@ pub(crate) fn extract_where_predicate(sql: &str) -> Option<Predicate> {
         return None;
     }
 
-    let upper = clause.to_uppercase();
-    if upper.ends_with(" IS NOT NULL") {
+    // ASCII-case tail checks on the ORIGINAL (uppercase-offset class).
+    let ends_ci = |needle: &str| {
+        clause.len() >= needle.len()
+            && clause.as_bytes()[clause.len() - needle.len()..]
+                .eq_ignore_ascii_case(needle.as_bytes())
+    };
+    if ends_ci(" IS NOT NULL") {
         return Some(Predicate {
-            column: clause[..clause.len() - "IS NOT NULL".len()]
+            column: clause[..clause.len() - " IS NOT NULL".len()]
                 .trim()
                 .to_string(),
             op: PredicateOp::IsNotNull,
             value: PredicateValue::Null,
         });
     }
-    if upper.ends_with(" IS NULL") {
+    if ends_ci(" IS NULL") {
         return Some(Predicate {
-            column: clause[..clause.len() - "IS NULL".len()].trim().to_string(),
+            column: clause[..clause.len() - " IS NULL".len()].trim().to_string(),
             op: PredicateOp::IsNull,
             value: PredicateValue::Null,
         });

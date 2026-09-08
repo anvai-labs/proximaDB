@@ -29,6 +29,16 @@ mod tests {
     }
 
     #[test]
+    fn document_filter_values_decode_sql_doubled_quotes() {
+        let value = FederatedExecutor::document_filter_sql_value("'O''Brien'")
+            .expect("quoted filter value should parse");
+        assert!(matches!(
+            value.value,
+            Some(sql_value::Value::StringValue(ref decoded)) if decoded == "O'Brien"
+        ));
+    }
+
+    #[test]
     fn test_jsonb_vectors_resolve_from_bare_and_nested_documents() {
         let nested = SqlValue {
             value: Some(sql_value::Value::JsonbValue(

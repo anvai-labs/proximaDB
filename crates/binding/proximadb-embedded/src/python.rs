@@ -44,9 +44,10 @@ use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 
 use super::{
     AccessMode, EmbeddedConfig, EmbeddedProximaDB, EmbeddedSqlQueryResult, StorageLocationConfig,
-    json_to_proxima_value, proxima_value_to_json,
+    json_to_proxima_value,
 };
 use proximadb::core::config::{AdvancedPruneConfig, PruneModeConfig};
+use proximadb_embedded_common::proxima_value_to_json;
 
 /// Python wrapper for disk configuration
 #[pyclass(name = "DiskConfig", from_py_object)]
@@ -2107,7 +2108,7 @@ impl PyProximaDB {
         vector_id: &str,
     ) -> PyResult<Option<Py<PyAny>>> {
         match self.db()?.get_vector(collection, vector_id) {
-            Ok(Some(record)) => {
+            Ok(Some(mut record)) => {
                 let dict = PyDict::new(py);
                 dict.set_item("id", &record.oid)?;
                 let vector = record
@@ -2118,7 +2119,10 @@ impl PyProximaDB {
                 dict.set_item("vector", vector)?;
 
                 let props_dict = PyDict::new(py);
-                for (key, node) in &record.props {
+                // props are MOVED out (the record is owned and props are
+                // dead after this loop) — each leaf flows into the owned
+                // canonical converter without the per-field deep clone.
+                for (key, node) in std::mem::take(&mut record.props) {
                     let value = proxima_tree_node_to_json(node);
                     let py_value = json_to_python(py, &value)?;
                     props_dict.set_item(key, py_value)?;
@@ -4271,13 +4275,14 @@ fn python_to_proxima_record(
     })
 }
 
-/// Convert serde_json::Value to Python object
-fn proxima_tree_node_to_json(node: &proximadb_records::ProximaTreeNode) -> serde_json::Value {
+/// Convert a props tree node to serde_json (OWNED — leaves flow into the
+/// owned canonical converter without a deep clone).
+fn proxima_tree_node_to_json(node: proximadb_records::ProximaTreeNode) -> serde_json::Value {
     match node {
-        proximadb_records::ProximaTreeNode::Value(value) => proxima_value_to_json(value.clone()),
+        proximadb_records::ProximaTreeNode::Value(value) => proxima_value_to_json(value),
         proximadb_records::ProximaTreeNode::Object(tree) => serde_json::Value::Object(
-            tree.iter()
-                .map(|(key, value)| (key.clone(), proxima_tree_node_to_json(value)))
+            tree.into_iter()
+                .map(|(key, value)| (key, proxima_tree_node_to_json(value)))
                 .collect(),
         ),
     }
@@ -4800,25 +4805,15 @@ fn trace_span_to_python(py: Python<'_>, span: super::EmbeddedTraceSpan) -> PyRes
 }
 
 fn inject_graph_target_into_cypher(graph_id: Option<&str>, cypher: &str) -> String {
-    let cypher = cypher.trim().trim_end_matches(';').trim();
-    let Some(graph_id) = graph_id.map(str::trim).filter(|value| !value.is_empty()) else {
-        return cypher.to_string();
-    };
-
-    let upper = cypher.to_ascii_uppercase();
-    if upper.contains(" FROM ") {
-        return cypher.to_string();
-    }
-
-    if let Some(return_index) = upper.find(" RETURN ") {
-        format!(
-            "{} FROM {}{}",
-            &cypher[..return_index],
-            graph_id,
-            &cypher[return_index..]
-        )
-    } else {
-        format!("{cypher} FROM {graph_id}")
+    // Delegate to the ONE shared home (this third copy had diverged: it
+    // injected for graph_id="default" — the sentinel the home treats as
+    // unspecified — and appended FROM at the end instead of before WHERE).
+    let graph_id = graph_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "default");
+    match graph_id {
+        Some(graph) => proximadb::core::utils::inject_graph_target_into_cypher(graph, cypher),
+        None => cypher.trim().trim_end_matches(';').trim().to_string(),
     }
 }
 

@@ -22,6 +22,16 @@ pub struct Uuid {
     bytes: [u8; 16],
 }
 
+/// Lowercase hex of a byte slice, single pass (one allocation).
+pub fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 impl Uuid {
     /// Creates a new random UUID v4 (optimized with thread-local RNG)
     pub fn new_v4() -> Self {
@@ -95,7 +105,7 @@ impl Uuid {
 
     /// Converts UUID to a simple hex string (no hyphens)
     pub fn to_simple_string(&self) -> String {
-        self.bytes.iter().map(|b| format!("{:02x}", b)).collect()
+        hex_lower(&self.bytes)
     }
 
     /// Parses a UUID from a hyphenated string

@@ -228,7 +228,7 @@ pub(crate) fn publish_ndv_statistics(
     schema: &CatalogTableSchema,
     records: &[ProximaRecord],
 ) {
-    use proximadb_search_types::sql_value_filter::proxima_value_to_json;
+    use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
 
     let mut summary = crate::core::statistics::StatisticsSummary::new(table_name);
     summary.set_record_count(records.len() as u64);
@@ -251,7 +251,7 @@ pub(crate) fn publish_ndv_statistics(
             // Same leaf extraction as `cluster_sort_key`: NULL/absent/object
             // nodes observe as `None` (counted in the null rate, not the HLL).
             let json_val = rec.props.get(*name).and_then(|node| match node {
-                ProximaTreeNode::Value(v) => Some(proxima_value_to_json(v)),
+                ProximaTreeNode::Value(v) => Some(proxima_value_to_filter_literal(v)),
                 _ => None,
             });
             summary.observe_field(name, ty, json_val.as_ref());
@@ -5986,29 +5986,50 @@ impl DmlService {
         }
     }
 
-    /// Convert SqlValueLiteral to vector
+    /// Convert SqlValueLiteral to vector — the ONE non-finite policy:
+    /// every query boundary rejects inf/NaN literals, so persisting one
+    /// here writes a poison row no query can ever express.
     fn literal_to_vector(&self, val: &SqlValueLiteral) -> Result<Vec<f32>> {
+        let ensure_finite = |f: f32| {
+            if f.is_finite() {
+                Ok(f)
+            } else {
+                Err(anyhow!("vector elements must be finite"))
+            }
+        };
         match val {
-            SqlValueLiteral::Array(arr) => arr
-                .iter()
-                .map(|v| match v {
-                    SqlValueLiteral::Float(f) => Ok(*f as f32),
-                    SqlValueLiteral::Integer(i) => Ok(*i as f32),
-                    _ => Err(anyhow!("Vector elements must be numeric")),
-                })
-                .collect(),
-            SqlValueLiteral::String(value) => value
-                .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(',')
-                .filter(|part| !part.trim().is_empty())
-                .map(|part| {
-                    part.trim()
-                        .parse::<f32>()
-                        .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))
-                })
-                .collect(),
+            SqlValueLiteral::Array(arr) => {
+                // NOTE: empty vectors are permitted on the WRITE path (a
+                // schema DEFAULT '[]' is legal config; every QUERY boundary
+                // rejects empty — the asymmetry is deliberate, develop-
+                // compatible, and avoids breaking whole tables).
+                arr.iter()
+                    .map(|v| match v {
+                        SqlValueLiteral::Float(f) => ensure_finite(*f as f32),
+                        SqlValueLiteral::Integer(i) => ensure_finite(*i as f32),
+                        _ => Err(anyhow!("Vector elements must be numeric")),
+                    })
+                    .collect()
+            }
+            SqlValueLiteral::String(value) => {
+                // Lazy iterator (an intermediate Vec cost ~36KB per
+                // 1536-dim row on the INSERT coercion path); emptiness is
+                // checked on the RESULT.
+                value
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .filter(|part| !part.trim().is_empty())
+                    .map(|part| {
+                        let f = part
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))?;
+                        ensure_finite(f)
+                    })
+                    .collect()
+            }
             _ => Err(anyhow!("Vector column expects array value")),
         }
     }

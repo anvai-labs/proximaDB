@@ -319,50 +319,6 @@ pub fn convert_metadata_from_proto(
 // Collection Config Conversions
 // ============================================================================
 
-/// Convert a map of v1 SqlValue to JSON values
-pub fn sql_values_to_json_map(
-    items: HashMap<String, crate::proto::proximadb_v1::SqlValue>,
-) -> HashMap<String, serde_json::Value> {
-    let mut out = HashMap::new();
-    for (k, v) in items {
-        let json = match v.value {
-            Some(crate::proto::proximadb_v1::sql_value::Value::StringValue(s)) => {
-                serde_json::Value::String(s)
-            }
-            Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(n)) => {
-                serde_json::Number::from_f64(n)
-                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
-            }
-            Some(crate::proto::proximadb_v1::sql_value::Value::BoolValue(b)) => {
-                serde_json::Value::Bool(b)
-            }
-            Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(i)) => {
-                serde_json::Value::Number(serde_json::Number::from(i))
-            }
-            Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(_bytes)) => {
-                serde_json::Value::String("[Binary Data]".to_string())
-            }
-            Some(crate::proto::proximadb_v1::sql_value::Value::JsonbValue(bytes)) => {
-                proximadb_data_model::ProximaValue::jsonb_to_json_lossy(&bytes)
-            }
-            Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(_)) => {
-                serde_json::Value::Null
-            }
-            Some(crate::proto::proximadb_v1::sql_value::Value::ArrayValue(_arr)) => {
-                // Deferred: Implement proper array conversion
-                serde_json::Value::String("[Array]".to_string())
-            }
-            Some(crate::proto::proximadb_v1::sql_value::Value::ObjectValue(_obj)) => {
-                // Deferred: Implement proper object conversion
-                serde_json::Value::String("[Object]".to_string())
-            }
-            None => serde_json::Value::Null,
-        };
-        out.insert(k, json);
-    }
-    out
-}
-
 /// Convert a ProximaValue metadata map to JSON values.
 pub fn proxima_values_to_json_map(
     items: HashMap<String, proximadb_data_model::ProximaValue>,

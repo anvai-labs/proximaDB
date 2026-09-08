@@ -287,47 +287,23 @@ impl RowGroups {
                     .metadata
                     .iter()
                     .map(|(key, value)| {
-                        (
-                            key.clone(),
-                            match &value.value {
-                                Some(
-                                    crate::proto::proximadb_v1::sql_value::Value::StringValue(s),
-                                ) => serde_json::Value::String(s.clone()),
-                                Some(
-                                    crate::proto::proximadb_v1::sql_value::Value::NumberValue(n),
-                                ) => serde_json::Value::Number(
+                        // Canonical rendering, one home. NUMBER dispatch is
+                        // proto-variant-driven (not JSON-type-driven): this
+                        // columnar layout is POSITIONAL per key, and any
+                        // Number→non-Number rendering change (e.g. NaN→null)
+                        // would re-route rows between column families and
+                        // shift every later entry — dispatch on the variant
+                        // so numeric identity holds by construction.
+                        let json = match &value.value {
+                            Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(n)) => {
+                                serde_json::Value::Number(
                                     serde_json::Number::from_f64(*n)
                                         .unwrap_or_else(|| serde_json::Number::from(0)),
-                                ),
-                                Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(
-                                    i,
-                                )) => serde_json::Value::Number(serde_json::Number::from(*i)),
-                                Some(crate::proto::proximadb_v1::sql_value::Value::BoolValue(
-                                    b,
-                                )) => serde_json::Value::Bool(*b),
-                                Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(
-                                    b,
-                                )) => {
-                                    use base64::Engine;
-                                    serde_json::Value::String(
-                                        base64::engine::general_purpose::STANDARD.encode(b),
-                                    )
-                                }
-                                Some(crate::proto::proximadb_v1::sql_value::Value::JsonbValue(
-                                    b,
-                                )) => proximadb_data_model::ProximaValue::jsonb_to_json_lossy(b),
-                                Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(
-                                    _,
-                                )) => serde_json::Value::Null,
-                                Some(crate::proto::proximadb_v1::sql_value::Value::ArrayValue(
-                                    arr,
-                                )) => serde_json::to_value(arr).unwrap_or(serde_json::Value::Null),
-                                Some(
-                                    crate::proto::proximadb_v1::sql_value::Value::ObjectValue(obj),
-                                ) => serde_json::to_value(obj).unwrap_or(serde_json::Value::Null),
-                                None => serde_json::Value::Null,
-                            },
-                        )
+                                )
+                            }
+                            _ => proximadb_records::conversions::sql_value_to_json(value),
+                        };
+                        (key.clone(), json)
                     })
                     .collect();
                 // Inline metadata addition to avoid borrow conflict

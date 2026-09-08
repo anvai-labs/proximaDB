@@ -14,12 +14,19 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
 use proximadb_runtime::UnifiedQueryPort;
+// The FILTER-lowering spelling (int-array binary, ns temporals) — named
+// for what it IS, mirroring the SqlValue twin sql_value_to_filter_literal;
+// the canonical (base64) renderer lives in records under a different name.
+use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal as proxima_filter_literal;
 use tracing::{debug, info};
 
 use crate::catalog::CatalogManager;
 use crate::query::authority_context::{AuthoritySource, resolve_catalog_authority_context};
 use crate::query::explain::StorageAuthorityExplanation;
 use crate::query::multimodal::plan::PlanContext;
+use crate::query::prepared::statement::{
+    escape_sql_text, float_sql_literal, sql_quote, vector_literal_text,
+};
 use crate::query::unified::uql::{
     ComparisonOperator, Condition, SelectStatement, UQLParser, UQLStatement, Value,
 };
@@ -47,53 +54,37 @@ fn proxima_value_to_param(value: &ProximaValue) -> ParameterValue {
         ProximaValue::Float64(v) => ParameterValue::Float(*v),
         ProximaValue::Boolean(v) => ParameterValue::Bool(*v),
         ProximaValue::DenseVector(values) => ParameterValue::Vector(values.clone()),
-        ProximaValue::Json(value) | ProximaValue::Jsonb(value) => {
-            ParameterValue::Json(value.clone())
-        }
-        ProximaValue::Array(values) => ParameterValue::Json(serde_json::Value::Array(
-            values.iter().map(proxima_value_to_json).collect(),
-        )),
-        ProximaValue::Map(values) | ProximaValue::Struct(values) => {
-            ParameterValue::Json(serde_json::Value::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), proxima_value_to_json(value)))
-                    .collect(),
-            ))
-        }
+        // Json/Array/Map flow through the exotic catch-all below — one
+        // spelling of 'structured value → JSON-text param' (the deleted
+        // per-variant arms re-derived it and drifted from the catch-all).
+        // A JSON-null DOCUMENT is the SQL NULL param (3VL), not the string
+        // 'null' the catch-all would splice — matching From<Value>'s arm.
+        ProximaValue::Json(v) | ProximaValue::Jsonb(v) if v.is_null() => ParameterValue::Null,
         ProximaValue::Null => ParameterValue::Null,
-        other => ParameterValue::String(format!("{other:?}")),
-    }
-}
-
-fn proxima_value_to_json(value: &ProximaValue) -> serde_json::Value {
-    match value {
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => serde_json::Value::String(s.clone()),
-        ProximaValue::Int8(v) => serde_json::json!(v),
-        ProximaValue::Int16(v) => serde_json::json!(v),
-        ProximaValue::Int32(v) => serde_json::json!(v),
-        ProximaValue::Int64(v) => serde_json::json!(v),
-        ProximaValue::UInt8(v) => serde_json::json!(v),
-        ProximaValue::UInt16(v) => serde_json::json!(v),
-        ProximaValue::UInt32(v) => serde_json::json!(v),
-        ProximaValue::UInt64(v) => serde_json::json!(v),
-        ProximaValue::Float16(v) => serde_json::json!(*v as f64),
-        ProximaValue::Float32(v) => serde_json::json!(*v as f64),
-        ProximaValue::Float64(v) => serde_json::json!(v),
-        ProximaValue::Boolean(v) => serde_json::json!(v),
-        ProximaValue::Json(value) | ProximaValue::Jsonb(value) => value.clone(),
-        ProximaValue::Array(values) => {
-            serde_json::Value::Array(values.iter().map(proxima_value_to_json).collect())
-        }
-        ProximaValue::Map(values) | ProximaValue::Struct(values) => serde_json::Value::Object(
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), proxima_value_to_json(value)))
-                .collect(),
-        ),
-        ProximaValue::DenseVector(values) => serde_json::json!(values),
-        ProximaValue::Null => serde_json::Value::Null,
-        other => serde_json::Value::String(format!("{other:?}")),
+        // Typed exotics (Binary/Uuid/ULID/temporals/SparseVector/Decimal)
+        // lower through the ONE shared filter spelling — the old Rust-Debug
+        // strings ("Binary([1, 2, 3])") could never equal a stored value's
+        // rendering, so such parameters silently matched nothing. Structured
+        // values map to their JSON TEXT as a String param — with
+        // to_sql_string quoting both String and Json params, the direct and
+        // literal paths agree on QUOTING (numeric-array text and
+        // UInt64>i64::MAX spellings still differ between them; the literal
+        // path's f32 vector coercion is pre-existing).
+        other => match proxima_filter_literal(other) {
+            serde_json::Value::String(text) => ParameterValue::String(text),
+            // JSON scalars keep their SEMANTIC param type — bool/number
+            // splice BARE like the From<Value> route (a String param would
+            // quote them into string-vs-numeric no-matches).
+            serde_json::Value::Bool(b) => ParameterValue::Bool(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    ParameterValue::Int(i)
+                } else {
+                    ParameterValue::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            json => ParameterValue::String(json.to_string()),
+        },
     }
 }
 
@@ -128,10 +119,6 @@ fn proxima_value_to_f32_vector(value: &ProximaValue) -> Option<Vec<f32>> {
     }
 }
 
-fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
     match value {
         ProximaValue::String(value) | ProximaValue::Symbol(value) => Ok(sql_quote(value)),
@@ -143,28 +130,52 @@ fn proxima_value_to_sql_literal(value: &ProximaValue) -> Result<String> {
         ProximaValue::UInt16(value) => Ok(value.to_string()),
         ProximaValue::UInt32(value) => Ok(value.to_string()),
         ProximaValue::UInt64(value) => Ok(value.to_string()),
-        ProximaValue::Float16(value) | ProximaValue::Float32(value) => Ok(value.to_string()),
-        ProximaValue::Float64(value) => Ok(value.to_string()),
+        // One shared non-finite rule; the f32-width arms render NATIVE
+        // precision (widening to f64 changes the literal: 0.1f32 ->
+        // 0.10000000149011612, silently unmatching equality filters).
+        ProximaValue::Float16(value) | ProximaValue::Float32(value) => Ok(if value.is_finite() {
+            value.to_string()
+        } else {
+            "NULL".to_string()
+        }),
+        ProximaValue::Float64(value) => Ok(float_sql_literal(*value)),
         ProximaValue::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
-        ProximaValue::DenseVector(values) => Ok(sql_quote(&serde_json::to_string(values)?)),
-        ProximaValue::Array(values) => {
-            if let Some(vector) = proxima_value_to_f32_vector(value) {
-                Ok(sql_quote(&serde_json::to_string(&vector)?))
-            } else {
-                Ok(sql_quote(&serde_json::to_string(&proxima_value_to_json(
-                    &ProximaValue::Array(values.clone()),
-                ))?))
-            }
-        }
-        ProximaValue::Json(value) | ProximaValue::Jsonb(value) => {
-            Ok(sql_quote(&serde_json::to_string(value)?))
-        }
-        ProximaValue::Map(_) | ProximaValue::Struct(_) => Ok(sql_quote(&serde_json::to_string(
-            &proxima_value_to_json(value),
-        )?)),
+        ProximaValue::DenseVector(values) => vector_to_sql_literal(values),
+        ProximaValue::Array(_) => match proxima_value_to_f32_vector(value) {
+            Some(vector) => vector_to_sql_literal(&vector),
+            None => exotic_literal(value),
+        },
+        // Json/Jsonb and Map/Struct flow through the exotic catch-all:
+        // their literals must render exactly what the filter evaluator
+        // renders on the stored side (a root-string Json lowers to BARE
+        // text there — the old serde_json spelling embedded the quotes
+        // and could never match).
         ProximaValue::Null => Ok("NULL".to_string()),
-        other => Ok(sql_quote(&format!("{other:?}"))),
+        other => exotic_literal(other),
     }
+}
+
+/// Structured/exotic literals — the filter-lowering spelling, QUOTED: these
+/// must render exactly what the filter evaluator renders on the stored side
+/// (a root-string Json lowers to BARE text there; the old serde_json
+/// spelling embedded the quotes and could never match). KNOWN GAPS
+/// (tracked in TD-PROTO-2, dialect-dependent): temporals splice as quoted
+/// epoch-numbers, and Binary/SparseVector as quoted JSON text — parseable
+/// SQL on every engine, but equality against a native binary/timestamp
+/// column needs the per-dialect literal form (ISO-8601 text for
+/// Postgres-style engines).
+fn exotic_literal(value: &ProximaValue) -> Result<String> {
+    // ONE splice definition: delegate to ParameterValue::Json's arm (the
+    // shape rule — null→SQL NULL, scalars bare, strings/containers
+    // quoted — lived here as a byte-identical third copy).
+    Ok(ParameterValue::Json(proxima_filter_literal(value)).to_sql_string())
+}
+
+fn vector_to_sql_literal(values: &[f32]) -> Result<String> {
+    if values.iter().any(|component| !component.is_finite()) {
+        return Err(anyhow!("query vector components must be finite"));
+    }
+    Ok(sql_quote(&vector_literal_text(values)))
 }
 
 fn bind_federated_sql_parameters(query: &str, parameters: &[ProximaValue]) -> Result<String> {
@@ -347,11 +358,11 @@ fn uql_to_federated_sql(
             if vector.is_empty() {
                 return Err(anyhow!("UQL vector query parameter cannot be empty"));
             }
-            let vector_json = serde_json::to_string(&vector)?;
+            let vector_literal = vector_to_sql_literal(&vector)?;
             Ok(Some(format!(
                 "SELECT * FROM VECTOR_SEARCH({}, {}, {})",
                 sql_quote(&select.from.collection),
-                sql_quote(&vector_json),
+                vector_literal,
                 limit
             )))
         }
@@ -510,32 +521,12 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
         }
     }
 
-    for function in [
-        "VECTOR_SEARCH",
-        "DOCUMENT_QUERY",
-        "GRAPH_QUERY",
-        "LOGS",
-        "METRICS",
-    ] {
-        let needle = format!("{function}(");
-        let mut search_from = 0;
-        while let Some(offset) = sql[search_from..].to_ascii_uppercase().find(&needle) {
-            let start = search_from + offset + needle.len();
-            let Some(rest) = sql.get(start..) else {
-                break;
-            };
-            let candidate = rest
-                .split([',', ')'])
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches('\'')
-                .trim_matches('"');
-            if !candidate.is_empty() && !candidate.starts_with('$') {
-                targets.push(candidate.to_string());
-            }
-            search_from = start;
-        }
+    // The REST twin's QUOTE-AWARE first-arg scanner — the hand-rolled
+    // split([',', ')']) here truncated quoted names at their first comma
+    // and trim_matches destroyed trailing doubled quotes before the
+    // decode. GRAPH_QUERY stays omitted (its cypher arg never resolves).
+    for function in crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS {
+        crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
     }
 
     targets
@@ -586,19 +577,25 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
         // Convert the JSON multi-model request to a federated SQL string.
-        // The root-crate logic is in multimodal_query::convert_multi_model_to_sql.
-        // We replicate a simplified version here so we don't import the handler module.
-        let sql = json_to_multi_model_sql(&request).unwrap_or_else(|| {
-            // Fallback: treat "query" field as raw SQL, or use a SELECT 1.
-            request
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("SELECT 1")
-                .to_string()
-        });
+        // Sibling of multimodal_query::convert_multi_model_to_sql (it already
+        // shares inject_graph_target_into_cypher; tracked: consolidate the
+        // twins — their defaults and limit handling still diverge).
+        let sql = match json_to_multi_model_sql(&request)? {
+            Some(sql) => sql,
+            None => {
+                // Fallback: treat "query" field as raw SQL, or use a SELECT 1.
+                request
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("SELECT 1")
+                    .to_string()
+            }
+        };
+        // chars().take — a byte-indexed slice can land mid-character in
+        // the user-controlled cypher/collection text now spliced verbatim.
         info!(
             "execute_multi_model_query SQL: {}",
-            &sql[..sql.len().min(200)]
+            sql.chars().take(200).collect::<String>()
         );
         let result = self
             .adapter
@@ -741,51 +738,126 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
 /// Convert a multi-model query JSON to a federated SQL string.
 ///
 /// Mirrors the logic in `src/network/rest/canonical/multimodal_query::convert_multi_model_to_sql`.
-/// Returns `None` when the request cannot be converted.
-fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
-    let components = req.get("components")?.as_array()?;
+/// Returns `None` when no component request is present and fails closed when
+/// a supplied component is malformed.
+fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
+    let Some(components_value) = req.get("components") else {
+        return Ok(None);
+    };
+    let components = components_value
+        .as_array()
+        .ok_or_else(|| anyhow!("components must be an array"))?;
     if components.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut parts = Vec::new();
-    for component in components {
-        let ctype = component.get("component_type")?.as_str()?;
+    for (component_index, component) in components.iter().enumerate() {
+        let ctype = component
+            .get("component_type")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                anyhow!("components[{component_index}].component_type must be a string")
+            })?;
         let config = component.get("config").cloned().unwrap_or_default();
         let sql_part = match ctype {
             "vector" => {
                 let collection = config
                     .get("collection")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
-                let query_vec = config
-                    .get("query_vector")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_f64())
-                            .map(|f| f.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.collection must be a string"
+                            )
+                        })
                     })
-                    .unwrap_or_default();
-                let top_k = config.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10);
+                    .transpose()?
+                    .ok_or_else(|| {
+                        anyhow!("components[{component_index}].config.collection is required")
+                    })?;
+                let query_values = config
+                    .get("query_vector")
+                    .ok_or_else(|| {
+                        anyhow!("components[{component_index}].config.query_vector is required")
+                    })?
+                    .as_array()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "components[{component_index}].config.query_vector must be an array"
+                        )
+                    })?;
+                if query_values.is_empty() {
+                    return Err(anyhow!(
+                        "components[{component_index}].config.query_vector must be non-empty"
+                    ));
+                }
+                // Validate then render through the ONE vector-text home
+                // (f64 Display splices a different literal than the REST
+                // twin for values outside exact f32 range).
+                let f32_vec: Result<Vec<f32>> = query_values
+                    .iter()
+                    .enumerate()
+                    .map(|(value_index, value)| {
+                        let number = value.as_f64().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.query_vector[{value_index}] must be numeric"
+                            )
+                        })?;
+                        let f = crate::core::utils::finite_f32(number)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.query_vector[{value_index}] must be a finite f32"
+                            )
+                        })?;
+                        Ok(f)
+                    })
+                    .collect();
+                let query_vec = vector_literal_text(&f32_vec?);
+                // Typed: a string top_k silently baked the default.
+                let top_k = config
+                    .get("top_k")
+                    .map(|v| {
+                        v.as_u64().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.top_k must be a non-negative integer"
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(10);
                 format!(
-                    "SELECT * FROM VECTOR_SEARCH('{}', '[{}]', {})",
-                    collection, query_vec, top_k
+                    "SELECT * FROM VECTOR_SEARCH('{}', '{}', {})",
+                    escape_sql_text(collection),
+                    query_vec,
+                    top_k
                 )
             }
             "document" => {
                 let collection = config
                     .get("collection")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.collection must be a string"
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        anyhow!("components[{component_index}].config.collection is required")
+                    })?;
                 let filter = config
                     .get("filter")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!("components[{component_index}].config.filter must be a string")
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("1=1");
                 format!(
                     "SELECT * FROM DOCUMENT_QUERY('{}', '{}')",
-                    collection, filter
+                    escape_sql_text(collection),
+                    escape_sql_text(filter)
                 )
             }
             "graph" => {
@@ -793,29 +865,53 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Option<String> {
                     .get("cypher")
                     .and_then(|v| v.as_str())
                     .unwrap_or("MATCH (n) RETURN n LIMIT 10");
-                format!("SELECT * FROM GRAPH_QUERY('{}')", cypher)
+                // Honor config.graph like the v1 twin — without the
+                // injection the query silently targets the DEFAULT graph.
+                let graph = config
+                    .get("graph")
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!("components[{component_index}].config.graph must be a string")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or("default");
+                let cypher = crate::core::utils::inject_graph_target_into_cypher(graph, cypher);
+                format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(&cypher))
             }
-            "observability" => {
+            // 'log'/'metric' are the v1 REST twin's component vocabulary
+            // for the same observability arms — accepting them here stops
+            // the silent `_ => continue` → 'SELECT 1' fallback returning a
+            // 200-OK wrong result for v1-shaped requests.
+            "observability" | "log" | "metric" => {
                 let namespace = config
                     .get("namespace")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
-                format!("SELECT * FROM LOGS('{}')", namespace)
+                let table = match ctype {
+                    "metric" => "METRICS",
+                    _ => "LOGS",
+                };
+                format!("SELECT * FROM {table}('{}')", escape_sql_text(namespace))
             }
-            _ => continue,
+            unknown => {
+                return Err(anyhow!(
+                    "components[{component_index}].component_type '{unknown}' is unsupported"
+                ));
+            }
         };
         parts.push(sql_part);
     }
 
     if parts.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Single component: use directly; multiple: UNION ALL
     if parts.len() == 1 {
-        Some(parts.remove(0))
+        Ok(Some(parts.remove(0)))
     } else {
-        Some(parts.join(" UNION ALL "))
+        Ok(Some(parts.join(" UNION ALL ")))
     }
 }
 
@@ -848,10 +944,12 @@ mod tests {
 
     #[test]
     fn test_proxima_value_to_param_composites() {
+        // Structured values flow through the catch-all as their JSON-text
+        // String param (the deleted per-variant Json arms re-derived it).
         let value = ProximaValue::Array(vec![ProximaValue::Int64(1), ProximaValue::Int64(2)]);
         assert!(matches!(
             proxima_value_to_param(&value),
-            ParameterValue::Json(_)
+            ParameterValue::String(s) if s == "[1,2]"
         ));
     }
 
@@ -889,6 +987,18 @@ mod tests {
             sql,
             "SELECT * FROM VECTOR_SEARCH('products', '[0.1,0.2]', 3)"
         );
+    }
+
+    #[test]
+    fn uql_vector_select_rejects_non_finite_components() {
+        let error = uql_to_federated_sql(
+            "SELECT * FROM vectors.products WHERE VECTOR_SIMILAR(embedding, ?, 0.8)",
+            &[ProximaValue::DenseVector(vec![f32::NAN])],
+            None,
+        )
+        .expect_err("non-finite UQL vector must fail closed");
+
+        assert!(error.to_string().contains("finite"));
     }
 
     #[test]
@@ -935,6 +1045,17 @@ mod tests {
             sql,
             "SELECT * FROM VECTOR_SEARCH('products', '[0.1,0.2,0.3]', 5)"
         );
+    }
+
+    #[test]
+    fn bind_federated_sql_parameters_rejects_non_finite_vectors() {
+        let error = bind_federated_sql_parameters(
+            "SELECT * FROM VECTOR_SEARCH('products', ?, 5)",
+            &[ProximaValue::DenseVector(vec![f32::NAN])],
+        )
+        .expect_err("non-finite vectors must fail closed");
+
+        assert!(error.to_string().contains("finite"));
     }
 
     #[test]
@@ -996,21 +1117,112 @@ mod tests {
                 }
             ]
         });
-        let sql = json_to_multi_model_sql(&req).unwrap();
-        assert!(sql.contains("VECTOR_SEARCH('embeddings'"));
-        assert!(sql.contains(", 5)"));
+        let sql = json_to_multi_model_sql(&req).unwrap().unwrap();
+        // STRICT vector pin: the splice is QUOTED (the bare '[...]'
+        // spelling was the round-15/20 churn — substring pins passed
+        // under both).
+        assert_eq!(
+            sql,
+            "SELECT * FROM VECTOR_SEARCH('embeddings', '[0.1,0.2,0.3]', 5)"
+        );
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_escapes_every_text_argument() {
+        let req = serde_json::json!({
+            "components": [
+                {
+                    "component_type": "vector",
+                    "config": {"collection": "team's-vectors", "query_vector": [0.1]}
+                },
+                {
+                    "component_type": "document",
+                    "config": {"collection": "team's-docs", "filter": "owner = \"O'Brien\""}
+                },
+                {
+                    "component_type": "graph",
+                    "config": {"cypher": "MATCH (n) RETURN 'label'"}
+                },
+                {
+                    "component_type": "observability",
+                    "config": {"namespace": "team's-production"}
+                }
+            ]
+        });
+
+        let sql = json_to_multi_model_sql(&req).unwrap().unwrap();
+        assert!(sql.contains("VECTOR_SEARCH('team''s-vectors'"));
+        assert!(sql.contains("DOCUMENT_QUERY('team''s-docs', 'owner = \"O''Brien\"')"));
+        assert!(sql.contains("GRAPH_QUERY('MATCH (n) RETURN ''label''')"));
+        assert!(sql.contains("LOGS('team''s-production')"));
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_rejects_non_numeric_vector_elements() {
+        let req = serde_json::json!({
+            "components": [{
+                "component_type": "vector",
+                "config": {"collection": "vectors", "query_vector": [0.1, "bad", 0.3]}
+            }]
+        });
+
+        let error = json_to_multi_model_sql(&req).expect_err("invalid vector must fail closed");
+        assert!(error.to_string().contains("query_vector[1]"));
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_requires_document_collection() {
+        let req = serde_json::json!({
+            "components": [{
+                "component_type": "document",
+                "config": {"filter": "active = true"}
+            }]
+        });
+        let error = json_to_multi_model_sql(&req).expect_err("collection must be explicit");
+        assert!(
+            error
+                .to_string()
+                .contains("components[0].config.collection is required")
+        );
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_uses_executable_document_match_all() {
+        let req = serde_json::json!({
+            "components": [{
+                "component_type": "document",
+                "config": {"collection": "docs"}
+            }]
+        });
+        let sql = json_to_multi_model_sql(&req)
+            .expect("conversion should succeed")
+            .expect("components produce SQL");
+        assert!(sql.contains("DOCUMENT_QUERY('docs', '1=1')"));
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_rejects_values_outside_f32_range() {
+        let req = serde_json::json!({
+            "components": [{
+                "component_type": "vector",
+                "config": {"collection": "vectors", "query_vector": [1e300]}
+            }]
+        });
+
+        let error = json_to_multi_model_sql(&req).expect_err("infinite f32 must fail closed");
+        assert!(error.to_string().contains("finite f32"));
     }
 
     #[test]
     fn test_json_to_multi_model_sql_empty_components() {
         let req = serde_json::json!({ "components": [] });
-        assert!(json_to_multi_model_sql(&req).is_none());
+        assert!(json_to_multi_model_sql(&req).unwrap().is_none());
     }
 
     #[test]
     fn test_json_to_multi_model_sql_no_components_field() {
         let req = serde_json::json!({ "query": "SELECT 1" });
-        assert!(json_to_multi_model_sql(&req).is_none());
+        assert!(json_to_multi_model_sql(&req).unwrap().is_none());
     }
 
     #[test]

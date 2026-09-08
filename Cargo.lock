@@ -7703,6 +7703,7 @@ name = "proximadb-embedded-common"
 version = "0.2.0"
 dependencies = [
  "proximadb-data-model",
+ "proximadb-records",
  "serde_json",
 ]
 
@@ -8260,7 +8261,6 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "futures",
- "hex",
  "lettre",
  "num_cpus",
  "object_store",
@@ -8441,6 +8441,7 @@ dependencies = [
  "proximadb-proto",
  "proximadb-query-filter",
  "proximadb-query-fusion",
+ "proximadb-records",
  "proximadb-runtime-common",
  "proximadb-search-types",
  "proximadb-uql",
@@ -8665,6 +8666,7 @@ dependencies = [
  "bincode",
  "half",
  "proximadb-data-model",
+ "proximadb-kernel",
  "proximadb-proto",
  "rmp-serde",
  "serde",

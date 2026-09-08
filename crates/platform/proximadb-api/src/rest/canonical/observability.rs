@@ -601,22 +601,11 @@ fn convert_log_request(req: &LogEntryRequest) -> RestResult<LogEntry> {
 }
 
 fn convert_log_to_response(entry: LogEntry) -> LogEntryResponse {
-    use proximadb_proto::v1::sql_value::Value as SV;
-
     let fields: HashMap<String, serde_json::Value> = entry
         .fields
         .into_iter()
         .map(|(k, v)| {
-            let json_val = match v.value {
-                Some(SV::StringValue(s)) => serde_json::Value::String(s),
-                Some(SV::Int64Value(i)) => serde_json::json!(i),
-                Some(SV::NumberValue(f)) => serde_json::json!(f),
-                Some(SV::BoolValue(b)) => serde_json::Value::Bool(b),
-                Some(SV::JsonbValue(bytes)) => {
-                    proximadb_data_model::ProximaValue::jsonb_to_json_lossy(&bytes)
-                }
-                _ => serde_json::Value::Null,
-            };
+            let json_val = proximadb_records::conversions::sql_value_to_json(&v);
             (k, json_val)
         })
         .collect();

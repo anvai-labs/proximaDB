@@ -10,7 +10,6 @@ use crate::query::execution::{
 use crate::services::operations::vectors::VectorOperationsService;
 use crate::storage::cache::orchestrator::CrossCacheOrchestrator;
 use anyhow::{Result, anyhow};
-use proximadb_data_model::ProximaValue;
 use proximadb_graph_query::service::GraphExecutionService;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,11 +27,6 @@ static TEST_SIMILAR_RESULTS: std::sync::OnceLock<
 static TEST_GRAPH_RESULTS: std::sync::OnceLock<
     Mutex<std::collections::HashMap<String, Vec<QueryRow>>>,
 > = std::sync::OnceLock::new();
-
-fn sql_value_to_query_json(value: &crate::proto::proximadb_v1::SqlValue) -> serde_json::Value {
-    // Round 7: delegate to the shared converter (was an arm-for-arm copy).
-    crate::storage::formats::arrow_conversion::sql_value_to_json(value)
-}
 
 /// Memory pool for reusing vectors to reduce allocations
 pub struct VectorPool {
@@ -872,7 +866,8 @@ impl MultiModalQueryExecutor {
 
                     // Add metadata fields with "metadata." prefix
                     for (key, sql_value) in &record.metadata {
-                        let json_value = sql_value_to_query_json(sql_value);
+                        let json_value =
+                            proximadb_records::conversions::sql_value_to_json(sql_value);
                         // Prefix with "metadata." for SQL projection compatibility
                         fields.insert(format!("metadata.{}", key), json_value);
                     }
@@ -1597,23 +1592,6 @@ impl MultiModalQueryExecutor {
         }
     }
 
-    /// Convert canonical metadata to a field map for result formatting.
-    #[allow(dead_code)]
-    fn convert_metadata_to_fields(
-        &self,
-        metadata: &std::collections::HashMap<String, ProximaValue>,
-    ) -> std::collections::HashMap<String, serde_json::Value> {
-        metadata
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    crate::core::search::sql_value_filter::proxima_value_to_json(value),
-                )
-            })
-            .collect()
-    }
-
     /// Extract result ID for fusion algorithms
     fn extract_result_id(&self, row: &QueryRow) -> String {
         row.fields
@@ -1633,6 +1611,7 @@ mod executor_tests {
         CsrRelationsStore, InMemoryProvenanceRegistry, ProximaEntityStore,
     };
     use async_trait::async_trait;
+    use proximadb_data_model::ProximaValue;
 
     #[test]
     fn query_rows_preserve_jsonb_metadata_as_json() {
@@ -1644,7 +1623,10 @@ mod executor_tests {
             )),
         };
 
-        assert_eq!(super::sql_value_to_query_json(&value), document);
+        assert_eq!(
+            proximadb_records::conversions::sql_value_to_json(&value),
+            document
+        );
     }
 
     #[test]

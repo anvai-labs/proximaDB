@@ -145,20 +145,88 @@ impl From<serde_json::Value> for ParameterValue {
     }
 }
 
+/// Single-quote SQL text with '' escaping — the ONE quoting rule shared by
+/// every parameter splice (String/Vector/Json) and the literal path in
+/// `unified_query_port_impl` (the direct and literal paths must agree on
+/// quoting for federated equality to be possible at all).
+/// Non-finite floats have no SQL literal — NULL (bare 'NaN'/'inf' text is
+/// a parse error on Postgres-style engines). ONE rule for every f64 arm
+/// (the f32 arms render native precision beside it).
+pub(crate) fn float_sql_literal(value: f64) -> String {
+    if value.is_finite() {
+        value.to_string()
+    } else {
+        "NULL".to_string()
+    }
+}
+
+pub(crate) fn escape_sql_text(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// Vector literal text '[f,f,...]' via float Display — serde_json nulls
+/// non-finite elements and the internal vector parsers reject null ('NaN'
+/// text parses). ONE home for every vector splice (param, literal, UQL).
+pub(crate) fn vector_literal_text(values: &[f32]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(values.len() * 8 + 2);
+    let _ = write!(text, "[");
+    for (i, f) in values.iter().enumerate() {
+        if i > 0 {
+            let _ = write!(text, ",");
+        }
+        let _ = write!(text, "{f}");
+    }
+    let _ = write!(text, "]");
+    text
+}
+
+/// Filter-lowering JSON as SQL param/literal TEXT: strings come out BARE
+/// (double-quoting the JSON text would embed the quotes in the literal
+/// itself), structured values as their JSON text. Applied at the SPLICE
+/// layer so every ParameterValue constructor is safe by construction.
+pub(crate) fn filter_literal_text(json: &serde_json::Value) -> String {
+    match json {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn sql_quote(value: &str) -> String {
+    format!("'{}'", escape_sql_text(value))
+}
+
 impl ParameterValue {
     /// Convert to SQL string representation
     pub fn to_sql_string(&self) -> String {
         match self {
-            ParameterValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+            ParameterValue::String(s) => sql_quote(s),
             ParameterValue::Int(i) => i.to_string(),
-            ParameterValue::Float(f) => f.to_string(),
+            // Non-finite floats have no SQL literal — bare 'NaN'/'inf'
+            // text is a parse error on Postgres-style engines ("column
+            // does not exist"). NULL is valid everywhere and, per SQL
+            // 3VL, compares to nothing — matching the canonical JSON
+            // rendering's null.
+            ParameterValue::Float(f) => float_sql_literal(*f),
             ParameterValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             ParameterValue::Null => "NULL".to_string(),
-            ParameterValue::Vector(v) => {
-                let formatted: Vec<String> = v.iter().map(|f| f.to_string()).collect();
-                format!("[{}]", formatted.join(","))
-            }
-            ParameterValue::Json(v) => v.to_string(),
+            // Quoted JSON-array TEXT (brackets kept — both internal
+            // vector parsers require '[' after quote-stripping). Query
+            // execution validates that every component is finite before
+            // calling this renderer.
+            ParameterValue::Vector(v) => sql_quote(&vector_literal_text(v)),
+            // JSON splices QUOTED: bare '[0,1,2]' / '{"x":1}' is a parse
+            // error on every engine (the text may still need a cast to
+            // compare — see the TD-tracked federated literal dialect gap).
+            // JSON docs splice by SHAPE: null is SQL NULL (3VL), bool/
+            // number scalars are valid BARE SQL (quoting them regressed
+            // public From<Value> bindings to string-vs-numeric no-matches),
+            // strings and containers quote (bare '[...]'/'{...}' is a
+            // parse error; root-string docs lower to bare text per the
+            // filter-literal spelling).
+            ParameterValue::Json(v) if v.is_null() => "NULL".to_string(),
+            ParameterValue::Json(v) if v.is_boolean() || v.is_number() => v.to_string(),
+            ParameterValue::Json(v) => sql_quote(&filter_literal_text(v)),
         }
     }
 }
@@ -352,13 +420,24 @@ impl PreparedStatement {
 
         let mut result = self.original_sql.clone();
 
-        // Sort bindings by position in reverse order to avoid index shifting
+        // Sort by PLACEHOLDER NUMBER descending: a global str::replace of
+        // $1 also rewrites the $1-prefix inside $10 — the longest
+        // placeholder must go first (position-descending could not fix
+        // out-of-order numbering; the full tokenizer remains TD-tracked).
         let mut bindings_with_params: Vec<_> = self.parameter_bindings.iter().enumerate().collect();
-        bindings_with_params.sort_by_key(|b| std::cmp::Reverse(b.1.position));
+        bindings_with_params.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         // Replace from the end to avoid position shifts
         for (param_idx, _binding) in &bindings_with_params {
             let param_value = &params[*param_idx];
+            if let ParameterValue::Vector(vector) = param_value
+                && vector.iter().any(|component| !component.is_finite())
+            {
+                return Err(PreparedStatementError::InvalidParameter(format!(
+                    "vector parameter {} contains a non-finite component",
+                    *param_idx + 1
+                )));
+            }
             let placeholder = format!("${}", *param_idx + 1);
             result = result.replace(&placeholder, &param_value.to_sql_string());
         }
@@ -726,8 +805,41 @@ mod tests {
         assert_eq!(ParameterValue::Null.to_sql_string(), "NULL");
         assert_eq!(
             ParameterValue::Vector(vec![0.1, 0.2]).to_sql_string(),
-            "[0.1,0.2]"
+            "'[0.1,0.2]'"
         );
+        // Json splices BY SHAPE: null → SQL NULL (3VL), scalars BARE,
+        // containers quoted — the most-rechurned spelling of this PR,
+        // pinned strictly.
+        assert_eq!(
+            ParameterValue::Json(serde_json::json!(null)).to_sql_string(),
+            "NULL"
+        );
+        assert_eq!(
+            ParameterValue::Json(serde_json::json!(true)).to_sql_string(),
+            "true"
+        );
+        assert_eq!(
+            ParameterValue::Json(serde_json::json!(42)).to_sql_string(),
+            "42"
+        );
+        assert_eq!(
+            ParameterValue::Json(serde_json::json!({"k": "v"})).to_sql_string(),
+            "'{\"k\":\"v\"}'"
+        );
+    }
+
+    #[test]
+    fn prepared_vector_parameters_reject_non_finite_components() {
+        let cache = PreparedStatementCache::with_defaults();
+        let id = cache
+            .prepare("SELECT * FROM VECTOR_SEARCH('vectors', $1, 1)")
+            .expect("prepare should succeed");
+
+        let error = cache
+            .execute_sql(&id, &[ParameterValue::Vector(vec![f32::NAN])])
+            .expect_err("non-finite vectors must fail closed");
+        assert!(matches!(error, PreparedStatementError::InvalidParameter(_)));
+        assert!(error.to_string().contains("finite"));
     }
 
     #[test]

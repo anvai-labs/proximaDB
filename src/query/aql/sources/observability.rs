@@ -35,9 +35,17 @@ impl ObservabilityAqlSource {
             SqlValueData::Int64Value(i) => AqlValue::Int(i),
             SqlValueData::NumberValue(f) => AqlValue::Float(f),
             SqlValueData::BoolValue(b) => AqlValue::Bool(b),
-            SqlValueData::BytesValue(bytes) => serde_json::from_slice(&bytes)
-                .map(AqlValue::Jsonb)
-                .unwrap_or(AqlValue::Null),
+            // Same JSON heuristic as the document/vector/graph siblings
+            // (deliberate for legacy producers — one policy per crate, and
+            // a cross-source predicate sees the same spelling everywhere;
+            // the base64 alternative is the tracked AQL family item).
+            SqlValueData::BytesValue(b) => {
+                if let Ok(json) = serde_json::from_slice(&b) {
+                    AqlValue::Jsonb(json)
+                } else {
+                    AqlValue::Null
+                }
+            }
             // types.proto tag 9: JSONB by declaration — same JSON heuristic as
             // BytesValue so a JSONB field is not silently nulled by the `_`
             // wildcard.
@@ -160,5 +168,23 @@ impl AqlSource for ObservabilityAqlSource {
         let frame_id = ctx.push_frame(frame);
 
         Ok(AqlResult { rows, frame_id })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AqlValue, ObservabilityAqlSource, SqlValueData};
+
+    #[test]
+    fn raw_bytes_follow_the_aql_family_json_heuristic() {
+        // Re-pinned round 38: the arm reverted to the sibling JSON-heuristic
+        // policy (one spelling per crate — the base64 alternative is the
+        // tracked AQL-family item). Non-JSON bytes null; JSON bytes decode.
+        let raw = ObservabilityAqlSource::sql_data_to_aql(SqlValueData::BytesValue(vec![0, 255]));
+        assert!(matches!(raw, AqlValue::Null));
+        let json = ObservabilityAqlSource::sql_data_to_aql(SqlValueData::BytesValue(
+            b"{\"k\":1}".to_vec(),
+        ));
+        assert!(matches!(json, AqlValue::Jsonb(_)));
     }
 }

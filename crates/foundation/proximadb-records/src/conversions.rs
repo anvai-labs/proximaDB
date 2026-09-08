@@ -87,6 +87,89 @@ pub fn sql_value_to_proxima(sql: &SqlValue) -> ProximaValue {
     }
 }
 
+/// Canonical JSON *rendering* of a proto `SqlValue` — THE one converter for
+/// API-facing surfaces (REST rows, pgwire, Arrow, hybrid, document adapter,
+/// metadata helper). TD-PROTO-2 consolidation: these sites carried seven
+/// hand-rolled copies whose bytes/NaN/Jsonb renderings had drifted (hex vs
+/// base64 vs int-array; NaN→0 vs Null). Rendering contract:
+///
+/// - bytes → base64 string (data-preserving, matches pgwire/Arrow)
+/// - non-finite floats → null (JSON has no NaN/∞)
+/// - JsonbValue → canonical MessagePack decode (jsonb_to_json_lossy)
+/// - unset oneof / NullValue → null
+///
+/// Distinct from `sql_value_filter::sql_val_to_json` (search-types), the
+/// FILTER LOWERING — it renders bytes as an int-array for comparison
+/// semantics and must not be conflated with rendering.
+pub fn sql_value_to_json(value: &SqlValue) -> serde_json::Value {
+    match value.value.as_ref() {
+        None | Some(sql_value::Value::NullValue(_)) => serde_json::Value::Null,
+        Some(sql_value::Value::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(sql_value::Value::Int64Value(i)) => serde_json::Value::Number((*i).into()),
+        Some(sql_value::Value::NumberValue(f)) => serde_json::Number::from_f64(*f)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Some(sql_value::Value::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(sql_value::Value::BytesValue(b)) => {
+            serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(b))
+        }
+        Some(sql_value::Value::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
+        Some(sql_value::Value::ArrayValue(arr)) => {
+            serde_json::Value::Array(arr.values.iter().map(sql_value_to_json).collect())
+        }
+        Some(sql_value::Value::ObjectValue(obj)) => serde_json::Value::Object(
+            obj.fields
+                .iter()
+                .map(|(k, v)| (k.clone(), sql_value_to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Canonical JSON *rendering* of a `ProximaValue` for API-facing surfaces —
+/// the ProximaValue-side twin of [`sql_value_to_json`]: Binary/BinaryVector
+/// as base64 (proxima_to_json alone renders them per-byte int-arrays,
+/// INCLUDING nested inside Array/Map/Struct), Uuid dashed (the
+/// cross-surface text convention; ULID plain hex — no dash convention
+/// exists). Callers: the embedded binding's JSON surface
+/// (embedded-common's one-line delegation — which the root crate's legacy
+/// v1 REST search path ALSO reaches transitively via
+/// proxima_values_to_json_map). v2 REST must NOT delegate here (its binary
+/// spelling is the int-array; see rest/v2's v2_row_render). OWNED: moves
+/// String/Symbol/Decimal/Json/container contents instead of deep-cloning
+/// every leaf. Not inlined into proxima_to_json because persisted graph
+/// canonical-text seams rely on its exact current output.
+pub fn proxima_value_to_json_canonical_owned(value: ProximaValue) -> serde_json::Value {
+    match value {
+        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
+            serde_json::Value::String(proximadb_proto::utils::encoding::base64_encode(&b))
+        }
+        ProximaValue::Uuid(u) => {
+            // to_hyphenated_string: one allocation (Display wraps it in a
+            // second fmt allocation).
+            serde_json::Value::String(
+                proximadb_kernel::uuid::Uuid::from_bytes(u).to_hyphenated_string(),
+            )
+        }
+        ProximaValue::String(s) | ProximaValue::Symbol(s) | ProximaValue::Decimal(s) => {
+            serde_json::Value::String(s)
+        }
+        ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v,
+        ProximaValue::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(proxima_value_to_json_canonical_owned)
+                .collect(),
+        ),
+        ProximaValue::Map(fields) | ProximaValue::Struct(fields) => serde_json::Value::Object(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k, proxima_value_to_json_canonical_owned(v)))
+                .collect(),
+        ),
+        other => proxima_to_json(&other),
+    }
+}
+
 /// Convert a `serde_json::Value` into a `ProximaValue` (natural-JSON mapping).
 ///
 /// Numbers split into `Int64`/`Float64`. This matches the composition
@@ -156,12 +239,9 @@ pub fn proxima_to_json(value: &ProximaValue) -> serde_json::Value {
         ProximaValue::Time(value, _)
         | ProximaValue::Timestamp(value, _)
         | ProximaValue::TimestampTz(value, _) => Value::Number((*value).into()),
-        ProximaValue::Uuid(value) | ProximaValue::ULID(value) => Value::String(
-            value
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-        ),
+        ProximaValue::Uuid(value) | ProximaValue::ULID(value) => {
+            Value::String(proximadb_kernel::hex_lower(value))
+        }
         ProximaValue::Json(value) | ProximaValue::Jsonb(value) => value.clone(),
         ProximaValue::Array(values) => Value::Array(values.iter().map(proxima_to_json).collect()),
         ProximaValue::Map(values) | ProximaValue::Struct(values) => Value::Object(
@@ -780,6 +860,59 @@ mod tests {
                 "k".to_string(),
                 ProximaValue::Float64(1.5),
             )]))
+        );
+    }
+
+    #[test]
+    fn canonical_uuid_is_dashed() {
+        // Cross-surface text convention (pgwire pins dashed; /v2/records
+        // dashes) — the canonical wrapper must not drift from it.
+        let u = ProximaValue::Uuid([
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65, 0x54, 0x40,
+            0x00, 0x00,
+        ]);
+        assert_eq!(
+            proxima_value_to_json_canonical_owned(u),
+            serde_json::json!("550e8400-e29b-41d4-a716-446554400000")
+        );
+    }
+
+    #[test]
+    fn canonical_rendering_contract_is_pinned() {
+        // TD-PROTO-2 consolidation: the ONE API-facing rendering — bytes are
+        // base64, non-finite floats null, Jsonb decodes, unset oneof null.
+        use proximadb_proto::proximadb_v1::sql_value::Value as V;
+        let mk = |v: Option<V>| SqlValue { value: v };
+        // All padding branches pinned with literals (a same-function loop
+        // cannot fail).
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![0, 1, 255])))),
+            serde_json::json!("AAH/")
+        );
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![1, 2])))),
+            serde_json::json!("AQI=")
+        );
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![7])))),
+            serde_json::json!("Bw==")
+        );
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::BytesValue(vec![])))),
+            serde_json::json!("")
+        );
+
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::NumberValue(f64::NAN)))),
+            serde_json::json!(null)
+        );
+        assert_eq!(sql_value_to_json(&mk(None)), serde_json::json!(null));
+        let doc = serde_json::json!({"a": 1});
+        assert_eq!(
+            sql_value_to_json(&mk(Some(V::JsonbValue(
+                ProximaValue::to_jsonb_vec(&doc).unwrap()
+            )))),
+            doc
         );
     }
 

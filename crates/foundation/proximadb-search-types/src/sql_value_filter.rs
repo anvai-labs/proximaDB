@@ -82,7 +82,7 @@ pub fn evaluate_filter(expr: &FilterExpression, metadata: &HashMap<String, SqlVa
             // Round 12: a top-level unset oneof is the SAME wire form of null
             // as the nested one the round-11 fix handles — `a = null` must
             // match, not drop the row.
-            return Some(sql_value_to_json(sql_value));
+            return Some(sql_value_to_filter_literal(sql_value));
         }
         // Dot traversal for JSON(B) roots — mirrors `resolve_proxima_value`
         // so the SqlValue and ProximaTree paths agree for nested fields:
@@ -156,7 +156,7 @@ pub fn json_get_path<'a, 'p>(
 /// Lower a whole `SqlValue` (including its unset-oneof null wire form) to
 /// JSON. Single authority for "unset oneof == JSON null" — rounds 11/12 were
 /// each this rule drifting by depth; do not re-derive it per call site.
-fn sql_value_to_json(sql: &SqlValue) -> serde_json::Value {
+pub fn sql_value_to_filter_literal(sql: &SqlValue) -> serde_json::Value {
     match sql.value.as_ref() {
         Some(inner) => sql_val_to_json(inner),
         None => serde_json::Value::Null,
@@ -214,7 +214,7 @@ fn sql_val_to_json(value: &SqlVal) -> serde_json::Value {
 }
 
 /// Convert a `ProximaValue` leaf to a `serde_json::Value` for filter evaluation.
-pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
+pub fn proxima_value_to_filter_literal(pv: &ProximaValue) -> serde_json::Value {
     match pv {
         ProximaValue::Null => serde_json::Value::Null,
         ProximaValue::Boolean(b) => serde_json::Value::Bool(*b),
@@ -240,12 +240,12 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
         ProximaValue::Json(v) => v.clone(),
         ProximaValue::Jsonb(v) => v.clone(),
         ProximaValue::Array(items) => {
-            serde_json::Value::Array(items.iter().map(proxima_value_to_json).collect())
+            serde_json::Value::Array(items.iter().map(proxima_value_to_filter_literal).collect())
         }
         ProximaValue::Map(map) | ProximaValue::Struct(map) => {
             let obj: serde_json::Map<String, serde_json::Value> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), proxima_value_to_json(v)))
+                .map(|(k, v)| (k.clone(), proxima_value_to_filter_literal(v)))
                 .collect();
             serde_json::Value::Object(obj)
         }
@@ -255,14 +255,31 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
         }
         ProximaValue::Date(d) => serde_json::Value::Number((*d as i64).into()),
         ProximaValue::Time(t, _) => serde_json::Value::Number((*t).into()),
-        // UUID/ULID — string representation
-        ProximaValue::Uuid(b) | ProximaValue::ULID(b) => {
-            serde_json::Value::String(format!("{b:?}"))
-        }
-        // Binary — base64-ish string
-        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => {
-            serde_json::Value::String(format!("[binary:{}]", b.len()))
-        }
+        // UUID/ULID — string representation. SEAM NOTE: this dashed spelling
+        // holds on the ProximaTree seam only; when a Uuid crosses the v1
+        // `SqlValue` bridge (`proxima_to_sql_value` → BytesValue) the type is
+        // lost and the SqlValue seam renders raw bytes (int-array), so the
+        // same stored uuid needs a different literal per seam until the bridge
+        // is type-preserving (tracked in TD-PROTO-2).
+        ProximaValue::Uuid(b) => serde_json::Value::String(
+            proximadb_kernel::uuid::Uuid::from_bytes(*b).to_hyphenated_string(),
+        ),
+        ProximaValue::ULID(b) => serde_json::Value::String(proximadb_kernel::hex_lower(b)),
+        // Binary — the int-array spelling the SQL-side filter literal lowers
+        // to — the old '[binary:N]' placeholder could never equal any literal,
+        // so bytes equality filters silently matched nothing (round 5). The
+        // render allocates one serde_json::Value per byte per record on scans;
+        // an allocation-free native bytes comparison needs the resolved-field
+        // contract to carry bytes natively (tracked in TD-PROTO-2). The SAME
+        // tracked item covers bytes op-semantics: rendered as an array, bytes
+        // flow into compare_json_op's array arms, so IN/NOT-IN/CONTAINS take
+        // element-membership semantics (byte-level) that can contradict
+        // Equals — op-aware bytes routing needs the same contract change.
+        ProximaValue::Binary(b) | ProximaValue::BinaryVector(b) => serde_json::Value::Array(
+            b.iter()
+                .map(|x| serde_json::Value::Number((*x as u64).into()))
+                .collect(),
+        ),
         ProximaValue::DenseVector(v) => serde_json::Value::Array(
             v.iter()
                 .map(|f| {
@@ -272,9 +289,15 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
                 })
                 .collect(),
         ),
-        ProximaValue::SparseVector { .. } => {
-            serde_json::Value::String("[sparse_vector]".to_string())
-        }
+        // Canonical {indices, values} object — the same shape records'
+        // proxima_to_json renders (and the read path returns), so an object
+        // literal CAN match. The old "[sparse_vector]" placeholder never
+        // equaled any literal, and a string literal of the placeholder itself
+        // degenerately matched every sparse value.
+        ProximaValue::SparseVector { indices, values } => serde_json::json!({
+            "indices": indices,
+            "values": values,
+        }),
     }
 }
 
@@ -285,7 +308,7 @@ pub fn proxima_value_to_json(pv: &ProximaValue) -> serde_json::Value {
 pub fn proxima_tree_to_json_map(props: &ProximaTree) -> HashMap<String, serde_json::Value> {
     fn node_to_json(node: &ProximaTreeNode) -> serde_json::Value {
         match node {
-            ProximaTreeNode::Value(pv) => proxima_value_to_json(pv),
+            ProximaTreeNode::Value(pv) => proxima_value_to_filter_literal(pv),
             ProximaTreeNode::Object(subtree) => serde_json::Value::Object(
                 subtree
                     .iter()
@@ -312,7 +335,7 @@ pub fn proxima_tree_to_json_map(props: &ProximaTree) -> HashMap<String, serde_js
 pub fn proxima_tree_to_canonical_json_string(props: &ProximaTree) -> String {
     fn node_to_canonical_json(node: &ProximaTreeNode) -> serde_json::Value {
         match node {
-            ProximaTreeNode::Value(pv) => proxima_value_to_json(pv),
+            ProximaTreeNode::Value(pv) => proxima_value_to_filter_literal(pv),
             ProximaTreeNode::Object(subtree) => {
                 let mut entries: Vec<(String, serde_json::Value)> = subtree
                     .iter()
@@ -633,13 +656,14 @@ where
 /// Evaluate a filter expression against a `ProximaTree` (canonical v2 path).
 ///
 /// Thin adapter over [`evaluate_filter_resolved`]: each field resolves to its
-/// scalar leaf lowered via [`proxima_value_to_json`]. Dot-separated fields walk
+/// scalar leaf lowered via [`proxima_value_to_filter_literal`]. Dot-separated fields walk
 /// both native [`ProximaTreeNode::Object`] values and JSON/JSONB scalar values,
 /// matching PostgreSQL's `payload->>'key'` semantics without flattening stored
 /// documents into a second metadata representation.
 pub fn evaluate_filter_proxima(expr: &FilterExpression, props: &ProximaTree) -> bool {
     evaluate_filter_resolved(expr, &|field| {
-        resolve_proxima_value(props, field).map(|value| proxima_value_to_json(value.as_ref()))
+        resolve_proxima_value(props, field)
+            .map(|value| proxima_value_to_filter_literal(value.as_ref()))
     })
 }
 
@@ -676,7 +700,8 @@ fn resolve_proxima_value<'a>(props: &'a ProximaTree, field: &str) -> Option<Cow<
 ///   Absence is handled exactly as the default walker handles it.
 pub fn evaluate_filter_proxima_type_strict(expr: &FilterExpression, props: &ProximaTree) -> bool {
     evaluate_filter_resolved_type_strict(expr, &|field| {
-        resolve_proxima_value(props, field).map(|value| proxima_value_to_json(value.as_ref()))
+        resolve_proxima_value(props, field)
+            .map(|value| proxima_value_to_filter_literal(value.as_ref()))
     })
 }
 
@@ -731,11 +756,11 @@ fn compare_proxima_op(
         Equals | NotEquals | LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => {
             match native_scalar_order(pv, literal) {
                 Some(ord) => apply_op(op, ord),
-                None => compare_json_op(op, &proxima_value_to_json(pv), literal),
+                None => compare_json_op(op, &proxima_value_to_filter_literal(pv), literal),
             }
         }
         // Operators that don't reduce to a single ordering always use the JSON path.
-        _ => compare_json_op(op, &proxima_value_to_json(pv), literal),
+        _ => compare_json_op(op, &proxima_value_to_filter_literal(pv), literal),
     }
 }
 
@@ -862,6 +887,64 @@ mod tests {
 
     fn make_sql_value(value: SqlVal) -> SqlValue {
         SqlValue { value: Some(value) }
+    }
+
+    #[test]
+    fn exotic_filter_literals_render_matchably() {
+        // Pins the literal spellings the ProximaTree seam renders for typed
+        // exotics: bytes as the int-array, Uuid dashed, ULID plain hex,
+        // sparse as the canonical {indices, values} object. Each previously
+        // rendered a placeholder or Rust Debug string no literal could ever
+        // match (TD-PROTO-2 rounds 5-9).
+        let mut props: ProximaTree = HashMap::new();
+        props.insert(
+            "blob".to_string(),
+            ProximaTreeNode::Value(ProximaValue::Binary(vec![0x00, 0x01, 0x02])),
+        );
+        props.insert(
+            "correlation_id".to_string(),
+            ProximaTreeNode::Value(ProximaValue::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65, 0x54, 0x40,
+                0x00, 0x00,
+            ])),
+        );
+        props.insert(
+            "trace_id".to_string(),
+            ProximaTreeNode::Value(ProximaValue::ULID([
+                0x01, 0xab, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00,
+            ])),
+        );
+        props.insert(
+            "embedding_sparse".to_string(),
+            ProximaTreeNode::Value(ProximaValue::SparseVector {
+                indices: vec![1, 3],
+                values: vec![0.5, 2.5],
+            }),
+        );
+
+        let eval = |field: &str, value: serde_json::Value| {
+            evaluate_filter_proxima(
+                &FilterExpression::Comparison {
+                    field: field.to_string(),
+                    operator: ComparisonOperator::Equals,
+                    value,
+                },
+                &props,
+            )
+        };
+
+        assert!(eval("blob", json!([0, 1, 2])));
+        assert!(!eval("blob", json!("AAEC"))); // base64 is the RENDERING spelling, not the filter's
+        assert!(eval(
+            "correlation_id",
+            json!("550e8400-e29b-41d4-a716-446554400000")
+        ));
+        assert!(eval("trace_id", json!("01ab0000000000000000000000000000")));
+        assert!(eval(
+            "embedding_sparse",
+            json!({"indices": [1, 3], "values": [0.5, 2.5]})
+        ));
     }
 
     #[test]
@@ -1579,7 +1662,8 @@ mod tests {
                 if native_scalar_order(pv, lit).is_some() {
                     for op in &ops {
                         let native = compare_proxima_op(pv, op, lit);
-                        let json_path = compare_json_op(op, &proxima_value_to_json(pv), lit);
+                        let json_path =
+                            compare_json_op(op, &proxima_value_to_filter_literal(pv), lit);
                         assert_eq!(
                             native, json_path,
                             "parity break: pv={pv:?} lit={lit} op={op:?}"
@@ -1609,7 +1693,7 @@ mod tests {
             let op = ComparisonOperator::Equals;
             assert_eq!(
                 compare_proxima_op(&pv, &op, &lit),
-                compare_json_op(&op, &proxima_value_to_json(&pv), &lit),
+                compare_json_op(&op, &proxima_value_to_filter_literal(&pv), &lit),
                 "fallback parity: {pv:?} vs {lit}"
             );
         }

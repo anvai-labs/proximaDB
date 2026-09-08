@@ -303,36 +303,11 @@ pub mod protocol_conversions {
         let conditions: Result<Vec<FilterExpression>, String> = filters
             .iter()
             .map(|(field, sql_value)| {
-                let value = match &sql_value.value {
-                    Some(crate::proto::proximadb_v1::sql_value::Value::StringValue(s)) => {
-                        serde_json::Value::String(s.clone())
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(n)) => {
-                        serde_json::json!(n)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::BoolValue(b)) => {
-                        serde_json::Value::Bool(*b)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(i)) => {
-                        serde_json::json!(*i)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(bytes)) => {
-                        serde_json::Value::String(format!("BYTES({} bytes)", bytes.len()))
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::JsonbValue(bytes)) => {
-                        proximadb_data_model::ProximaValue::jsonb_to_json_lossy(bytes)
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(_)) => {
-                        serde_json::Value::Null
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::ArrayValue(_)) => {
-                        serde_json::Value::Array(vec![]) // Simplified for now
-                    }
-                    Some(crate::proto::proximadb_v1::sql_value::Value::ObjectValue(_)) => {
-                        serde_json::Value::Object(serde_json::Map::new()) // Simplified for now
-                    }
-                    None => serde_json::Value::Null,
-                };
+                // The canonical FILTER LOWERING via the one unset-oneof
+                // wrapper (the rule is not re-derived here).
+                let value = proximadb_search_types::sql_value_filter::sql_value_to_filter_literal(
+                    sql_value,
+                );
 
                 Ok(FilterExpression::Comparison {
                     field: field.clone(),

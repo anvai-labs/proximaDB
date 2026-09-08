@@ -82,6 +82,7 @@ use crate::query::federated::{
     FederatedParser, FederatedQueryContext, QueryType as FederatedQueryType,
 };
 use crate::query::multimodal::plan::PlanContext;
+use crate::query::prepared::statement::escape_sql_text;
 use crate::query::prepared::{ParameterValue, PreparedStatementCache, PreparedStatementConfig};
 use crate::query::unified::executor::ParallelExecutor;
 use crate::query::unified::{
@@ -407,7 +408,6 @@ pub struct ComponentPlanResponse {
     pub parallelizable: bool,
 }
 
-/// Create router for unified query endpoints
 pub fn create_router() -> Router<UnifiedQueryApiState> {
     Router::new()
         .route("/execute", post(execute_query))
@@ -502,10 +502,6 @@ async fn execute_query_via_adapter(
     Ok(JsonResponse(response))
 }
 
-/// Transform QueryResult from facade to QueryResultResponse for REST API
-///
-/// This function handles backward-compatible conversion from the unified
-/// QueryResult type to the REST API response format.
 fn transform_query_result_to_response(
     result: crate::query::facade::QueryResult,
     elapsed_ms: f64,
@@ -673,31 +669,6 @@ async fn execute_multi_model_via_adapter(
 ///
 /// Generates SQL with multi-model extensions (VECTOR_SEARCH, GRAPH_QUERY, etc.)
 /// that can be executed through the federated query engine.
-fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
-    let graph = graph.trim();
-    let cypher = cypher.trim().trim_end_matches(';').trim();
-
-    if graph.is_empty() || graph == "default" {
-        return cypher.to_string();
-    }
-
-    let upper = cypher.to_uppercase();
-    if upper.contains(" FROM ") {
-        return cypher.to_string();
-    }
-
-    let insertion_index = [" WHERE ", " RETURN ", " ORDER BY ", " LIMIT ", " SKIP "]
-        .iter()
-        .filter_map(|needle| upper.find(needle))
-        .min();
-
-    if let Some(index) = insertion_index {
-        format!("{} FROM {}{}", &cypher[..index], graph, &cypher[index..])
-    } else {
-        format!("{} FROM {}", cypher, graph)
-    }
-}
-
 fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<String> {
     let mut sql_parts = Vec::new();
 
@@ -707,65 +678,146 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 let collection = component
                     .config
                     .get("collection")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
-                let query_vector = component
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "vector component config.collection must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "vector component config.collection is required".to_string(),
+                        )
+                    })?;
+                let query_values = component
                     .config
                     .get("query_vector")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_f64())
-                            .map(|f| f.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .unwrap_or_default();
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "vector component config.query_vector is required".to_string(),
+                        )
+                    })?
+                    .as_array()
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "vector component config.query_vector must be an array".to_string(),
+                        )
+                    })?;
+                if query_values.is_empty() {
+                    return Err(ApiError::InvalidArgument(
+                        "vector component config.query_vector must be non-empty".to_string(),
+                    ));
+                }
+                // Validate then render through the ONE vector-text home
+                // (f64 Display would splice a different literal than the
+                // port path for values outside exact f32 range).
+                let query_vector = {
+                    let f32_vec: ApiResult<Vec<f32>> = query_values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            let number = value.as_f64().ok_or_else(|| {
+                                ApiError::InvalidArgument(format!(
+                                    "vector component config.query_vector[{index}] must be numeric"
+                                ))
+                            })?;
+                            let f = crate::core::utils::finite_f32(number)
+                            .ok_or_else(|| {
+                                ApiError::InvalidArgument(format!(
+                                    "vector component config.query_vector[{index}] must be a finite f32"
+                                ))
+                            })?;
+                            Ok(f)
+                        })
+                        .collect();
+                    crate::query::prepared::statement::vector_literal_text(&f32_vec?)
+                };
+                // Typed: a string top_k silently baked the default (the
+                // silent-default class rounds 19-20 fixed for siblings).
                 let top_k = component
                     .config
                     .get("top_k")
-                    .and_then(|v| v.as_u64())
+                    .map(|v| {
+                        v.as_u64().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "vector component config.top_k must be a non-negative integer"
+                                    .to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or(10);
 
                 format!(
-                    "SELECT * FROM VECTOR_SEARCH('{}', '[{}]', {})",
-                    collection, query_vector, top_k
+                    "SELECT * FROM VECTOR_SEARCH('{}', '{}', {})",
+                    escape_sql_text(collection),
+                    query_vector,
+                    top_k
                 )
             }
             "document" => {
+                // Fail-closed (the PR's direction for silent defaults —
+                // and the strict twin's test): the collection is REQUIRED.
                 let collection = component
                     .config
                     .get("collection")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "document component config.collection must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "document component config.collection is required".to_string(),
+                        )
+                    })?;
                 let filter = component
                     .config
                     .get("filter")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("true");
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "document component config.filter must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    // '1=1' — the executor's match-all whitelist; 'true'
+                    // hard-errored as an unsupported filter clause.
+                    .unwrap_or("1=1");
 
                 format!(
                     "SELECT * FROM DOCUMENT_QUERY('{}', '{}')",
-                    collection, filter
+                    escape_sql_text(collection),
+                    escape_sql_text(filter)
                 )
             }
             "graph" => {
                 let graph = component
                     .config
                     .get("graph")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "graph component config.graph must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("default");
                 let cypher = component
                     .config
                     .get("cypher")
                     .and_then(|v| v.as_str())
                     .unwrap_or("MATCH (n) RETURN n");
-                let cypher = inject_graph_target_into_cypher(graph, cypher);
+                let cypher = crate::core::utils::inject_graph_target_into_cypher(graph, cypher);
 
-                format!(
-                    "SELECT * FROM GRAPH_QUERY('{}')",
-                    cypher.replace('\'', "''")
-                )
+                format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(&cypher))
             }
             "log" => {
                 let namespace = component
@@ -774,7 +826,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
 
-                format!("SELECT * FROM LOGS('{}')", namespace)
+                format!("SELECT * FROM LOGS('{}')", escape_sql_text(namespace))
             }
             "metric" => {
                 let namespace = component
@@ -783,7 +835,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
 
-                format!("SELECT * FROM METRICS('{}')", namespace)
+                format!("SELECT * FROM METRICS('{}')", escape_sql_text(namespace))
             }
             unknown => {
                 return Err(ApiError::InvalidArgument(format!(
@@ -909,45 +961,13 @@ async fn explain_storage_authorities(
 fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
 
-    for function_name in ["VECTOR_SEARCH", "DOCUMENT_QUERY", "LOGS", "METRICS"] {
-        collect_quoted_first_args(sql, function_name, &mut targets);
+    for function in crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS {
+        crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
     }
 
     collect_from_targets(sql, &mut targets);
     targets.dedup();
     targets
-}
-
-fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
-    let upper = sql.to_uppercase();
-    let mut search_start = 0;
-
-    while let Some(relative_pos) = upper[search_start..].find(function_name) {
-        let name_start = search_start + relative_pos;
-        let after_name = name_start + function_name.len();
-        let Some(open_relative) = sql[after_name..].find('(') else {
-            break;
-        };
-        let mut arg_start = after_name + open_relative + 1;
-        while let Some(ch) = sql[arg_start..].chars().next() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            arg_start += ch.len_utf8();
-        }
-        if sql[arg_start..].starts_with('\'') {
-            let value_start = arg_start + 1;
-            if let Some(close_relative) = sql[value_start..].find('\'') {
-                let value = sql[value_start..value_start + close_relative].trim();
-                if !value.is_empty() {
-                    push_unique_target(targets, value);
-                }
-                search_start = value_start + close_relative + 1;
-                continue;
-            }
-        }
-        search_start = after_name;
-    }
 }
 
 fn collect_from_targets(sql: &str, targets: &mut Vec<String>) {
@@ -1190,7 +1210,6 @@ fn extract_value_from_array(array: &dyn arrow::array::Array, row_idx: usize) -> 
     }
 }
 
-/// Detect the source model from the schema
 fn detect_source_model(schema: &arrow::datatypes::Schema) -> String {
     let field_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
@@ -1875,7 +1894,6 @@ async fn get_prepared_stats(
     }))
 }
 
-/// Convert a JSON value to a ParameterValue
 fn json_to_parameter_value(v: &serde_json::Value) -> ParameterValue {
     match v {
         serde_json::Value::String(s) => ParameterValue::String(s.clone()),
@@ -1891,14 +1909,24 @@ fn json_to_parameter_value(v: &serde_json::Value) -> ParameterValue {
         serde_json::Value::Bool(b) => ParameterValue::Bool(*b),
         serde_json::Value::Null => ParameterValue::Null,
         serde_json::Value::Array(arr) => {
-            // Try to parse as vector of f32
+            // Try to parse as a vector of FINITE f32 (the ONE narrowing
+            // guard — f32 overflow would dispatch inf to the kernels).
+            // KNOWN GAP (tracked): a numeric-but-f32-overflowing element
+            // falls through to the Json arm below (quoted text, silently
+            // accepted) — fixing needs an error channel on this fn.
             let floats: Vec<f32> = arr
                 .iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .filter_map(|v| v.as_f64().and_then(crate::core::utils::finite_f32))
                 .collect();
             if floats.len() == arr.len() {
                 ParameterValue::Vector(floats)
             } else {
+                // KNOWN GAP (tracked): a NUMERIC-but-f32-overflowing
+                // element falls through to the Json arm (quoted text —
+                // silently accepted; the prepared non-finite guard never
+                // sees it). Fixing needs an error channel on this
+                // converter — folds into the tracked json_to_parameter_value
+                // twins item.
                 ParameterValue::Json(v.clone())
             }
         }
@@ -2244,10 +2272,98 @@ mod tests {
     }
 
     #[test]
+    fn multi_model_sql_conversion_rejects_malformed_vectors() {
+        let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+            "components": [{
+                "component_type": "vector",
+                "config": {
+                    "collection": "vectors",
+                    "query_vector": [0.1, "bad", 0.3]
+                }
+            }]
+        }))
+        .expect("request should parse");
+
+        let error = convert_multi_model_to_sql(&request)
+            .expect_err("nonnumeric vector elements must fail closed");
+        assert!(matches!(error, ApiError::InvalidArgument(_)));
+        assert!(error.to_string().contains("query_vector[1]"));
+    }
+
+    #[test]
+    fn document_component_requires_collection() {
+        let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+            "components": [{
+                "component_type": "document",
+                "config": {"filter": "active = true"}
+            }]
+        }))
+        .expect("request should parse");
+
+        let error =
+            convert_multi_model_to_sql(&request).expect_err("document collection must be explicit");
+        assert!(
+            error
+                .to_string()
+                .contains("document component config.collection is required")
+        );
+    }
+
+    #[test]
+    fn document_component_without_filter_uses_executable_match_all() {
+        let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+            "components": [{
+                "component_type": "document",
+                "config": {"collection": "docs"}
+            }]
+        }))
+        .expect("request should parse");
+
+        let sql = convert_multi_model_to_sql(&request).expect("match-all query should lower");
+        assert!(sql.contains("DOCUMENT_QUERY('docs', '1=1')"));
+    }
+
+    #[test]
+    fn multi_model_sql_conversion_escapes_all_text_arguments() {
+        let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+            "components": [
+                {
+                    "component_type": "vector",
+                    "config": {"collection": "team's-vectors", "query_vector": [0.1]}
+                },
+                {
+                    "component_type": "document",
+                    "config": {"collection": "team's-docs", "filter": "owner = \"O'Brien\""}
+                },
+                {
+                    "component_type": "graph",
+                    "config": {"cypher": "MATCH (n) RETURN 'label'"}
+                },
+                {
+                    "component_type": "log",
+                    "config": {"namespace": "team's-production"}
+                },
+                {
+                    "component_type": "metric",
+                    "config": {"namespace": "team's-metrics"}
+                }
+            ]
+        }))
+        .expect("request should parse");
+
+        let sql = convert_multi_model_to_sql(&request).expect("conversion should succeed");
+        assert!(sql.contains("VECTOR_SEARCH('team''s-vectors'"));
+        assert!(sql.contains("DOCUMENT_QUERY('team''s-docs', 'owner = \"O''Brien\"')"));
+        assert!(sql.contains("GRAPH_QUERY('MATCH (n) RETURN ''label''')"));
+        assert!(sql.contains("LOGS('team''s-production')"));
+        assert!(sql.contains("METRICS('team''s-metrics')"));
+    }
+
+    #[test]
     fn test_inject_graph_target_into_cypher_does_not_duplicate_from_clause() {
         let cypher = "MATCH (n:Person) FROM social RETURN n.name";
         assert_eq!(
-            inject_graph_target_into_cypher("other", cypher),
+            crate::core::utils::inject_graph_target_into_cypher("other", cypher),
             cypher.to_string()
         );
     }
@@ -2316,5 +2432,33 @@ mod tests {
                 "events".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn explain_target_scanner_preserves_quoted_delimiters_and_skips_binds() {
+        let mut targets = Vec::new();
+        crate::core::utils::collect_quoted_first_args(
+            r#"VECTOR_SEARCH("tenant,west", '[0.5]', 5)"#,
+            "VECTOR_SEARCH",
+            &mut targets,
+        );
+        crate::core::utils::collect_quoted_first_args(
+            r#"DOCUMENT_QUERY("team""docs", '$.kind = article')"#,
+            "DOCUMENT_QUERY",
+            &mut targets,
+        );
+        crate::core::utils::collect_quoted_first_args("LOGS(unquoted_logs)", "LOGS", &mut targets);
+        crate::core::utils::collect_quoted_first_args("METRICS($1)", "METRICS", &mut targets);
+
+        assert_eq!(targets, ["tenant,west", "team\"docs", "unquoted_logs"]);
+    }
+
+    #[test]
+    fn explain_catalog_targets_include_traces_and_rerank() {
+        let targets = explain_catalog_targets(
+            "SELECT * FROM TRACES('ops') UNION ALL SELECT * FROM RERANK('docs', 'q', '[0.5]', 5)",
+        );
+        assert!(targets.contains(&"ops".to_string()));
+        assert!(targets.contains(&"docs".to_string()));
     }
 }

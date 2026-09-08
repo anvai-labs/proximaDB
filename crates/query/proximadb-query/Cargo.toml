@@ -26,6 +26,7 @@ serde_json.workspace = true
 tracing = "0.1"
 tokio = { version = "1.37", features = ["rt", "sync", "macros"] }
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
+proximadb-records = { path = "../../foundation/proximadb-records" }
 proximadb-search-types = { path = "../../foundation/proximadb-search-types" }
 proximadb-document-query = { path = "../proximadb-document-query" }
 proximadb-filter-expression = { path = "../../foundation/proximadb-filter-expression" }

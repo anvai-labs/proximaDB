@@ -90,50 +90,6 @@ fn json_to_sql_value(value: &serde_json::Value) -> crate::proto::proximadb_v1::S
 }
 
 #[cfg(test)]
-/// Convert SqlValue back to JSON for legacy conversion tests.
-fn sql_value_to_json(
-    value: &crate::proto::proximadb_v1::SqlValue,
-) -> Result<serde_json::Value, ApiError> {
-    use crate::proto::proximadb_v1::sql_value::Value;
-
-    Ok(match value.value.as_ref() {
-        Some(Value::NullValue(_)) => serde_json::Value::Null,
-        Some(Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Value::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-        Some(Value::NumberValue(f)) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| {
-                ApiError::Internal(format!(
-                    "Failed to convert f64 to serde_json::Number: {}",
-                    f
-                ))
-            })?,
-        Some(Value::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(Value::BytesValue(b)) => serde_json::Value::Array(
-            b.iter()
-                .map(|x| serde_json::Value::Number((*x as u64).into()))
-                .collect(),
-        ),
-        Some(Value::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
-        Some(Value::ArrayValue(arr)) => serde_json::Value::Array(
-            arr.values
-                .iter()
-                .map(sql_value_to_json)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Some(Value::ObjectValue(obj)) => {
-            let map: serde_json::Map<String, serde_json::Value> = obj
-                .fields
-                .iter()
-                .map(|(k, v)| Ok((k.clone(), sql_value_to_json(v)?)))
-                .collect::<Result<_, ApiError>>()?;
-            serde_json::Value::Object(map)
-        }
-        None => serde_json::Value::Null,
-    })
-}
-
-#[cfg(test)]
 /// Convert a JSON value to a FilterClause value.
 fn json_to_filter_clause_value(
     value: &serde_json::Value,
@@ -2638,6 +2594,35 @@ mod tests {
     }
 
     #[test]
+    fn v2_read_spelling_is_pinned_to_the_write_form() {
+        // v2 intra-version symmetry: the read rendering must spell binary as
+        // the per-byte int-array (the ONLY form the typed write path parses)
+        // and uuid DASHED. sql.rs's v2_row_render pins the SQL side; this
+        // pins the records side — the two must not drift apart silently.
+        let RestProximaValue::Typed { type_name, value } =
+            proxima_value_to_rest_value(&ProximaValue::Binary(vec![0, 1, 2]))
+        else {
+            panic!("binary renders typed");
+        };
+        assert_eq!(type_name, "binary");
+        assert_eq!(value, serde_json::json!([0, 1, 2]));
+
+        let RestProximaValue::Typed { type_name, value } =
+            proxima_value_to_rest_value(&ProximaValue::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65, 0x54, 0x40,
+                0x00, 0x00,
+            ]))
+        else {
+            panic!("uuid renders typed");
+        };
+        assert_eq!(type_name, "uuid");
+        assert_eq!(
+            value,
+            serde_json::json!("550e8400-e29b-41d4-a716-446554400000")
+        );
+    }
+
+    #[test]
     fn parse_metadata_filter_object_form_is_equality_and() {
         use crate::core::search::{ComparisonOperator, FilterExpression};
 
@@ -3405,168 +3390,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Tests for sql_value_to_json (the v2 records version)
-    // =========================================================================
-
-    #[test]
-    fn test_sql_value_to_json_null() {
-        use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
-        let sv = SqlValue {
-            value: Some(Value::NullValue(0)),
-        };
-        let result = sql_value_to_json(&sv).expect("Should convert null");
-        assert!(result.is_null());
-    }
-
-    #[test]
-    fn test_sql_value_to_json_bool() {
-        use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
-        let sv = SqlValue {
-            value: Some(Value::BoolValue(true)),
-        };
-        let result = sql_value_to_json(&sv).expect("Should convert bool");
-        assert_eq!(result, serde_json::json!(true));
-    }
-
-    #[test]
-    fn test_sql_value_to_json_int64() {
-        use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
-        let sv = SqlValue {
-            value: Some(Value::Int64Value(999)),
-        };
-        let result = sql_value_to_json(&sv).expect("Should convert int64");
-        assert_eq!(result, serde_json::json!(999));
-    }
-
-    #[test]
-    fn test_sql_value_to_json_number() {
-        use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
-        let sv = SqlValue {
-            value: Some(Value::NumberValue(2.5)),
-        };
-        let result = sql_value_to_json(&sv).expect("Should convert number");
-        assert!((result.as_f64().expect("Should be f64") - 2.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_sql_value_to_json_string() {
-        use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
-        let sv = SqlValue {
-            value: Some(Value::StringValue("test_str".to_string())),
-        };
-        let result = sql_value_to_json(&sv).expect("Should convert string");
-        assert_eq!(result, serde_json::json!("test_str"));
-    }
-
-    #[test]
-    fn test_sql_value_to_json_bytes() {
-        use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
-        let sv = SqlValue {
-            value: Some(Value::BytesValue(vec![0, 1, 255])),
-        };
-        let result = sql_value_to_json(&sv).expect("Should convert bytes");
-        assert_eq!(result, serde_json::json!([0, 1, 255]));
-    }
-
-    #[test]
-    fn test_sql_value_to_json_array() {
-        use crate::proto::proximadb_v1::{SqlArray, SqlValue, sql_value::Value};
-        let sv = SqlValue {
-            value: Some(Value::ArrayValue(SqlArray {
-                values: vec![
-                    SqlValue {
-                        value: Some(Value::Int64Value(1)),
-                    },
-                    SqlValue {
-                        value: Some(Value::Int64Value(2)),
-                    },
-                ],
-            })),
-        };
-        let result = sql_value_to_json(&sv).expect("Should convert array");
-        assert_eq!(result, serde_json::json!([1, 2]));
-    }
-
-    #[test]
-    fn test_sql_value_to_json_object() {
-        use crate::proto::proximadb_v1::{SqlObject, SqlValue, sql_value::Value};
-        let mut fields = HashMap::new();
-        fields.insert(
-            "name".to_string(),
-            SqlValue {
-                value: Some(Value::StringValue("alice".to_string())),
-            },
-        );
-        let sv = SqlValue {
-            value: Some(Value::ObjectValue(SqlObject { fields })),
-        };
-        let result = sql_value_to_json(&sv).expect("Should convert object");
-        assert_eq!(result["name"], serde_json::json!("alice"));
-    }
-
-    #[test]
-    fn test_sql_value_to_json_none_value() {
-        use crate::proto::proximadb_v1::SqlValue;
-        let sv = SqlValue { value: None };
-        let result = sql_value_to_json(&sv).expect("Should convert None to null");
-        assert!(result.is_null());
-    }
-
-    #[test]
-    fn test_sql_value_to_json_nan_returns_error() {
-        use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
-        let sv = SqlValue {
-            value: Some(Value::NumberValue(f64::NAN)),
-        };
-        let result = sql_value_to_json(&sv);
-        assert!(result.is_err());
-    }
-
-    // =========================================================================
-    // Tests for json_to_sql_value -> sql_value_to_json roundtrip
-    // =========================================================================
-
-    #[test]
-    fn test_json_sql_value_roundtrip_string() {
-        let original = serde_json::json!("roundtrip_test");
-        let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
-        assert_eq!(original, result);
-    }
-
-    #[test]
-    fn test_json_sql_value_roundtrip_integer() {
-        let original = serde_json::json!(42);
-        let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
-        assert_eq!(original, result);
-    }
-
-    #[test]
-    fn test_json_sql_value_roundtrip_bool() {
-        let original = serde_json::json!(true);
-        let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
-        assert_eq!(original, result);
-    }
-
-    #[test]
-    fn test_json_sql_value_roundtrip_null() {
-        let original = serde_json::json!(null);
-        let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
-        assert_eq!(original, result);
-    }
-
-    #[test]
-    fn test_json_sql_value_roundtrip_nested_object() {
-        let original = serde_json::json!({"a": 1, "b": "two", "c": [true, null]});
-        let sql_val = json_to_sql_value(&original);
-        let result = sql_value_to_json(&sql_val).expect("Roundtrip should succeed");
-        assert_eq!(original, result);
-    }
-
-    // =========================================================================
     // Tests for unsupported filter operators
     // =========================================================================
 
@@ -3617,133 +3440,6 @@ mod tests {
         let clauses =
             convert_typed_filters_to_clauses(&filters).expect("Empty filters should succeed");
         assert!(clauses.is_empty());
-    }
-
-    // ============================================================
-    // json_to_sql_value / sql_value_to_json conversion tests
-    // ============================================================
-
-    #[test]
-    fn test_json_to_sql_null() {
-        let sv = json_to_sql_value(&serde_json::Value::Null);
-        assert!(matches!(
-            sv.value,
-            Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(_))
-        ));
-    }
-
-    #[test]
-    fn test_json_to_sql_bool() {
-        let sv = json_to_sql_value(&serde_json::json!(true));
-        assert!(matches!(
-            sv.value,
-            Some(crate::proto::proximadb_v1::sql_value::Value::BoolValue(
-                true
-            ))
-        ));
-    }
-
-    #[test]
-    fn test_json_to_sql_integer() {
-        let sv = json_to_sql_value(&serde_json::json!(42));
-        assert!(matches!(
-            sv.value,
-            Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(42))
-        ));
-    }
-
-    #[test]
-    fn test_json_to_sql_float() {
-        let sv = json_to_sql_value(&serde_json::json!(3.5));
-        if let Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(f)) = sv.value {
-            assert!((f - 3.5).abs() < 1e-10);
-        } else {
-            panic!("Expected NumberValue");
-        }
-    }
-
-    #[test]
-    fn test_json_to_sql_string() {
-        let sv = json_to_sql_value(&serde_json::json!("hello"));
-        assert!(matches!(
-            sv.value,
-            Some(crate::proto::proximadb_v1::sql_value::Value::StringValue(_))
-        ));
-    }
-
-    #[test]
-    fn test_json_to_sql_array() {
-        let sv = json_to_sql_value(&serde_json::json!([1, 2, 3]));
-        if let Some(crate::proto::proximadb_v1::sql_value::Value::ArrayValue(arr)) = sv.value {
-            assert_eq!(arr.values.len(), 3);
-        } else {
-            panic!("Expected ArrayValue");
-        }
-    }
-
-    #[test]
-    fn test_json_to_sql_object() {
-        let sv = json_to_sql_value(&serde_json::json!({"key": "val"}));
-        if let Some(crate::proto::proximadb_v1::sql_value::Value::ObjectValue(obj)) = sv.value {
-            assert!(obj.fields.contains_key("key"));
-        } else {
-            panic!("Expected ObjectValue");
-        }
-    }
-
-    #[test]
-    fn test_sql_to_json_roundtrip_null() {
-        let sv = json_to_sql_value(&serde_json::Value::Null);
-        let json = sql_value_to_json(&sv).unwrap();
-        assert!(json.is_null());
-    }
-
-    #[test]
-    fn test_sql_to_json_roundtrip_bool() {
-        let original = serde_json::json!(false);
-        let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
-        assert_eq!(json, original);
-    }
-
-    #[test]
-    fn test_sql_to_json_roundtrip_integer() {
-        let original = serde_json::json!(12345);
-        let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
-        assert_eq!(json, original);
-    }
-
-    #[test]
-    fn test_sql_to_json_roundtrip_string() {
-        let original = serde_json::json!("test_value");
-        let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
-        assert_eq!(json, original);
-    }
-
-    #[test]
-    fn test_sql_to_json_roundtrip_array() {
-        let original = serde_json::json!(["a", "b", "c"]);
-        let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
-        assert_eq!(json, original);
-    }
-
-    #[test]
-    fn test_sql_to_json_roundtrip_nested_object() {
-        let original = serde_json::json!({"nested": {"deep": true}});
-        let sv = json_to_sql_value(&original);
-        let json = sql_value_to_json(&sv).unwrap();
-        assert_eq!(json, original);
-    }
-
-    #[test]
-    fn test_sql_to_json_none_value() {
-        use crate::proto::proximadb_v1::SqlValue;
-        let sv = SqlValue { value: None };
-        let json = sql_value_to_json(&sv).unwrap();
-        assert!(json.is_null());
     }
 
     // ============================================================

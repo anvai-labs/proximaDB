@@ -194,12 +194,7 @@ impl VectorExtractor for HelixExtractor {
                     let json_map: serde_json::Map<String, serde_json::Value> = record
                         .metadata
                         .into_iter()
-                        .map(|(k, v)| {
-                            (
-                                k,
-                                crate::storage::formats::arrow_conversion::sql_value_to_json(&v),
-                            )
-                        })
+                        .map(|(k, v)| (k, proximadb_records::conversions::sql_value_to_json(&v)))
                         .collect();
                     // (Non-empty by the outer guard; the converter always
                     // yields a value per key — the old filter_map could drop.)

@@ -24,6 +24,7 @@ use super::session::{Session, SessionManager};
 use super::translator::QueryTranslator;
 use super::types::{FieldDescription, PgType};
 use crate::catalog::CatalogManager;
+use crate::core::utils::find_ascii_ci;
 use crate::graph::GraphService;
 use crate::network::arrow_ipc::ArrowProtoCodec;
 use crate::observability::ObservabilityService;
@@ -42,11 +43,7 @@ use crate::storage::document::DocumentService;
 use proximadb_data_model::ProximaType;
 use proximadb_data_model::ProximaValue;
 
-fn sql_value_to_json(value: &crate::proto::proximadb_v1::SqlValue) -> serde_json::Value {
-    // Round 7: delegate to the shared converter — this local copy duplicated
-    // it arm-for-arm (the family the consolidation follow-up collapses).
-    crate::storage::formats::arrow_conversion::sql_value_to_json(value)
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 fn sql_object_to_json(obj: &crate::proto::proximadb_v1::SqlObject) -> String {
     let value = serde_json::Value::Object(
@@ -1372,14 +1369,19 @@ impl PostgresProtocol {
             .unwrap_or(rest)
             .trim_start();
 
-        let (name, value) = if let Some(eq_index) = rest.find('=') {
-            (&rest[..eq_index], &rest[eq_index + 1..])
-        } else {
-            let upper = rest.to_ascii_uppercase();
-            let Some(to_index) = upper.find(" TO ") else {
+        // Both separators found OUTSIDE quotes (a quoted name may contain
+        // ' TO '; a quoted value may contain '='), then split at whichever
+        // comes first — mis-splitting garbles the name and silently skips
+        // the tenant assertion gate below.
+        let eq_pos = crate::core::utils::find_ascii_ci_outside_quotes(rest, "=");
+        let to_pos = crate::core::utils::find_ascii_ci_outside_quotes(rest, " TO ");
+        let (name, value) = match (eq_pos, to_pos) {
+            (Some(eq), Some(to)) if eq < to => (&rest[..eq], &rest[eq + 1..]),
+            (_, Some(to)) => (&rest[..to], &rest[to + " TO ".len()..]),
+            (Some(eq), None) => (&rest[..eq], &rest[eq + 1..]),
+            (None, None) => {
                 return Err(anyhow!("expected SET name = value or SET name TO value"));
-            };
-            (&rest[..to_index], &rest[to_index + " TO ".len()..])
+            }
         };
 
         let name = name.trim().trim_matches('"').to_ascii_lowercase();
@@ -1391,11 +1393,9 @@ impl PostgresProtocol {
     }
 
     fn strip_set_value_literal(value: &str) -> String {
-        let value = value.trim().trim_end_matches(';').trim();
-        if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-            return value[1..value.len() - 1].replace("''", "'");
-        }
-        value.trim_matches('"').to_string()
+        // Same rule as strip_sql_literal (the two byte-identical twins
+        // merged — one decode policy for pgwire literals).
+        Self::strip_sql_literal(value)
     }
 
     /// Execute a translated query
@@ -1764,8 +1764,7 @@ impl PostgresProtocol {
     }
 
     fn extract_create_table_name(&self, query: &str) -> Option<String> {
-        let upper = query.to_ascii_uppercase();
-        let table_pos = upper.find("CREATE TABLE")?;
+        let table_pos = find_ascii_ci(query, "CREATE TABLE")?;
         let after_table = query[table_pos + "CREATE TABLE".len()..].trim_start();
         let after_table = after_table
             .strip_prefix("IF NOT EXISTS")
@@ -2362,8 +2361,7 @@ impl PostgresProtocol {
         // `ns.table` for cross-namespace routing (dropping the qualifier, as
         // `clean_identifier` does for column refs, broke
         // `pgwire_enforces_cross_namespace_fk_referential_actions`).
-        let upper = query.to_ascii_uppercase();
-        let from_pos = upper.find("FROM ")?;
+        let from_pos = find_ascii_ci(query, "FROM ")?;
         let after_from = &query[from_pos + 5..];
         let table_end = after_from
             .find(|c: char| c.is_whitespace() || c == ';')
@@ -2391,8 +2389,7 @@ impl PostgresProtocol {
 
     /// Extract LIMIT value from query
     fn extract_limit(&self, query: &str) -> Option<usize> {
-        let upper = query.to_uppercase();
-        let limit_pos = upper.find("LIMIT ")?;
+        let limit_pos = find_ascii_ci(query, "LIMIT ")?;
         let after_limit = &query[limit_pos + 6..];
         let limit_end = after_limit
             .find(|c: char| !c.is_ascii_digit())
@@ -2421,11 +2418,10 @@ impl PostgresProtocol {
     }
 
     fn extract_selected_column_names(query: &str) -> Vec<String> {
-        let upper = query.to_ascii_uppercase();
-        let Some(select_pos) = upper.find("SELECT ") else {
+        let Some(select_pos) = find_ascii_ci(query, "SELECT ") else {
             return Vec::new();
         };
-        let Some(from_pos) = upper.find(" FROM ") else {
+        let Some(from_pos) = find_ascii_ci(query, " FROM ") else {
             return Vec::new();
         };
 
@@ -2723,11 +2719,22 @@ impl PostgresProtocol {
     }
 
     fn extract_select_where_clause(query: &str) -> Option<&str> {
-        let upper = query.to_ascii_uppercase();
-        let where_pos = upper.find(" WHERE ")?;
+        let where_pos = find_ascii_ci(query, " WHERE ")?;
         let mut predicate = query[where_pos + 7..].trim();
-        for terminator in [" ORDER BY ", " GROUP BY ", " LIMIT ", " OFFSET "] {
-            if let Some(pos) = Self::find_keyword_outside_literals(predicate, terminator) {
+        for terminator in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"] {
+            // The shared quote-AND-comment-aware scanner (the private
+            // single-quote-only variant truncated at terminators inside
+            // double-quoted identifiers or comments).
+            if let Some(pos) = crate::core::utils::find_ascii_ci_outside_quotes(
+                predicate, terminator,
+            )
+            .filter(|&pos| {
+                let bytes = predicate.as_bytes();
+                let before_ok = pos == 0 || bytes[pos - 1].is_ascii_whitespace();
+                let end = pos + terminator.len();
+                let after_ok = end >= bytes.len() || bytes[end].is_ascii_whitespace();
+                before_ok && after_ok
+            }) {
                 predicate = predicate[..pos].trim();
             }
         }
@@ -3186,8 +3193,7 @@ impl PostgresProtocol {
     ) -> Option<crate::proto::proximadb_v1::DocumentFilter> {
         use crate::proto::proximadb_v1::DocumentFilter;
 
-        let upper = query.to_uppercase();
-        let where_pos = upper.find("WHERE")?;
+        let where_pos = find_ascii_ci(query, "WHERE")?;
         let where_clause = &query[where_pos + 5..];
 
         // Simple parsing: look for $.field op value patterns
@@ -3531,10 +3537,8 @@ impl PostgresProtocol {
         default_start: i64,
         default_range: i64,
     ) -> (i64, i64) {
-        let upper = query.to_uppercase();
-
         // Look for BETWEEN ... AND ...
-        if let Some(_between_pos) = upper.find("BETWEEN") {
+        if let Some(_between_pos) = find_ascii_ci(query, "BETWEEN") {
             // Complex parsing - for now use defaults
             return (default_start - default_range, default_start);
         }
@@ -3569,10 +3573,9 @@ impl PostgresProtocol {
 
     /// Extract service filter from query
     fn extract_service_filter(&self, query: &str) -> Vec<String> {
-        let upper = query.to_uppercase();
         let mut services = Vec::new();
 
-        if let Some(service_pos) = upper.find("SERVICE") {
+        if let Some(service_pos) = find_ascii_ci(query, "SERVICE") {
             let after = &query[service_pos..];
             // Look for = 'value' pattern
             if let Some(eq_pos) = after.find('=') {
@@ -3590,9 +3593,7 @@ impl PostgresProtocol {
 
     /// Extract metric name from WHERE clause
     fn extract_metric_name(&self, query: &str) -> Option<String> {
-        let upper = query.to_uppercase();
-
-        if let Some(name_pos) = upper.find("METRIC_NAME") {
+        if let Some(name_pos) = find_ascii_ci(query, "METRIC_NAME") {
             let after = &query[name_pos..];
             if let Some(eq_pos) = after.find('=') {
                 let value_start = after[eq_pos + 1..].trim();
@@ -3667,9 +3668,9 @@ impl PostgresProtocol {
 
         // Extract table name: CREATE TABLE [IF NOT EXISTS] name
         let table_start = if if_not_exists {
-            upper.find("EXISTS").map(|p| p + 6)
+            find_ascii_ci(query, "EXISTS").map(|p| p + 6)
         } else {
-            upper.find("TABLE").map(|p| p + 5)
+            find_ascii_ci(query, "TABLE").map(|p| p + 5)
         };
 
         let Some(start) = table_start else {
@@ -4310,9 +4311,9 @@ impl PostgresProtocol {
 
         // Extract table name
         let table_start = if upper.contains("IF EXISTS") {
-            upper.find("EXISTS").map(|p| p + 6)
+            find_ascii_ci(query, "EXISTS").map(|p| p + 6)
         } else {
-            upper.find("TABLE").map(|p| p + 5)
+            find_ascii_ci(query, "TABLE").map(|p| p + 5)
         };
 
         let Some(start) = table_start else {
@@ -4383,9 +4384,8 @@ impl PostgresProtocol {
         }
 
         // Extract table name
-        let copy_pos = upper
-            .find("COPY ")
-            .ok_or_else(|| anyhow::anyhow!("Invalid COPY syntax"))?;
+        let copy_pos =
+            find_ascii_ci(query, "COPY ").ok_or_else(|| anyhow::anyhow!("Invalid COPY syntax"))?;
         let after_copy = query[copy_pos + 5..].trim();
         let table_end = after_copy
             .find(|c: char| c.is_whitespace() || c == '(')

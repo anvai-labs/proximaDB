@@ -400,68 +400,35 @@ pub struct EmbeddedCollectionInfo {
 /// Rich types (Map, Array, Json, Jsonb) are JSON-serialised so no data is lost.
 pub(crate) fn proxima_value_to_string(v: proximadb_data_model::ProximaValue) -> String {
     use proximadb_data_model::ProximaValue;
+    // Only arms that DIFFER from the canonical fallback (or that move
+    // instead of clone) are spelled; numbers/bools render identically
+    // through it.
     match v {
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => s,
+        // Floats keep RUST DISPLAY text on this Python-text surface —
+        // it differs from the canonical JSON spelling for non-finite values
+        // (null there, 'NaN' here — more informative for a Python reader)
+        // AND for finite f32s (Display prints the f32; canonical JSON
+        // widens to f64, e.g. 0.1 → 0.10000000149011612). Deliberate
+        // surface spelling — do not delete these arms as redundant.
+        ProximaValue::Float16(f) => f.to_string(),
         ProximaValue::Float32(f) => f.to_string(),
         ProximaValue::Float64(f) => f.to_string(),
-        ProximaValue::Int8(i) => i.to_string(),
-        ProximaValue::Int16(i) => i.to_string(),
-        ProximaValue::Int32(i) => i.to_string(),
-        ProximaValue::Int64(i) => i.to_string(),
-        ProximaValue::UInt8(i) => i.to_string(),
-        ProximaValue::UInt16(i) => i.to_string(),
-        ProximaValue::UInt32(i) => i.to_string(),
-        ProximaValue::UInt64(i) => i.to_string(),
-        ProximaValue::Boolean(b) => b.to_string(),
-        ProximaValue::Binary(b) => format!("<{} bytes>", b.len()),
+        // JSON values keep their JSON TEXT (quotes included) — a root-
+        // string document renders as '"hello"', parseable by json.loads;
+        // the bare-text unwrap of the fallback is for STRING-KIND exotics
+        // (uuid/ulid), not Json payloads.
         ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v.to_string(),
-        ProximaValue::Map(m) => {
-            let json: serde_json::Map<String, serde_json::Value> = m
-                .into_iter()
-                .map(|(k, v)| (k, proxima_value_to_json(v)))
-                .collect();
-            serde_json::to_string(&serde_json::Value::Object(json)).unwrap_or_default()
-        }
-        ProximaValue::Struct(m) => {
-            let json: serde_json::Map<String, serde_json::Value> = m
-                .into_iter()
-                .map(|(k, v)| (k, proxima_value_to_json(v)))
-                .collect();
-            serde_json::to_string(&serde_json::Value::Object(json)).unwrap_or_default()
-        }
-        ProximaValue::Array(arr) => {
-            let json: Vec<serde_json::Value> = arr.into_iter().map(proxima_value_to_json).collect();
-            serde_json::to_string(&serde_json::Value::Array(json)).unwrap_or_default()
-        }
         ProximaValue::Null => String::new(),
-        other => format!("{:?}", other),
-    }
-}
-
-pub(crate) fn proxima_value_to_json(v: proximadb_data_model::ProximaValue) -> serde_json::Value {
-    use proximadb_data_model::ProximaValue;
-    match v {
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => serde_json::Value::String(s),
-        ProximaValue::Float32(f) => serde_json::Number::from_f64(f as f64)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        ProximaValue::Float64(f) => serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        ProximaValue::Int64(i) => serde_json::Value::Number(serde_json::Number::from(i)),
-        ProximaValue::Int32(i) => serde_json::Value::Number(serde_json::Number::from(i)),
-        ProximaValue::Boolean(b) => serde_json::Value::Bool(b),
-        ProximaValue::Json(v) | ProximaValue::Jsonb(v) => v,
-        ProximaValue::Map(m) | ProximaValue::Struct(m) => serde_json::Value::Object(
-            m.into_iter()
-                .map(|(k, v)| (k, proxima_value_to_json(v)))
-                .collect(),
-        ),
-        ProximaValue::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(proxima_value_to_json).collect())
-        }
-        ProximaValue::Null => serde_json::Value::Null,
-        other => serde_json::Value::String(format!("{:?}", other)),
+        // Everything else — containers AND exotics (dashed uuid, base64
+        // binary, temporals) — renders through the shared canonical JSON
+        // surface: strings come back as bare text, structured values as
+        // their JSON text. The old arms here included a '<N bytes>'
+        // Binary placeholder (content unrecoverable) and the Rust-Debug
+        // fallback for exotics.
+        other => match proximadb_embedded_common::proxima_value_to_json(other) {
+            serde_json::Value::String(s) => s,
+            json => json.to_string(),
+        },
     }
 }
 
@@ -5021,36 +4988,12 @@ impl EmbeddedProximaDB {
     fn sql_object_to_json(obj: &proximadb::proto::proximadb_v1::SqlObject) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         for (key, value) in &obj.fields {
-            map.insert(key.clone(), Self::sql_value_to_json(value));
+            map.insert(
+                key.clone(),
+                proximadb_records::conversions::sql_value_to_json(value),
+            );
         }
         serde_json::Value::Object(map)
-    }
-
-    /// Convert SqlValue to serde_json::Value
-    fn sql_value_to_json(value: &proximadb::proto::proximadb_v1::SqlValue) -> serde_json::Value {
-        use proximadb::proto::proximadb_v1::sql_value::Value;
-
-        match &value.value {
-            None | Some(Value::NullValue(_)) => serde_json::Value::Null,
-            Some(Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-            Some(Value::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-            Some(Value::NumberValue(f)) => serde_json::Number::from_f64(*f)
-                .map_or(serde_json::Value::Null, serde_json::Value::Number),
-            Some(Value::StringValue(s)) => serde_json::Value::String(s.clone()),
-            Some(Value::ArrayValue(arr)) => {
-                serde_json::Value::Array(arr.values.iter().map(Self::sql_value_to_json).collect())
-            }
-            Some(Value::ObjectValue(obj)) => Self::sql_object_to_json(obj),
-            Some(Value::BytesValue(b)) => {
-                // Encode binary as hex string
-                let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-                serde_json::Value::String(format!("0x{}", hex))
-            }
-            Some(Value::JsonbValue(b)) => {
-                use proximadb_data_model::ProximaValue;
-                ProximaValue::jsonb_to_json_lossy(b)
-            }
-        }
     }
 
     /// Parse a simple filter expression into DocumentFilter conditions
@@ -5304,7 +5247,7 @@ impl EmbeddedProximaDB {
         let service = trace
             .attributes
             .get("service.name")
-            .map(Self::sql_value_to_json)
+            .map(proximadb_records::conversions::sql_value_to_json)
             .and_then(|value| value.as_str().map(|v| v.to_string()));
         let (status_code, status_message) = trace.status.map_or_else(
             || ("UNSET".to_string(), None),
@@ -5330,7 +5273,12 @@ impl EmbeddedProximaDB {
             attributes: trace
                 .attributes
                 .into_iter()
-                .map(|(key, value)| (key, Self::sql_value_to_json(&value)))
+                .map(|(key, value)| {
+                    (
+                        key,
+                        proximadb_records::conversions::sql_value_to_json(&value),
+                    )
+                })
                 .collect(),
         }
     }
@@ -5345,7 +5293,10 @@ impl EmbeddedProximaDB {
                 let mut json_row = serde_json::Map::new();
                 for field in row.fields {
                     if let Some(value) = field.value {
-                        json_row.insert(field.key, Self::sql_value_to_json(&value));
+                        json_row.insert(
+                            field.key,
+                            proximadb_records::conversions::sql_value_to_json(&value),
+                        );
                     } else {
                         json_row.insert(field.key, serde_json::Value::Null);
                     }
@@ -5542,7 +5493,9 @@ impl EmbeddedProximaDB {
                         fields: log
                             .fields
                             .into_iter()
-                            .map(|(k, v)| (k, Self::sql_value_to_json(&v)))
+                            .map(|(k, v)| {
+                                (k, proximadb_records::conversions::sql_value_to_json(&v))
+                            })
                             .collect(),
                     }
                 })

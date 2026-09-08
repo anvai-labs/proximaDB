@@ -119,14 +119,22 @@ impl VectorSearchSourceExecutor {
     pub fn parse_vector(s: &str) -> Result<Vec<f32>> {
         let trimmed = s.trim().trim_start_matches('[').trim_end_matches(']');
         if trimmed.is_empty() {
-            return Ok(vec![]);
+            // The ONE empty-vector policy (every other boundary rejects —
+            // dispatching a 0-dimension query is a kernel error or garbage).
+            return Err(anyhow!("query vector must be non-empty"));
         }
         trimmed
             .split(',')
             .map(|v| {
-                v.trim()
+                let f = v
+                    .trim()
                     .parse::<f32>()
-                    .map_err(|e| anyhow!("invalid vector component '{}': {}", v.trim(), e))
+                    .map_err(|e| anyhow!("invalid vector component '{}': {}", v.trim(), e))?;
+                // The ONE non-finite policy (inf/NaN reaches the kernels).
+                if !f.is_finite() {
+                    return Err(anyhow!("query vector components must be finite"));
+                }
+                Ok(f)
             })
             .collect()
     }
@@ -302,8 +310,9 @@ mod tests {
         let v = VectorSearchSourceExecutor::parse_vector("[1.0, 2.0, 3.0]").unwrap();
         assert_eq!(v, vec![1.0, 2.0, 3.0]);
 
-        let empty = VectorSearchSourceExecutor::parse_vector("[]").unwrap();
-        assert!(empty.is_empty());
+        // Empty and non-finite literals reject (the ONE policy).
+        assert!(VectorSearchSourceExecutor::parse_vector("[]").is_err());
+        assert!(VectorSearchSourceExecutor::parse_vector("[NaN]").is_err());
 
         assert!(VectorSearchSourceExecutor::parse_vector("[a, b]").is_err());
     }

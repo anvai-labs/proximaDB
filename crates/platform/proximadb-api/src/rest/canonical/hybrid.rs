@@ -12,7 +12,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use proximadb_data_model::ProximaValue;
 use proximadb_proto::v1::{FusionStrategy, HybridFusionSearchRequest, SqlValue};
 use proximadb_runtime::{BM25Document, BM25IndexPort, HybridPort};
 use serde::{Deserialize, Serialize};
@@ -121,34 +120,7 @@ pub struct SqlQueryRequest {
 
 // ── Helper: proto SqlValue → serde_json::Value ────────────────────────────────
 
-pub fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
-    use proximadb_proto::v1::sql_value::Value as V;
-    match v.value.as_ref() {
-        Some(V::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(V::NumberValue(n)) => serde_json::Value::Number(
-            serde_json::Number::from_f64(*n).unwrap_or_else(|| serde_json::Number::from(0)),
-        ),
-        Some(V::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(V::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-        Some(V::BytesValue(b)) => serde_json::Value::Array(
-            b.iter()
-                .map(|x| serde_json::Value::Number((*x as u64).into()))
-                .collect(),
-        ),
-        Some(V::JsonbValue(b)) => ProximaValue::jsonb_to_json_lossy(b),
-        Some(V::NullValue(_)) | None => serde_json::Value::Null,
-        Some(V::ArrayValue(arr)) => {
-            serde_json::Value::Array(arr.values.iter().map(sql_value_to_json).collect())
-        }
-        Some(V::ObjectValue(obj)) => {
-            let mut map = serde_json::Map::new();
-            for (k, sv) in &obj.fields {
-                map.insert(k.clone(), sql_value_to_json(sv));
-            }
-            serde_json::Value::Object(map)
-        }
-    }
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 // ── Handler functions ──────────────────────────────────────────────────────────
 
@@ -701,9 +673,10 @@ mod tests {
             sql_value_to_json(&sql_value(Value::Int64Value(42))),
             serde_json::json!(42)
         );
+        // Round: canonical rendering — bytes are base64 (was int-array).
         assert_eq!(
             sql_value_to_json(&sql_value(Value::BytesValue(vec![1, 2]))),
-            serde_json::json!([1, 2])
+            serde_json::json!("AQI=")
         );
         assert_eq!(
             sql_value_to_json(&sql_value(Value::NullValue(0))),
