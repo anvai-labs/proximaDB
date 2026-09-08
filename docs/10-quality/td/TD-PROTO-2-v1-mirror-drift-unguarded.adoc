@@ -1641,6 +1641,30 @@ angles after the main agent hit a rate limit):**
   a THIRD copy of the Cypher dialect (kernel is a viable shared home —
   both crates depend on it). ~13 typed-config closure copies want an
   opt_str helper (the graph-cypher defaults already diverge).
+
+**Consolidation review round 41 (2026-09-08, follow-up PR #1852):**
+- The strip_if_not_exists delegation traded shapes (the parser's
+  whitespace-only boundary regressed EXISTS"logs" — it parses under
+  the pinned dialect); the shared home in core::utils accepts a word
+  boundary (whitespace OR quote) and the network layer no longer
+  imports a query-internal path (CLAUDE.md 17(a)).
+- The WHERE locate uses the crate's TOP-LEVEL scanner — depth-aware
+  (a subquery's WHERE shadowed the outer one and mis-parsed into a
+  wrong literal filter). The terminator boundary tightened to
+  whitespace/paren ('t.limit > 5' was gutted — '.' passed the
+  identifier-byte boundary).
+- INTO/UPDATE EXPLAIN targets split at the paren (INSERT column
+  lists kept their table; FROM/JOIN keep the function-call skip).
+  The backing-collection creation prefers the AST ddl_table (quoted/
+  mixed-case names diverged from the string extractor — a stray
+  collection was minted). Empty components Err INSIDE the callee
+  (None now unambiguously means 'not multi-model'; the caller-side
+  raw-JSON re-inspection deleted — the contract split was how the
+  guard got dropped once). Pins added: REST empty components,
+  non-string cypher/namespace, DISTINCT composite shapes.
+- Tracked: the REST/PORT FROM-extractor divergence (REST trims a
+  different punctuation set and knows only FROM) — one shared
+  collect_from_targets beside collect_quoted_first_args.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

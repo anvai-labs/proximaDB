@@ -1666,7 +1666,13 @@ impl PostgresProtocol {
                     {
                         Ok(result) => {
                             if upper.starts_with("CREATE TABLE")
-                                && let Some(table_name) = self.extract_create_table_name(query)
+                                // The AST name when present (quoted/mixed-
+                                // case names diverged from the string
+                                // extractor — a stray backing collection was
+                                // minted while the real table got none).
+                                && let Some(table_name) = ddl_table
+                                    .clone()
+                                    .or_else(|| self.extract_create_table_name(query))
                             {
                                 self.ensure_relational_backing_collection(
                                     &table_name,
@@ -1768,7 +1774,7 @@ impl PostgresProtocol {
         let after_table = query[table_pos + "CREATE TABLE".len()..].trim_start();
         // The frontend parser's ONE case-insensitive strip (whitespace
         // boundary included — a hand-rolled variant here drifted).
-        let after_table = crate::query::sql_frontend::parser::strip_if_not_exists(after_table).1;
+        let after_table = crate::core::utils::strip_if_not_exists(after_table).1;
         let table_end = after_table
             .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
             .unwrap_or(after_table.len());
@@ -2718,38 +2724,23 @@ impl PostgresProtocol {
     }
 
     fn extract_select_where_clause(query: &str) -> Option<&str> {
-        // WHERE locate on the SHARED quote+comment-aware scanner (a WHERE
-        // inside a projection literal produced a bogus predicate). ALL
-        // occurrences are tried until one passes the boundary (a first
-        // match inside FILTER(...) must not shadow the real WHERE), and
-        // the slice is at pos + 5 (the -1/+7 dance sliced one past the
-        // end when WHERE ended the string — an abort-class panic under
-        // panic=abort).
+        // WHERE locate via the crate's TOP-LEVEL scanner — depth-aware
+        // (a subquery's WHERE must not shadow the outer one), quote-aware,
+        // and identifier-boundary. find_top_level_keyword matches word
+        // boundaries by construction.
         let mut predicate = {
-            let bytes = query.as_bytes();
-            let mut found = None;
-            let mut search_from = 0usize;
-            while let Some(rel) =
-                crate::core::utils::find_ascii_ci_outside_quotes(&query[search_from..], "WHERE")
-            {
-                let pos = search_from + rel;
-                let end = pos + 5;
-                let boundary = (pos == 0
-                    || !crate::core::utils::is_identifier_byte(bytes[pos - 1]))
-                    && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
-                if boundary {
-                    found = Some(&query[end.min(query.len())..]);
-                    break;
-                }
-                search_from = end;
-            }
-            found?.trim()
+            let where_pos =
+                crate::query::federated::optimizer::sql_parsing::find_top_level_keyword(
+                    query, "WHERE",
+                )?;
+            query[where_pos + "WHERE".len()..].trim()
         };
         for terminator in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"] {
             // Iterate ALL occurrences until one passes the boundary test —
             // a first match inside `limit_val` must not hide a later real
-            // terminator (a first-only filter skipped it entirely). The
-            // boundary is the shared identifier byte class.
+            // terminator. The boundary is whitespace or an opening paren
+            // ('t.limit' must NOT count — '.' is not an identifier byte
+            // but a qualified column's terminator must not gut it).
             let mut search_from = 0usize;
             while let Some(rel) = crate::core::utils::find_ascii_ci_outside_quotes(
                 &predicate[search_from..],
@@ -2758,9 +2749,11 @@ impl PostgresProtocol {
                 let pos = search_from + rel;
                 let bytes = predicate.as_bytes();
                 let end = pos + terminator.len();
-                let boundary = (pos == 0
-                    || !crate::core::utils::is_identifier_byte(bytes[pos - 1]))
-                    && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
+                let boundary =
+                    (pos == 0 || bytes[pos - 1].is_ascii_whitespace() || bytes[pos - 1] == b'(')
+                        && (end >= bytes.len()
+                            || bytes[end].is_ascii_whitespace()
+                            || bytes[end] == b')');
                 if boundary {
                     predicate = predicate[..pos].trim();
                     break;

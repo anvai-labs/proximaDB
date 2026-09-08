@@ -20,7 +20,7 @@ use crate::query::capability::{Capability, CapabilitySet};
 use crate::storage::multimodel::ModelType;
 use proximadb_kernel::error::VectorDBError;
 
-mod sql_parsing;
+pub(crate) mod sql_parsing;
 pub(crate) mod vector_query_parsing;
 
 pub mod cached_plan_builder;
@@ -824,9 +824,9 @@ struct PredicatePushResult {
     predicate_pushed: bool,
 }
 
-struct SelectItem {
-    expression: String,
-    alias: Option<String>,
+pub(crate) struct SelectItem {
+    pub(crate) expression: String,
+    pub(crate) alias: Option<String>,
 }
 
 #[derive(Clone, Copy)]

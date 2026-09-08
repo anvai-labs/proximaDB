@@ -63,6 +63,26 @@ pub fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
 /// [`find_ascii_ci`], but matches only OUTSIDE single/double-quoted
 /// segments (quote-doubling aware) — SET-style name/value splits must not
 /// fire inside a quoted identifier such as "time TO live".
+/// Case-insensitive `IF NOT EXISTS` prefix strip with a word boundary
+/// (whitespace OR an opening quote — `EXISTS"logs"` parses under the
+/// pinned GenericDialect). Returns (had_prefix, rest).
+pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
+    let Some(head) = input.get(.."IF NOT EXISTS".len()) else {
+        return (false, input);
+    };
+    if !head.eq_ignore_ascii_case("IF NOT EXISTS") {
+        return (false, input);
+    }
+    let next = input.as_bytes().get("IF NOT EXISTS".len());
+    match next {
+        None => (true, ""),
+        Some(b) if b.is_ascii_whitespace() || *b == b'"' => {
+            (true, input["IF NOT EXISTS".len()..].trim_start())
+        }
+        _ => (false, input),
+    }
+}
+
 pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usize> {
     let bytes = haystack.as_bytes();
     let mut quote: Option<u8> = None;

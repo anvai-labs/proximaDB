@@ -2467,6 +2467,44 @@ mod tests {
     }
 
     #[test]
+    fn empty_components_fail_closed() {
+        let request = MultiModelQueryRequest {
+            components: vec![],
+            fusion_strategy: default_fusion(),
+            limit: None,
+        };
+        let err = convert_multi_model_to_sql(&request).unwrap_err();
+        assert!(err.to_string().contains("no components"), "got: {err}");
+    }
+
+    #[test]
+    fn non_string_cypher_and_namespace_fail_closed() {
+        let mk = |component_type: &str, config: serde_json::Value| MultiModelQueryRequest {
+            components: vec![QueryComponentRequest {
+                component_type: component_type.to_string(),
+                config,
+            }],
+            fusion_strategy: default_fusion(),
+            limit: None,
+        };
+        let graph = mk("graph", serde_json::json!({"cypher": {"match": "n"}}));
+        assert!(
+            convert_multi_model_to_sql(&graph)
+                .unwrap_err()
+                .to_string()
+                .contains("cypher must be a string")
+        );
+
+        let logs = mk("log", serde_json::json!({"namespace": 42}));
+        assert!(
+            convert_multi_model_to_sql(&logs)
+                .unwrap_err()
+                .to_string()
+                .contains("namespace must be a string")
+        );
+    }
+
+    #[test]
     fn explain_target_scanner_preserves_quoted_delimiters_and_skips_binds() {
         let mut targets = Vec::new();
         crate::core::utils::collect_quoted_first_args(

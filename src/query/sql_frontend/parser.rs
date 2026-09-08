@@ -4134,18 +4134,7 @@ pub(crate) fn try_parse_create_function(sql: &str) -> Result<Option<DdlStatement
 }
 
 pub(crate) fn strip_if_not_exists(input: &str) -> (bool, &str) {
-    let upper = input.to_ascii_uppercase();
-    if upper.starts_with("IF NOT EXISTS")
-        && input
-            .chars()
-            .nth("IF NOT EXISTS".len())
-            .map(|c| c.is_whitespace())
-            .unwrap_or(false)
-    {
-        (true, input["IF NOT EXISTS".len()..].trim_start())
-    } else {
-        (false, input)
-    }
+    crate::core::utils::strip_if_not_exists(input)
 }
 
 fn strip_if_exists(input: &str) -> (bool, &str) {

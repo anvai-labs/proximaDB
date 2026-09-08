@@ -517,15 +517,24 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     for window in tokens.windows(2) {
         if let [keyword, target] = window {
             let keyword = keyword.trim_matches('"').to_ascii_uppercase();
-            if matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
-                && !target.starts_with('$')
-                && !target.contains('(')
+            if !matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
+                || target.starts_with('$')
             {
-                // Strip trailing statement punctuation — a subquery's
-                // 'orders)' must keep its target (the paren-normalization
-                // era captured it).
+                continue;
+            }
+            // INTO/UPDATE: a paren list is the INSERT column list —
+            // `orders(a,b)` keeps `orders`. FROM/JOIN: a paren is a
+            // function-call position — `TRACES('ops')` is not a target.
+            // Trailing statement punctuation strips (a subquery's
+            // 'orders)' keeps its target).
+            let candidate = if keyword == "INTO" || keyword == "UPDATE" {
+                target.split('(').next().unwrap_or(target)
+            } else {
+                target
+            };
+            if !candidate.contains('(') {
                 targets.push(
-                    target
+                    candidate
                         .trim_matches('"')
                         .trim_end_matches([';', ')', ','])
                         .to_string(),
@@ -595,14 +604,6 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // twins — their defaults and limit handling still diverge).
         let sql = match json_to_multi_model_sql(&request)? {
             Some(sql) => sql,
-            // Components present (ANY shape — including empty) fail
-            // closed: the 'SELECT 1' fallback returned 200-OK garbage
-            // (round 22's contract; the Result restructure dropped it).
-            None if request.get("components").is_some() => {
-                return Err(anyhow!(
-                    "multi-model request contained a component that could not be lowered (empty, malformed, or unknown component_type)"
-                ));
-            }
             None => request
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -766,7 +767,13 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
         .as_array()
         .ok_or_else(|| anyhow!("components must be an array"))?;
     if components.is_empty() {
-        return Ok(None);
+        // Err, not Ok(None): None must unambiguously mean 'not a
+        // multi-model request' — the caller-side components-present
+        // guard (raw-JSON re-inspection) was dropped once by a
+        // restructure and returned SELECT-1 garbage.
+        return Err(anyhow!(
+            "multi-model request contained no components that could be lowered"
+        ));
     }
     let mut parts = Vec::new();
     for (component_index, component) in components.iter().enumerate() {
@@ -1258,8 +1265,11 @@ mod tests {
 
     #[test]
     fn test_json_to_multi_model_sql_empty_components() {
-        let req = serde_json::json!({ "components": [] });
-        assert!(json_to_multi_model_sql(&req).unwrap().is_none());
+        // Err (not Ok(None)) since round 41 — None must mean 'not a
+        // multi-model request' only.
+        let req = serde_json::json!({"components": []});
+        let err = json_to_multi_model_sql(&req).unwrap_err();
+        assert!(err.to_string().contains("no components"));
     }
 
     #[test]
