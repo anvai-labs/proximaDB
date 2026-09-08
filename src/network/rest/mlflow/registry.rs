@@ -421,18 +421,18 @@ async fn model_versions_search(
     MlflowRead(req): MlflowRead<ModelVersionsSearchRequest>,
 ) -> MlflowResult<Json<Value>> {
     let mut name = req.name.trim().to_string();
-    if name.is_empty() {
-        if let Some(filter) = &req.filter {
-            for clause in super::split_filter_clauses(filter)? {
-                let (field, op, value) = super::parse_filter_parts(clause.trim(), true)?;
-                if field.eq_ignore_ascii_case("name") && op == "=" {
-                    name = value;
-                } else {
-                    return Err(MlflowError::invalid(format!(
-                        "unsupported model-version filter clause '{}'",
-                        clause.trim()
-                    )));
-                }
+    if name.is_empty()
+        && let Some(filter) = &req.filter
+    {
+        for clause in super::split_filter_clauses(filter)? {
+            let (field, op, value) = super::parse_filter_parts(clause.trim(), true)?;
+            if field.eq_ignore_ascii_case("name") && op == "=" {
+                name = value;
+            } else {
+                return Err(MlflowError::invalid(format!(
+                    "unsupported model-version filter clause '{}'",
+                    clause.trim()
+                )));
             }
         }
     }
