@@ -131,9 +131,24 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
 pub fn skip_leading_ws_and_comments(input: &str) -> &str {
     let bytes = input.as_bytes();
     let mut i = 0usize;
+    // Unicode whitespace allowed at the START (char::is_whitespace —
+    // NBSP/U+3000 from rich text or CJK input; the ASCII-only narrowing
+    // silently skipped collection creation with a success response).
+    while let Some((idx, ch)) = input[i..].char_indices().next() {
+        if ch.is_whitespace() {
+            i += idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
     loop {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+        // Unicode whitespace anywhere whitespace is skipped.
+        while let Some((idx, ch)) = input[i..].char_indices().next() {
+            if ch.is_whitespace() {
+                i += idx + ch.len_utf8();
+            } else {
+                break;
+            }
         }
         if bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'-') {
             i += 2;
@@ -179,11 +194,27 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
     match next {
         None => (true, ""),
         // The dialect accepts double-quote AND backtick identifier
-        // quoting (GenericDialect is_delimited_identifier_start).
-        Some(b) if b.is_ascii_whitespace() || *b == b'"' || *b == b'`' => (
-            true,
-            skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
-        ),
+        // quoting (GenericDialect is_delimited_identifier_start) — and the
+        // operand is DECODED so consumers never see the delimiter (a
+        // literal-`logs` name mints a phantom no DROP can address).
+        Some(b) if b.is_ascii_whitespace() || *b >= 0x80 => {
+            // >= 0x80 may be a multi-byte whitespace char (NBSP) — the
+            // skip helper handles unicode; non-ws multibyte simply won't
+            // strip further.
+            (
+                true,
+                skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
+            )
+        }
+        Some(b) if *b == b'"' || *b == b'`' => {
+            let rest = &cleaned["IF NOT EXISTS".len()..];
+            let quote = *b as char;
+            let inner = rest[1..]
+                .split_once(quote)
+                .map(|(name, _)| name)
+                .unwrap_or(&rest[1..]);
+            (true, inner)
+        }
         _ => (false, input),
     }
 }
@@ -290,7 +321,7 @@ mod tests {
             (true, "docs")
         );
         // Backtick-quoted identifiers (GenericDialect accepts them).
-        assert_eq!(strip_if_not_exists("IF NOT EXISTS`logs`"), (true, "`logs`"));
+        assert_eq!(strip_if_not_exists("IF NOT EXISTS`logs`"), (true, "logs"));
         // Word boundary: no separator, no strip.
         assert_eq!(
             strip_if_not_exists("IF NOT EXISTSx"),

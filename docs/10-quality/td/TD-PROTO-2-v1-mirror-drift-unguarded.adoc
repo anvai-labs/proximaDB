@@ -1833,6 +1833,21 @@ pinned + narrated:**
   parameterization); FOUR copies of the nested-block-comment loop now
   live in core/utils/mod.rs alone.
 
+**Consolidation review round 45 (2026-09-08, follow-up PR #1852):**
+- The WHERE/terminator boundary excludes QUOTE/DELIMITER bytes (a
+  backtick-quoted column named `where` passed the old check and
+  gutted the predicate into a silent unfiltered scan — verified by
+  compiled repro against both versions; the terminator side
+  truncated at `limit`).
+- strip_if_not_exists DECODES a quoted operand (a literal-backtick
+  name mints a phantom profile/collection no DROP can address) and
+  the boundary accepts multibyte whitespace (NBSP — the ASCII-only
+  narrowing silently skipped collection creation with a success
+  response; skip_leading_ws_and_comments is unicode-whitespace
+  aware).
+- The stale 10-line round-42 gate narrative on the Err fallback
+  collapsed to the current behavior.
+
 == Not in scope
 
 The v2 package already has both generation (`PROXIMADB_PROTO_REGEN=1`) and the

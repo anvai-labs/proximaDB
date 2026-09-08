@@ -2714,10 +2714,18 @@ impl PostgresProtocol {
     }
 
     fn extract_select_where_clause(query: &str) -> Option<&str> {
-        // WHERE locate via the crate's TOP-LEVEL scanner — depth-aware
-        // (a subquery's WHERE must not shadow the outer one), quote-aware,
-        // and identifier-boundary. find_top_level_keyword matches word
-        // boundaries by construction.
+        // WHERE locate via the crate's TOP-LEVEL scanner (depth- and
+        // quote-aware). The boundary check excludes identifier bytes,
+        // '.', AND quote/delimiter bytes — a backtick-quoted column
+        // NAMED `where` passed the old check and gutted the predicate
+        // into a silent unfiltered scan.
+        let not_delimiter = |b: u8| {
+            !crate::core::utils::is_identifier_byte(b)
+                && b != b'.'
+                && b != b'`'
+                && b != b'"'
+                && b != b'\''
+        };
         let mut predicate = {
             let bytes = query.as_bytes();
             let mut found = None;
@@ -2727,10 +2735,8 @@ impl PostgresProtocol {
             {
                 let pos = search_from + rel;
                 let end = pos + 5;
-                let boundary = (pos == 0
-                    || (!crate::core::utils::is_identifier_byte(bytes[pos - 1])
-                        && bytes[pos - 1] != b'.'))
-                    && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
+                let boundary = (pos == 0 || not_delimiter(bytes[pos - 1]))
+                    && (end >= bytes.len() || not_delimiter(bytes[end]));
                 if boundary {
                     found = Some(&query[end.min(query.len())..]);
                     break;
@@ -2742,9 +2748,8 @@ impl PostgresProtocol {
         for terminator in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"] {
             // Iterate ALL occurrences until one passes the boundary test —
             // a first match inside `limit_val` must not hide a later real
-            // terminator. The boundary is whitespace or an opening paren
-            // ('t.limit' must NOT count — '.' is not an identifier byte
-            // but a qualified column's terminator must not gut it).
+            // terminator; the shared not_delimiter class also rejects
+            // qualified ('t.limit') and backtick-quoted (`limit`) names.
             let mut search_from = 0usize;
             while let Some(rel) = crate::core::utils::find_ascii_ci_at_top_level(
                 &predicate[search_from..],
@@ -2753,10 +2758,8 @@ impl PostgresProtocol {
                 let pos = search_from + rel;
                 let bytes = predicate.as_bytes();
                 let end = pos + terminator.len();
-                let boundary = (pos == 0
-                    || (!crate::core::utils::is_identifier_byte(bytes[pos - 1])
-                        && bytes[pos - 1] != b'.'))
-                    && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
+                let boundary = (pos == 0 || not_delimiter(bytes[pos - 1]))
+                    && (end >= bytes.len() || not_delimiter(bytes[end]));
                 if boundary {
                     predicate = predicate[..pos].trim();
                     break;
@@ -3026,16 +3029,10 @@ impl PostgresProtocol {
                     .await?
             }
             Err(_) => {
-                // Gate on the AWARE top-level scanner (a raw ' WHERE '
-                // substring disagreed in both directions: a tab-delimited
-                // WHERE skipped the gate entirely — silent unfiltered
-                // scan — while a literal ' WHERE ' armed it and the
-                // extractor's None hard-errored a WHERE-less query).
-                // None ⇒ no predicates ⇒ unfiltered, the correct answer
-                // for a query with no top-level WHERE.
-                // No gate: it re-ran the extractor's own scanner and
-                // unwrap_or_default erased the distinction anyway (the
-                // dead if/else cost a second full scan per fallback).
+                // None = no top-level WHERE (or an unparseable one) ⇒ no
+                // predicates ⇒ unfiltered. (The TD holds the round
+                // narrative: the raw-substring gate disagreed with the
+                // extractor in both directions and was behaviorally dead.)
                 let predicates = Self::extract_select_where_predicates(query).unwrap_or_default();
                 dml_service
                     .select_table_records_with_projection(
