@@ -758,9 +758,8 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 )
             }
             "document" => {
-                // Lenient default (test-pinned: document components
-                // without a collection query 'default' — the port twin
-                // agrees); a NON-STRING value still errors.
+                // Fail-closed (the PR's direction for silent defaults —
+                // and the strict twin's test): the collection is REQUIRED.
                 let collection = component
                     .config
                     .get("collection")
@@ -772,7 +771,11 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                         })
                     })
                     .transpose()?
-                    .unwrap_or("default");
+                    .ok_or_else(|| {
+                        ApiError::InvalidArgument(
+                            "document component config.collection is required".to_string(),
+                        )
+                    })?;
                 let filter = component
                     .config
                     .get("filter")
