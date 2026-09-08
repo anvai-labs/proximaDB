@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::network::middleware::tenant::TenantContext;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -66,12 +66,19 @@ fn is_enabled(value: Option<&str>) -> bool {
 pub fn mlflow_routes() -> Router<MlflowState> {
     Router::new()
         .route("/experiments/create", post(experiments_create))
-        .route("/experiments/get", get(experiments_get))
+        .route(
+            "/experiments/get",
+            get(experiments_get).post(experiments_get),
+        )
+        .route(
+            "/experiments/get-by-name",
+            get(experiments_get_by_name).post(experiments_get_by_name),
+        )
         .route("/experiments/search", post(experiments_search))
         .route("/experiments/delete", post(experiments_delete))
         .route("/experiments/restore", post(experiments_restore))
         .route("/runs/create", post(runs_create))
-        .route("/runs/get", get(runs_get))
+        .route("/runs/get", get(runs_get).post(runs_get))
         .route("/runs/update", post(runs_update))
         .route("/runs/search", post(runs_search))
         .route("/runs/delete", post(runs_delete))
@@ -81,6 +88,43 @@ pub fn mlflow_routes() -> Router<MlflowState> {
         .route("/runs/log-batch", post(runs_log_batch))
         .route("/runs/set-tag", post(runs_set_tag))
         .route("/runs/delete-tag", post(runs_delete_tag))
+        .route(
+            "/metrics/get-history",
+            get(metrics_get_history).post(metrics_get_history),
+        )
+}
+
+/// MLflow read endpoints are dual-shaped on the wire: the proto HTTP
+/// annotations map them to **GET with query-string parameters** in current
+/// clients, while older clients POST a JSON body. Accept both.
+struct MlflowRead<T>(T);
+
+impl<S, T> axum::extract::FromRequest<S> for MlflowRead<T>
+where
+    S: Send + Sync,
+    T: for<'de> Deserialize<'de>,
+{
+    type Rejection = MlflowError;
+
+    async fn from_request(
+        req: axum::http::Request<axum::body::Body>,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        if req.method() == axum::http::Method::GET {
+            let query = req.uri().query().unwrap_or_default();
+            let value = serde_urlencoded::from_str::<T>(query).map_err(|e| {
+                MlflowError::invalid(format!("invalid query parameters '{query}': {e}"))
+            })?;
+            Ok(MlflowRead(value))
+        } else {
+            match axum::extract::Json::<T>::from_request(req, state).await {
+                Ok(axum::Json(value)) => Ok(MlflowRead(value)),
+                Err(rejection) => Err(MlflowError::invalid(format!(
+                    "invalid JSON body: {rejection}"
+                ))),
+            }
+        }
+    }
 }
 
 fn store_for(tenant: &TenantContext, state: &MlflowState) -> MlflowResult<SubstrateRunStore> {
@@ -126,6 +170,13 @@ struct ExperimentOut {
     last_update_time: i64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tags: Vec<KeyValueOut>,
+}
+
+#[derive(Default, Deserialize)]
+struct ExperimentNameRequest {
+    /// Proto field name is `experiment_name`; older JSON bodies use `name`.
+    #[serde(default, alias = "experiment_name")]
+    name: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -607,11 +658,36 @@ async fn experiments_create(
 async fn experiments_get(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
-    Query(req): Query<ExperimentIdRequest>,
+    MlflowRead(req): MlflowRead<ExperimentIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     let id = parse_id(&req.experiment_id, "experiment")?;
     let store = store_for(&tenant, &state)?;
     let record = store.get_experiment(id).await?;
+    Ok(Json(serde_json::json!({
+        "experiment": experiment_out(&record),
+    })))
+}
+
+async fn experiments_get_by_name(
+    State(state): State<MlflowState>,
+    Extension(tenant): Extension<TenantContext>,
+    MlflowRead(req): MlflowRead<ExperimentNameRequest>,
+) -> MlflowResult<Json<serde_json::Value>> {
+    if req.name.is_empty() {
+        return Err(MlflowError::invalid("experiment_name must not be empty"));
+    }
+    let store = store_for(&tenant, &state)?;
+    let record = store
+        .list_experiments(true)
+        .await?
+        .into_iter()
+        .find(|e| e.name == req.name)
+        .ok_or_else(|| {
+            MlflowError::not_found(format!(
+                "Could not find experiment with name '{name}'",
+                name = req.name
+            ))
+        })?;
     Ok(Json(serde_json::json!({
         "experiment": experiment_out(&record),
     })))
@@ -781,7 +857,7 @@ fn uuid_like_id() -> String {
 async fn runs_get(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
-    Query(req): Query<RunIdRequest>,
+    MlflowRead(req): MlflowRead<RunIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     if req.run_id.is_empty() {
         return Err(MlflowError::invalid("run_id must not be empty"));
@@ -898,6 +974,39 @@ async fn runs_set_tag(
         .set_tag(&req.run_id, &req.key, &req.value)
         .await?;
     Ok(Json(serde_json::json!({})))
+}
+
+#[derive(Default, Deserialize)]
+struct MetricHistoryRequest {
+    #[serde(default)]
+    run_id: String,
+    #[serde(default, alias = "metric_key")]
+    key: String,
+}
+
+async fn metrics_get_history(
+    State(state): State<MlflowState>,
+    Extension(tenant): Extension<TenantContext>,
+    MlflowRead(req): MlflowRead<MetricHistoryRequest>,
+) -> MlflowResult<Json<serde_json::Value>> {
+    if req.run_id.is_empty() || req.key.is_empty() {
+        return Err(MlflowError::invalid(
+            "run_id and metric_key must not be empty",
+        ));
+    }
+    let store = store_for(&tenant, &state)?;
+    let mut history = store.metric_history(&req.run_id, &req.key).await?;
+    history.sort_by_key(|p| (p.step, p.timestamp_ms));
+    let metrics: Vec<MetricOut> = history
+        .iter()
+        .map(|p| MetricOut {
+            key: p.key.clone(),
+            value: p.value,
+            timestamp: p.timestamp_ms,
+            step: p.step,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "metrics": metrics })))
 }
 
 async fn runs_delete_tag(

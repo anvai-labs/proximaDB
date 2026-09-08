@@ -1933,6 +1933,81 @@ jobs:
             fi
           done
 
+  # TD-MLOPS-1 slice 2: real-client MLflow conformance ratchet. Builds the
+  # server, spawns it with PROXIMADB_MLFLOW_COMPAT_ENABLE=1, and drives the
+  # canonical workflow through the REAL mlflow client (mlflow-skinny, PINNED
+  # — unpinned latest would make the counts-only-up ratchet drift upstream).
+  # The ratchet high-water lives in clients/python/tests/mlflow_conformance_steps.txt.
+  mlflow-conformance:
+    name: MLflow conformance (real client)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: changes
+    if: |
+      !inputs.skip_tests &&
+      needs.changes.outputs.test_tier == 'true' &&
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true')
+    env:
+      PROXIMADB_MLFLOW_COMPAT_ENABLE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-nightly-dev"
+          shared-key: "build"
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+      - name: Build server binary
+        run: cargo build -p proximadb-server
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install pinned mlflow client
+        run: python -m pip install "mlflow-skinny==2.14.3" requests
+      - name: Validate conformance harness
+        working-directory: clients/python
+        run: python tests/test_mlflow_conformance_harness.py
+      - name: Spawn server and run conformance workflow
+        run: |
+          set -euo pipefail
+          DATA_DIR="$(mktemp -d)"
+          # The unified server binds its configured port (5678 by default);
+          # `-p` does not override it — probe the port it actually serves.
+          # config.toml carries explicit storage URLs under /tmp/proximadb
+          # that `-d` never rebases — rewrite them into DATA_DIR so runs
+          # (and the set-once global WAL manifest) cannot cross-contaminate.
+          PORT=5678
+          sed "s|/tmp/proximadb|$DATA_DIR|g" config/config.toml > "$DATA_DIR/config.toml"
+          ./target/debug/proximadb-server -c "$DATA_DIR/config.toml" -d "$DATA_DIR" &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:$PORT/health/live" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf "http://127.0.0.1:$PORT/health/live" > /dev/null
+          cd clients/python
+          python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" | tee /tmp/conformance.log
+      - name: Ratchet — passing steps only go up
+        if: always()
+        run: |
+          set -eu
+          if [ -f /tmp/conformance.log ]; then
+            PASSED=$(grep -c '^PASS ' /tmp/conformance.log || true)
+          else
+            PASSED=0
+          fi
+          RATCHET=$(cat clients/python/tests/mlflow_conformance_steps.txt)
+          echo "passed=$PASSED ratchet=$RATCHET"
+          if [ "$PASSED" -lt "$RATCHET" ]; then
+            echo "::error::MLflow conformance regressed: $PASSED < $RATCHET steps. If intentional, lower the ratchet in the same PR with justification."
+            exit 1
+          fi
+
   rust-integration-test-authz:
     name: Rust Integration Tests (authz e2e)
     runs-on: ubuntu-latest
