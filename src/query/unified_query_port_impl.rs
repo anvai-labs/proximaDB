@@ -519,6 +519,11 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
             let keyword = keyword.trim_matches('"').to_ascii_uppercase();
             if matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
                 && !target.starts_with('$')
+                // A spaced function call (FROM TRACES ('ops')) tokenizes
+                // the name and paren apart — a catalog-function name is a
+                // call position, not a target.
+                && !crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS
+                    .contains(&target.to_ascii_uppercase().as_str())
             {
                 // Strip trailing statement punctuation — a subquery's
                 // 'orders)' must keep its target (the paren-normalization

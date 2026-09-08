@@ -1848,6 +1848,31 @@ pinned + narrated:**
 - The stale 10-line round-42 gate narrative on the Err fallback
   collapsed to the current behavior.
 
+**Consolidation review round 46 (2026-09-08, follow-up PR #1852):**
+- Backticks OPEN QUOTE MODE in both core::utils scanners (text inside
+  a `col` was scanned as code — keywords/apostrophes/parens in it
+  gutted the predicate into a silent unfiltered scan, compiled-repro
+  verified).
+- strip_if_not_exists decodes quoted operands in the SPACED arm too
+  (the conventional spelling took the whitespace arm undecoded and
+  minted phantom literal-backtick collections); a quoted operand
+  yields the decoded NAME ONLY (tail-reading consumers use the
+  original input — tracked).
+- extract_select_limit is on the aware scanner, LAST-occurrence
+  parity (a LIMIT inside a trailing comment or literal silently
+  truncated results: '-- LIMIT 1' returned 1 row instead of 5).
+  The port EXPLAIN skips catalog-FUNCTION names as FROM targets (the
+  spaced 'FROM TRACES ('ops')' tokenized the call apart and minted
+  TRACES again). The duplicated pre-loop unicode-ws skip and the dead
+  end.min() clamp dropped.
+- Tracked: the prepared-bind loop's global str::replace re-substitutes
+  lower-numbered placeholders inside spliced VALUES ('$2 = total $1
+  each' corrupted after the $1 pass) — the tokenizer item. The
+  port/REST FROM-target rules remain divergent (INTO/UPDATE vs
+  FROM-only; different trims) — hoist collect_from_targets beside
+  collect_quoted_first_args. extract_select_table_name and
+  parse_document_where_clause still use raw scanners.
+
 == Not in scope
 
 The v2 package already has both generation (`PROXIMADB_PROTO_REGEN=1`) and the

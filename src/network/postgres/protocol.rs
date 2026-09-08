@@ -2738,7 +2738,7 @@ impl PostgresProtocol {
                 let boundary = (pos == 0 || not_delimiter(bytes[pos - 1]))
                     && (end >= bytes.len() || not_delimiter(bytes[end]));
                 if boundary {
-                    found = Some(&query[end.min(query.len())..]);
+                    found = Some(&query[end..]);
                     break;
                 }
                 search_from = end;
@@ -2888,12 +2888,29 @@ impl PostgresProtocol {
     }
 
     fn extract_select_limit(query: &str) -> Option<usize> {
-        let upper = query.to_ascii_uppercase();
-        let limit_pos = upper.rfind(" LIMIT ")?;
-        let after_limit = query[limit_pos + " LIMIT ".len()..]
-            .trim()
-            .trim_end_matches(';')
-            .trim();
+        // The AWARE top-level scanner, LAST occurrence (rfind parity) —
+        // a LIMIT inside a trailing comment or string literal silently
+        // truncated results ('-- LIMIT 1' returned 1 row instead of 5).
+        let bytes = query.as_bytes();
+        let mut last: Option<usize> = None;
+        let mut search_from = 0usize;
+        while let Some(rel) =
+            crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "LIMIT")
+        {
+            let pos = search_from + rel;
+            let end = pos + 5;
+            let boundary = pos > 0
+                && !crate::core::utils::is_identifier_byte(bytes[pos - 1])
+                && bytes[pos - 1] != b'.'
+                && bytes[pos - 1] != b'`'
+                && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
+            if boundary {
+                last = Some(pos);
+            }
+            search_from = pos + 5;
+        }
+        let limit_pos = last?;
+        let after_limit = query[limit_pos + 5..].trim().trim_end_matches(';').trim();
         let token = after_limit.split_whitespace().next()?;
         token.parse::<usize>().ok()
     }

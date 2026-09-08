@@ -110,7 +110,10 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
                     }
                     continue;
                 }
-                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                // Backticks quote identifiers (GenericDialect) — text
+                // inside them is NOT code (keywords/apostrophes/parens
+                // in a `col` gutted the predicate).
+                if matches!(bytes[i], b'\'' | b'"' | b'`') {
                     quote = Some(bytes[i]);
                     i += 1;
                     continue;
@@ -131,16 +134,6 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
 pub fn skip_leading_ws_and_comments(input: &str) -> &str {
     let bytes = input.as_bytes();
     let mut i = 0usize;
-    // Unicode whitespace allowed at the START (char::is_whitespace —
-    // NBSP/U+3000 from rich text or CJK input; the ASCII-only narrowing
-    // silently skipped collection creation with a success response).
-    while let Some((idx, ch)) = input[i..].char_indices().next() {
-        if ch.is_whitespace() {
-            i += idx + ch.len_utf8();
-        } else {
-            break;
-        }
-    }
     loop {
         // Unicode whitespace anywhere whitespace is skipped.
         while let Some((idx, ch)) = input[i..].char_indices().next() {
@@ -198,13 +191,22 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
         // operand is DECODED so consumers never see the delimiter (a
         // literal-`logs` name mints a phantom no DROP can address).
         Some(b) if b.is_ascii_whitespace() || *b >= 0x80 => {
-            // >= 0x80 may be a multi-byte whitespace char (NBSP) — the
-            // skip helper handles unicode; non-ws multibyte simply won't
-            // strip further.
-            (
-                true,
-                skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
-            )
+            // Whitespace (any width — >= 0x80 may be NBSP); if the
+            // operand is QUOTED, decode it (the conventional spaced
+            // spelling took this arm undecoded and minted phantom
+            // literal-`logs` collections).
+            let rest = skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]);
+            if let Some(q) = rest
+                .as_bytes()
+                .first()
+                .filter(|b| **b == b'"' || **b == b'`')
+            {
+                let quote = *q as char;
+                if let Some((name, _tail)) = rest[1..].split_once(quote) {
+                    return (true, name);
+                }
+            }
+            (true, rest)
         }
         Some(b) if *b == b'"' || *b == b'`' => {
             let rest = &cleaned["IF NOT EXISTS".len()..];
@@ -264,7 +266,10 @@ pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize>
                     }
                     continue;
                 }
-                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                // Backticks quote identifiers (GenericDialect) — text
+                // inside them is NOT code (keywords/apostrophes/parens
+                // in a `col` gutted the predicate).
+                if matches!(bytes[i], b'\'' | b'"' | b'`') {
                     quote = Some(bytes[i]);
                     i += 1;
                     continue;
@@ -322,6 +327,15 @@ mod tests {
         );
         // Backtick-quoted identifiers (GenericDialect accepts them).
         assert_eq!(strip_if_not_exists("IF NOT EXISTS`logs`"), (true, "logs"));
+        // The conventional SPACED spelling decodes too (undecoded, it
+        // minted a phantom literal-backtick collection). A QUOTED operand
+        // yields the DECODED NAME ONLY — consumers that need the tail
+        // (rank profiles' AS clause) read it from the original input;
+        // tracked in the TD.
+        assert_eq!(
+            strip_if_not_exists("IF NOT EXISTS `logs` (id INT)"),
+            (true, "logs")
+        );
         // Word boundary: no separator, no strip.
         assert_eq!(
             strip_if_not_exists("IF NOT EXISTSx"),
