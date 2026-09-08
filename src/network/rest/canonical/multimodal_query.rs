@@ -1001,12 +1001,13 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
 
 fn collect_from_targets(sql: &str, targets: &mut Vec<String>) {
     let mut previous_was_from = false;
-    let tokens = sql.split_whitespace().collect::<Vec<_>>();
+    let tokens = crate::core::utils::tokenize_sql_preserving_quotes(sql);
     for (index, token) in tokens.iter().enumerate() {
         if previous_was_from {
             let candidate = token
                 .trim_end_matches(')')
-                .trim_matches(|ch: char| matches!(ch, ',' | ';' | '"' | '`' | '[' | ']'));
+                .trim_matches(|ch: char| matches!(ch, ',' | ';' | '[' | ']'));
+            let candidate = crate::core::utils::decode_identifier(candidate);
             if !candidate.is_empty()
                 && !candidate.contains('(')
                 && !tokens
@@ -1014,7 +1015,7 @@ fn collect_from_targets(sql: &str, targets: &mut Vec<String>) {
                     .is_some_and(|next| next.starts_with('('))
                 && !candidate.eq_ignore_ascii_case("SELECT")
             {
-                push_unique_target(targets, candidate);
+                push_unique_target(targets, candidate.as_ref());
             }
             previous_was_from = false;
             continue;
@@ -2558,5 +2559,18 @@ mod tests {
         assert!(targets.contains(&"docs".to_string()));
         assert!(targets.contains(&"archive".to_string()));
         assert!(!targets.contains(&"TRACES".to_string()));
+
+        let quoted = explain_catalog_targets(
+            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data""#,
+        );
+        assert!(quoted.contains(&"team\"logs".to_string()), "got {quoted:?}");
+        assert!(
+            quoted.contains(&"tenant,west".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"archive data".to_string()),
+            "got {quoted:?}"
+        );
     }
 }

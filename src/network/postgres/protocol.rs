@@ -2462,8 +2462,33 @@ impl PostgresProtocol {
     }
 
     fn extract_legacy_select_predicates(query: &str) -> anyhow::Result<Vec<SelectPredicate>> {
-        let aware_where = crate::core::utils::find_ascii_ci_at_top_level_checked(query, "WHERE")
+        let not_delimiter = |b: u8| {
+            !crate::core::utils::is_identifier_byte(b)
+                && b != b'.'
+                && b != b'`'
+                && b != b'"'
+                && b != b'\''
+        };
+        let bytes = query.as_bytes();
+        let mut search_from = 0usize;
+        let aware_where = loop {
+            let found = crate::core::utils::find_ascii_ci_at_top_level_checked(
+                &query[search_from..],
+                "WHERE",
+            )
             .map_err(|reason| anyhow::anyhow!("malformed SELECT structure: {reason}"))?;
+            let Some(relative) = found else {
+                break None;
+            };
+            let position = search_from + relative;
+            let end = position + "WHERE".len();
+            if (position == 0 || not_delimiter(bytes[position - 1]))
+                && (end >= bytes.len() || not_delimiter(bytes[end]))
+            {
+                break Some(position);
+            }
+            search_from = end;
+        };
         if Self::extract_select_where_clause(query).is_some() {
             Self::extract_select_where_predicates(query)
                 .ok_or_else(|| anyhow::anyhow!("unsupported or malformed WHERE predicate"))
@@ -3768,12 +3793,21 @@ impl PostgresProtocol {
 
         let raw_name = &after_table[..table_end];
         let table_name = crate::core::utils::decode_identifier(raw_name).to_lowercase();
+        let valid_unquoted = || {
+            let mut chars = raw_name.chars();
+            let Some(first) = chars.next() else {
+                return false;
+            };
+            (first == '_' || first.is_alphabetic())
+                && chars.all(|ch| ch == '_' || ch == '$' || ch.is_alphanumeric())
+        };
         if table_name.is_empty()
             || (!quoted
-                && matches!(
-                    table_name.to_ascii_uppercase().as_str(),
-                    "USING" | "AS" | "WITH" | "SELECT"
-                ))
+                && (!valid_unquoted()
+                    || matches!(
+                        table_name.to_ascii_uppercase().as_str(),
+                        "IF" | "NOT" | "EXISTS" | "USING" | "AS" | "WITH" | "SELECT"
+                    )))
         {
             return Err(anyhow!("CREATE TABLE is missing a valid table name"));
         }

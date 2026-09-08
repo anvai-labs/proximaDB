@@ -196,20 +196,99 @@ pub fn decode_identifier(ident: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(ident)
 }
 
+/// Tokenize SQL for lightweight authority discovery without splitting quoted
+/// identifiers or string literals. Commas and whitespace delimit tokens only
+/// outside quotes; line and nested block comments are discarded.
+pub(crate) fn tokenize_sql_preserving_quotes(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut quote = None;
+
+    let flush = |token: &mut String, tokens: &mut Vec<String>| {
+        if !token.is_empty() {
+            tokens.push(std::mem::take(token));
+        }
+    };
+
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = quote {
+            token.push(ch);
+            if ch == delimiter {
+                if chars.peek() == Some(&delimiter) {
+                    token.push(delimiter);
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            token.push(ch);
+        } else if ch == '-' && chars.peek() == Some(&'-') {
+            flush(&mut token, &mut tokens);
+            chars.next();
+            for comment_ch in chars.by_ref() {
+                if comment_ch == '\n' {
+                    break;
+                }
+            }
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            flush(&mut token, &mut tokens);
+            chars.next();
+            let mut depth = 1usize;
+            while let Some(comment_ch) = chars.next() {
+                if comment_ch == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    depth += 1;
+                } else if comment_ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        } else if ch.is_whitespace() || ch == ',' {
+            flush(&mut token, &mut tokens);
+        } else {
+            token.push(ch);
+        }
+    }
+    flush(&mut token, &mut tokens);
+    tokens
+}
+
 /// Case-insensitive `IF NOT EXISTS` prefix strip with a word boundary
 /// (whitespace OR an opening quote — `EXISTS"logs"` parses under the
 /// pinned GenericDialect). Returns (had_prefix, rest).
 pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
-    // Comments may sit between the keyword and the operand — skip them on
-    // BOTH sides (a comment after the prefix produced name '/*').
+    // Comments and arbitrary SQL whitespace may separate each keyword.
+    // Require trivia between words so identifier prefixes such as IFNOT and
+    // NOTEXISTS never match.
+    fn take_word<'a>(value: &'a str, word: &str) -> Option<&'a str> {
+        let head = value.get(..word.len())?;
+        head.eq_ignore_ascii_case(word)
+            .then(|| &value[word.len()..])
+    }
+    fn separated(value: &str) -> Option<&str> {
+        let remainder = skip_leading_ws_and_comments(value);
+        (remainder.len() < value.len()).then_some(remainder)
+    }
+
     let cleaned = skip_leading_ws_and_comments(input);
-    let Some(head) = cleaned.get(.."IF NOT EXISTS".len()) else {
+    let Some(after_if) = take_word(cleaned, "IF").and_then(separated) else {
         return (false, input);
     };
-    if !head.eq_ignore_ascii_case("IF NOT EXISTS") {
+    let Some(after_not) = take_word(after_if, "NOT").and_then(separated) else {
         return (false, input);
-    }
-    let rest = &cleaned["IF NOT EXISTS".len()..];
+    };
+    let Some(rest) = take_word(after_not, "EXISTS") else {
+        return (false, input);
+    };
     let next = rest.chars().next();
     match next {
         None => (true, ""),
@@ -227,14 +306,12 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
         // Paren-adjacent too (IF NOT EXISTS(x INT) — the paren is the
         // column-list opener, never identifier text; the fall-through
         // minted a collection named 'if').
-        Some(b) if *b == b'"' || *b == b'`' || *b == b'(' => {
-            (true, &cleaned["IF NOT EXISTS".len()..])
-        }
+        Some('"' | '`' | '(') => (true, rest),
         // Comment-ADJACENT operand (IF NOT EXISTS/* v2 */docs — comments
         // are whitespace to the lexer; the fall-through minted 'if').
-        Some(b) if *b == b'/' => {
-            let rest = skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]);
-            (rest != &cleaned["IF NOT EXISTS".len()..], rest)
+        Some('/') => {
+            let operand = skip_leading_ws_and_comments(rest);
+            (operand != rest, operand)
         }
         Some(_) => (false, input),
     }
@@ -413,6 +490,11 @@ mod tests {
         assert_eq!(
             strip_if_not_exists("IF NOT EXISTSécole"),
             (false, "IF NOT EXISTSécole")
+        );
+        assert_eq!(strip_if_not_exists("IF\nNOT\tEXISTS docs"), (true, "docs"));
+        assert_eq!(
+            strip_if_not_exists("IF/* one */NOT /* two */ EXISTS docs"),
+            (true, "docs")
         );
         // Quoted operands pass through raw (consumers decode).
         assert_eq!(

@@ -511,8 +511,7 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     // as FROM targets (FROM TRACES('ops') → 'TRACES'); tokens CONTAINING
     // a paren are function-call positions and skipped (the REST twin's
     // rule).
-    let normalized = sql.replace(['\n', '\t', ','], " ");
-    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    let tokens = crate::core::utils::tokenize_sql_preserving_quotes(sql);
 
     for (window_index, window) in tokens.windows(2).enumerate() {
         if let [keyword, target] = window {
@@ -542,22 +541,22 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 // TRACES('ops'), TRACES ('ops'), TRACES ( 'ops' )). INSERT
                 // column lists (INTO/UPDATE) and subquery opens never
                 // trigger it.
-                // The gate needs the paren to open a CALL arg list, not a
-                // subquery/derived table: require the paren token to
-                // carry a QUOTED first arg ITSELF (TRACES('ops'),
-                // TRACES ( 'ops' )) — a bare '(' followed by a separate
-                // quoted token is a derived table (t, (SELECT 'a'...))
-                // and must NOT gate. Backtick args count (the dialect's
-                // other delimiter). get(1..) keeps the slice
-                // char-boundary-safe (a multibyte-initial token panicked
-                // on the byte form — abort under panic=abort).
+                // The gate needs a quoted first call argument after the open
+                // paren. Whitespace may split `TRACES ( 'ops')` into three
+                // tokens; a derived table starts with SELECT, not a quote.
+                // strip_prefix is char-boundary-safe for multibyte targets.
                 let is_from_join = matches!(keyword.as_str(), "FROM" | "JOIN");
                 let arg_openers = ['\'', '"', '`'];
+                let call_tail = &tokens[window_index + 2..];
                 let next_opens_call = is_from_join
-                    && tokens.get(window_index + 2).is_some_and(|t| {
-                        t.starts_with('(')
-                            && t.get(1..)
-                                .is_some_and(|rest| rest.trim_start().starts_with(arg_openers))
+                    && call_tail.first().is_some_and(|token| {
+                        token.strip_prefix('(').is_some_and(|after_open| {
+                            after_open.trim_start().starts_with(arg_openers)
+                                || (after_open.trim().is_empty()
+                                    && call_tail
+                                        .get(1)
+                                        .is_some_and(|arg| arg.starts_with(arg_openers)))
+                        })
                     });
                 if !target.is_empty() && !next_opens_call {
                     targets.push(target.to_string());
@@ -1379,6 +1378,19 @@ mod tests {
         assert!(targets.contains(&"default.docs".to_string()));
         assert!(targets.contains(&"graph.edges".to_string()));
         assert!(targets.contains(&"vectors".to_string()));
+
+        let quoted = explain_catalog_targets(
+            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data""#,
+        );
+        assert!(quoted.contains(&"team\"logs".to_string()), "got {quoted:?}");
+        assert!(
+            quoted.contains(&"tenant,west".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"archive data".to_string()),
+            "got {quoted:?}"
+        );
     }
 
     #[test]

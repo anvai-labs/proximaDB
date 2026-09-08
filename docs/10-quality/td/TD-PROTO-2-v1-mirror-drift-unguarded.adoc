@@ -1976,15 +1976,22 @@ pinned + narrated:**
 - Port EXPLAIN recognizes a quoted extension argument even when whitespace
   splits `FROM TRACES ( 'ops')` into three tokens, avoiding a phantom `TRACES`
   authority while retaining the real `ops` target.
+- Unquoted legacy CREATE names use a positive identifier grammar rather than a
+  clause-only denylist, so punctuation and digit-leading tokens cannot become
+  collections. Both EXPLAIN target scanners pass intact quoted identifiers to
+  a shared quote/comment-aware tokenizer and decoder, preserving whitespace,
+  commas, and doubled-delimiter semantics.
+- The optional CREATE clause accepts SQL whitespace/comments between all three
+  keywords. The checked legacy-WHERE presence loop applies identifier
+  boundaries, so a WHERE-less fallback containing `somewhere` remains valid.
 
 **Consolidation review round 51 (2026-09-08, follow-up PR #1852):**
 - The call gate's byte slice panicked on multibyte-initial tokens
   (EXPLAIN with a Cyrillic table aborted the server under
-  panic=abort — three compiled repros) — get(1..) char-boundary
-  safe. The gate requires the QUOTED arg in the SAME token as the
-  paren (a bare paren + separate quoted token is a derived table —
-  comma-joins false-positived and dropped the real FROM target;
-  backtick args now count).
+  panic=abort — three compiled repros) — strip_prefix is char-boundary
+  safe. A quoted call arg may share the paren token or follow a bare
+  paren (`TRACES ( 'ops')`); derived tables start with SELECT, while
+  backtick args count as the dialect's other quoted form.
 - strip_if_not_exists accepts the comment-ADJACENT operand (the
   fall-through minted 'if' from IF NOT EXISTS/* v2 */docs — round
   44's claim only covered the spaced form). clean_identifier decodes

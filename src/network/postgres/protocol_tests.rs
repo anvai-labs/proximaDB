@@ -46,6 +46,11 @@ fn extract_where_handles_trailing_where_and_prefixed_columns() {
             "malformed structure must not become an unfiltered scan: {malformed}"
         );
     }
+    assert!(
+        PostgresProtocol::extract_legacy_select_predicates("SELECT somewhere FROM t")
+            .expect("an identifier containing WHERE is still WHERE-less")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -60,6 +65,11 @@ fn legacy_create_table_target_rejects_missing_or_unterminated_names() {
         "CREATE TABLE (id INT) USING VECTOR",
         "CREATE TABLE \"unterminated USING VECTOR",
         "CREATE TABLE `unterminated USING VECTOR",
+        "CREATE TABLE ; USING VECTOR",
+        "CREATE TABLE ) USING VECTOR",
+        "CREATE TABLE , USING VECTOR",
+        "CREATE TABLE 123 USING VECTOR",
+        "CREATE TABLE foo-bar USING VECTOR",
     ] {
         let error = PostgresProtocol::extract_legacy_create_table_target(query)
             .expect_err("malformed CREATE TABLE must fail closed");
@@ -90,6 +100,17 @@ fn legacy_create_table_target_rejects_missing_or_unterminated_names() {
         .expect("doubled quote escapes one identifier delimiter"),
         ("team\"logs".to_string(), true)
     );
+    for query in [
+        "CREATE TABLE IF\nNOT EXISTS logs USING VECTOR",
+        "CREATE TABLE IF\u{00a0}NOT\tEXISTS logs USING VECTOR",
+        "CREATE TABLE IF /* one */ NOT /* two */ EXISTS logs USING VECTOR",
+    ] {
+        assert_eq!(
+            PostgresProtocol::extract_legacy_create_table_target(query)
+                .expect("SQL trivia may separate IF NOT EXISTS"),
+            ("logs".to_string(), true)
+        );
+    }
 }
 
 #[test]
