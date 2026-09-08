@@ -858,10 +858,16 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                     .unwrap_or("MATCH (n) RETURN n LIMIT 10");
                 // Honor config.graph like the v1 twin — without the
                 // injection the query silently targets the DEFAULT graph.
-                let cypher = crate::network::rest::canonical::multimodal_query::inject_graph_target_into_cypher(
-                    config.get("graph").and_then(|v| v.as_str()).unwrap_or("default"),
-                    cypher,
-                );
+                let graph = config
+                    .get("graph")
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!("components[{component_index}].config.graph must be a string")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or("default");
+                let cypher = crate::core::utils::inject_graph_target_into_cypher(graph, cypher);
                 format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(&cypher))
             }
             // 'log'/'metric' are the v1 REST twin's component vocabulary

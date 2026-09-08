@@ -408,7 +408,6 @@ pub struct ComponentPlanResponse {
     pub parallelizable: bool,
 }
 
-/// Create router for unified query endpoints
 pub fn create_router() -> Router<UnifiedQueryApiState> {
     Router::new()
         .route("/execute", post(execute_query))
@@ -503,10 +502,6 @@ async fn execute_query_via_adapter(
     Ok(JsonResponse(response))
 }
 
-/// Transform QueryResult from facade to QueryResultResponse for REST API
-///
-/// This function handles backward-compatible conversion from the unified
-/// QueryResult type to the REST API response format.
 fn transform_query_result_to_response(
     result: crate::query::facade::QueryResult,
     elapsed_ms: f64,
@@ -674,34 +669,6 @@ async fn execute_multi_model_via_adapter(
 ///
 /// Generates SQL with multi-model extensions (VECTOR_SEARCH, GRAPH_QUERY, etc.)
 /// that can be executed through the federated query engine.
-pub(crate) fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
-    let graph = graph.trim();
-    let cypher = cypher.trim().trim_end_matches(';').trim();
-
-    if graph.is_empty() || graph == "default" {
-        return cypher.to_string();
-    }
-
-    // ASCII-case search directly on the original (shared helper) —
-    // to_uppercase() can change UTF-8 byte lengths, and offsets found in
-    // the copy can slice the original mid-character (panic) or past its
-    // end.
-    if crate::core::utils::find_ascii_ci(cypher, " FROM ").is_some() {
-        return cypher.to_string();
-    }
-
-    let insertion_index = [" WHERE ", " RETURN ", " ORDER BY ", " LIMIT ", " SKIP "]
-        .iter()
-        .filter_map(|needle| crate::core::utils::find_ascii_ci(cypher, needle))
-        .min();
-
-    if let Some(index) = insertion_index {
-        format!("{} FROM {}{}", &cypher[..index], graph, &cypher[index..])
-    } else {
-        format!("{} FROM {}", cypher, graph)
-    }
-}
-
 fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<String> {
     let mut sql_parts = Vec::new();
 
@@ -797,7 +764,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
                             ApiError::InvalidArgument(
-                                "vector component config.collection must be a string".to_string(),
+                                "document component config.collection must be a string".to_string(),
                             )
                         })
                     })
@@ -837,7 +804,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .get("cypher")
                     .and_then(|v| v.as_str())
                     .unwrap_or("MATCH (n) RETURN n");
-                let cypher = inject_graph_target_into_cypher(graph, cypher);
+                let cypher = crate::core::utils::inject_graph_target_into_cypher(graph, cypher);
 
                 format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(&cypher))
             }
@@ -1232,7 +1199,6 @@ fn extract_value_from_array(array: &dyn arrow::array::Array, row_idx: usize) -> 
     }
 }
 
-/// Detect the source model from the schema
 fn detect_source_model(schema: &arrow::datatypes::Schema) -> String {
     let field_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
@@ -1917,7 +1883,6 @@ async fn get_prepared_stats(
     }))
 }
 
-/// Convert a JSON value to a ParameterValue
 fn json_to_parameter_value(v: &serde_json::Value) -> ParameterValue {
     match v {
         serde_json::Value::String(s) => ParameterValue::String(s.clone()),
@@ -2354,7 +2319,7 @@ mod tests {
     fn test_inject_graph_target_into_cypher_does_not_duplicate_from_clause() {
         let cypher = "MATCH (n:Person) FROM social RETURN n.name";
         assert_eq!(
-            inject_graph_target_into_cypher("other", cypher),
+            crate::core::utils::inject_graph_target_into_cypher("other", cypher),
             cypher.to_string()
         );
     }

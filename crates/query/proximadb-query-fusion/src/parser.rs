@@ -341,7 +341,12 @@ impl FederatedParser {
         let collection = Self::unquote_sql_string(&parts[0]);
         let query_text = Self::unquote_sql_string(&parts[1]);
         let query_vector = self.parse_vector_argument(&parts[2])?;
-        let k = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+        // Present-but-unparseable k rejects the extension (silent-default
+        // class — see VECTOR_SEARCH's top_k).
+        let k = match parts.get(3) {
+            Some(s) => s.parse().ok()?,
+            None => 10,
+        };
         // Empty rank_profile string → None (retrieval-only path); a
         // non-empty string → Some(name). Mirrors the REST DTO
         // `rank_profile: Option<String>` contract.
@@ -371,7 +376,16 @@ impl FederatedParser {
 
         let collection = Self::unquote_sql_string(&parts[0]);
         let query_vector = self.parse_vector_argument(&parts[1])?;
-        let top_k = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+        // A present-but-unparseable top_k REJECTS the extension (the
+        // silent default-to-10 class the JSON twins eliminated — a user
+        // asking for 50 got 10 with no signal).
+        let top_k = match parts.get(2) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| ()) // caller turns Err into None
+                .ok()?,
+            None => 10,
+        };
 
         Some(SqlExtension::VectorSearch {
             collection,

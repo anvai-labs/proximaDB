@@ -81,13 +81,22 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
                 i += 1;
             }
             None => {
-                // Line comments: an apostrophe INSIDE '-- don't' must not
-                // open quote state (it swallowed every target after it).
+                // Comments: an apostrophe INSIDE '-- don't' or a block
+                // comment must not open quote state (it swallowed every
+                // match after it).
                 if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
                     i += 2;
                     while i < bytes.len() && bytes[i] != b'\n' {
                         i += 1;
                     }
+                    continue;
+                }
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = i.saturating_add(2);
                     continue;
                 }
                 if bytes[i] == b'\'' || bytes[i] == b'"' {
@@ -214,5 +223,33 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
             continue;
         }
         search_start = after_name;
+    }
+}
+
+pub fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
+    let graph = graph.trim();
+    let cypher = cypher.trim().trim_end_matches(';').trim();
+
+    if graph.is_empty() || graph == "default" {
+        return cypher.to_string();
+    }
+
+    // ASCII-case search directly on the original (shared helper) —
+    // to_uppercase() can change UTF-8 byte lengths, and offsets found in
+    // the copy can slice the original mid-character (panic) or past its
+    // end.
+    if find_ascii_ci(cypher, " FROM ").is_some() {
+        return cypher.to_string();
+    }
+
+    let insertion_index = [" WHERE ", " RETURN ", " ORDER BY ", " LIMIT ", " SKIP "]
+        .iter()
+        .filter_map(|needle| find_ascii_ci(cypher, needle))
+        .min();
+
+    if let Some(index) = insertion_index {
+        format!("{} FROM {}{}", &cypher[..index], graph, &cypher[index..])
+    } else {
+        format!("{} FROM {}", cypher, graph)
     }
 }

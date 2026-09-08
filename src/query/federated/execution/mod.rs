@@ -1673,7 +1673,7 @@ impl FederatedExecutor {
                     // The ONE non-finite policy: the f32 narrowing can
                     // overflow (1e300 → inf) — reject, don't dispatch.
                     serde_json::Value::Number(n) => {
-                        n.as_f64().map(|f| f as f32).filter(|f| f.is_finite())
+                        n.as_f64().and_then(crate::core::utils::finite_f32)
                     }
                     _ => None,
                 })
@@ -2464,19 +2464,19 @@ impl FederatedExecutor {
     ) -> Result<f32> {
         match value {
             serde_json::Value::Number(number) => {
-                // The ONE non-finite policy: serde_json numbers are always
-                // finite as f64, but the f32 NARROWING can overflow to inf
-                // (1e300) — the old ok_or_else 'non-finite' arm was dead
-                // code and inf reached the kernels on this path.
-                let narrowed = number.as_f64().unwrap_or(f64::NAN) as f32;
-                if !narrowed.is_finite() {
-                    return Err(anyhow!(
-                        "Nested vector source '{}.{}' contains a component outside the finite f32 range",
-                        source,
-                        nested_path.join(".")
-                    ));
-                }
-                Ok(narrowed)
+                // The ONE non-finite policy (shared finite_f32 helper):
+                // serde_json numbers are always finite as f64, but the f32
+                // NARROWING can overflow to inf (1e300).
+                number
+                    .as_f64()
+                    .and_then(crate::core::utils::finite_f32)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Nested vector source '{}.{}' contains a component outside the finite f32 range",
+                            source,
+                            nested_path.join(".")
+                        )
+                    })
             }
             serde_json::Value::Object(object) => {
                 if let Some(inner) = object

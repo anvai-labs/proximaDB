@@ -1448,6 +1448,28 @@ angles after the main agent hit a rate limit):**
 - Tracked: the fusion parser's per-loop uppercase copies (~42-98KB
   transient per request on 14KB literals — hoist one copy; the
   eq_ignore_ascii_case window scan already landed in sql_parsing).
+
+**Consolidation review round 33 (2026-09-07):**
+- parse_predicate_value DECODES doubled quotes in WHERE string
+  literals — this PR's own producers (sql_quote) emit them, and an
+  apostrophe-bearing bound string silently matched nothing.
+- The DISTINCT detectors agree on whitespace class (any ASCII ws —
+  'DISTINCT\tname' projected the keyword away without dedup). The
+  quote-aware scanner skips BLOCK comments too (an apostrophe inside
+  /* don't */ opened permanent quote state).
+- Empty vectors permitted on the WRITE path again (a schema DEFAULT
+  '[]' made the whole table unwritable — the shared literal_to_vector
+  serves both explicit INSERTs and default application; every QUERY
+  boundary keeps the empty reject, develop-compatible asymmetry).
+- The multimodal twins type their remaining config: collection
+  required at BOTH document arms (the port silently queried
+  'default'; the REST error was mislabeled 'vector component'),
+  graph string-checked. The fusion parser rejects a
+  present-but-unparseable top_k/k (silently ran 10).
+- inject_graph_target_into_cypher homed in core::utils (recreating
+  the query-imports-network inversion round 30 eliminated). Six
+  inline finite_f32 copies swapped for the shared helper (the
+  component fn's unwrap_or(NAN) smell dropped with them).
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

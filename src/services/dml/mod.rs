@@ -5999,9 +5999,10 @@ impl DmlService {
         };
         match val {
             SqlValueLiteral::Array(arr) => {
-                if arr.is_empty() {
-                    return Err(anyhow!("vector elements must be non-empty"));
-                }
+                // NOTE: empty vectors are permitted on the WRITE path (a
+                // schema DEFAULT '[]' is legal config; every QUERY boundary
+                // rejects empty — the asymmetry is deliberate, develop-
+                // compatible, and avoids breaking whole tables).
                 arr.iter()
                     .map(|v| match v {
                         SqlValueLiteral::Float(f) => ensure_finite(*f as f32),
@@ -6014,7 +6015,7 @@ impl DmlService {
                 // Lazy iterator (an intermediate Vec cost ~36KB per
                 // 1536-dim row on the INSERT coercion path); emptiness is
                 // checked on the RESULT.
-                let parsed: Result<Vec<f32>> = value
+                value
                     .trim()
                     .trim_start_matches('[')
                     .trim_end_matches(']')
@@ -6027,12 +6028,7 @@ impl DmlService {
                             .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))?;
                         ensure_finite(f)
                     })
-                    .collect();
-                let parsed = parsed?;
-                if parsed.is_empty() {
-                    return Err(anyhow!("vector elements must be non-empty"));
-                }
-                Ok(parsed)
+                    .collect()
             }
             _ => Err(anyhow!("Vector column expects array value")),
         }

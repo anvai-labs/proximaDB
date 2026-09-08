@@ -142,10 +142,16 @@ pub(crate) fn select_has_distinct(sql: &str) -> bool {
         return false;
     };
 
-    sql[select_pos + 6..from_pos]
-        .trim_start()
-        .to_uppercase()
-        .starts_with("DISTINCT ")
+    // Same whitespace class as the strip in extract_select_items (any
+    // ASCII whitespace after the keyword — the two detectors must agree
+    // or DISTINCT\t queries project the keyword away without dedup).
+    let head = sql[select_pos + 6..from_pos].trim_start();
+    head.len() >= 8
+        && head[..8].eq_ignore_ascii_case("DISTINCT")
+        && head
+            .as_bytes()
+            .get(8)
+            .is_some_and(|b| b.is_ascii_whitespace())
 }
 
 pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
@@ -431,9 +437,16 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
     if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
         || (trimmed.starts_with('"') && trimmed.ends_with('"'))
     {
-        return Some(PredicateValue::String(
-            trimmed[1..trimmed.len() - 1].to_string(),
-        ));
+        let inner = &trimmed[1..trimmed.len() - 1];
+        // Decode SQL-standard doubled quotes — this PR's own producers
+        // (sql_quote) emit them, and a WHERE literal containing an
+        // apostrophe silently matched nothing undecoded.
+        let decoded = if trimmed.starts_with('\'') {
+            inner.replace("''", "'")
+        } else {
+            inner.replace("\"\"", "\"")
+        };
+        return Some(PredicateValue::String(decoded));
     }
     if let Ok(value) = trimmed.parse::<i64>() {
         return Some(PredicateValue::Int(value));
