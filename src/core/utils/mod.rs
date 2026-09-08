@@ -208,13 +208,28 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
         // strips both delimiters at the pgwire create path. Decoding in
         // the strip truncated doubled-quote escapes and dropped the tail
         // (rounds 45-47 churn).
-        Some(b) if b.is_ascii_whitespace() || *b >= 0x80 => (
-            true,
-            skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
-        ),
+        // Char-based whitespace (NBSP included) — a bare >= 0x80 byte
+        // test treated é as a separator while is_identifier_byte counts
+        // it as identifier text.
+        Some(_)
+            if cleaned["IF NOT EXISTS".len()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace) =>
+        {
+            (
+                true,
+                skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
+            )
+        }
         // Quote-ADJACENT operand (IF NOT EXISTS"logs" parses under the
         // pinned dialect): strip, rest undecoded (consumers decode).
-        Some(b) if *b == b'"' || *b == b'`' => (true, &cleaned["IF NOT EXISTS".len()..]),
+        // Paren-adjacent too (IF NOT EXISTS(x INT) — the paren is the
+        // column-list opener, never identifier text; the fall-through
+        // minted a collection named 'if').
+        Some(b) if *b == b'"' || *b == b'`' || *b == b'(' => {
+            (true, &cleaned["IF NOT EXISTS".len()..])
+        }
         Some(_) => (false, input),
     }
 }

@@ -534,17 +534,22 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 } else {
                     target
                 };
-                let target = crate::core::utils::decode_identifier(target.trim_matches(['"', '`']));
-                // Call-position gate, FROM/JOIN only: skip when the next
-                // token opens an EXTENSION call's argument list — a
-                // catalog-function name followed by a QUOTED first arg
-                // (TRACES ('ops')). INSERT column lists (INTO/UPDATE) and
-                // subquery opens never trigger it.
+                // decode alone (a pre-trim re-introduces the overtrim the
+                // shared decoder exists to avoid).
+                let target = crate::core::utils::decode_identifier(target);
+                // Call-position gate, FROM/JOIN only: skip when a QUOTED
+                // first argument follows (adjacent OR in the next token —
+                // TRACES('ops'), TRACES ('ops'), TRACES ( 'ops' )). INSERT
+                // column lists (INTO/UPDATE) and subquery opens never
+                // trigger it.
                 let is_from_join = matches!(keyword.as_str(), "FROM" | "JOIN");
-                let next_opens_call = is_from_join
-                    && tokens.get(window_index + 2).is_some_and(|t| {
-                        t.starts_with('(') && t[1..].trim_start().starts_with(['\'', '"'])
+                let tail = &tokens[window_index + 2..];
+                let opens = tail.first().is_some_and(|t| t.starts_with('('));
+                let quoted = tail.get(1).is_some_and(|t| t.starts_with(['\'', '"']))
+                    || tail.first().is_some_and(|t| {
+                        t.len() > 1 && t[1..].trim_start().starts_with(['\'', '"'])
                     });
+                let next_opens_call = is_from_join && opens && quoted;
                 if !target.is_empty() && !next_opens_call {
                     targets.push(target.to_string());
                 }

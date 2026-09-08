@@ -2917,15 +2917,12 @@ impl PostgresProtocol {
     }
 
     fn clean_identifier(identifier: &str) -> String {
-        // The ONE shared decoder on the last dot-segment (the qualifier
-        // split stays — cross-namespace routing parses ns.table).
-        crate::core::utils::decode_identifier(
-            crate::core::utils::decode_identifier(identifier.trim())
-                .split('.')
-                .next_back()
-                .unwrap_or_default(),
-        )
-        .to_string()
+        // Split FIRST on the original (each dot-segment carries its own
+        // delimiters — decoding before the split left a stray quote on
+        // fully-quoted qualified identifiers like "t"."col"), then decode
+        // the final segment (cross-namespace routing parses ns.table).
+        let last = identifier.trim().rsplit('.').next().unwrap_or_default();
+        crate::core::utils::decode_identifier(last).to_string()
     }
 
     /// Detect store type for SELECT queries

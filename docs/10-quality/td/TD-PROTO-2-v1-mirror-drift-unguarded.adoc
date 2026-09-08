@@ -1917,6 +1917,25 @@ pinned + narrated:**
   (backticked rank-profile names keep delimiters; doubled-quote
   unescape diverges from the shared decoder — unify on the helper).
 
+**Consolidation review round 49 (2026-09-08, follow-up PR #1852):**
+- clean_identifier splits BEFORE decoding (decoding first left a
+  stray quote on fully-quoted qualified identifiers — "t"."col"
+  became the column name '"col'; compiled repro verified).
+- strip_if_not_exists: paren-ADJACENT operand accepted (the
+  fall-through minted a collection named 'if' from IF NOT
+  EXISTS(x INT)) and the whitespace boundary is CHAR-based (the
+  bare >= 0x80 byte test treated é as a separator).
+- The EXPLAIN call gate covers the SPACED argument form (TRACES
+  ( 'ops' ) — a bare '(' token defeated the adjacency requirement)
+  and the pre-trim before decode dropped (overtrim re-introduced).
+- Tracked: execute_create_table's operand EXTENT is quote-blind
+  ("my logs" truncates at the space — the quote-aware extent exists
+  in extract_identifier); a THIRD hand-rolled keyword-boundary
+  predicate (extract_select_limit) diverges from the shared
+  not_delimiter (hoist one boundary-aware locator); the twins'
+  empty-components error string is copy-pasted (one const beside
+  the shared helpers).
+
 == Not in scope
 
 The v2 package already has both generation (`PROXIMADB_PROTO_REGEN=1`) and the
