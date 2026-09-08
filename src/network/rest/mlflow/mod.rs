@@ -36,11 +36,15 @@ use crate::storage::document::DocumentService;
 #[derive(Clone)]
 pub struct MlflowState {
     document: Arc<DocumentService>,
+    registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
 }
 
 impl MlflowState {
-    pub fn new(document: Arc<DocumentService>) -> Self {
-        Self { document }
+    pub fn new(
+        document: Arc<DocumentService>,
+        registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
+    ) -> Self {
+        Self { document, registry }
     }
 }
 
@@ -62,6 +66,8 @@ fn is_enabled(value: Option<&str>) -> bool {
         None => false,
     }
 }
+
+pub mod registry;
 
 pub fn mlflow_routes() -> Router<MlflowState> {
     Router::new()
@@ -92,12 +98,13 @@ pub fn mlflow_routes() -> Router<MlflowState> {
             "/metrics/get-history",
             get(metrics_get_history).post(metrics_get_history),
         )
+        .merge(registry::registry_routes())
 }
 
 /// MLflow read endpoints are dual-shaped on the wire: the proto HTTP
 /// annotations map them to **GET with query-string parameters** in current
 /// clients, while older clients POST a JSON body. Accept both.
-struct MlflowRead<T>(T);
+pub(crate) struct MlflowRead<T>(pub(crate) T);
 
 impl<S, T> axum::extract::FromRequest<S> for MlflowRead<T>
 where
@@ -403,14 +410,14 @@ struct RunsSearchResponse {
 // Error envelope — MLflow native
 // ---------------------------------------------------------------------------
 
-struct MlflowError {
+pub(crate) struct MlflowError {
     status: StatusCode,
     code: &'static str,
     message: String,
 }
 
 impl MlflowError {
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "RESOURCE_DOES_NOT_EXIST",
@@ -418,7 +425,7 @@ impl MlflowError {
         }
     }
 
-    fn exists(message: impl Into<String>) -> Self {
+    pub(crate) fn exists(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "RESOURCE_ALREADY_EXISTS",
@@ -426,7 +433,7 @@ impl MlflowError {
         }
     }
 
-    fn invalid(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_PARAMETER_VALUE",
@@ -434,7 +441,7 @@ impl MlflowError {
         }
     }
 
-    fn invalid_state(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid_state(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_STATE",
@@ -442,7 +449,7 @@ impl MlflowError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "INTERNAL_ERROR",
@@ -504,7 +511,7 @@ impl From<RunStoreError> for MlflowError {
     }
 }
 
-type MlflowResult<T> = Result<T, MlflowError>;
+pub(crate) type MlflowResult<T> = Result<T, MlflowError>;
 
 // ---------------------------------------------------------------------------
 // Lowering helpers
@@ -1154,7 +1161,7 @@ impl FieldFilter {
     }
 }
 
-fn like_match(value: &str, pattern: &str) -> bool {
+pub(crate) fn like_match(value: &str, pattern: &str) -> bool {
     // SQL LIKE: % = any run, _ = one char. Case-sensitive (MLflow is).
     let mut regex = String::from("^");
     for c in pattern.chars() {
@@ -1221,7 +1228,7 @@ fn parse_run_filter(filter: &str) -> MlflowResult<Vec<FieldFilter>> {
     Ok(out)
 }
 
-fn split_filter_clauses(filter: &str) -> MlflowResult<Vec<&str>> {
+pub(crate) fn split_filter_clauses(filter: &str) -> MlflowResult<Vec<&str>> {
     let bytes = filter.as_bytes();
     let mut clauses = Vec::new();
     let mut quote = None;
@@ -1270,7 +1277,10 @@ fn split_filter_clauses(filter: &str) -> MlflowResult<Vec<&str>> {
     Ok(clauses)
 }
 
-fn parse_filter_parts(rest: &str, string_value: bool) -> MlflowResult<(String, String, String)> {
+pub(crate) fn parse_filter_parts(
+    rest: &str,
+    string_value: bool,
+) -> MlflowResult<(String, String, String)> {
     let identifier = r#"(?:`(?:``|[^`])+`|"(?:""|[^"])+"|[^\s!<>=]+)"#;
     let pattern = if string_value {
         format!(r#"(?i)^\s*({identifier})\s*(!=|=|LIKE)\s*'((?:''|[^'])*)'\s*$"#)
@@ -1348,7 +1358,14 @@ mod tests {
         let engine = Arc::new(SstEngine::new().await.unwrap());
         let document = Arc::new(DocumentService::new(engine));
         mlflow_routes()
-            .with_state(MlflowState::new(document))
+            .with_state(MlflowState::new(
+                document,
+                Arc::new(
+                    proximadb_catalog::model_registry_service::CatalogModelRegistryService::new(
+                        Arc::new(crate::catalog::CatalogManager::new()),
+                    ),
+                ),
+            ))
             .layer(axum::Extension(tenant_ctx(tenant)))
     }
 

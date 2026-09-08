@@ -143,6 +143,56 @@ def main() -> int:
 
     step("restore_experiment", do_restore)
 
+    # 6. Registry through the REAL client (TD-MLOPS-1 slice 3): registered
+    # models lower to xCatalog registries; version creation and stage
+    # transitions are the documented honest rejections.
+    def do_model_create():
+        client.create_registered_model("conformance-model")
+        model = client.get_registered_model("conformance-model")
+        assert model.name == "conformance-model"
+
+    step("create+get_registered_model", do_model_create)
+
+    def do_model_search():
+        models = client.search_registered_models(
+            filter_string="name LIKE '%conformance%'"
+        )
+        assert any(m.name == "conformance-model" for m in models), models
+
+    step("search_registered_models", do_model_search)
+
+    def do_version_create_rejected():
+        import mlflow
+
+        try:
+            client.create_model_version("conformance-model", "s3://bucket/model")
+        except mlflow.exceptions.MlflowException as exc:
+            assert "lifecycle API" in str(exc), str(exc)
+        else:
+            raise AssertionError("create_model_version must be rejected")
+
+    step("model_version_create_rejected", do_version_create_rejected)
+
+    def do_stage_rejected():
+        import mlflow
+
+        try:
+            client.transition_model_version_stage(
+                "conformance-model", "1", "Production"
+            )
+        except mlflow.exceptions.MlflowException as exc:
+            assert "alias" in str(exc).lower(), str(exc)
+        else:
+            raise AssertionError("transition-stage must be rejected")
+
+    step("transition_stage_rejected_with_alias_pointer", do_stage_rejected)
+
+    def do_model_versions_empty():
+        versions = client.search_model_versions("name='conformance-model'")
+        assert list(versions) == [], list(versions)
+
+    step("model_versions_search_empty", do_model_versions_empty)
+
     total = len(PASSED)
     print(f"CONFORMANCE_STEPS={total}")
     # Fail the workflow outright if ANY attempted step missed. Keep this

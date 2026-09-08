@@ -541,7 +541,10 @@ impl RestServer {
 
         // TD-MLOPS-1 slice 2: MLflow-compatible tracking wire, default OFF.
         if super::mlflow::enabled() {
-            let mlflow_state = super::mlflow::MlflowState::new(state.document_service.clone());
+            let mlflow_state = super::mlflow::MlflowState::new(
+                state.document_service.clone(),
+                state.model_registry_service.clone(),
+            );
             let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state);
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
             tracing::info!("✅ MLflow compatibility wire enabled at /api/2.0/mlflow");
@@ -925,7 +928,10 @@ impl RestServer {
 
         // TD-MLOPS-1 slice 2: MLflow-compatible tracking wire, default OFF.
         if super::mlflow::enabled() {
-            let mlflow_state = super::mlflow::MlflowState::new(state.document_service.clone());
+            let mlflow_state = super::mlflow::MlflowState::new(
+                state.document_service.clone(),
+                state.model_registry_service.clone(),
+            );
             let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state);
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
             tracing::info!("✅ MLflow compatibility wire enabled at /api/2.0/mlflow");
