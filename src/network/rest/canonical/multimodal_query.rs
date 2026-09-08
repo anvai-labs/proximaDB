@@ -771,7 +771,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .transpose()?
                     .ok_or_else(|| {
                         ApiError::InvalidArgument(
-                            "vector component config.collection is required".to_string(),
+                            "document component config.collection is required".to_string(),
                         )
                     })?;
                 let filter = component
@@ -2277,6 +2277,20 @@ mod tests {
             .expect_err("nonnumeric vector elements must fail closed");
         assert!(matches!(error, ApiError::InvalidArgument(_)));
         assert!(error.to_string().contains("query_vector[1]"));
+    }
+
+    #[test]
+    fn document_component_keeps_default_collection() {
+        let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+            "components": [{
+                "component_type": "document",
+                "config": {"filter": "active = true"}
+            }]
+        }))
+        .expect("request should parse");
+
+        let sql = convert_multi_model_to_sql(&request).expect("default collection is supported");
+        assert!(sql.contains("DOCUMENT_QUERY('default', 'active = true')"));
     }
 
     #[test]

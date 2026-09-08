@@ -81,22 +81,33 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
                 i += 1;
             }
             None => {
-                // Comments: an apostrophe INSIDE '-- don't' or a block
-                // comment must not open quote state (it swallowed every
-                // match after it).
+                // PostgreSQL block comments may nest. Ignore every nested
+                // comment body so function-like text there cannot become an
+                // EXPLAIN catalog target (and an apostrophe inside one must
+                // not open quote state).
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    i += 2;
+                    let mut depth = 1usize;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                // Line comments: an apostrophe INSIDE '-- don't' must not
+                // open quote state (it swallowed every target after it).
                 if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
                     i += 2;
                     while i < bytes.len() && bytes[i] != b'\n' {
                         i += 1;
                     }
-                    continue;
-                }
-                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-                    i += 2;
-                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                        i += 1;
-                    }
-                    i = i.saturating_add(2);
                     continue;
                 }
                 if bytes[i] == b'\'' || bytes[i] == b'"' {
@@ -127,7 +138,7 @@ pub fn finite_f32(value: f64) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::finite_f32;
+    use super::{collect_quoted_first_args, finite_f32};
 
     #[test]
     fn finite_f32_rejects_non_finite_and_overflowed_values() {
@@ -136,6 +147,38 @@ mod tests {
         assert_eq!(finite_f32(f64::NAN), None);
         assert_eq!(finite_f32(f64::INFINITY), None);
         assert_eq!(finite_f32(1e300), None);
+    }
+
+    #[test]
+    fn target_scanner_requires_a_complete_function_call_name() {
+        let mut targets = Vec::new();
+        collect_quoted_first_args(
+            "SELECT * FROM NOT_VECTOR_SEARCH('wrong', [1.0])",
+            "VECTOR_SEARCH",
+            &mut targets,
+        );
+        collect_quoted_first_args(
+            "SELECT * FROM πVECTOR_SEARCH('unicode_wrong', [1.0])",
+            "VECTOR_SEARCH",
+            &mut targets,
+        );
+        collect_quoted_first_args(
+            "/* outer /* VECTOR_SEARCH('block_wrong') */ comment */",
+            "VECTOR_SEARCH",
+            &mut targets,
+        );
+        collect_quoted_first_args(
+            "SELECT VECTOR_SEARCH + other_call('also_wrong')",
+            "VECTOR_SEARCH",
+            &mut targets,
+        );
+        collect_quoted_first_args(
+            "SELECT * FROM VECTOR_SEARCH ('right', [1.0])",
+            "VECTOR_SEARCH",
+            &mut targets,
+        );
+
+        assert_eq!(targets, ["right"]);
     }
 }
 
@@ -156,10 +199,37 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
     {
         let name_start = search_start + relative_pos;
         let after_name = name_start + function_name.len();
-        let Some(open_relative) = sql[after_name..].find('(') else {
-            break;
-        };
-        let mut arg_start = after_name + open_relative + 1;
+        // Keep searching after every rejected occurrence. SQL identifiers may
+        // contain ASCII letters, digits, underscores, and dollar signs, so a
+        // match within NOT_VECTOR_SEARCH or VECTOR_SEARCH_V2 is not this
+        // function. Likewise, only whitespace may separate the name and `(`;
+        // scanning forward to an unrelated call misattributes its first arg.
+        search_start = after_name;
+        let is_identifier_char = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '$');
+        if sql[..name_start]
+            .chars()
+            .next_back()
+            .is_some_and(is_identifier_char)
+            || sql[after_name..]
+                .chars()
+                .next()
+                .is_some_and(is_identifier_char)
+        {
+            continue;
+        }
+
+        let mut open = after_name;
+        while let Some(ch) = sql[open..].chars().next() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            open += ch.len_utf8();
+        }
+        if sql.as_bytes().get(open) != Some(&b'(') {
+            continue;
+        }
+
+        let mut arg_start = open + 1;
         while let Some(ch) = sql[arg_start..].chars().next() {
             if !ch.is_whitespace() {
                 break;

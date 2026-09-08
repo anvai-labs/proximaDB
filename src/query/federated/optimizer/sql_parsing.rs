@@ -134,6 +134,16 @@ pub(crate) fn split_top_level_list(input: &str) -> Vec<String> {
     items
 }
 
+fn strip_distinct_prefix(clause: &str) -> Option<&str> {
+    let keyword = clause.get(.."DISTINCT".len())?;
+    if !keyword.eq_ignore_ascii_case("DISTINCT") {
+        return None;
+    }
+    let rest = clause.get("DISTINCT".len()..)?;
+    rest.chars().next().filter(|ch| ch.is_whitespace())?;
+    Some(rest.trim_start())
+}
+
 pub(crate) fn select_has_distinct(sql: &str) -> bool {
     let Some(select_pos) = find_top_level_keyword(sql, "SELECT") else {
         return false;
@@ -142,16 +152,7 @@ pub(crate) fn select_has_distinct(sql: &str) -> bool {
         return false;
     };
 
-    // Same whitespace class as the strip in extract_select_items (any
-    // ASCII whitespace after the keyword — the two detectors must agree
-    // or DISTINCT\t queries project the keyword away without dedup).
-    let head = sql[select_pos + 6..from_pos].trim_start();
-    head.len() >= 8
-        && head[..8].eq_ignore_ascii_case("DISTINCT")
-        && head
-            .as_bytes()
-            .get(8)
-            .is_some_and(|b| b.is_ascii_whitespace())
+    strip_distinct_prefix(sql[select_pos + 6..from_pos].trim_start()).is_some()
 }
 
 pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
@@ -163,27 +164,9 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
     };
 
     let clause = sql[select_pos + 6..from_pos].trim();
-    let clause = clause
-        .strip_prefix("DISTINCT ")
-        .or_else(|| clause.strip_prefix("distinct "))
-        // Fully case-insensitive ('Distinct ') — select_has_distinct
-        // matches any case; a leaked keyword becomes a projected column.
-        .or_else(|| {
-            // Word boundary required: 'distinct_id' is a COLUMN, not the
-            // keyword (select_has_distinct requires the trailing space —
-            // the two detectors must agree).
-            clause
-                .get(..8)
-                .filter(|head| head.eq_ignore_ascii_case("DISTINCT"))
-                .filter(|_| {
-                    clause
-                        .as_bytes()
-                        .get(8)
-                        .is_none_or(|b| b.is_ascii_whitespace())
-                })
-                .map(|_| &clause[8..])
-        })
-        .unwrap_or(clause);
+    // Fully case-insensitive and token-boundary-aware: a projected column
+    // named `Distinctive` must not lose its prefix.
+    let clause = strip_distinct_prefix(clause).unwrap_or(clause);
 
     split_top_level_list(clause)
         .into_iter()
@@ -459,7 +442,10 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
 
 #[cfg(test)]
 mod scanner_tests {
-    use super::{extract_select_items, find_top_level_keyword, find_top_level_operator};
+    use super::{
+        extract_order_by, extract_select_items, extract_where_predicate, find_top_level_keyword,
+        find_top_level_operator, select_has_distinct,
+    };
 
     #[test]
     fn top_level_scanners_keep_original_utf8_offsets() {
@@ -477,12 +463,31 @@ mod scanner_tests {
         assert_eq!(items[0].expression, "'ﬀ'");
         assert_eq!(items[0].alias.as_deref(), Some("label"));
 
+        let order = extract_order_by("SELECT label FROM documents ORDER BY 'ﬀ' DESC NULLS LAST");
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].column, "'ﬀ'");
+        assert!(!order[0].ascending);
+        assert!(!order[0].nulls_first);
+
+        let predicate = extract_where_predicate("SELECT * FROM documents WHERE 'ﬀ' IS NOT NULL")
+            .expect("simple predicate");
+        assert_eq!(predicate.column, "'ﬀ'");
+
         let predicate = "label = 'ﬀ' AND score >= 0.5";
         assert_eq!(
             find_top_level_operator(predicate, ">="),
             predicate.find(">="),
             "operator offsets must refer to the original predicate"
         );
+    }
+
+    #[test]
+    fn distinct_keyword_requires_a_token_boundary() {
+        let sql = "SELECT Distinctive FROM documents";
+        assert!(!select_has_distinct(sql));
+        let items = extract_select_items(sql);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].expression, "Distinctive");
     }
 }
 
