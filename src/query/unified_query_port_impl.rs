@@ -523,7 +523,7 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 // Strip trailing statement punctuation — a subquery's
                 // 'orders)' must keep its target (the paren-normalization
                 // era captured it).
-                let target = target.trim_end_matches([';', ')', ',']);
+                let target = target.trim_end_matches([';', ')']);
                 let target = if matches!(keyword.as_str(), "INTO" | "UPDATE") {
                     target
                         .split_once('(')

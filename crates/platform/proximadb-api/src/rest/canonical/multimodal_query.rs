@@ -501,6 +501,8 @@ mod tests {
             match self.mode {
                 MockMode::Ok => Ok(serde_json::json!({ "op": op })),
                 MockMode::NotImplemented => Err(anyhow!("{op} not implemented")),
+                // Kept (the handler lacks the InvalidQueryInput downcast —
+                // these endpoints surface client errors as 500 today).
                 MockMode::InvalidInput => {
                     Err(InvalidQueryInput(format!("{op} input is invalid")).into())
                 }

@@ -3976,7 +3976,7 @@ pub(crate) fn try_parse_create_rank_profile(sql: &str) -> Result<Option<DdlState
     }
     let after_prefix = normalised["CREATE RANK PROFILE".len()..].trim_start();
 
-    let (if_not_exists, after_optional) = strip_if_not_exists(after_prefix);
+    let (if_not_exists, after_optional) = crate::core::utils::strip_if_not_exists(after_prefix);
     let (name, after_name) = extract_identifier(after_optional)?;
 
     let after_name = after_name.trim_start();
@@ -4131,10 +4131,6 @@ pub(crate) fn try_parse_create_function(sql: &str) -> Result<Option<DdlStatement
         body,
         or_replace,
     }))
-}
-
-pub(crate) fn strip_if_not_exists(input: &str) -> (bool, &str) {
-    crate::core::utils::strip_if_not_exists(input)
 }
 
 fn strip_if_exists(input: &str) -> (bool, &str) {

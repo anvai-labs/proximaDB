@@ -126,6 +126,42 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
     }
     None
 }
+/// Skip leading whitespace and SQL comments (line + nested block) so a
+/// keyword check can see through `TABLE /* v2 */ IF NOT EXISTS`.
+pub fn skip_leading_ws_and_comments(input: &str) -> &str {
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'-') && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        return &input[i..];
+    }
+}
+
 /// Case-insensitive `IF NOT EXISTS` prefix strip with a word boundary
 /// (whitespace OR an opening quote — `EXISTS"logs"` parses under the
 /// pinned GenericDialect). Returns (had_prefix, rest).

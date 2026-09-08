@@ -3033,12 +3033,10 @@ impl PostgresProtocol {
                 // extractor's None hard-errored a WHERE-less query).
                 // None ⇒ no predicates ⇒ unfiltered, the correct answer
                 // for a query with no top-level WHERE.
-                let predicates =
-                    if crate::core::utils::find_ascii_ci_at_top_level(query, "WHERE").is_some() {
-                        Self::extract_select_where_predicates(query).unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
+                // No gate: it re-ran the extractor's own scanner and
+                // unwrap_or_default erased the distinction anyway (the
+                // dead if/else cost a second full scan per fallback).
+                let predicates = Self::extract_select_where_predicates(query).unwrap_or_default();
                 dml_service
                     .select_table_records_with_projection(
                         table_name,
@@ -3702,7 +3700,10 @@ impl PostgresProtocol {
         let Some(table_pos) = find_ascii_ci(query, "TABLE") else {
             return self.send_command_complete("OK").await;
         };
-        let after_clause = query[table_pos + "TABLE".len()..].trim_start();
+        // Comment-tolerant: 'TABLE /* v2 */ IF NOT EXISTS docs' regressed
+        // to table_name '/*' with the flag lost.
+        let after_clause =
+            crate::core::utils::skip_leading_ws_and_comments(&query[table_pos + "TABLE".len()..]);
         let (if_not_exists, after_table) = crate::core::utils::strip_if_not_exists(after_clause);
 
         let table_end = after_table

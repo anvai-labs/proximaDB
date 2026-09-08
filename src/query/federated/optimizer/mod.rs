@@ -824,9 +824,9 @@ struct PredicatePushResult {
     predicate_pushed: bool,
 }
 
-pub(crate) struct SelectItem {
-    pub(crate) expression: String,
-    pub(crate) alias: Option<String>,
+struct SelectItem {
+    expression: String,
+    alias: Option<String>,
 }
 
 #[derive(Clone, Copy)]

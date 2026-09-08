@@ -1796,6 +1796,28 @@ pinned + narrated:**
   InvalidQueryInput duplicates ProtocolError::InvalidArgument
   (kernel's documented unified type — the api crate deps kernel).
 
+**Consolidation review round 43 (2026-09-08, follow-up PR #1852):**
+- The comment-between shape regressed (CREATE TABLE /* v2 */ IF NOT
+  EXISTS docs → table_name '/*' with the flag lost): a
+  skip_leading_ws_and_comments helper (core::utils) feeds the strip.
+- The legacy WHERE gate was BEHAVIORALLY DEAD (it re-ran the
+  extractor's own scanner; unwrap_or_default erased the distinction)
+  — dropped; the extractor is called unconditionally.
+- The parser's strip_if_not_exists forwarding shim deleted (two
+  public names for one behavior). SelectItem's gratuitous pub(crate)
+  widening reverted (zero external consumers — children see the
+  parent's private items). The dead ',' in the EXPLAIN trim dropped.
+  The dead InvalidInput mock arms DOCUMENTED (those handlers lack
+  the downcast — kept to state that fact, not to suggest 400
+  mapping).
+- Tracked: the 501-substring test survives at SEVEN sibling handlers
+  (user-controlled query/statement text containing 'not implemented'
+  misroutes; the typed channel is wired at 1 of ~5 port methods).
+  find_ascii_ci_at_top_level lacks backslash-escape handling
+  (E'…\\'…' closes early — pre-existing gap). explain_catalog_targets
+  is on its third round of lexical special-cases — the terminal fix
+  is SqlFrontendParser-based extraction.
+
 == Not in scope
 
 The v2 package already has both generation (`PROXIMADB_PROTO_REGEN=1`) and the
