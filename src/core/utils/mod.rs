@@ -189,6 +189,21 @@ mod tests {
             "MATCH (n {note: ' FROM archived RETURN value'}) FROM social RETURN n"
         );
     }
+
+    #[test]
+    fn graph_target_injection_ignores_cypher_names_and_comments() {
+        let quoted_name = "MATCH (n:` FROM archive RETURN value`) RETURN n";
+        assert_eq!(
+            inject_graph_target_into_cypher("social", quoted_name),
+            "MATCH (n:` FROM archive RETURN value`) FROM social RETURN n"
+        );
+
+        let line_comment = "MATCH (n) // FROM archive RETURN value\nRETURN n";
+        assert_eq!(
+            inject_graph_target_into_cypher("social", line_comment),
+            "MATCH (n) // FROM archive RETURN value\nFROM social RETURN n"
+        );
+    }
 }
 
 /// Bind placeholders ('$N' and bare '?') cannot resolve during EXPLAIN —
@@ -305,6 +320,93 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
     }
 }
 
+/// Find a whitespace-delimited Cypher keyword sequence outside strings,
+/// backtick-quoted symbolic names, and comments. Cypher line comments use
+/// `//`, and escaped quotes use backslashes, so the SQL-oriented scanner above
+/// is deliberately not reused here.
+fn find_cypher_clause(haystack: &str, keywords: &[&str]) -> Option<usize> {
+    let first = keywords.first()?.as_bytes();
+    let bytes = haystack.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' && q != b'`' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                if i + 1 < bytes.len() && bytes[i + 1] == q {
+                    i += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            quote = Some(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        let starts_at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+        if starts_at_boundary
+            && i + first.len() <= bytes.len()
+            && bytes[i..i + first.len()].eq_ignore_ascii_case(first)
+        {
+            let mut end = i + first.len();
+            let mut matched = true;
+            for keyword in &keywords[1..] {
+                let whitespace_start = end;
+                while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+                    end += 1;
+                }
+                let keyword = keyword.as_bytes();
+                if end == whitespace_start
+                    || end + keyword.len() > bytes.len()
+                    || !bytes[end..end + keyword.len()].eq_ignore_ascii_case(keyword)
+                {
+                    matched = false;
+                    break;
+                }
+                end += keyword.len();
+            }
+            if matched && (end == bytes.len() || bytes[end].is_ascii_whitespace()) {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
     let graph = graph.trim();
     let cypher = cypher.trim().trim_end_matches(';').trim();
@@ -313,38 +415,23 @@ pub fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
         return cypher.to_string();
     }
 
-    // ASCII-case, quote-aware, WHITESPACE-CLASS keyword scan on the
-    // original — a newline- or tab-padded keyword must behave exactly
-    // like the space-padded one (multi-line Cypher config is normal):
-    // the duplicate-FROM guard must still fire and the insertion point
-    // must still be found.
-    let keyword_offset = |needle: &str| {
-        find_ascii_ci_outside_quotes(cypher, needle).filter(|&pos| {
-            let before_ok = pos == 0 || cypher.as_bytes()[pos - 1].is_ascii_whitespace();
-            let end = pos + needle.len();
-            let after_ok = end >= cypher.len() || cypher.as_bytes()[end].is_ascii_whitespace();
-            before_ok && after_ok
-        })
-    };
-    if keyword_offset("FROM").is_some() {
+    if find_cypher_clause(cypher, &["FROM"]).is_some() {
         return cypher.to_string();
     }
 
-    let insertion_index = ["WHERE", "RETURN", "ORDER BY", "LIMIT", "SKIP"]
-        .iter()
-        .filter_map(|needle| keyword_offset(needle))
-        .min();
+    let insertion_index = [
+        find_cypher_clause(cypher, &["WHERE"]),
+        find_cypher_clause(cypher, &["RETURN"]),
+        find_cypher_clause(cypher, &["ORDER", "BY"]),
+        find_cypher_clause(cypher, &["LIMIT"]),
+        find_cypher_clause(cypher, &["SKIP"]),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
 
     if let Some(index) = insertion_index {
-        // Normalize the padding: the head's own trailing whitespace plus
-        // ours doubled (or, clipped, vanished). Trim the head, provide
-        // exactly one space each side.
-        format!(
-            "{} FROM {} {}",
-            cypher[..index].trim_end(),
-            graph,
-            &cypher[index..]
-        )
+        format!("{}FROM {} {}", &cypher[..index], graph, &cypher[index..])
     } else {
         format!("{} FROM {}", cypher, graph)
     }

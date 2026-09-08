@@ -1472,11 +1472,10 @@ angles after the main agent hit a rate limit):**
   component fn's unwrap_or(NAN) smell dropped with them).
 
 **Consolidation review round 34 (2026-09-07):**
-- A RED TEST on HEAD: the reconciliation adopted the parallel
-  session's document-default test while keeping this session's strict
-  required-collection arm — resolved to the TEST-PINNED lenient
-  semantics (missing collection → 'default' at BOTH twins; non-string
-  still errors). The REST graph arm typed (matches the port).
+- A RED TEST on one reconciliation head exposed opposite document-collection
+  policies from parallel review lines. The final policy is fail-closed at BOTH
+  twins: collection is required and a missing or non-string value errors. The
+  REST graph arm is typed (matching the port).
 - COUNT's DISTINCT arm uses the ONE shared predicate ('DISTINCT\tid'
   silently fell to a non-distinct count with a phantom column — the
   third detector the census missed). inject_graph_target_into_cypher's
@@ -1491,9 +1490,9 @@ angles after the main agent hit a rate limit):**
   apostrophe inside '-- don't' before ORDER BY drops the sort) —
   per-loop comment state is exactly the late-stage churn class this
   PR got burned by; folds into the terminal shared-scanner item with
-  a comment-strip-at-entry alternative noted. The port twin remains
-  the only LIVE multi-model route with the lenient collection default
-  (twins item). columnar.rs (fresh surface, unregistered provider):
+  a comment-strip-at-entry alternative noted. Both live multi-model routes
+  now enforce the same required collection policy. columnar.rs (fresh surface,
+  unregistered provider):
   two more DISTINCT detectors + an uppercase-offset slice panic —
   latent, same classes.
 
