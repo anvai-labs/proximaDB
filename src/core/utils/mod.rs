@@ -230,6 +230,12 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
         Some(b) if *b == b'"' || *b == b'`' || *b == b'(' => {
             (true, &cleaned["IF NOT EXISTS".len()..])
         }
+        // Comment-ADJACENT operand (IF NOT EXISTS/* v2 */docs — comments
+        // are whitespace to the lexer; the fall-through minted 'if').
+        Some(b) if *b == b'/' => {
+            let rest = skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]);
+            (rest != &cleaned["IF NOT EXISTS".len()..], rest)
+        }
         Some(_) => (false, input),
     }
 }

@@ -2917,11 +2917,16 @@ impl PostgresProtocol {
     }
 
     fn clean_identifier(identifier: &str) -> String {
-        // Split FIRST on the original (each dot-segment carries its own
-        // delimiters — decoding before the split left a stray quote on
-        // fully-quoted qualified identifiers like "t"."col"), then decode
-        // the final segment (cross-namespace routing parses ns.table).
-        let last = identifier.trim().rsplit('.').next().unwrap_or_default();
+        // A WHOLLY-quoted identifier may contain dots ("meta.score" is one
+        // column) — decode first and keep it intact. Otherwise split on
+        // the original and decode the final segment (qualifiers carry
+        // their own delimiters; cross-namespace routing parses ns.table).
+        let trimmed = identifier.trim();
+        let decoded = crate::core::utils::decode_identifier(trimmed);
+        if decoded != trimmed {
+            return decoded.to_string();
+        }
+        let last = trimmed.rsplit('.').next().unwrap_or_default();
         crate::core::utils::decode_identifier(last).to_string()
     }
 

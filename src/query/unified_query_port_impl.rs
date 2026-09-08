@@ -542,14 +542,23 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 // TRACES('ops'), TRACES ('ops'), TRACES ( 'ops' )). INSERT
                 // column lists (INTO/UPDATE) and subquery opens never
                 // trigger it.
+                // The gate needs the paren to open a CALL arg list, not a
+                // subquery/derived table: require the paren token to
+                // carry a QUOTED first arg ITSELF (TRACES('ops'),
+                // TRACES ( 'ops' )) — a bare '(' followed by a separate
+                // quoted token is a derived table (t, (SELECT 'a'...))
+                // and must NOT gate. Backtick args count (the dialect's
+                // other delimiter). get(1..) keeps the slice
+                // char-boundary-safe (a multibyte-initial token panicked
+                // on the byte form — abort under panic=abort).
                 let is_from_join = matches!(keyword.as_str(), "FROM" | "JOIN");
-                let tail = &tokens[window_index + 2..];
-                let opens = tail.first().is_some_and(|t| t.starts_with('('));
-                let quoted = tail.get(1).is_some_and(|t| t.starts_with(['\'', '"']))
-                    || tail.first().is_some_and(|t| {
-                        t.len() > 1 && t[1..].trim_start().starts_with(['\'', '"'])
+                let arg_openers = ['\'', '"', '`'];
+                let next_opens_call = is_from_join
+                    && tokens.get(window_index + 2).is_some_and(|t| {
+                        t.starts_with('(')
+                            && t.get(1..)
+                                .is_some_and(|rest| rest.trim_start().starts_with(arg_openers))
                     });
-                let next_opens_call = is_from_join && opens && quoted;
                 if !target.is_empty() && !next_opens_call {
                     targets.push(target.to_string());
                 }
