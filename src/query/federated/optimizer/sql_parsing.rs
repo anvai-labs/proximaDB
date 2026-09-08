@@ -142,10 +142,15 @@ fn strip_distinct_prefix(clause: &str) -> Option<&str> {
         return None;
     }
     let rest = clause.get("DISTINCT".len()..)?;
-    // Whitespace (any amount) optionally followed by parens that WRAP the
-    // whole operand — the Postgres-legal COUNT(DISTINCT(id)) and
-    // COUNT(DISTINCT (id)) spellings (the spaced form returned a
-    // paren-wrapped column; a mid-operand paren was blindly stripped).
+    // Whitespace (any amount) and/or parens that WRAP the whole operand —
+    // the Postgres-legal DISTINCT id / DISTINCT(id) / DISTINCT (id)
+    // spellings. The whitespace test is on the UNTRIMMED rest
+    // (trim_start-then-check was always false — every unparenthesized
+    // spelling silently lost its dedup).
+    let paren_form = rest.starts_with('(');
+    if !paren_form && !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
     let trimmed_rest = rest.trim_start();
     if let Some(inner) = trimmed_rest
         .strip_prefix('(')
@@ -154,10 +159,7 @@ fn strip_distinct_prefix(clause: &str) -> Option<&str> {
     {
         return Some(inner.trim());
     }
-    if trimmed_rest.starts_with(|c: char| c.is_whitespace()) {
-        return Some(trimmed_rest);
-    }
-    None
+    Some(trimmed_rest)
 }
 
 pub(crate) fn select_has_distinct(sql: &str) -> bool {
@@ -197,9 +199,15 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
                 search_from = position + "AS".len();
             }
             if let Some(as_pos) = as_pos {
+                // An end-of-item AS ('id AS' with FROM terminating the
+                // clause) yields an EMPTY alias — treat as no alias (the
+                // old inline scanner required a following whitespace byte
+                // and never matched at end-of-string).
+                let alias_text = item[as_pos + "AS".len()..].trim().to_string();
+                let alias = (!alias_text.is_empty()).then_some(alias_text);
                 SelectItem {
                     expression: item[..as_pos].trim().to_string(),
-                    alias: Some(item[as_pos + "AS".len()..].trim().to_string()),
+                    alias,
                 }
             } else {
                 SelectItem {
@@ -327,13 +335,29 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
             // ASCII-case tail checks on the ORIGINAL — uppercase can
             // change UTF-8 byte lengths, making len()-needle subtraction
             // slice mid-character (the class the sibling scanners fixed).
+            // Whitespace-class tails: the needle's LEADING space is any
+            // ASCII whitespace (tab/newline padding flipped sort
+            // direction silently).
             let ends_ci = |needle: &str| {
-                // BYTE compare (a str slice could cut mid-character)
-                entry.len() >= needle.len()
-                    && entry.as_bytes()[entry.len() - needle.len()..]
-                        .eq_ignore_ascii_case(needle.as_bytes())
+                let nb = needle.as_bytes();
+                let lead_ws = nb[0].is_ascii_whitespace();
+                let kw = if lead_ws { &nb[1..] } else { nb };
+                entry.len() >= needle.len() && {
+                    let tail = &entry.as_bytes()[entry.len() - kw.len()..];
+                    tail.eq_ignore_ascii_case(kw)
+                        && (!lead_ws
+                            || entry.as_bytes()[entry.len() - kw.len() - 1].is_ascii_whitespace())
+                }
             };
-            let strip_ci = |needle: &str| entry[..entry.len() - needle.len()].trim();
+            let strip_ci = |needle: &str| {
+                let nb = needle.as_bytes();
+                let kw_len = if nb[0].is_ascii_whitespace() {
+                    nb.len() - 1
+                } else {
+                    nb.len()
+                };
+                entry[..entry.len() - kw_len].trim()
+            };
             let trimmed = if ends_ci(" NULLS FIRST") {
                 strip_ci(" NULLS FIRST")
             } else if ends_ci(" NULLS LAST") {

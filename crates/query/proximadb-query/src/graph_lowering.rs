@@ -155,19 +155,48 @@ pub fn parse_supported_graph_query(
 fn strip_from_clause(query: &str) -> Result<(String, Option<String>)> {
     let trimmed = query.trim().trim_end_matches(';').trim();
 
-    // WHITESPACE-CLASS keyword scan on the original bytes — the injector
-    // preserves the caller's newline/tab padding before FROM, and an
-    // uppercased-copy find (both the offset class and the space-literal
-    // needle) missed it (hard parse error on multi-line Cypher).
+    // WHITESPACE-CLASS, QUOTE-AWARE keyword scan — the injector preserves
+    // the caller's newline/tab padding before FROM, and a FROM inside a
+    // Cypher string literal (its own tests use exactly that shape) must
+    // not hijack the split.
     let bytes = trimmed.as_bytes();
-    let from_pos = (0..bytes.len().saturating_sub(4))
-        .filter(|&i| bytes[i..i + 4].eq_ignore_ascii_case(b"FROM"))
-        .find(|&i| {
-            let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
-            let after = i + 4;
-            let after_ok = after >= bytes.len() || bytes[after].is_ascii_whitespace();
-            before_ok && after_ok
-        });
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    let mut from_pos: Option<usize> = None;
+    while i < bytes.len() {
+        match quote {
+            Some(q) => {
+                if bytes[i] == q {
+                    if i + 1 < bytes.len() && bytes[i + 1] == q {
+                        i += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                    quote = Some(bytes[i]);
+                    i += 1;
+                    continue;
+                }
+                let boundary_before = i == 0 || bytes[i - 1].is_ascii_whitespace();
+                if boundary_before
+                    && i + 4 <= bytes.len()
+                    && bytes[i..i + 4].eq_ignore_ascii_case(b"FROM")
+                {
+                    let after = i + 4;
+                    let boundary_after = after >= bytes.len() || bytes[after].is_ascii_whitespace();
+                    if boundary_after {
+                        from_pos = Some(i);
+                        break;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
     let Some(from_pos) = from_pos else {
         return Ok((trimmed.to_string(), None));
     };

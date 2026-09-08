@@ -1393,11 +1393,9 @@ impl PostgresProtocol {
     }
 
     fn strip_set_value_literal(value: &str) -> String {
-        let value = value.trim().trim_end_matches(';').trim();
-        if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-            return value[1..value.len() - 1].replace("''", "'");
-        }
-        value.trim_matches('"').to_string()
+        // Same rule as strip_sql_literal (the two byte-identical twins
+        // merged — one decode policy for pgwire literals).
+        Self::strip_sql_literal(value)
     }
 
     /// Execute a translated query

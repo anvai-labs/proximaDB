@@ -103,17 +103,17 @@ fn is_identifier(part: &str) -> bool {
         let unescaped = inner.replace("\"\"", "");
         return !inner.is_empty() && !unescaped.contains('"');
     }
-    // Same class as the shared is_identifier_byte ('$' and non-ASCII are
-    // identifier bytes — p$x / témoin aliases are legal and were degrading
-    // to unsupported-expression errors).
+    // The ONE shared byte class ('$' and non-ASCII are identifier bytes —
+    // p$x / témoin aliases are legal); first byte additionally excludes
+    // digits and '$' (a leading digit/dollar is not an identifier start).
     let bytes = trimmed.as_bytes();
     match bytes.first() {
-        Some(b) if b.is_ascii_alphabetic() || *b == b'_' || *b >= 0x80 || *b == b'$' => {}
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' || *b >= 0x80 => {}
         _ => return false,
     }
     bytes[1..]
         .iter()
-        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b >= 0x80 || *b == b'$')
+        .all(|b| crate::core::utils::is_identifier_byte(*b))
 }
 
 fn is_dotted_identifier_path(part: &str) -> bool {

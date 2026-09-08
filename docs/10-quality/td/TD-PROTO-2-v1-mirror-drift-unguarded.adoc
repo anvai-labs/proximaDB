@@ -1546,6 +1546,30 @@ angles after the main agent hit a rate limit):**
   change. The four SQL doubled-quote DECODE copies (document filter,
   predicate, EXPLAIN scanner, fusion unquote) want one
   unquote_sql_text beside escape_sql_text.
+
+**Consolidation review round 37 (2026-09-08):**
+- RED TEST AT HEAD fixed: round 36's strip_distinct_prefix rewrite
+  left the whitespace branch dead (trim_start-then-check was always
+  false) — every unparenthesized DISTINCT spelling silently lost its
+  dedup (SELECT DISTINCT returned duplicates; COUNT(DISTINCT id)
+  hard-errored). The pin test had pinned only the paren spelling.
+  Both whitespace and immediate-paren forms accept now.
+- strip_from_clause is QUOTE-aware (a FROM inside a Cypher literal
+  hijacked the split and read the wrong graph). The ORDER BY
+  direction/nulls tails are whitespace-class (tab padding flipped
+  sort direction silently). An end-of-item AS yields NO alias (the
+  scanner delegation made it match with an empty alias string).
+- The port EXPLAIN filters function-name tokens (the paren→space
+  normalization minted 'TRACES' as a catalog target). is_identifier
+  routes through the shared byte class (first byte excludes digits/
+  dollar). The bare-JSON-Number nested arm delegates to the ONE
+  component policy. The two pgwire decode twins merged. The AQL
+  observability BytesValue arm reverted to the sibling JSON-heuristic
+  (the cross-source inconsistency was the collision; the base64
+  alternative is the tracked AQL-family item).
+- Tracked: the facade DOCUMENT_QUERY twin parses emitted SQL
+  quote-blind and treats 1=1 as a literal field filter (reachability
+  depends on SQL classification into the facade path).
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

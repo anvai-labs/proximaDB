@@ -35,21 +35,15 @@ impl ObservabilityAqlSource {
             SqlValueData::Int64Value(i) => AqlValue::Int(i),
             SqlValueData::NumberValue(f) => AqlValue::Float(f),
             SqlValueData::BoolValue(b) => AqlValue::Bool(b),
-            SqlValueData::BytesValue(bytes) => {
-                // Raw bytes are NOT JSON — the JSON-sniff silently nulled
-                // non-JSON blobs (data loss) and happened-to-parse bytes
-                // got a third spelling. The canonical rendering (base64)
-                // matches every other API surface; the LEGACY jsonb magic
-                // prefix still decodes for old writers.
-                if let Some(payload) = bytes.strip_prefix(proximadb_data_model::JSONB_LEGACY_MAGIC)
-                {
-                    serde_json::from_slice(payload)
-                        .map(AqlValue::Jsonb)
-                        .unwrap_or(AqlValue::String(
-                            proximadb_proto::utils::encoding::base64_encode(&bytes),
-                        ))
+            // Same JSON heuristic as the document/vector/graph siblings
+            // (deliberate for legacy producers — one policy per crate, and
+            // a cross-source predicate sees the same spelling everywhere;
+            // the base64 alternative is the tracked AQL family item).
+            SqlValueData::BytesValue(b) => {
+                if let Ok(json) = serde_json::from_slice(&b) {
+                    AqlValue::Jsonb(json)
                 } else {
-                    AqlValue::String(proximadb_proto::utils::encoding::base64_encode(&bytes))
+                    AqlValue::Null
                 }
             }
             // types.proto tag 9: JSONB by declaration — same JSON heuristic as
