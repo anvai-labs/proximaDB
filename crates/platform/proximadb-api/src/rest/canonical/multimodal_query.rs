@@ -31,7 +31,7 @@ use axum::{
     routing::{delete, post},
 };
 use proximadb_data_model::ProximaValue;
-use proximadb_runtime::UnifiedQueryPort;
+use proximadb_runtime::{InvalidQueryInput, UnifiedQueryPort};
 use serde::Deserialize;
 use tracing::{error, info};
 
@@ -202,6 +202,12 @@ async fn execute_multi_model_query(
             if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
             {
                 not_implemented("execute_multi_model_query").into_response()
+            } else if e.downcast_ref::<InvalidQueryInput>().is_some() {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response()
             } else {
                 error!("Multi-model query failed: {e}");
                 (
@@ -472,6 +478,7 @@ mod tests {
     enum MockMode {
         Ok,
         NotImplemented,
+        InvalidInput,
         Internal,
     }
 
@@ -490,6 +497,9 @@ mod tests {
             match self.mode {
                 MockMode::Ok => Ok(serde_json::json!({ "op": op })),
                 MockMode::NotImplemented => Err(anyhow!("{op} not implemented")),
+                MockMode::InvalidInput => {
+                    Err(InvalidQueryInput(format!("{op} input is invalid")).into())
+                }
                 MockMode::Internal => Err(anyhow!("{op} failed")),
             }
         }
@@ -547,6 +557,9 @@ mod tests {
             match self.mode {
                 MockMode::Ok => Ok("stmt-1".to_string()),
                 MockMode::NotImplemented => Err(anyhow!("prepare_statement not implemented")),
+                MockMode::InvalidInput => {
+                    Err(InvalidQueryInput("prepare_statement input is invalid".to_string()).into())
+                }
                 MockMode::Internal => Err(anyhow!("prepare_statement failed")),
             }
         }
@@ -564,6 +577,9 @@ mod tests {
             match self.mode {
                 MockMode::Ok => Ok(()),
                 MockMode::NotImplemented => Err(anyhow!("delete_prepared not implemented")),
+                MockMode::InvalidInput => {
+                    Err(InvalidQueryInput("delete_prepared input is invalid".to_string()).into())
+                }
                 MockMode::Internal => Err(anyhow!("delete_prepared failed")),
             }
         }
@@ -750,6 +766,14 @@ mod tests {
         .await
         .into_response();
         assert_eq!(not_implemented.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let invalid_input = execute_multi_model_query(
+            MockUnifiedQueryPort::state(MockMode::InvalidInput),
+            Ok(Json(serde_json::json!({}))),
+        )
+        .await
+        .into_response();
+        assert_eq!(invalid_input.status(), StatusCode::BAD_REQUEST);
 
         let internal = execute_distributed_query(
             MockUnifiedQueryPort::state(MockMode::Internal),

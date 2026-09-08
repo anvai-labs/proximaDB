@@ -673,10 +673,15 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
     let mut sql_parts = Vec::new();
 
     for component in &request.components {
+        let config = component.config.as_object().ok_or_else(|| {
+            ApiError::InvalidArgument(format!(
+                "{} component config must be an object",
+                component.component_type
+            ))
+        })?;
         let sql_part = match component.component_type.as_str() {
             "vector" => {
-                let collection = component
-                    .config
+                let collection = config
                     .get("collection")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -691,8 +696,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                             "vector component config.collection is required".to_string(),
                         )
                     })?;
-                let query_values = component
-                    .config
+                let query_values = config
                     .get("query_vector")
                     .ok_or_else(|| {
                         ApiError::InvalidArgument(
@@ -736,8 +740,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 };
                 // Typed: a string top_k silently baked the default (the
                 // silent-default class rounds 19-20 fixed for siblings).
-                let top_k = component
-                    .config
+                let top_k = config
                     .get("top_k")
                     .map(|v| {
                         v.as_u64().ok_or_else(|| {
@@ -760,8 +763,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
             "document" => {
                 // Fail-closed (the PR's direction for silent defaults —
                 // and the strict twin's test): the collection is REQUIRED.
-                let collection = component
-                    .config
+                let collection = config
                     .get("collection")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -776,8 +778,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                             "document component config.collection is required".to_string(),
                         )
                     })?;
-                let filter = component
-                    .config
+                let filter = config
                     .get("filter")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -798,8 +799,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 )
             }
             "graph" => {
-                let graph = component
-                    .config
+                let graph = config
                     .get("graph")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -812,8 +812,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     .unwrap_or("default");
                 // Typed (the silent-default class — an object-shaped
                 // cypher silently ran the default query).
-                let cypher = component
-                    .config
+                let cypher = config
                     .get("cypher")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -829,8 +828,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(&cypher))
             }
             "log" => {
-                let namespace = component
-                    .config
+                let namespace = config
                     .get("namespace")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -845,8 +843,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 format!("SELECT * FROM LOGS('{}')", escape_sql_text(namespace))
             }
             "metric" => {
-                let namespace = component
-                    .config
+                let namespace = config
                     .get("namespace")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -2320,6 +2317,29 @@ mod tests {
             .expect_err("nonnumeric vector elements must fail closed");
         assert!(matches!(error, ApiError::InvalidArgument(_)));
         assert!(error.to_string().contains("query_vector[1]"));
+    }
+
+    #[test]
+    fn multi_model_sql_conversion_rejects_non_object_config() {
+        for component_type in ["graph", "log", "metric"] {
+            for config in [
+                serde_json::json!([]),
+                serde_json::json!(42),
+                serde_json::Value::Null,
+            ] {
+                let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+                    "components": [{
+                        "component_type": component_type,
+                        "config": config
+                    }]
+                }))
+                .expect("request shape should deserialize");
+
+                let error = convert_multi_model_to_sql(&request)
+                    .expect_err("a supplied component config must be an object");
+                assert!(error.to_string().contains("config must be an object"));
+            }
+        }
     }
 
     #[test]

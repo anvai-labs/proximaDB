@@ -7,15 +7,30 @@ use proximadb_records::{ProximaRecord, ProximaTreeNode};
 fn extract_where_handles_trailing_where_and_prefixed_columns() {
     // WHERE ending the string must not panic (the -1/+7 dance sliced one
     // past the end — abort-class under panic=abort).
-    assert!(
-        PostgresProtocol::extract_select_where_clause("SELECT ' WHERE ' FROM t WHERE").is_some()
+    let trailing = "SELECT ' WHERE ' FROM t WHERE ";
+    assert_eq!(
+        PostgresProtocol::extract_select_where_clause(trailing),
+        Some("")
     );
+    assert!(PostgresProtocol::extract_select_where_predicates(trailing).is_none());
 
     // A 'limit_val' column must not shadow a later real LIMIT terminator.
     let predicate = PostgresProtocol::extract_select_where_clause(
         "SELECT * FROM t WHERE limit_val > 5 LIMIT 3",
     );
     assert_eq!(predicate, Some("limit_val > 5"));
+
+    // Clause keywords used as qualified identifiers are not clauses. The
+    // scanner must continue to the real top-level WHERE/ORDER BY tokens.
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT t.where FROM t WHERE t.limit > 5 ORDER BY t.id",
+    );
+    assert_eq!(predicate, Some("t.limit > 5"));
+
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT COUNT(*) FILTER (WHERE active) FROM t WHERE id = 7",
+    );
+    assert_eq!(predicate, Some("id = 7"));
 }
 
 #[test]

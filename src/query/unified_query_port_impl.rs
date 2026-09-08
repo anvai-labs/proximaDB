@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
-use proximadb_runtime::UnifiedQueryPort;
+use proximadb_runtime::{InvalidQueryInput, UnifiedQueryPort};
 // The FILTER-lowering spelling (int-array binary, ns temporals) — named
 // for what it IS, mirroring the SqlValue twin sql_value_to_filter_literal;
 // the canonical (base64) renderer lives in records under a different name.
@@ -517,28 +517,27 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     for window in tokens.windows(2) {
         if let [keyword, target] = window {
             let keyword = keyword.trim_matches('"').to_ascii_uppercase();
-            if !matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
-                || target.starts_with('$')
+            if matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
+                && !target.starts_with('$')
             {
-                continue;
-            }
-            // INTO/UPDATE: a paren list is the INSERT column list —
-            // `orders(a,b)` keeps `orders`. FROM/JOIN: a paren is a
-            // function-call position — `TRACES('ops')` is not a target.
-            // Trailing statement punctuation strips (a subquery's
-            // 'orders)' keeps its target).
-            let candidate = if keyword == "INTO" || keyword == "UPDATE" {
-                target.split('(').next().unwrap_or(target)
-            } else {
-                target
-            };
-            if !candidate.contains('(') {
-                targets.push(
-                    candidate
-                        .trim_matches('"')
-                        .trim_end_matches([';', ')', ','])
-                        .to_string(),
-                );
+                // Strip trailing statement punctuation — a subquery's
+                // 'orders)' must keep its target (the paren-normalization
+                // era captured it).
+                let target = target.trim_end_matches([';', ')', ',']);
+                let target = if matches!(keyword.as_str(), "INTO" | "UPDATE") {
+                    target
+                        .split_once('(')
+                        .map(|(name, _)| name)
+                        .unwrap_or(target)
+                } else if target.contains('(') {
+                    continue;
+                } else {
+                    target
+                };
+                let target = target.trim_matches('"');
+                if !target.is_empty() {
+                    targets.push(target.to_string());
+                }
             }
         }
     }
@@ -602,8 +601,20 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // Sibling of multimodal_query::convert_multi_model_to_sql (it already
         // shares inject_graph_target_into_cypher; tracked: consolidate the
         // twins — their defaults and limit handling still diverge).
-        let sql = match json_to_multi_model_sql(&request)? {
+        let sql = match json_to_multi_model_sql(&request)
+            .map_err(|error| InvalidQueryInput(error.to_string()))?
+        {
             Some(sql) => sql,
+            // Components present (ANY shape — including empty) fail
+            // closed: the 'SELECT 1' fallback returned 200-OK garbage
+            // (round 22's contract; the Result restructure dropped it).
+            None if request.get("components").is_some() => {
+                return Err(InvalidQueryInput(
+                    "multi-model request contained a component that could not be lowered (empty, malformed, or unknown component_type)"
+                        .to_string(),
+                )
+                .into());
+            }
             None => request
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -776,6 +787,7 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
         ));
     }
     let mut parts = Vec::new();
+    let empty_config = serde_json::Map::new();
     for (component_index, component) in components.iter().enumerate() {
         let ctype = component
             .get("component_type")
@@ -783,7 +795,12 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
             .ok_or_else(|| {
                 anyhow!("components[{component_index}].component_type must be a string")
             })?;
-        let config = component.get("config").cloned().unwrap_or_default();
+        let config = match component.get("config") {
+            Some(value) => value
+                .as_object()
+                .ok_or_else(|| anyhow!("components[{component_index}].config must be an object"))?,
+            None => &empty_config,
+        };
         let sql_part = match ctype {
             "vector" => {
                 let collection = config
@@ -1151,6 +1168,12 @@ mod tests {
         );
         assert!(!targets.iter().any(|t| t == "TRACES"), "got {targets:?}");
         assert!(targets.iter().any(|t| t == "orders"), "got {targets:?}");
+
+        let targets = explain_catalog_targets(
+            r#"INSERT INTO orders(id) VALUES (1); SELECT 1 FROM (SELECT * FROM "archive")"#,
+        );
+        assert!(targets.iter().any(|t| t == "orders"), "got {targets:?}");
+        assert!(targets.iter().any(|t| t == "archive"), "got {targets:?}");
     }
 
     #[test]
@@ -1270,6 +1293,24 @@ mod tests {
         let req = serde_json::json!({"components": []});
         let err = json_to_multi_model_sql(&req).unwrap_err();
         assert!(err.to_string().contains("no components"));
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_rejects_non_object_config() {
+        for component_type in ["graph", "log", "metric"] {
+            for config in [
+                serde_json::json!([]),
+                serde_json::json!(42),
+                serde_json::Value::Null,
+            ] {
+                let req = serde_json::json!({
+                    "components": [{"component_type": component_type, "config": config}]
+                });
+                let error = json_to_multi_model_sql(&req)
+                    .expect_err("a supplied component config must be an object");
+                assert!(error.to_string().contains("config must be an object"));
+            }
+        }
     }
 
     #[test]

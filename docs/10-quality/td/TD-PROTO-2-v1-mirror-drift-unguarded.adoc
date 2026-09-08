@@ -1596,6 +1596,25 @@ angles after the main agent hit a rate limit):**
 - Tracked: CATALOG_FIRST_ARG_FUNCTIONS is derivable from the fusion
   registry (FUNCTION_NAMES needs pub + a filter); the 12-copy
   config-validation chain wants an opt_str helper.
+- SQL-standard doubled single quotes are now decoded at the federated
+  extension-parser boundary. Round 16/17 escaped the four programmatic
+  multimodal SQL producers, but the parser returned the doubled form to
+  VECTOR_SEARCH, DOCUMENT_QUERY, GRAPH_QUERY, and LOGS consumers, corrupting
+  collection names, filters, Cypher, and namespaces containing apostrophes.
+- Programmatic multi-model vectors now fail closed on missing, non-array,
+  nonnumeric, or out-of-f32-range components instead of silently dropping
+  elements and changing vector dimensionality.
+- Raw SQL, UQL lowering, direct `?` binding, and prepared `$N` binding now
+  reject non-finite vector components. This aligns the federated compatibility
+  path with the canonical `VectorSearchExpr::validate` contract instead of
+  forwarding NaN or infinity into distance kernels.
+
+- Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
+  has 4+ hand-rolled copies with divergent number fallbacks (nullify /
+  stringify / drop) — the render consolidation's mirror image, needs its
+  own canonical home; per-site contract tests duplicating records' pinned
+  contract (delete as touched); the owned-input converter entry point
+  (executor/log-response clone-per-field).
 
 **Consolidation review round 39 (2026-09-08):**
 - Round 38's paren-balance check was INERT (depth started 0 after the
@@ -1621,69 +1640,40 @@ angles after the main agent hit a rate limit):**
 - #1845 MERGED as 6ef7ffbc8 (rounds 8-38); this round rides the
   squashed develop.
 - ROUND-39 REGRESSION FIXED: the WHERE locate's -1/+7 offset dance
-  sliced one PAST THE END when WHERE ended the string — a client-
-  triggerable abort-class panic under panic=abort (two independent
-  compiled repros). The locate now iterates ALL occurrences with the
-  shared identifier boundary (a first match inside FILTER(...)
-  shadowed the real WHERE) and slices at pos+5.
+  sliced one PAST THE END when WHERE ended the string — an abort-class
+  helper regression under panic=abort (two independent compiled repros).
+  The locate now iterates occurrences with the shared identifier boundary
+  and slices at pos+5; top-level clause selection is completed in round 41.
 - The EXPLAIN paren-skip checks only '(' (REST parity) and strips
   trailing ;/) , from tokens — 'orders)' (subquery) keeps its target;
-  INSERT-list shapes skip like the REST twin. The REST twin's builder
-  fails closed on empty components (parity with the port caller
+  function-call positions skip like the REST twin. The REST twin's
+  builder fails closed on empty components (parity with the port caller
   guard — empty SQL reached the federated engine and 500'd).
   extract_create_table_name delegates to the frontend parser's ONE
   strip_if_not_exists (whitespace boundary included).
 - PINS added for the previously-untested round-39/40 fixes: trailing-
   WHERE no-panic, limit_val terminator, DISTINCT composite shapes,
   TRACES-subquery target pair.
-- Tracked: the api-crate route maps the new fail-closed errors to 500
-  (the tracked typed-error-channel item). graph_lowering's scanner is
-  a THIRD copy of the Cypher dialect (kernel is a viable shared home —
-  both crates depend on it). ~13 typed-config closure copies want an
-  opt_str helper (the graph-cypher defaults already diverge).
+- Tracked: graph_lowering's scanner is a THIRD copy of the Cypher dialect
+  (kernel is a viable shared home — both crates depend on it). ~13
+  typed-config closure copies want an opt_str helper (the graph-cypher
+  defaults already diverge).
 
-**Consolidation review round 41 (2026-09-08, follow-up PR #1852):**
-- The strip_if_not_exists delegation traded shapes (the parser's
-  whitespace-only boundary regressed EXISTS"logs" — it parses under
-  the pinned dialect); the shared home in core::utils accepts a word
-  boundary (whitespace OR quote) and the network layer no longer
-  imports a query-internal path (CLAUDE.md 17(a)).
-- The WHERE locate uses the crate's TOP-LEVEL scanner — depth-aware
-  (a subquery's WHERE shadowed the outer one and mis-parsed into a
-  wrong literal filter). The terminator boundary tightened to
-  whitespace/paren ('t.limit > 5' was gutted — '.' passed the
-  identifier-byte boundary).
-- INTO/UPDATE EXPLAIN targets split at the paren (INSERT column
-  lists kept their table; FROM/JOIN keep the function-call skip).
-  The backing-collection creation prefers the AST ddl_table (quoted/
-  mixed-case names diverged from the string extractor — a stray
-  collection was minted). Empty components Err INSIDE the callee
-  (None now unambiguously means 'not multi-model'; the caller-side
-  raw-JSON re-inspection deleted — the contract split was how the
-  guard got dropped once). Pins added: REST empty components,
-  non-string cypher/namespace, DISTINCT composite shapes.
-- Tracked: the REST/PORT FROM-extractor divergence (REST trims a
-  different punctuation set and knows only FROM) — one shared
-  collect_from_targets beside collect_quoted_first_args.
-- SQL-standard doubled single quotes are now decoded at the federated
-  extension-parser boundary. Round 16/17 escaped the four programmatic
-  multimodal SQL producers, but the parser returned the doubled form to
-  VECTOR_SEARCH, DOCUMENT_QUERY, GRAPH_QUERY, and LOGS consumers, corrupting
-  collection names, filters, Cypher, and namespaces containing apostrophes.
-- Programmatic multi-model vectors now fail closed on missing, non-array,
-  nonnumeric, or out-of-f32-range components instead of silently dropping
-  elements and changing vector dimensionality.
-- Raw SQL, UQL lowering, direct `?` binding, and prepared `$N` binding now
-  reject non-finite vector components. This aligns the federated compatibility
-  path with the canonical `VectorSearchExpr::validate` contract instead of
-  forwarding NaN or infinity into distance kernels.
-
-- Tracked (follow-up scale): the JSON-to-SqlValue PARSE direction still
-  has 4+ hand-rolled copies with divergent number fallbacks (nullify /
-  stringify / drop) — the render consolidation's mirror image, needs its
-  own canonical home; per-site contract tests duplicating records' pinned
-  contract (delete as touched); the owned-input converter entry point
-  (executor/log-response clone-per-field).
+**Consolidation review round 41 (2026-09-08, adversarial closure):**
+- The pgwire fallback now selects only top-level WHERE/terminator tokens:
+  FILTER `(WHERE ...)`, subqueries, and qualified columns named `where` or
+  `limit` cannot shadow statement clauses. A present but malformed/empty
+  WHERE no longer degrades to an unfiltered legacy scan.
+- Both programmatic multi-model twins reject a supplied non-object `config`;
+  arrays/scalars can no longer silently execute the graph/log/metric defaults.
+  The runtime port marks validation failures with `InvalidQueryInput`, which
+  the v2 REST adapter maps to 400 instead of reporting a client error as 500.
+- EXPLAIN target extraction distinguishes read function-call positions from
+  write column lists: `INSERT INTO orders(id)` retains `orders`, while
+  `FROM TRACES(...)` remains excluded. Trailing punctuation is stripped
+  before quote decoding so a quoted subquery target remains intact.
+- The round-38 evidence bullets were restored to round 38; the earlier
+  insertion point had incorrectly placed them beneath round 40.
 
 **Round 19 follow-up (2026-09-05, PR fix/dot-walker-consolidation):** the
 two unconsolidated dot-path walkers now delegate to the shared

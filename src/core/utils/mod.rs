@@ -147,6 +147,82 @@ pub fn find_ascii_ci_outside_quotes(haystack: &str, needle: &str) -> Option<usiz
     None
 }
 
+/// [`find_ascii_ci_outside_quotes`], additionally excluding text nested in
+/// parentheses, brackets, or braces. This is the appropriate scanner for
+/// top-level SQL clauses: for example, `WHERE` inside `FILTER (WHERE ...)`
+/// is not the statement's predicate clause.
+pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut nesting = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match quote {
+            Some(q) => {
+                if bytes[i] == q {
+                    if i + 1 < bytes.len() && bytes[i + 1] == q {
+                        i += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    i += 2;
+                    let mut comment_depth = 1usize;
+                    while i < bytes.len() && comment_depth > 0 {
+                        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                            comment_depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                            comment_depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                    quote = Some(bytes[i]);
+                    i += 1;
+                    continue;
+                }
+                match bytes[i] {
+                    b'(' | b'[' | b'{' => {
+                        nesting += 1;
+                        i += 1;
+                        continue;
+                    }
+                    b')' | b']' | b'}' => {
+                        nesting = nesting.saturating_sub(1);
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if nesting == 0
+                    && i + needle.len() <= bytes.len()
+                    && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+                {
+                    return Some(i);
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 /// Shared f64→f32 narrowing guard: the narrowing can overflow to inf
 /// (1e300), and non-finite components must never dispatch to the distance
 /// kernels. Call sites migrate here incrementally so the policy has one

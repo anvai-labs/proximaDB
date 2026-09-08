@@ -2450,6 +2450,9 @@ impl PostgresProtocol {
 
     fn extract_select_where_predicates(query: &str) -> Option<Vec<SelectPredicate>> {
         let predicate = Self::extract_select_where_clause(query)?;
+        if predicate.is_empty() {
+            return None;
+        }
 
         // OR detected: try to fold `col = v1 OR col = v2` into `col IN (v1, v2)`.
         // Mixed-column OR, non-equality OR, and AND/OR combinations return None so
@@ -2729,11 +2732,25 @@ impl PostgresProtocol {
         // and identifier-boundary. find_top_level_keyword matches word
         // boundaries by construction.
         let mut predicate = {
-            let where_pos =
-                crate::query::federated::optimizer::sql_parsing::find_top_level_keyword(
-                    query, "WHERE",
-                )?;
-            query[where_pos + "WHERE".len()..].trim()
+            let bytes = query.as_bytes();
+            let mut found = None;
+            let mut search_from = 0usize;
+            while let Some(rel) =
+                crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "WHERE")
+            {
+                let pos = search_from + rel;
+                let end = pos + 5;
+                let boundary = (pos == 0
+                    || (!crate::core::utils::is_identifier_byte(bytes[pos - 1])
+                        && bytes[pos - 1] != b'.'))
+                    && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
+                if boundary {
+                    found = Some(&query[end.min(query.len())..]);
+                    break;
+                }
+                search_from = end;
+            }
+            found?.trim()
         };
         for terminator in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"] {
             // Iterate ALL occurrences until one passes the boundary test —
@@ -2742,18 +2759,17 @@ impl PostgresProtocol {
             // ('t.limit' must NOT count — '.' is not an identifier byte
             // but a qualified column's terminator must not gut it).
             let mut search_from = 0usize;
-            while let Some(rel) = crate::core::utils::find_ascii_ci_outside_quotes(
+            while let Some(rel) = crate::core::utils::find_ascii_ci_at_top_level(
                 &predicate[search_from..],
                 terminator,
             ) {
                 let pos = search_from + rel;
                 let bytes = predicate.as_bytes();
                 let end = pos + terminator.len();
-                let boundary =
-                    (pos == 0 || bytes[pos - 1].is_ascii_whitespace() || bytes[pos - 1] == b'(')
-                        && (end >= bytes.len()
-                            || bytes[end].is_ascii_whitespace()
-                            || bytes[end] == b')');
+                let boundary = (pos == 0
+                    || (!crate::core::utils::is_identifier_byte(bytes[pos - 1])
+                        && bytes[pos - 1] != b'.'))
+                    && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
                 if boundary {
                     predicate = predicate[..pos].trim();
                     break;
@@ -3024,7 +3040,9 @@ impl PostgresProtocol {
             }
             Err(_) => {
                 let predicates = if query.to_ascii_uppercase().contains(" WHERE ") {
-                    Self::extract_select_where_predicates(query).unwrap_or_default()
+                    Self::extract_select_where_predicates(query).ok_or_else(|| {
+                        anyhow::anyhow!("unsupported or malformed WHERE predicate")
+                    })?
                 } else {
                     Vec::new()
                 };

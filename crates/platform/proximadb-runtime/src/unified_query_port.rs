@@ -14,6 +14,20 @@ use anyhow::Result;
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
 
+/// A request reached the unified query port but its client-supplied query
+/// shape or values are invalid. Protocol adapters map this error to their
+/// invalid-argument status instead of reporting an internal server failure.
+#[derive(Debug)]
+pub struct InvalidQueryInput(pub String);
+
+impl std::fmt::Display for InvalidQueryInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidQueryInput {}
+
 /// Port for cross-model unified and federated query execution.
 ///
 /// Implemented by root-crate services that own `QueryFacadeAdapter`.  Injected
