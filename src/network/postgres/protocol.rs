@@ -2362,9 +2362,8 @@ impl PostgresProtocol {
         if table.is_empty() {
             None
         } else {
-            // Both dialect delimiters (create decodes backticks — the
-            // read side must match or CREATE `logs` selects nothing).
-            Some(table.trim_matches(['"', '`']).to_string())
+            // The ONE shared decoder (create/read symmetric).
+            Some(crate::core::utils::decode_identifier(table).to_string())
         }
     }
 
@@ -2918,16 +2917,13 @@ impl PostgresProtocol {
     }
 
     fn clean_identifier(identifier: &str) -> String {
-        // Backtick is the dialect's other identifier delimiter (a
-        // literal-`logs` name minted a phantom no DROP could address).
-        fn trim_delims(s: &str) -> &str {
-            s.trim_matches(['"', '`'])
-        }
-        trim_delims(
-            trim_delims(identifier.trim())
+        // The ONE shared decoder on the last dot-segment (the qualifier
+        // split stays — cross-namespace routing parses ns.table).
+        crate::core::utils::decode_identifier(
+            crate::core::utils::decode_identifier(identifier.trim())
                 .split('.')
                 .next_back()
-                .unwrap_or(identifier),
+                .unwrap_or_default(),
         )
         .to_string()
     }
@@ -3729,7 +3725,10 @@ impl PostgresProtocol {
         let table_end = after_table
             .find(|c: char| c.is_whitespace() || c == '(')
             .unwrap_or(after_table.len());
-        let table_name = after_table[..table_end].trim().to_lowercase();
+        // The ONE consumer-side decoder (six ad-hoc trims diverged; the
+        // raw path minted phantom literal-backtick collections).
+        let table_name =
+            crate::core::utils::decode_identifier(after_table[..table_end].trim()).to_lowercase();
 
         if table_name.is_empty() {
             return self.send_command_complete("OK").await;

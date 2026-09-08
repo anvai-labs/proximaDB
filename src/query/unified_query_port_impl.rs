@@ -534,14 +534,17 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 } else {
                     target
                 };
-                let target = target.trim_matches(['"', '`']);
-                // Call-position gate: a collection named logs/metrics is a
-                // REAL target (the bare-name gate dropped it) — skip only
-                // when the NEXT token opens the call's argument list.
-                let window_end = window_index + 2;
-                let next_opens_call = tokens
-                    .get(window_end)
-                    .is_some_and(|t| t.starts_with('(') && !t.starts_with("(SELECT"));
+                let target = crate::core::utils::decode_identifier(target.trim_matches(['"', '`']));
+                // Call-position gate, FROM/JOIN only: skip when the next
+                // token opens an EXTENSION call's argument list — a
+                // catalog-function name followed by a QUOTED first arg
+                // (TRACES ('ops')). INSERT column lists (INTO/UPDATE) and
+                // subquery opens never trigger it.
+                let is_from_join = matches!(keyword.as_str(), "FROM" | "JOIN");
+                let next_opens_call = is_from_join
+                    && tokens.get(window_index + 2).is_some_and(|t| {
+                        t.starts_with('(') && t[1..].trim_start().starts_with(['\'', '"'])
+                    });
                 if !target.is_empty() && !next_opens_call {
                     targets.push(target.to_string());
                 }

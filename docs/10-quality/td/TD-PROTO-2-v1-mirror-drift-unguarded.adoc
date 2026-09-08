@@ -1895,6 +1895,28 @@ pinned + narrated:**
   collect_from_targets still mints spaced function names. Dollar-
   quotes ($$…$$) are unhandled (the tolerance fallback mitigates).
 
+**Consolidation review round 48 (2026-09-08, follow-up PR #1852):**
+- The round-47 retry fired on ANY None and probed EVERY quote byte —
+  keywords inside properly-TERMINATED literals matched (wrong results,
+  compiled-repro verified) and needle-absent scans went QUADRATIC
+  (15k quotes → 15k rescans; 901ms on a 100KB query). The retry is
+  EXACTLY-ONCE now, driven by the tracked EOF-in-quote opener (≤2
+  scans, O(n)).
+- ONE consumer-side decode_identifier (matched outer pair, either
+  delimiter, no overtrim) wires the CREATE path (the raw path minted
+  phantom literal-backtick collections — round 47's 'clean_identifier
+  covers it' claim was false, clean_identifier is column-only), the
+  read side, and clean_identifier (dot-split kept; dead fallback
+  dropped). The quote-ADJACENT strip arm restored (round 47 deleted
+  it — EXISTS"logs" minted a collection named 'if').
+- The port EXPLAIN call gate is FROM/JOIN-only and requires a QUOTED
+  first arg after the paren (INSERT column lists and subqueries are
+  never extension calls; the '(SELECT' exemption was case/spacing
+  blind).
+- Tracked: extract_identifier's quoted branch is double-quote-only
+  (backticked rank-profile names keep delimiters; doubled-quote
+  unescape diverges from the shared decoder — unify on the helper).
+
 == Not in scope
 
 The v2 package already has both generation (`PROXIMADB_PROTO_REGEN=1`) and the

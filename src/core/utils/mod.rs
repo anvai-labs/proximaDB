@@ -170,6 +170,22 @@ pub fn skip_leading_ws_and_comments(input: &str) -> &str {
     }
 }
 
+/// Decode ONE identifier: strip a MATCHED outer delimiter pair (double
+/// quote or backtick — content of the other style is untouched) with no
+/// dot-splitting. The ONE consumer-side decoder beside strip_if_not_exists
+/// (six ad-hoc trims had diverged: quote-only, both-with-overtrim, none).
+pub fn decode_identifier(ident: &str) -> &str {
+    let bytes = ident.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' || first == b'`') && first == last {
+            return &ident[1..ident.len() - 1];
+        }
+    }
+    ident
+}
+
 /// Case-insensitive `IF NOT EXISTS` prefix strip with a word boundary
 /// (whitespace OR an opening quote — `EXISTS"logs"` parses under the
 /// pinned GenericDialect). Returns (had_prefix, rest).
@@ -196,6 +212,9 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
             true,
             skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
         ),
+        // Quote-ADJACENT operand (IF NOT EXISTS"logs" parses under the
+        // pinned dialect): strip, rest undecoded (consumers decode).
+        Some(b) if *b == b'"' || *b == b'`' => (true, &cleaned["IF NOT EXISTS".len()..]),
         Some(_) => (false, input),
     }
 }
@@ -204,14 +223,18 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
 /// parentheses, brackets, or braces. This is the appropriate scanner for
 /// top-level SQL clauses: for example, `WHERE` inside `FILTER (WHERE ...)`
 /// is not the statement's predicate clause.
-fn at_top_level_impl(haystack: &str, needle: &str, skip_quote_at: Option<usize>) -> Option<usize> {
+fn at_top_level_impl(
+    haystack: &str,
+    needle: &str,
+    skip_quote_at: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
     let bytes = haystack.as_bytes();
-    let mut quote: Option<u8> = None;
+    let mut quote: Option<(u8, usize)> = None;
     let mut nesting = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
         match quote {
-            Some(q) => {
+            Some((q, _opened_at)) => {
                 if bytes[i] == q {
                     if i + 1 < bytes.len() && bytes[i + 1] == q {
                         i += 2;
@@ -249,7 +272,7 @@ fn at_top_level_impl(haystack: &str, needle: &str, skip_quote_at: Option<usize>)
                 // inside them is NOT code (keywords/apostrophes/parens
                 // in a `col` gutted the predicate).
                 if matches!(bytes[i], b'\'' | b'"' | b'`') && skip_quote_at != Some(i) {
-                    quote = Some(bytes[i]);
+                    quote = Some((bytes[i], i));
                     i += 1;
                     continue;
                 }
@@ -270,32 +293,34 @@ fn at_top_level_impl(haystack: &str, needle: &str, skip_quote_at: Option<usize>)
                     && i + needle.len() <= bytes.len()
                     && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
                 {
-                    return Some(i);
+                    return (Some(i), None);
                 }
                 i += 1;
             }
         }
     }
-    None
+    // EOF in quote mode: report the opener so the caller can retry once
+    // with it treated as a literal byte (a stray apostrophe must not
+    // swallow the rest of the query).
+    (None, quote.map(|(_, at)| at))
 }
 
 pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize> {
-    // Unterminated-quote tolerance: a stray apostrophe/dollar-quote body
-    // must not swallow the rest of the query (LIMIT inside $$ don't panic $$
-    // streamed the whole table). On EOF-in-quote, re-scan with the opener
-    // treated as a literal byte.
-    if let Some(found) = at_top_level_impl(haystack, needle, None) {
-        return Some(found);
+    // Unterminated-quote tolerance, EXACTLY-ONCE retry: a stray apostrophe
+    // or dollar-quote body must not swallow the rest of the query (LIMIT
+    // inside $$ don't panic $$ streamed the whole table). The retry is
+    // driven by the tracked EOF-in-quote opener — retrying EVERY quote
+    // byte matched keywords inside properly-terminated literals (wrong
+    // results) and made needle-absent scans quadratic (15k quotes → 15k
+    // rescans).
+    let (found, unterminated) = at_top_level_impl(haystack, needle, None);
+    if found.is_some() {
+        return found;
     }
-    let bytes = haystack.as_bytes();
-    for (idx, b) in bytes.iter().enumerate() {
-        if matches!(b, b'\'' | b'"' | b'`')
-            && let Some(found) = at_top_level_impl(haystack, needle, Some(idx))
-        {
-            return Some(found);
-        }
+    match unterminated {
+        Some(open) => at_top_level_impl(haystack, needle, Some(open)).0,
+        None => None,
     }
-    None
 }
 
 /// Shared f64→f32 narrowing guard: the narrowing can overflow to inf
