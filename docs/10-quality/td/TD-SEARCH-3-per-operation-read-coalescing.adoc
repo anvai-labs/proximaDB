@@ -801,8 +801,9 @@ same process.
 
 No production selector or TOML option is authorized by this result. The
 candidate evaluated during review was removed rather than lower the recall
-ratchet. The measured binary is also 433 commits behind the rejected PR head,
-and no current-head Config→global-settings→real-PAX recall eval covered exact
+ratchet. The rejected PR head contained 433 commits absent from the measured
+revision, while the measured revision contained 2 commits absent from the PR
+head; no current-head Config→global-settings→real-PAX recall eval covered exact
 anchors, interpolation boundaries, top-k bucket boundaries, or supported
 metric/corpus classes. A successor must carry collection-scoped calibration
 identity, fail closed on an identity mismatch, and pass that production-route

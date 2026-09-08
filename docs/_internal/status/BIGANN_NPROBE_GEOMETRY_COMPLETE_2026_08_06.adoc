@@ -91,8 +91,9 @@ calibration identity with which to distinguish those workloads.
 
 The proposed `measured_quality_v1` configuration surface is therefore
 **REFUTED and removed**. Default-OFF would not have made it correct for a
-mixed-collection process. The benchmark binary also predates the rejected PR
-head by 433 commits, and selector-unit tests did not exercise
+mixed-collection process. The rejected PR head contained 433 commits absent
+from the measured revision, while the measured revision contained 2 commits
+absent from the PR head; selector-unit tests did not exercise
 Config→global-settings→real-PAX recall. A future policy must be
 collection-scoped, fail closed on calibration-identity mismatch, and pass a
 current-head production-route recall matrix covering anchors, interpolation
