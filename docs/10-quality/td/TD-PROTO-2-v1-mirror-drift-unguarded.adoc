@@ -1470,6 +1470,32 @@ angles after the main agent hit a rate limit):**
   the query-imports-network inversion round 30 eliminated). Six
   inline finite_f32 copies swapped for the shared helper (the
   component fn's unwrap_or(NAN) smell dropped with them).
+
+**Consolidation review round 34 (2026-09-07):**
+- A RED TEST on HEAD: the reconciliation adopted the parallel
+  session's document-default test while keeping this session's strict
+  required-collection arm — resolved to the TEST-PINNED lenient
+  semantics (missing collection → 'default' at BOTH twins; non-string
+  still errors). The REST graph arm typed (matches the port).
+- COUNT's DISTINCT arm uses the ONE shared predicate ('DISTINCT\tid'
+  silently fell to a non-distinct count with a phantom column — the
+  third detector the census missed). inject_graph_target_into_cypher's
+  needles are quote-aware (a ' FROM ' inside a Cypher string literal
+  suppressed injection and downstream mis-extracted the graph). The
+  Python binding's THIRD inject twin delegates to the shared home
+  (it injected for the 'default' sentinel and appended FROM at the
+  end). The top-level keyword boundary treats '$' and non-ASCII as
+  identifier bytes (b$from/éfrom matched FROM mid-identifier). The
+  remaining inline finite_f32 bodies swapped for the helper.
+- Tracked: the top-level scanner family is still comment-blind (an
+  apostrophe inside '-- don't' before ORDER BY drops the sort) —
+  per-loop comment state is exactly the late-stage churn class this
+  PR got burned by; folds into the terminal shared-scanner item with
+  a comment-strip-at-entry alternative noted. The port twin remains
+  the only LIVE multi-model route with the lenient collection default
+  (twins item). columnar.rs (fresh surface, unregistered provider):
+  two more DISTINCT detectors + an uppercase-offset slice panic —
+  latent, same classes.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

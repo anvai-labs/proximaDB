@@ -4805,25 +4805,15 @@ fn trace_span_to_python(py: Python<'_>, span: super::EmbeddedTraceSpan) -> PyRes
 }
 
 fn inject_graph_target_into_cypher(graph_id: Option<&str>, cypher: &str) -> String {
-    let cypher = cypher.trim().trim_end_matches(';').trim();
-    let Some(graph_id) = graph_id.map(str::trim).filter(|value| !value.is_empty()) else {
-        return cypher.to_string();
-    };
-
-    let upper = cypher.to_ascii_uppercase();
-    if upper.contains(" FROM ") {
-        return cypher.to_string();
-    }
-
-    if let Some(return_index) = upper.find(" RETURN ") {
-        format!(
-            "{} FROM {}{}",
-            &cypher[..return_index],
-            graph_id,
-            &cypher[return_index..]
-        )
-    } else {
-        format!("{cypher} FROM {graph_id}")
+    // Delegate to the ONE shared home (this third copy had diverged: it
+    // injected for graph_id="default" — the sentinel the home treats as
+    // unspecified — and appended FROM at the end instead of before WHERE).
+    let graph_id = graph_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "default");
+    match graph_id {
+        Some(graph) => proximadb::core::utils::inject_graph_target_into_cypher(graph, cypher),
+        None => cypher.trim().trim_end_matches(';').trim().to_string(),
     }
 }
 

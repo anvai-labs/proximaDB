@@ -308,13 +308,13 @@ pub fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
     // to_uppercase() can change UTF-8 byte lengths, and offsets found in
     // the copy can slice the original mid-character (panic) or past its
     // end.
-    if find_ascii_ci(cypher, " FROM ").is_some() {
+    if find_ascii_ci_outside_quotes(cypher, " FROM ").is_some() {
         return cypher.to_string();
     }
 
     let insertion_index = [" WHERE ", " RETURN ", " ORDER BY ", " LIMIT ", " SKIP "]
         .iter()
-        .filter_map(|needle| find_ascii_ci(cypher, needle))
+        .filter_map(|needle| find_ascii_ci_outside_quotes(cypher, needle))
         .min();
 
     if let Some(index) = insertion_index {

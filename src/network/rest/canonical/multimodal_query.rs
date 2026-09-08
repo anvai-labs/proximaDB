@@ -758,6 +758,9 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 )
             }
             "document" => {
+                // Lenient default (test-pinned: document components
+                // without a collection query 'default' — the port twin
+                // agrees); a NON-STRING value still errors.
                 let collection = component
                     .config
                     .get("collection")
@@ -769,11 +772,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                         })
                     })
                     .transpose()?
-                    .ok_or_else(|| {
-                        ApiError::InvalidArgument(
-                            "document component config.collection is required".to_string(),
-                        )
-                    })?;
+                    .unwrap_or("default");
                 let filter = component
                     .config
                     .get("filter")
@@ -797,7 +796,14 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 let graph = component
                     .config
                     .get("graph")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "graph component config.graph must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("default");
                 let cypher = component
                     .config

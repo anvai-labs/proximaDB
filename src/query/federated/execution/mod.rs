@@ -1712,12 +1712,10 @@ impl FederatedExecutor {
                 .iter()
                 .map(|value| match value.value.as_ref()? {
                     sql_value::Value::NumberValue(number) => {
-                        let f = *number as f32;
-                        f.is_finite().then_some(f)
+                        crate::core::utils::finite_f32(*number)
                     }
                     sql_value::Value::Int64Value(number) => {
-                        let f = *number as f32;
-                        f.is_finite().then_some(f)
+                        crate::core::utils::finite_f32(*number as f64)
                     }
                     _ => None,
                 })
@@ -1741,12 +1739,10 @@ impl FederatedExecutor {
                 .iter()
                 .map(|value| match value.value.as_ref()? {
                     property_value::Value::DoubleValue(number) => {
-                        let f = *number as f32;
-                        f.is_finite().then_some(f)
+                        crate::core::utils::finite_f32(*number)
                     }
                     property_value::Value::IntValue(number) => {
-                        let f = *number as f32;
-                        f.is_finite().then_some(f)
+                        crate::core::utils::finite_f32(*number as f64)
                     }
                     _ => None,
                 })

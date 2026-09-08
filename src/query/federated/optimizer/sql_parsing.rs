@@ -59,11 +59,14 @@ pub(crate) fn find_top_level_keyword_from(
             .get(index..index.saturating_add(keyword_len))
             .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword_bytes))
         {
-            let before_ok = index == 0
-                || (!bytes[index - 1].is_ascii_alphanumeric() && bytes[index - 1] != b'_');
+            // Identifier boundary: '$' and non-ASCII letters continue an
+            // identifier (b$from / éfrom must not match FROM) — the same
+            // class core::utils::is_identifier_char uses.
+            let is_ident_byte =
+                |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+            let before_ok = index == 0 || !is_ident_byte(bytes[index - 1]);
             let after_index = index + keyword_len;
-            let after_ok = after_index == bytes.len()
-                || (!bytes[after_index].is_ascii_alphanumeric() && bytes[after_index] != b'_');
+            let after_ok = after_index == bytes.len() || !is_ident_byte(bytes[after_index]);
             if before_ok && after_ok {
                 return Some(index);
             }
@@ -234,10 +237,10 @@ pub(crate) fn parse_aggregate_expr(item: &SelectItem) -> Option<AggregateExpr> {
                     column: None,
                     alias,
                 })
-            } else if let Some(distinct_column) = inner
-                .strip_prefix("DISTINCT ")
-                .or_else(|| inner.strip_prefix("distinct "))
-            {
+            } else if let Some(distinct_column) = strip_distinct_prefix(inner) {
+                // The ONE distinct predicate (any case + any whitespace —
+                // 'DISTINCT\tid' silently fell to a non-distinct count
+                // with a phantom column).
                 Some(AggregateExpr {
                     function: AggregateFunction::CountDistinct,
                     column: Some(distinct_column.trim().to_string()),
