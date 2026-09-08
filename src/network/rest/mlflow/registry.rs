@@ -521,7 +521,11 @@ mod tests {
             .expect("test catalog");
         let registry = Arc::new(CatalogModelRegistryService::new(manager));
         let router = registry_routes()
-            .with_state(MlflowState::new(document, registry.clone()))
+            .with_state(MlflowState::new(
+                document,
+                registry.clone(),
+                std::env::temp_dir(),
+            ))
             .layer(axum::Extension(TenantContext::new(
                 "default",
                 TenantIdSource::Default,

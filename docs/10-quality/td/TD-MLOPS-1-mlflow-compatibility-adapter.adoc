@@ -7,7 +7,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | In Progress — slices 1-3 implemented (tracking core, tracking wire + real-client conformance, registry wire); slice 4 (artifacts) remains
+| Status | Implemented — all four slices (tracking core, tracking wire + conformance, registry wire, artifacts proxy); gate default-OFF, flip assessment pending
 | Severity | Medium — platform gap: the AI-native data platform cannot be driven by the ML tooling ecosystem (MLflow clients) without this adapter
 | Component | `src/network/rest/mlflow/` (new), `crates/control/proximadb-catalog` (registry lowering), RunStore port (new)
 | Design authority | `docs/12-design/XCATALOG_MLOPS_MODEL_REGISTRY_2026_08_12.adoc` ("one authority, several adapters")
@@ -188,6 +188,19 @@ execution; MLflow auth pass-through (tenant identity stays ours).
   unit lane: full workflow, tenant-uniformity, gate default. The
   real-client (mlflow-skinny, pinned) conformance lane follows as this
   slice's closing commit.
+* **Slice 4 (2026-09-08)**: the artifacts PROXY family —
+  /api/2.0/mlflow-artifacts/artifacts/{*path} PUT/GET/DELETE plus the
+  bare-root LIST/DELETE via ?path= (listing a FILE path yields the empty
+  list, the convention the client download flow relies on);
+  artifact_location/artifact_uri populated (experiments default
+  mlflow-artifacts:/<id>; runs mlflow-artifacts:/<exp>/<run>/artifacts);
+  local-file storage under <data_dir>/mlflow_artifacts/<tenant>/...
+  (traversal-sanitized, verbatim filenames, tenant-scoped; S3-backed
+  repository is the tracked follow-up). Conformance 17 -> 18:
+  log/list/download artifact round-trip through the real client. ALL
+  FOUR SLICES IMPLEMENTED — the wave's remaining item is the flip
+  assessment (conformance green across consecutive develop revisions +
+  SIFT-bed load measurement + product sign-off).
 * **Slice 3 (2026-09-08)**: the registry wire — registered-models
   create/get/get-by-name/search and model-versions get/search lowering to
   `CatalogModelRegistryService` (create_registry / get / list /

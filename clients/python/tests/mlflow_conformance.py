@@ -193,6 +193,34 @@ def main() -> int:
 
     step("model_versions_search_empty", do_model_versions_empty)
 
+    # 7. Artifacts through the proxy family (TD-MLOPS-1 slice 4): the run's
+    # artifact_uri resolves against the tracking host's
+    # /api/2.0/mlflow-artifacts proxy.
+    import os
+    import tempfile
+
+    def do_artifact_roundtrip():
+        run = client.get_run(state["run_id"])
+        assert run.info.artifact_uri.startswith(
+            "mlflow-artifacts:/"
+        ), run.info.artifact_uri
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "model.txt")
+            with open(local, "w") as fh:
+                fh.write("artifact-bytes")
+            client.log_artifact(state["run_id"], local)
+            artifacts = client.list_artifacts(state["run_id"])
+            assert any(
+                a.path == "model.txt" and not a.is_dir for a in artifacts
+            ), artifacts
+            dest = os.path.join(tmp, "dl")
+            os.makedirs(dest)
+            downloaded = client.download_artifacts(state["run_id"], "model.txt", dest)
+            with open(downloaded, "r") as fh:
+                assert fh.read() == "artifact-bytes"
+
+    step("artifact_roundtrip", do_artifact_roundtrip)
+
     total = len(PASSED)
     print(f"CONFORMANCE_STEPS={total}")
     # Fail the workflow outright if ANY attempted step missed. Keep this

@@ -37,14 +37,20 @@ use crate::storage::document::DocumentService;
 pub struct MlflowState {
     document: Arc<DocumentService>,
     registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
+    pub(crate) data_dir: std::path::PathBuf,
 }
 
 impl MlflowState {
     pub fn new(
         document: Arc<DocumentService>,
         registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
+        data_dir: std::path::PathBuf,
     ) -> Self {
-        Self { document, registry }
+        Self {
+            document,
+            registry,
+            data_dir,
+        }
     }
 }
 
@@ -67,7 +73,14 @@ fn is_enabled(value: Option<&str>) -> bool {
     }
 }
 
+pub mod artifacts;
 pub mod registry;
+
+/// The artifacts PROXY lives at /api/2.0/mlflow-artifacts (a sibling of
+/// /api/2.0/mlflow, not under it) — mounted separately in server.rs.
+pub fn artifacts_router() -> Router<MlflowState> {
+    artifacts::artifacts_routes()
+}
 
 pub fn mlflow_routes() -> Router<MlflowState> {
     Router::new()
@@ -521,7 +534,10 @@ fn experiment_out(record: &ExperimentRecord) -> ExperimentOut {
     ExperimentOut {
         experiment_id: record.experiment_id.to_string(),
         name: record.name.clone(),
-        artifact_uri: record.artifact_location.clone().unwrap_or_default(),
+        artifact_uri: record
+            .artifact_location
+            .clone()
+            .unwrap_or_else(|| artifacts::experiment_artifact_location(record.experiment_id)),
         lifecycle_stage: match record.stage {
             ExperimentStage::Active => "active",
             ExperimentStage::Deleted => "deleted",
@@ -570,7 +586,7 @@ fn run_out(record: &RunRecord) -> RunOut {
                 RunLifecycle::Active => "active",
                 RunLifecycle::Deleted => "deleted",
             },
-            artifact_uri: String::new(),
+            artifact_uri: artifacts::run_artifact_uri(record.experiment_id, &record.run_id),
             run_name: record.run_name.clone(),
         },
         data: RunData {
@@ -1365,6 +1381,7 @@ mod tests {
                         Arc::new(crate::catalog::CatalogManager::new()),
                     ),
                 ),
+                std::env::temp_dir(),
             ))
             .layer(axum::Extension(tenant_ctx(tenant)))
     }

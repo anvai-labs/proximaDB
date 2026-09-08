@@ -544,10 +544,17 @@ impl RestServer {
             let mlflow_state = super::mlflow::MlflowState::new(
                 state.document_service.clone(),
                 state.model_registry_service.clone(),
+                state.data_dir.clone(),
             );
-            let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state);
+            let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
-            tracing::info!("✅ MLflow compatibility wire enabled at /api/2.0/mlflow");
+            let artifacts_router = super::mlflow::artifacts_router().with_state(mlflow_state);
+            // merge (not nest): the artifacts family carries its full
+            // absolute path and must combine with, not nest under, the base.
+            base_router = base_router.merge(artifacts_router);
+            tracing::info!(
+                "✅ MLflow compatibility wire enabled at /api/2.0/mlflow (+ artifacts proxy)"
+            );
         }
 
         // Unmatched routes (incl. the removed v1 surfaces) return the canonical
@@ -931,10 +938,17 @@ impl RestServer {
             let mlflow_state = super::mlflow::MlflowState::new(
                 state.document_service.clone(),
                 state.model_registry_service.clone(),
+                state.data_dir.clone(),
             );
-            let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state);
+            let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
-            tracing::info!("✅ MLflow compatibility wire enabled at /api/2.0/mlflow");
+            let artifacts_router = super::mlflow::artifacts_router().with_state(mlflow_state);
+            // merge (not nest): the artifacts family carries its full
+            // absolute path and must combine with, not nest under, the base.
+            base_router = base_router.merge(artifacts_router);
+            tracing::info!(
+                "✅ MLflow compatibility wire enabled at /api/2.0/mlflow (+ artifacts proxy)"
+            );
         }
 
         // Unmatched routes (incl. removed v1 surfaces) → canonical 404 + hint.
