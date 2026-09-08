@@ -20,7 +20,7 @@ use crate::query::capability::{Capability, CapabilitySet};
 use crate::storage::multimodel::ModelType;
 use proximadb_kernel::error::VectorDBError;
 
-pub(crate) mod sql_parsing;
+mod sql_parsing;
 pub(crate) mod vector_query_parsing;
 
 pub mod cached_plan_builder;

@@ -605,16 +605,9 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             .map_err(|error| InvalidQueryInput(error.to_string()))?
         {
             Some(sql) => sql,
-            // Components present (ANY shape — including empty) fail
-            // closed: the 'SELECT 1' fallback returned 200-OK garbage
-            // (round 22's contract; the Result restructure dropped it).
-            None if request.get("components").is_some() => {
-                return Err(InvalidQueryInput(
-                    "multi-model request contained a component that could not be lowered (empty, malformed, or unknown component_type)"
-                        .to_string(),
-                )
-                .into());
-            }
+            // None unambiguously means 'not a multi-model request' (the
+            // callee errs on every components-present shape — empty,
+            // malformed, unknown — since round 41).
             None => request
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -958,9 +951,9 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
         parts.push(sql_part);
     }
 
-    if parts.is_empty() {
-        return Ok(None);
-    }
+    // parts cannot be empty: a present components array with zero
+    // entries errs above, and every present component either errs or
+    // pushes (the dead Ok(None) arm here was the ambiguous-None trap).
 
     // Single component: use directly; multiple: UNION ALL
     if parts.len() == 1 {

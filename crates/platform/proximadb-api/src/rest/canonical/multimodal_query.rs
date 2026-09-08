@@ -199,15 +199,19 @@ async fn execute_multi_model_query(
     match s.unified_query_port.execute_multi_model_query(req).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("execute_multi_model_query").into_response()
-            } else if e.downcast_ref::<InvalidQueryInput>().is_some() {
+            // Downcast FIRST: InvalidQueryInput embeds user-controlled
+            // component_type text — a client error containing the words
+            // 'not implemented' misrouted to 501.
+            if e.downcast_ref::<InvalidQueryInput>().is_some() {
                 (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "error": e.to_string() })),
                 )
                     .into_response()
+            } else if e.to_string().contains("not implemented")
+                || e.to_string().contains("UNIMPLEMENTED")
+            {
+                not_implemented("execute_multi_model_query").into_response()
             } else {
                 error!("Multi-model query failed: {e}");
                 (

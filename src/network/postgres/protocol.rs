@@ -1666,13 +1666,13 @@ impl PostgresProtocol {
                     {
                         Ok(result) => {
                             if upper.starts_with("CREATE TABLE")
-                                // The AST name when present (quoted/mixed-
-                                // case names diverged from the string
-                                // extractor — a stray backing collection was
-                                // minted while the real table got none).
-                                && let Some(table_name) = ddl_table
-                                    .clone()
-                                    .or_else(|| self.extract_create_table_name(query))
+                                // The AST name (quoted/mixed-case names
+                                // diverged from string extraction — a stray
+                                // backing collection was minted while the
+                                // real table got none). Under
+                                // upper.starts_with("CREATE TABLE") with a
+                                // parsed statement it is ALWAYS Some.
+                                && let Some(table_name) = ddl_table.clone()
                             {
                                 self.ensure_relational_backing_collection(
                                     &table_name,
@@ -1767,19 +1767,6 @@ impl PostgresProtocol {
 
         // Handle other commands
         self.send_command_complete("OK").await
-    }
-
-    fn extract_create_table_name(&self, query: &str) -> Option<String> {
-        let table_pos = find_ascii_ci(query, "CREATE TABLE")?;
-        let after_table = query[table_pos + "CREATE TABLE".len()..].trim_start();
-        // The frontend parser's ONE case-insensitive strip (whitespace
-        // boundary included — a hand-rolled variant here drifted).
-        let after_table = crate::core::utils::strip_if_not_exists(after_table).1;
-        let table_end = after_table
-            .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
-            .unwrap_or(after_table.len());
-        let table_name = Self::clean_identifier(&after_table[..table_end]);
-        (!table_name.is_empty()).then_some(table_name.to_lowercase())
     }
 
     async fn ensure_relational_backing_collection(
@@ -3039,13 +3026,19 @@ impl PostgresProtocol {
                     .await?
             }
             Err(_) => {
-                let predicates = if query.to_ascii_uppercase().contains(" WHERE ") {
-                    Self::extract_select_where_predicates(query).ok_or_else(|| {
-                        anyhow::anyhow!("unsupported or malformed WHERE predicate")
-                    })?
-                } else {
-                    Vec::new()
-                };
+                // Gate on the AWARE top-level scanner (a raw ' WHERE '
+                // substring disagreed in both directions: a tab-delimited
+                // WHERE skipped the gate entirely — silent unfiltered
+                // scan — while a literal ' WHERE ' armed it and the
+                // extractor's None hard-errored a WHERE-less query).
+                // None ⇒ no predicates ⇒ unfiltered, the correct answer
+                // for a query with no top-level WHERE.
+                let predicates =
+                    if crate::core::utils::find_ascii_ci_at_top_level(query, "WHERE").is_some() {
+                        Self::extract_select_where_predicates(query).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                 dml_service
                     .select_table_records_with_projection(
                         table_name,
@@ -3704,21 +3697,14 @@ impl PostgresProtocol {
     async fn execute_create_table(&mut self, query: &str) -> Result<()> {
         let upper = query.to_uppercase();
 
-        // Check if IF NOT EXISTS was specified (ADR-018 Phase 2)
-        let if_not_exists = upper.contains("IF NOT EXISTS");
-
-        // Extract table name: CREATE TABLE [IF NOT EXISTS] name
-        let table_start = if if_not_exists {
-            find_ascii_ci(query, "EXISTS").map(|p| p + 6)
-        } else {
-            find_ascii_ci(query, "TABLE").map(|p| p + 5)
-        };
-
-        let Some(start) = table_start else {
+        // The ONE strip (a contains() + first-EXISTS find armed the flag
+        // and mis-sliced the name from text inside a DEFAULT literal).
+        let Some(table_pos) = find_ascii_ci(query, "TABLE") else {
             return self.send_command_complete("OK").await;
         };
+        let after_clause = query[table_pos + "TABLE".len()..].trim_start();
+        let (if_not_exists, after_table) = crate::core::utils::strip_if_not_exists(after_clause);
 
-        let after_table = query[start..].trim();
         let table_end = after_table
             .find(|c: char| c.is_whitespace() || c == '(')
             .unwrap_or(after_table.len());
