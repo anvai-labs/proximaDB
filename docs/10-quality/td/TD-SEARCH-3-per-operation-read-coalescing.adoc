@@ -767,6 +767,56 @@ link:../../_internal/status/BIGANN_NPROBE_GEOMETRY_100K_10M_2026_08_04.adoc[the
 five-scale partial evidence artifact] for source hashes, coverage, fits, charts,
 and remaining measurement gates.
 
+=== S5b: complete same-binary five-scale nprobe evidence (2026-08-06)
+
+The missing 10M curve and same-binary rerun are complete. One release-server
+binary (`aed724fc5`, SHA-256 `62677fb41686015569f7de408fbe8c9758dd7a469de582cb33c8c9d17d1efdae`)
+served all five natural-cell BIGANN matrices: 100K/330K/1M/3.3M/10M rows,
+`k_c=3/10/30/100/305`, exact prefix-matched ground truth, 1,000 queries per
+point, top-10 and top-20, fresh process per point. Every matrix is complete,
+passes its measurement protocol, and has zero measurement failures.
+
+The minimum measured nprobe attaining recall 0.98 is top-10
+`3/5/6/16/22` and top-20 `3/5/7/16/26`. At 10M, top-10 nprobe 22 measured
+recall 0.9804 at 52.902 physical GET/query and 130.86 MB/query; top-20 nprobe
+26 measured 0.98285 at 64.340 GET/query and 163.39 MB/query. This closes the
+partial-result caveat above without pretending nprobe alone reaches the
+20-GET serving objective.
+
+The five-scale quality fits are top-10 `1.7202765*k_c^0.4466996` and top-20
+`1.6639694*k_c^0.4751678`. They are useful only inside the measured
+`k_c=3..305`, and only for top-k at most 20. In particular, the continuous fit
+under-predicts the measured `k_c=100` floor, so blindly replacing the shipped
+geometric default would violate the evidence.
+
+**Production-policy verdict: REFUTED.** A cell-count/top-k-only interpolation
+of these BIGANN anchors selects nprobe 15 at `k_c=90`. Existing 384-d and 768-d
+BGE evidence at the same cell count requires nprobe 25 for top-10 and about 30
+for top-20; even nprobe 20 measured below recall 0.98 (TD-IVF-3, "The sqrt-based
+nprobe policy is BIGANN-specific"). The segment selector is process-global and
+serves L2, cosine, and dot-product searches without collection, corpus family,
+dimension, projection width, seed, or calibration identity. An opt-in global
+BIGANN policy would therefore silently under-probe other collections in the
+same process.
+
+No production selector or TOML option is authorized by this result. The
+candidate evaluated during review was removed rather than lower the recall
+ratchet. The rejected PR head contained 433 commits absent from the measured
+revision, while the measured revision contained 2 commits absent from the PR
+head; no current-head Config→global-settings→real-PAX recall eval covered exact
+anchors, interpolation boundaries, top-k bucket boundaries, or supported
+metric/corpus classes. A successor must carry collection-scoped calibration
+identity, fail closed on an identity mismatch, and pass that production-route
+eval before it can expose a policy surface. The existing geometric behavior
+remains unchanged; that continuity is not a new cross-corpus recall claim.
+
+Full provenance, hashes, curves, and limitations:
+link:../../_internal/status/BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc[complete
+five-scale evidence] (ledger
+`bigann_nprobe_geometry_complete_same_binary_100k_10m`). A default flip still
+requires current-binary, provider-realistic paired evidence, collection-scoped
+policy plumbing, and the recall ratchet.
+
 === S3c: the k_c=90 eligible-cap repeat (2026-08-20) — 24 MiB is NOT eligible
 
 The `k_c=90` repeat this TD required is complete. Immutable bed
