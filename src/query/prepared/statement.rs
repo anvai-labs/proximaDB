@@ -425,8 +425,7 @@ impl PreparedStatement {
         // a plain reverse gives number-descending; the full tokenizer
         // remains TD-tracked).
 
-        // Replace from the end to avoid position shifts
-        for (param_idx, _binding) in self.parameter_bindings.iter().enumerate().rev() {
+        for param_idx in (0..self.parameter_bindings.len()).rev() {
             let param_value = &params[param_idx];
             if let ParameterValue::Vector(vector) = param_value
                 && vector.iter().any(|component| !component.is_finite())

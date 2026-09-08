@@ -166,18 +166,24 @@ pub fn skip_leading_ws_and_comments(input: &str) -> &str {
 /// (whitespace OR an opening quote — `EXISTS"logs"` parses under the
 /// pinned GenericDialect). Returns (had_prefix, rest).
 pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
-    let Some(head) = input.get(.."IF NOT EXISTS".len()) else {
+    // Comments may sit between the keyword and the operand — skip them on
+    // BOTH sides (a comment after the prefix produced name '/*').
+    let cleaned = skip_leading_ws_and_comments(input);
+    let Some(head) = cleaned.get(.."IF NOT EXISTS".len()) else {
         return (false, input);
     };
     if !head.eq_ignore_ascii_case("IF NOT EXISTS") {
         return (false, input);
     }
-    let next = input.as_bytes().get("IF NOT EXISTS".len());
+    let next = cleaned.as_bytes().get("IF NOT EXISTS".len());
     match next {
         None => (true, ""),
-        Some(b) if b.is_ascii_whitespace() || *b == b'"' => {
-            (true, input["IF NOT EXISTS".len()..].trim_start())
-        }
+        // The dialect accepts double-quote AND backtick identifier
+        // quoting (GenericDialect is_delimited_identifier_start).
+        Some(b) if b.is_ascii_whitespace() || *b == b'"' || *b == b'`' => (
+            true,
+            skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
+        ),
         _ => (false, input),
     }
 }
@@ -269,6 +275,38 @@ pub fn finite_f32(value: f64) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
+    use super::{skip_leading_ws_and_comments, strip_if_not_exists};
+
+    #[test]
+    fn strip_if_not_exists_is_comment_and_quote_tolerant() {
+        // Comment BEFORE the prefix (round 43's fix)...
+        assert_eq!(
+            strip_if_not_exists("/* v2 */ IF NOT EXISTS docs"),
+            (true, "docs")
+        );
+        // ...and AFTER it (the round-44 regression: name '/*').
+        assert_eq!(
+            strip_if_not_exists("IF NOT EXISTS /* v2 */ docs"),
+            (true, "docs")
+        );
+        // Backtick-quoted identifiers (GenericDialect accepts them).
+        assert_eq!(strip_if_not_exists("IF NOT EXISTS`logs`"), (true, "`logs`"));
+        // Word boundary: no separator, no strip.
+        assert_eq!(
+            strip_if_not_exists("IF NOT EXISTSx"),
+            (false, "IF NOT EXISTSx")
+        );
+    }
+
+    #[test]
+    fn skip_leading_ws_and_comments_handles_nested_blocks() {
+        assert_eq!(
+            skip_leading_ws_and_comments("  -- note\n  /* a /* b */ */ t"),
+            "t"
+        );
+        assert_eq!(skip_leading_ws_and_comments("plain"), "plain");
+    }
+
     use super::{collect_quoted_first_args, finite_f32, inject_graph_target_into_cypher};
 
     #[test]
