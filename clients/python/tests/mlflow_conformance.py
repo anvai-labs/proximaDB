@@ -12,6 +12,7 @@ import sys
 import traceback
 
 PASSED = []
+FAILED = []
 
 
 def step(name, fn):
@@ -23,8 +24,14 @@ def step(name, fn):
         PASSED.append(name)
         print(f"PASS {name}")
     except Exception:
+        FAILED.append(name)
         print(f"FAIL {name}")
         traceback.print_exc()
+
+
+def result_code() -> int:
+    """Fail if any attempted step failed, independent of the ratchet count."""
+    return 0 if not FAILED else 1
 
 
 def main() -> int:
@@ -138,9 +145,9 @@ def main() -> int:
 
     total = len(PASSED)
     print(f"CONFORMANCE_STEPS={total}")
-    # Fail the workflow outright if ANY step missed (the ratchet in CI adds
-    # the historical high-water comparison).
-    return 0 if total == 12 else 1
+    # Fail the workflow outright if ANY attempted step missed. Keep this
+    # independent of the count so adding a passing step can raise the ratchet.
+    return result_code()
 
 
 if __name__ == "__main__":

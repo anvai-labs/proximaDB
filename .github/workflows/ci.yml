@@ -1942,11 +1942,11 @@ jobs:
     name: MLflow conformance (real client)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    needs: [changes, rust-build]
+    needs: changes
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
-      needs.changes.outputs.rust == 'true'
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true')
     env:
       PROXIMADB_MLFLOW_COMPAT_ENABLE: "1"
     steps:
@@ -1966,6 +1966,9 @@ jobs:
           python-version: "3.11"
       - name: Install pinned mlflow client
         run: python -m pip install "mlflow-skinny==2.14.3" requests
+      - name: Validate conformance harness
+        working-directory: clients/python
+        run: python tests/test_mlflow_conformance_harness.py
       - name: Spawn server and run conformance workflow
         run: |
           set -euo pipefail
@@ -1980,7 +1983,7 @@ jobs:
           ./target/debug/proximadb-server -c "$DATA_DIR/config.toml" -d "$DATA_DIR" &
           SERVER_PID=$!
           trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -sf "http://127.0.0.1:$PORT/health/live" >/dev/null 2>&1; then
               break
             fi
@@ -1990,9 +1993,14 @@ jobs:
           cd clients/python
           python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" | tee /tmp/conformance.log
       - name: Ratchet — passing steps only go up
+        if: always()
         run: |
           set -eu
-          PASSED=$(grep -c '^PASS ' /tmp/conformance.log || true)
+          if [ -f /tmp/conformance.log ]; then
+            PASSED=$(grep -c '^PASS ' /tmp/conformance.log || true)
+          else
+            PASSED=0
+          fi
           RATCHET=$(cat clients/python/tests/mlflow_conformance_steps.txt)
           echo "passed=$PASSED ratchet=$RATCHET"
           if [ "$PASSED" -lt "$RATCHET" ]; then
