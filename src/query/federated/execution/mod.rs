@@ -1283,8 +1283,16 @@ impl FederatedExecutor {
             });
 
         if let Some(value) = unquoted {
+            // Decode SQL-standard doubled quotes (round 33 added this to
+            // the sibling parse_predicate_value — the filter value with an
+            // apostrophe silently matched 0 rows here).
+            let decoded = if trimmed.starts_with('\'') {
+                value.replace("''", "'")
+            } else {
+                value.replace("\"\"", "\"")
+            };
             return Ok(SqlValue {
-                value: Some(sql_value::Value::StringValue(value.to_string())),
+                value: Some(sql_value::Value::StringValue(decoded)),
             });
         }
 

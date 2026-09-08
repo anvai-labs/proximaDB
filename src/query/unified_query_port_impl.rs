@@ -525,7 +525,16 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     // split([',', ')']) here truncated quoted names at their first comma
     // and trim_matches destroyed trailing doubled quotes before the
     // decode. GRAPH_QUERY stays omitted (its cypher arg never resolves).
-    for function in ["VECTOR_SEARCH", "DOCUMENT_QUERY", "LOGS", "METRICS"] {
+    for function in [
+        "VECTOR_SEARCH",
+        "DOCUMENT_QUERY",
+        "LOGS",
+        "METRICS",
+        // The parser registry has 7 — these two have catalog-target
+        // first args and were silently invisible to EXPLAIN.
+        "TRACES",
+        "RERANK",
+    ] {
         crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
     }
 
@@ -802,12 +811,12 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                                 "components[{component_index}].config.query_vector[{value_index}] must be numeric"
                             )
                         })?;
-                        let f = number as f32;
-                        if !f.is_finite() {
-                            return Err(anyhow!(
+                        let f = crate::core::utils::finite_f32(number)
+                        .ok_or_else(|| {
+                            anyhow!(
                                 "components[{component_index}].config.query_vector[{value_index}] must be a finite f32"
-                            ));
-                        }
+                            )
+                        })?;
                         Ok(f)
                     })
                     .collect();

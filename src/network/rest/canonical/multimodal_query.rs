@@ -723,12 +723,12 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                                     "vector component config.query_vector[{index}] must be numeric"
                                 ))
                             })?;
-                            let f = number as f32;
-                            if !f.is_finite() {
-                                return Err(ApiError::InvalidArgument(format!(
+                            let f = crate::core::utils::finite_f32(number)
+                            .ok_or_else(|| {
+                                ApiError::InvalidArgument(format!(
                                     "vector component config.query_vector[{index}] must be a finite f32"
-                                )));
-                            }
+                                ))
+                            })?;
                             Ok(f)
                         })
                         .collect();
@@ -787,7 +787,9 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                         })
                     })
                     .transpose()?
-                    .unwrap_or("true");
+                    // '1=1' — the executor's match-all whitelist; 'true'
+                    // hard-errored as an unsupported filter clause.
+                    .unwrap_or("1=1");
 
                 format!(
                     "SELECT * FROM DOCUMENT_QUERY('{}', '{}')",
@@ -959,7 +961,16 @@ async fn explain_storage_authorities(
 fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
 
-    for function_name in ["VECTOR_SEARCH", "DOCUMENT_QUERY", "LOGS", "METRICS"] {
+    for function_name in [
+        "VECTOR_SEARCH",
+        "DOCUMENT_QUERY",
+        "LOGS",
+        "METRICS",
+        // The parser registry has 7 — these two have catalog-target
+        // first args and were silently invisible to EXPLAIN.
+        "TRACES",
+        "RERANK",
+    ] {
         crate::core::utils::collect_quoted_first_args(sql, function_name, &mut targets);
     }
 

@@ -59,14 +59,13 @@ pub(crate) fn find_top_level_keyword_from(
             .get(index..index.saturating_add(keyword_len))
             .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword_bytes))
         {
-            // Identifier boundary: '$' and non-ASCII letters continue an
-            // identifier (b$from / éfrom must not match FROM) — the same
-            // class core::utils::is_identifier_char uses.
-            let is_ident_byte =
-                |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
-            let before_ok = index == 0 || !is_ident_byte(bytes[index - 1]);
+            // Identifier boundary via the ONE shared byte class
+            // ('$' and non-ASCII continue an identifier — b$from / éfrom
+            // must not match FROM).
+            let before_ok = index == 0 || !crate::core::utils::is_identifier_byte(bytes[index - 1]);
             let after_index = index + keyword_len;
-            let after_ok = after_index == bytes.len() || !is_ident_byte(bytes[after_index]);
+            let after_ok = after_index == bytes.len()
+                || !crate::core::utils::is_identifier_byte(bytes[after_index]);
             if before_ok && after_ok {
                 return Some(index);
             }
@@ -143,7 +142,18 @@ fn strip_distinct_prefix(clause: &str) -> Option<&str> {
         return None;
     }
     let rest = clause.get("DISTINCT".len()..)?;
-    rest.chars().next().filter(|ch| ch.is_whitespace())?;
+    // Whitespace OR an opening paren (the Postgres-legal
+    // COUNT(DISTINCT(id)) spelling — the paren form fell to a plain
+    // count with a phantom column).
+    let next = rest.chars().next()?;
+    if !(next.is_whitespace() || next == '(') {
+        return None;
+    }
+    // Parenthesized operand: keep the parens for the caller's column parse
+    // when they wrap the whole operand.
+    if next == '(' && rest.ends_with(')') {
+        return Some(&rest[1..rest.len() - 1]);
+    }
     Some(rest.trim_start())
 }
 
@@ -174,14 +184,54 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
     split_top_level_list(clause)
         .into_iter()
         .map(|item| {
-            // ASCII-case search on the ORIGINAL — an offset into a
-            // to_uppercase() copy can slice the original mid-character
-            // (uppercase changes UTF-8 byte lengths; the sibling scanners
-            // in this file were fixed for the same class).
+            // ASCII-case scan on the ORIGINAL, OUTSIDE QUOTES and at
+            // paren depth 0 — CAST(price AS INT) and literals containing
+            // ' AS ' are not alias separators (the only scanner in this
+            // family still blind to both).
             let bytes = item.as_bytes();
-            let as_pos = bytes
-                .windows(4)
-                .rposition(|w| w.eq_ignore_ascii_case(b" AS "));
+            let mut quote: Option<u8> = None;
+            let mut depth = 0usize;
+            let mut as_pos: Option<usize> = None;
+            let mut k = 0;
+            while k < bytes.len() {
+                match quote {
+                    Some(q) => {
+                        if bytes[k] == q {
+                            if k + 1 < bytes.len() && bytes[k + 1] == q {
+                                k += 2; // doubled quote stays inside
+                                continue;
+                            }
+                            quote = None;
+                        }
+                        k += 1;
+                    }
+                    None => {
+                        match bytes[k] {
+                            b'\'' | b'"' => {
+                                quote = Some(bytes[k]);
+                                k += 1;
+                            }
+                            b'(' => {
+                                depth += 1;
+                                k += 1;
+                            }
+                            b')' => {
+                                depth = depth.saturating_sub(1);
+                                k += 1;
+                            }
+                            _ => {
+                                if depth == 0
+                                    && k + 4 <= bytes.len()
+                                    && bytes[k..k + 4].eq_ignore_ascii_case(b" AS ")
+                                {
+                                    as_pos = Some(k); // keep scanning: LAST wins
+                                }
+                                k += 1;
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(as_pos) = as_pos {
                 SelectItem {
                     expression: item[..as_pos].trim().to_string(),

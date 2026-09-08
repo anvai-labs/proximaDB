@@ -313,22 +313,47 @@ pub fn inject_graph_target_into_cypher(graph: &str, cypher: &str) -> String {
         return cypher.to_string();
     }
 
-    // ASCII-case search directly on the original (shared helper) —
-    // to_uppercase() can change UTF-8 byte lengths, and offsets found in
-    // the copy can slice the original mid-character (panic) or past its
-    // end.
-    if find_ascii_ci_outside_quotes(cypher, " FROM ").is_some() {
+    // ASCII-case, quote-aware, WHITESPACE-CLASS keyword scan on the
+    // original — a newline- or tab-padded keyword must behave exactly
+    // like the space-padded one (multi-line Cypher config is normal):
+    // the duplicate-FROM guard must still fire and the insertion point
+    // must still be found.
+    let keyword_offset = |needle: &str| {
+        find_ascii_ci_outside_quotes(cypher, needle).filter(|&pos| {
+            let before_ok = pos == 0 || cypher.as_bytes()[pos - 1].is_ascii_whitespace();
+            let end = pos + needle.len();
+            let after_ok = end >= cypher.len() || cypher.as_bytes()[end].is_ascii_whitespace();
+            before_ok && after_ok
+        })
+    };
+    if keyword_offset("FROM").is_some() {
         return cypher.to_string();
     }
 
-    let insertion_index = [" WHERE ", " RETURN ", " ORDER BY ", " LIMIT ", " SKIP "]
+    let insertion_index = ["WHERE", "RETURN", "ORDER BY", "LIMIT", "SKIP"]
         .iter()
-        .filter_map(|needle| find_ascii_ci_outside_quotes(cypher, needle))
+        .filter_map(|needle| keyword_offset(needle))
         .min();
 
     if let Some(index) = insertion_index {
-        format!("{} FROM {}{}", &cypher[..index], graph, &cypher[index..])
+        // Normalize the padding: the head's own trailing whitespace plus
+        // ours doubled (or, clipped, vanished). Trim the head, provide
+        // exactly one space each side.
+        format!(
+            "{} FROM {} {}",
+            cypher[..index].trim_end(),
+            graph,
+            &cypher[index..]
+        )
     } else {
         format!("{} FROM {}", cypher, graph)
     }
+}
+
+/// The ONE identifier-continuation byte class ('$' and non-ASCII are
+/// identifier bytes — Postgres identifiers may contain dollar signs and
+/// Unicode letters). Shared by the keyword-boundary checks and the
+/// identifier validators.
+pub fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
 }

@@ -1496,6 +1496,28 @@ angles after the main agent hit a rate limit):**
   (twins item). columnar.rs (fresh surface, unregistered provider):
   two more DISTINCT detectors + an uppercase-offset slice panic —
   latent, same classes.
+
+**Consolidation review round 35 (2026-09-07):**
+- document_filter_sql_value DECODES doubled quotes (the sibling
+  predicate path got it in round 33; a filter value with an
+  apostrophe silently matched 0 rows here).
+- The AS alias scan is quote- AND paren-aware (CAST(price AS INT) and
+  literals containing ' AS ' were mis-split into phantom columns —
+  the one scanner in the family still blind). strip_distinct_prefix
+  accepts the paren operand (COUNT(DISTINCT(id)) fell to a plain
+  count with a phantom column).
+- inject_graph_target_into_cypher's needles are WHITESPACE-CLASS
+  keywords (newline-padded Cypher defeated the duplicate-FROM guard
+  and landed FROM after RETURN). Both EXPLAIN twins scan TRACES and
+  RERANK (the registry has 7; the hand lists had 4). The REST default
+  document filter is the executable '1=1' ('true' hard-errored as an
+  unsupported clause). AQL's BytesValue renders canonical base64 (the
+  JSON-sniff nulled non-JSON blobs — silent data loss on that
+  surface). The twins' inline finite guards route through the helper
+  (error attribution kept). is_identifier_byte is ONE shared class.
+- Tracked: the unquoted-arg EXPLAIN arm still terminates at the first
+  raw comma (quoted segments inside an unquoted arg mint garbage and
+  mask later occurrences) — needs the quote-aware terminator scan.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to
