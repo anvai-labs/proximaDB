@@ -2461,6 +2461,15 @@ impl PostgresProtocol {
         Some(predicates)
     }
 
+    fn extract_legacy_select_predicates(query: &str) -> anyhow::Result<Vec<SelectPredicate>> {
+        if Self::extract_select_where_clause(query).is_some() {
+            Self::extract_select_where_predicates(query)
+                .ok_or_else(|| anyhow::anyhow!("unsupported or malformed WHERE predicate"))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     fn split_or_predicates(predicate: &str) -> Vec<&str> {
         let mut parts = Vec::new();
         let mut remaining = predicate;
@@ -3050,11 +3059,10 @@ impl PostgresProtocol {
                     .await?
             }
             Err(_) => {
-                // None = no top-level WHERE (or an unparseable one) ⇒ no
-                // predicates ⇒ unfiltered. (The TD holds the round
-                // narrative: the raw-substring gate disagreed with the
-                // extractor in both directions and was behaviorally dead.)
-                let predicates = Self::extract_select_where_predicates(query).unwrap_or_default();
+                // The aware gate distinguishes a WHERE-less query from a
+                // present but unsupported predicate. The latter must fail
+                // closed instead of becoming an unfiltered legacy scan.
+                let predicates = Self::extract_legacy_select_predicates(query)?;
                 dml_service
                     .select_table_records_with_projection(
                         table_name,

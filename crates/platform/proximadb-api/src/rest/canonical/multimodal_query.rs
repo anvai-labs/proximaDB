@@ -504,7 +504,9 @@ mod tests {
                 // Kept (the handler lacks the InvalidQueryInput downcast —
                 // these endpoints surface client errors as 500 today).
                 MockMode::InvalidInput => {
-                    Err(InvalidQueryInput(format!("{op} input is invalid")).into())
+                    // Collision control: client text must not outrank the
+                    // typed error class and become a false 501.
+                    Err(InvalidQueryInput(format!("{op} not implemented")).into())
                 }
                 MockMode::Internal => Err(anyhow!("{op} failed")),
             }

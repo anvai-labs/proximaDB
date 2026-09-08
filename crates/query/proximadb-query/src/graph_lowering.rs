@@ -527,4 +527,28 @@ mod tests {
 
         assert!(error.to_string().contains("unknown variable 'm'"));
     }
+
+    #[test]
+    fn from_scanner_ignores_backslash_escaped_quote_literals() {
+        let query = r#"MATCH (n {text: 'don\'t FROM wrong'}) FROM social RETURN n"#;
+        let (normalized, graph) = strip_from_clause(query).expect("strip graph target");
+
+        assert_eq!(graph.as_deref(), Some("social"));
+        assert_eq!(
+            normalized,
+            r#"MATCH (n {text: 'don\'t FROM wrong'}) RETURN n"#
+        );
+    }
+
+    #[test]
+    fn from_scanner_ignores_nested_block_comments() {
+        let query = "MATCH (n) /* outer /* FROM wrong */ tail */ FROM social RETURN n";
+        let (normalized, graph) = strip_from_clause(query).expect("strip graph target");
+
+        assert_eq!(graph.as_deref(), Some("social"));
+        assert_eq!(
+            normalized,
+            "MATCH (n) /* outer /* FROM wrong */ tail */ RETURN n"
+        );
+    }
 }

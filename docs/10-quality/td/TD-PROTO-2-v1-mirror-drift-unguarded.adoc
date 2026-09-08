@@ -1660,20 +1660,33 @@ angles after the main agent hit a rate limit):**
   defaults already diverge).
 
 **Consolidation review round 41 (2026-09-08, adversarial closure):**
+- `strip_if_not_exists` now has one core home and accepts the GenericDialect's
+  quoted-name boundary (`EXISTS"logs"`); pgwire no longer imports a
+  query-internal helper. Backing-collection creation prefers the parsed DDL
+  table name, preserving quoted/mixed-case identity. Empty component arrays
+  error inside the multi-model converter, so `None` unambiguously means the
+  request was not multi-model.
 - The pgwire fallback now selects only top-level WHERE/terminator tokens:
   FILTER `(WHERE ...)`, subqueries, and qualified columns named `where` or
   `limit` cannot shadow statement clauses. A present but malformed/empty
-  WHERE no longer degrades to an unfiltered legacy scan.
+  WHERE no longer degrades to an unfiltered legacy scan, regardless of
+  whether end-of-input, newline, tab, or a comment follows the keyword.
 - Both programmatic multi-model twins reject a supplied non-object `config`;
   arrays/scalars can no longer silently execute the graph/log/metric defaults.
   The runtime port marks validation failures with `InvalidQueryInput`, which
-  the v2 REST adapter maps to 400 instead of reporting a client error as 500.
+  the v2 REST adapter maps to 400 before inspecting legacy string sentinels,
+  so client-controlled `not implemented` text cannot counterfeit a 501.
 - EXPLAIN target extraction distinguishes read function-call positions from
   write column lists: `INSERT INTO orders(id)` retains `orders`, while
   `FROM TRACES(...)` remains excluded. Trailing punctuation is stripped
   before quote decoding so a quoted subquery target remains intact.
 - The round-38 evidence bullets were restored to round 38; the earlier
   insertion point had incorrectly placed them beneath round 40.
+- Backslash-escaped literals and nested-block-comment branches in the local
+  graph FROM scanner now have direct production-helper controls.
+- Tracked: consolidate the REST/port catalog-target extractors beside
+  `collect_quoted_first_args`; their punctuation and keyword vocabularies
+  still differ.
 
 **Round 19 follow-up (2026-09-05, PR fix/dot-walker-consolidation):** the
 two unconsolidated dot-path walkers now delegate to the shared

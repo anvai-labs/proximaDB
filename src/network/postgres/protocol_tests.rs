@@ -7,12 +7,16 @@ use proximadb_records::{ProximaRecord, ProximaTreeNode};
 fn extract_where_handles_trailing_where_and_prefixed_columns() {
     // WHERE ending the string must not panic (the -1/+7 dance sliced one
     // past the end — abort-class under panic=abort).
-    let trailing = "SELECT ' WHERE ' FROM t WHERE ";
-    assert_eq!(
-        PostgresProtocol::extract_select_where_clause(trailing),
-        Some("")
-    );
-    assert!(PostgresProtocol::extract_select_where_predicates(trailing).is_none());
+    for trailing in [
+        "SELECT ' WHERE ' FROM t WHERE",
+        "SELECT * FROM t WHERE\n",
+        "SELECT * FROM t WHERE\t",
+        "SELECT * FROM t WHERE/* comment */",
+    ] {
+        assert!(PostgresProtocol::extract_select_where_clause(trailing).is_some());
+        assert!(PostgresProtocol::extract_select_where_predicates(trailing).is_none());
+        assert!(PostgresProtocol::extract_legacy_select_predicates(trailing).is_err());
+    }
 
     // A 'limit_val' column must not shadow a later real LIMIT terminator.
     let predicate = PostgresProtocol::extract_select_where_clause(
