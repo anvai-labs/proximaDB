@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::network::middleware::tenant::TenantContext;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
