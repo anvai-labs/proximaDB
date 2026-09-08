@@ -142,19 +142,22 @@ fn strip_distinct_prefix(clause: &str) -> Option<&str> {
         return None;
     }
     let rest = clause.get("DISTINCT".len()..)?;
-    // Whitespace OR an opening paren (the Postgres-legal
-    // COUNT(DISTINCT(id)) spelling — the paren form fell to a plain
-    // count with a phantom column).
-    let next = rest.chars().next()?;
-    if !(next.is_whitespace() || next == '(') {
-        return None;
+    // Whitespace (any amount) optionally followed by parens that WRAP the
+    // whole operand — the Postgres-legal COUNT(DISTINCT(id)) and
+    // COUNT(DISTINCT (id)) spellings (the spaced form returned a
+    // paren-wrapped column; a mid-operand paren was blindly stripped).
+    let trimmed_rest = rest.trim_start();
+    if let Some(inner) = trimmed_rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .filter(|inner| !inner.is_empty())
+    {
+        return Some(inner.trim());
     }
-    // Parenthesized operand: keep the parens for the caller's column parse
-    // when they wrap the whole operand.
-    if next == '(' && rest.ends_with(')') {
-        return Some(&rest[1..rest.len() - 1]);
+    if trimmed_rest.starts_with(|c: char| c.is_whitespace()) {
+        return Some(trimmed_rest);
     }
-    Some(rest.trim_start())
+    None
 }
 
 pub(crate) fn select_has_distinct(sql: &str) -> bool {
@@ -220,11 +223,20 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
                                 k += 1;
                             }
                             _ => {
+                                // Whitespace-class: 'price\tAS\tlabel' is an
+                                // alias separator too (tab/newline padding
+                                // formatting-dependently failed GROUP BY
+                                // validation).
+                                let ws_before = k > 0 && bytes[k - 1].is_ascii_whitespace();
                                 if depth == 0
-                                    && k + 4 <= bytes.len()
-                                    && bytes[k..k + 4].eq_ignore_ascii_case(b" AS ")
+                                    && ws_before
+                                    && k + 2 <= bytes.len()
+                                    && bytes[k..k + 2].eq_ignore_ascii_case(b"AS")
                                 {
-                                    as_pos = Some(k); // keep scanning: LAST wins
+                                    let after = k + 2;
+                                    if after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                                        as_pos = Some(k); // keep scanning: LAST wins
+                                    }
                                 }
                                 k += 1;
                             }
@@ -233,9 +245,16 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
                 }
             }
             if let Some(as_pos) = as_pos {
+                // Skip the (whitespace-padded) keyword between expression
+                // and alias.
+                let after_as = item[as_pos..]
+                    .find(|c: char| !c.is_whitespace())
+                    .map(|rel| as_pos + rel)
+                    .unwrap_or(item.len());
+                let alias_start = after_as + 2; // "AS"
                 SelectItem {
                     expression: item[..as_pos].trim().to_string(),
-                    alias: Some(item[as_pos + 4..].trim().to_string()),
+                    alias: Some(item[alias_start..].trim().to_string()),
                 }
             } else {
                 SelectItem {

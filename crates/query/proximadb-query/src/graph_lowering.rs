@@ -154,14 +154,26 @@ pub fn parse_supported_graph_query(
 
 fn strip_from_clause(query: &str) -> Result<(String, Option<String>)> {
     let trimmed = query.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
 
-    let Some(from_pos) = upper.find(" FROM ") else {
+    // WHITESPACE-CLASS keyword scan on the original bytes — the injector
+    // preserves the caller's newline/tab padding before FROM, and an
+    // uppercased-copy find (both the offset class and the space-literal
+    // needle) missed it (hard parse error on multi-line Cypher).
+    let bytes = trimmed.as_bytes();
+    let from_pos = (0..bytes.len().saturating_sub(4))
+        .filter(|&i| bytes[i..i + 4].eq_ignore_ascii_case(b"FROM"))
+        .find(|&i| {
+            let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            let after = i + 4;
+            let after_ok = after >= bytes.len() || bytes[after].is_ascii_whitespace();
+            before_ok && after_ok
+        });
+    let Some(from_pos) = from_pos else {
         return Ok((trimmed.to_string(), None));
     };
 
     let before_from = trimmed[..from_pos].trim_end();
-    let after_from = trimmed[from_pos + 6..].trim_start();
+    let after_from = trimmed[from_pos + 4..].trim_start();
     let graph_name_len = after_from
         .chars()
         .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')

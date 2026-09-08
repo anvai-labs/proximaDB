@@ -103,12 +103,17 @@ fn is_identifier(part: &str) -> bool {
         let unescaped = inner.replace("\"\"", "");
         return !inner.is_empty() && !unescaped.contains('"');
     }
-    let mut chars = trimmed.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+    // Same class as the shared is_identifier_byte ('$' and non-ASCII are
+    // identifier bytes — p$x / témoin aliases are legal and were degrading
+    // to unsupported-expression errors).
+    let bytes = trimmed.as_bytes();
+    match bytes.first() {
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' || *b >= 0x80 || *b == b'$' => {}
         _ => return false,
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b >= 0x80 || *b == b'$')
 }
 
 fn is_dotted_identifier_path(part: &str) -> bool {

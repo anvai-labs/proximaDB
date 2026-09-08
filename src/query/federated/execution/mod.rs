@@ -2445,13 +2445,21 @@ impl FederatedExecutor {
                     object
                 ))
             }
-            serde_json::Value::Number(number) => Ok(vec![number.as_f64().ok_or_else(|| {
-                anyhow!(
-                    "Nested vector source '{}.{}' contains a non-finite number",
-                    source,
-                    nested_path.join(".")
-                )
-            })? as f32]),
+            serde_json::Value::Number(number) => {
+                // The ONE narrowing guard (the raw `as f32` overflowed to
+                // inf — the same value wrapped in an array was rejected).
+                let narrowed = number
+                    .as_f64()
+                    .and_then(crate::core::utils::finite_f32)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Nested vector source '{}.{}' contains a component outside the finite f32 range",
+                            source,
+                            nested_path.join(".")
+                        )
+                    })?;
+                Ok(vec![narrowed])
+            }
             other => Err(anyhow!(
                 "Nested vector source '{}.{}' resolved to unsupported JSON value {:?}",
                 source,

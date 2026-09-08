@@ -212,6 +212,20 @@ fn is_bind_placeholder(value: &str) -> bool {
     value.starts_with('$') || value == "?"
 }
 
+/// Extension functions whose FIRST argument is a catalog target
+/// (collection/namespace) — the EXPLAIN authority scanner's list.
+/// GRAPH_QUERY is EXCLUDED (its first arg is Cypher, never a target).
+/// Keep in sync with the fusion parser's FUNCTION_NAMES registry —
+/// derive from it when the terminal scanner home lands.
+pub const CATALOG_FIRST_ARG_FUNCTIONS: [&str; 6] = [
+    "VECTOR_SEARCH",
+    "DOCUMENT_QUERY",
+    "LOGS",
+    "METRICS",
+    "TRACES",
+    "RERANK",
+];
+
 pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets: &mut Vec<String>) {
     // ASCII-case search on the original (shared helper — offsets in a
     // to_uppercase copy can slice mid-character).
@@ -229,7 +243,11 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
         // function. Likewise, only whitespace may separate the name and `(`;
         // scanning forward to an unrelated call misattributes its first arg.
         search_start = after_name;
-        let is_identifier_char = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '$');
+        // The ONE shared byte class (is_identifier_byte semantics) — a
+        // divergent char-class here tokenized '·LOGS' differently from
+        // the keyword scanners in the same file.
+        let is_identifier_char =
+            |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') || !ch.is_ascii();
         if sql[..name_start]
             .chars()
             .next_back()
@@ -284,10 +302,10 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
             if let Some(close) = closed {
                 let escaped = if quote == b'\'' { "''" } else { "\"\"" };
                 let replacement = if quote == b'\'' { "'" } else { "\"" };
-                let value = sql[value_start..close]
-                    .replace(escaped, replacement)
-                    .trim()
-                    .to_string();
+                // No trim: the runtime parser's unquote preserves inner
+                // padding — EXPLAIN must resolve the SAME name execution
+                // uses (' ops ' stayed untrimmed at runtime).
+                let value = sql[value_start..close].replace(escaped, replacement);
                 // '$'-binds skip on the QUOTED arm too (consistent with
                 // the unquoted arm below).
                 if !value.is_empty()

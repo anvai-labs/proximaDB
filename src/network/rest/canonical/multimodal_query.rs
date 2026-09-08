@@ -961,17 +961,8 @@ async fn explain_storage_authorities(
 fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
 
-    for function_name in [
-        "VECTOR_SEARCH",
-        "DOCUMENT_QUERY",
-        "LOGS",
-        "METRICS",
-        // The parser registry has 7 — these two have catalog-target
-        // first args and were silently invisible to EXPLAIN.
-        "TRACES",
-        "RERANK",
-    ] {
-        crate::core::utils::collect_quoted_first_args(sql, function_name, &mut targets);
+    for function in crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS {
+        crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
     }
 
     collect_from_targets(sql, &mut targets);

@@ -1517,6 +1517,35 @@ angles after the main agent hit a rate limit):**
 - Tracked: the unquoted-arg EXPLAIN arm still terminates at the first
   raw comma (quoted segments inside an unquoted arg mint garbage and
   mask later occurrences) — needs the quote-aware terminator scan.
+
+**Consolidation review round 36 (2026-09-07):**
+- The fourth reconciliation REGRESSED the injector: its
+  preserved-whitespace FROM broke downstream strip_from_clause (a
+  space-literal ' FROM ' find — newline-padded multi-line Cypher hard-
+  errored). The CONSUMER is now whitespace-class (keyword-boundary
+  scan on the original bytes); the injector's preserved-whitespace
+  contract and its test stand.
+- is_identifier accepts '$' and non-ASCII (the shared byte class —
+  p$x/témoin aliases degraded to unsupported-expression errors). The
+  AS alias scan is whitespace-class (tab-padded aliases failed GROUP
+  BY validation formatting-dependently). The bare-JSON-Number nested
+  arm routes through finite_f32 (the same value in an array was
+  rejected; bare, it dispatched inf). strip_distinct_prefix handles
+  BOTH paren spellings and only strips parens that wrap the whole
+  operand (DISTINCT(a)-(b) was blindly byte-stripped).
+- EXPLAIN's decoded first arg is NOT trimmed (the runtime unquote
+  preserves inner padding — EXPLAIN resolved a different name than
+  execution used). The scanner's identifier closure routes through
+  the ONE byte class. The 6-name catalog-target list is ONE shared
+  const (CATALOG_FIRST_ARG_FUNCTIONS) both twins iterate — four
+  hand-lists reduced to two (the parser registry + this).
+- Tracked: the runtime fusion parser matches function names as raw
+  substrings (no boundary) while the EXPLAIN scanner enforces
+  boundaries — ANALYTICS_LOGS('ops') EXECUTES but explains with no
+  authority (audit-visibility direction); aligning means a parser
+  change. The four SQL doubled-quote DECODE copies (document filter,
+  predicate, EXPLAIN scanner, fusion unquote) want one
+  unquote_sql_text beside escape_sql_text.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to
