@@ -1187,6 +1187,20 @@ mod tests {
     }
 
     #[test]
+    fn json_to_multi_model_sql_uses_executable_document_match_all() {
+        let req = serde_json::json!({
+            "components": [{
+                "component_type": "document",
+                "config": {"collection": "docs"}
+            }]
+        });
+        let sql = json_to_multi_model_sql(&req)
+            .expect("conversion should succeed")
+            .expect("components produce SQL");
+        assert!(sql.contains("DOCUMENT_QUERY('docs', '1=1')"));
+    }
+
+    #[test]
     fn json_to_multi_model_sql_rejects_values_outside_f32_range() {
         let req = serde_json::json!({
             "components": [{

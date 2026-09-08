@@ -176,3 +176,14 @@ impl AqlSource for ObservabilityAqlSource {
         Ok(AqlResult { rows, frame_id })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AqlValue, ObservabilityAqlSource, SqlValueData};
+
+    #[test]
+    fn raw_bytes_render_as_canonical_base64_instead_of_null() {
+        let value = ObservabilityAqlSource::sql_data_to_aql(SqlValueData::BytesValue(vec![0, 255]));
+        assert!(matches!(value, AqlValue::String(encoded) if encoded == "AP8="));
+    }
+}

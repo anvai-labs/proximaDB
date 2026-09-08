@@ -2310,6 +2310,20 @@ mod tests {
     }
 
     #[test]
+    fn document_component_without_filter_uses_executable_match_all() {
+        let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+            "components": [{
+                "component_type": "document",
+                "config": {"collection": "docs"}
+            }]
+        }))
+        .expect("request should parse");
+
+        let sql = convert_multi_model_to_sql(&request).expect("match-all query should lower");
+        assert!(sql.contains("DOCUMENT_QUERY('docs', '1=1')"));
+    }
+
+    #[test]
     fn multi_model_sql_conversion_escapes_all_text_arguments() {
         let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
             "components": [
@@ -2437,5 +2451,14 @@ mod tests {
         crate::core::utils::collect_quoted_first_args("METRICS($1)", "METRICS", &mut targets);
 
         assert_eq!(targets, ["tenant,west", "team\"docs", "unquoted_logs"]);
+    }
+
+    #[test]
+    fn explain_catalog_targets_include_traces_and_rerank() {
+        let targets = explain_catalog_targets(
+            "SELECT * FROM TRACES('ops') UNION ALL SELECT * FROM RERANK('docs', 'q', '[0.5]', 5)",
+        );
+        assert!(targets.contains(&"ops".to_string()));
+        assert!(targets.contains(&"docs".to_string()));
     }
 }

@@ -187,62 +187,14 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
     split_top_level_list(clause)
         .into_iter()
         .map(|item| {
-            // ASCII-case scan on the ORIGINAL, OUTSIDE QUOTES and at
-            // paren depth 0 — CAST(price AS INT) and literals containing
-            // ' AS ' are not alias separators (the only scanner in this
-            // family still blind to both).
-            let bytes = item.as_bytes();
-            let mut quote: Option<u8> = None;
-            let mut depth = 0usize;
+            // Use the shared top-level scanner: CAST(price AS INT) and
+            // literals containing ' AS ' are not alias separators, while
+            // every SQL whitespace class is accepted around a real alias.
             let mut as_pos: Option<usize> = None;
-            let mut k = 0;
-            while k < bytes.len() {
-                match quote {
-                    Some(q) => {
-                        if bytes[k] == q {
-                            if k + 1 < bytes.len() && bytes[k + 1] == q {
-                                k += 2; // doubled quote stays inside
-                                continue;
-                            }
-                            quote = None;
-                        }
-                        k += 1;
-                    }
-                    None => {
-                        match bytes[k] {
-                            b'\'' | b'"' => {
-                                quote = Some(bytes[k]);
-                                k += 1;
-                            }
-                            b'(' => {
-                                depth += 1;
-                                k += 1;
-                            }
-                            b')' => {
-                                depth = depth.saturating_sub(1);
-                                k += 1;
-                            }
-                            _ => {
-                                // Whitespace-class: 'price\tAS\tlabel' is an
-                                // alias separator too (tab/newline padding
-                                // formatting-dependently failed GROUP BY
-                                // validation).
-                                let ws_before = k > 0 && bytes[k - 1].is_ascii_whitespace();
-                                if depth == 0
-                                    && ws_before
-                                    && k + 2 <= bytes.len()
-                                    && bytes[k..k + 2].eq_ignore_ascii_case(b"AS")
-                                {
-                                    let after = k + 2;
-                                    if after < bytes.len() && bytes[after].is_ascii_whitespace() {
-                                        as_pos = Some(k); // keep scanning: LAST wins
-                                    }
-                                }
-                                k += 1;
-                            }
-                        }
-                    }
-                }
+            let mut search_from = 0usize;
+            while let Some(position) = find_top_level_keyword_from(&item, "AS", search_from) {
+                as_pos = Some(position); // keep scanning: LAST wins
+                search_from = position + "AS".len();
             }
             if let Some(as_pos) = as_pos {
                 // Skip the (whitespace-padded) keyword between expression
@@ -254,7 +206,7 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
                 let alias_start = after_as + 2; // "AS"
                 SelectItem {
                     expression: item[..as_pos].trim().to_string(),
-                    alias: Some(item[alias_start..].trim().to_string()),
+                    alias: Some(item[as_pos + "AS".len()..].trim().to_string()),
                 }
             } else {
                 SelectItem {
@@ -516,8 +468,9 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
 #[cfg(test)]
 mod scanner_tests {
     use super::{
-        extract_order_by, extract_select_items, extract_where_predicate, find_top_level_keyword,
-        find_top_level_operator, parse_predicate_value, select_has_distinct,
+        AggregateFunction, extract_order_by, extract_select_items, extract_where_predicate,
+        find_top_level_keyword, find_top_level_operator, parse_aggregate_expr,
+        parse_predicate_value, select_has_distinct,
     };
 
     #[test]
@@ -567,6 +520,30 @@ mod scanner_tests {
     fn malformed_single_quote_predicate_fails_closed() {
         assert!(parse_predicate_value("'").is_none());
         assert!(parse_predicate_value("\"").is_none());
+    }
+
+    #[test]
+    fn select_alias_scanner_accepts_whitespace_classes_only_at_top_level() {
+        let items = extract_select_items(
+            "SELECT CAST(price AS INT)\tAS\tprice_int, 'kept AS literal'\nAS\nlabel FROM sales",
+        );
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].expression, "CAST(price AS INT)");
+        assert_eq!(items[0].alias.as_deref(), Some("price_int"));
+        assert_eq!(items[1].expression, "'kept AS literal'");
+        assert_eq!(items[1].alias.as_deref(), Some("label"));
+
+        let aggregate_items = extract_select_items(
+            "SELECT COUNT(DISTINCT(customer_id)) AS unique_customers FROM sales",
+        );
+        let aggregate = parse_aggregate_expr(&aggregate_items[0])
+            .expect("parenthesized distinct operand must parse");
+        assert!(matches!(
+            aggregate.function,
+            AggregateFunction::CountDistinct
+        ));
+        assert_eq!(aggregate.column.as_deref(), Some("customer_id"));
     }
 }
 
