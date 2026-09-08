@@ -151,6 +151,7 @@ pub fn skip_leading_ws_and_comments(input: &str) -> &str {
             continue;
         }
         if bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*') {
+            let comment_start = i;
             i += 2;
             let mut depth = 1usize;
             while i < bytes.len() && depth > 0 {
@@ -163,6 +164,9 @@ pub fn skip_leading_ws_and_comments(input: &str) -> &str {
                 } else {
                     i += 1;
                 }
+            }
+            if depth > 0 {
+                return &input[comment_start..];
             }
             continue;
         }
@@ -389,6 +393,18 @@ mod tests {
             "t"
         );
         assert_eq!(skip_leading_ws_and_comments("plain"), "plain");
+
+        // An unterminated comment is invalid input, not ignorable trivia.
+        // Preserve it so callers fail closed instead of mistaking the
+        // remainder for an absent identifier.
+        assert_eq!(
+            skip_leading_ws_and_comments("  /* unterminated"),
+            "/* unterminated"
+        );
+        assert_eq!(
+            strip_if_not_exists("IF NOT EXISTS /* unterminated"),
+            (true, "/* unterminated")
+        );
     }
 
     use super::{collect_quoted_first_args, finite_f32, inject_graph_target_into_cypher};

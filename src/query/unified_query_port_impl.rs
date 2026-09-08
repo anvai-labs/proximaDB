@@ -625,19 +625,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // Sibling of multimodal_query::convert_multi_model_to_sql (it already
         // shares inject_graph_target_into_cypher; tracked: consolidate the
         // twins — their defaults and limit handling still diverge).
-        let sql = match json_to_multi_model_sql(&request)
-            .map_err(|error| InvalidQueryInput(error.to_string()))?
-        {
-            Some(sql) => sql,
-            // None unambiguously means 'not a multi-model request' (the
-            // callee errs on every components-present shape — empty,
-            // malformed, unknown — since round 41).
-            None => request
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("SELECT 1")
-                .to_string(),
-        };
+        let sql = multi_model_sql_from_request(&request)?;
         // chars().take — a byte-indexed slice can land mid-character in
         // the user-controlled cypher/collection text now spliced verbatim.
         info!(
@@ -777,6 +765,31 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             "total_access_count": stats.total_access_count,
             "oldest_statement_age_secs": stats.oldest_statement_age_secs,
         }))
+    }
+}
+
+fn multi_model_sql_from_request(request: &serde_json::Value) -> Result<String> {
+    match json_to_multi_model_sql(request)
+        .map_err(|error| InvalidQueryInput(error.to_string()))?
+    {
+        Some(sql) => Ok(sql),
+        // None unambiguously means 'not a multi-model request' (the
+        // callee errs on every components-present shape — empty,
+        // malformed, unknown — since round 41). The raw-query fallback
+        // must still be explicit and typed; invalid JSON must never become
+        // a successful broad `SELECT 1`.
+        None => request
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .filter(|query| !query.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                InvalidQueryInput(
+                    "multi-model request without components must include a non-empty string 'query' field"
+                        .to_string(),
+                )
+                .into()
+            }),
     }
 }
 
@@ -1180,11 +1193,15 @@ mod tests {
         // Paren-bearing tokens are function-call positions, not catalog
         // targets — and a subquery's closing paren must NOT lose its
         // target.
-        let targets = explain_catalog_targets(
+        for query in [
             "SELECT * FROM TRACES('ops') WHERE EXISTS (SELECT 1 FROM orders)",
-        );
-        assert!(!targets.iter().any(|t| t == "TRACES"), "got {targets:?}");
-        assert!(targets.iter().any(|t| t == "orders"), "got {targets:?}");
+            "SELECT * FROM TRACES ('ops') WHERE EXISTS (SELECT 1 FROM orders)",
+        ] {
+            let targets = explain_catalog_targets(query);
+            assert!(!targets.iter().any(|t| t == "TRACES"), "got {targets:?}");
+            assert!(targets.iter().any(|t| t == "orders"), "got {targets:?}");
+            assert!(targets.iter().any(|t| t == "ops"), "got {targets:?}");
+        }
 
         let targets = explain_catalog_targets(
             r#"INSERT INTO orders(id) VALUES (1); SELECT 1 FROM (SELECT * FROM "archive")"#,
@@ -1334,6 +1351,21 @@ mod tests {
     fn test_json_to_multi_model_sql_no_components_field() {
         let req = serde_json::json!({ "query": "SELECT 1" });
         assert!(json_to_multi_model_sql(&req).unwrap().is_none());
+        assert_eq!(multi_model_sql_from_request(&req).unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn multi_model_sql_requires_typed_non_empty_raw_query() {
+        for req in [
+            serde_json::json!({}),
+            serde_json::json!({"query": 42}),
+            serde_json::json!({"query": null}),
+            serde_json::json!({"query": "  "}),
+        ] {
+            let error = multi_model_sql_from_request(&req)
+                .expect_err("missing or malformed raw query must fail closed");
+            assert!(error.downcast_ref::<InvalidQueryInput>().is_some());
+        }
     }
 
     #[test]

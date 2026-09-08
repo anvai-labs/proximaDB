@@ -1948,6 +1948,19 @@ pinned + narrated:**
   not_delimiter (hoist one boundary-aware locator); the twins'
   empty-components error string is copy-pasted (one const beside
   the shared helpers).
+- The round-43 rewrite had replaced the aware legacy-WHERE distinction with
+  `unwrap_or_default`, restoring an unfiltered scan for malformed predicates;
+  the fail-closed helper and its end/newline/tab/comment controls are restored.
+- Legacy CREATE target extraction rejects missing, comment-only, and
+  unterminated-comment names instead of returning a successful empty-name
+  no-op. The shared trivia helper preserves unterminated block comments so
+  callers can recognize invalid input.
+- A request without `components` must carry a non-empty string `query`; absent,
+  null, scalar, and whitespace-only inputs return typed `InvalidQueryInput`
+  instead of silently executing `SELECT 1`.
+- The REST EXPLAIN authority scanner now matches the port's round-46 behavior:
+  it skips read-function names when whitespace separates the name from `(` and
+  preserves quoted targets followed by a subquery-closing parenthesis.
 
 **Consolidation review round 51 (2026-09-08, follow-up PR #1852):**
 - The call gate's byte slice panicked on multibyte-initial tokens

@@ -3712,6 +3712,30 @@ impl PostgresProtocol {
         }
     }
 
+    fn extract_legacy_create_table_target(query: &str) -> Result<(String, bool)> {
+        let table_pos = find_ascii_ci(query, "TABLE")
+            .ok_or_else(|| anyhow!("CREATE TABLE is missing its TABLE keyword"))?;
+        let after_clause =
+            crate::core::utils::skip_leading_ws_and_comments(&query[table_pos + "TABLE".len()..]);
+        let (if_not_exists, after_table) = crate::core::utils::strip_if_not_exists(after_clause);
+
+        if after_table.is_empty() || after_table.starts_with("/*") || after_table.starts_with("--")
+        {
+            return Err(anyhow!("CREATE TABLE is missing a valid table name"));
+        }
+
+        let table_end = after_table
+            .find(|c: char| c.is_whitespace() || c == '(')
+            .unwrap_or(after_table.len());
+        let table_name =
+            crate::core::utils::decode_identifier(&after_table[..table_end]).to_lowercase();
+        if table_name.is_empty() {
+            return Err(anyhow!("CREATE TABLE is missing a valid table name"));
+        }
+
+        Ok((table_name, if_not_exists))
+    }
+
     /// Execute CREATE TABLE - creates a ProximaDB collection
     /// Supports multiple store types:
     /// - Vector: CREATE TABLE name (id TEXT, embedding vector(dim)) [USING VECTOR]
@@ -3723,26 +3747,17 @@ impl PostgresProtocol {
 
         // The ONE strip (a contains() + first-EXISTS find armed the flag
         // and mis-sliced the name from text inside a DEFAULT literal).
-        let Some(table_pos) = find_ascii_ci(query, "TABLE") else {
-            return self.send_command_complete("OK").await;
-        };
         // Comment-tolerant: 'TABLE /* v2 */ IF NOT EXISTS docs' regressed
-        // to table_name '/*' with the flag lost.
-        let after_clause =
-            crate::core::utils::skip_leading_ws_and_comments(&query[table_pos + "TABLE".len()..]);
-        let (if_not_exists, after_table) = crate::core::utils::strip_if_not_exists(after_clause);
-
-        let table_end = after_table
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_table.len());
-        // The ONE consumer-side decoder (six ad-hoc trims diverged; the
-        // raw path minted phantom literal-backtick collections).
-        let table_name =
-            crate::core::utils::decode_identifier(after_table[..table_end].trim()).to_lowercase();
-
-        if table_name.is_empty() {
-            return self.send_command_complete("OK").await;
-        }
+        // to table_name '/*' with the flag lost. Invalid/comment-only input
+        // must return a syntax error, never a successful empty-name no-op.
+        let (table_name, if_not_exists) = match Self::extract_legacy_create_table_target(query) {
+            Ok(target) => target,
+            Err(error) => {
+                return self
+                    .send_error("ERROR", "42601", &format!("Parse error: {error}"))
+                    .await;
+            }
+        };
 
         // Detect store type from USING clause or column types
         let store_type = self.detect_store_type(&upper);

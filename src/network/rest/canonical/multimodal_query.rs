@@ -1001,12 +1001,17 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
 
 fn collect_from_targets(sql: &str, targets: &mut Vec<String>) {
     let mut previous_was_from = false;
-    for token in sql.split_whitespace() {
+    let tokens = sql.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
         if previous_was_from {
-            let candidate =
-                token.trim_matches(|ch: char| matches!(ch, ',' | ';' | '"' | '`' | '[' | ']'));
+            let candidate = token
+                .trim_end_matches(')')
+                .trim_matches(|ch: char| matches!(ch, ',' | ';' | '"' | '`' | '[' | ']'));
             if !candidate.is_empty()
                 && !candidate.contains('(')
+                && !tokens
+                    .get(index + 1)
+                    .is_some_and(|next| next.starts_with('('))
                 && !candidate.eq_ignore_ascii_case("SELECT")
             {
                 push_unique_target(targets, candidate);
@@ -2546,9 +2551,12 @@ mod tests {
     #[test]
     fn explain_catalog_targets_include_traces_and_rerank() {
         let targets = explain_catalog_targets(
-            "SELECT * FROM TRACES('ops') UNION ALL SELECT * FROM RERANK('docs', 'q', '[0.5]', 5)",
+            "SELECT * FROM TRACES ('ops') UNION ALL SELECT * FROM RERANK('docs', 'q', '[0.5]', 5) \
+             UNION ALL SELECT * FROM (SELECT * FROM \"archive\")",
         );
         assert!(targets.contains(&"ops".to_string()));
         assert!(targets.contains(&"docs".to_string()));
+        assert!(targets.contains(&"archive".to_string()));
+        assert!(!targets.contains(&"TRACES".to_string()));
     }
 }
