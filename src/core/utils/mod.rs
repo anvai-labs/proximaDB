@@ -175,19 +175,25 @@ pub fn skip_leading_ws_and_comments(input: &str) -> &str {
 }
 
 /// Decode ONE identifier: strip a MATCHED outer delimiter pair (double
-/// quote or backtick — content of the other style is untouched) with no
-/// dot-splitting. The ONE consumer-side decoder beside strip_if_not_exists
-/// (six ad-hoc trims had diverged: quote-only, both-with-overtrim, none).
-pub fn decode_identifier(ident: &str) -> &str {
+/// quote or backtick — content of the other style is untouched), collapse
+/// doubled delimiter escapes, and perform no dot-splitting. Borrow when no
+/// escape needs allocation.
+pub fn decode_identifier(ident: &str) -> std::borrow::Cow<'_, str> {
     let bytes = ident.as_bytes();
     if bytes.len() >= 2 {
         let first = bytes[0];
         let last = bytes[bytes.len() - 1];
         if (first == b'"' || first == b'`') && first == last {
-            return &ident[1..ident.len() - 1];
+            let inner = &ident[1..ident.len() - 1];
+            let doubled = if first == b'"' { "\"\"" } else { "``" };
+            if inner.contains(doubled) {
+                let delimiter = if first == b'"' { "\"" } else { "`" };
+                return std::borrow::Cow::Owned(inner.replace(doubled, delimiter));
+            }
+            return std::borrow::Cow::Borrowed(inner);
         }
     }
-    ident
+    std::borrow::Cow::Borrowed(ident)
 }
 
 /// Case-insensitive `IF NOT EXISTS` prefix strip with a word boundary
@@ -203,7 +209,8 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
     if !head.eq_ignore_ascii_case("IF NOT EXISTS") {
         return (false, input);
     }
-    let next = cleaned.as_bytes().get("IF NOT EXISTS".len());
+    let rest = &cleaned["IF NOT EXISTS".len()..];
+    let next = rest.chars().next();
     match next {
         None => (true, ""),
         // No operand decoding here: identifier decoding belongs to the
@@ -212,20 +219,9 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
         // strips both delimiters at the pgwire create path. Decoding in
         // the strip truncated doubled-quote escapes and dropped the tail
         // (rounds 45-47 churn).
-        // Char-based whitespace (NBSP included) — a bare >= 0x80 byte
-        // test treated é as a separator while is_identifier_byte counts
-        // it as identifier text.
-        Some(_)
-            if cleaned["IF NOT EXISTS".len()..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace) =>
-        {
-            (
-                true,
-                skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
-            )
-        }
+        // Char-based whitespace (NBSP included) — a bare >= 0x80 byte test
+        // treated é as a separator while identifier scanning treats it as text.
+        Some(ch) if ch.is_whitespace() => (true, skip_leading_ws_and_comments(rest)),
         // Quote-ADJACENT operand (IF NOT EXISTS"logs" parses under the
         // pinned dialect): strip, rest undecoded (consumers decode).
         // Paren-adjacent too (IF NOT EXISTS(x INT) — the paren is the
@@ -252,7 +248,7 @@ fn at_top_level_impl(
     haystack: &str,
     needle: &str,
     skip_quote_at: Option<usize>,
-) -> (Option<usize>, Option<usize>) {
+) -> (Option<usize>, Option<usize>, bool) {
     let bytes = haystack.as_bytes();
     let mut quote: Option<(u8, usize)> = None;
     let mut nesting = 0usize;
@@ -283,6 +279,9 @@ fn at_top_level_impl(
                         } else {
                             i += 1;
                         }
+                    }
+                    if comment_depth > 0 {
+                        return (None, None, true);
                     }
                     continue;
                 }
@@ -318,7 +317,7 @@ fn at_top_level_impl(
                     && i + needle.len() <= bytes.len()
                     && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
                 {
-                    return (Some(i), None);
+                    return (Some(i), None, false);
                 }
                 i += 1;
             }
@@ -327,7 +326,7 @@ fn at_top_level_impl(
     // EOF in quote mode: report the opener so the caller can retry once
     // with it treated as a literal byte (a stray apostrophe must not
     // swallow the rest of the query).
-    (None, quote.map(|(_, at)| at))
+    (None, quote.map(|(_, at)| at), nesting != 0)
 }
 
 pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize> {
@@ -338,13 +337,45 @@ pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize>
     // byte matched keywords inside properly-terminated literals (wrong
     // results) and made needle-absent scans quadratic (15k quotes → 15k
     // rescans).
-    let (found, unterminated) = at_top_level_impl(haystack, needle, None);
+    let (found, unterminated, _) = at_top_level_impl(haystack, needle, None);
     if found.is_some() {
         return found;
     }
     match unterminated {
         Some(open) => at_top_level_impl(haystack, needle, Some(open)).0,
         None => None,
+    }
+}
+
+/// The bounded top-level keyword scan with malformed-structure reporting.
+/// This is for fail-closed fallback paths that must distinguish a genuinely
+/// absent clause from one hidden by an unterminated quote, comment, or nesting
+/// delimiter. As above, at most one quote-opener retry is performed.
+pub fn find_ascii_ci_at_top_level_checked(
+    haystack: &str,
+    needle: &str,
+) -> Result<Option<usize>, &'static str> {
+    let (found, unterminated, malformed) = at_top_level_impl(haystack, needle, None);
+    if found.is_some() {
+        return Ok(found);
+    }
+
+    if let Some(open) = unterminated {
+        let (retried, retry_unterminated, retry_malformed) =
+            at_top_level_impl(haystack, needle, Some(open));
+        if retried.is_some() {
+            return Ok(retried);
+        }
+        if retry_unterminated.is_some() || malformed || retry_malformed {
+            return Err("unterminated SQL quote, comment, or nesting delimiter");
+        }
+        return Ok(None);
+    }
+
+    if malformed {
+        Err("unterminated SQL comment or nesting delimiter")
+    } else {
+        Ok(None)
     }
 }
 
@@ -378,6 +409,10 @@ mod tests {
         assert_eq!(
             strip_if_not_exists("IF NOT EXISTSx"),
             (false, "IF NOT EXISTSx")
+        );
+        assert_eq!(
+            strip_if_not_exists("IF NOT EXISTSécole"),
+            (false, "IF NOT EXISTSécole")
         );
         // Quoted operands pass through raw (consumers decode).
         assert_eq!(

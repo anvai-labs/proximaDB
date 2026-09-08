@@ -2462,9 +2462,13 @@ impl PostgresProtocol {
     }
 
     fn extract_legacy_select_predicates(query: &str) -> anyhow::Result<Vec<SelectPredicate>> {
+        let aware_where = crate::core::utils::find_ascii_ci_at_top_level_checked(query, "WHERE")
+            .map_err(|reason| anyhow::anyhow!("malformed SELECT structure: {reason}"))?;
         if Self::extract_select_where_clause(query).is_some() {
             Self::extract_select_where_predicates(query)
                 .ok_or_else(|| anyhow::anyhow!("unsupported or malformed WHERE predicate"))
+        } else if aware_where.is_some() {
+            Err(anyhow::anyhow!("unsupported or malformed WHERE clause"))
         } else {
             Ok(Vec::new())
         }
@@ -3724,12 +3728,53 @@ impl PostgresProtocol {
             return Err(anyhow!("CREATE TABLE is missing a valid table name"));
         }
 
-        let table_end = after_table
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_table.len());
-        let table_name =
-            crate::core::utils::decode_identifier(&after_table[..table_end]).to_lowercase();
-        if table_name.is_empty() {
+        let bytes = after_table.as_bytes();
+        let quoted = matches!(bytes.first(), Some(b'"' | b'`'));
+        let table_end = if quoted {
+            let delimiter = bytes[0];
+            let mut index = 1usize;
+            let mut end = None;
+            while index < bytes.len() {
+                if bytes[index] == delimiter {
+                    if bytes.get(index + 1) == Some(&delimiter) {
+                        index += 2;
+                        continue;
+                    }
+                    end = Some(index + 1);
+                    break;
+                }
+                index += 1;
+            }
+            end.ok_or_else(|| {
+                anyhow!(
+                    "CREATE TABLE is missing a valid table name: unterminated quoted identifier"
+                )
+            })?
+        } else {
+            after_table
+                .find(|c: char| c.is_whitespace() || c == '(')
+                .unwrap_or(after_table.len())
+        };
+
+        let tail = &after_table[table_end..];
+        let valid_boundary = tail.is_empty()
+            || tail
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() || ch == '(');
+        if !valid_boundary {
+            return Err(anyhow!("CREATE TABLE has an invalid table-name boundary"));
+        }
+
+        let raw_name = &after_table[..table_end];
+        let table_name = crate::core::utils::decode_identifier(raw_name).to_lowercase();
+        if table_name.is_empty()
+            || (!quoted
+                && matches!(
+                    table_name.to_ascii_uppercase().as_str(),
+                    "USING" | "AS" | "WITH" | "SELECT"
+                ))
+        {
             return Err(anyhow!("CREATE TABLE is missing a valid table name"));
         }
 

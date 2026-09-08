@@ -1196,6 +1196,7 @@ mod tests {
         for query in [
             "SELECT * FROM TRACES('ops') WHERE EXISTS (SELECT 1 FROM orders)",
             "SELECT * FROM TRACES ('ops') WHERE EXISTS (SELECT 1 FROM orders)",
+            "SELECT * FROM TRACES ( 'ops') WHERE EXISTS (SELECT 1 FROM orders)",
         ] {
             let targets = explain_catalog_targets(query);
             assert!(!targets.iter().any(|t| t == "TRACES"), "got {targets:?}");

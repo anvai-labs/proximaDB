@@ -4157,11 +4157,26 @@ fn extract_identifier(input: &str) -> Result<(String, &str)> {
         return Err(anyhow!("expected identifier"));
     }
     if let Some(rest) = input.strip_prefix('"') {
-        let end = rest
-            .find('"')
-            .ok_or_else(|| anyhow!("unterminated quoted identifier"))?;
-        let name = rest[..end].replace("\"\"", "\"");
-        Ok((name, &rest[end + 1..]))
+        let bytes = rest.as_bytes();
+        let mut index = 0usize;
+        let mut name = String::new();
+        while index < bytes.len() {
+            if bytes[index] == b'"' {
+                if bytes.get(index + 1) == Some(&b'"') {
+                    name.push('"');
+                    index += 2;
+                    continue;
+                }
+                return Ok((name, &rest[index + 1..]));
+            }
+            let ch = rest[index..]
+                .chars()
+                .next()
+                .ok_or_else(|| anyhow!("unterminated quoted identifier"))?;
+            name.push(ch);
+            index += ch.len_utf8();
+        }
+        Err(anyhow!("unterminated quoted identifier"))
     } else {
         let end = input
             .find(|c: char| c.is_whitespace())
@@ -4288,6 +4303,12 @@ mod rank_profile_ddl_tests {
         assert_create_profile(
             "CREATE RANK PROFILE \"My Profile\" AS 'body'",
             "My Profile",
+            "body",
+            false,
+        );
+        assert_create_profile(
+            "CREATE RANK PROFILE \"My \"\"Profile\" AS 'body'",
+            "My \"Profile",
             "body",
             false,
         );

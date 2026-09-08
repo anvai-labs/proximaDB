@@ -35,6 +35,17 @@ fn extract_where_handles_trailing_where_and_prefixed_columns() {
         "SELECT COUNT(*) FILTER (WHERE active) FROM t WHERE id = 7",
     );
     assert_eq!(predicate, Some("id = 7"));
+
+    for malformed in [
+        "SELECT * FROM t ( WHERE id = 7",
+        "SELECT * FROM t ' \" WHERE id = 7",
+        "SELECT * FROM t /* WHERE id = 7",
+    ] {
+        assert!(
+            PostgresProtocol::extract_legacy_select_predicates(malformed).is_err(),
+            "malformed structure must not become an unfiltered scan: {malformed}"
+        );
+    }
 }
 
 #[test]
@@ -43,6 +54,12 @@ fn legacy_create_table_target_rejects_missing_or_unterminated_names() {
         "CREATE TABLE IF NOT EXISTS /* unterminated USING VECTOR",
         "CREATE TABLE -- USING VECTOR",
         "CREATE TABLE IF NOT EXISTS",
+        "CREATE TABLE USING VECTOR",
+        "CREATE TABLE IF NOT EXISTS USING VECTOR",
+        "CREATE TABLE /* comment-only */ USING VECTOR",
+        "CREATE TABLE (id INT) USING VECTOR",
+        "CREATE TABLE \"unterminated USING VECTOR",
+        "CREATE TABLE `unterminated USING VECTOR",
     ] {
         let error = PostgresProtocol::extract_legacy_create_table_target(query)
             .expect_err("malformed CREATE TABLE must fail closed");
@@ -58,6 +75,20 @@ fn legacy_create_table_target_rejects_missing_or_unterminated_names() {
         )
         .expect("valid comment-separated target"),
         ("logs".to_string(), true)
+    );
+    assert_eq!(
+        PostgresProtocol::extract_legacy_create_table_target(
+            "CREATE TABLE IF NOT EXISTS \"Team Logs\" (id INT) USING VECTOR"
+        )
+        .expect("quoted target may contain whitespace"),
+        ("team logs".to_string(), true)
+    );
+    assert_eq!(
+        PostgresProtocol::extract_legacy_create_table_target(
+            "CREATE TABLE IF NOT EXISTS \"team\"\"logs\" (id INT) USING VECTOR"
+        )
+        .expect("doubled quote escapes one identifier delimiter"),
+        ("team\"logs".to_string(), true)
     );
 }
 
