@@ -197,13 +197,6 @@ pub(crate) fn extract_select_items(sql: &str) -> Vec<SelectItem> {
                 search_from = position + "AS".len();
             }
             if let Some(as_pos) = as_pos {
-                // Skip the (whitespace-padded) keyword between expression
-                // and alias.
-                let after_as = item[as_pos..]
-                    .find(|c: char| !c.is_whitespace())
-                    .map(|rel| as_pos + rel)
-                    .unwrap_or(item.len());
-                let alias_start = after_as + 2; // "AS"
                 SelectItem {
                     expression: item[..as_pos].trim().to_string(),
                     alias: Some(item[as_pos + "AS".len()..].trim().to_string()),
