@@ -2362,7 +2362,9 @@ impl PostgresProtocol {
         if table.is_empty() {
             None
         } else {
-            Some(table.trim_matches('"').to_string())
+            // Both dialect delimiters (create decodes backticks — the
+            // read side must match or CREATE `logs` selects nothing).
+            Some(table.trim_matches(['"', '`']).to_string())
         }
     }
 
@@ -2916,14 +2918,18 @@ impl PostgresProtocol {
     }
 
     fn clean_identifier(identifier: &str) -> String {
-        identifier
-            .trim()
-            .trim_matches('"')
-            .split('.')
-            .next_back()
-            .unwrap_or(identifier)
-            .trim_matches('"')
-            .to_string()
+        // Backtick is the dialect's other identifier delimiter (a
+        // literal-`logs` name minted a phantom no DROP could address).
+        fn trim_delims(s: &str) -> &str {
+            s.trim_matches(['"', '`'])
+        }
+        trim_delims(
+            trim_delims(identifier.trim())
+                .split('.')
+                .next_back()
+                .unwrap_or(identifier),
+        )
+        .to_string()
     }
 
     /// Detect store type for SELECT queries

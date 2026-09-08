@@ -514,16 +514,11 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let normalized = sql.replace(['\n', '\t', ','], " ");
     let tokens: Vec<&str> = normalized.split_whitespace().collect();
 
-    for window in tokens.windows(2) {
+    for (window_index, window) in tokens.windows(2).enumerate() {
         if let [keyword, target] = window {
             let keyword = keyword.trim_matches('"').to_ascii_uppercase();
             if matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
                 && !target.starts_with('$')
-                // A spaced function call (FROM TRACES ('ops')) tokenizes
-                // the name and paren apart — a catalog-function name is a
-                // call position, not a target.
-                && !crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS
-                    .contains(&target.to_ascii_uppercase().as_str())
             {
                 // Strip trailing statement punctuation — a subquery's
                 // 'orders)' must keep its target (the paren-normalization
@@ -539,8 +534,15 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 } else {
                     target
                 };
-                let target = target.trim_matches('"');
-                if !target.is_empty() {
+                let target = target.trim_matches(['"', '`']);
+                // Call-position gate: a collection named logs/metrics is a
+                // REAL target (the bare-name gate dropped it) — skip only
+                // when the NEXT token opens the call's argument list.
+                let window_end = window_index + 2;
+                let next_opens_call = tokens
+                    .get(window_end)
+                    .is_some_and(|t| t.starts_with('(') && !t.starts_with("(SELECT"));
+                if !target.is_empty() && !next_opens_call {
                     targets.push(target.to_string());
                 }
             }

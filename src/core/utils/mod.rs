@@ -186,38 +186,17 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
     let next = cleaned.as_bytes().get("IF NOT EXISTS".len());
     match next {
         None => (true, ""),
-        // The dialect accepts double-quote AND backtick identifier
-        // quoting (GenericDialect is_delimited_identifier_start) — and the
-        // operand is DECODED so consumers never see the delimiter (a
-        // literal-`logs` name mints a phantom no DROP can address).
-        Some(b) if b.is_ascii_whitespace() || *b >= 0x80 => {
-            // Whitespace (any width — >= 0x80 may be NBSP); if the
-            // operand is QUOTED, decode it (the conventional spaced
-            // spelling took this arm undecoded and minted phantom
-            // literal-`logs` collections).
-            let rest = skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]);
-            if let Some(q) = rest
-                .as_bytes()
-                .first()
-                .filter(|b| **b == b'"' || **b == b'`')
-            {
-                let quote = *q as char;
-                if let Some((name, _tail)) = rest[1..].split_once(quote) {
-                    return (true, name);
-                }
-            }
-            (true, rest)
-        }
-        Some(b) if *b == b'"' || *b == b'`' => {
-            let rest = &cleaned["IF NOT EXISTS".len()..];
-            let quote = *b as char;
-            let inner = rest[1..]
-                .split_once(quote)
-                .map(|(name, _)| name)
-                .unwrap_or(&rest[1..]);
-            (true, inner)
-        }
-        _ => (false, input),
+        // No operand decoding here: identifier decoding belongs to the
+        // CONSUMERS — extract_identifier handles quotes AND preserves the
+        // AS-clause tail the rank-profile parser needs; clean_identifier
+        // strips both delimiters at the pgwire create path. Decoding in
+        // the strip truncated doubled-quote escapes and dropped the tail
+        // (rounds 45-47 churn).
+        Some(b) if b.is_ascii_whitespace() || *b >= 0x80 => (
+            true,
+            skip_leading_ws_and_comments(&cleaned["IF NOT EXISTS".len()..]),
+        ),
+        Some(_) => (false, input),
     }
 }
 
@@ -225,7 +204,7 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
 /// parentheses, brackets, or braces. This is the appropriate scanner for
 /// top-level SQL clauses: for example, `WHERE` inside `FILTER (WHERE ...)`
 /// is not the statement's predicate clause.
-pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize> {
+fn at_top_level_impl(haystack: &str, needle: &str, skip_quote_at: Option<usize>) -> Option<usize> {
     let bytes = haystack.as_bytes();
     let mut quote: Option<u8> = None;
     let mut nesting = 0usize;
@@ -269,7 +248,7 @@ pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize>
                 // Backticks quote identifiers (GenericDialect) — text
                 // inside them is NOT code (keywords/apostrophes/parens
                 // in a `col` gutted the predicate).
-                if matches!(bytes[i], b'\'' | b'"' | b'`') {
+                if matches!(bytes[i], b'\'' | b'"' | b'`') && skip_quote_at != Some(i) {
                     quote = Some(bytes[i]);
                     i += 1;
                     continue;
@@ -300,6 +279,25 @@ pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize>
     None
 }
 
+pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize> {
+    // Unterminated-quote tolerance: a stray apostrophe/dollar-quote body
+    // must not swallow the rest of the query (LIMIT inside $$ don't panic $$
+    // streamed the whole table). On EOF-in-quote, re-scan with the opener
+    // treated as a literal byte.
+    if let Some(found) = at_top_level_impl(haystack, needle, None) {
+        return Some(found);
+    }
+    let bytes = haystack.as_bytes();
+    for (idx, b) in bytes.iter().enumerate() {
+        if matches!(b, b'\'' | b'"' | b'`')
+            && let Some(found) = at_top_level_impl(haystack, needle, Some(idx))
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Shared f64→f32 narrowing guard: the narrowing can overflow to inf
 /// (1e300), and non-finite components must never dispatch to the distance
 /// kernels. Call sites migrate here incrementally so the policy has one
@@ -314,32 +312,27 @@ mod tests {
     use super::{skip_leading_ws_and_comments, strip_if_not_exists};
 
     #[test]
-    fn strip_if_not_exists_is_comment_and_quote_tolerant() {
-        // Comment BEFORE the prefix (round 43's fix)...
+    fn strip_if_not_exists_is_comment_and_ws_tolerant() {
+        // Comment BEFORE the prefix and AFTER it (rounds 43-44); operand
+        // decoding belongs to the CONSUMERS (extract_identifier /
+        // clean_identifier) — the strip hands back the raw rest.
         assert_eq!(
             strip_if_not_exists("/* v2 */ IF NOT EXISTS docs"),
             (true, "docs")
         );
-        // ...and AFTER it (the round-44 regression: name '/*').
         assert_eq!(
             strip_if_not_exists("IF NOT EXISTS /* v2 */ docs"),
             (true, "docs")
-        );
-        // Backtick-quoted identifiers (GenericDialect accepts them).
-        assert_eq!(strip_if_not_exists("IF NOT EXISTS`logs`"), (true, "logs"));
-        // The conventional SPACED spelling decodes too (undecoded, it
-        // minted a phantom literal-backtick collection). A QUOTED operand
-        // yields the DECODED NAME ONLY — consumers that need the tail
-        // (rank profiles' AS clause) read it from the original input;
-        // tracked in the TD.
-        assert_eq!(
-            strip_if_not_exists("IF NOT EXISTS `logs` (id INT)"),
-            (true, "logs")
         );
         // Word boundary: no separator, no strip.
         assert_eq!(
             strip_if_not_exists("IF NOT EXISTSx"),
             (false, "IF NOT EXISTSx")
+        );
+        // Quoted operands pass through raw (consumers decode).
+        assert_eq!(
+            strip_if_not_exists("IF NOT EXISTS `logs` (id INT)"),
+            (true, "`logs` (id INT)")
         );
     }
 
