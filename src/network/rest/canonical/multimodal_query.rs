@@ -810,10 +810,19 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     })
                     .transpose()?
                     .unwrap_or("default");
+                // Typed (the silent-default class — an object-shaped
+                // cypher silently ran the default query).
                 let cypher = component
                     .config
                     .get("cypher")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "graph component config.cypher must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("MATCH (n) RETURN n");
                 let cypher = crate::core::utils::inject_graph_target_into_cypher(graph, cypher);
 
@@ -823,7 +832,14 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 let namespace = component
                     .config
                     .get("namespace")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "component config.namespace must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("default");
 
                 format!("SELECT * FROM LOGS('{}')", escape_sql_text(namespace))
@@ -832,7 +848,14 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 let namespace = component
                     .config
                     .get("namespace")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "component config.namespace must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("default");
 
                 format!("SELECT * FROM METRICS('{}')", escape_sql_text(namespace))

@@ -420,25 +420,23 @@ impl PreparedStatement {
 
         let mut result = self.original_sql.clone();
 
-        // Sort by PLACEHOLDER NUMBER descending: a global str::replace of
-        // $1 also rewrites the $1-prefix inside $10 — the longest
-        // placeholder must go first (position-descending could not fix
-        // out-of-order numbering; the full tokenizer remains TD-tracked).
-        let mut bindings_with_params: Vec<_> = self.parameter_bindings.iter().enumerate().collect();
-        bindings_with_params.sort_by_key(|b| std::cmp::Reverse(b.0));
+        // Longest placeholder FIRST (a global str::replace of $1 also
+        // rewrites the $1-prefix inside $10; enumeration is ascending, so
+        // a plain reverse gives number-descending; the full tokenizer
+        // remains TD-tracked).
 
         // Replace from the end to avoid position shifts
-        for (param_idx, _binding) in &bindings_with_params {
-            let param_value = &params[*param_idx];
+        for (param_idx, _binding) in self.parameter_bindings.iter().enumerate().rev() {
+            let param_value = &params[param_idx];
             if let ParameterValue::Vector(vector) = param_value
                 && vector.iter().any(|component| !component.is_finite())
             {
                 return Err(PreparedStatementError::InvalidParameter(format!(
                     "vector parameter {} contains a non-finite component",
-                    *param_idx + 1
+                    param_idx + 1
                 )));
             }
-            let placeholder = format!("${}", *param_idx + 1);
+            let placeholder = format!("${}", param_idx + 1);
             result = result.replace(&placeholder, &param_value.to_sql_string());
         }
 

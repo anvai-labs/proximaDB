@@ -1596,6 +1596,26 @@ angles after the main agent hit a rate limit):**
 - Tracked: CATALOG_FIRST_ARG_FUNCTIONS is derivable from the fusion
   registry (FUNCTION_NAMES needs pub + a filter); the 12-copy
   config-validation chain wants an opt_str helper.
+
+**Consolidation review round 39 (2026-09-08):**
+- Round 38's paren-balance check was INERT (depth started 0 after the
+  leading paren was stripped — it must start 1; both motivating shapes
+  were still gutted). The port-EXPLAIN paren skip ALSO never survived
+  the rebase — both landed for real this round, verified in-tree.
+- Empty components fail closed AGAIN in the caller (the Result
+  restructure had dropped round 22's components-present error —
+  'SELECT 1' 200-OK garbage returned).
+- extract_select_where_clause: the WHERE LOCATE is quote+comment-aware
+  (a WHERE inside a projection literal produced a bogus predicate) and
+  the terminator loop iterates ALL occurrences with the shared
+  identifier-byte boundary (a first match inside 'limit_val' hid a
+  later real terminator).
+- The last silent multimodal defaults typed at both twins: cypher and
+  namespace (an object-shaped cypher silently ran the default query).
+  strip_from_clause handles backslash-escaped quotes and NESTED block
+  comments (injector parity). 'IF NOT EXISTS' strips case-insensitively
+  (lowercase DDL extracted the collection 'if'). The $N substitution
+  iterates number-descending without the collect+sort.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

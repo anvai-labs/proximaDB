@@ -166,6 +166,13 @@ fn strip_from_clause(query: &str) -> Result<(String, Option<String>)> {
     while i < bytes.len() {
         match quote {
             Some(q) => {
+                // Backslash-escaped quote (the injector's scanner handles
+                // it; without it the literal closed early and FROM was
+                // never found or mis-split).
+                if bytes[i] == b'\\' && q != b'`' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
                 if bytes[i] == q {
                     if i + 1 < bytes.len() && bytes[i + 1] == q {
                         i += 2;
@@ -189,11 +196,21 @@ fn strip_from_clause(query: &str) -> Result<(String, Option<String>)> {
                     continue;
                 }
                 if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    // NESTED block comments (Postgres allows them; the
+                    // injector's scanner counts depth).
                     i += 2;
-                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                        i += 1;
+                    let mut depth = 1usize;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
                     }
-                    i = (i + 2).min(bytes.len());
                     continue;
                 }
                 if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {

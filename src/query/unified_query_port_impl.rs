@@ -507,7 +507,11 @@ impl UnifiedQueryPortImpl {
 
 fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
-    let normalized = sql.replace(['\n', '\t', ',', '(', ')'], " ");
+    // Parens are NOT normalized to space — that minted function names
+    // as FROM targets (FROM TRACES('ops') → 'TRACES'); tokens CONTAINING
+    // a paren are function-call positions and skipped (the REST twin's
+    // rule).
+    let normalized = sql.replace(['\n', '\t', ','], " ");
     let tokens: Vec<&str> = normalized.split_whitespace().collect();
 
     for window in tokens.windows(2) {
@@ -515,6 +519,7 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
             let keyword = keyword.trim_matches('"').to_ascii_uppercase();
             if matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
                 && !target.starts_with('$')
+                && !target.contains(['(', ')'])
             {
                 targets.push(target.trim_matches('"').trim_end_matches(';').to_string());
             }
@@ -582,14 +587,19 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // twins — their defaults and limit handling still diverge).
         let sql = match json_to_multi_model_sql(&request)? {
             Some(sql) => sql,
-            None => {
-                // Fallback: treat "query" field as raw SQL, or use a SELECT 1.
-                request
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("SELECT 1")
-                    .to_string()
+            // Components present (ANY shape — including empty) fail
+            // closed: the 'SELECT 1' fallback returned 200-OK garbage
+            // (round 22's contract; the Result restructure dropped it).
+            None if request.get("components").is_some() => {
+                return Err(anyhow!(
+                    "multi-model request contained a component that could not be lowered (empty, malformed, or unknown component_type)"
+                ));
             }
+            None => request
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("SELECT 1")
+                .to_string(),
         };
         // chars().take — a byte-indexed slice can land mid-character in
         // the user-controlled cypher/collection text now spliced verbatim.
@@ -861,9 +871,15 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                 )
             }
             "graph" => {
+                // Typed (the silent-default class).
                 let cypher = config
                     .get("cypher")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!("components[{component_index}].config.cypher must be a string")
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("MATCH (n) RETURN n LIMIT 10");
                 // Honor config.graph like the v1 twin — without the
                 // injection the query silently targets the DEFAULT graph.
@@ -886,7 +902,14 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
             "observability" | "log" | "metric" => {
                 let namespace = config
                     .get("namespace")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.namespace must be a string"
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("default");
                 let table = match ctype {
                     "metric" => "METRICS",
