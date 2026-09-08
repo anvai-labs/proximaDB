@@ -1873,6 +1873,28 @@ pinned + narrated:**
   collect_quoted_first_args. extract_select_table_name and
   parse_document_where_clause still use raw scanners.
 
+
+**Consolidation review round 47 (2026-09-08, follow-up PR #1852):**
+- UNTERMINATED-QUOTE tolerance in find_ascii_ci_at_top_level (a stray
+  apostrophe or dollar-quote body swallowed the trailing LIMIT and
+  streamed the whole table; on EOF-in-quote the scan retries with the
+  opener as a literal byte).
+- The strip's operand DECODE moved to the CONSUMERS (extract_identifier
+  preserves the AS-clause tail the rank-profile parser needs — the
+  in-strip decode broke quoted-name CREATE RANK PROFILE, compiled-repro
+  verified; clean_identifier handles BOTH delimiters at the create
+  path, extract_table_name at the read side — the create-decodes/
+  read-doesn't asymmetry made CREATE backtick-logs SELECT nothing).
+- The port EXPLAIN gates on CALL POSITION (the next token opening the
+  argument list), not bare function names — a real collection named
+  logs is a target again (the name gate dropped it) while spaced
+  TRACES ('ops') calls are not.
+- Tracked: find_keyword_outside_literals opens quote state on single
+  quotes only (backtick/double-quoted identifiers still split as code —
+  the same class, missed in this third splitter). The REST twin's
+  collect_from_targets still mints spaced function names. Dollar-
+  quotes ($$…$$) are unhandled (the tolerance fallback mitigates).
+
 == Not in scope
 
 The v2 package already has both generation (`PROXIMADB_PROTO_REGEN=1`) and the
