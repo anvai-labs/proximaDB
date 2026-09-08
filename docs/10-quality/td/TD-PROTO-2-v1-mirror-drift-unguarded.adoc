@@ -1769,6 +1769,33 @@ pinned + narrated:**
   this); nodes carrying present nulls are now emitted as IsNull(true)
   instead of omitted (rounds 11-12 rule at the read boundary).
 
+
+**Consolidation review round 42 (2026-09-08, follow-up PR #1852):**
+- The legacy WHERE GATE used a raw ' WHERE ' substring — it disagreed
+  with the aware extractor in BOTH directions (a tab-delimited WHERE
+  skipped the gate → silent unfiltered scan; a literal ' WHERE '
+  armed it and the extractor's None hard-errored a WHERE-less
+  query). The gate uses the shared top-level scanner; None ⇒ no
+  predicates ⇒ unfiltered (correct for no-WHERE queries).
+- execute_create_table (the legacy CREATE path) used the ONE strip (a
+  contains() + first-EXISTS find armed the flag and mis-sliced the
+  name from text inside a DEFAULT literal). The demoted
+  extract_create_table_name deleted (caller-less after the AST-name
+  preference). The api-crate handler downcasts InvalidQueryInput
+  BEFORE the 'not implemented' substring test (user text containing
+  the words misrouted client errors to 501). The unreachable
+  caller-side components arm and the dead callee parts-empty branch
+  removed (None = not-multi-model, unambiguously).
+  strip_if_not_exists moved below the fn it was mis-documenting;
+  sql_parsing's dead pub(crate) widening reverted.
+- Tracked: TWO top-level scanners coexist (core::utils
+  find_ascii_ci_at_top_level — comment-aware, no boundary check; and
+  sql_parsing find_top_level_keyword_from — boundary-aware, no
+  comment skip); protocol inlines the boundary expression twice. One
+  boundary+comment-aware scanner in core::utils is the terminal fix.
+  InvalidQueryInput duplicates ProtocolError::InvalidArgument
+  (kernel's documented unified type — the api crate deps kernel).
+
 == Not in scope
 
 The v2 package already has both generation (`PROXIMADB_PROTO_REGEN=1`) and the
