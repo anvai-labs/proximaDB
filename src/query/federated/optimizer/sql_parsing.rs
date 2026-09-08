@@ -515,6 +515,21 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
 
 #[cfg(test)]
 mod scanner_tests {
+    #[test]
+    fn distinct_paren_shapes_are_preserved() {
+        use super::strip_distinct_prefix;
+        // Balanced whole-operand parens strip; composite shapes keep the
+        // text INTACT (the inert check gutted them to 'price), (tax').
+        assert_eq!(strip_distinct_prefix("DISTINCT (a)"), Some("a"));
+        assert_eq!(strip_distinct_prefix("DISTINCT(a)"), Some("a"));
+        assert_eq!(
+            strip_distinct_prefix("DISTINCT (price), (tax)"),
+            Some("(price), (tax)")
+        );
+        assert_eq!(strip_distinct_prefix("DISTINCT(a)-(b)"), Some("(a)-(b)"));
+        assert_eq!(strip_distinct_prefix("DISTINCT id"), Some("id"));
+    }
+
     use super::{
         AggregateFunction, extract_order_by, extract_select_items, extract_where_predicate,
         find_top_level_keyword, find_top_level_operator, parse_aggregate_expr,

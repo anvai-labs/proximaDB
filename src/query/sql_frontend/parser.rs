@@ -4133,7 +4133,7 @@ pub(crate) fn try_parse_create_function(sql: &str) -> Result<Option<DdlStatement
     }))
 }
 
-fn strip_if_not_exists(input: &str) -> (bool, &str) {
+pub(crate) fn strip_if_not_exists(input: &str) -> (bool, &str) {
     let upper = input.to_ascii_uppercase();
     if upper.starts_with("IF NOT EXISTS")
         && input

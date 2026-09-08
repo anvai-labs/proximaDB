@@ -1766,12 +1766,9 @@ impl PostgresProtocol {
     fn extract_create_table_name(&self, query: &str) -> Option<String> {
         let table_pos = find_ascii_ci(query, "CREATE TABLE")?;
         let after_table = query[table_pos + "CREATE TABLE".len()..].trim_start();
-        // Case-insensitive (lowercase DDL extracted the collection 'if').
-        let after_table = after_table
-            .get(.."IF NOT EXISTS".len())
-            .filter(|head| head.eq_ignore_ascii_case("IF NOT EXISTS"))
-            .map(|_| after_table["IF NOT EXISTS".len()..].trim_start())
-            .unwrap_or(after_table);
+        // The frontend parser's ONE case-insensitive strip (whitespace
+        // boundary included — a hand-rolled variant here drifted).
+        let after_table = crate::query::sql_frontend::parser::strip_if_not_exists(after_table).1;
         let table_end = after_table
             .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
             .unwrap_or(after_table.len());
@@ -2722,17 +2719,32 @@ impl PostgresProtocol {
 
     fn extract_select_where_clause(query: &str) -> Option<&str> {
         // WHERE locate on the SHARED quote+comment-aware scanner (a WHERE
-        // inside a projection literal produced a bogus predicate).
-        let where_pos = crate::core::utils::find_ascii_ci_outside_quotes(query, "WHERE")
-            .filter(|&pos| {
-                let bytes = query.as_bytes();
-                let before_ok = pos == 0 || bytes[pos - 1].is_ascii_whitespace();
+        // inside a projection literal produced a bogus predicate). ALL
+        // occurrences are tried until one passes the boundary (a first
+        // match inside FILTER(...) must not shadow the real WHERE), and
+        // the slice is at pos + 5 (the -1/+7 dance sliced one past the
+        // end when WHERE ended the string — an abort-class panic under
+        // panic=abort).
+        let mut predicate = {
+            let bytes = query.as_bytes();
+            let mut found = None;
+            let mut search_from = 0usize;
+            while let Some(rel) =
+                crate::core::utils::find_ascii_ci_outside_quotes(&query[search_from..], "WHERE")
+            {
+                let pos = search_from + rel;
                 let end = pos + 5;
-                let after_ok = end >= bytes.len() || bytes[end].is_ascii_whitespace();
-                before_ok && after_ok
-            })
-            .map(|pos| pos.saturating_sub(1))?; // keep the leading space offset shape
-        let mut predicate = query[where_pos + 7..].trim();
+                let boundary = (pos == 0
+                    || !crate::core::utils::is_identifier_byte(bytes[pos - 1]))
+                    && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
+                if boundary {
+                    found = Some(&query[end.min(query.len())..]);
+                    break;
+                }
+                search_from = end;
+            }
+            found?.trim()
+        };
         for terminator in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"] {
             // Iterate ALL occurrences until one passes the boundary test —
             // a first match inside `limit_val` must not hide a later real

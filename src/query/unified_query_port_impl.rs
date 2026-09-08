@@ -519,9 +519,17 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
             let keyword = keyword.trim_matches('"').to_ascii_uppercase();
             if matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
                 && !target.starts_with('$')
-                && !target.contains(['(', ')'])
+                && !target.contains('(')
             {
-                targets.push(target.trim_matches('"').trim_end_matches(';').to_string());
+                // Strip trailing statement punctuation — a subquery's
+                // 'orders)' must keep its target (the paren-normalization
+                // era captured it).
+                targets.push(
+                    target
+                        .trim_matches('"')
+                        .trim_end_matches([';', ')', ','])
+                        .to_string(),
+                );
             }
         }
     }
@@ -1124,6 +1132,18 @@ mod tests {
             proxima_value_to_param(&value),
             ParameterValue::Null
         ));
+    }
+
+    #[test]
+    fn explain_skips_function_call_positions() {
+        // Paren-bearing tokens are function-call positions, not catalog
+        // targets — and a subquery's closing paren must NOT lose its
+        // target.
+        let targets = explain_catalog_targets(
+            "SELECT * FROM TRACES('ops') WHERE EXISTS (SELECT 1 FROM orders)",
+        );
+        assert!(!targets.iter().any(|t| t == "TRACES"), "got {targets:?}");
+        assert!(targets.iter().any(|t| t == "orders"), "got {targets:?}");
     }
 
     #[test]

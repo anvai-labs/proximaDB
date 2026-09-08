@@ -4,6 +4,21 @@ use crate::query::multimodal_router;
 use proximadb_records::{ProximaRecord, ProximaTreeNode};
 
 #[test]
+fn extract_where_handles_trailing_where_and_prefixed_columns() {
+    // WHERE ending the string must not panic (the -1/+7 dance sliced one
+    // past the end — abort-class under panic=abort).
+    assert!(
+        PostgresProtocol::extract_select_where_clause("SELECT ' WHERE ' FROM t WHERE").is_some()
+    );
+
+    // A 'limit_val' column must not shadow a later real LIMIT terminator.
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT * FROM t WHERE limit_val > 5 LIMIT 3",
+    );
+    assert_eq!(predicate, Some("limit_val > 5"));
+}
+
+#[test]
 fn document_json_output_preserves_jsonb_fields() {
     let document = serde_json::json!({"profile": {"tier": "gold"}});
     let object = crate::proto::proximadb_v1::SqlObject {

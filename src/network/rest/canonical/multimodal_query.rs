@@ -870,6 +870,15 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
         sql_parts.push(sql_part);
     }
 
+    // Fail closed on an EMPTY components array (parity with the port
+    // twin's caller guard — empty SQL reached the federated engine and
+    // 500'd).
+    if sql_parts.is_empty() {
+        return Err(ApiError::InvalidArgument(
+            "multi-model request contained no components that could be lowered".to_string(),
+        ));
+    }
+
     // Combine with UNION based on fusion strategy
     let combined_sql = if sql_parts.len() == 1 {
         sql_parts.into_iter().next().unwrap_or_default()
