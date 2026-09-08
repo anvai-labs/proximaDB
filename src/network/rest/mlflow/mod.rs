@@ -658,7 +658,7 @@ async fn experiments_create(
 async fn experiments_get(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
-    Query(req): Query<ExperimentIdRequest>,
+    MlflowRead(req): MlflowRead<ExperimentIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     let id = parse_id(&req.experiment_id, "experiment")?;
     let store = store_for(&tenant, &state)?;
@@ -857,7 +857,7 @@ fn uuid_like_id() -> String {
 async fn runs_get(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
-    Query(req): Query<RunIdRequest>,
+    MlflowRead(req): MlflowRead<RunIdRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
     if req.run_id.is_empty() {
         return Err(MlflowError::invalid("run_id must not be empty"));

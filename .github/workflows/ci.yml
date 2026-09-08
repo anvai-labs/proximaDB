@@ -1972,8 +1972,12 @@ jobs:
           DATA_DIR="$(mktemp -d)"
           # The unified server binds its configured port (5678 by default);
           # `-p` does not override it — probe the port it actually serves.
+          # config.toml carries explicit storage URLs under /tmp/proximadb
+          # that `-d` never rebases — rewrite them into DATA_DIR so runs
+          # (and the set-once global WAL manifest) cannot cross-contaminate.
           PORT=5678
-          ./target/debug/proximadb-server -d "$DATA_DIR" &
+          sed "s|/tmp/proximadb|$DATA_DIR|g" config/config.toml > "$DATA_DIR/config.toml"
+          ./target/debug/proximadb-server -c "$DATA_DIR/config.toml" -d "$DATA_DIR" &
           SERVER_PID=$!
           trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
           for i in $(seq 1 60); do
@@ -1987,6 +1991,7 @@ jobs:
           python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" | tee /tmp/conformance.log
       - name: Ratchet — passing steps only go up
         run: |
+          set -eu
           PASSED=$(grep -c '^PASS ' /tmp/conformance.log || true)
           RATCHET=$(cat clients/python/tests/mlflow_conformance_steps.txt)
           echo "passed=$PASSED ratchet=$RATCHET"
