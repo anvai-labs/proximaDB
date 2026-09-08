@@ -100,13 +100,17 @@ def main() -> int:
 
     def do_search_match():
         client.set_terminated(state["run_id"], status="FINISHED")
-        runs = client.search_runs([state["experiment"]], filter_string="params.lr = '0.01'")
+        runs = client.search_runs(
+            [state["experiment"]], filter_string="params.lr = '0.01'"
+        )
         assert len(runs) == 1, len(runs)
 
     step("search_runs_match", do_search_match)
 
     def do_search_non_match():
-        runs = client.search_runs([state["experiment"]], filter_string="params.lr = '9.9'")
+        runs = client.search_runs(
+            [state["experiment"]], filter_string="params.lr = '9.9'"
+        )
         assert len(runs) == 0, len(runs)
 
     step("search_runs_non_match_empty", do_search_non_match)
