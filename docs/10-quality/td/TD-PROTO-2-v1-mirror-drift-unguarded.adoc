@@ -1616,6 +1616,31 @@ angles after the main agent hit a rate limit):**
   comments (injector parity). 'IF NOT EXISTS' strips case-insensitively
   (lowercase DDL extracted the collection 'if'). The $N substitution
   iterates number-descending without the collect+sort.
+
+**Consolidation review round 40 (2026-09-08, follow-up PR #1852):**
+- #1845 MERGED as 6ef7ffbc8 (rounds 8-38); this round rides the
+  squashed develop.
+- ROUND-39 REGRESSION FIXED: the WHERE locate's -1/+7 offset dance
+  sliced one PAST THE END when WHERE ended the string — a client-
+  triggerable abort-class panic under panic=abort (two independent
+  compiled repros). The locate now iterates ALL occurrences with the
+  shared identifier boundary (a first match inside FILTER(...)
+  shadowed the real WHERE) and slices at pos+5.
+- The EXPLAIN paren-skip checks only '(' (REST parity) and strips
+  trailing ;/) , from tokens — 'orders)' (subquery) keeps its target;
+  INSERT-list shapes skip like the REST twin. The REST twin's builder
+  fails closed on empty components (parity with the port caller
+  guard — empty SQL reached the federated engine and 500'd).
+  extract_create_table_name delegates to the frontend parser's ONE
+  strip_if_not_exists (whitespace boundary included).
+- PINS added for the previously-untested round-39/40 fixes: trailing-
+  WHERE no-panic, limit_val terminator, DISTINCT composite shapes,
+  TRACES-subquery target pair.
+- Tracked: the api-crate route maps the new fail-closed errors to 500
+  (the tracked typed-error-channel item). graph_lowering's scanner is
+  a THIRD copy of the Cypher dialect (kernel is a viable shared home —
+  both crates depend on it). ~13 typed-config closure copies want an
+  opt_str helper (the graph-cypher defaults already diverge).
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to
