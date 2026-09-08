@@ -181,11 +181,25 @@ fn contract_error(e: ModelRegistryServiceError) -> MlflowError {
 
 fn registered_model_out(record: &CatalogModelRegistryRecord) -> Value {
     let registry = &record.registry;
-    let aliases: Vec<&String> = registry.aliases.keys().collect();
+    // MLflow's RegisteredModel.aliases is repeated RegisteredModelAlias
+    // {alias, version} — bare strings parse into EMPTY alias messages
+    // client-side (verified against mlflow 2.14.3).
+    let aliases: Vec<Value> = registry
+        .aliases
+        .iter()
+        .map(|(alias, version)| json!({"alias": alias, "version": version.to_string()}))
+        .collect();
+    let latest_versions: Vec<Value> = registry
+        .versions
+        .keys()
+        .filter_map(|v| model_version_out(record, &v.to_string()))
+        .collect();
     json!({
         "name": registry.name,
         "aliases": aliases,
-        "versions": registry.versions.keys().map(|v| v.to_string()).collect::<Vec<_>>(),
+        // The proto field is `latest_versions`; a `versions` key is silently
+        // dropped by the client.
+        "latest_versions": latest_versions,
         "creation_timestamp": 0i64,
         "last_updated_timestamp": 0i64,
     })
@@ -465,17 +479,16 @@ async fn model_versions_create(
 async fn model_versions_transition_stage(
     State(_state): State<MlflowState>,
     Extension(_tenant): Extension<TenantContext>,
-    Json(_req): Json<TransitionStageRequest>,
+    Json(req): Json<TransitionStageRequest>,
 ) -> MlflowResult<Json<Value>> {
     // No built-in staging/production state machine (design authority);
     // aliases are the supported promotion path.
     Err(MlflowError::invalid(format!(
         "stage transitions are not supported: the registry has no staging/production \
-             state machine. Point the '{}' alias at this version instead \
+             state machine. Point a '{}' alias at this version instead \
              (registered-models/alias), and resolve deployments by alias",
-        "Production"
+        req.stage
     )))
-    .map(|r: Json<Value>| r)
 }
 
 #[cfg(test)]
@@ -491,7 +504,7 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    async fn test_router() -> Router {
+    async fn test_router() -> (Router, Arc<CatalogModelRegistryService>) {
         let engine = Arc::new(SstEngine::new().await.unwrap());
         let document = Arc::new(DocumentService::new(engine));
         let manager = Arc::new(crate::catalog::CatalogManager::new());
@@ -507,12 +520,13 @@ mod tests {
             .await
             .expect("test catalog");
         let registry = Arc::new(CatalogModelRegistryService::new(manager));
-        registry_routes()
-            .with_state(MlflowState::new(document, registry))
+        let router = registry_routes()
+            .with_state(MlflowState::new(document, registry.clone()))
             .layer(axum::Extension(TenantContext::new(
                 "default",
                 TenantIdSource::Default,
-            )))
+            )));
+        (router, registry)
     }
 
     async fn post(router: &mut Router, path: &str, body: Value) -> (axum::http::StatusCode, Value) {
@@ -544,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_workflow_over_the_wire() {
-        let mut router = test_router().await;
+        let (mut router, service) = test_router().await;
 
         // Create -> duplicate is RESOURCE_ALREADY_EXISTS.
         let (status, body) = post(
@@ -658,5 +672,97 @@ mod tests {
         .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert_eq!(body["model_versions"].as_array().unwrap().len(), 0);
+
+        // Register a version through the AUTHORITY (the native path the
+        // rejection message points at), then exercise alias set/get and the
+        // object-shaped alias projection the real client parses.
+        service
+            .create_registry("default", "versioned")
+            .await
+            .unwrap();
+        let version = proximadb_catalog::mlops::CatalogEmbeddingModelVersion {
+            version: 1,
+            provider_model_id: "bge-small".to_string(),
+            artifact: proximadb_catalog::mlops::CatalogArtifactDescriptor::new(
+                "s3://bucket/model.bin",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1024,
+                "application/octet-stream",
+            )
+            .expect("descriptor"),
+            input: minimally_valid_input_contract(),
+            output: minimally_valid_output_contract(),
+            governance: Default::default(),
+            lineage: Default::default(),
+            created_at_ms: 1_000,
+            source_run_id: Some("run-0001".to_string()),
+        };
+        let record = service
+            .apply_mutation(
+                "default",
+                "versioned",
+                0,
+                CatalogModelRegistryMutation::register_version(version),
+            )
+            .await
+            .expect("register");
+
+        let (status, body) = post(
+            &mut router,
+            "/registered-models/alias",
+            json!({"name": "versioned", "alias": "champion", "version": "1"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+
+        let (status, body) = post(
+            &mut router,
+            "/registered-models/get",
+            json!({"name": "versioned"}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        // MLflow's RegisteredModel.aliases is repeated {alias, version} —
+        // bare strings parse into EMPTY alias messages client-side.
+        let aliases = body["registered_model"]["aliases"].as_array().unwrap();
+        assert_eq!(aliases.len(), 1, "{body}");
+        assert_eq!(aliases[0]["alias"], "champion");
+        assert_eq!(aliases[0]["version"], "1");
+        // The proto field is latest_versions and carries the projection.
+        let latest = body["registered_model"]["latest_versions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0]["version"], "1");
+        assert_eq!(latest[0]["source"], "s3://bucket/model.bin");
+        assert_eq!(latest[0]["run_id"], "run-0001");
+        assert_eq!(record.registry.versions.len(), 1);
+    }
+
+    fn minimally_valid_input_contract() -> proximadb_catalog::mlops::CatalogEmbeddingInputContract {
+        proximadb_catalog::mlops::CatalogEmbeddingInputContract {
+            model_revision: "main".to_string(),
+            tokenizer_id: "bge-small".to_string(),
+            tokenizer_revision: "main".to_string(),
+            tokenizer_fingerprint: format!("sha256:{}", "b".repeat(64)),
+            declared_context_limit: 512,
+            effective_context_limit: 512,
+            special_token_count: 0,
+            document_template: "{text}".to_string(),
+            query_template: "{text}".to_string(),
+            document_parameters: Default::default(),
+            query_parameters: Default::default(),
+        }
+    }
+
+    fn minimally_valid_output_contract() -> proximadb_catalog::mlops::CatalogEmbeddingOutputContract
+    {
+        proximadb_catalog::mlops::CatalogEmbeddingOutputContract {
+            native_dimension: 384,
+            dimension_policy: proximadb_catalog::mlops::CatalogDimensionPolicy::Fixed,
+            supported_dimensions: vec![384],
+            normalized: true,
+            pooling: "mean".to_string(),
+        }
     }
 }

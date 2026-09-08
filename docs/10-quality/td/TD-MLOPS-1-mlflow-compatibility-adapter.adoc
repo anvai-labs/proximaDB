@@ -200,7 +200,17 @@ execution; MLflow auth pass-through (tenant identity stays ours).
   17 steps (ratchet raised): model create/get/search through the actual
   MLflow client, including the two documented rejections and the
   model-versions search (clients pass `name='...'` as a FILTER string —
-  parsed; searches arrive GET+query like every read).
+  parsed; searches arrive GET+query like every read). Review round 1:
+  `aliases` serialize as MLflow `RegisteredModelAlias {alias, version}`
+  OBJECTS (bare strings parse into empty alias messages client-side) and
+  the version projection rides the proto's `latest_versions` field;
+  lowercase LIKE accepted; unsupported `order_by` explicitly rejected;
+  the transition-stage message names the REQUESTED stage. KNOWN LIMIT:
+  alias-set is a read-revision-then-mutate cycle — a concurrent registry
+  mutation surfaces as a typed 400 "revision conflict" (no lost update)
+  that MLflow clients do NOT auto-retry; one-shot failure is the
+  documented behavior until a server-side compare-and-retry lands with
+  the RemoveAlias command.
 * **Slice 2 closing (2026-09-07)**: the conformance lane shipped —
   `clients/python/tests/mlflow_conformance.py` drives the canonical
   workflow (experiment lifecycle incl. get-by-name, run lifecycle,
