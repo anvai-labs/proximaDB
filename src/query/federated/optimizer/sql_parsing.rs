@@ -156,6 +156,24 @@ fn strip_distinct_prefix(clause: &str) -> Option<&str> {
         .strip_prefix('(')
         .and_then(|r| r.strip_suffix(')'))
         .filter(|inner| !inner.is_empty())
+        .filter(|inner| {
+            // Only strip when the leading paren CLOSES at the end —
+            // '(price), (tax)' and 'DISTINCT(a)-(b)' were gutted.
+            let mut depth = 0i32;
+            for (i, b) in inner.bytes().enumerate() {
+                match b {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 && i + 1 < inner.len() {
+                            return false; // closed mid-operand
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            depth == 0
+        })
     {
         return Some(inner.trim());
     }
@@ -366,16 +384,27 @@ pub(crate) fn extract_order_by(sql: &str) -> Vec<OrderByClause> {
                 entry.trim()
             };
 
+            // Whitespace-class (the NULLS tails above got the same fix —
+            // tab-padded DESC silently ran ascending on a phantom column).
             let ends_trim_ci = |needle: &str| {
-                trimmed.len() >= needle.len()
-                    && trimmed.as_bytes()[trimmed.len() - needle.len()..]
-                        .eq_ignore_ascii_case(needle.as_bytes())
+                let nb = needle.as_bytes();
+                let kw = &nb[1..]; // needle starts with a space
+                trimmed.len() > kw.len()
+                    && trimmed.as_bytes()[trimmed.len() - kw.len()..].eq_ignore_ascii_case(kw)
+                    && trimmed.as_bytes()[trimmed.len() - kw.len() - 1].is_ascii_whitespace()
+            };
+            let strip_trim_ci = |needle: &str| {
+                let kw_len = needle.len() - 1; // the leading space
+                trimmed[..trimmed.len() - kw_len].trim()
             };
             let ascending = !ends_trim_ci(" DESC");
             let column = if ends_trim_ci(" ASC") || ends_trim_ci(" DESC") {
-                trimmed[..trimmed.rfind(' ').unwrap_or(trimmed.len())]
-                    .trim()
-                    .to_string()
+                strip_trim_ci(if ends_trim_ci(" ASC") {
+                    " ASC"
+                } else {
+                    " DESC"
+                })
+                .to_string()
             } else {
                 trimmed.to_string()
             };

@@ -533,12 +533,10 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
         .into_iter()
         .filter(|target| {
             let upper = target.to_ascii_uppercase();
-            // Function-name tokens are not catalog targets — the '('→space
-            // normalization made FROM TRACES('ops') mint "TRACES".
             !matches!(
                 upper.as_str(),
                 "SELECT" | "WHERE" | "ON" | "AS" | "LATERAL" | "UNNEST"
-            ) && !crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS.contains(&upper.as_str())
+            )
         })
         .collect()
 }

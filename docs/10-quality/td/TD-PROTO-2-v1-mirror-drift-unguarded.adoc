@@ -1570,6 +1570,32 @@ angles after the main agent hit a rate limit):**
 - Tracked: the facade DOCUMENT_QUERY twin parses emitted SQL
   quote-blind and treats 1=1 as a literal field filter (reachability
   depends on SQL classification into the facade path).
+
+**Consolidation review round 38 (2026-09-08):**
+- RED TEST AT HEAD: round 37's AQL revert left round 35's base64 pin —
+  re-pinned to the family JSON-heuristic policy.
+- strip_distinct_prefix strips parens only when they WRAP the operand
+  (a balance+position check — '(price), (tax)' and 'DISTINCT(a)-(b)'
+  were gutted). The ASC/DESC tails are whitespace-class (the round-37
+  fix covered only NULLS — tab-padded DESC ran ascending on a phantom
+  column).
+- The port EXPLAIN skips paren-bearing tokens instead of normalizing
+  parens to space (which minted 'TRACES' — and the denylist band-aid
+  dropped real collections named logs/metrics; both removed).
+- strip_from_clause handles // and /* */ comments and backtick names
+  (a FROM inside them hijacked the split — the crate cannot import
+  the root's shared scanner; the local dialect now matches the
+  injector's, terminal-home item noted). substitute_parameters
+  replaces the LONGEST placeholder first ($1's global replace
+  clobbered $10's prefix when numbering ran out of position order —
+  the in-literal rewriting remains the tracked tokenizer item).
+  extract_select_where_clause uses the shared quote+comment scanner
+  (the private single-quote variant truncated at terminators inside
+  double-quoted identifiers). The scanner's identifier closure
+  routes through the ONE byte class.
+- Tracked: CATALOG_FIRST_ARG_FUNCTIONS is derivable from the fusion
+  registry (FUNCTION_NAMES needs pub + a filter); the 12-copy
+  config-validation chain wants an opt_str helper.
 - SQL-standard doubled single quotes are now decoded at the federated
   extension-parser boundary. Round 16/17 escaped the four programmatic
   multimodal SQL producers, but the parser returned the doubled form to

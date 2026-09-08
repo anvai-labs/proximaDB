@@ -176,7 +176,27 @@ fn strip_from_clause(query: &str) -> Result<(String, Option<String>)> {
                 i += 1;
             }
             None => {
-                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                // Cypher line comments (//), block comments, and backtick
+                // symbolic names — a FROM inside any of them hijacked the
+                // split (the injector's scanner handles all three; this
+                // crate cannot import the root's shared home — the
+                // terminal-scanner TD item).
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(bytes.len());
+                    continue;
+                }
+                if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
                     quote = Some(bytes[i]);
                     i += 1;
                     continue;

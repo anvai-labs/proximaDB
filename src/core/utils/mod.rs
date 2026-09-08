@@ -243,11 +243,9 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
         // function. Likewise, only whitespace may separate the name and `(`;
         // scanning forward to an unrelated call misattributes its first arg.
         search_start = after_name;
-        // The ONE shared byte class (is_identifier_byte semantics) — a
-        // divergent char-class here tokenized '·LOGS' differently from
-        // the keyword scanners in the same file.
-        let is_identifier_char =
-            |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') || !ch.is_ascii();
+        // The ONE shared byte class — a divergent char-class here
+        // tokenized '·LOGS' differently from the keyword scanners.
+        let is_identifier_char = |ch: char| !ch.is_ascii() || is_identifier_byte(ch as u8);
         if sql[..name_start]
             .chars()
             .next_back()
@@ -334,6 +332,8 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
             search_start = candidate_end;
             continue;
         }
+        // Only reachable for an unterminated literal — resume past the
+        // name to avoid an infinite loop.
         search_start = after_name;
     }
 }
@@ -342,7 +342,7 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
 /// backtick-quoted symbolic names, and comments. Cypher line comments use
 /// `//`, and escaped quotes use backslashes, so the SQL-oriented scanner above
 /// is deliberately not reused here.
-fn find_cypher_clause(haystack: &str, keywords: &[&str]) -> Option<usize> {
+pub fn find_cypher_clause(haystack: &str, keywords: &[&str]) -> Option<usize> {
     let first = keywords.first()?.as_bytes();
     let bytes = haystack.as_bytes();
     let mut quote: Option<u8> = None;

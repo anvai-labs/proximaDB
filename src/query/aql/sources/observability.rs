@@ -176,8 +176,15 @@ mod tests {
     use super::{AqlValue, ObservabilityAqlSource, SqlValueData};
 
     #[test]
-    fn raw_bytes_render_as_canonical_base64_instead_of_null() {
-        let value = ObservabilityAqlSource::sql_data_to_aql(SqlValueData::BytesValue(vec![0, 255]));
-        assert!(matches!(value, AqlValue::String(encoded) if encoded == "AP8="));
+    fn raw_bytes_follow_the_aql_family_json_heuristic() {
+        // Re-pinned round 38: the arm reverted to the sibling JSON-heuristic
+        // policy (one spelling per crate — the base64 alternative is the
+        // tracked AQL-family item). Non-JSON bytes null; JSON bytes decode.
+        let raw = ObservabilityAqlSource::sql_data_to_aql(SqlValueData::BytesValue(vec![0, 255]));
+        assert!(matches!(raw, AqlValue::Null));
+        let json = ObservabilityAqlSource::sql_data_to_aql(SqlValueData::BytesValue(
+            b"{\"k\":1}".to_vec(),
+        ));
+        assert!(matches!(json, AqlValue::Jsonb(_)));
     }
 }

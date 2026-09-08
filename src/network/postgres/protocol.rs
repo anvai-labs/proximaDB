@@ -2721,8 +2721,20 @@ impl PostgresProtocol {
     fn extract_select_where_clause(query: &str) -> Option<&str> {
         let where_pos = find_ascii_ci(query, " WHERE ")?;
         let mut predicate = query[where_pos + 7..].trim();
-        for terminator in [" ORDER BY ", " GROUP BY ", " LIMIT ", " OFFSET "] {
-            if let Some(pos) = Self::find_keyword_outside_literals(predicate, terminator) {
+        for terminator in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"] {
+            // The shared quote-AND-comment-aware scanner (the private
+            // single-quote-only variant truncated at terminators inside
+            // double-quoted identifiers or comments).
+            if let Some(pos) = crate::core::utils::find_ascii_ci_outside_quotes(
+                predicate, terminator,
+            )
+            .filter(|&pos| {
+                let bytes = predicate.as_bytes();
+                let before_ok = pos == 0 || bytes[pos - 1].is_ascii_whitespace();
+                let end = pos + terminator.len();
+                let after_ok = end >= bytes.len() || bytes[end].is_ascii_whitespace();
+                before_ok && after_ok
+            }) {
                 predicate = predicate[..pos].trim();
             }
         }
