@@ -834,8 +834,17 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
             "document" => {
                 let collection = config
                     .get("collection")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default");
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.collection must be a string"
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .ok_or_else(|| {
+                        anyhow!("components[{component_index}].config.collection is required")
+                    })?;
                 let filter = config
                     .get("filter")
                     .map(|v| {
@@ -1159,6 +1168,22 @@ mod tests {
 
         let error = json_to_multi_model_sql(&req).expect_err("invalid vector must fail closed");
         assert!(error.to_string().contains("query_vector[1]"));
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_requires_document_collection() {
+        let req = serde_json::json!({
+            "components": [{
+                "component_type": "document",
+                "config": {"filter": "active = true"}
+            }]
+        });
+        let error = json_to_multi_model_sql(&req).expect_err("collection must be explicit");
+        assert!(
+            error
+                .to_string()
+                .contains("components[0].config.collection is required")
+        );
     }
 
     #[test]

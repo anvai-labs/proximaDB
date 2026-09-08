@@ -138,7 +138,7 @@ pub fn finite_f32(value: f64) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_quoted_first_args, finite_f32};
+    use super::{collect_quoted_first_args, finite_f32, inject_graph_target_into_cypher};
 
     #[test]
     fn finite_f32_rejects_non_finite_and_overflowed_values() {
@@ -179,6 +179,15 @@ mod tests {
         );
 
         assert_eq!(targets, ["right"]);
+    }
+
+    #[test]
+    fn graph_target_injection_ignores_clause_text_inside_literals() {
+        let cypher = "MATCH (n {note: ' FROM archived RETURN value'}) RETURN n";
+        assert_eq!(
+            inject_graph_target_into_cypher("social", cypher),
+            "MATCH (n {note: ' FROM archived RETURN value'}) FROM social RETURN n"
+        );
     }
 }
 

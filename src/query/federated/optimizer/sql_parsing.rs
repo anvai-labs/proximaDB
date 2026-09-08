@@ -420,8 +420,9 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
     if trimmed.eq_ignore_ascii_case("FALSE") {
         return Some(PredicateValue::Bool(false));
     }
-    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"')))
     {
         let inner = &trimmed[1..trimmed.len() - 1];
         // Decode SQL-standard doubled quotes — this PR's own producers
@@ -447,7 +448,7 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
 mod scanner_tests {
     use super::{
         extract_order_by, extract_select_items, extract_where_predicate, find_top_level_keyword,
-        find_top_level_operator, select_has_distinct,
+        find_top_level_operator, parse_predicate_value, select_has_distinct,
     };
 
     #[test]
@@ -491,6 +492,12 @@ mod scanner_tests {
         let items = extract_select_items(sql);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].expression, "Distinctive");
+    }
+
+    #[test]
+    fn malformed_single_quote_predicate_fails_closed() {
+        assert!(parse_predicate_value("'").is_none());
+        assert!(parse_predicate_value("\"").is_none());
     }
 }
 
