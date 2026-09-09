@@ -13,7 +13,7 @@
 //! segment-sanitized (no `..`, no absolute escapes) and tenant-scoped.
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Extension, Json, Router};
@@ -23,6 +23,11 @@ use serde_json::{Value, json};
 use crate::network::middleware::tenant::TenantContext;
 
 use super::{MlflowError, MlflowResult, MlflowState};
+
+/// Artifact uploads carry model weights — allow the legacy-path cap
+/// (64 MiB) instead of axum's silent 2 MiB default; the rest of the API
+/// surface keeps the platform defaults.
+const ARTIFACT_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 pub fn artifacts_routes() -> Router<MlflowState> {
     Router::new()
@@ -34,6 +39,7 @@ pub fn artifacts_routes() -> Router<MlflowState> {
             "/api/2.0/mlflow-artifacts/artifacts/{*path}",
             any(artifact_proxy),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT))
 }
 
 /// The client's directory LIST hits the bare `/artifacts` root with the
@@ -45,6 +51,7 @@ async fn artifact_root_list(
 ) -> MlflowResult<Json<Value>> {
     let sub = list.path.clone().unwrap_or_default();
     let segments = sanitize_segments(&sub)?;
+    let prefix = list_entry_prefix(&segments);
     let root = tenant_artifact_root(&state, &tenant);
     let target = segments.iter().fold(root, |acc, s| acc.join(s));
     if !target.exists() {
@@ -72,8 +79,14 @@ async fn artifact_root_list(
         } else {
             entry.metadata().await.map(|m| m.len()).unwrap_or(0)
         };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
         files.push(json!({
-            "path": entry.file_name().to_string_lossy(),
+            "path": path,
             "is_dir": is_dir,
             "file_size": size,
         }));
@@ -103,6 +116,18 @@ async fn artifact_root_delete(
             .map_err(|e| MlflowError::internal(format!("delete artifact: {e}")))?;
     }
     Ok(StatusCode::OK.into_response())
+}
+
+/// Entry names for directory listings are relative to the RUN's artifact
+/// root (`<exp>/<run>/artifacts`), not to the listed subdirectory — the
+/// client passes `file.path` verbatim as the next remote path.
+fn list_entry_prefix(segments: &[String]) -> String {
+    let anchor = segments
+        .iter()
+        .position(|s| s == "artifacts")
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    segments[anchor..].join("/")
 }
 
 fn sanitize_segments(path: &str) -> MlflowResult<Vec<String>> {
@@ -154,9 +179,7 @@ async fn artifact_proxy(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
     Path(path): Path<String>,
-    Query(list): Query<ListParams>,
     method: axum::http::Method,
-    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> MlflowResult<Response> {
     let segments = sanitize_segments(&path)?;
@@ -184,18 +207,11 @@ async fn artifact_proxy(
                 )));
             }
             if target.is_dir() {
-                // Directory LIST: MLflow shape {files: [{path, is_dir,
-                // file_size}]} relative to the requested directory.
-                let list_root = match &list.path {
-                    Some(sub) => {
-                        let mut p = target.clone();
-                        for segment in sanitize_segments(sub)? {
-                            p = p.join(segment);
-                        }
-                        p
-                    }
-                    None => target,
-                };
+                // Directory LIST. Entry names are repo-root-relative
+                // (relative to <exp>/<run>/artifacts) — the client feeds
+                // file.path verbatim into the next remote GET.
+                let prefix = list_entry_prefix(&segments);
+                let list_root = target.clone();
                 let mut entries = tokio::fs::read_dir(&list_root)
                     .await
                     .map_err(|e| MlflowError::internal(format!("read artifact dir: {e}")))?;
@@ -211,8 +227,14 @@ async fn artifact_proxy(
                     } else {
                         entry.metadata().await.map(|m| m.len()).unwrap_or(0)
                     };
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let entry_path = if prefix.is_empty() {
+                        name
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
                     files.push(json!({
-                        "path": entry.file_name().to_string_lossy(),
+                        "path": entry_path,
                         "is_dir": is_dir,
                         "file_size": size,
                     }));
@@ -222,15 +244,14 @@ async fn artifact_proxy(
                 let bytes = tokio::fs::read(&target)
                     .await
                     .map_err(|e| MlflowError::internal(format!("read artifact: {e}")))?;
-                let mut response = Response::new(axum::body::Body::from(bytes));
-                if let Some(mime) = headers.get("accept").and_then(|v| v.to_str().ok()) {
-                    if !mime.is_empty() && mime != "*/*" {
-                        response
-                            .headers_mut()
-                            .insert(axum::http::header::CONTENT_TYPE, mime.parse().unwrap());
-                    }
-                }
-                Ok(response)
+                // Octet-stream: the proxy carries bytes; echoing the
+                // request's Accept header as Content-Type is semantically
+                // wrong and could yield an invalid MIME.
+                Ok((
+                    [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                    bytes,
+                )
+                    .into_response())
             }
         }
         axum::http::Method::DELETE => {
