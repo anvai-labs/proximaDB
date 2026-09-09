@@ -157,15 +157,7 @@ fn store_for(
         .map_err(|e| MlflowError::internal(e.to_string()))
 }
 
-// ---------------------------------------------------------------------------
-// MLflow REST DTOs (serde snake_case, string ids — JavaScript-safe)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Error envelope — MLflow native
-// ---------------------------------------------------------------------------
-
-pub(crate) fn experiment_out(record: &ExperimentRecord) -> ExperimentOut {
+fn experiment_out(record: &ExperimentRecord) -> ExperimentOut {
     ExperimentOut {
         experiment_id: record.experiment_id.to_string(),
         name: record.name.clone(),
