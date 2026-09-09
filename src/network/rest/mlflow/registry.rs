@@ -138,24 +138,6 @@ pub struct TransitionStageRequest {
 // Error lowering — the registry service's typed errors to MLflow codes
 // ---------------------------------------------------------------------------
 
-impl From<ModelRegistryServiceError> for MlflowError {
-    fn from(e: ModelRegistryServiceError) -> Self {
-        match &e {
-            ModelRegistryServiceError::NotFound { name, .. } => {
-                MlflowError::not_found(format!("Could not find registered model '{name}'"))
-            }
-            ModelRegistryServiceError::AlreadyExists { name, .. } => {
-                MlflowError::exists(format!("Registered model '{name}' already exists"))
-            }
-            ModelRegistryServiceError::InvalidName { reason }
-            | ModelRegistryServiceError::InvalidTenant { reason } => {
-                MlflowError::invalid(reason.clone())
-            }
-            other => MlflowError::internal(other.to_string()),
-        }
-    }
-}
-
 fn contract_error(e: ModelRegistryServiceError) -> MlflowError {
     // Contract failures (duplicate version, unknown alias) surface as typed
     // MLflow errors, not opaque internals.
