@@ -346,17 +346,10 @@ async fn registered_models_search(
                 && name_like
                     .as_ref()
                     .is_none_or(|pat| super::like_match(&r.registry.name, pat))
-                && tag_clauses.iter().all(|(key, value, is_eq)| {
-                    // Absent tag: = false, != true. When the annotation
-                    // facet lands, read the value here instead of None.
-                    let present: Option<&String> = None;
-                    let _ = key;
-                    match (is_eq, present) {
-                        (true, Some(v)) => v == value,
-                        (true, None) => false,
-                        (false, Some(v)) => v != value,
-                        (false, None) => true,
-                    }
+                && tag_clauses.iter().all(|(_key, value, is_eq)| {
+                    // Registry annotation facet not yet present — the
+                    // port's absent-value semantics decide.
+                    proximadb_catalog::run_store::tag_clause_matches(*is_eq, None, value)
                 })
         })
         .map(registered_model_out)

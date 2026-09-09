@@ -268,6 +268,20 @@ pub trait RunStore: Send + Sync {
     async fn dataset_inputs(&self, run_id: &str) -> Result<Vec<RunDatasetInput>, RunStoreError>;
 }
 
+/// Model-registry tag evaluation with MLflow absent-value semantics:
+/// `=` never matches a missing tag, `!=` matches everything. Lives at the
+/// port so every adapter (wire, future CLI) shares one truth; when the
+/// registry's annotation facet lands, implementations override with real
+/// lookups and this default becomes the in-memory/test truth only.
+pub fn tag_clause_matches(is_eq: bool, present_value: Option<&String>, expected: &str) -> bool {
+    match (is_eq, present_value) {
+        (true, Some(v)) => v == expected,
+        (true, None) => false,
+        (false, Some(v)) => v != expected,
+        (false, None) => true,
+    }
+}
+
 /// Tenant-scoped factory over [`RunStore`] implementations — the seam the
 /// wire depends on (DIP): transports receive a factory, never a concrete
 /// store, so a second implementation (test double, alternative substrate)
