@@ -2449,9 +2449,9 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                "products".to_string(),
                 "docs".to_string(),
-                "events".to_string()
+                "events".to_string(),
+                "products".to_string()
             ]
         );
     }
