@@ -514,7 +514,6 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             }
             record_offset(location, byte_index + ch.len_utf8());
         }
-        drop(record_offset);
         let byte_offset = |location: Location| {
             let index = requested_locations.binary_search(&location).ok()?;
             requested_offsets.get(index).copied().flatten()
