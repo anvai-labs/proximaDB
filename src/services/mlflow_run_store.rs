@@ -70,6 +70,30 @@ fn mutation_lock_for(collection: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// Production [`RunStoreFactory`](proximadb_catalog::run_store::RunStoreFactory):
+/// builds a tenant-scoped store over the shared document substrate.
+pub struct SubstrateRunStoreFactory {
+    document: Arc<DocumentService>,
+}
+
+impl SubstrateRunStoreFactory {
+    pub fn new(document: Arc<DocumentService>) -> Self {
+        Self { document }
+    }
+}
+
+impl proximadb_catalog::run_store::RunStoreFactory for SubstrateRunStoreFactory {
+    fn store_for(&self, tenant_id: &str) -> Result<std::sync::Arc<dyn RunStore>, RunStoreError> {
+        let store =
+            SubstrateRunStore::for_tenant(self.document.clone(), tenant_id).map_err(|e| {
+                RunStoreError::Internal {
+                    message: format!("tenant '{tenant_id}' cannot be scoped: {e:#}"),
+                }
+            })?;
+        Ok(std::sync::Arc::new(store))
+    }
+}
+
 pub struct SubstrateRunStore {
     document: Arc<DocumentService>,
     collection: String,

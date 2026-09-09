@@ -1964,8 +1964,12 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - name: Install pinned mlflow client
-        run: python -m pip install "mlflow-skinny==2.14.3" requests
+      - name: Install pinned mlflow clients (2.x floor + 3.x forward)
+        run: |
+          python -m pip install "mlflow-skinny==2.14.3" requests
+          python -m venv /tmp/mlflow3env
+          /tmp/mlflow3env/bin/pip install --quiet --upgrade pip
+          /tmp/mlflow3env/bin/pip install "mlflow-skinny==3.16.0" requests
       - name: Validate conformance harness
         working-directory: clients/python
         run: python tests/test_mlflow_conformance_harness.py
@@ -1991,20 +1995,25 @@ jobs:
           done
           curl -sf "http://127.0.0.1:$PORT/health/live" > /dev/null
           cd clients/python
-          python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" | tee /tmp/conformance.log
+          # Each client generation runs the FULL workflow; both must clear
+          # the ratchet floor (the 3.x client appends tag-filter clauses to
+          # registry searches — absent-value semantics keep it green).
+          python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" 2x | tee /tmp/conformance-2x.log
+          /tmp/mlflow3env/bin/python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" 3x | tee /tmp/conformance-3x.log
       - name: Ratchet — passing steps only go up
         if: always()
         run: |
           set -eu
-          if [ -f /tmp/conformance.log ]; then
-            PASSED=$(grep -c '^PASS ' /tmp/conformance.log || true)
-          else
-            PASSED=0
-          fi
           RATCHET=$(cat clients/python/tests/mlflow_conformance_steps.txt)
-          echo "passed=$PASSED ratchet=$RATCHET"
+          PASSED=$(grep -c '^PASS ' /tmp/conformance-2x.log || true)
+          PASSED3=$(grep -c '^PASS ' /tmp/conformance-3x.log || true)
+          echo "passed-2x=$PASSED passed-3x=$PASSED3 ratchet=$RATCHET"
           if [ "$PASSED" -lt "$RATCHET" ]; then
-            echo "::error::MLflow conformance regressed: $PASSED < $RATCHET steps. If intentional, lower the ratchet in the same PR with justification."
+            echo "::error::MLflow 2.x conformance regressed: $PASSED < $RATCHET steps."
+            exit 1
+          fi
+          if [ "$PASSED3" -lt "$RATCHET" ]; then
+            echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET steps."
             exit 1
           fi
 

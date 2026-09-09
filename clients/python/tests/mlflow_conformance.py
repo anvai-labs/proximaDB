@@ -35,10 +35,13 @@ def result_code() -> int:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: mlflow_conformance.py <tracking_uri>", file=sys.stderr)
+    if len(sys.argv) not in (2, 3):
+        print("usage: mlflow_conformance.py <tracking_uri> [tag]", file=sys.stderr)
         return 2
     tracking_uri = sys.argv[1]
+    # Resource names are tagged per invocation so successive runs (e.g. the
+    # 2.x and 3.x clients in one lane) never collide on create.
+    tag = sys.argv[2] if len(sys.argv) == 3 else "default"
 
     import mlflow
     from mlflow.tracking import MlflowClient
@@ -48,15 +51,15 @@ def main() -> int:
     state = {}
 
     def do_create():
-        experiment = client.create_experiment("conformance-e2e")
+        experiment = client.create_experiment(f"conformance-e2e-{tag}")
         fetched = client.get_experiment(experiment)
-        assert fetched.name == "conformance-e2e", fetched.name
+        assert fetched.name == f"conformance-e2e-{tag}", fetched.name
         state["experiment"] = experiment
 
     step("create+get_experiment", do_create)
 
     def do_by_name():
-        by_name = client.get_experiment_by_name("conformance-e2e")
+        by_name = client.get_experiment_by_name(f"conformance-e2e-{tag}")
         assert by_name is not None
         assert by_name.experiment_id == state["experiment"]
 
@@ -147,17 +150,17 @@ def main() -> int:
     # models lower to xCatalog registries; version creation and stage
     # transitions are the documented honest rejections.
     def do_model_create():
-        client.create_registered_model("conformance-model")
-        model = client.get_registered_model("conformance-model")
-        assert model.name == "conformance-model"
+        client.create_registered_model(f"conformance-model-{tag}")
+        model = client.get_registered_model(f"conformance-model-{tag}")
+        assert model.name == f"conformance-model-{tag}"
 
     step("create+get_registered_model", do_model_create)
 
     def do_model_search():
         models = client.search_registered_models(
-            filter_string="name LIKE '%conformance%'"
+            filter_string=f"name LIKE '%conformance-model-{tag}%'"
         )
-        assert any(m.name == "conformance-model" for m in models), models
+        assert any(m.name == f"conformance-model-{tag}" for m in models), models
 
     step("search_registered_models", do_model_search)
 
@@ -165,7 +168,7 @@ def main() -> int:
         import mlflow
 
         try:
-            client.create_model_version("conformance-model", "s3://bucket/model")
+            client.create_model_version(f"conformance-model-{tag}", "s3://bucket/model")
         except mlflow.exceptions.MlflowException as exc:
             assert "lifecycle API" in str(exc), str(exc)
         else:
@@ -178,7 +181,7 @@ def main() -> int:
 
         try:
             client.transition_model_version_stage(
-                "conformance-model", "1", "Production"
+                f"conformance-model-{tag}", "1", "Production"
             )
         except mlflow.exceptions.MlflowException as exc:
             assert "alias" in str(exc).lower(), str(exc)
@@ -188,10 +191,38 @@ def main() -> int:
     step("transition_stage_rejected_with_alias_pointer", do_stage_rejected)
 
     def do_model_versions_empty():
-        versions = client.search_model_versions("name='conformance-model'")
+        versions = client.search_model_versions(f"name='conformance-model-{tag}'")
         assert list(versions) == [], list(versions)
 
     step("model_versions_search_empty", do_model_versions_empty)
+
+    # 7. Artifacts through the proxy family (TD-MLOPS-1 slice 4): the run's
+    # artifact_uri resolves against the tracking host's
+    # /api/2.0/mlflow-artifacts proxy.
+    import os
+    import tempfile
+
+    def do_artifact_roundtrip():
+        run = client.get_run(state["run_id"])
+        assert run.info.artifact_uri.startswith(
+            "mlflow-artifacts:/"
+        ), run.info.artifact_uri
+        with tempfile.TemporaryDirectory() as tmp:
+            local = os.path.join(tmp, "model.txt")
+            with open(local, "w") as fh:
+                fh.write("artifact-bytes")
+            client.log_artifact(state["run_id"], local)
+            artifacts = client.list_artifacts(state["run_id"])
+            assert any(
+                a.path == "model.txt" and not a.is_dir for a in artifacts
+            ), artifacts
+            dest = os.path.join(tmp, "dl")
+            os.makedirs(dest)
+            downloaded = client.download_artifacts(state["run_id"], "model.txt", dest)
+            with open(downloaded, "r") as fh:
+                assert fh.read() == "artifact-bytes"
+
+    step("artifact_roundtrip", do_artifact_roundtrip)
 
     total = len(PASSED)
     print(f"CONFORMANCE_STEPS={total}")

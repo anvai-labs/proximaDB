@@ -289,24 +289,51 @@ async fn registered_models_search(
     // error (never silently ignored).
     let mut name_eq: Option<String> = None;
     let mut name_like: Option<String> = None;
+    // Tag predicates: the registry has no tag facet yet (the annotation
+    // facet ships with the native lifecycle surface), so = never matches
+    // and != matches everything — the absent-value semantics the MLflow
+    // 3.x client relies on: it appends
+    // `tag.`mlflow.prompt.is_prompt` != 'true'` to EVERY search to hide
+    // prompt models, and that clause must pass cleanly.
+    let mut tag_clauses: Vec<(String, String, bool)> = Vec::new();
     if let Some(filter) = &req.filter {
-        for clause in super::split_filter_clauses(filter)? {
+        for clause in super::filter::split_filter_clauses(filter)? {
             let clause = clause.trim();
-            let (field, op, value) = super::parse_filter_parts(clause, true)?;
-            match field.to_ascii_lowercase().as_str() {
-                "name" | "attributes.name" => match op.as_str() {
-                    "=" => name_eq = Some(value),
-                    "LIKE" => name_like = Some(value),
+            let (field, op, value) = super::filter::parse_filter_parts(clause, true)?;
+            let field_lower = field.to_ascii_lowercase();
+            let tag_key = field_lower
+                .strip_prefix("tag.")
+                .or_else(|| field_lower.strip_prefix("tags."))
+                .map(|k| k.trim_matches('`').to_string());
+            if let Some(key) = tag_key {
+                if key.is_empty() {
+                    return Err(MlflowError::invalid("tag filter needs a key"));
+                }
+                match op.as_str() {
+                    "=" => tag_clauses.push((key, value, true)),
+                    "!=" => tag_clauses.push((key, value, false)),
                     other => {
                         return Err(MlflowError::invalid(format!(
-                            "name filter supports = / LIKE, got '{other}'"
+                            "tag filter supports = / !=, got '{other}'"
                         )));
                     }
-                },
-                _ => {
-                    return Err(MlflowError::invalid(format!(
-                        "unsupported registered-model filter clause '{clause}' (slice 3: name = / LIKE)"
-                    )));
+                }
+            } else {
+                match field_lower.as_str() {
+                    "name" | "attributes.name" => match op.as_str() {
+                        "=" => name_eq = Some(value),
+                        "LIKE" => name_like = Some(value),
+                        other => {
+                            return Err(MlflowError::invalid(format!(
+                                "name filter supports = / LIKE, got '{other}'"
+                            )));
+                        }
+                    },
+                    _ => {
+                        return Err(MlflowError::invalid(format!(
+                            "unsupported registered-model filter clause '{clause}'"
+                        )));
+                    }
                 }
             }
         }
@@ -318,7 +345,12 @@ async fn registered_models_search(
             name_eq.as_ref().is_none_or(|v| &r.registry.name == v)
                 && name_like
                     .as_ref()
-                    .is_none_or(|pat| super::like_match(&r.registry.name, pat))
+                    .is_none_or(|pat| super::filter::like_match(&r.registry.name, pat))
+                && tag_clauses.iter().all(|(_key, value, is_eq)| {
+                    // Registry annotation facet not yet present — the
+                    // port's absent-value semantics decide.
+                    proximadb_catalog::run_store::tag_clause_matches(*is_eq, None, value)
+                })
         })
         .map(registered_model_out)
         .collect();
@@ -424,8 +456,8 @@ async fn model_versions_search(
     if name.is_empty()
         && let Some(filter) = &req.filter
     {
-        for clause in super::split_filter_clauses(filter)? {
-            let (field, op, value) = super::parse_filter_parts(clause.trim(), true)?;
+        for clause in super::filter::split_filter_clauses(filter)? {
+            let (field, op, value) = super::filter::parse_filter_parts(clause.trim(), true)?;
             if field.eq_ignore_ascii_case("name") && op == "=" {
                 name = value;
             } else {
@@ -520,8 +552,14 @@ mod tests {
             .await
             .expect("test catalog");
         let registry = Arc::new(CatalogModelRegistryService::new(manager));
+        let run_store =
+            Arc::new(crate::services::mlflow_run_store::SubstrateRunStoreFactory::new(document));
         let router = registry_routes()
-            .with_state(MlflowState::new(document, registry.clone()))
+            .with_state(MlflowState::new(
+                run_store,
+                registry.clone(),
+                std::env::temp_dir(),
+            ))
             .layer(axum::Extension(TenantContext::new(
                 "default",
                 TenantIdSource::Default,
