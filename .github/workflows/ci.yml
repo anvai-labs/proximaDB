@@ -1998,8 +1998,8 @@ jobs:
           # Each client generation runs the FULL workflow; both must clear
           # the ratchet floor (the 3.x client appends tag-filter clauses to
           # registry searches — absent-value semantics keep it green).
-          python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" | tee /tmp/conformance-2x.log
-          /tmp/mlflow3env/bin/python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" | tee /tmp/conformance-3x.log
+          python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" 2x | tee /tmp/conformance-2x.log
+          /tmp/mlflow3env/bin/python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" 3x | tee /tmp/conformance-3x.log
       - name: Ratchet — passing steps only go up
         if: always()
         run: |
