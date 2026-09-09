@@ -196,6 +196,42 @@ pub fn decode_identifier(ident: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(ident)
 }
 
+/// Find punctuation outside double-quoted/backtick identifier segments.
+/// Doubled delimiters remain inside their segment.
+pub(crate) fn find_unquoted_char(input: &str, needle: char) -> Option<usize> {
+    let mut quote = None;
+    let mut chars = input.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+        } else if matches!(ch, '"' | '`') {
+            quote = Some(ch);
+        } else if ch == needle {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Decode each component of a qualified identifier independently, preserving
+/// dots that belong inside a quoted component.
+pub(crate) fn decode_qualified_identifier(identifier: &str) -> String {
+    let mut components = Vec::new();
+    let mut remaining = identifier;
+    while let Some(dot) = find_unquoted_char(remaining, '.') {
+        components.push(decode_identifier(&remaining[..dot]).into_owned());
+        remaining = &remaining[dot + 1..];
+    }
+    components.push(decode_identifier(remaining).into_owned());
+    components.join(".")
+}
+
 /// Tokenize SQL for lightweight authority discovery without splitting quoted
 /// identifiers or string literals. Commas and whitespace delimit tokens only
 /// outside quotes; line and nested block comments are discarded.
@@ -563,8 +599,18 @@ mod tests {
             "VECTOR_SEARCH",
             &mut targets,
         );
+        collect_quoted_first_args(
+            "SELECT * FROM TRACES /* outer /* nested */ comment */ ( /* arg */ 'commented')",
+            "TRACES",
+            &mut targets,
+        );
+        collect_quoted_first_args(
+            "SELECT * FROM TRACES -- call trivia\n ( -- arg trivia\n 'line-commented')",
+            "TRACES",
+            &mut targets,
+        );
 
-        assert_eq!(targets, ["right"]);
+        assert_eq!(targets, ["right", "commented", "line-commented"]);
     }
 
     #[test]
@@ -626,12 +672,15 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
         // Keep searching after every rejected occurrence. SQL identifiers may
         // contain ASCII letters, digits, underscores, and dollar signs, so a
         // match within NOT_VECTOR_SEARCH or VECTOR_SEARCH_V2 is not this
-        // function. Likewise, only whitespace may separate the name and `(`;
+        // function. Likewise, only SQL trivia may separate the name and `(`;
         // scanning forward to an unrelated call misattributes its first arg.
         search_start = after_name;
         // The ONE shared byte class — a divergent char-class here
         // tokenized '·LOGS' differently from the keyword scanners.
-        let is_identifier_char = |ch: char| !ch.is_ascii() || is_identifier_byte(ch as u8);
+        let is_identifier_char = |ch: char| {
+            (!ch.is_ascii() && !ch.is_whitespace())
+                || (ch.is_ascii() && is_identifier_byte(ch as u8))
+        };
         if sql[..name_start]
             .chars()
             .next_back()
@@ -644,24 +693,16 @@ pub(crate) fn collect_quoted_first_args(sql: &str, function_name: &str, targets:
             continue;
         }
 
-        let mut open = after_name;
-        while let Some(ch) = sql[open..].chars().next() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            open += ch.len_utf8();
-        }
+        let after_name_slice = &sql[after_name..];
+        let after_name_trivia = skip_leading_ws_and_comments(after_name_slice);
+        let open = after_name + (after_name_slice.len() - after_name_trivia.len());
         if sql.as_bytes().get(open) != Some(&b'(') {
             continue;
         }
 
-        let mut arg_start = open + 1;
-        while let Some(ch) = sql[arg_start..].chars().next() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            arg_start += ch.len_utf8();
-        }
+        let after_open = &sql[open + 1..];
+        let after_arg_trivia = skip_leading_ws_and_comments(after_open);
+        let arg_start = open + 1 + (after_open.len() - after_arg_trivia.len());
         // Quoted first args may contain delimiter characters. Match the
         // fusion parser's SQL quote-doubling rules before considering the
         // simpler unquoted form.

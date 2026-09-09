@@ -2011,6 +2011,16 @@ pinned + narrated:**
   unfiltered). The InvalidQueryInput 400 arm hand-rolls the envelope
   (RestError::InvalidArgument carries type/code/request_id).
 
+**Consolidation review round 53 (2026-09-08, follow-up PR #1852):**
+- EXPLAIN authority discovery decodes qualified quoted identifiers one
+  component at a time and finds INSERT column-list parentheses only outside
+  identifier quotes, so `"schema"."table"` and `"events(2026)"(id)` resolve
+  the same target names as execution.
+- Extension-function discovery accepts nested block comments, line comments,
+  and Unicode whitespace as SQL trivia around the opening parenthesis and
+  first argument. Quoted keyword identifiers remain data rather than becoming
+  FROM/JOIN/INTO/UPDATE syntax.
+
 == Not in scope
 
 The v2 package already has both generation (`PROXIMADB_PROTO_REGEN=1`) and the

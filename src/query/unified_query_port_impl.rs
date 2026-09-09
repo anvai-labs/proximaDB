@@ -515,7 +515,9 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
 
     for (window_index, window) in tokens.windows(2).enumerate() {
         if let [keyword, target] = window {
-            let keyword = keyword.trim_matches('"').to_ascii_uppercase();
+            // Quoted identifiers named FROM/JOIN/INTO/UPDATE are data, not
+            // clause keywords. The tokenizer preserves their delimiters.
+            let keyword = keyword.to_ascii_uppercase();
             if matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
                 && !target.starts_with('$')
             {
@@ -523,21 +525,17 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 // 'orders)' must keep its target (the paren-normalization
                 // era captured it).
                 let target = target.trim_end_matches([';', ')']);
-                let target_is_quoted =
-                    crate::core::utils::decode_identifier(target).as_ref() != target;
-                let target = if matches!(keyword.as_str(), "INTO" | "UPDATE") && !target_is_quoted {
-                    target
-                        .split_once('(')
-                        .map(|(name, _)| name)
-                        .unwrap_or(target)
-                } else if !target_is_quoted && target.contains('(') {
+                let unquoted_paren = crate::core::utils::find_unquoted_char(target, '(');
+                let target = if matches!(keyword.as_str(), "INTO" | "UPDATE") {
+                    unquoted_paren.map(|at| &target[..at]).unwrap_or(target)
+                } else if unquoted_paren.is_some() {
                     continue;
                 } else {
                     target
                 };
                 // decode alone (a pre-trim re-introduces the overtrim the
                 // shared decoder exists to avoid).
-                let target = crate::core::utils::decode_identifier(target);
+                let target = crate::core::utils::decode_qualified_identifier(target);
                 // Call-position gate, FROM/JOIN only: skip when a QUOTED
                 // first argument follows (adjacent OR in the next token —
                 // TRACES('ops'), TRACES ('ops'), TRACES ( 'ops' )). INSERT
@@ -561,7 +559,7 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                         })
                     });
                 if !target.is_empty() && !next_opens_call {
-                    targets.push(target.to_string());
+                    targets.push(target);
                 }
             }
         }
@@ -1206,9 +1204,13 @@ mod tests {
         }
 
         let targets = explain_catalog_targets(
-            r#"INSERT INTO orders(id) VALUES (1); SELECT 1 FROM (SELECT * FROM "archive")"#,
+            r#"INSERT INTO orders(id) VALUES (1); INSERT INTO "events(2026)"(id) VALUES (1); SELECT 1 FROM (SELECT * FROM "archive")"#,
         );
         assert!(targets.iter().any(|t| t == "orders"), "got {targets:?}");
+        assert!(
+            targets.iter().any(|t| t == "events(2026)"),
+            "got {targets:?}"
+        );
         assert!(targets.iter().any(|t| t == "archive"), "got {targets:?}");
     }
 
@@ -1382,7 +1384,7 @@ mod tests {
         assert!(targets.contains(&"vectors".to_string()));
 
         let quoted = explain_catalog_targets(
-            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data"; SELECT * FROM "events(2026)""#,
+            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data"; SELECT * FROM "events(2026)"; SELECT * FROM "schema"."table""#,
         );
         assert!(quoted.contains(&"team\"logs".to_string()), "got {quoted:?}");
         assert!(
@@ -1397,6 +1399,13 @@ mod tests {
             quoted.contains(&"events(2026)".to_string()),
             "got {quoted:?}"
         );
+        assert!(
+            quoted.contains(&"schema.table".to_string()),
+            "got {quoted:?}"
+        );
+
+        let quoted_keyword = explain_catalog_targets(r#"SELECT 1 AS "FROM" FROM actual"#);
+        assert_eq!(quoted_keyword, ["actual"]);
     }
 
     #[test]
