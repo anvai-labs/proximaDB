@@ -2021,10 +2021,14 @@ pinned + narrated:**
   first argument. Quoted keyword identifiers remain data rather than becoming
   FROM/JOIN/INTO/UPDATE syntax; reserved-word filtering runs only on unquoted
   SQL target tokens, never decoded quoted table names or function arguments.
-- REST and port now share one clause-target scanner. Its tokenizer recognizes
-  punctuation and opening quotes as SQL boundaries, preserving authority for
-  valid compact forms such as `SELECT*FROM "orders"` and
-  `INSERT INTO"orders"(id)` without minting table-function names.
+- REST and port now share one AST relation visitor rather than duplicating an
+  approximate clause lexer. The pinned SQL parser handles compact syntax,
+  comma source lists, qualified-name trivia, subqueries, and write targets;
+  expression-level FROM/UPDATE tokens cannot mint unrelated authorities.
+  Table-valued function names and CTE aliases are excluded while their real
+  underlying relations and quoted first-argument authorities remain visible.
+  Both surfaces sort/dedup once after collection (O(n log n)), avoiding the
+  former per-insert linear scan and its O(n^2) adversarial EXPLAIN cost.
 
 == Not in scope
 

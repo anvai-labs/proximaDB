@@ -995,6 +995,7 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     }
 
     crate::core::utils::collect_sql_catalog_targets(sql, &mut targets);
+    targets.sort();
     targets.dedup();
     targets
 }

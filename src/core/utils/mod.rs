@@ -196,171 +196,114 @@ pub fn decode_identifier(ident: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(ident)
 }
 
-/// Find punctuation outside double-quoted/backtick identifier segments.
-/// Doubled delimiters remain inside their segment.
-pub(crate) fn find_unquoted_char(input: &str, needle: char) -> Option<usize> {
-    let mut quote = None;
-    let mut chars = input.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
-        if let Some(delimiter) = quote {
-            if ch == delimiter {
-                if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
-                    chars.next();
-                } else {
-                    quote = None;
-                }
-            }
-        } else if matches!(ch, '"' | '`') {
-            quote = Some(ch);
-        } else if ch == needle {
-            return Some(index);
-        }
-    }
-    None
-}
+/// Discover catalog-backed relations through the pinned SQL parser's AST.
+/// This is deliberately shared by REST and the unified-query port so EXPLAIN
+/// reports the same storage authority on both surfaces. Invalid SQL yields no
+/// relational metadata; callers still collect supported extension-function
+/// targets separately.
+pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::{
+        Ident, ObjectName, Query, Statement, TableFactor, TableObject, Visit, Visitor,
+    };
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
 
-/// Decode each component of a qualified identifier independently, preserving
-/// dots that belong inside a quoted component.
-pub(crate) fn decode_qualified_identifier(identifier: &str) -> String {
-    let mut components = Vec::new();
-    let mut remaining = identifier;
-    while let Some(dot) = find_unquoted_char(remaining, '.') {
-        components.push(decode_identifier(&remaining[..dot]).into_owned());
-        remaining = &remaining[dot + 1..];
-    }
-    components.push(decode_identifier(remaining).into_owned());
-    components.join(".")
-}
-
-/// Tokenize SQL for lightweight authority discovery without splitting quoted
-/// identifiers or string literals. SQL punctuation and whitespace delimit
-/// tokens only outside quotes; line and nested block comments are discarded.
-pub(crate) fn tokenize_sql_preserving_quotes(sql: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut token = String::new();
-    let mut chars = sql.chars().peekable();
-    let mut quote = None;
-
-    let flush = |token: &mut String, tokens: &mut Vec<String>| {
-        if !token.is_empty() {
-            tokens.push(std::mem::take(token));
-        }
+    let Ok(statements) = Parser::parse_sql(&GenericDialect, sql) else {
+        return;
     };
 
-    while let Some(ch) = chars.next() {
-        if let Some(delimiter) = quote {
-            token.push(ch);
-            if ch == delimiter {
-                if chars.peek() == Some(&delimiter) {
-                    token.push(delimiter);
-                    chars.next();
-                } else {
-                    quote = None;
-                }
-            }
-            continue;
-        }
+    struct RelationCollector<'a> {
+        targets: &'a mut Vec<String>,
+        cte_scopes: Vec<Vec<Ident>>,
+    }
 
-        if matches!(ch, '\'' | '"' | '`') {
-            // A quote may begin immediately after a clause keyword
-            // (`INTO"orders"`). Keep it attached only when it continues a
-            // qualified identifier (`schema."orders"`).
-            if !token.is_empty() && !token.ends_with('.') {
-                flush(&mut token, &mut tokens);
-            }
-            quote = Some(ch);
-            token.push(ch);
-        } else if ch == '-' && chars.peek() == Some(&'-') {
-            flush(&mut token, &mut tokens);
-            chars.next();
-            for comment_ch in chars.by_ref() {
-                if comment_ch == '\n' {
-                    break;
-                }
-            }
-        } else if ch == '/' && chars.peek() == Some(&'*') {
-            flush(&mut token, &mut tokens);
-            chars.next();
-            let mut depth = 1usize;
-            while let Some(comment_ch) = chars.next() {
-                if comment_ch == '/' && chars.peek() == Some(&'*') {
-                    chars.next();
-                    depth += 1;
-                } else if comment_ch == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
+    impl RelationCollector<'_> {
+        fn is_cte_reference(&self, relation: &ObjectName) -> bool {
+            let [part] = relation.0.as_slice() else {
+                return false;
+            };
+            let Some(ident) = part.as_ident() else {
+                return false;
+            };
+            self.cte_scopes.iter().rev().flatten().any(|alias| {
+                match (alias.quote_style, ident.quote_style) {
+                    (None, None) => alias.value.eq_ignore_ascii_case(&ident.value),
+                    (alias_quote, ident_quote) => {
+                        alias_quote == ident_quote && alias.value == ident.value
                     }
                 }
-            }
-        } else if ch.is_whitespace() || matches!(ch, ',' | ';' | '*') {
-            flush(&mut token, &mut tokens);
-        } else if matches!(ch, '(' | ')' | '[' | ']' | '{' | '}') {
-            flush(&mut token, &mut tokens);
-            tokens.push(ch.to_string());
-        } else {
-            token.push(ch);
+            })
         }
-    }
-    flush(&mut token, &mut tokens);
-    tokens
-}
 
-/// Discover catalog-backed SQL targets after FROM/JOIN/INTO/UPDATE. This is
-/// deliberately shared by REST and the unified-query port so EXPLAIN reports
-/// the same storage authority on both surfaces.
-pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) {
-    let tokens = tokenize_sql_preserving_quotes(sql);
-    let mut target_keyword = None;
-
-    for (index, token) in tokens.iter().enumerate() {
-        if let Some(keyword) = target_keyword.take() {
-            let candidate = token.trim_end_matches([';', ')']);
-            let unquoted_paren = find_unquoted_char(candidate, '(');
-            let candidate = if matches!(keyword, "INTO" | "UPDATE") {
-                unquoted_paren
-                    .map(|at| &candidate[..at])
-                    .unwrap_or(candidate)
-            } else if unquoted_paren.is_some() {
-                continue;
-            } else {
-                candidate
-            };
-            let candidate = candidate.trim_matches(|ch: char| matches!(ch, ',' | '[' | ']'));
-            let candidate_is_quoted = candidate.starts_with(['"', '`']);
-            let candidate = decode_qualified_identifier(candidate);
-            let is_unquoted_syntax = !candidate_is_quoted
-                && matches!(
-                    candidate.to_ascii_uppercase().as_str(),
-                    "SELECT" | "WHERE" | "ON" | "AS" | "LATERAL" | "UNNEST"
-                );
-            let next_opens_call = matches!(keyword, "FROM" | "JOIN")
-                && tokens.get(index + 1).is_some_and(|next| next == "(");
-
-            if !candidate.is_empty()
-                && !is_bind_placeholder(&candidate)
-                && !is_unquoted_syntax
-                && !next_opens_call
-                && !targets.iter().any(|existing| existing == &candidate)
+        fn push_relation(&mut self, relation: &ObjectName) {
+            if self.is_cte_reference(relation) {
+                return;
+            }
+            let components = relation
+                .0
+                .iter()
+                .map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+                .collect::<Option<Vec<_>>>();
+            if let Some(components) = components
+                && !components.is_empty()
             {
-                targets.push(candidate);
+                self.targets.push(components.join("."));
             }
-            continue;
+        }
+    }
+
+    impl Visitor for RelationCollector<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            let aliases = query
+                .with
+                .as_ref()
+                .map(|with| {
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| cte.alias.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.cte_scopes.push(aliases);
+            ControlFlow::Continue(())
         }
 
-        target_keyword = if token.eq_ignore_ascii_case("FROM") {
-            Some("FROM")
-        } else if token.eq_ignore_ascii_case("JOIN") {
-            Some("JOIN")
-        } else if token.eq_ignore_ascii_case("INTO") {
-            Some("INTO")
-        } else if token.eq_ignore_ascii_case("UPDATE") {
-            Some("UPDATE")
-        } else {
-            None
-        };
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            self.cte_scopes.pop();
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            if let TableFactor::Table {
+                name, args: None, ..
+            } = table_factor
+            {
+                self.push_relation(name);
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+            if let Statement::Insert(insert) = statement
+                && let TableObject::TableName(name) = &insert.table
+            {
+                self.push_relation(name);
+            }
+            ControlFlow::Continue(())
+        }
     }
+
+    let mut collector = RelationCollector {
+        targets,
+        cte_scopes: Vec::new(),
+    };
+    let _ = statements.visit(&mut collector);
 }
 
 /// Case-insensitive `IF NOT EXISTS` prefix strip with a word boundary
@@ -627,34 +570,44 @@ mod tests {
 
     use super::{
         collect_quoted_first_args, collect_sql_catalog_targets, finite_f32,
-        inject_graph_target_into_cypher, tokenize_sql_preserving_quotes,
+        inject_graph_target_into_cypher,
     };
 
     #[test]
-    fn sql_target_scanner_handles_punctuation_and_quote_adjacency() {
-        assert_eq!(
-            tokenize_sql_preserving_quotes(
-                r#"SELECT*FROM "schema"."orders"; INSERT INTO"events(2026)"(id)"#
-            ),
-            [
-                "SELECT",
-                "FROM",
-                r#""schema"."orders""#,
-                "INSERT",
-                "INTO",
-                r#""events(2026)""#,
-                "(",
-                "id",
-                ")"
-            ]
-        );
-
+    fn sql_target_scanner_uses_ast_relation_context() {
         let mut targets = Vec::new();
         collect_sql_catalog_targets(
-            r#"SELECT*FROM "schema"."orders"; INSERT INTO"events(2026)"(id) VALUES (1)"#,
+            r#"SELECT*FROM "schema"."orders", extra;
+               INSERT INTO"events(2026)"(id) VALUES (1) ON CONFLICT DO UPDATE SET id = 2;
+               SELECT EXTRACT(YEAR FROM created_at) FROM "left"JOIN "right" ON true;
+               SELECT * FROM "tenant" . "spaced";
+               SELECT * FROM "commented"/*c*/."table";
+               SELECT * FROM orders FOR UPDATE;
+               SELECT * FROM TRACES('ops');
+               SELECT * FROM "TRACES";
+               WITH scoped AS (SELECT * FROM base) SELECT * FROM scoped"#,
             &mut targets,
         );
-        assert_eq!(targets, ["schema.orders", "events(2026)"]);
+        targets.sort();
+        targets.dedup();
+        assert_eq!(
+            targets,
+            [
+                "TRACES",
+                "base",
+                "commented.table",
+                "events(2026)",
+                "extra",
+                "left",
+                "orders",
+                "right",
+                "schema.orders",
+                "tenant.spaced",
+            ]
+        );
+        assert!(!targets.contains(&"created_at".to_string()));
+        assert!(!targets.contains(&"id".to_string()));
+        assert!(!targets.contains(&"scoped".to_string()));
     }
 
     #[test]

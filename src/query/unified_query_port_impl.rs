@@ -517,6 +517,8 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
         crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
     }
 
+    targets.sort();
+    targets.dedup();
     targets
 }
 
