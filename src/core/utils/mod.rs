@@ -233,8 +233,8 @@ pub(crate) fn decode_qualified_identifier(identifier: &str) -> String {
 }
 
 /// Tokenize SQL for lightweight authority discovery without splitting quoted
-/// identifiers or string literals. Commas and whitespace delimit tokens only
-/// outside quotes; line and nested block comments are discarded.
+/// identifiers or string literals. SQL punctuation and whitespace delimit
+/// tokens only outside quotes; line and nested block comments are discarded.
 pub(crate) fn tokenize_sql_preserving_quotes(sql: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut token = String::new();
@@ -262,6 +262,12 @@ pub(crate) fn tokenize_sql_preserving_quotes(sql: &str) -> Vec<String> {
         }
 
         if matches!(ch, '\'' | '"' | '`') {
+            // A quote may begin immediately after a clause keyword
+            // (`INTO"orders"`). Keep it attached only when it continues a
+            // qualified identifier (`schema."orders"`).
+            if !token.is_empty() && !token.ends_with('.') {
+                flush(&mut token, &mut tokens);
+            }
             quote = Some(ch);
             token.push(ch);
         } else if ch == '-' && chars.peek() == Some(&'-') {
@@ -288,14 +294,73 @@ pub(crate) fn tokenize_sql_preserving_quotes(sql: &str) -> Vec<String> {
                     }
                 }
             }
-        } else if ch.is_whitespace() || ch == ',' {
+        } else if ch.is_whitespace() || matches!(ch, ',' | ';' | '*') {
             flush(&mut token, &mut tokens);
+        } else if matches!(ch, '(' | ')' | '[' | ']' | '{' | '}') {
+            flush(&mut token, &mut tokens);
+            tokens.push(ch.to_string());
         } else {
             token.push(ch);
         }
     }
     flush(&mut token, &mut tokens);
     tokens
+}
+
+/// Discover catalog-backed SQL targets after FROM/JOIN/INTO/UPDATE. This is
+/// deliberately shared by REST and the unified-query port so EXPLAIN reports
+/// the same storage authority on both surfaces.
+pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) {
+    let tokens = tokenize_sql_preserving_quotes(sql);
+    let mut target_keyword = None;
+
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(keyword) = target_keyword.take() {
+            let candidate = token.trim_end_matches([';', ')']);
+            let unquoted_paren = find_unquoted_char(candidate, '(');
+            let candidate = if matches!(keyword, "INTO" | "UPDATE") {
+                unquoted_paren
+                    .map(|at| &candidate[..at])
+                    .unwrap_or(candidate)
+            } else if unquoted_paren.is_some() {
+                continue;
+            } else {
+                candidate
+            };
+            let candidate = candidate.trim_matches(|ch: char| matches!(ch, ',' | '[' | ']'));
+            let candidate_is_quoted = candidate.starts_with(['"', '`']);
+            let candidate = decode_qualified_identifier(candidate);
+            let is_unquoted_syntax = !candidate_is_quoted
+                && matches!(
+                    candidate.to_ascii_uppercase().as_str(),
+                    "SELECT" | "WHERE" | "ON" | "AS" | "LATERAL" | "UNNEST"
+                );
+            let next_opens_call = matches!(keyword, "FROM" | "JOIN")
+                && tokens.get(index + 1).is_some_and(|next| next == "(");
+
+            if !candidate.is_empty()
+                && !is_bind_placeholder(&candidate)
+                && !is_unquoted_syntax
+                && !next_opens_call
+                && !targets.iter().any(|existing| existing == &candidate)
+            {
+                targets.push(candidate);
+            }
+            continue;
+        }
+
+        target_keyword = if token.eq_ignore_ascii_case("FROM") {
+            Some("FROM")
+        } else if token.eq_ignore_ascii_case("JOIN") {
+            Some("JOIN")
+        } else if token.eq_ignore_ascii_case("INTO") {
+            Some("INTO")
+        } else if token.eq_ignore_ascii_case("UPDATE") {
+            Some("UPDATE")
+        } else {
+            None
+        };
+    }
 }
 
 /// Case-insensitive `IF NOT EXISTS` prefix strip with a word boundary
@@ -560,7 +625,37 @@ mod tests {
         );
     }
 
-    use super::{collect_quoted_first_args, finite_f32, inject_graph_target_into_cypher};
+    use super::{
+        collect_quoted_first_args, collect_sql_catalog_targets, finite_f32,
+        inject_graph_target_into_cypher, tokenize_sql_preserving_quotes,
+    };
+
+    #[test]
+    fn sql_target_scanner_handles_punctuation_and_quote_adjacency() {
+        assert_eq!(
+            tokenize_sql_preserving_quotes(
+                r#"SELECT*FROM "schema"."orders"; INSERT INTO"events(2026)"(id)"#
+            ),
+            [
+                "SELECT",
+                "FROM",
+                r#""schema"."orders""#,
+                "INSERT",
+                "INTO",
+                r#""events(2026)""#,
+                "(",
+                "id",
+                ")"
+            ]
+        );
+
+        let mut targets = Vec::new();
+        collect_sql_catalog_targets(
+            r#"SELECT*FROM "schema"."orders"; INSERT INTO"events(2026)"(id) VALUES (1)"#,
+            &mut targets,
+        );
+        assert_eq!(targets, ["schema.orders", "events(2026)"]);
+    }
 
     #[test]
     fn finite_f32_rejects_non_finite_and_overflowed_values() {

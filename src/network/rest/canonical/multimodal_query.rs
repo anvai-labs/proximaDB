@@ -994,59 +994,9 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
         crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
     }
 
-    collect_from_targets(sql, &mut targets);
+    crate::core::utils::collect_sql_catalog_targets(sql, &mut targets);
     targets.dedup();
     targets
-}
-
-fn collect_from_targets(sql: &str, targets: &mut Vec<String>) {
-    let mut target_keyword = None;
-    let tokens = crate::core::utils::tokenize_sql_preserving_quotes(sql);
-    for (index, token) in tokens.iter().enumerate() {
-        if let Some(keyword) = target_keyword.take() {
-            let candidate = token.trim_end_matches([';', ')']);
-            let unquoted_paren = crate::core::utils::find_unquoted_char(candidate, '(');
-            let candidate = if matches!(keyword, "INTO" | "UPDATE") {
-                unquoted_paren
-                    .map(|at| &candidate[..at])
-                    .unwrap_or(candidate)
-            } else if unquoted_paren.is_some() {
-                continue;
-            } else {
-                candidate
-            };
-            let candidate = candidate.trim_matches(|ch: char| matches!(ch, ',' | '[' | ']'));
-            let candidate = crate::core::utils::decode_qualified_identifier(candidate);
-            if !candidate.is_empty()
-                && (!matches!(keyword, "FROM" | "JOIN")
-                    || !tokens
-                        .get(index + 1)
-                        .is_some_and(|next| next.starts_with('(')))
-                && !candidate.eq_ignore_ascii_case("SELECT")
-            {
-                push_unique_target(targets, &candidate);
-            }
-            continue;
-        }
-
-        target_keyword = if token.eq_ignore_ascii_case("FROM") {
-            Some("FROM")
-        } else if token.eq_ignore_ascii_case("JOIN") {
-            Some("JOIN")
-        } else if token.eq_ignore_ascii_case("INTO") {
-            Some("INTO")
-        } else if token.eq_ignore_ascii_case("UPDATE") {
-            Some("UPDATE")
-        } else {
-            None
-        };
-    }
-}
-
-fn push_unique_target(targets: &mut Vec<String>, value: &str) {
-    if !targets.iter().any(|existing| existing == value) {
-        targets.push(value.to_string());
-    }
 }
 
 /// Parse fusion strategy from string
@@ -2598,6 +2548,9 @@ mod tests {
             quoted.contains(&"schema.table".to_string()),
             "got {quoted:?}"
         );
+        assert!(
+            explain_catalog_targets(r#"SELECT * FROM "SELECT""#).contains(&"SELECT".to_string())
+        );
 
         let writes_and_join = explain_catalog_targets(
             "INSERT INTO orders(id) VALUES (1); INSERT INTO \"events(2026)\"(id) VALUES (1); \
@@ -2608,6 +2561,16 @@ mod tests {
             assert!(
                 writes_and_join.contains(&expected.to_string()),
                 "missing {expected}: {writes_and_join:?}"
+            );
+        }
+
+        let adjacent = explain_catalog_targets(
+            r#"SELECT*FROM "orders"; INSERT INTO"events(2026)"(id) VALUES (1)"#,
+        );
+        for expected in ["orders", "events(2026)"] {
+            assert!(
+                adjacent.contains(&expected.to_string()),
+                "missing {expected}: {adjacent:?}"
             );
         }
     }

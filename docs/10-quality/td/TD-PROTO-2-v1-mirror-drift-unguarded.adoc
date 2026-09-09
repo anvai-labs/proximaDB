@@ -2019,7 +2019,12 @@ pinned + narrated:**
 - Extension-function discovery accepts nested block comments, line comments,
   and Unicode whitespace as SQL trivia around the opening parenthesis and
   first argument. Quoted keyword identifiers remain data rather than becoming
-  FROM/JOIN/INTO/UPDATE syntax.
+  FROM/JOIN/INTO/UPDATE syntax; reserved-word filtering runs only on unquoted
+  SQL target tokens, never decoded quoted table names or function arguments.
+- REST and port now share one clause-target scanner. Its tokenizer recognizes
+  punctuation and opening quotes as SQL boundaries, preserving authority for
+  valid compact forms such as `SELECT*FROM "orders"` and
+  `INSERT INTO"orders"(id)` without minting table-function names.
 
 == Not in scope
 
