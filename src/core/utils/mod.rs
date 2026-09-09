@@ -225,7 +225,10 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
         sql: &str,
         dialect: &GenericDialect,
     ) -> Option<(String, usize)> {
-        let tokens = Tokenizer::new(dialect, sql).tokenize().ok()?;
+        let tokens = Tokenizer::new(dialect, sql)
+            .with_unescape(false)
+            .tokenize()
+            .ok()?;
         let significant = tokens
             .iter()
             .enumerate()
@@ -233,8 +236,23 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let mut rewrite = std::collections::HashSet::new();
+        let mut statement_has_insert = false;
+        let mut statement_has_into = false;
 
         for (position, token_index) in significant.iter().copied().enumerate() {
+            match &tokens[token_index] {
+                Token::SemiColon => {
+                    statement_has_insert = false;
+                    statement_has_into = false;
+                }
+                Token::Word(word) if word.keyword == Keyword::INSERT => {
+                    statement_has_insert = true;
+                }
+                Token::Word(word) if word.keyword == Keyword::INTO && statement_has_insert => {
+                    statement_has_into = true;
+                }
+                _ => {}
+            }
             let Token::Word(word) = &tokens[token_index] else {
                 continue;
             };
@@ -267,22 +285,67 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                                     )
                             )
                         });
-            let statement_start = significant[..position]
-                .iter()
-                .rposition(|index| matches!(tokens[*index], Token::SemiColon))
-                .map_or(0, |index| index + 1);
-            let insert_query_body =
-                significant[statement_start..position].iter().any(|index| {
-                    matches!(
-                        &tokens[*index],
-                        Token::Word(word) if word.keyword == Keyword::INSERT
-                    )
-                }) && significant[statement_start..position].iter().any(|index| {
-                    matches!(
-                        &tokens[*index],
-                        Token::Word(word) if word.keyword == Keyword::INTO
-                    )
-                });
+            let after_by_name = previous_keyword == Some(Keyword::NAME)
+                && position
+                    .checked_sub(2)
+                    .and_then(|index| significant.get(index))
+                    .is_some_and(|index| {
+                        matches!(
+                            &tokens[*index],
+                            Token::Word(word) if word.keyword == Keyword::BY
+                        )
+                    })
+                && position
+                    .checked_sub(3)
+                    .and_then(|index| significant.get(index))
+                    .is_some_and(|index| {
+                        matches!(
+                            &tokens[*index],
+                            Token::Word(word)
+                                if matches!(
+                                    word.keyword,
+                                    Keyword::UNION
+                                        | Keyword::INTERSECT
+                                        | Keyword::EXCEPT
+                                        | Keyword::MINUS
+                                        | Keyword::ALL
+                                        | Keyword::DISTINCT
+                                )
+                        )
+                    })
+                && (position
+                    .checked_sub(3)
+                    .and_then(|index| significant.get(index))
+                    .is_some_and(|index| {
+                        matches!(
+                            &tokens[*index],
+                            Token::Word(word)
+                                if matches!(
+                                    word.keyword,
+                                    Keyword::UNION
+                                        | Keyword::INTERSECT
+                                        | Keyword::EXCEPT
+                                        | Keyword::MINUS
+                                )
+                        )
+                    })
+                    || position
+                        .checked_sub(4)
+                        .and_then(|index| significant.get(index))
+                        .is_some_and(|index| {
+                            matches!(
+                                &tokens[*index],
+                                Token::Word(word)
+                                    if matches!(
+                                        word.keyword,
+                                        Keyword::UNION
+                                            | Keyword::INTERSECT
+                                            | Keyword::EXCEPT
+                                            | Keyword::MINUS
+                                    )
+                            )
+                        }));
+            let insert_query_body = statement_has_insert && statement_has_into;
             let query_body_position = previous.is_none()
                 || matches!(
                     previous,
@@ -299,6 +362,7 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                     )
                 )
                 || after_quantifier
+                || after_by_name
                 || insert_query_body;
             if !query_body_position {
                 continue;
@@ -334,7 +398,7 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             let valid_boundary = boundary.is_none()
                 || matches!(
                     boundary,
-                    Some(Token::SemiColon | Token::RParen | Token::Pipe)
+                    Some(Token::SemiColon | Token::RParen | Token::VerticalBarRightAngleBracket)
                 )
                 || matches!(
                     boundary,
@@ -351,6 +415,8 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                                 | Keyword::FETCH
                                 | Keyword::FOR
                                 | Keyword::FORMAT
+                                | Keyword::ON
+                                | Keyword::RETURNING
                                 | Keyword::SETTINGS
                         )
                 );
@@ -980,6 +1046,8 @@ mod tests {
             r#"WITH É AS (SELECT * FROM unicode_seed) SELECT * FROM "é""#,
             "WITH write_target AS (SELECT * FROM write_seed) INSERT INTO write_target VALUES (1)",
             "INSERT INTO insertion_sink TABLE insertion_source",
+            "INSERT INTO returning_sink TABLE returning_source RETURNING id",
+            "INSERT INTO conflict_sink TABLE conflict_source ON CONFLICT DO NOTHING",
             "TABLE shorthand",
             "TABLE public.qualified_shorthand",
             "TABLE terminated;",
@@ -987,6 +1055,12 @@ mod tests {
             r#"WITH caps_table AS (SELECT * FROM caps_table_seed) TABLE "CapsTable""#,
             r#"WITH "QuotedTable" AS (SELECT * FROM quoted_table_seed) TABLE "QuotedTable""#,
             r#"SELECT * FROM union_base UNION ALL TABLE "UnionTable""#,
+            "SELECT 'O''Brien' FROM literal_base UNION ALL TABLE literal_other",
+            r#"SELECT * FROM "a""b" UNION ALL TABLE identifier_other"#,
+            "TABLE pipe_source |> CALL TRACES('pipe_table')",
+            "SELECT * FROM by_base UNION BY NAME TABLE by_source",
+            "SELECT * FROM by_all_base UNION ALL BY NAME TABLE by_all_source",
+            "SELECT * FROM by_distinct_base UNION DISTINCT BY NAME TABLE by_distinct_source",
             "SELECT $$ harmless TRACES('secret') $$ AS note FROM actual",
             "CALL TRACES('called')",
             r#"CALL "TRACES"('quoted_call')"#,
@@ -1003,25 +1077,41 @@ mod tests {
                 "CaseTable",
                 "TRACES",
                 "UnionTable",
+                "a\"b",
                 "actual",
                 "base",
+                "by_all_base",
+                "by_all_source",
+                "by_base",
+                "by_distinct_base",
+                "by_distinct_source",
+                "by_source",
                 "called",
                 "caps",
                 "caps_base",
                 "caps_table_seed",
                 "commented.table",
+                "conflict_sink",
+                "conflict_source",
                 "events(2026)",
                 "extra",
+                "identifier_other",
                 "insertion_sink",
                 "insertion_source",
                 "later",
                 "left",
+                "literal_base",
+                "literal_other",
                 "ops",
                 "orders",
+                "pipe_source",
+                "pipe_table",
                 "plain_base",
                 "public.qualified_shorthand",
                 "quoted_base",
                 "quoted_table_seed",
+                "returning_sink",
+                "returning_source",
                 "right",
                 "schema.orders",
                 "seed",
@@ -1086,6 +1176,23 @@ mod tests {
         assert!(targets.contains(&"base0".to_string()));
         assert!(targets.contains(&"base511".to_string()));
         assert!(!targets.contains(&"c511".to_string()));
+    }
+
+    #[test]
+    fn table_authority_normalization_handles_large_set_chain() {
+        const TABLE_COUNT: usize = 256;
+        let sql = (0..TABLE_COUNT)
+            .map(|index| format!("TABLE table{index}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let mut targets = Vec::new();
+        collect_sql_catalog_targets(&sql, &mut targets);
+        targets.sort();
+        targets.dedup();
+
+        assert_eq!(targets.len(), TABLE_COUNT);
+        assert!(targets.contains(&"table0".to_string()));
+        assert!(targets.contains(&"table255".to_string()));
     }
 
     #[test]
