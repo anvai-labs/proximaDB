@@ -542,7 +542,11 @@ impl RestServer {
         // TD-MLOPS-1 slice 2: MLflow-compatible tracking wire, default OFF.
         if super::mlflow::enabled() {
             let mlflow_state = super::mlflow::MlflowState::new(
-                state.document_service.clone(),
+                std::sync::Arc::new(
+                    crate::services::mlflow_run_store::SubstrateRunStoreFactory::new(
+                        state.document_service.clone(),
+                    ),
+                ),
                 state.model_registry_service.clone(),
                 state.data_dir.clone(),
             );
@@ -936,7 +940,11 @@ impl RestServer {
         // TD-MLOPS-1 slice 2: MLflow-compatible tracking wire, default OFF.
         if super::mlflow::enabled() {
             let mlflow_state = super::mlflow::MlflowState::new(
-                state.document_service.clone(),
+                std::sync::Arc::new(
+                    crate::services::mlflow_run_store::SubstrateRunStoreFactory::new(
+                        state.document_service.clone(),
+                    ),
+                ),
                 state.model_registry_service.clone(),
                 state.data_dir.clone(),
             );

@@ -28,26 +28,23 @@ use proximadb_catalog::run_store::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::services::mlflow_run_store::SubstrateRunStore;
-use crate::storage::document::DocumentService;
-
 /// Minimal state: the tracking wire touches nothing but the document
 /// substrate. Built once at mount time from the canonical `AppState`.
 #[derive(Clone)]
 pub struct MlflowState {
-    document: Arc<DocumentService>,
+    run_store: std::sync::Arc<dyn proximadb_catalog::run_store::RunStoreFactory>,
     registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
     pub(crate) data_dir: std::path::PathBuf,
 }
 
 impl MlflowState {
     pub fn new(
-        document: Arc<DocumentService>,
+        run_store: std::sync::Arc<dyn proximadb_catalog::run_store::RunStoreFactory>,
         registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
         data_dir: std::path::PathBuf,
     ) -> Self {
         Self {
-            document,
+            run_store,
             registry,
             data_dir,
         }
@@ -147,12 +144,14 @@ where
     }
 }
 
-fn store_for(tenant: &TenantContext, state: &MlflowState) -> MlflowResult<SubstrateRunStore> {
-    SubstrateRunStore::for_tenant(state.document.clone(), &tenant.tenant_id).map_err(|error| {
-        MlflowError::internal(format!(
-            "failed to construct tenant-scoped tracking store: {error}"
-        ))
-    })
+fn store_for(
+    tenant: &TenantContext,
+    state: &MlflowState,
+) -> MlflowResult<std::sync::Arc<dyn RunStore>> {
+    state
+        .run_store
+        .store_for(&tenant.tenant_id)
+        .map_err(|e| MlflowError::internal(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,11 +1370,13 @@ mod tests {
     }
 
     async fn test_router(tenant: &str) -> Router {
-        let engine = Arc::new(SstEngine::new().await.unwrap());
-        let document = Arc::new(DocumentService::new(engine));
+        // DIP payoff: the wire tests run on the in-memory double — no
+        // substrate bootstrap. (The registry side still needs the real
+        // catalog service; its tests live in registry.rs.)
+        use proximadb_catalog::run_store::conformance_tests::InMemoryRunStoreFactory;
         mlflow_routes()
             .with_state(MlflowState::new(
-                document,
+                Arc::new(InMemoryRunStoreFactory::new()),
                 Arc::new(
                     proximadb_catalog::model_registry_service::CatalogModelRegistryService::new(
                         Arc::new(crate::catalog::CatalogManager::new()),

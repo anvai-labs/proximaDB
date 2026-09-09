@@ -559,9 +559,11 @@ mod tests {
             .await
             .expect("test catalog");
         let registry = Arc::new(CatalogModelRegistryService::new(manager));
+        let run_store =
+            Arc::new(crate::services::mlflow_run_store::SubstrateRunStoreFactory::new(document));
         let router = registry_routes()
             .with_state(MlflowState::new(
-                document,
+                run_store,
                 registry.clone(),
                 std::env::temp_dir(),
             ))

@@ -268,9 +268,56 @@ pub trait RunStore: Send + Sync {
     async fn dataset_inputs(&self, run_id: &str) -> Result<Vec<RunDatasetInput>, RunStoreError>;
 }
 
+/// Tenant-scoped factory over [`RunStore`] implementations — the seam the
+/// wire depends on (DIP): transports receive a factory, never a concrete
+/// store, so a second implementation (test double, alternative substrate)
+/// injects without touching handler code.
+pub trait RunStoreFactory: Send + Sync {
+    /// Returns the tenant-scoped store. The tenant id MUST already be a
+    /// validated request tenant (implementations may re-validate cheaply).
+    fn store_for(
+        &self,
+        tenant_id: &str,
+    ) -> std::result::Result<std::sync::Arc<dyn RunStore>, RunStoreError>;
+}
+
 /// Executable port semantics shared by every implementation.
 pub mod conformance_tests {
     use super::*;
+
+    /// Test double factory: one independent in-memory store per tenant —
+    /// the same structural isolation the substrate implementation provides.
+    pub struct InMemoryRunStoreFactory {
+        stores:
+            std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<InMemoryRunStore>>>,
+    }
+
+    impl Default for InMemoryRunStoreFactory {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl InMemoryRunStoreFactory {
+        pub fn new() -> Self {
+            Self {
+                stores: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl super::RunStoreFactory for InMemoryRunStoreFactory {
+        fn store_for(
+            &self,
+            tenant_id: &str,
+        ) -> std::result::Result<std::sync::Arc<dyn RunStore>, RunStoreError> {
+            let mut stores = self.stores.lock().unwrap_or_else(|p| p.into_inner());
+            Ok(stores
+                .entry(tenant_id.to_string())
+                .or_insert_with(|| std::sync::Arc::new(InMemoryRunStore::new()))
+                .clone())
+        }
+    }
 
     /// Reference in-memory implementation: executable semantics for the port.
     /// The substrate-backed store (TD-MLOPS-1 slice 1) must pass the same
