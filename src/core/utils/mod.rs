@@ -211,31 +211,78 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
     use sqlparser::dialect::GenericDialect;
     use sqlparser::keywords::Keyword;
     use sqlparser::parser::Parser;
-    use sqlparser::tokenizer::{Token, Tokenizer};
+    use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
     let dialect = GenericDialect;
-    let original = Parser::parse_sql(&dialect, sql);
+    let Ok(tokenized) = Tokenizer::new(&dialect, sql)
+        .with_unescape(false)
+        .tokenize_with_location()
+    else {
+        return;
+    };
+
+    // The derived AST visitor is recursive. Bound adversarially deep/large
+    // inputs before parsing or visiting them so catalog introspection cannot
+    // exhaust a server thread stack. The 256-way TABLE regression remains
+    // comfortably inside these limits.
+    const MAX_SQL_AUTHORITY_TOKENS: usize = 16_384;
+    const MAX_SQL_AUTHORITY_NESTING: usize = 128;
+    const MAX_SQL_AUTHORITY_SET_OPERATIONS: usize = 512;
+    let mut significant_count = 0usize;
+    let mut nesting = 0usize;
+    let mut set_operations = 0usize;
+    for entry in &tokenized {
+        if matches!(entry.token, Token::Whitespace(_)) {
+            continue;
+        }
+        significant_count += 1;
+        if significant_count > MAX_SQL_AUTHORITY_TOKENS {
+            return;
+        }
+        match entry.token {
+            Token::LParen => {
+                nesting += 1;
+                if nesting > MAX_SQL_AUTHORITY_NESTING {
+                    return;
+                }
+            }
+            Token::RParen => nesting = nesting.saturating_sub(1),
+            Token::Word(ref word)
+                if matches!(
+                    word.keyword,
+                    Keyword::UNION | Keyword::INTERSECT | Keyword::EXCEPT | Keyword::MINUS
+                ) =>
+            {
+                set_operations += 1;
+                if set_operations > MAX_SQL_AUTHORITY_SET_OPERATIONS {
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
 
     // sqlparser 0.59's SetExpr::Table discards identifier quote style, and its
     // direct query parser over-consumes two tokens after an unqualified name.
     // Normalize only TABLE query-body positions, then run the normal full SQL
-    // parser. Token reconstruction preserves strings/comments/quoted words;
-    // full reparsing remains the syntax authority.
+    // parser. Only the TABLE keyword's source span is replaced; every other
+    // source byte remains untouched, including eager-decoded E/U& literals.
+    // Full reparsing remains the syntax authority.
     fn normalize_table_query_bodies(
         sql: &str,
-        dialect: &GenericDialect,
+        tokenized: &[TokenWithSpan],
     ) -> Option<(String, usize)> {
-        let tokens = Tokenizer::new(dialect, sql)
-            .with_unescape(false)
-            .tokenize()
-            .ok()?;
+        let tokens = tokenized
+            .iter()
+            .map(|entry| entry.token.clone())
+            .collect::<Vec<_>>();
         let significant = tokens
             .iter()
             .enumerate()
             .filter(|(_, token)| !matches!(token, Token::Whitespace(_)))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        let mut rewrite = std::collections::HashSet::new();
+        let mut rewrite = Vec::new();
         let mut statement_has_insert = false;
         let mut statement_has_into = false;
 
@@ -401,57 +448,81 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                     Some(Token::SemiColon | Token::RParen | Token::VerticalBarRightAngleBracket)
                 )
                 || matches!(
-                    boundary,
-                    Some(Token::Word(word))
-                        if matches!(
-                            word.keyword,
-                            Keyword::UNION
-                                | Keyword::INTERSECT
-                                | Keyword::EXCEPT
-                                | Keyword::MINUS
-                                | Keyword::ORDER
-                                | Keyword::LIMIT
-                                | Keyword::OFFSET
-                                | Keyword::FETCH
-                                | Keyword::FOR
-                                | Keyword::FORMAT
-                                | Keyword::ON
-                                | Keyword::RETURNING
-                                | Keyword::SETTINGS
-                        )
+                        boundary,
+                        Some(Token::Word(word))
+                            if matches!(
+                                word.keyword,
+                                Keyword::UNION
+                                    | Keyword::INTERSECT
+                                    | Keyword::EXCEPT
+                                    | Keyword::MINUS
+                                    | Keyword::ORDER
+                                    | Keyword::LIMIT
+                                    | Keyword::OFFSET
+                                    | Keyword::FETCH
+                                    | Keyword::FOR
+                                    | Keyword::FORMAT
+                                    | Keyword::ON
+                                    | Keyword::RETURNING
+                                    | Keyword::SETTINGS
+                            )
                 );
             if valid_boundary {
-                rewrite.insert(token_index);
+                rewrite.push(token_index);
             }
         }
 
         if rewrite.is_empty() {
             return None;
         }
-        let rewritten = tokens
-            .iter()
-            .enumerate()
-            .map(|(index, token)| {
-                if rewrite.contains(&index) {
-                    "SELECT * FROM".to_string()
-                } else {
-                    token.to_string()
-                }
-            })
-            .collect::<String>();
-        Some((rewritten, rewrite.len()))
+        let mut line_boundaries = vec![vec![0usize]];
+        for (byte_index, ch) in sql.char_indices() {
+            let after = byte_index + ch.len_utf8();
+            if ch == '\n' {
+                line_boundaries.push(vec![after]);
+            } else if let Some(line) = line_boundaries.last_mut() {
+                line.push(after);
+            }
+        }
+        let byte_offset = |location: sqlparser::tokenizer::Location| {
+            let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
+            let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
+            line_boundaries.get(line)?.get(column).copied()
+        };
+        let mut rewritten = String::with_capacity(sql.len());
+        let mut cursor = 0usize;
+        let rewrite_count = rewrite.len();
+        for token_index in rewrite {
+            let span = tokenized.get(token_index)?.span;
+            let start = byte_offset(span.start)?;
+            let end = byte_offset(span.end)?;
+            if start < cursor || end < start {
+                return None;
+            }
+            rewritten.push_str(sql.get(cursor..start)?);
+            rewritten.push_str("SELECT * FROM");
+            cursor = end;
+        }
+        rewritten.push_str(sql.get(cursor..)?);
+        Some((rewritten, rewrite_count))
     }
 
     fn direct_table_count(body: &SetExpr) -> usize {
-        match body {
-            SetExpr::Table(_) => 1,
-            SetExpr::SetOperation { left, right, .. } => {
-                direct_table_count(left) + direct_table_count(right)
+        let mut count = 0usize;
+        let mut pending = vec![body];
+        while let Some(body) = pending.pop() {
+            match body {
+                SetExpr::Table(_) => count += 1,
+                SetExpr::SetOperation { left, right, .. } => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                // Nested Query nodes receive their own visitor callback.
+                SetExpr::Query(_) => {}
+                _ => {}
             }
-            // Nested Query nodes receive their own visitor callback.
-            SetExpr::Query(_) => 0,
-            _ => 0,
         }
+        count
     }
 
     struct TableCounter(usize);
@@ -464,6 +535,8 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
         }
     }
 
+    let original = Parser::parse_sql(&dialect, sql);
+    let normalized = normalize_table_query_bodies(sql, &tokenized);
     let statements = match original {
         Ok(statements) => {
             let mut counter = TableCounter(0);
@@ -471,8 +544,7 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             if counter.0 == 0 {
                 statements
             } else {
-                let Some((rewritten, rewrite_count)) = normalize_table_query_bodies(sql, &dialect)
-                else {
+                let Some((rewritten, rewrite_count)) = normalized else {
                     return;
                 };
                 if rewrite_count != counter.0 {
@@ -485,7 +557,7 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             }
         }
         Err(_) => {
-            let Some((rewritten, _)) = normalize_table_query_bodies(sql, &dialect) else {
+            let Some((rewritten, _)) = normalized else {
                 return;
             };
             let Ok(statements) = Parser::parse_sql(&dialect, &rewritten) else {
@@ -1056,6 +1128,8 @@ mod tests {
             r#"WITH "QuotedTable" AS (SELECT * FROM quoted_table_seed) TABLE "QuotedTable""#,
             r#"SELECT * FROM union_base UNION ALL TABLE "UnionTable""#,
             "SELECT 'O''Brien' FROM literal_base UNION ALL TABLE literal_other",
+            r#"SELECT E'O\'Brien' FROM e_base UNION ALL TABLE e_other"#,
+            r#"SELECT U&'d\0061t' FROM u_base UNION ALL TABLE u_other"#,
             r#"SELECT * FROM "a""b" UNION ALL TABLE identifier_other"#,
             "TABLE pipe_source |> CALL TRACES('pipe_table')",
             "SELECT * FROM by_base UNION BY NAME TABLE by_source",
@@ -1093,6 +1167,8 @@ mod tests {
                 "commented.table",
                 "conflict_sink",
                 "conflict_source",
+                "e_base",
+                "e_other",
                 "events(2026)",
                 "extra",
                 "identifier_other",
@@ -1118,6 +1194,8 @@ mod tests {
                 "shorthand",
                 "tenant.spaced",
                 "terminated",
+                "u_base",
+                "u_other",
                 "unicode_seed",
                 "union_base",
                 "write_seed",
@@ -1193,6 +1271,21 @@ mod tests {
         assert_eq!(targets.len(), TABLE_COUNT);
         assert!(targets.contains(&"table0".to_string()));
         assert!(targets.contains(&"table255".to_string()));
+    }
+
+    #[test]
+    fn sql_authority_scanner_bounds_adversarial_ast_shapes() {
+        let oversized_set_chain = (0..600)
+            .map(|index| format!("TABLE table{index}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let mut targets = Vec::new();
+        collect_sql_catalog_targets(&oversized_set_chain, &mut targets);
+        assert!(targets.is_empty());
+
+        let deeply_nested = format!("{}SELECT * FROM hidden{}", "(".repeat(129), ")".repeat(129));
+        collect_sql_catalog_targets(&deeply_nested, &mut targets);
+        assert!(targets.is_empty());
     }
 
     #[test]
