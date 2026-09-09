@@ -289,6 +289,10 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
     let Some(rest) = take_word(after_not, "EXISTS") else {
         return (false, input);
     };
+    let operand = skip_leading_ws_and_comments(rest);
+    if operand.len() < rest.len() {
+        return (true, operand);
+    }
     let next = rest.chars().next();
     match next {
         None => (true, ""),
@@ -300,19 +304,13 @@ pub fn strip_if_not_exists(input: &str) -> (bool, &str) {
         // (rounds 45-47 churn).
         // Char-based whitespace (NBSP included) — a bare >= 0x80 byte test
         // treated é as a separator while identifier scanning treats it as text.
-        Some(ch) if ch.is_whitespace() => (true, skip_leading_ws_and_comments(rest)),
+        Some(ch) if ch.is_whitespace() => (true, operand),
         // Quote-ADJACENT operand (IF NOT EXISTS"logs" parses under the
         // pinned dialect): strip, rest undecoded (consumers decode).
         // Paren-adjacent too (IF NOT EXISTS(x INT) — the paren is the
         // column-list opener, never identifier text; the fall-through
         // minted a collection named 'if').
         Some('"' | '`' | '(') => (true, rest),
-        // Comment-ADJACENT operand (IF NOT EXISTS/* v2 */docs — comments
-        // are whitespace to the lexer; the fall-through minted 'if').
-        Some('/') => {
-            let operand = skip_leading_ws_and_comments(rest);
-            (operand != rest, operand)
-        }
         Some(_) => (false, input),
     }
 }
@@ -325,10 +323,12 @@ fn at_top_level_impl(
     haystack: &str,
     needle: &str,
     skip_quote_at: Option<usize>,
+    complete_scan: bool,
 ) -> (Option<usize>, Option<usize>, bool) {
     let bytes = haystack.as_bytes();
     let mut quote: Option<(u8, usize)> = None;
-    let mut nesting = 0usize;
+    let mut nesting = Vec::new();
+    let mut found = None;
     let mut i = 0usize;
     while i < bytes.len() {
         match quote {
@@ -379,22 +379,33 @@ fn at_top_level_impl(
                 }
                 match bytes[i] {
                     b'(' | b'[' | b'{' => {
-                        nesting += 1;
+                        nesting.push(bytes[i]);
                         i += 1;
                         continue;
                     }
-                    b')' | b']' | b'}' => {
-                        nesting = nesting.saturating_sub(1);
+                    close @ (b')' | b']' | b'}') => {
+                        let expected_open = match close {
+                            b')' => b'(',
+                            b']' => b'[',
+                            _ => b'{',
+                        };
+                        if nesting.pop() != Some(expected_open) {
+                            return (None, None, true);
+                        }
                         i += 1;
                         continue;
                     }
                     _ => {}
                 }
-                if nesting == 0
+                if nesting.is_empty()
+                    && found.is_none()
                     && i + needle.len() <= bytes.len()
                     && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
                 {
-                    return (Some(i), None, false);
+                    if !complete_scan {
+                        return (Some(i), None, false);
+                    }
+                    found = Some(i);
                 }
                 i += 1;
             }
@@ -403,7 +414,7 @@ fn at_top_level_impl(
     // EOF in quote mode: report the opener so the caller can retry once
     // with it treated as a literal byte (a stray apostrophe must not
     // swallow the rest of the query).
-    (None, quote.map(|(_, at)| at), nesting != 0)
+    (found, quote.map(|(_, at)| at), !nesting.is_empty())
 }
 
 pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize> {
@@ -414,45 +425,30 @@ pub fn find_ascii_ci_at_top_level(haystack: &str, needle: &str) -> Option<usize>
     // byte matched keywords inside properly-terminated literals (wrong
     // results) and made needle-absent scans quadratic (15k quotes → 15k
     // rescans).
-    let (found, unterminated, _) = at_top_level_impl(haystack, needle, None);
+    let (found, unterminated, _) = at_top_level_impl(haystack, needle, None, false);
     if found.is_some() {
         return found;
     }
     match unterminated {
-        Some(open) => at_top_level_impl(haystack, needle, Some(open)).0,
+        Some(open) => at_top_level_impl(haystack, needle, Some(open), false).0,
         None => None,
     }
 }
 
-/// The bounded top-level keyword scan with malformed-structure reporting.
-/// This is for fail-closed fallback paths that must distinguish a genuinely
-/// absent clause from one hidden by an unterminated quote, comment, or nesting
-/// delimiter. As above, at most one quote-opener retry is performed.
+/// A full top-level keyword scan with malformed-structure reporting.
+/// Fail-closed fallback paths must distinguish a genuinely absent clause from
+/// one hidden by an unterminated quote, comment, or nesting delimiter, and must
+/// validate syntax after an early keyword too. Ordinary tolerant lookup above
+/// retains its at-most-once retry; checked lookup is strict and scans once.
 pub fn find_ascii_ci_at_top_level_checked(
     haystack: &str,
     needle: &str,
 ) -> Result<Option<usize>, &'static str> {
-    let (found, unterminated, malformed) = at_top_level_impl(haystack, needle, None);
-    if found.is_some() {
-        return Ok(found);
-    }
-
-    if let Some(open) = unterminated {
-        let (retried, retry_unterminated, retry_malformed) =
-            at_top_level_impl(haystack, needle, Some(open));
-        if retried.is_some() {
-            return Ok(retried);
-        }
-        if retry_unterminated.is_some() || malformed || retry_malformed {
-            return Err("unterminated SQL quote, comment, or nesting delimiter");
-        }
-        return Ok(None);
-    }
-
-    if malformed {
-        Err("unterminated SQL comment or nesting delimiter")
+    let (found, unterminated, malformed) = at_top_level_impl(haystack, needle, None, true);
+    if malformed || unterminated.is_some() {
+        Err("unterminated SQL quote, comment, or mismatched nesting delimiter")
     } else {
-        Ok(None)
+        Ok(found)
     }
 }
 
@@ -495,6 +491,10 @@ mod tests {
         assert_eq!(
             strip_if_not_exists("IF/* one */NOT /* two */ EXISTS docs"),
             (true, "docs")
+        );
+        assert_eq!(
+            strip_if_not_exists("IF NOT EXISTS-- note\nlogs"),
+            (true, "logs")
         );
         // Quoted operands pass through raw (consumers decode).
         assert_eq!(

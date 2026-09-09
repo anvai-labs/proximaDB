@@ -2462,28 +2462,32 @@ impl PostgresProtocol {
     }
 
     fn extract_legacy_select_predicates(query: &str) -> anyhow::Result<Vec<SelectPredicate>> {
-        let not_delimiter = |b: u8| {
-            !crate::core::utils::is_identifier_byte(b)
-                && b != b'.'
-                && b != b'`'
-                && b != b'"'
-                && b != b'\''
+        let not_delimiter = |ch: char| {
+            ch.is_whitespace()
+                || (ch.is_ascii()
+                    && !crate::core::utils::is_identifier_byte(ch as u8)
+                    && !matches!(ch, '.' | '`' | '"' | '\''))
         };
-        let bytes = query.as_bytes();
         let mut search_from = 0usize;
+        let mut needs_full_validation = true;
         let aware_where = loop {
-            let found = crate::core::utils::find_ascii_ci_at_top_level_checked(
-                &query[search_from..],
-                "WHERE",
-            )
-            .map_err(|reason| anyhow::anyhow!("malformed SELECT structure: {reason}"))?;
-            let Some(relative) = found else {
+            let found = if needs_full_validation {
+                needs_full_validation = false;
+                crate::core::utils::find_ascii_ci_at_top_level_checked(query, "WHERE")
+                    .map_err(|reason| anyhow::anyhow!("malformed SELECT structure: {reason}"))?
+            } else {
+                crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "WHERE")
+                    .map(|relative| search_from + relative)
+            };
+            let Some(position) = found else {
                 break None;
             };
-            let position = search_from + relative;
             let end = position + "WHERE".len();
-            if (position == 0 || not_delimiter(bytes[position - 1]))
-                && (end >= bytes.len() || not_delimiter(bytes[end]))
+            if query[..position]
+                .chars()
+                .next_back()
+                .is_none_or(not_delimiter)
+                && query[end..].chars().next().is_none_or(not_delimiter)
             {
                 break Some(position);
             }
@@ -2758,15 +2762,13 @@ impl PostgresProtocol {
         // '.', AND quote/delimiter bytes — a backtick-quoted column
         // NAMED `where` passed the old check and gutted the predicate
         // into a silent unfiltered scan.
-        let not_delimiter = |b: u8| {
-            !crate::core::utils::is_identifier_byte(b)
-                && b != b'.'
-                && b != b'`'
-                && b != b'"'
-                && b != b'\''
+        let not_delimiter = |ch: char| {
+            ch.is_whitespace()
+                || (ch.is_ascii()
+                    && !crate::core::utils::is_identifier_byte(ch as u8)
+                    && !matches!(ch, '.' | '`' | '"' | '\''))
         };
         let mut predicate = {
-            let bytes = query.as_bytes();
             let mut found = None;
             let mut search_from = 0usize;
             while let Some(rel) =
@@ -2774,8 +2776,8 @@ impl PostgresProtocol {
             {
                 let pos = search_from + rel;
                 let end = pos + 5;
-                let boundary = (pos == 0 || not_delimiter(bytes[pos - 1]))
-                    && (end >= bytes.len() || not_delimiter(bytes[end]));
+                let boundary = query[..pos].chars().next_back().is_none_or(not_delimiter)
+                    && query[end..].chars().next().is_none_or(not_delimiter);
                 if boundary {
                     found = Some(&query[end..]);
                     break;
@@ -2795,10 +2797,12 @@ impl PostgresProtocol {
                 terminator,
             ) {
                 let pos = search_from + rel;
-                let bytes = predicate.as_bytes();
                 let end = pos + terminator.len();
-                let boundary = (pos == 0 || not_delimiter(bytes[pos - 1]))
-                    && (end >= bytes.len() || not_delimiter(bytes[end]));
+                let boundary = predicate[..pos]
+                    .chars()
+                    .next_back()
+                    .is_none_or(not_delimiter)
+                    && predicate[end..].chars().next().is_none_or(not_delimiter);
                 if boundary {
                     predicate = predicate[..pos].trim();
                     break;
@@ -2955,17 +2959,29 @@ impl PostgresProtocol {
     }
 
     fn clean_identifier(identifier: &str) -> String {
-        // A WHOLLY-quoted identifier may contain dots ("meta.score" is one
-        // column) — decode first and keep it intact. Otherwise split on
-        // the original and decode the final segment (qualifiers carry
-        // their own delimiters; cross-namespace routing parses ns.table).
+        // Split on the last dot OUTSIDE quoted segments: "meta.score" is one
+        // column, while schema."meta.score" and "schema"."score" retain the
+        // delimiters needed for the shared decoder.
         let trimmed = identifier.trim();
-        let decoded = crate::core::utils::decode_identifier(trimmed);
-        if decoded != trimmed {
-            return decoded.to_string();
+        let mut quote = None;
+        let mut segment_start = 0usize;
+        let mut chars = trimmed.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            if let Some(delimiter) = quote {
+                if ch == delimiter {
+                    if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+            } else if matches!(ch, '"' | '`') {
+                quote = Some(ch);
+            } else if ch == '.' {
+                segment_start = index + ch.len_utf8();
+            }
         }
-        let last = trimmed.rsplit('.').next().unwrap_or_default();
-        crate::core::utils::decode_identifier(last).to_string()
+        crate::core::utils::decode_identifier(&trimmed[segment_start..]).to_string()
     }
 
     /// Detect store type for SELECT queries

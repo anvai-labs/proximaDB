@@ -11,6 +11,8 @@ fn extract_where_handles_trailing_where_and_prefixed_columns() {
         "SELECT ' WHERE ' FROM t WHERE",
         "SELECT * FROM t WHERE\n",
         "SELECT * FROM t WHERE\t",
+        "SELECT * FROM t WHERE\u{2003}",
+        "SELECT * FROM t WHERE\u{00a0}",
         "SELECT * FROM t WHERE/* comment */",
     ] {
         assert!(PostgresProtocol::extract_select_where_clause(trailing).is_some());
@@ -38,8 +40,12 @@ fn extract_where_handles_trailing_where_and_prefixed_columns() {
 
     for malformed in [
         "SELECT * FROM t ( WHERE id = 7",
+        "SELECT * FROM t )",
+        "SELECT * FROM t (]",
         "SELECT * FROM t ' \" WHERE id = 7",
         "SELECT * FROM t /* WHERE id = 7",
+        "SELECT * FROM t WHERE id = 1 LIMIT 2 (",
+        "SELECT * FROM t WHERE id = 1 LIMIT 2 /* unterminated",
     ] {
         assert!(
             PostgresProtocol::extract_legacy_select_predicates(malformed).is_err(),
@@ -50,6 +56,22 @@ fn extract_where_handles_trailing_where_and_prefixed_columns() {
         PostgresProtocol::extract_legacy_select_predicates("SELECT somewhere FROM t")
             .expect("an identifier containing WHERE is still WHERE-less")
             .is_empty()
+    );
+}
+
+#[test]
+fn clean_identifier_respects_quoted_qualified_segments() {
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#""meta.score""#),
+        "meta.score"
+    );
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#"schema."meta.score""#),
+        "meta.score"
+    );
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#""schema"."score""#),
+        "score"
     );
 }
 
@@ -104,6 +126,7 @@ fn legacy_create_table_target_rejects_missing_or_unterminated_names() {
         "CREATE TABLE IF\nNOT EXISTS logs USING VECTOR",
         "CREATE TABLE IF\u{00a0}NOT\tEXISTS logs USING VECTOR",
         "CREATE TABLE IF /* one */ NOT /* two */ EXISTS logs USING VECTOR",
+        "CREATE TABLE IF NOT EXISTS-- note\nlogs USING VECTOR",
     ] {
         assert_eq!(
             PostgresProtocol::extract_legacy_create_table_target(query)

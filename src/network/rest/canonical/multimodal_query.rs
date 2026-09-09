@@ -1000,28 +1000,48 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
 }
 
 fn collect_from_targets(sql: &str, targets: &mut Vec<String>) {
-    let mut previous_was_from = false;
+    let mut target_keyword = None;
     let tokens = crate::core::utils::tokenize_sql_preserving_quotes(sql);
     for (index, token) in tokens.iter().enumerate() {
-        if previous_was_from {
-            let candidate = token
-                .trim_end_matches(')')
-                .trim_matches(|ch: char| matches!(ch, ',' | ';' | '[' | ']'));
+        if let Some(keyword) = target_keyword.take() {
+            let candidate = token.trim_end_matches([';', ')']);
+            let candidate_is_quoted =
+                crate::core::utils::decode_identifier(candidate).as_ref() != candidate;
+            let candidate = if matches!(keyword, "INTO" | "UPDATE") && !candidate_is_quoted {
+                candidate
+                    .split_once('(')
+                    .map(|(name, _)| name)
+                    .unwrap_or(candidate)
+            } else if !candidate_is_quoted && candidate.contains('(') {
+                continue;
+            } else {
+                candidate
+            };
+            let candidate = candidate.trim_matches(|ch: char| matches!(ch, ',' | '[' | ']'));
             let candidate = crate::core::utils::decode_identifier(candidate);
             if !candidate.is_empty()
-                && !candidate.contains('(')
-                && !tokens
-                    .get(index + 1)
-                    .is_some_and(|next| next.starts_with('('))
+                && (!matches!(keyword, "FROM" | "JOIN")
+                    || !tokens
+                        .get(index + 1)
+                        .is_some_and(|next| next.starts_with('(')))
                 && !candidate.eq_ignore_ascii_case("SELECT")
             {
                 push_unique_target(targets, candidate.as_ref());
             }
-            previous_was_from = false;
             continue;
         }
 
-        previous_was_from = token.eq_ignore_ascii_case("FROM")
+        target_keyword = if token.eq_ignore_ascii_case("FROM") {
+            Some("FROM")
+        } else if token.eq_ignore_ascii_case("JOIN") {
+            Some("JOIN")
+        } else if token.eq_ignore_ascii_case("INTO") {
+            Some("INTO")
+        } else if token.eq_ignore_ascii_case("UPDATE") {
+            Some("UPDATE")
+        } else {
+            None
+        };
     }
 }
 
@@ -2561,7 +2581,7 @@ mod tests {
         assert!(!targets.contains(&"TRACES".to_string()));
 
         let quoted = explain_catalog_targets(
-            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data""#,
+            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data"; SELECT * FROM "events(2026)""#,
         );
         assert!(quoted.contains(&"team\"logs".to_string()), "got {quoted:?}");
         assert!(
@@ -2572,5 +2592,20 @@ mod tests {
             quoted.contains(&"archive data".to_string()),
             "got {quoted:?}"
         );
+        assert!(
+            quoted.contains(&"events(2026)".to_string()),
+            "got {quoted:?}"
+        );
+
+        let writes_and_join = explain_catalog_targets(
+            "INSERT INTO orders(id) VALUES (1); UPDATE inventory SET n = 1; \
+             SELECT * FROM docs JOIN archive ON docs.id = archive.id",
+        );
+        for expected in ["orders", "inventory", "docs", "archive"] {
+            assert!(
+                writes_and_join.contains(&expected.to_string()),
+                "missing {expected}: {writes_and_join:?}"
+            );
+        }
     }
 }

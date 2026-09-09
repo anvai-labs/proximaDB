@@ -1984,6 +1984,12 @@ pinned + narrated:**
 - The optional CREATE clause accepts SQL whitespace/comments between all three
   keywords. The checked legacy-WHERE presence loop applies identifier
   boundaries, so a WHERE-less fallback containing `somewhere` remains valid.
+- Clause boundaries are Unicode-whitespace aware, and qualified identifiers
+  split only on dots outside quotes. REST authority discovery now has the
+  port's FROM/JOIN/INTO/UPDATE coverage rather than omitting write/join targets.
+- The checked scanner tracks delimiter kinds: unmatched closing delimiters and
+  mismatched pairs such as `(]` are malformed instead of saturating a scalar
+  depth to zero and falling through to an unfiltered legacy SELECT.
 
 **Consolidation review round 51 (2026-09-08, follow-up PR #1852):**
 - The call gate's byte slice panicked on multibyte-initial tokens

@@ -523,12 +523,14 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
                 // 'orders)' must keep its target (the paren-normalization
                 // era captured it).
                 let target = target.trim_end_matches([';', ')']);
-                let target = if matches!(keyword.as_str(), "INTO" | "UPDATE") {
+                let target_is_quoted =
+                    crate::core::utils::decode_identifier(target).as_ref() != target;
+                let target = if matches!(keyword.as_str(), "INTO" | "UPDATE") && !target_is_quoted {
                     target
                         .split_once('(')
                         .map(|(name, _)| name)
                         .unwrap_or(target)
-                } else if target.contains('(') {
+                } else if !target_is_quoted && target.contains('(') {
                     continue;
                 } else {
                     target
@@ -1380,7 +1382,7 @@ mod tests {
         assert!(targets.contains(&"vectors".to_string()));
 
         let quoted = explain_catalog_targets(
-            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data""#,
+            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data"; SELECT * FROM "events(2026)""#,
         );
         assert!(quoted.contains(&"team\"logs".to_string()), "got {quoted:?}");
         assert!(
@@ -1389,6 +1391,10 @@ mod tests {
         );
         assert!(
             quoted.contains(&"archive data".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"events(2026)".to_string()),
             "got {quoted:?}"
         );
     }
