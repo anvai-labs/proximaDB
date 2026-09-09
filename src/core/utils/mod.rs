@@ -196,7 +196,8 @@ pub fn decode_identifier(ident: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(ident)
 }
 
-const MAX_SQL_AUTHORITY_BYTES: usize = 1_048_576;
+const MAX_SQL_AUTHORITY_BYTES: usize = 65_536;
+const MAX_SQL_AUTHORITY_LEXEMES: usize = 16_384;
 
 /// Discover catalog-backed relations through the pinned SQL parser's AST.
 /// This is deliberately shared by REST and the unified-query port so EXPLAIN
@@ -226,6 +227,9 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
     else {
         return;
     };
+    if tokenized.len() > MAX_SQL_AUTHORITY_LEXEMES {
+        return;
+    }
 
     // The derived AST visitor is recursive. Bound adversarially deep/large
     // inputs before parsing or visiting them so catalog introspection cannot
@@ -1120,8 +1124,8 @@ mod tests {
     }
 
     use super::{
-        MAX_SQL_AUTHORITY_BYTES, collect_sql_catalog_targets, finite_f32,
-        inject_graph_target_into_cypher,
+        MAX_SQL_AUTHORITY_BYTES, MAX_SQL_AUTHORITY_LEXEMES, collect_sql_catalog_targets,
+        finite_f32, inject_graph_target_into_cypher,
     };
 
     #[test]
@@ -1320,6 +1324,11 @@ mod tests {
             "x".repeat(MAX_SQL_AUTHORITY_BYTES)
         );
         collect_sql_catalog_targets(&oversized_literal, &mut targets);
+        assert!(targets.is_empty());
+
+        let whitespace_dense =
+            format!("TABLE visible{}", " ".repeat(MAX_SQL_AUTHORITY_LEXEMES + 1));
+        collect_sql_catalog_targets(&whitespace_dense, &mut targets);
         assert!(targets.is_empty());
     }
 
