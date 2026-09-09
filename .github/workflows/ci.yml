@@ -2016,6 +2016,10 @@ jobs:
             echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET steps."
             exit 1
           fi
+          if [ "$PASSED3" -lt "$RATCHET" ]; then
+            echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET steps."
+            exit 1
+          fi
           echo "passed-2x=$PASSED passed-3x=$PASSED3 ratchet=$RATCHET"
           else
             PASSED=0
