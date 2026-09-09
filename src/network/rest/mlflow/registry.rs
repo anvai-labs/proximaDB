@@ -297,9 +297,9 @@ async fn registered_models_search(
     // prompt models, and that clause must pass cleanly.
     let mut tag_clauses: Vec<(String, String, bool)> = Vec::new();
     if let Some(filter) = &req.filter {
-        for clause in super::split_filter_clauses(filter)? {
+        for clause in super::filter::split_filter_clauses(filter)? {
             let clause = clause.trim();
-            let (field, op, value) = super::parse_filter_parts(clause, true)?;
+            let (field, op, value) = super::filter::parse_filter_parts(clause, true)?;
             let field_lower = field.to_ascii_lowercase();
             let tag_key = field_lower
                 .strip_prefix("tag.")
@@ -345,7 +345,7 @@ async fn registered_models_search(
             name_eq.as_ref().is_none_or(|v| &r.registry.name == v)
                 && name_like
                     .as_ref()
-                    .is_none_or(|pat| super::like_match(&r.registry.name, pat))
+                    .is_none_or(|pat| super::filter::like_match(&r.registry.name, pat))
                 && tag_clauses.iter().all(|(_key, value, is_eq)| {
                     // Registry annotation facet not yet present — the
                     // port's absent-value semantics decide.
@@ -456,8 +456,8 @@ async fn model_versions_search(
     if name.is_empty()
         && let Some(filter) = &req.filter
     {
-        for clause in super::split_filter_clauses(filter)? {
-            let (field, op, value) = super::parse_filter_parts(clause.trim(), true)?;
+        for clause in super::filter::split_filter_clauses(filter)? {
+            let (field, op, value) = super::filter::parse_filter_parts(clause.trim(), true)?;
             if field.eq_ignore_ascii_case("name") && op == "=" {
                 name = value;
             } else {
