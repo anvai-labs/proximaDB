@@ -18,15 +18,12 @@ use std::sync::Arc;
 
 use crate::network::middleware::tenant::TenantContext;
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use proximadb_catalog::run_store::{
     ExperimentRecord, ExperimentStage, MetricPoint, RunLifecycle, RunRecord, RunStatus, RunStore,
-    RunStoreError,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Minimal state: the tracking wire touches nothing but the document
 /// substrate. Built once at mount time from the canonical `AppState`.
@@ -71,7 +68,11 @@ fn is_enabled(value: Option<&str>) -> bool {
 }
 
 pub mod artifacts;
+pub mod dto;
+pub mod error;
+pub(crate) use dto::*;
 pub mod filter;
+pub(crate) use error::{MlflowError, MlflowResult};
 use filter::ExperimentFilter;
 pub mod registry;
 
@@ -160,378 +161,11 @@ fn store_for(
 // MLflow REST DTOs (serde snake_case, string ids — JavaScript-safe)
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct KeyValue {
-    key: String,
-    value: String,
-}
-
-#[derive(Serialize)]
-struct KeyValueOut {
-    key: String,
-    value: String,
-}
-
-#[derive(Default, Deserialize)]
-struct ExperimentsCreateRequest {
-    name: String,
-    #[serde(default)]
-    artifact_location: Option<String>,
-    #[serde(default)]
-    tags: Vec<KeyValue>,
-}
-
-#[derive(Serialize)]
-struct ExperimentOut {
-    experiment_id: String,
-    name: String,
-    artifact_uri: String,
-    lifecycle_stage: &'static str,
-    creation_time: i64,
-    last_update_time: i64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tags: Vec<KeyValueOut>,
-}
-
-#[derive(Default, Deserialize)]
-struct ExperimentNameRequest {
-    /// Proto field name is `experiment_name`; older JSON bodies use `name`.
-    #[serde(default, alias = "experiment_name")]
-    name: String,
-}
-
-#[derive(Default, Deserialize)]
-struct ExperimentIdRequest {
-    #[serde(default)]
-    experiment_id: String,
-}
-
-#[derive(Default, Deserialize)]
-struct ExperimentsSearchRequest {
-    #[serde(default)]
-    max_results: Option<u32>,
-    #[serde(default)]
-    filter: Option<String>,
-    #[serde(default)]
-    view_type: Option<String>,
-    #[serde(default)]
-    page_token: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ExperimentsSearchResponse {
-    experiments: Vec<ExperimentOut>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_page_token: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct RunsCreateRequest {
-    experiment_id: String,
-    #[serde(default)]
-    start_time: Option<i64>,
-    #[serde(default)]
-    run_name: Option<String>,
-    #[serde(default)]
-    tags: Vec<KeyValue>,
-}
-
-#[derive(Serialize)]
-struct MetricOut {
-    key: String,
-    #[serde(serialize_with = "serialize_metric_value")]
-    value: f64,
-    timestamp: i64,
-    step: i64,
-}
-
-fn serialize_metric_value<S: serde::Serializer>(
-    value: &f64,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    if value.is_nan() {
-        serializer.serialize_str("NaN")
-    } else if *value == f64::INFINITY {
-        serializer.serialize_str("Infinity")
-    } else if *value == f64::NEG_INFINITY {
-        serializer.serialize_str("-Infinity")
-    } else {
-        serializer.serialize_f64(*value)
-    }
-}
-
-#[derive(Serialize)]
-struct ParamOut {
-    key: String,
-    value: String,
-}
-
-#[derive(Serialize)]
-struct RunData {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    metrics: Vec<MetricOut>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    params: Vec<ParamOut>,
-    tags: Vec<KeyValueOut>,
-}
-
-#[derive(Serialize)]
-struct RunInfo {
-    run_id: String,
-    experiment_id: String,
-    status: &'static str,
-    start_time: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    end_time: Option<i64>,
-    lifecycle_stage: &'static str,
-    artifact_uri: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    run_name: Option<String>,
-}
-
-#[derive(Serialize)]
-struct RunOut {
-    info: RunInfo,
-    data: RunData,
-}
-
-#[derive(Default, Deserialize)]
-struct RunIdRequest {
-    #[serde(default)]
-    run_id: String,
-}
-
-#[derive(Default, Deserialize)]
-struct RunsUpdateRequest {
-    #[serde(default)]
-    run_id: String,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    end_time: Option<i64>,
-}
-
-#[derive(Serialize)]
-struct RunInfoResponse {
-    run_info: RunInfo,
-}
-
-#[derive(Default, Deserialize)]
-struct LogParameterRequest {
-    #[serde(default)]
-    run_id: String,
-    #[serde(default)]
-    key: String,
-    #[serde(default)]
-    value: String,
-}
-
-#[derive(Default, Deserialize)]
-struct MetricInput {
-    #[serde(default)]
-    key: String,
-    #[serde(default, deserialize_with = "deserialize_metric_value")]
-    value: f64,
-    #[serde(default)]
-    timestamp: i64,
-    #[serde(default)]
-    step: i64,
-}
-
-#[derive(Default, Deserialize)]
-struct LogMetricRequest {
-    #[serde(default)]
-    run_id: String,
-    #[serde(default)]
-    key: String,
-    #[serde(default, deserialize_with = "deserialize_metric_value")]
-    value: f64,
-    #[serde(default)]
-    timestamp: i64,
-    #[serde(default)]
-    step: i64,
-}
-
-fn deserialize_metric_value<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<f64, D::Error> {
-    use serde::de::Error as _;
-    let raw = serde_json::Value::deserialize(deserializer)?;
-    match raw {
-        serde_json::Value::Number(number) => number
-            .as_f64()
-            .ok_or_else(|| D::Error::custom("metric value out of f64 range")),
-        serde_json::Value::String(value) => match value.as_str() {
-            "NaN" => Ok(f64::NAN),
-            "Infinity" => Ok(f64::INFINITY),
-            "-Infinity" => Ok(f64::NEG_INFINITY),
-            other => other
-                .parse::<f64>()
-                .map_err(|_| D::Error::custom(format!("invalid metric value '{other}'"))),
-        },
-        other => Err(D::Error::custom(format!(
-            "metric value must be a number or numeric string, got {other}"
-        ))),
-    }
-}
-
-#[derive(Default, Deserialize)]
-struct LogBatchRequest {
-    #[serde(default)]
-    run_id: String,
-    #[serde(default)]
-    metrics: Vec<MetricInput>,
-    #[serde(default)]
-    params: Vec<LogParameterRequest>,
-    #[serde(default)]
-    tags: Vec<KeyValue>,
-}
-
-#[derive(Default, Deserialize)]
-struct SetTagRequest {
-    #[serde(default)]
-    run_id: String,
-    #[serde(default)]
-    key: String,
-    #[serde(default)]
-    value: String,
-}
-
-#[derive(Default, Deserialize)]
-struct RunsSearchRequest {
-    #[serde(default)]
-    experiment_ids: Vec<String>,
-    #[serde(default)]
-    filter: Option<String>,
-    #[serde(default)]
-    run_view_type: Option<String>,
-    #[serde(default)]
-    max_results: Option<u32>,
-    #[serde(default)]
-    order_by: Vec<String>,
-    #[serde(default)]
-    page_token: Option<String>,
-}
-
-#[derive(Serialize)]
-struct RunsSearchResponse {
-    runs: Vec<RunOut>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    next_page_token: Option<String>,
-}
-
 // ---------------------------------------------------------------------------
 // Error envelope — MLflow native
 // ---------------------------------------------------------------------------
 
-pub(crate) struct MlflowError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
-}
-
-impl MlflowError {
-    pub(crate) fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            code: "RESOURCE_DOES_NOT_EXIST",
-            message: message.into(),
-        }
-    }
-
-    pub(crate) fn exists(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code: "RESOURCE_ALREADY_EXISTS",
-            message: message.into(),
-        }
-    }
-
-    pub(crate) fn invalid(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code: "INVALID_PARAMETER_VALUE",
-            message: message.into(),
-        }
-    }
-
-    pub(crate) fn invalid_state(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code: "INVALID_STATE",
-            message: message.into(),
-        }
-    }
-
-    pub(crate) fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "INTERNAL_ERROR",
-            message: message.into(),
-        }
-    }
-}
-
-impl IntoResponse for MlflowError {
-    fn into_response(self) -> Response {
-        #[derive(Serialize)]
-        struct Body {
-            error_code: &'static str,
-            message: String,
-        }
-        (
-            self.status,
-            Json(Body {
-                error_code: self.code,
-                message: self.message,
-            }),
-        )
-            .into_response()
-    }
-}
-
-impl From<RunStoreError> for MlflowError {
-    fn from(e: RunStoreError) -> Self {
-        match e {
-            RunStoreError::UnknownExperiment { experiment_id } => MlflowError::not_found(format!(
-                "Could not find experiment with ID '{experiment_id}'"
-            )),
-            RunStoreError::UnknownRun { run_id } => {
-                MlflowError::not_found(format!("Could not find run with ID '{run_id}'"))
-            }
-            RunStoreError::ExperimentNameConflict { name } => {
-                MlflowError::exists(format!("Experiment '{name}' already exists"))
-            }
-            RunStoreError::RunIdConflict { run_id } => {
-                MlflowError::exists(format!("Run '{run_id}' already exists"))
-            }
-            RunStoreError::ParamImmutable { key, run_id } => MlflowError::invalid(format!(
-                "Param '{key}' on run '{run_id}' is locked to its first value (MLflow params are immutable; re-logging a different value is rejected)"
-            )),
-            RunStoreError::RunFinished { run_id } => MlflowError::invalid_state(format!(
-                "Run '{run_id}' is finished and no longer accepts param/metric writes"
-            )),
-            RunStoreError::ExperimentDeleted { experiment_id } => MlflowError::invalid_state(
-                format!("Experiment '{experiment_id}' is deleted (restore it first)"),
-            ),
-            RunStoreError::Empty { field } => {
-                MlflowError::invalid(format!("{field} must not be empty"))
-            }
-            RunStoreError::NotTerminal => {
-                MlflowError::internal("tracking store requires a terminal run status")
-            }
-            RunStoreError::Internal { message } => MlflowError::internal(message),
-        }
-    }
-}
-
-pub(crate) type MlflowResult<T> = Result<T, MlflowError>;
-
-// ---------------------------------------------------------------------------
-// Lowering helpers
-// ---------------------------------------------------------------------------
-
-fn experiment_out(record: &ExperimentRecord) -> ExperimentOut {
+pub(crate) fn experiment_out(record: &ExperimentRecord) -> ExperimentOut {
     ExperimentOut {
         experiment_id: record.experiment_id.to_string(),
         name: record.name.clone(),
@@ -935,14 +569,6 @@ async fn runs_set_tag(
     Ok(Json(serde_json::json!({})))
 }
 
-#[derive(Default, Deserialize)]
-struct MetricHistoryRequest {
-    #[serde(default)]
-    run_id: String,
-    #[serde(default, alias = "metric_key")]
-    key: String,
-}
-
 async fn metrics_get_history(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
@@ -1087,6 +713,7 @@ mod tests {
     use crate::storage::engines::sst::SstEngine;
     use axum::body::Body;
     use axum::http::Request;
+    use axum::http::StatusCode;
     use serde_json::Value;
     use tower::ServiceExt;
 
