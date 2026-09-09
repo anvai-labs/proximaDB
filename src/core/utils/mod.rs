@@ -204,31 +204,228 @@ pub fn decode_identifier(ident: &str) -> std::borrow::Cow<'_, str> {
 pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) {
     use core::ops::ControlFlow;
     use sqlparser::ast::{
-        Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, Query,
-        SetExpr, Statement, TableFactor, TableObject, Visit, Visitor,
+        Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+        ObjectName, PipeOperator, Query, SetExpr, Statement, TableFactor, TableObject, Visit,
+        Visitor,
     };
     use sqlparser::dialect::GenericDialect;
+    use sqlparser::keywords::Keyword;
     use sqlparser::parser::Parser;
-    use sqlparser::tokenizer::Token;
+    use sqlparser::tokenizer::{Token, Tokenizer};
 
     let dialect = GenericDialect;
-    let statements = match Parser::parse_sql(&dialect, sql) {
-        Ok(statements) => statements,
-        // sqlparser 0.59 models PostgreSQL's `TABLE relation` as a query body,
-        // but its statement dispatcher does not accept TABLE at the top level.
-        // Retrying through the query parser preserves AST validation and also
-        // covers TABLE operands inside set expressions without a raw scanner.
-        Err(_) => {
-            let Ok(mut parser) = Parser::new(&dialect).try_with_sql(sql) else {
-                return;
+    let original = Parser::parse_sql(&dialect, sql);
+
+    // sqlparser 0.59's SetExpr::Table discards identifier quote style, and its
+    // direct query parser over-consumes two tokens after an unqualified name.
+    // Normalize only TABLE query-body positions, then run the normal full SQL
+    // parser. Token reconstruction preserves strings/comments/quoted words;
+    // full reparsing remains the syntax authority.
+    fn normalize_table_query_bodies(
+        sql: &str,
+        dialect: &GenericDialect,
+    ) -> Option<(String, usize)> {
+        let tokens = Tokenizer::new(dialect, sql).tokenize().ok()?;
+        let significant = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| !matches!(token, Token::Whitespace(_)))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let mut rewrite = std::collections::HashSet::new();
+
+        for (position, token_index) in significant.iter().copied().enumerate() {
+            let Token::Word(word) = &tokens[token_index] else {
+                continue;
             };
-            let Ok(query) = parser.parse_query() else {
-                return;
-            };
-            if !parser.consume_token(&Token::EOF) {
-                return;
+            if word.keyword != Keyword::TABLE {
+                continue;
             }
-            vec![Statement::Query(query)]
+            let previous = position
+                .checked_sub(1)
+                .and_then(|index| significant.get(index))
+                .map(|index| &tokens[*index]);
+            let previous_keyword = previous.and_then(|token| match token {
+                Token::Word(word) => Some(word.keyword),
+                _ => None,
+            });
+            let after_quantifier =
+                matches!(previous_keyword, Some(Keyword::ALL | Keyword::DISTINCT))
+                    && position
+                        .checked_sub(2)
+                        .and_then(|index| significant.get(index))
+                        .is_some_and(|index| {
+                            matches!(
+                                &tokens[*index],
+                                Token::Word(word)
+                                    if matches!(
+                                        word.keyword,
+                                        Keyword::UNION
+                                            | Keyword::INTERSECT
+                                            | Keyword::EXCEPT
+                                            | Keyword::MINUS
+                                    )
+                            )
+                        });
+            let statement_start = significant[..position]
+                .iter()
+                .rposition(|index| matches!(tokens[*index], Token::SemiColon))
+                .map_or(0, |index| index + 1);
+            let insert_query_body =
+                significant[statement_start..position].iter().any(|index| {
+                    matches!(
+                        &tokens[*index],
+                        Token::Word(word) if word.keyword == Keyword::INSERT
+                    )
+                }) && significant[statement_start..position].iter().any(|index| {
+                    matches!(
+                        &tokens[*index],
+                        Token::Word(word) if word.keyword == Keyword::INTO
+                    )
+                });
+            let query_body_position = previous.is_none()
+                || matches!(
+                    previous,
+                    Some(Token::SemiColon | Token::LParen | Token::RParen)
+                )
+                || matches!(
+                    previous_keyword,
+                    Some(
+                        Keyword::AS
+                            | Keyword::UNION
+                            | Keyword::INTERSECT
+                            | Keyword::EXCEPT
+                            | Keyword::MINUS
+                    )
+                )
+                || after_quantifier
+                || insert_query_body;
+            if !query_body_position {
+                continue;
+            }
+
+            // Match sqlparser's TABLE grammar exactly: one Word, optionally
+            // followed by `. Word`, and then a query-boundary token. This is
+            // what prevents `TABLE orders garbage` from becoming a SELECT
+            // with an accidentally accepted alias.
+            let first_name_position = position + 1;
+            let Some(first_name_index) = significant.get(first_name_position) else {
+                continue;
+            };
+            if !matches!(tokens[*first_name_index], Token::Word(_)) {
+                continue;
+            }
+            let mut after_name_position = first_name_position + 1;
+            if significant
+                .get(after_name_position)
+                .is_some_and(|index| matches!(tokens[*index], Token::Period))
+            {
+                let Some(qualified_name_index) = significant.get(after_name_position + 1) else {
+                    continue;
+                };
+                if !matches!(tokens[*qualified_name_index], Token::Word(_)) {
+                    continue;
+                }
+                after_name_position += 2;
+            }
+            let boundary = significant
+                .get(after_name_position)
+                .map(|index| &tokens[*index]);
+            let valid_boundary = boundary.is_none()
+                || matches!(
+                    boundary,
+                    Some(Token::SemiColon | Token::RParen | Token::Pipe)
+                )
+                || matches!(
+                    boundary,
+                    Some(Token::Word(word))
+                        if matches!(
+                            word.keyword,
+                            Keyword::UNION
+                                | Keyword::INTERSECT
+                                | Keyword::EXCEPT
+                                | Keyword::MINUS
+                                | Keyword::ORDER
+                                | Keyword::LIMIT
+                                | Keyword::OFFSET
+                                | Keyword::FETCH
+                                | Keyword::FOR
+                                | Keyword::FORMAT
+                                | Keyword::SETTINGS
+                        )
+                );
+            if valid_boundary {
+                rewrite.insert(token_index);
+            }
+        }
+
+        if rewrite.is_empty() {
+            return None;
+        }
+        let rewritten = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| {
+                if rewrite.contains(&index) {
+                    "SELECT * FROM".to_string()
+                } else {
+                    token.to_string()
+                }
+            })
+            .collect::<String>();
+        Some((rewritten, rewrite.len()))
+    }
+
+    fn direct_table_count(body: &SetExpr) -> usize {
+        match body {
+            SetExpr::Table(_) => 1,
+            SetExpr::SetOperation { left, right, .. } => {
+                direct_table_count(left) + direct_table_count(right)
+            }
+            // Nested Query nodes receive their own visitor callback.
+            SetExpr::Query(_) => 0,
+            _ => 0,
+        }
+    }
+
+    struct TableCounter(usize);
+    impl Visitor for TableCounter {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            self.0 += direct_table_count(&query.body);
+            ControlFlow::Continue(())
+        }
+    }
+
+    let statements = match original {
+        Ok(statements) => {
+            let mut counter = TableCounter(0);
+            let _ = statements.visit(&mut counter);
+            if counter.0 == 0 {
+                statements
+            } else {
+                let Some((rewritten, rewrite_count)) = normalize_table_query_bodies(sql, &dialect)
+                else {
+                    return;
+                };
+                if rewrite_count != counter.0 {
+                    return;
+                }
+                let Ok(statements) = Parser::parse_sql(&dialect, &rewritten) else {
+                    return;
+                };
+                statements
+            }
+        }
+        Err(_) => {
+            let Some((rewritten, _)) = normalize_table_query_bodies(sql, &dialect) else {
+                return;
+            };
+            let Ok(statements) = Parser::parse_sql(&dialect, &rewritten) else {
+                return;
+            };
+            statements
         }
     };
 
@@ -236,18 +433,18 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
         targets: &'a mut Vec<String>,
         cte_scopes: Vec<CteScope>,
         cte_children: std::collections::HashMap<usize, (usize, usize)>,
-        query_restorations: Vec<Option<(usize, std::collections::HashSet<String>)>>,
+        query_restorations: Vec<Option<(usize, usize)>>,
     }
 
     struct CteScope {
-        aliases: Vec<String>,
-        visible: std::collections::HashSet<String>,
+        declaration_index: std::collections::HashMap<String, usize>,
+        visible_count: usize,
     }
 
     impl RelationCollector<'_> {
         fn identifier_key(ident: &Ident) -> String {
             if ident.quote_style.is_none() {
-                ident.value.to_lowercase()
+                ident.value.to_ascii_lowercase()
             } else {
                 ident.value.clone()
             }
@@ -261,10 +458,12 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                 return false;
             };
             let key = Self::identifier_key(ident);
-            self.cte_scopes
-                .iter()
-                .rev()
-                .any(|scope| scope.visible.contains(&key))
+            self.cte_scopes.iter().rev().any(|scope| {
+                scope
+                    .declaration_index
+                    .get(&key)
+                    .is_some_and(|index| *index < scope.visible_count)
+            })
         }
 
         fn push_relation(&mut self, relation: &ObjectName) {
@@ -309,10 +508,11 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             let Some(name) = name.0.last().and_then(|part| part.as_ident()) else {
                 return false;
             };
-            matches!(
-                name.value.to_ascii_uppercase().as_str(),
-                "VECTOR_SEARCH" | "DOCUMENT_QUERY" | "LOGS" | "METRICS" | "TRACES" | "RERANK"
-            )
+            name.quote_style.is_none()
+                && matches!(
+                    name.value.to_ascii_uppercase().as_str(),
+                    "VECTOR_SEARCH" | "DOCUMENT_QUERY" | "LOGS" | "METRICS" | "TRACES" | "RERANK"
+                )
         }
 
         fn function_arg_expr(arg: &FunctionArg) -> &FunctionArgExpr {
@@ -350,33 +550,9 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             }
         }
 
-        fn push_table_shorthands(&mut self, body: &SetExpr) {
-            match body {
-                SetExpr::Table(table) => {
-                    let Some(table_name) = &table.table_name else {
-                        return;
-                    };
-                    if table.schema_name.is_none()
-                        && self
-                            .cte_scopes
-                            .iter()
-                            .rev()
-                            .any(|scope| scope.visible.contains(&table_name.to_lowercase()))
-                    {
-                        return;
-                    }
-                    let target = table
-                        .schema_name
-                        .as_ref()
-                        .map(|schema| format!("{schema}.{table_name}"))
-                        .unwrap_or_else(|| table_name.clone());
-                    self.targets.push(target);
-                }
-                SetExpr::SetOperation { left, right, .. } => {
-                    self.push_table_shorthands(left);
-                    self.push_table_shorthands(right);
-                }
-                _ => {}
+        fn push_function(&mut self, function: &Function) {
+            if let FunctionArguments::List(args) = &function.args {
+                self.push_catalog_function(&function.name, &args.args);
             }
         }
     }
@@ -396,8 +572,8 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                     .remove(&query_key)
                     .and_then(|(scope_index, visible_count)| {
                         let scope = self.cte_scopes.get_mut(scope_index)?;
-                        let full_visibility = std::mem::take(&mut scope.visible);
-                        scope.visible = scope.aliases.iter().take(visible_count).cloned().collect();
+                        let full_visibility =
+                            std::mem::replace(&mut scope.visible_count, visible_count);
                         Some((scope_index, full_visibility))
                     });
             self.query_restorations.push(restoration);
@@ -422,10 +598,18 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                 }
             }
             self.cte_scopes.push(CteScope {
-                visible: aliases.iter().cloned().collect(),
-                aliases,
+                visible_count: aliases.len(),
+                declaration_index: aliases
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, alias)| (alias, index))
+                    .collect(),
             });
-            self.push_table_shorthands(&query.body);
+            for operator in &query.pipe_operators {
+                if let PipeOperator::Call { function, .. } = operator {
+                    self.push_function(function);
+                }
+            }
             ControlFlow::Continue(())
         }
 
@@ -434,7 +618,7 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
             if let Some(Some((scope_index, full_visibility))) = self.query_restorations.pop()
                 && let Some(scope) = self.cte_scopes.get_mut(scope_index)
             {
-                scope.visible = full_visibility;
+                scope.visible_count = full_visibility;
             }
             ControlFlow::Continue(())
         }
@@ -466,24 +650,34 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
 
         fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
             match statement {
-                Statement::Insert(insert) => {
-                    if let TableObject::TableName(name) = &insert.table {
-                        self.push_relation_unconditionally(name);
-                    }
-                }
+                Statement::Insert(insert) => match &insert.table {
+                    TableObject::TableName(name) => self.push_relation_unconditionally(name),
+                    TableObject::TableFunction(function) => self.push_function(function),
+                },
                 Statement::Update { table, .. } => {
                     self.push_table_factor_unconditionally(&table.relation);
                 }
                 Statement::Delete(delete) => {
-                    let from = match &delete.from {
-                        FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from) => from,
-                    };
-                    for table in from {
-                        self.push_table_factor_unconditionally(&table.relation);
+                    if delete.tables.is_empty() {
+                        let from = match &delete.from {
+                            FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from) => {
+                                from
+                            }
+                        };
+                        for table in from {
+                            self.push_table_factor_unconditionally(&table.relation);
+                        }
+                    } else {
+                        for table in &delete.tables {
+                            self.push_relation_unconditionally(table);
+                        }
                     }
                 }
                 Statement::Merge { table, .. } => {
                     self.push_table_factor_unconditionally(table);
+                }
+                Statement::Call(function) => {
+                    self.push_function(function);
                 }
                 _ => {}
             }
@@ -783,10 +977,20 @@ mod tests {
             r#"WITH "foo" AS (SELECT * FROM quoted_base) SELECT * FROM foo"#,
             r#"WITH bar AS (SELECT * FROM plain_base) SELECT * FROM "bar""#,
             r#"WITH "Caps" AS (SELECT * FROM caps_base) SELECT * FROM caps"#,
+            r#"WITH É AS (SELECT * FROM unicode_seed) SELECT * FROM "é""#,
             "WITH write_target AS (SELECT * FROM write_seed) INSERT INTO write_target VALUES (1)",
+            "INSERT INTO insertion_sink TABLE insertion_source",
             "TABLE shorthand",
             "TABLE public.qualified_shorthand",
+            "TABLE terminated;",
+            r#"TABLE "CaseTable""#,
+            r#"WITH caps_table AS (SELECT * FROM caps_table_seed) TABLE "CapsTable""#,
+            r#"WITH "QuotedTable" AS (SELECT * FROM quoted_table_seed) TABLE "QuotedTable""#,
+            r#"SELECT * FROM union_base UNION ALL TABLE "UnionTable""#,
             "SELECT $$ harmless TRACES('secret') $$ AS note FROM actual",
+            "CALL TRACES('called')",
+            r#"CALL "TRACES"('quoted_call')"#,
+            r#"SELECT * FROM "TRACES"('quoted_function')"#,
         ] {
             collect_sql_catalog_targets(sql, &mut targets);
         }
@@ -795,14 +999,21 @@ mod tests {
         assert_eq!(
             targets,
             [
+                "CapsTable",
+                "CaseTable",
                 "TRACES",
+                "UnionTable",
                 "actual",
                 "base",
+                "called",
                 "caps",
                 "caps_base",
+                "caps_table_seed",
                 "commented.table",
                 "events(2026)",
                 "extra",
+                "insertion_sink",
+                "insertion_source",
                 "later",
                 "left",
                 "ops",
@@ -810,14 +1021,19 @@ mod tests {
                 "plain_base",
                 "public.qualified_shorthand",
                 "quoted_base",
+                "quoted_table_seed",
                 "right",
                 "schema.orders",
                 "seed",
                 "shorthand",
                 "tenant.spaced",
+                "terminated",
+                "unicode_seed",
+                "union_base",
                 "write_seed",
                 "write_target",
                 "x",
+                "é",
             ]
         );
         assert!(!targets.contains(&"created_at".to_string()));
@@ -828,6 +1044,72 @@ mod tests {
         assert!(!targets.contains(&"foo".to_string()));
         assert!(!targets.contains(&"bar".to_string()));
         assert!(!targets.contains(&"secret".to_string()));
+        assert!(!targets.contains(&"quoted_call".to_string()));
+        assert!(!targets.contains(&"quoted_function".to_string()));
+
+        for malformed in ["TABLE guarded garbage", "TABLE guarded; SELECT"] {
+            let mut trailing = Vec::new();
+            collect_sql_catalog_targets(malformed, &mut trailing);
+            assert!(trailing.is_empty(), "{malformed}: {trailing:?}");
+        }
+    }
+
+    #[test]
+    fn delete_target_authority_distinguishes_multi_table_sources() {
+        let mut targets = Vec::new();
+        // GenericDialect rejects MySQL's multi-target form before traversal;
+        // keep the defensive Delete.tables branch for any future dialect
+        // broadening, without claiming unsupported syntax is accepted here.
+        collect_sql_catalog_targets("DELETE t FROM c JOIN t ON true", &mut targets);
+        assert!(targets.is_empty());
+
+        collect_sql_catalog_targets("WITH t AS (SELECT * FROM seed) DELETE FROM t", &mut targets);
+        targets.sort();
+        targets.dedup();
+        assert_eq!(targets, ["seed", "t"]);
+    }
+
+    #[test]
+    fn cte_authority_scope_handles_large_flat_with_list() {
+        const CTE_COUNT: usize = 512;
+        let definitions = (0..CTE_COUNT)
+            .map(|index| format!("c{index} AS (SELECT * FROM base{index})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("WITH {definitions} SELECT * FROM c511");
+        let mut targets = Vec::new();
+        collect_sql_catalog_targets(&sql, &mut targets);
+        targets.sort();
+        targets.dedup();
+
+        assert_eq!(targets.len(), CTE_COUNT);
+        assert!(targets.contains(&"base0".to_string()));
+        assert!(targets.contains(&"base511".to_string()));
+        assert!(!targets.contains(&"c511".to_string()));
+    }
+
+    #[test]
+    fn catalog_functions_are_collected_from_bare_function_ast_slots() {
+        let mut targets = Vec::new();
+        for sql in [
+            "CALL TRACES('called')",
+            "SELECT * FROM source |> CALL TRACES('piped')",
+        ] {
+            collect_sql_catalog_targets(sql, &mut targets);
+        }
+        targets.sort();
+        targets.dedup();
+        assert_eq!(targets, ["called", "piped", "source"]);
+
+        // GenericDialect rejects ClickHouse's TableObject::TableFunction
+        // syntax. The visitor still covers that AST slot defensively if the
+        // collector's configured dialect expands later.
+        targets.clear();
+        collect_sql_catalog_targets(
+            "INSERT INTO TABLE FUNCTION TRACES('inserted') VALUES (1)",
+            &mut targets,
+        );
+        assert!(targets.is_empty());
     }
 
     #[test]

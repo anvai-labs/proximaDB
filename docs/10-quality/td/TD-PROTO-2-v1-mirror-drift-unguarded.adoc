@@ -2031,12 +2031,14 @@ pinned + narrated:**
   former per-insert linear scan and its O(n^2) adversarial EXPLAIN cost.
   CTE visibility advances in declaration order: non-recursive definitions see
   only prior aliases, recursive definitions also see themselves, and the main
-  query sees the complete alias list. Per-scope normalized identifier sets
-  implement SQL quoted/unquoted identity without a relation-by-alias linear
-  scan.
+  query sees the complete alias list. A per-scope normalized alias-to-position
+  index plus an O(1) visibility bound implements SQL quoted/unquoted identity
+  without prefix rebuilding or a relation-by-alias linear scan.
   Extension-function arguments are collected from AST function nodes (including
   dollar/tagged-string safety), and write-target positions bypass read-side CTE
-  shadowing. PostgreSQL `TABLE name` set expressions are covered explicitly.
+  shadowing. PostgreSQL `TABLE name` set expressions are token-normalized into
+  equivalent AST relations before full reparsing, retaining identifier quote
+  style while rejecting malformed trailing tokens.
 
 == Not in scope
 
