@@ -289,24 +289,51 @@ async fn registered_models_search(
     // error (never silently ignored).
     let mut name_eq: Option<String> = None;
     let mut name_like: Option<String> = None;
+    // Tag predicates: the registry has no tag facet yet (the annotation
+    // facet ships with the native lifecycle surface), so = never matches
+    // and != matches everything — the absent-value semantics the MLflow
+    // 3.x client relies on: it appends
+    // `tag.`mlflow.prompt.is_prompt` != 'true'` to EVERY search to hide
+    // prompt models, and that clause must pass cleanly.
+    let mut tag_clauses: Vec<(String, String, bool)> = Vec::new();
     if let Some(filter) = &req.filter {
         for clause in super::split_filter_clauses(filter)? {
             let clause = clause.trim();
             let (field, op, value) = super::parse_filter_parts(clause, true)?;
-            match field.to_ascii_lowercase().as_str() {
-                "name" | "attributes.name" => match op.as_str() {
-                    "=" => name_eq = Some(value),
-                    "LIKE" => name_like = Some(value),
+            let field_lower = field.to_ascii_lowercase();
+            let tag_key = field_lower
+                .strip_prefix("tag.")
+                .or_else(|| field_lower.strip_prefix("tags."))
+                .map(|k| k.trim_matches('`').to_string());
+            if let Some(key) = tag_key {
+                if key.is_empty() {
+                    return Err(MlflowError::invalid("tag filter needs a key"));
+                }
+                match op.as_str() {
+                    "=" => tag_clauses.push((key, value, true)),
+                    "!=" => tag_clauses.push((key, value, false)),
                     other => {
                         return Err(MlflowError::invalid(format!(
-                            "name filter supports = / LIKE, got '{other}'"
+                            "tag filter supports = / !=, got '{other}'"
                         )));
                     }
-                },
-                _ => {
-                    return Err(MlflowError::invalid(format!(
-                        "unsupported registered-model filter clause '{clause}' (slice 3: name = / LIKE)"
-                    )));
+                }
+            } else {
+                match field_lower.as_str() {
+                    "name" | "attributes.name" => match op.as_str() {
+                        "=" => name_eq = Some(value),
+                        "LIKE" => name_like = Some(value),
+                        other => {
+                            return Err(MlflowError::invalid(format!(
+                                "name filter supports = / LIKE, got '{other}'"
+                            )));
+                        }
+                    },
+                    _ => {
+                        return Err(MlflowError::invalid(format!(
+                            "unsupported registered-model filter clause '{clause}'"
+                        )));
+                    }
                 }
             }
         }
@@ -319,6 +346,18 @@ async fn registered_models_search(
                 && name_like
                     .as_ref()
                     .is_none_or(|pat| super::like_match(&r.registry.name, pat))
+                && tag_clauses.iter().all(|(key, value, is_eq)| {
+                    // Absent tag: = false, != true. When the annotation
+                    // facet lands, read the value here instead of None.
+                    let present: Option<&String> = None;
+                    let _ = key;
+                    match (is_eq, present) {
+                        (true, Some(v)) => v == value,
+                        (true, None) => false,
+                        (false, Some(v)) => v != value,
+                        (false, None) => true,
+                    }
+                })
         })
         .map(registered_model_out)
         .collect();
