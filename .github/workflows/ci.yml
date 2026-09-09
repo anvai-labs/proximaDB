@@ -2004,11 +2004,16 @@ jobs:
         if: always()
         run: |
           set -eu
-          if [ -f /tmp/conformance.log ]; then
-            PASSED=$(grep -c '^PASS ' /tmp/conformance-2x.log || true)
+          RATCHET=$(cat clients/python/tests/mlflow_conformance_steps.txt)
+          PASSED=$(grep -c '^PASS ' /tmp/conformance-2x.log || true)
           PASSED3=$(grep -c '^PASS ' /tmp/conformance-3x.log || true)
+          echo "passed-2x=$PASSED passed-3x=$PASSED3 ratchet=$RATCHET"
+          if [ "$PASSED" -lt "$RATCHET" ]; then
+            echo "::error::MLflow 2.x conformance regressed: $PASSED < $RATCHET steps."
+            exit 1
+          fi
           if [ "$PASSED3" -lt "$RATCHET" ]; then
-            echo "::error::MLflow 3.x client conformance regressed: $PASSED3 < $RATCHET steps."
+            echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET steps."
             exit 1
           fi
           echo "passed-2x=$PASSED passed-3x=$PASSED3 ratchet=$RATCHET"
