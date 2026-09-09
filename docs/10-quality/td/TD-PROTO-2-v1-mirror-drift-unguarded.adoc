@@ -2029,6 +2029,14 @@ pinned + narrated:**
   underlying relations and quoted first-argument authorities remain visible.
   Both surfaces sort/dedup once after collection (O(n log n)), avoiding the
   former per-insert linear scan and its O(n^2) adversarial EXPLAIN cost.
+  CTE visibility advances in declaration order: non-recursive definitions see
+  only prior aliases, recursive definitions also see themselves, and the main
+  query sees the complete alias list. Per-scope normalized identifier sets
+  implement SQL quoted/unquoted identity without a relation-by-alias linear
+  scan.
+  Extension-function arguments are collected from AST function nodes (including
+  dollar/tagged-string safety), and write-target positions bypass read-side CTE
+  shadowing. PostgreSQL `TABLE name` set expressions are covered explicitly.
 
 == Not in scope
 

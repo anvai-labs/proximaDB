@@ -509,14 +509,6 @@ fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
     crate::core::utils::collect_sql_catalog_targets(sql, &mut targets);
 
-    // The REST twin's QUOTE-AWARE first-arg scanner — the hand-rolled
-    // split([',', ')']) here truncated quoted names at their first comma
-    // and trim_matches destroyed trailing doubled quotes before the
-    // decode. GRAPH_QUERY stays omitted (its cypher arg never resolves).
-    for function in crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS {
-        crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
-    }
-
     targets.sort();
     targets.dedup();
     targets

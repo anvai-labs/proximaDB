@@ -989,11 +989,6 @@ async fn explain_storage_authorities(
 
 fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
-
-    for function in crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS {
-        crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
-    }
-
     crate::core::utils::collect_sql_catalog_targets(sql, &mut targets);
     targets.sort();
     targets.dedup();
@@ -2501,21 +2496,14 @@ mod tests {
 
     #[test]
     fn explain_target_scanner_preserves_quoted_delimiters_and_skips_binds() {
-        let mut targets = Vec::new();
-        crate::core::utils::collect_quoted_first_args(
-            r#"VECTOR_SEARCH("tenant,west", '[0.5]', 5)"#,
-            "VECTOR_SEARCH",
-            &mut targets,
+        let targets = explain_catalog_targets(
+            r#"SELECT * FROM VECTOR_SEARCH("tenant,west", '[0.5]', 5);
+               SELECT * FROM DOCUMENT_QUERY("team""docs", '$.kind = article');
+               SELECT * FROM LOGS(unquoted_logs);
+               SELECT * FROM METRICS($1)"#,
         );
-        crate::core::utils::collect_quoted_first_args(
-            r#"DOCUMENT_QUERY("team""docs", '$.kind = article')"#,
-            "DOCUMENT_QUERY",
-            &mut targets,
-        );
-        crate::core::utils::collect_quoted_first_args("LOGS(unquoted_logs)", "LOGS", &mut targets);
-        crate::core::utils::collect_quoted_first_args("METRICS($1)", "METRICS", &mut targets);
 
-        assert_eq!(targets, ["tenant,west", "team\"docs", "unquoted_logs"]);
+        assert_eq!(targets, ["team\"docs", "tenant,west", "unquoted_logs"]);
     }
 
     #[test]
