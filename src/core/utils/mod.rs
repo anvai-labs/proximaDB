@@ -196,6 +196,8 @@ pub fn decode_identifier(ident: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(ident)
 }
 
+const MAX_SQL_AUTHORITY_BYTES: usize = 1_048_576;
+
 /// Discover catalog-backed relations through the pinned SQL parser's AST.
 /// This is deliberately shared by REST and the unified-query port so EXPLAIN
 /// reports the same storage authority on both surfaces. Invalid SQL yields no
@@ -211,7 +213,11 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
     use sqlparser::dialect::GenericDialect;
     use sqlparser::keywords::Keyword;
     use sqlparser::parser::Parser;
-    use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
+    use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
+
+    if sql.len() > MAX_SQL_AUTHORITY_BYTES {
+        return;
+    }
 
     let dialect = GenericDialect;
     let Ok(tokenized) = Tokenizer::new(&dialect, sql)
@@ -475,25 +481,44 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
         if rewrite.is_empty() {
             return None;
         }
-        let mut line_boundaries = vec![vec![0usize]];
-        for (byte_index, ch) in sql.char_indices() {
-            let after = byte_index + ch.len_utf8();
-            if ch == '\n' {
-                line_boundaries.push(vec![after]);
-            } else if let Some(line) = line_boundaries.last_mut() {
-                line.push(after);
+        let spans = rewrite
+            .iter()
+            .map(|token_index| tokenized.get(*token_index).map(|entry| entry.span))
+            .collect::<Option<Vec<_>>>()?;
+        let mut requested_locations = spans
+            .iter()
+            .flat_map(|span| [span.start, span.end])
+            .collect::<Vec<_>>();
+        requested_locations.sort_unstable();
+        requested_locations.dedup();
+        let mut requested_offsets = vec![None; requested_locations.len()];
+        let mut requested_index = 0usize;
+        let mut record_offset = |location: Location, byte_offset: usize| {
+            if requested_locations.get(requested_index) == Some(&location) {
+                requested_offsets[requested_index] = Some(byte_offset);
+                requested_index += 1;
             }
+        };
+        let mut location = Location::new(1, 1);
+        record_offset(location, 0);
+        for (byte_index, ch) in sql.char_indices() {
+            if ch == '\n' {
+                location.line += 1;
+                location.column = 1;
+            } else {
+                location.column += 1;
+            }
+            record_offset(location, byte_index + ch.len_utf8());
         }
-        let byte_offset = |location: sqlparser::tokenizer::Location| {
-            let line = usize::try_from(location.line).ok()?.checked_sub(1)?;
-            let column = usize::try_from(location.column).ok()?.checked_sub(1)?;
-            line_boundaries.get(line)?.get(column).copied()
+        drop(record_offset);
+        let byte_offset = |location: Location| {
+            let index = requested_locations.binary_search(&location).ok()?;
+            requested_offsets.get(index).copied().flatten()
         };
         let mut rewritten = String::with_capacity(sql.len());
         let mut cursor = 0usize;
         let rewrite_count = rewrite.len();
-        for token_index in rewrite {
-            let span = tokenized.get(token_index)?.span;
+        for span in spans {
             let start = byte_offset(span.start)?;
             let end = byte_offset(span.end)?;
             if start < cursor || end < start {
@@ -1094,7 +1119,10 @@ mod tests {
         );
     }
 
-    use super::{collect_sql_catalog_targets, finite_f32, inject_graph_target_into_cypher};
+    use super::{
+        MAX_SQL_AUTHORITY_BYTES, collect_sql_catalog_targets, finite_f32,
+        inject_graph_target_into_cypher,
+    };
 
     #[test]
     fn sql_target_scanner_uses_ast_relation_context() {
@@ -1285,6 +1313,13 @@ mod tests {
 
         let deeply_nested = format!("{}SELECT * FROM hidden{}", "(".repeat(129), ")".repeat(129));
         collect_sql_catalog_targets(&deeply_nested, &mut targets);
+        assert!(targets.is_empty());
+
+        let oversized_literal = format!(
+            "TABLE visible UNION ALL SELECT '{}' FROM hidden",
+            "x".repeat(MAX_SQL_AUTHORITY_BYTES)
+        );
+        collect_sql_catalog_targets(&oversized_literal, &mut targets);
         assert!(targets.is_empty());
     }
 
