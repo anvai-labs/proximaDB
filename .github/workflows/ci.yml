@@ -2016,20 +2016,6 @@ jobs:
             echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET steps."
             exit 1
           fi
-          if [ "$PASSED3" -lt "$RATCHET" ]; then
-            echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET steps."
-            exit 1
-          fi
-          echo "passed-2x=$PASSED passed-3x=$PASSED3 ratchet=$RATCHET"
-          else
-            PASSED=0
-          fi
-          RATCHET=$(cat clients/python/tests/mlflow_conformance_steps.txt)
-          echo "passed=$PASSED ratchet=$RATCHET"
-          if [ "$PASSED" -lt "$RATCHET" ]; then
-            echo "::error::MLflow conformance regressed: $PASSED < $RATCHET steps. If intentional, lower the ratchet in the same PR with justification."
-            exit 1
-          fi
 
   rust-integration-test-authz:
     name: Rust Integration Tests (authz e2e)
