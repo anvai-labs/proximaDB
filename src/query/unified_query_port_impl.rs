@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use proximadb_data_model::ProximaValue;
-use proximadb_runtime::UnifiedQueryPort;
+use proximadb_runtime::{InvalidQueryInput, UnifiedQueryPort};
 // The FILTER-lowering spelling (int-array binary, ns temporals) — named
 // for what it IS, mirroring the SqlValue twin sql_value_to_filter_literal;
 // the canonical (base64) renderer lives in records under a different name.
@@ -507,38 +507,11 @@ impl UnifiedQueryPortImpl {
 
 fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
-    let normalized = sql.replace(['\n', '\t', ',', '(', ')'], " ");
-    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    crate::core::utils::collect_sql_catalog_targets(sql, &mut targets);
 
-    for window in tokens.windows(2) {
-        if let [keyword, target] = window {
-            let keyword = keyword.trim_matches('"').to_ascii_uppercase();
-            if matches!(keyword.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE")
-                && !target.starts_with('$')
-            {
-                targets.push(target.trim_matches('"').trim_end_matches(';').to_string());
-            }
-        }
-    }
-
-    // The REST twin's QUOTE-AWARE first-arg scanner — the hand-rolled
-    // split([',', ')']) here truncated quoted names at their first comma
-    // and trim_matches destroyed trailing doubled quotes before the
-    // decode. GRAPH_QUERY stays omitted (its cypher arg never resolves).
-    for function in crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS {
-        crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
-    }
-
+    targets.sort();
+    targets.dedup();
     targets
-        .into_iter()
-        .filter(|target| {
-            let upper = target.to_ascii_uppercase();
-            !matches!(
-                upper.as_str(),
-                "SELECT" | "WHERE" | "ON" | "AS" | "LATERAL" | "UNNEST"
-            )
-        })
-        .collect()
 }
 
 #[async_trait]
@@ -580,17 +553,7 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         // Sibling of multimodal_query::convert_multi_model_to_sql (it already
         // shares inject_graph_target_into_cypher; tracked: consolidate the
         // twins — their defaults and limit handling still diverge).
-        let sql = match json_to_multi_model_sql(&request)? {
-            Some(sql) => sql,
-            None => {
-                // Fallback: treat "query" field as raw SQL, or use a SELECT 1.
-                request
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("SELECT 1")
-                    .to_string()
-            }
-        };
+        let sql = multi_model_sql_from_request(&request)?;
         // chars().take — a byte-indexed slice can land mid-character in
         // the user-controlled cypher/collection text now spliced verbatim.
         info!(
@@ -733,6 +696,31 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
     }
 }
 
+fn multi_model_sql_from_request(request: &serde_json::Value) -> Result<String> {
+    match json_to_multi_model_sql(request)
+        .map_err(|error| InvalidQueryInput(error.to_string()))?
+    {
+        Some(sql) => Ok(sql),
+        // None unambiguously means 'not a multi-model request' (the
+        // callee errs on every components-present shape — empty,
+        // malformed, unknown — since round 41). The raw-query fallback
+        // must still be explicit and typed; invalid JSON must never become
+        // a successful broad `SELECT 1`.
+        None => request
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .filter(|query| !query.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                InvalidQueryInput(
+                    "multi-model request without components must include a non-empty string 'query' field"
+                        .to_string(),
+                )
+                .into()
+            }),
+    }
+}
+
 // ── Multi-model JSON → SQL conversion ────────────────────────────────────────
 
 /// Convert a multi-model query JSON to a federated SQL string.
@@ -748,9 +736,16 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
         .as_array()
         .ok_or_else(|| anyhow!("components must be an array"))?;
     if components.is_empty() {
-        return Ok(None);
+        // Err, not Ok(None): None must unambiguously mean 'not a
+        // multi-model request' — the caller-side components-present
+        // guard (raw-JSON re-inspection) was dropped once by a
+        // restructure and returned SELECT-1 garbage.
+        return Err(anyhow!(
+            "multi-model request contained no components that could be lowered"
+        ));
     }
     let mut parts = Vec::new();
+    let empty_config = serde_json::Map::new();
     for (component_index, component) in components.iter().enumerate() {
         let ctype = component
             .get("component_type")
@@ -758,7 +753,12 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
             .ok_or_else(|| {
                 anyhow!("components[{component_index}].component_type must be a string")
             })?;
-        let config = component.get("config").cloned().unwrap_or_default();
+        let config = match component.get("config") {
+            Some(value) => value
+                .as_object()
+                .ok_or_else(|| anyhow!("components[{component_index}].config must be an object"))?,
+            None => &empty_config,
+        };
         let sql_part = match ctype {
             "vector" => {
                 let collection = config
@@ -861,9 +861,15 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
                 )
             }
             "graph" => {
+                // Typed (the silent-default class).
                 let cypher = config
                     .get("cypher")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!("components[{component_index}].config.cypher must be a string")
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("MATCH (n) RETURN n LIMIT 10");
                 // Honor config.graph like the v1 twin — without the
                 // injection the query silently targets the DEFAULT graph.
@@ -886,7 +892,14 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
             "observability" | "log" | "metric" => {
                 let namespace = config
                     .get("namespace")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            anyhow!(
+                                "components[{component_index}].config.namespace must be a string"
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("default");
                 let table = match ctype {
                     "metric" => "METRICS",
@@ -903,9 +916,9 @@ fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {
         parts.push(sql_part);
     }
 
-    if parts.is_empty() {
-        return Ok(None);
-    }
+    // parts cannot be empty: a present components array with zero
+    // entries errs above, and every present component either errs or
+    // pushes (the dead Ok(None) arm here was the ambiguous-None trap).
 
     // Single component: use directly; multiple: UNION ALL
     if parts.len() == 1 {
@@ -1104,6 +1117,33 @@ mod tests {
     }
 
     #[test]
+    fn explain_skips_function_call_positions() {
+        // Paren-bearing tokens are function-call positions, not catalog
+        // targets — and a subquery's closing paren must NOT lose its
+        // target.
+        for query in [
+            "SELECT * FROM TRACES('ops') WHERE EXISTS (SELECT 1 FROM orders)",
+            "SELECT * FROM TRACES ('ops') WHERE EXISTS (SELECT 1 FROM orders)",
+            "SELECT * FROM TRACES ( 'ops') WHERE EXISTS (SELECT 1 FROM orders)",
+        ] {
+            let targets = explain_catalog_targets(query);
+            assert!(!targets.iter().any(|t| t == "TRACES"), "got {targets:?}");
+            assert!(targets.iter().any(|t| t == "orders"), "got {targets:?}");
+            assert!(targets.iter().any(|t| t == "ops"), "got {targets:?}");
+        }
+
+        let targets = explain_catalog_targets(
+            r#"INSERT INTO orders(id) VALUES (1); INSERT INTO "events(2026)"(id) VALUES (1); SELECT 1 FROM (SELECT * FROM "archive")"#,
+        );
+        assert!(targets.iter().any(|t| t == "orders"), "got {targets:?}");
+        assert!(
+            targets.iter().any(|t| t == "events(2026)"),
+            "got {targets:?}"
+        );
+        assert!(targets.iter().any(|t| t == "archive"), "got {targets:?}");
+    }
+
+    #[test]
     fn test_json_to_multi_model_sql_vector() {
         let req = serde_json::json!({
             "components": [
@@ -1215,14 +1255,50 @@ mod tests {
 
     #[test]
     fn test_json_to_multi_model_sql_empty_components() {
-        let req = serde_json::json!({ "components": [] });
-        assert!(json_to_multi_model_sql(&req).unwrap().is_none());
+        // Err (not Ok(None)) since round 41 — None must mean 'not a
+        // multi-model request' only.
+        let req = serde_json::json!({"components": []});
+        let err = json_to_multi_model_sql(&req).unwrap_err();
+        assert!(err.to_string().contains("no components"));
+    }
+
+    #[test]
+    fn json_to_multi_model_sql_rejects_non_object_config() {
+        for component_type in ["graph", "log", "metric"] {
+            for config in [
+                serde_json::json!([]),
+                serde_json::json!(42),
+                serde_json::Value::Null,
+            ] {
+                let req = serde_json::json!({
+                    "components": [{"component_type": component_type, "config": config}]
+                });
+                let error = json_to_multi_model_sql(&req)
+                    .expect_err("a supplied component config must be an object");
+                assert!(error.to_string().contains("config must be an object"));
+            }
+        }
     }
 
     #[test]
     fn test_json_to_multi_model_sql_no_components_field() {
         let req = serde_json::json!({ "query": "SELECT 1" });
         assert!(json_to_multi_model_sql(&req).unwrap().is_none());
+        assert_eq!(multi_model_sql_from_request(&req).unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn multi_model_sql_requires_typed_non_empty_raw_query() {
+        for req in [
+            serde_json::json!({}),
+            serde_json::json!({"query": 42}),
+            serde_json::json!({"query": null}),
+            serde_json::json!({"query": "  "}),
+        ] {
+            let error = multi_model_sql_from_request(&req)
+                .expect_err("missing or malformed raw query must fail closed");
+            assert!(error.downcast_ref::<InvalidQueryInput>().is_some());
+        }
     }
 
     #[test]
@@ -1235,6 +1311,44 @@ mod tests {
         assert!(targets.contains(&"default.docs".to_string()));
         assert!(targets.contains(&"graph.edges".to_string()));
         assert!(targets.contains(&"vectors".to_string()));
+
+        let quoted = explain_catalog_targets(
+            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data"; SELECT * FROM "events(2026)"; SELECT * FROM "schema"."table""#,
+        );
+        assert!(quoted.contains(&"team\"logs".to_string()), "got {quoted:?}");
+        assert!(
+            quoted.contains(&"tenant,west".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"archive data".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"events(2026)".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"schema.table".to_string()),
+            "got {quoted:?}"
+        );
+
+        let quoted_keyword =
+            explain_catalog_targets(r#"SELECT 1 AS "FROM" FROM actual; SELECT * FROM "SELECT""#);
+        assert!(quoted_keyword.contains(&"actual".to_string()));
+        assert!(quoted_keyword.contains(&"SELECT".to_string()));
+
+        let quoted_function_arg = explain_catalog_targets("SELECT * FROM TRACES('SELECT')");
+        assert_eq!(quoted_function_arg, ["SELECT"]);
+
+        let adjacent = explain_catalog_targets(
+            r#"SELECT*FROM "orders"; INSERT INTO"events(2026)"(id) VALUES (1)"#,
+        );
+        assert!(adjacent.contains(&"orders".to_string()), "got {adjacent:?}");
+        assert!(
+            adjacent.contains(&"events(2026)".to_string()),
+            "got {adjacent:?}"
+        );
     }
 
     #[test]

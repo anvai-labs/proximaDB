@@ -157,22 +157,24 @@ fn strip_distinct_prefix(clause: &str) -> Option<&str> {
         .and_then(|r| r.strip_suffix(')'))
         .filter(|inner| !inner.is_empty())
         .filter(|inner| {
-            // Only strip when the leading paren CLOSES at the end —
-            // '(price), (tax)' and 'DISTINCT(a)-(b)' were gutted.
-            let mut depth = 0i32;
-            for (i, b) in inner.bytes().enumerate() {
+            // Only strip when the leading paren (already stripped) closes
+            // EXACTLY at the end — depth starts at 1 for it; hitting 0
+            // early ('(price), (tax)') or ending ≠1 ('DISTINCT(a)-(b)')
+            // keeps the text intact.
+            let mut depth = 1i32;
+            for b in inner.bytes() {
                 match b {
                     b'(' => depth += 1,
                     b')' => {
                         depth -= 1;
-                        if depth == 0 && i + 1 < inner.len() {
-                            return false; // closed mid-operand
+                        if depth == 0 {
+                            return false; // the leading paren closed early
                         }
                     }
                     _ => {}
                 }
             }
-            depth == 0
+            depth == 1
         })
     {
         return Some(inner.trim());
@@ -513,6 +515,21 @@ pub(crate) fn parse_predicate_value(raw: &str) -> Option<PredicateValue> {
 
 #[cfg(test)]
 mod scanner_tests {
+    #[test]
+    fn distinct_paren_shapes_are_preserved() {
+        use super::strip_distinct_prefix;
+        // Balanced whole-operand parens strip; composite shapes keep the
+        // text INTACT (the inert check gutted them to 'price), (tax').
+        assert_eq!(strip_distinct_prefix("DISTINCT (a)"), Some("a"));
+        assert_eq!(strip_distinct_prefix("DISTINCT(a)"), Some("a"));
+        assert_eq!(
+            strip_distinct_prefix("DISTINCT (price), (tax)"),
+            Some("(price), (tax)")
+        );
+        assert_eq!(strip_distinct_prefix("DISTINCT(a)-(b)"), Some("(a)-(b)"));
+        assert_eq!(strip_distinct_prefix("DISTINCT id"), Some("id"));
+    }
+
     use super::{
         AggregateFunction, extract_order_by, extract_select_items, extract_where_predicate,
         find_top_level_keyword, find_top_level_operator, parse_aggregate_expr,

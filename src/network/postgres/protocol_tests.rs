@@ -4,6 +4,139 @@ use crate::query::multimodal_router;
 use proximadb_records::{ProximaRecord, ProximaTreeNode};
 
 #[test]
+fn extract_where_handles_trailing_where_and_prefixed_columns() {
+    // WHERE ending the string must not panic (the -1/+7 dance sliced one
+    // past the end — abort-class under panic=abort).
+    for trailing in [
+        "SELECT ' WHERE ' FROM t WHERE",
+        "SELECT * FROM t WHERE\n",
+        "SELECT * FROM t WHERE\t",
+        "SELECT * FROM t WHERE\u{2003}",
+        "SELECT * FROM t WHERE\u{00a0}",
+        "SELECT * FROM t WHERE/* comment */",
+    ] {
+        assert!(PostgresProtocol::extract_select_where_clause(trailing).is_some());
+        assert!(PostgresProtocol::extract_select_where_predicates(trailing).is_none());
+        assert!(PostgresProtocol::extract_legacy_select_predicates(trailing).is_err());
+    }
+
+    // A 'limit_val' column must not shadow a later real LIMIT terminator.
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT * FROM t WHERE limit_val > 5 LIMIT 3",
+    );
+    assert_eq!(predicate, Some("limit_val > 5"));
+
+    // Clause keywords used as qualified identifiers are not clauses. The
+    // scanner must continue to the real top-level WHERE/ORDER BY tokens.
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT t.where FROM t WHERE t.limit > 5 ORDER BY t.id",
+    );
+    assert_eq!(predicate, Some("t.limit > 5"));
+
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT COUNT(*) FILTER (WHERE active) FROM t WHERE id = 7",
+    );
+    assert_eq!(predicate, Some("id = 7"));
+
+    for malformed in [
+        "SELECT * FROM t ( WHERE id = 7",
+        "SELECT * FROM t )",
+        "SELECT * FROM t (]",
+        "SELECT * FROM t ' \" WHERE id = 7",
+        "SELECT * FROM t /* WHERE id = 7",
+        "SELECT * FROM t WHERE id = 1 LIMIT 2 (",
+        "SELECT * FROM t WHERE id = 1 LIMIT 2 /* unterminated",
+    ] {
+        assert!(
+            PostgresProtocol::extract_legacy_select_predicates(malformed).is_err(),
+            "malformed structure must not become an unfiltered scan: {malformed}"
+        );
+    }
+    assert!(
+        PostgresProtocol::extract_legacy_select_predicates("SELECT somewhere FROM t")
+            .expect("an identifier containing WHERE is still WHERE-less")
+            .is_empty()
+    );
+}
+
+#[test]
+fn clean_identifier_respects_quoted_qualified_segments() {
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#""meta.score""#),
+        "meta.score"
+    );
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#"schema."meta.score""#),
+        "meta.score"
+    );
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#""schema"."score""#),
+        "score"
+    );
+}
+
+#[test]
+fn legacy_create_table_target_rejects_missing_or_unterminated_names() {
+    for query in [
+        "CREATE TABLE IF NOT EXISTS /* unterminated USING VECTOR",
+        "CREATE TABLE -- USING VECTOR",
+        "CREATE TABLE IF NOT EXISTS",
+        "CREATE TABLE USING VECTOR",
+        "CREATE TABLE IF NOT EXISTS USING VECTOR",
+        "CREATE TABLE /* comment-only */ USING VECTOR",
+        "CREATE TABLE (id INT) USING VECTOR",
+        "CREATE TABLE \"unterminated USING VECTOR",
+        "CREATE TABLE `unterminated USING VECTOR",
+        "CREATE TABLE ; USING VECTOR",
+        "CREATE TABLE ) USING VECTOR",
+        "CREATE TABLE , USING VECTOR",
+        "CREATE TABLE 123 USING VECTOR",
+        "CREATE TABLE foo-bar USING VECTOR",
+    ] {
+        let error = PostgresProtocol::extract_legacy_create_table_target(query)
+            .expect_err("malformed CREATE TABLE must fail closed");
+        assert!(
+            error.to_string().contains("valid table name"),
+            "got: {error}"
+        );
+    }
+
+    assert_eq!(
+        PostgresProtocol::extract_legacy_create_table_target(
+            "CREATE TABLE /* v2 */ IF NOT EXISTS `logs` USING VECTOR"
+        )
+        .expect("valid comment-separated target"),
+        ("logs".to_string(), true)
+    );
+    assert_eq!(
+        PostgresProtocol::extract_legacy_create_table_target(
+            "CREATE TABLE IF NOT EXISTS \"Team Logs\" (id INT) USING VECTOR"
+        )
+        .expect("quoted target may contain whitespace"),
+        ("team logs".to_string(), true)
+    );
+    assert_eq!(
+        PostgresProtocol::extract_legacy_create_table_target(
+            "CREATE TABLE IF NOT EXISTS \"team\"\"logs\" (id INT) USING VECTOR"
+        )
+        .expect("doubled quote escapes one identifier delimiter"),
+        ("team\"logs".to_string(), true)
+    );
+    for query in [
+        "CREATE TABLE IF\nNOT EXISTS logs USING VECTOR",
+        "CREATE TABLE IF\u{00a0}NOT\tEXISTS logs USING VECTOR",
+        "CREATE TABLE IF /* one */ NOT /* two */ EXISTS logs USING VECTOR",
+        "CREATE TABLE IF NOT EXISTS-- note\nlogs USING VECTOR",
+    ] {
+        assert_eq!(
+            PostgresProtocol::extract_legacy_create_table_target(query)
+                .expect("SQL trivia may separate IF NOT EXISTS"),
+            ("logs".to_string(), true)
+        );
+    }
+}
+
+#[test]
 fn document_json_output_preserves_jsonb_fields() {
     let document = serde_json::json!({"profile": {"tier": "gold"}});
     let object = crate::proto::proximadb_v1::SqlObject {

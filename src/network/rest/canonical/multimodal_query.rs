@@ -673,10 +673,15 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
     let mut sql_parts = Vec::new();
 
     for component in &request.components {
+        let config = component.config.as_object().ok_or_else(|| {
+            ApiError::InvalidArgument(format!(
+                "{} component config must be an object",
+                component.component_type
+            ))
+        })?;
         let sql_part = match component.component_type.as_str() {
             "vector" => {
-                let collection = component
-                    .config
+                let collection = config
                     .get("collection")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -691,8 +696,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                             "vector component config.collection is required".to_string(),
                         )
                     })?;
-                let query_values = component
-                    .config
+                let query_values = config
                     .get("query_vector")
                     .ok_or_else(|| {
                         ApiError::InvalidArgument(
@@ -736,8 +740,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 };
                 // Typed: a string top_k silently baked the default (the
                 // silent-default class rounds 19-20 fixed for siblings).
-                let top_k = component
-                    .config
+                let top_k = config
                     .get("top_k")
                     .map(|v| {
                         v.as_u64().ok_or_else(|| {
@@ -760,8 +763,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
             "document" => {
                 // Fail-closed (the PR's direction for silent defaults —
                 // and the strict twin's test): the collection is REQUIRED.
-                let collection = component
-                    .config
+                let collection = config
                     .get("collection")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -776,8 +778,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                             "document component config.collection is required".to_string(),
                         )
                     })?;
-                let filter = component
-                    .config
+                let filter = config
                     .get("filter")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -798,8 +799,7 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                 )
             }
             "graph" => {
-                let graph = component
-                    .config
+                let graph = config
                     .get("graph")
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
@@ -810,29 +810,49 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
                     })
                     .transpose()?
                     .unwrap_or("default");
-                let cypher = component
-                    .config
+                // Typed (the silent-default class — an object-shaped
+                // cypher silently ran the default query).
+                let cypher = config
                     .get("cypher")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "graph component config.cypher must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("MATCH (n) RETURN n");
                 let cypher = crate::core::utils::inject_graph_target_into_cypher(graph, cypher);
 
                 format!("SELECT * FROM GRAPH_QUERY('{}')", escape_sql_text(&cypher))
             }
             "log" => {
-                let namespace = component
-                    .config
+                let namespace = config
                     .get("namespace")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "component config.namespace must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("default");
 
                 format!("SELECT * FROM LOGS('{}')", escape_sql_text(namespace))
             }
             "metric" => {
-                let namespace = component
-                    .config
+                let namespace = config
                     .get("namespace")
-                    .and_then(|v| v.as_str())
+                    .map(|v| {
+                        v.as_str().ok_or_else(|| {
+                            ApiError::InvalidArgument(
+                                "component config.namespace must be a string".to_string(),
+                            )
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or("default");
 
                 format!("SELECT * FROM METRICS('{}')", escape_sql_text(namespace))
@@ -845,6 +865,15 @@ fn convert_multi_model_to_sql(request: &MultiModelQueryRequest) -> ApiResult<Str
             }
         };
         sql_parts.push(sql_part);
+    }
+
+    // Fail closed on an EMPTY components array (parity with the port
+    // twin's caller guard — empty SQL reached the federated engine and
+    // 500'd).
+    if sql_parts.is_empty() {
+        return Err(ApiError::InvalidArgument(
+            "multi-model request contained no components that could be lowered".to_string(),
+        ));
     }
 
     // Combine with UNION based on fusion strategy
@@ -960,40 +989,10 @@ async fn explain_storage_authorities(
 
 fn explain_catalog_targets(sql: &str) -> Vec<String> {
     let mut targets = Vec::new();
-
-    for function in crate::core::utils::CATALOG_FIRST_ARG_FUNCTIONS {
-        crate::core::utils::collect_quoted_first_args(sql, function, &mut targets);
-    }
-
-    collect_from_targets(sql, &mut targets);
+    crate::core::utils::collect_sql_catalog_targets(sql, &mut targets);
+    targets.sort();
     targets.dedup();
     targets
-}
-
-fn collect_from_targets(sql: &str, targets: &mut Vec<String>) {
-    let mut previous_was_from = false;
-    for token in sql.split_whitespace() {
-        if previous_was_from {
-            let candidate =
-                token.trim_matches(|ch: char| matches!(ch, ',' | ';' | '"' | '`' | '[' | ']'));
-            if !candidate.is_empty()
-                && !candidate.contains('(')
-                && !candidate.eq_ignore_ascii_case("SELECT")
-            {
-                push_unique_target(targets, candidate);
-            }
-            previous_was_from = false;
-            continue;
-        }
-
-        previous_was_from = token.eq_ignore_ascii_case("FROM")
-    }
-}
-
-fn push_unique_target(targets: &mut Vec<String>, value: &str) {
-    if !targets.iter().any(|existing| existing == value) {
-        targets.push(value.to_string());
-    }
 }
 
 /// Parse fusion strategy from string
@@ -2291,6 +2290,29 @@ mod tests {
     }
 
     #[test]
+    fn multi_model_sql_conversion_rejects_non_object_config() {
+        for component_type in ["graph", "log", "metric"] {
+            for config in [
+                serde_json::json!([]),
+                serde_json::json!(42),
+                serde_json::Value::Null,
+            ] {
+                let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
+                    "components": [{
+                        "component_type": component_type,
+                        "config": config
+                    }]
+                }))
+                .expect("request shape should deserialize");
+
+                let error = convert_multi_model_to_sql(&request)
+                    .expect_err("a supplied component config must be an object");
+                assert!(error.to_string().contains("config must be an object"));
+            }
+        }
+    }
+
+    #[test]
     fn document_component_requires_collection() {
         let request: MultiModelQueryRequest = serde_json::from_value(serde_json::json!({
             "components": [{
@@ -2427,38 +2449,118 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                "products".to_string(),
                 "docs".to_string(),
-                "events".to_string()
+                "events".to_string(),
+                "products".to_string()
             ]
         );
     }
 
     #[test]
-    fn explain_target_scanner_preserves_quoted_delimiters_and_skips_binds() {
-        let mut targets = Vec::new();
-        crate::core::utils::collect_quoted_first_args(
-            r#"VECTOR_SEARCH("tenant,west", '[0.5]', 5)"#,
-            "VECTOR_SEARCH",
-            &mut targets,
-        );
-        crate::core::utils::collect_quoted_first_args(
-            r#"DOCUMENT_QUERY("team""docs", '$.kind = article')"#,
-            "DOCUMENT_QUERY",
-            &mut targets,
-        );
-        crate::core::utils::collect_quoted_first_args("LOGS(unquoted_logs)", "LOGS", &mut targets);
-        crate::core::utils::collect_quoted_first_args("METRICS($1)", "METRICS", &mut targets);
+    fn empty_components_fail_closed() {
+        let request = MultiModelQueryRequest {
+            components: vec![],
+            fusion_strategy: default_fusion(),
+            limit: None,
+        };
+        let err = convert_multi_model_to_sql(&request).unwrap_err();
+        assert!(err.to_string().contains("no components"), "got: {err}");
+    }
 
-        assert_eq!(targets, ["tenant,west", "team\"docs", "unquoted_logs"]);
+    #[test]
+    fn non_string_cypher_and_namespace_fail_closed() {
+        let mk = |component_type: &str, config: serde_json::Value| MultiModelQueryRequest {
+            components: vec![QueryComponentRequest {
+                component_type: component_type.to_string(),
+                config,
+            }],
+            fusion_strategy: default_fusion(),
+            limit: None,
+        };
+        let graph = mk("graph", serde_json::json!({"cypher": {"match": "n"}}));
+        assert!(
+            convert_multi_model_to_sql(&graph)
+                .unwrap_err()
+                .to_string()
+                .contains("cypher must be a string")
+        );
+
+        let logs = mk("log", serde_json::json!({"namespace": 42}));
+        assert!(
+            convert_multi_model_to_sql(&logs)
+                .unwrap_err()
+                .to_string()
+                .contains("namespace must be a string")
+        );
+    }
+
+    #[test]
+    fn explain_target_scanner_preserves_quoted_delimiters_and_skips_binds() {
+        let targets = explain_catalog_targets(
+            r#"SELECT * FROM VECTOR_SEARCH("tenant,west", '[0.5]', 5);
+               SELECT * FROM DOCUMENT_QUERY("team""docs", '$.kind = article');
+               SELECT * FROM LOGS(unquoted_logs);
+               SELECT * FROM METRICS($1)"#,
+        );
+
+        assert_eq!(targets, ["team\"docs", "tenant,west", "unquoted_logs"]);
     }
 
     #[test]
     fn explain_catalog_targets_include_traces_and_rerank() {
         let targets = explain_catalog_targets(
-            "SELECT * FROM TRACES('ops') UNION ALL SELECT * FROM RERANK('docs', 'q', '[0.5]', 5)",
+            "SELECT * FROM TRACES ('ops') UNION ALL SELECT * FROM RERANK('docs', 'q', '[0.5]', 5) \
+             UNION ALL SELECT * FROM (SELECT * FROM \"archive\")",
         );
         assert!(targets.contains(&"ops".to_string()));
         assert!(targets.contains(&"docs".to_string()));
+        assert!(targets.contains(&"archive".to_string()));
+        assert!(!targets.contains(&"TRACES".to_string()));
+
+        let quoted = explain_catalog_targets(
+            r#"SELECT * FROM "team""logs"; SELECT * FROM "tenant,west"; SELECT * FROM "archive data"; SELECT * FROM "events(2026)"; SELECT * FROM "schema"."table""#,
+        );
+        assert!(quoted.contains(&"team\"logs".to_string()), "got {quoted:?}");
+        assert!(
+            quoted.contains(&"tenant,west".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"archive data".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"events(2026)".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            quoted.contains(&"schema.table".to_string()),
+            "got {quoted:?}"
+        );
+        assert!(
+            explain_catalog_targets(r#"SELECT * FROM "SELECT""#).contains(&"SELECT".to_string())
+        );
+
+        let writes_and_join = explain_catalog_targets(
+            "INSERT INTO orders(id) VALUES (1); INSERT INTO \"events(2026)\"(id) VALUES (1); \
+             UPDATE inventory SET n = 1; \
+             SELECT * FROM docs JOIN archive ON docs.id = archive.id",
+        );
+        for expected in ["orders", "events(2026)", "inventory", "docs", "archive"] {
+            assert!(
+                writes_and_join.contains(&expected.to_string()),
+                "missing {expected}: {writes_and_join:?}"
+            );
+        }
+
+        let adjacent = explain_catalog_targets(
+            r#"SELECT*FROM "orders"; INSERT INTO"events(2026)"(id) VALUES (1)"#,
+        );
+        for expected in ["orders", "events(2026)"] {
+            assert!(
+                adjacent.contains(&expected.to_string()),
+                "missing {expected}: {adjacent:?}"
+            );
+        }
     }
 }

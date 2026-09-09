@@ -1666,7 +1666,13 @@ impl PostgresProtocol {
                     {
                         Ok(result) => {
                             if upper.starts_with("CREATE TABLE")
-                                && let Some(table_name) = self.extract_create_table_name(query)
+                                // The AST name (quoted/mixed-case names
+                                // diverged from string extraction — a stray
+                                // backing collection was minted while the
+                                // real table got none). Under
+                                // upper.starts_with("CREATE TABLE") with a
+                                // parsed statement it is ALWAYS Some.
+                                && let Some(table_name) = ddl_table.clone()
                             {
                                 self.ensure_relational_backing_collection(
                                     &table_name,
@@ -1761,20 +1767,6 @@ impl PostgresProtocol {
 
         // Handle other commands
         self.send_command_complete("OK").await
-    }
-
-    fn extract_create_table_name(&self, query: &str) -> Option<String> {
-        let table_pos = find_ascii_ci(query, "CREATE TABLE")?;
-        let after_table = query[table_pos + "CREATE TABLE".len()..].trim_start();
-        let after_table = after_table
-            .strip_prefix("IF NOT EXISTS")
-            .map(str::trim_start)
-            .unwrap_or(after_table);
-        let table_end = after_table
-            .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
-            .unwrap_or(after_table.len());
-        let table_name = Self::clean_identifier(&after_table[..table_end]);
-        (!table_name.is_empty()).then_some(table_name.to_lowercase())
     }
 
     async fn ensure_relational_backing_collection(
@@ -2370,7 +2362,8 @@ impl PostgresProtocol {
         if table.is_empty() {
             None
         } else {
-            Some(table.trim_matches('"').to_string())
+            // The ONE shared decoder (create/read symmetric).
+            Some(crate::core::utils::decode_identifier(table).to_string())
         }
     }
 
@@ -2445,6 +2438,9 @@ impl PostgresProtocol {
 
     fn extract_select_where_predicates(query: &str) -> Option<Vec<SelectPredicate>> {
         let predicate = Self::extract_select_where_clause(query)?;
+        if predicate.is_empty() {
+            return None;
+        }
 
         // OR detected: try to fold `col = v1 OR col = v2` into `col IN (v1, v2)`.
         // Mixed-column OR, non-equality OR, and AND/OR combinations return None so
@@ -2463,6 +2459,48 @@ impl PostgresProtocol {
         }
 
         Some(predicates)
+    }
+
+    fn extract_legacy_select_predicates(query: &str) -> anyhow::Result<Vec<SelectPredicate>> {
+        let not_delimiter = |ch: char| {
+            ch.is_whitespace()
+                || (ch.is_ascii()
+                    && !crate::core::utils::is_identifier_byte(ch as u8)
+                    && !matches!(ch, '.' | '`' | '"' | '\''))
+        };
+        let mut search_from = 0usize;
+        let mut needs_full_validation = true;
+        let aware_where = loop {
+            let found = if needs_full_validation {
+                needs_full_validation = false;
+                crate::core::utils::find_ascii_ci_at_top_level_checked(query, "WHERE")
+                    .map_err(|reason| anyhow::anyhow!("malformed SELECT structure: {reason}"))?
+            } else {
+                crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "WHERE")
+                    .map(|relative| search_from + relative)
+            };
+            let Some(position) = found else {
+                break None;
+            };
+            let end = position + "WHERE".len();
+            if query[..position]
+                .chars()
+                .next_back()
+                .is_none_or(not_delimiter)
+                && query[end..].chars().next().is_none_or(not_delimiter)
+            {
+                break Some(position);
+            }
+            search_from = end;
+        };
+        if Self::extract_select_where_clause(query).is_some() {
+            Self::extract_select_where_predicates(query)
+                .ok_or_else(|| anyhow::anyhow!("unsupported or malformed WHERE predicate"))
+        } else if aware_where.is_some() {
+            Err(anyhow::anyhow!("unsupported or malformed WHERE clause"))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn split_or_predicates(predicate: &str) -> Vec<&str> {
@@ -2719,23 +2757,57 @@ impl PostgresProtocol {
     }
 
     fn extract_select_where_clause(query: &str) -> Option<&str> {
-        let where_pos = find_ascii_ci(query, " WHERE ")?;
-        let mut predicate = query[where_pos + 7..].trim();
+        // WHERE locate via the crate's TOP-LEVEL scanner (depth- and
+        // quote-aware). The boundary check excludes identifier bytes,
+        // '.', AND quote/delimiter bytes — a backtick-quoted column
+        // NAMED `where` passed the old check and gutted the predicate
+        // into a silent unfiltered scan.
+        let not_delimiter = |ch: char| {
+            ch.is_whitespace()
+                || (ch.is_ascii()
+                    && !crate::core::utils::is_identifier_byte(ch as u8)
+                    && !matches!(ch, '.' | '`' | '"' | '\''))
+        };
+        let mut predicate = {
+            let mut found = None;
+            let mut search_from = 0usize;
+            while let Some(rel) =
+                crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "WHERE")
+            {
+                let pos = search_from + rel;
+                let end = pos + 5;
+                let boundary = query[..pos].chars().next_back().is_none_or(not_delimiter)
+                    && query[end..].chars().next().is_none_or(not_delimiter);
+                if boundary {
+                    found = Some(&query[end..]);
+                    break;
+                }
+                search_from = end;
+            }
+            found?.trim()
+        };
         for terminator in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"] {
-            // The shared quote-AND-comment-aware scanner (the private
-            // single-quote-only variant truncated at terminators inside
-            // double-quoted identifiers or comments).
-            if let Some(pos) = crate::core::utils::find_ascii_ci_outside_quotes(
-                predicate, terminator,
-            )
-            .filter(|&pos| {
-                let bytes = predicate.as_bytes();
-                let before_ok = pos == 0 || bytes[pos - 1].is_ascii_whitespace();
+            // Iterate ALL occurrences until one passes the boundary test —
+            // a first match inside `limit_val` must not hide a later real
+            // terminator; the shared not_delimiter class also rejects
+            // qualified ('t.limit') and backtick-quoted (`limit`) names.
+            let mut search_from = 0usize;
+            while let Some(rel) = crate::core::utils::find_ascii_ci_at_top_level(
+                &predicate[search_from..],
+                terminator,
+            ) {
+                let pos = search_from + rel;
                 let end = pos + terminator.len();
-                let after_ok = end >= bytes.len() || bytes[end].is_ascii_whitespace();
-                before_ok && after_ok
-            }) {
-                predicate = predicate[..pos].trim();
+                let boundary = predicate[..pos]
+                    .chars()
+                    .next_back()
+                    .is_none_or(not_delimiter)
+                    && predicate[end..].chars().next().is_none_or(not_delimiter);
+                if boundary {
+                    predicate = predicate[..pos].trim();
+                    break;
+                }
+                search_from = pos + terminator.len();
             }
         }
         Some(predicate.trim_end_matches(';').trim())
@@ -2859,25 +2931,57 @@ impl PostgresProtocol {
     }
 
     fn extract_select_limit(query: &str) -> Option<usize> {
-        let upper = query.to_ascii_uppercase();
-        let limit_pos = upper.rfind(" LIMIT ")?;
-        let after_limit = query[limit_pos + " LIMIT ".len()..]
-            .trim()
-            .trim_end_matches(';')
-            .trim();
+        // The AWARE top-level scanner, LAST occurrence (rfind parity) —
+        // a LIMIT inside a trailing comment or string literal silently
+        // truncated results ('-- LIMIT 1' returned 1 row instead of 5).
+        let bytes = query.as_bytes();
+        let mut last: Option<usize> = None;
+        let mut search_from = 0usize;
+        while let Some(rel) =
+            crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "LIMIT")
+        {
+            let pos = search_from + rel;
+            let end = pos + 5;
+            let boundary = pos > 0
+                && !crate::core::utils::is_identifier_byte(bytes[pos - 1])
+                && bytes[pos - 1] != b'.'
+                && bytes[pos - 1] != b'`'
+                && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
+            if boundary {
+                last = Some(pos);
+            }
+            search_from = pos + 5;
+        }
+        let limit_pos = last?;
+        let after_limit = query[limit_pos + 5..].trim().trim_end_matches(';').trim();
         let token = after_limit.split_whitespace().next()?;
         token.parse::<usize>().ok()
     }
 
     fn clean_identifier(identifier: &str) -> String {
-        identifier
-            .trim()
-            .trim_matches('"')
-            .split('.')
-            .next_back()
-            .unwrap_or(identifier)
-            .trim_matches('"')
-            .to_string()
+        // Split on the last dot OUTSIDE quoted segments: "meta.score" is one
+        // column, while schema."meta.score" and "schema"."score" retain the
+        // delimiters needed for the shared decoder.
+        let trimmed = identifier.trim();
+        let mut quote = None;
+        let mut segment_start = 0usize;
+        let mut chars = trimmed.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            if let Some(delimiter) = quote {
+                if ch == delimiter {
+                    if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+            } else if matches!(ch, '"' | '`') {
+                quote = Some(ch);
+            } else if ch == '.' {
+                segment_start = index + ch.len_utf8();
+            }
+        }
+        crate::core::utils::decode_identifier(&trimmed[segment_start..]).to_string()
     }
 
     /// Detect store type for SELECT queries
@@ -3000,11 +3104,10 @@ impl PostgresProtocol {
                     .await?
             }
             Err(_) => {
-                let predicates = if query.to_ascii_uppercase().contains(" WHERE ") {
-                    Self::extract_select_where_predicates(query).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                // The aware gate distinguishes a WHERE-less query from a
+                // present but unsupported predicate. The latter must fail
+                // closed instead of becoming an unfiltered legacy scan.
+                let predicates = Self::extract_legacy_select_predicates(query)?;
                 dml_service
                     .select_table_records_with_projection(
                         table_name,
@@ -3654,6 +3757,80 @@ impl PostgresProtocol {
         }
     }
 
+    fn extract_legacy_create_table_target(query: &str) -> Result<(String, bool)> {
+        let table_pos = find_ascii_ci(query, "TABLE")
+            .ok_or_else(|| anyhow!("CREATE TABLE is missing its TABLE keyword"))?;
+        let after_clause =
+            crate::core::utils::skip_leading_ws_and_comments(&query[table_pos + "TABLE".len()..]);
+        let (if_not_exists, after_table) = crate::core::utils::strip_if_not_exists(after_clause);
+
+        if after_table.is_empty() || after_table.starts_with("/*") || after_table.starts_with("--")
+        {
+            return Err(anyhow!("CREATE TABLE is missing a valid table name"));
+        }
+
+        let bytes = after_table.as_bytes();
+        let quoted = matches!(bytes.first(), Some(b'"' | b'`'));
+        let table_end = if quoted {
+            let delimiter = bytes[0];
+            let mut index = 1usize;
+            let mut end = None;
+            while index < bytes.len() {
+                if bytes[index] == delimiter {
+                    if bytes.get(index + 1) == Some(&delimiter) {
+                        index += 2;
+                        continue;
+                    }
+                    end = Some(index + 1);
+                    break;
+                }
+                index += 1;
+            }
+            end.ok_or_else(|| {
+                anyhow!(
+                    "CREATE TABLE is missing a valid table name: unterminated quoted identifier"
+                )
+            })?
+        } else {
+            after_table
+                .find(|c: char| c.is_whitespace() || c == '(')
+                .unwrap_or(after_table.len())
+        };
+
+        let tail = &after_table[table_end..];
+        let valid_boundary = tail.is_empty()
+            || tail
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() || ch == '(');
+        if !valid_boundary {
+            return Err(anyhow!("CREATE TABLE has an invalid table-name boundary"));
+        }
+
+        let raw_name = &after_table[..table_end];
+        let table_name = crate::core::utils::decode_identifier(raw_name).to_lowercase();
+        let valid_unquoted = || {
+            let mut chars = raw_name.chars();
+            let Some(first) = chars.next() else {
+                return false;
+            };
+            (first == '_' || first.is_alphabetic())
+                && chars.all(|ch| ch == '_' || ch == '$' || ch.is_alphanumeric())
+        };
+        if table_name.is_empty()
+            || (!quoted
+                && (!valid_unquoted()
+                    || matches!(
+                        table_name.to_ascii_uppercase().as_str(),
+                        "IF" | "NOT" | "EXISTS" | "USING" | "AS" | "WITH" | "SELECT"
+                    )))
+        {
+            return Err(anyhow!("CREATE TABLE is missing a valid table name"));
+        }
+
+        Ok((table_name, if_not_exists))
+    }
+
     /// Execute CREATE TABLE - creates a ProximaDB collection
     /// Supports multiple store types:
     /// - Vector: CREATE TABLE name (id TEXT, embedding vector(dim)) [USING VECTOR]
@@ -3663,29 +3840,19 @@ impl PostgresProtocol {
     async fn execute_create_table(&mut self, query: &str) -> Result<()> {
         let upper = query.to_uppercase();
 
-        // Check if IF NOT EXISTS was specified (ADR-018 Phase 2)
-        let if_not_exists = upper.contains("IF NOT EXISTS");
-
-        // Extract table name: CREATE TABLE [IF NOT EXISTS] name
-        let table_start = if if_not_exists {
-            find_ascii_ci(query, "EXISTS").map(|p| p + 6)
-        } else {
-            find_ascii_ci(query, "TABLE").map(|p| p + 5)
+        // The ONE strip (a contains() + first-EXISTS find armed the flag
+        // and mis-sliced the name from text inside a DEFAULT literal).
+        // Comment-tolerant: 'TABLE /* v2 */ IF NOT EXISTS docs' regressed
+        // to table_name '/*' with the flag lost. Invalid/comment-only input
+        // must return a syntax error, never a successful empty-name no-op.
+        let (table_name, if_not_exists) = match Self::extract_legacy_create_table_target(query) {
+            Ok(target) => target,
+            Err(error) => {
+                return self
+                    .send_error("ERROR", "42601", &format!("Parse error: {error}"))
+                    .await;
+            }
         };
-
-        let Some(start) = table_start else {
-            return self.send_command_complete("OK").await;
-        };
-
-        let after_table = query[start..].trim();
-        let table_end = after_table
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_table.len());
-        let table_name = after_table[..table_end].trim().to_lowercase();
-
-        if table_name.is_empty() {
-            return self.send_command_complete("OK").await;
-        }
 
         // Detect store type from USING clause or column types
         let store_type = self.detect_store_type(&upper);

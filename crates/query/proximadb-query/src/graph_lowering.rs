@@ -166,6 +166,13 @@ fn strip_from_clause(query: &str) -> Result<(String, Option<String>)> {
     while i < bytes.len() {
         match quote {
             Some(q) => {
+                // Backslash-escaped quote (the injector's scanner handles
+                // it; without it the literal closed early and FROM was
+                // never found or mis-split).
+                if bytes[i] == b'\\' && q != b'`' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
                 if bytes[i] == q {
                     if i + 1 < bytes.len() && bytes[i + 1] == q {
                         i += 2;
@@ -189,11 +196,21 @@ fn strip_from_clause(query: &str) -> Result<(String, Option<String>)> {
                     continue;
                 }
                 if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    // NESTED block comments (Postgres allows them; the
+                    // injector's scanner counts depth).
                     i += 2;
-                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                        i += 1;
+                    let mut depth = 1usize;
+                    while i < bytes.len() && depth > 0 {
+                        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
                     }
-                    i = (i + 2).min(bytes.len());
                     continue;
                 }
                 if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
@@ -509,5 +526,29 @@ mod tests {
         .expect_err("unknown variable should fail validation");
 
         assert!(error.to_string().contains("unknown variable 'm'"));
+    }
+
+    #[test]
+    fn from_scanner_ignores_backslash_escaped_quote_literals() {
+        let query = r#"MATCH (n {text: 'don\'t FROM wrong'}) FROM social RETURN n"#;
+        let (normalized, graph) = strip_from_clause(query).expect("strip graph target");
+
+        assert_eq!(graph.as_deref(), Some("social"));
+        assert_eq!(
+            normalized,
+            r#"MATCH (n {text: 'don\'t FROM wrong'}) RETURN n"#
+        );
+    }
+
+    #[test]
+    fn from_scanner_ignores_nested_block_comments() {
+        let query = "MATCH (n) /* outer /* FROM wrong */ tail */ FROM social RETURN n";
+        let (normalized, graph) = strip_from_clause(query).expect("strip graph target");
+
+        assert_eq!(graph.as_deref(), Some("social"));
+        assert_eq!(
+            normalized,
+            "MATCH (n) /* outer /* FROM wrong */ tail */ RETURN n"
+        );
     }
 }
