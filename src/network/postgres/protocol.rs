@@ -136,33 +136,255 @@ pub struct PostgresProtocol {
     /// resolver REST/gRPC/Arrow use). `None` = unwired ⇒ identity carries no
     /// stable id (pgwire ABAC inert for policy lookup, same default REST had).
     stable_id_resolver: Option<Arc<dyn proximadb_tenant::TenantStableIdResolver>>,
+    /// ADR-018 P2.D (TD-076): per-connection transaction write buffer.
+    /// Writes inside an explicit transaction accumulate here and replay
+    /// sequentially at COMMIT; ROLLBACK discards; dropping the connection
+    /// drops the buffer (implicit rollback — in-memory until COMMIT, exactly
+    /// per the ADR). Lives on the protocol (not `Session`) because it is
+    /// per-connection protocol state, like `prepared_statements`/`portals`.
+    transaction_buffer: TransactionBuffer,
 }
 
+/// A transaction-control statement classified for execution
+/// (ADR-018 P2.D / TD-076).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransactionControlPolicy {
-    Unsupported,
+pub(crate) enum TransactionControl {
+    /// `BEGIN` / `START TRANSACTION`.
+    Begin { read_only: bool },
+    /// `COMMIT` / `END`.
+    Commit,
+    /// `ROLLBACK` / `ABORT`.
+    Rollback,
+    /// `SET TRANSACTION [characteristics]` / `SET SESSION CHARACTERISTICS` —
+    /// carries the READ ONLY/WRITE flag (`None` = unchanged). ISOLATION LEVEL
+    /// READ COMMITTED is accepted-and-ignored (it IS the semantics P2.D
+    /// provides); other levels decline.
+    SetTransaction { read_only: Option<bool> },
 }
 
-fn transaction_control_policy(query: &str) -> Option<TransactionControlPolicy> {
-    let normalized = query.trim().trim_end_matches(';').trim().to_uppercase();
-    let words: Vec<&str> = normalized.split_whitespace().collect();
+/// What one statement means for transaction state: real control to execute,
+/// or a recognized-but-unsupported form that must fail closed with the
+/// carried reason — never silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TransactionStatement {
+    Control(TransactionControl),
+    Unsupported(String),
+}
+
+/// True when the whitespace-tokenized tail grants the READ ONLY/WRITE mode we
+/// honor. Returns `Err(reason)` for modes we cannot claim (SERIALIZABLE,
+/// REPEATABLE READ, DEFERRABLE) — an honest Unsupported, not a silent accept.
+fn parse_transaction_mode_tail(words: &[&str]) -> Result<Option<bool>, String> {
+    let mut read_only = None;
+    let mut index = 0;
+    while index < words.len() {
+        match words[index] {
+            "READ" => {
+                let next = words.get(index + 1).copied().unwrap_or_default();
+                match next {
+                    "ONLY" => read_only = Some(true),
+                    "WRITE" => read_only = Some(false),
+                    // ISOLATION LEVEL READ COMMITTED — the "READ" here belongs
+                    // to the isolation level, handled below.
+                    _ => {}
+                }
+                index += 2;
+            }
+            "ISOLATION" => {
+                // ISOLATION LEVEL <level>
+                let level = words.get(index + 2).copied().unwrap_or_default();
+                if level != "READ" {
+                    return Err(
+                        "only ISOLATION LEVEL READ COMMITTED is provided (ADR-018 P2.D; \
+                         real MVCC is Phase 3)"
+                            .to_string(),
+                    );
+                }
+                index += 4;
+            }
+            "WORK" | "TRANSACTION" | "DEFERRABLE" => {
+                // DEFERRABLE is a no-op under READ COMMITTED.
+                index += 1;
+            }
+            "NOT" if words.get(index + 1).copied() == Some("DEFERRABLE") => {
+                index += 2;
+            }
+            other => {
+                return Err(unsupported_mode_reason(other));
+            }
+        }
+    }
+    Ok(read_only)
+}
+
+/// Heap-backed reason for an unsupported transaction mode (the caller-facing
+/// `Unsupported` carries String — a leaked &'static str per statement is not
+/// acceptable).
+fn unsupported_mode_reason(mode: &str) -> String {
+    format!("unsupported transaction mode `{mode}` (ADR-018 P2.D)")
+}
+
+/// Bounds for the P2.D in-memory write buffer (mirrors "in-memory until
+/// COMMIT" honesty: an unbounded transaction could OOM the process).
+const TRANSACTION_MAX_ENTRIES: usize = 10_000;
+const TRANSACTION_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// One buffered transactional DML (ADR-018 P2.D). Gates (primary-pod,
+/// tenant visibility) already ran at BUFFER time, so replay is
+/// authorization-preserved.
+#[derive(Clone)]
+struct TransactionBufferEntry {
+    statement: crate::services::dml::DmlStatement,
+    tenant_ctx: Option<crate::storage::tenant::context::TenantContext>,
+    approx_bytes: usize,
+}
+
+/// Bounded in-memory write buffer for one explicit transaction.
+#[derive(Default)]
+struct TransactionBuffer {
+    read_only: bool,
+    /// SET TRANSACTION characteristics observed OUTSIDE a transaction apply
+    /// to the NEXT BEGIN (PostgreSQL session-default semantics).
+    pending_read_only: Option<bool>,
+    entries: Vec<TransactionBufferEntry>,
+    total_bytes: usize,
+}
+
+impl TransactionBuffer {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+        self.read_only = false;
+    }
+}
+
+/// Buffer-time CommandComplete summary for a DML statement: (kind, row hint,
+/// approximate serialized size for the buffer bound).
+fn dml_summary(
+    statement: &crate::services::dml::DmlStatement,
+) -> (&'static str, Option<u64>, usize) {
+    use crate::services::dml::DmlStatement as D;
+    match statement {
+        D::Insert {
+            columns, values, ..
+        } => {
+            let n = values.len() as u64;
+            let width = columns.len().max(1);
+            (
+                "INSERT",
+                Some(n),
+                64usize.saturating_mul(values.len().saturating_mul(width)),
+            )
+        }
+        D::Upsert { values, .. } => {
+            let n = values.len() as u64;
+            (
+                "INSERT",
+                Some(n),
+                64usize.saturating_mul(n.saturating_add(1) as usize),
+            )
+        }
+        D::Update { assignments, .. } => (
+            "UPDATE",
+            None,
+            64usize.saturating_mul(assignments.len().saturating_add(1)),
+        ),
+        D::InsertSelect { .. } => ("INSERT", None, 4096),
+        D::InsertOverwrite { .. } => ("INSERT", None, 4096),
+        D::Delete { .. } => ("DELETE", None, 256),
+    }
+}
+
+/// Classify one statement against the transaction-control grammar.
+/// `None` = not a control statement (execute normally). P2.D scope: real
+/// BEGIN/COMMIT/ROLLBACK (+ SET TRANSACTION READ ONLY|WRITE, ISOLATION LEVEL
+/// READ COMMITTED); savepoints and two-phase commit stay fail-closed
+/// Unsupported with the reason spelled out.
+fn classify_transaction_statement(query: &str) -> Option<TransactionStatement> {
+    let normalized = query.trim().trim_end_matches(';').trim();
+    let upper = normalized.to_ascii_uppercase();
+    let words: Vec<&str> = upper.split_whitespace().collect();
     let first = words.first().copied().unwrap_or_default();
     let second = words.get(1).copied().unwrap_or_default();
-    let is_control = matches!(
-        first,
-        "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE"
-    ) || (first == "START" && second == "TRANSACTION")
-        || (first == "PREPARE" && second == "TRANSACTION")
-        || (first == "SET" && matches!(second, "TRANSACTION" | "CONSTRAINTS"))
-        || (words.as_slice().starts_with(&[
-            "SET",
-            "SESSION",
-            "CHARACTERISTICS",
-            "AS",
-            "TRANSACTION",
-        ]));
+    let unsupported =
+        |reason: &'static str| Some(TransactionStatement::Unsupported(reason.to_string()));
 
-    is_control.then_some(TransactionControlPolicy::Unsupported)
+    match first {
+        "BEGIN" | "START" => {
+            if first == "START" && second != "TRANSACTION" {
+                return None;
+            }
+            let tail = &words[if first == "START" { 2 } else { 1 }..];
+            let read_only = match parse_transaction_mode_tail(tail) {
+                Ok(read_only) => read_only,
+                Err(reason) => {
+                    return Some(TransactionStatement::Unsupported(reason));
+                }
+            };
+            Some(TransactionStatement::Control(TransactionControl::Begin {
+                read_only: read_only.unwrap_or(false),
+            }))
+        }
+        "COMMIT" | "END" => match (second, words.len()) {
+            (_, 1) => Some(TransactionStatement::Control(TransactionControl::Commit)),
+            ("WORK", 2) => Some(TransactionStatement::Control(TransactionControl::Commit)),
+            ("PREPARED", _) => {
+                unsupported("two-phase commit (COMMIT PREPARED) is not supported (ADR-018 P2.D)")
+            }
+            ("AND", _) => unsupported("COMMIT AND CHAIN is not supported (ADR-018 P2.D)"),
+            _ => None,
+        },
+        "ROLLBACK" | "ABORT" => match (second, words.len()) {
+            (_, 1) => Some(TransactionStatement::Control(TransactionControl::Rollback)),
+            ("WORK", 2) => Some(TransactionStatement::Control(TransactionControl::Rollback)),
+            ("TRANSACTION", 2) => Some(TransactionStatement::Control(TransactionControl::Rollback)),
+            ("TO", _) => unsupported(
+                "SAVEPOINT/ROLLBACK TO SAVEPOINT is not supported yet (ADR-018 P2.D \
+                 defers savepoints to Phase 3)",
+            ),
+            ("PREPARED", _) => {
+                unsupported("two-phase commit (ROLLBACK PREPARED) is not supported (ADR-018 P2.D)")
+            }
+            ("AND", _) => unsupported("ROLLBACK AND [NO] CHAIN is not supported (ADR-018 P2.D)"),
+            _ => None,
+        },
+        "SAVEPOINT" | "RELEASE" => unsupported(
+            "SAVEPOINT/RELEASE is not supported yet (ADR-018 P2.D defers \
+             savepoints to Phase 3)",
+        ),
+        "PREPARE" if second == "TRANSACTION" => {
+            unsupported("two-phase commit (PREPARE TRANSACTION) is not supported (ADR-018 P2.D)")
+        }
+        "SET" => {
+            let session_characteristics = words.as_slice().starts_with(&[
+                "SET",
+                "SESSION",
+                "CHARACTERISTICS",
+                "AS",
+                "TRANSACTION",
+            ]);
+            if second == "CONSTRAINTS" {
+                return unsupported(
+                    "SET CONSTRAINTS is not supported (constraint deferral is not implemented)",
+                );
+            }
+            if second != "TRANSACTION" && !session_characteristics {
+                return None;
+            }
+            let read_only = match parse_transaction_mode_tail(
+                &words[if session_characteristics { 5 } else { 2 }..],
+            ) {
+                Ok(read_only) => read_only,
+                Err(reason) => {
+                    return Some(TransactionStatement::Unsupported(reason));
+                }
+            };
+            Some(TransactionStatement::Control(
+                TransactionControl::SetTransaction { read_only },
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Slice 6.3 gate-input bundle. Distinct type per surface for module
@@ -478,6 +700,7 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            transaction_buffer: TransactionBuffer::default(),
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -537,6 +760,7 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            transaction_buffer: TransactionBuffer::default(),
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -588,6 +812,7 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            transaction_buffer: TransactionBuffer::default(),
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -1139,14 +1364,54 @@ impl PostgresProtocol {
         let query = self.parse_cstring(body)?;
         debug!("Received query: {}", query);
 
-        if transaction_control_policy(&query).is_some() {
+        // ADR-018 P2.D (TD-076): classify once; real control executes,
+        // recognized-but-unsupported forms fail closed with the reason.
+        let transaction_statement = classify_transaction_statement(&query);
+
+        // In a FAILED transaction every non-control statement errors until
+        // ROLLBACK (PostgreSQL 25P02 semantics).
+        if !matches!(
+            &transaction_statement,
+            Some(TransactionStatement::Control(_))
+        ) && self.transaction_state_is_failed().await
+        {
+            self.send_error(
+                "ERROR",
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )
+            .await?;
+            self.send_ready_for_query('E').await?;
+            return Ok(());
+        }
+
+        match transaction_statement {
+            Some(TransactionStatement::Control(control)) => {
+                return self.handle_transaction_control(control, true).await;
+            }
+            Some(TransactionStatement::Unsupported(reason)) => {
+                self.send_error("ERROR", "0A000", &reason).await?;
+                self.send_ready_for_query(self.transaction_status_byte().await)
+                    .await?;
+                return Ok(());
+            }
+            None => {}
+        }
+
+        // P2.D: DDL inside a transaction is rejected — the buffer is DML-only,
+        // and executing DDL immediately would make ROLLBACK silently not undo
+        // it (worse than a clean rejection).
+        let upper = query.to_uppercase();
+        if (upper.starts_with("CREATE") || upper.starts_with("ALTER") || upper.starts_with("DROP"))
+            && self.transaction_in_progress().await
+        {
             self.send_error(
                 "ERROR",
                 "0A000",
-                "transactions are not supported; pgwire executes individual statements in autocommit mode",
+                "transactional DDL is not supported yet (ADR-018 P2.D); commit or roll back the current transaction first",
             )
             .await?;
-            self.send_ready_for_query('I').await?;
+            self.send_ready_for_query('T').await?;
             return Ok(());
         }
 
@@ -1158,7 +1423,8 @@ impl PostgresProtocol {
                         .await?;
                 }
             }
-            self.send_ready_for_query('I').await?;
+            self.send_ready_for_query(self.transaction_status_byte().await)
+                .await?;
             return Ok(());
         }
 
@@ -1176,23 +1442,40 @@ impl PostgresProtocol {
         // disappeared. This was a data-loss bug, not a feature gap.
         let statements = Self::split_sql_statements(&query);
         if statements.is_empty() {
-            self.send_ready_for_query('I').await?;
+            self.send_ready_for_query(self.transaction_status_byte().await)
+                .await?;
             return Ok(());
         }
-        if statements
-            .iter()
-            .any(|statement| transaction_control_policy(statement).is_some())
-        {
-            self.send_error(
-                "ERROR",
-                "0A000",
-                "transactions are not supported; pgwire executes individual statements in autocommit mode",
-            )
-            .await?;
-            self.send_ready_for_query('I').await?;
-            return Ok(());
-        }
+        // NOTE (ADR-018 P2.D): the former whole-batch transaction rejection is
+        // gone — control statements execute inline in the loop below, which is
+        // what makes `BEGIN; INSERT …; COMMIT;` work. Per-statement
+        // classification + abort-on-error remain, so the historical
+        // silent-INSERT-drop bug stays fixed by construction.
         for statement in statements {
+            // Control statements execute inline (no per-statement RFQ; the
+            // batch sends one at the end from the session status byte).
+            match classify_transaction_statement(&statement) {
+                Some(TransactionStatement::Control(control)) => {
+                    self.handle_transaction_control(control, false).await?;
+                    continue;
+                }
+                Some(TransactionStatement::Unsupported(reason)) => {
+                    self.send_error("ERROR", "0A000", &reason).await?;
+                    self.transaction_fail_if_active().await;
+                    break;
+                }
+                None => {}
+            }
+            // FAILED-transaction gate inside batches: 25P02 until ROLLBACK.
+            if self.transaction_state_is_failed().await {
+                self.send_error(
+                    "ERROR",
+                    "25P02",
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                )
+                .await?;
+                break;
+            }
             // Translate each statement to ProximaDB format.
             let translated = match self.translator.translate(&statement) {
                 Ok(t) => t,
@@ -1201,7 +1484,10 @@ impl PostgresProtocol {
                         .await?;
                     // Stop processing subsequent statements on error to
                     // match PostgreSQL's "abort on error" semantics
-                    // inside a multi-statement query.
+                    // inside a multi-statement query. Inside a transaction
+                    // the abort also FAILS the transaction (25P02 from here
+                    // until ROLLBACK).
+                    self.transaction_fail_if_active().await;
                     break;
                 }
             };
@@ -1229,6 +1515,7 @@ impl PostgresProtocol {
                 Ok(Err(e)) => {
                     self.send_error("ERROR", "XX000", &format!("execution failed: {}", e))
                         .await?;
+                    self.transaction_fail_if_active().await;
                     break;
                 }
                 Err(panic_payload) => {
@@ -1257,8 +1544,9 @@ impl PostgresProtocol {
             }
         }
 
-        // Send ready for query
-        self.send_ready_for_query('I').await?;
+        // Send ready for query — status byte reflects the transaction state.
+        self.send_ready_for_query(self.transaction_status_byte().await)
+            .await?;
 
         Ok(())
     }
@@ -1276,6 +1564,237 @@ impl PostgresProtocol {
         } else {
             "unrecoverable error (panic payload not stringifiable)".to_string()
         }
+    }
+
+    // ── ADR-018 P2.D (TD-076): transaction control + buffering ──────────
+
+    async fn transaction_status_byte(&self) -> char {
+        self.session.read().await.transaction_state.status_byte()
+    }
+
+    async fn transaction_in_progress(&self) -> bool {
+        matches!(
+            self.session.read().await.transaction_state,
+            super::session::TransactionState::InTransaction
+        )
+    }
+
+    async fn transaction_is_read_only(&self) -> bool {
+        self.transaction_buffer.read_only
+    }
+
+    async fn transaction_state_is_failed(&self) -> bool {
+        matches!(
+            self.session.read().await.transaction_state,
+            super::session::TransactionState::Failed
+        )
+    }
+
+    /// Abort an ACTIVE transaction on a statement error (the batch loop's
+    /// error/panic breaks). No-op when idle.
+    async fn transaction_fail_if_active(&mut self) {
+        let mut session = self.session.write().await;
+        if matches!(
+            session.transaction_state,
+            super::session::TransactionState::InTransaction
+        ) {
+            session.fail_transaction();
+        }
+    }
+
+    /// Push one gated DML statement into the transaction buffer. Fails with
+    /// the `54000` reason when the P2.D memory bounds are exceeded (and
+    /// aborts the transaction — an over-budget buffer is not silently
+    /// truncated).
+    async fn transaction_push(
+        &mut self,
+        statement: crate::services::dml::DmlStatement,
+        tenant_ctx: Option<crate::storage::tenant::context::TenantContext>,
+        approx_bytes: usize,
+    ) -> Result<(), String> {
+        if self.transaction_buffer.entries.len() >= TRANSACTION_MAX_ENTRIES
+            || self
+                .transaction_buffer
+                .total_bytes
+                .saturating_add(approx_bytes)
+                > TRANSACTION_MAX_BYTES
+        {
+            self.session.write().await.fail_transaction();
+            self.transaction_buffer.clear();
+            return Err(format!(
+                "transaction exceeds the in-memory write buffer limit ({TRANSACTION_MAX_ENTRIES} statements / {TRANSACTION_MAX_BYTES} bytes); the transaction has been aborted (ADR-018 P2.D)"
+            ));
+        }
+        self.transaction_buffer.total_bytes = self
+            .transaction_buffer
+            .total_bytes
+            .saturating_add(approx_bytes);
+        self.transaction_buffer
+            .entries
+            .push(TransactionBufferEntry {
+                statement,
+                tenant_ctx,
+                approx_bytes,
+            });
+        Ok(())
+    }
+
+    /// Execute one classified transaction-control statement. Sends the
+    /// CommandComplete always; sends ReadyForQuery only when `send_rfq`
+    /// (the simple-query single-statement path — batch and extended paths
+    /// send one RFQ at Sync/batch end, from the session status byte).
+    async fn handle_transaction_control(
+        &mut self,
+        control: TransactionControl,
+        send_rfq: bool,
+    ) -> Result<()> {
+        use super::session::TransactionState;
+        let completion: &'static str = match control {
+            TransactionControl::Begin { read_only } => {
+                {
+                    let mut session = self.session.write().await;
+                    match session.transaction_state {
+                        // Nested BEGIN: PostgreSQL warns and keeps the outer
+                        // transaction (no NoticeResponse helper yet — no-op,
+                        // documented in the ADR amendment).
+                        TransactionState::InTransaction => {}
+                        _ => {
+                            session.begin_transaction();
+                            let buffer = &mut self.transaction_buffer;
+                            buffer.clear();
+                            buffer.read_only =
+                                read_only || buffer.pending_read_only.unwrap_or(false);
+                            buffer.pending_read_only = None;
+                        }
+                    }
+                }
+                "BEGIN"
+            }
+            TransactionControl::SetTransaction { read_only } => {
+                {
+                    let session = self.session.write().await;
+                    if matches!(session.transaction_state, TransactionState::InTransaction) {
+                        if let Some(read_only) = read_only {
+                            self.transaction_buffer.read_only = read_only;
+                        }
+                    } else if read_only.is_some() {
+                        self.transaction_buffer.pending_read_only = read_only;
+                    }
+                }
+                "SET"
+            }
+            TransactionControl::Commit => {
+                let state = self.session.read().await.transaction_state;
+                match state {
+                    // COMMIT outside a transaction: no-op (PG tag COMMIT).
+                    TransactionState::Idle => "COMMIT",
+                    // COMMIT in a FAILED transaction behaves as ROLLBACK and
+                    // reports the ROLLBACK tag (PostgreSQL semantics).
+                    TransactionState::Failed => {
+                        self.transaction_buffer.clear();
+                        self.session.write().await.rollback_transaction();
+                        "ROLLBACK"
+                    }
+                    TransactionState::InTransaction => {
+                        if let Err(error) = self.replay_transaction_buffer().await {
+                            // Replay failure: already-replayed entries are
+                            // durable (documented P2.D divergence), the
+                            // transaction is FAILED, and the buffer is kept
+                            // for ROLLBACK. The error response is already on
+                            // the wire.
+                            error!("transaction COMMIT replay failed: {error:#}");
+                            self.send_ready_for_query(self.transaction_status_byte().await)
+                                .await?;
+                            return Ok(());
+                        }
+                        self.transaction_buffer.clear();
+                        self.session.write().await.commit_transaction();
+                        "COMMIT"
+                    }
+                }
+            }
+            TransactionControl::Rollback => {
+                self.transaction_buffer.clear();
+                self.session.write().await.rollback_transaction();
+                "ROLLBACK"
+            }
+        };
+        self.send_command_complete(completion).await?;
+        if send_rfq {
+            self.send_ready_for_query(self.transaction_status_byte().await)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Drain the P2.D write buffer: sequential `execute_scoped` per entry.
+    /// First failure → the error is sent, the transaction FAILS, and the
+    /// already-replayed statements stay durable (documented divergence —
+    /// full atomicity is ADR-018 P3.B).
+    async fn replay_transaction_buffer(&mut self) -> Result<()> {
+        let Some(dml_service) = self.dml_service.clone() else {
+            self.send_error(
+                "ERROR",
+                "XX000",
+                "transaction buffer holds writes but no DML service is wired",
+            )
+            .await?;
+            self.session.write().await.fail_transaction();
+            return Err(anyhow!("transaction replay without DML service"));
+        };
+        let timeout_ms: Option<u64> = self
+            .session
+            .read()
+            .await
+            .parameters
+            .get("statement_timeout")
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0);
+        let entries = std::mem::take(&mut self.transaction_buffer.entries);
+        let mut replayed_bytes = 0usize;
+        for (index, entry) in entries.iter().enumerate() {
+            replayed_bytes = replayed_bytes.saturating_add(entry.approx_bytes);
+            let replay = match timeout_ms {
+                Some(ms) => match tokio::time::timeout(
+                    std::time::Duration::from_millis(ms),
+                    dml_service.execute_scoped(entry.statement.clone(), entry.tenant_ctx.as_ref()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow!(
+                        "canceling statement due to statement timeout (transaction replay)"
+                    )),
+                },
+                None => {
+                    dml_service
+                        .execute_scoped(entry.statement.clone(), entry.tenant_ctx.as_ref())
+                        .await
+                }
+            };
+            match replay {
+                Ok(_) => {}
+                Err(e) => {
+                    // Keep the UNREPLAYED remainder so ROLLBACK is a clean
+                    // discard; the transaction is FAILED either way.
+                    self.transaction_buffer.entries = entries[index + 1..].to_vec();
+                    self.transaction_buffer.total_bytes = self
+                        .transaction_buffer
+                        .total_bytes
+                        .saturating_sub(replayed_bytes);
+                    self.send_error(
+                        "ERROR",
+                        "25P02",
+                        &format!("transaction replay failed: {e}; the transaction has aborted"),
+                    )
+                    .await?;
+                    self.session.write().await.fail_transaction();
+                    return Err(anyhow!("transaction replay failed: {e}"));
+                }
+            }
+        }
+        self.transaction_buffer.total_bytes = 0;
+        Ok(())
     }
 
     /// Split a multi-statement SQL query on top-level semicolons.
@@ -1461,14 +1980,42 @@ impl PostgresProtocol {
     ) -> Result<()> {
         let upper = query.to_uppercase();
 
-        if transaction_control_policy(query).is_some() {
+        // ADR-018 P2.D: the extended protocol honors the same control
+        // classification. No ReadyForQuery here — Sync sends it from the
+        // session status byte.
+        match classify_transaction_statement(query) {
+            Some(TransactionStatement::Control(control)) => {
+                return self.handle_transaction_control(control, false).await;
+            }
+            Some(TransactionStatement::Unsupported(reason)) => {
+                return self.send_error("ERROR", "0A000", &reason).await;
+            }
+            None => {}
+        }
+        if self.transaction_state_is_failed().await {
             return self
                 .send_error(
                     "ERROR",
-                    "0A000",
-                    "transactions are not supported; pgwire executes individual statements in autocommit mode",
+                    "25P02",
+                    "current transaction is aborted, commands ignored until end of transaction block",
                 )
                 .await;
+        }
+        {
+            let upper_for_ddl = upper.trim().to_string();
+            if (upper_for_ddl.starts_with("CREATE")
+                || upper_for_ddl.starts_with("ALTER")
+                || upper_for_ddl.starts_with("DROP"))
+                && self.transaction_in_progress().await
+            {
+                return self
+                    .send_error(
+                        "ERROR",
+                        "0A000",
+                        "transactional DDL is not supported yet (ADR-018 P2.D); commit or roll back the current transaction first",
+                    )
+                    .await;
+            }
         }
 
         // Handle SHOW commands converted to SELECT
@@ -4182,6 +4729,37 @@ impl PostgresProtocol {
                     crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
                 });
 
+                // ADR-018 P2.D: inside an explicit transaction the write
+                // BUFFERS (the primary-pod + tenant-visibility gates above
+                // already ran at statement time) and replays sequentially at
+                // COMMIT. Read-only transactions reject writes here (25006).
+                if self.transaction_in_progress().await {
+                    if self.transaction_is_read_only().await {
+                        return self
+                            .send_error(
+                                "ERROR",
+                                "25006",
+                                &format!(
+                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
+                                    dml_summary(&statement).0
+                                ),
+                            )
+                            .await;
+                    }
+                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
+                    if let Err(reason) = self
+                        .transaction_push(statement, tenant_ctx, approx_bytes)
+                        .await
+                    {
+                        return self.send_error("ERROR", "54000", &reason).await;
+                    }
+                    let tag = if kind == "INSERT" {
+                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
+                    } else {
+                        format!("{kind} 0")
+                    };
+                    return self.send_command_complete(&tag).await;
+                }
                 match dml_service
                     .execute_scoped(statement, tenant_ctx.as_ref())
                     .await
@@ -4304,6 +4882,37 @@ impl PostgresProtocol {
                     crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
                 });
 
+                // ADR-018 P2.D: inside an explicit transaction the write
+                // BUFFERS (the primary-pod + tenant-visibility gates above
+                // already ran at statement time) and replays sequentially at
+                // COMMIT. Read-only transactions reject writes here (25006).
+                if self.transaction_in_progress().await {
+                    if self.transaction_is_read_only().await {
+                        return self
+                            .send_error(
+                                "ERROR",
+                                "25006",
+                                &format!(
+                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
+                                    dml_summary(&statement).0
+                                ),
+                            )
+                            .await;
+                    }
+                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
+                    if let Err(reason) = self
+                        .transaction_push(statement, tenant_ctx, approx_bytes)
+                        .await
+                    {
+                        return self.send_error("ERROR", "54000", &reason).await;
+                    }
+                    let tag = if kind == "INSERT" {
+                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
+                    } else {
+                        format!("{kind} 0")
+                    };
+                    return self.send_command_complete(&tag).await;
+                }
                 match dml_service
                     .execute_scoped(statement, tenant_ctx.as_ref())
                     .await
@@ -4420,6 +5029,37 @@ impl PostgresProtocol {
                     crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
                 });
 
+                // ADR-018 P2.D: inside an explicit transaction the write
+                // BUFFERS (the primary-pod + tenant-visibility gates above
+                // already ran at statement time) and replays sequentially at
+                // COMMIT. Read-only transactions reject writes here (25006).
+                if self.transaction_in_progress().await {
+                    if self.transaction_is_read_only().await {
+                        return self
+                            .send_error(
+                                "ERROR",
+                                "25006",
+                                &format!(
+                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
+                                    dml_summary(&statement).0
+                                ),
+                            )
+                            .await;
+                    }
+                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
+                    if let Err(reason) = self
+                        .transaction_push(statement, tenant_ctx, approx_bytes)
+                        .await
+                    {
+                        return self.send_error("ERROR", "54000", &reason).await;
+                    }
+                    let tag = if kind == "INSERT" {
+                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
+                    } else {
+                        format!("{kind} 0")
+                    };
+                    return self.send_command_complete(&tag).await;
+                }
                 match dml_service
                     .execute_scoped(statement, tenant_ctx.as_ref())
                     .await
@@ -5428,7 +6068,8 @@ impl PostgresProtocol {
 
     /// Handle Sync message
     async fn handle_sync(&mut self) -> Result<()> {
-        self.send_ready_for_query('I').await
+        self.send_ready_for_query(self.transaction_status_byte().await)
+            .await
     }
 
     /// Handle Flush message
@@ -5501,6 +6142,21 @@ impl PostgresProtocol {
 
     /// Send error response
     async fn send_error(&mut self, severity: &str, code: &str, message: &str) -> Result<()> {
+        // ADR-018 P2.D (TD-076): ANY ERROR inside an active transaction —
+        // other than the aborted-transaction marker itself — FAILS the
+        // transaction (PostgreSQL semantics: subsequent commands are ignored
+        // with 25P02 until ROLLBACK). One hook here covers every statement
+        // path (simple, extended, DML, SELECT) without each having to
+        // remember.
+        if code != "25P02" {
+            let mut session = self.session.write().await;
+            if matches!(
+                session.transaction_state,
+                super::session::TransactionState::InTransaction
+            ) {
+                session.fail_transaction();
+            }
+        }
         let len = 4 + 1 + severity.len() + 1 + 1 + code.len() + 1 + 1 + message.len() + 1 + 1;
         self.write_buffer.put_u8(b'E');
         self.write_buffer.put_i32(len as i32);
