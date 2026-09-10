@@ -700,6 +700,16 @@ impl CollectionService {
         // engine choices are passed through untouched.
         let (selected_engine, selection_reason) =
             crate::services::collection::engine_selector::infer_storage_engine(&enriched_config);
+        // TD-VIPER-1 S2 (ADR-093): reject NEW VIPER selections at creation.
+        // Existing VIPER collections remain readable via the context-free
+        // factory; only new creations are refused (staged retirement S1 → S2).
+        if selected_engine == crate::proto::proximadb_v1::StorageEngine::Viper {
+            return Err(anyhow!(
+                "VIPER is deprecated (ADR-093) and can no longer be selected for new \
+                 collections: use SST (default), NOVA (columnar analytics), HELIX, or the \
+                 DataFusion/Parquet path for warehouse-shaped analytics"
+            ));
+        }
         let previous_engine_field = enriched_config.storage_engine;
         enriched_config.storage_engine = Some(selected_engine as i32);
         tracing::info!(

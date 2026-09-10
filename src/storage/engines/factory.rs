@@ -224,12 +224,14 @@ impl StorageEngineFactory {
                 Self::create_sst()
             }
             ProtoStorageEngine::Mmap => {
-                warn!("MMAP engine not yet implemented, using SST");
-                Self::create_sst()
+                anyhow::bail!(
+                    "MMAP engine is not implemented; select SST (default), NOVA, or HELIX instead — the former silent SST fallback misreported the deployment"
+                )
             }
             ProtoStorageEngine::Hybrid => {
-                warn!("Hybrid engine not yet implemented, using SST");
-                Self::create_sst()
+                anyhow::bail!(
+                    "Hybrid engine is not implemented; select SST (default), NOVA, or HELIX instead — the former silent SST fallback misreported the deployment"
+                )
             }
         }
     }
@@ -285,12 +287,14 @@ impl StorageEngineFactory {
                 Self::create_sst_async().await
             }
             ProtoStorageEngine::Mmap => {
-                warn!("MMAP engine not yet implemented, using SST");
-                Self::create_sst_async().await
+                anyhow::bail!(
+                    "MMAP engine is not implemented; select SST (default), NOVA, or HELIX instead — the former silent SST fallback misreported the deployment"
+                );
             }
             ProtoStorageEngine::Hybrid => {
-                warn!("Hybrid engine not yet implemented, using SST");
-                Self::create_sst_async().await
+                anyhow::bail!(
+                    "Hybrid engine is not implemented; select SST (default), NOVA, or HELIX instead — the former silent SST fallback misreported the deployment"
+                );
             }
         }
     }
@@ -1151,22 +1155,38 @@ mod tests {
             );
         }
 
-        // Mmap and Hybrid should fall back to SST (not error), verify they succeed
+        // Mmap and Hybrid now FAIL LOUD (the former silent SST fallback
+        // misreported the deployment — a client asking for MMAP got SST with
+        // only a warn). Verify both are rejected.
         let mmap_engine =
             StorageEngineFactory::create_from_proto_async(ProtoStorageEngine::Mmap).await;
         assert!(
-            mmap_engine.is_ok(),
-            "Mmap should fallback to SST, not error"
+            mmap_engine.is_err(),
+            "Mmap must fail loud, not silently fall back"
         );
-        assert_eq!(mmap_engine.as_ref().unwrap().format_name(), "sst");
+        assert!(
+            mmap_engine
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not implemented"),
+            "Mmap error must name the misconfiguration"
+        );
 
         let hybrid_engine =
             StorageEngineFactory::create_from_proto_async(ProtoStorageEngine::Hybrid).await;
         assert!(
-            hybrid_engine.is_ok(),
-            "Hybrid should fallback to SST, not error"
+            hybrid_engine.is_err(),
+            "Hybrid must fail loud, not silently fall back"
         );
-        assert_eq!(hybrid_engine.as_ref().unwrap().format_name(), "sst");
+        assert!(
+            hybrid_engine
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not implemented"),
+            "Hybrid error must name the misconfiguration"
+        );
     }
 
     // -----------------------------------------------------------------------
