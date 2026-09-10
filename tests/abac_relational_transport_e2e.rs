@@ -100,6 +100,7 @@ fn transport_security_config() -> SecurityConfig {
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys,
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test-secret".to_string(),
@@ -136,6 +137,7 @@ fn transport_security_config() -> SecurityConfig {
         encryption: EncryptionConfig::default(),
         key_store: KeyStoreConfig::default(),
         tenant: Default::default(),
+        pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
     }
 }
 

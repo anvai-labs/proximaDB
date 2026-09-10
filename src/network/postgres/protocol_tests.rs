@@ -1413,6 +1413,69 @@ fn order_by_no_clause_returns_none() {
     assert!(PostgresProtocol::extract_select_order_by("SELECT * FROM t").is_none(),);
 }
 
+// ---------------- TD-PGWIRE-AUTH-1: pgwire auth-posture ladder ----------------
+
+use crate::network::postgres::protocol::PgwireAuthMode;
+
+#[test]
+fn pgwire_auth_authentication_enabled_forces_scram() {
+    // Fail-closed: when [security.authentication] is enabled, SCRAM is REQUIRED
+    // and no config/env combination lowers it — a trust request is warn-ignored.
+    assert_eq!(
+        PgwireAuthMode::resolve(true, Some("trust"), None),
+        PgwireAuthMode::ScramRequired
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(true, None, Some("trust")),
+        PgwireAuthMode::ScramRequired
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(true, None, None),
+        PgwireAuthMode::ScramRequired
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(true, Some("password"), None),
+        PgwireAuthMode::ScramRequired
+    );
+}
+
+#[test]
+fn pgwire_auth_env_overrides_config() {
+    // Env wins over config.
+    assert_eq!(
+        PgwireAuthMode::resolve(false, Some("password"), Some("trust")),
+        PgwireAuthMode::ScramRequired
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(false, Some("trust"), Some("password")),
+        PgwireAuthMode::Trust
+    );
+    // Config alone raises above the trust default.
+    assert_eq!(
+        PgwireAuthMode::resolve(false, None, Some("password")),
+        PgwireAuthMode::ScramRequired
+    );
+    // Case/alias tolerance.
+    assert_eq!(
+        PgwireAuthMode::resolve(false, Some(" SCRAM-SHA-256 "), None),
+        PgwireAuthMode::ScramRequired
+    );
+}
+
+#[test]
+fn pgwire_auth_defaults_to_trust_and_ignores_unknown_values() {
+    // The dev/embedded default: nothing configured ⇒ trust (byte-identical to
+    // the pre-TD-PGWIRE-AUTH-1 posture).
+    assert_eq!(
+        PgwireAuthMode::resolve(false, None, None),
+        PgwireAuthMode::Trust
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(false, Some("bogus"), Some("also-bogus")),
+        PgwireAuthMode::Trust
+    );
+}
+
 #[test]
 fn split_top_level_commas_respects_string_literals() {
     let parts = PostgresProtocol::split_top_level_commas("a, 'b, c', d");

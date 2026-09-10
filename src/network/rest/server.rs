@@ -1425,6 +1425,7 @@ mod tests {
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
                 api_keys,
+                scram_users: std::collections::HashMap::new(),
                 jwt: JwtConfig {
                     enabled: false,
                     secret: "dev-secret".to_string(),
@@ -1461,6 +1462,7 @@ mod tests {
             encryption: crate::security::EncryptionConfig::default(),
             key_store: crate::security::KeyStoreConfig::default(),
             tenant: Default::default(),
+            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
         }
     }
 

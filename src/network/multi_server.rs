@@ -112,6 +112,10 @@ pub struct MultiServer {
     /// Shared services accessible for WAL recovery during startup
     pub shared_services: SharedServices,
     security_coordinator: Option<Arc<SecurityCoordinator>>,
+    rest_auth_enabled: bool,
+    /// TD-PGWIRE-AUTH-1: the resolved pgwire authentication posture (resolved
+    /// once in `database.rs`, threaded to every pgwire server start path).
+    pgwire_auth: crate::network::postgres::protocol::PgwireAuthMode,
     tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode,
     authentication_required: bool,
     server_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -305,6 +309,8 @@ impl MultiServer {
             shared_services,
             security_coordinator,
             authentication_required: rest_auth_enabled,
+            rest_auth_enabled,
+            pgwire_auth: crate::network::postgres::protocol::PgwireAuthMode::Trust,
             tenant_deployment_mode,
             server_handles: Arc::new(Mutex::new(Vec::new())),
             llm_engine,
@@ -320,6 +326,16 @@ impl MultiServer {
     /// pass here). Threaded into every network surface at start.
     pub fn with_tenant_header_trust(mut self, policy: proximadb_tenant::HeaderTrustPolicy) -> Self {
         self.tenant_header_trust = policy;
+        self
+    }
+
+    /// TD-PGWIRE-AUTH-1: set the resolved pgwire authentication posture
+    /// threaded into every pgwire server start path.
+    pub fn with_pgwire_auth_mode(
+        mut self,
+        mode: crate::network::postgres::protocol::PgwireAuthMode,
+    ) -> Self {
+        self.pgwire_auth = mode;
         self
     }
 
@@ -977,6 +993,8 @@ impl MultiServer {
                 });
 
             let tenant_header_trust = self.tenant_header_trust;
+            let pgwire_coordinator = self.security_coordinator.clone();
+            let pgwire_auth_mode = self.pgwire_auth;
             let tier_header_trust = self.tier_header_trust;
             let tenant_deployment_mode = self.tenant_deployment_mode.clone();
             let postgres_handle = tokio::spawn(async move {
@@ -1007,6 +1025,11 @@ impl MultiServer {
                 server = server.with_tenant_deployment_mode(tenant_deployment_mode);
                 if let Some(limiter) = pgwire_rate_limiter {
                     server = server.with_rate_limiter(limiter);
+                }
+                // TD-PGWIRE-AUTH-1: the coordinator + resolved posture — pgwire
+                // is the last network surface they are threaded into.
+                if let Some(coordinator) = pgwire_coordinator {
+                    server = server.with_security_coordinator(coordinator, pgwire_auth_mode);
                 }
                 if let Err(e) = server.start().await {
                     tracing::error!("❌ PostgreSQL Server error: {}", e);
@@ -1370,6 +1393,8 @@ impl MultiServer {
             let direct_write_services = self.build_direct_pgwire_write_services().await?;
             let warehouse_root_url = format!("file://{}/warehouse", self.config.data_dir.display());
             let tenant_header_trust = self.tenant_header_trust;
+            let pgwire_coordinator = self.security_coordinator.clone();
+            let pgwire_auth_mode = self.pgwire_auth;
             let tier_header_trust = self.tier_header_trust;
             let tenant_deployment_mode = self.tenant_deployment_mode.clone();
             let postgres_handle = tokio::spawn(async move {
@@ -1411,6 +1436,11 @@ impl MultiServer {
                 server = server.with_tier_header_trust(tier_header_trust);
                 server = server.with_tenant_deployment_mode(tenant_deployment_mode);
 
+                // TD-PGWIRE-AUTH-1: the coordinator + resolved posture — pgwire
+                // is the last network surface they are threaded into.
+                if let Some(coordinator) = pgwire_coordinator {
+                    server = server.with_security_coordinator(coordinator, pgwire_auth_mode);
+                }
                 if let Err(e) = server.start().await {
                     tracing::error!("❌ PostgreSQL Server error: {}", e);
                 }

@@ -1,0 +1,76 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGWIRE-AUTH-1: pgwire SCRAM-SHA-256 authentication — the last unauthenticated network surface
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (this filing).** SCRAM-SHA-256 is live on pgwire with a fail-closed posture ladder; trust remains the explicit dev/embedded default.
+| Priority | **HIGH** — pgwire was the only network surface without a `SecurityCoordinator`; it carried full DDL+DML authority over tenant data with no credential binding (the strategic pgwire-wedge gap, first principles: *every network surface authenticates or honestly refuses*).
+| Component | `src/network/postgres/scram.rs` (pure SASL machine), `src/network/postgres/protocol.rs` (startup exchange + identity), `src/security/auth_service.rs` (`scram_users` + `AuthenticationData::ScramAuthenticated`), `src/security/security_coordinator.rs` (`[security.pgwire]`), `src/network/postgres/mod.rs` + `src/network/multi_server.rs` + `src/database.rs` (wiring + one-time posture resolution).
+| Relates to | TD-AUTHZ-1 L0.4 ("pgwire authenticates or is registry-gated"), TD-TENANT-1 follow-up (b) (SCRAM bindings re-scoped here), TD-ABAC-10 (identity constructor flip), TD-ABAC-6 (`resolve_request_identity` reuse), ADR-018 P3.H, ADR-018 P2.D (transactions — the sibling wedge gap).
+|===
+
+== The gap
+
+pgwire ran **trust-only authentication**: the startup `user`/`database` parameters were bare
+client assertions (`protocol.rs` sent `AuthenticationOk` unconditionally). The same surface
+executes DDL and DML against tenant data. Under strict tenant policies, pgwire tenant
+selection had to be DISABLED entirely (SUPPORTED_SURFACE: "strict policies disable pgwire
+tenant selection rather than authenticate it") — the wedge could not be a wedge.
+
+== The design
+
+*Auth ladder* (fail-closed, resolved ONCE at boot in `database.rs` via the pure
+`PgwireAuthMode::resolve`):
+
+[cols="1,3", options="header"]
+|===
+| Condition | Effective posture
+| `security` disabled / absent (dev, embedded, the 25 pgwire e2e suites) | `Trust` — byte-identical to the pre-change wire behavior.
+| `[security.authentication] enabled = true` | **`ScramRequired` — forced.** No config/env combination can lower it; a `trust` request is warn-ignored. (Mirrors Arrow Flight's "coordinator present requires a credential".)
+| Otherwise | `PROXIMADB_PGWIRE_AUTH` env > `[security.pgwire] auth` (`"trust"` | `"password"`) > trust. The knob can RAISE pgwire above the global posture but never LOWER it.
+|===
+
+Boot invariant: `ScramRequired` with no coordinator (security disabled) is a startup ERROR.
+
+*Secret material*: `AuthenticationConfig.scram_users` — a namespace SEPARATE from `api_keys`
+so leaked verifier material can never replay as an API key. Each entry carries a plaintext
+password (derived into a verifier at build, iterations 4096 / PG default, salt 16 random
+bytes) or a precomputed verifier; a tenant binding; delegation-only role claims (same
+sanitized `gateway`/`operator` seam as API keys). `AuthenticationData::ScramAuthenticated`
+is server-side-only: `parse_authorization` can never produce it, so no HTTP surface can
+forge the shape.
+
+*Exchange* (`scram.rs`, RFC 7677/5802, RFC-7677-vector unit-tested): AuthenticationSASL
+advertising exactly `SCRAM-SHA-256` (never `-PLUS` — no TLS channel to bind; a `p=` gs2 flag
+is rejected) → SASLInitialResponse → AuthenticationSASLContinue → SASLResponse →
+AuthenticationSASLFinal → AuthenticationOk. Unknown users run the full exchange against a
+mock verifier and fail at client-final with the same 28P01 shape/timing (RFC 5803
+anti-enumeration). Constant-time StoredKey comparison. An auth-time rate-limit check (the
+query-loop limiter never covered the handshake).
+
+*Identity* (TD-ABAC-10): on success the verified credential flows through the ONE identity
+resolver (`resolve_request_identity`) — `AuthClass::Authenticated`, subject from the
+credential, tenant reconciled against the credential's binding (`binding != None` for the
+first time on pgwire), `tenant_stable_id` stamped. The bare tenant/subject assertion gates
+are skipped on this path (the credential IS the proof); strict policies now AUTHENTICATE
+pgwire tenant selection and the `proximadb_tier` claim instead of dropping it. The
+DEFAULT_TENANT pre-gate remains until TD-AUTHZ-1 L0.4 retires it.
+
+== Verification
+
+* Unit: RFC 7677 §3 vector (full exchange), wrong password, tampered proof, nonce mismatch,
+  channel-binding rejection, mandatory-extension rejection, gs2 `y,` echo, mock-verifier
+  anti-enumeration, malformed matrix, nonce charset; the full `PgwireAuthMode::resolve`
+  ladder matrix in `protocol_tests.rs`.
+* E2E (`tests/pgwire_scram_auth_e2e.rs`, real `tokio_postgres` client — natively SCRAM over
+  NoTls): trust default accepts credential-less; correct password authenticates and serves
+  `SELECT 1`; wrong password → 28P01; credential-less → rejected; unknown user → 28P01 with
+  the same message text as a wrong password.
+
+== Residual
+
+* Channel binding (`SCRAM-SHA-256-PLUS`) lands with native TLS negotiation (ADR-018 P3.H).
+* `ALTER ROLE`/`CREATE USER`-style on-wire user management: identities are config-provisioned.
+* mTLS on pgwire remains tracked in the postgres.adoc security section.

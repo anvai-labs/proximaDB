@@ -22,8 +22,12 @@ tokio_postgres::connect(
 ).await?;
 ----
 
-The pgwire impl accepts any user name in the v0.2 permissive default; mTLS and
-SCRAM-SHA-256 authentication are tracked separately under TD-077.
+pgwire authentication follows a fail-closed ladder (TD-PGWIRE-AUTH-1): with
+`[security.authentication] enabled`, SCRAM-SHA-256 is REQUIRED (provision identities under
+`[security.authentication.scram_users]`); otherwise `PROXIMADB_PGWIRE_AUTH=password`
+(or `[security.pgwire] auth`) raises pgwire to SCRAM while the deployment stays in trust
+elsewhere. Absent any of these, the dev default is trust (any user name, no credential).
+mTLS remains tracked under TD-TENANT-1 (b).
 
 === Tenant selection
 

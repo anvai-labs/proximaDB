@@ -136,6 +136,74 @@ pub struct PostgresProtocol {
     /// resolver REST/gRPC/Arrow use). `None` = unwired ⇒ identity carries no
     /// stable id (pgwire ABAC inert for policy lookup, same default REST had).
     stable_id_resolver: Option<Arc<dyn proximadb_tenant::TenantStableIdResolver>>,
+    /// TD-PGWIRE-AUTH-1: coordinator for the SCRAM-SHA-256 mode — verifier
+    /// lookups + post-exchange identity resolution. `None` ⇒ SCRAM
+    /// unavailable (trust mode only).
+    security_coordinator: Option<Arc<crate::security::SecurityCoordinator>>,
+    /// TD-PGWIRE-AUTH-1: the resolved pgwire authentication posture (trust |
+    /// SCRAM-required), resolved once at startup in `database.rs`.
+    pgwire_auth: PgwireAuthMode,
+}
+
+/// The pgwire authentication posture (TD-PGWIRE-AUTH-1). Resolved ONCE at
+/// startup: `security` disabled ⇒ Trust; `[security.authentication] enabled`
+/// FORCES `ScramRequired` (fail-closed, mirrors Flight's
+/// "coordinator present requires a credential" rule); otherwise the
+/// `[security.pgwire] auth` config / `PROXIMADB_PGWIRE_AUTH` env ladder
+/// applies (it can raise pgwire above the global default but never lower it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PgwireAuthMode {
+    /// Trust authentication: no credential exchange (dev / embedded default).
+    #[default]
+    Trust,
+    /// SCRAM-SHA-256 required: a startup without a successful exchange is
+    /// rejected with FATAL 28000/28P01.
+    ScramRequired,
+}
+
+impl PgwireAuthMode {
+    /// Resolve the effective posture (TD-PGWIRE-AUTH-1) — pure, unit-testable.
+    ///
+    /// Ladder: `[security.authentication] enabled` FORCES
+    /// [`PgwireAuthMode::ScramRequired`] (fail-closed — mirrors Arrow Flight's
+    /// "coordinator present requires a credential" rule); a `trust` request
+    /// under it is warn-ignored. Otherwise the `PROXIMADB_PGWIRE_AUTH` env
+    /// override wins over the `[security.pgwire] auth` config value; unknown
+    /// values warn and fall back to trust. The CALLER errors at boot when the
+    /// result is `ScramRequired` but no coordinator was built.
+    pub fn resolve(
+        auth_enabled: bool,
+        env_override: Option<&str>,
+        configured: Option<&str>,
+    ) -> Self {
+        let normalize = |value: &str| match value.trim().to_ascii_lowercase().as_str() {
+            "password" | "scram" | "scram-sha-256" => Some(Self::ScramRequired),
+            "trust" => Some(Self::Trust),
+            _ => None,
+        };
+        let env_mode = env_override.and_then(normalize);
+        if let Some(value) = env_override
+            && env_mode.is_none()
+        {
+            tracing::warn!(
+                value = %value,
+                "ignoring unknown PROXIMADB_PGWIRE_AUTH value (expected 'trust' or 'password')"
+            );
+        }
+        if auth_enabled {
+            if env_mode == Some(Self::Trust) || configured.map(normalize) == Some(Some(Self::Trust))
+            {
+                tracing::warn!(
+                    "pgwire auth downgrade to trust ignored: [security.authentication] \
+                     enabled forces SCRAM-SHA-256 on pgwire (TD-PGWIRE-AUTH-1)"
+                );
+            }
+            return Self::ScramRequired;
+        }
+        env_mode
+            .or_else(|| configured.and_then(normalize))
+            .unwrap_or(Self::Trust)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +546,8 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            security_coordinator: None,
+            pgwire_auth: PgwireAuthMode::Trust,
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -497,6 +567,24 @@ impl PostgresProtocol {
     ) -> Self {
         self.rate_limiter = Some(limiter);
         self.peer_ip = peer_ip;
+        self
+    }
+
+    /// TD-PGWIRE-AUTH-1: attach the security coordinator so the SCRAM-SHA-256
+    /// mode can resolve verifiers + identities (the last surface the
+    /// coordinator is threaded into — REST/gRPC/Flight already carry it).
+    pub fn with_security_coordinator(
+        mut self,
+        coordinator: Arc<crate::security::SecurityCoordinator>,
+    ) -> Self {
+        self.security_coordinator = Some(coordinator);
+        self
+    }
+
+    /// TD-PGWIRE-AUTH-1: set the resolved authentication posture (trust |
+    /// SCRAM-required).
+    pub fn with_pgwire_auth_mode(mut self, mode: PgwireAuthMode) -> Self {
+        self.pgwire_auth = mode;
         self
     }
 
@@ -537,6 +625,8 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            security_coordinator: None,
+            pgwire_auth: PgwireAuthMode::Trust,
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -588,6 +678,8 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            security_coordinator: None,
+            pgwire_auth: PgwireAuthMode::Trust,
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -955,6 +1047,16 @@ impl PostgresProtocol {
                 b'S' => self.handle_sync().await?,
                 b'H' => self.handle_flush().await?,
                 b'C' => self.handle_close(&body).await?,
+                b'p' => {
+                    // TD-PGWIRE-AUTH-1: a password/SASL message outside the
+                    // startup exchange is a protocol violation (mirrors PG's
+                    // 08P01). The startup exchange reads its b'p' messages
+                    // inline in `handle_startup`, never via this loop.
+                    warn!("Unexpected password/SASL message outside authentication");
+                    self.send_error("FATAL", "08P01", "password message outside authentication")
+                        .await?;
+                    return Err(anyhow!("unexpected SASL message in main loop"));
+                }
                 _ => {
                     warn!("Unknown message type: {}", msg_type as char);
                     self.send_error("ERROR", "XX000", "Unknown message type")
@@ -1010,6 +1112,22 @@ impl PostgresProtocol {
         let params = self.read_bytes(param_len).await?;
         let params = self.parse_startup_params(&params)?;
 
+        // TD-PGWIRE-AUTH-1: SCRAM-required mode runs the SASL exchange FIRST and
+        // builds the session identity from the VERIFIED credential. The bare-
+        // assertion gates below are then subsumed (the credential supplies the
+        // subject; `resolve_request_identity` reconciles the asserted tenant
+        // against the credential's binding — TD-ABAC-10). Failure paths send
+        // their own FATAL before returning.
+        let scram_identity = match self.pgwire_auth {
+            PgwireAuthMode::Trust => None,
+            PgwireAuthMode::ScramRequired => match self.scram_startup_auth(&params).await {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    return Err(anyhow!("pgwire SCRAM authentication failed: {error}"));
+                }
+            },
+        };
+
         let startup_tenant = match Self::resolve_startup_tenant(
             params.get("database").map(String::as_str),
             &self.tenant_deployment_mode,
@@ -1022,10 +1140,12 @@ impl PostgresProtocol {
         };
 
         // TD-TENANT-1: the startup `database` doubles as the tenant/catalog
-        // (TD-064) and pgwire runs trust auth — the assertion is bare by
-        // definition. Under a strict policy, reject the connection at the
-        // handshake (SQLSTATE 28000) instead of granting the asserted tenant.
-        if let Some(database) = params.get("database")
+        // (TD-064) and — in TRUST mode — the assertion is bare by definition.
+        // Under a strict policy, reject the connection at the handshake
+        // (SQLSTATE 28000) instead of granting the asserted tenant. Skipped in
+        // SCRAM mode: the verified credential owns the tenant binding.
+        if self.pgwire_auth == PgwireAuthMode::Trust
+            && let Some(database) = params.get("database")
             && let Err(message) = self.check_pgwire_tenant_assertion(database)
         {
             self.send_error("FATAL", "28000", &message).await?;
@@ -1037,8 +1157,10 @@ impl PostgresProtocol {
         // bare, unauthenticated subject at the handshake rather than letting ABAC
         // enforce against a spoofable id. Default-OFF surface (`abac-policy`);
         // under `Open` (default) the assertion is accepted like the tenant's.
+        // Skipped in SCRAM mode: the subject is credential-derived.
         #[cfg(feature = "abac-policy")]
-        if let Some(user) = params.get("user")
+        if self.pgwire_auth == PgwireAuthMode::Trust
+            && let Some(user) = params.get("user")
             && let Err(message) = self.check_pgwire_subject_assertion(user)
         {
             self.send_error("FATAL", "28000", &message).await?;
@@ -1059,13 +1181,34 @@ impl PostgresProtocol {
                 self.stable_id_resolver.as_deref(),
             ));
             session.database = startup_tenant;
+            // TD-PGWIRE-AUTH-1: in SCRAM mode the VERIFIED identity replaces the
+            // trust-asserted one, and the credential's tenant binding is
+            // authoritative (it also authenticates the tier claim below under
+            // strict policies — previously structurally impossible over pgwire).
+            let tier_binding = scram_identity.as_ref().and_then(|resolved| {
+                resolved.user_context.as_ref().and_then(|context| {
+                    context.tenant_id.as_ref().map(|tenant_id| {
+                        proximadb_tenant::AuthenticatedTenantBinding {
+                            tenant_id: tenant_id.clone(),
+                            is_gateway_principal: context.is_gateway_principal(),
+                        }
+                    })
+                })
+            });
+            if let Some(resolved) = &scram_identity {
+                if let Some(context) = &resolved.user_context {
+                    session.user = context.user_id.clone();
+                }
+                session.identity = Some(resolved.identity.clone());
+                session.database = resolved.identity.tenant.clone();
+            }
             // Open-core cache tier hook: a `proximadb_tier` startup parameter
             // (control-plane supplied) records the connection tenant's tier for
             // the cache policy. database == tenant/catalog (TD-064). Opaque id.
-            // ADR-0053 W8: gated by tier_header_trust. pgwire has no
-            // authenticated binding (trust auth), so the binding is None and
-            // any strict policy drops the claim (warned, never SQLSTATE) —
-            // under strict policies the startup parameter is inert.
+            // ADR-0053 W8: gated by tier_header_trust. In TRUST mode pgwire has
+            // no authenticated binding, so the binding is None and any strict
+            // policy drops the claim (warned, never SQLSTATE). In SCRAM mode the
+            // credential's binding authenticates the claim (TD-PGWIRE-AUTH-1).
             // TD-TENANT-3: the shared claim vocabulary. pgwire's spelling
             // differs because the PG startup-parameter grammar forbids `-`, so
             // the canonical `x-tenant-tier` cannot be spelled here — the
@@ -1076,7 +1219,11 @@ impl PostgresProtocol {
             let db = session.database.clone();
             match (
                 db.is_empty(),
-                proximadb_tenant::resolve_tier_claim(tier_claim, None, self.tier_header_trust),
+                proximadb_tenant::resolve_tier_claim(
+                    tier_claim,
+                    tier_binding.as_ref(),
+                    self.tier_header_trust,
+                ),
             ) {
                 // Rejected: DROPPED (never SQLSTATE). pgwire's drop was fully
                 // silent — count it (ADR-0053 W8) so a strict deployment can
@@ -1115,6 +1262,291 @@ impl PostgresProtocol {
         info!("PostgreSQL startup complete");
 
         Ok(())
+    }
+
+    /// TD-PGWIRE-AUTH-1: run the SCRAM-SHA-256 server exchange over the startup
+    /// message stream and resolve the verified identity through
+    /// [`crate::security::request_identity::resolve_request_identity`]. Sends
+    /// every wire message itself — AuthenticationSASL → (client
+    /// SASLInitialResponse) → AuthenticationSASLContinue → (client SASLResponse)
+    /// → AuthenticationSASLFinal — and on any failure the FATAL error; the
+    /// caller only closes the connection. On success the caller still sends
+    /// AuthenticationOk + parameters (PostgreSQL's message order).
+    async fn scram_startup_auth(
+        &mut self,
+        params: &HashMap<String, String>,
+    ) -> Result<crate::security::request_identity::ResolvedIdentity> {
+        use crate::network::postgres::scram::{ScramExchange, ScramVerifier, generate_nonce};
+
+        let Some(coordinator) = self.security_coordinator.clone() else {
+            self.send_error(
+                "FATAL",
+                "28000",
+                "SCRAM authentication required but no security coordinator is configured",
+            )
+            .await?;
+            return Err(anyhow!("pgwire SCRAM required with no coordinator"));
+        };
+        let Some(username) = params
+            .get("user")
+            .map(String::as_str)
+            .filter(|user| !user.is_empty())
+            .map(str::to_owned)
+        else {
+            self.send_error(
+                "FATAL",
+                "28000",
+                "no PostgreSQL user name specified in startup packet",
+            )
+            .await?;
+            return Err(anyhow!("pgwire SCRAM: missing user"));
+        };
+
+        // Auth-time rate limit — the query-loop limiter only covers queries, and
+        // the credential-stuffing target is the handshake itself.
+        if let Some(limiter) = self.rate_limiter.clone()
+            && let Err(retry_after) = limiter.check_and_consume(self.peer_ip).await
+        {
+            self.send_error(
+                "FATAL",
+                "53300",
+                "too many sign-in attempts for this address; retry later",
+            )
+            .await?;
+            return Err(anyhow!(
+                "pgwire SCRAM rate limited (retry after {retry_after}s)"
+            ));
+        }
+
+        // Advertise exactly one mechanism — never `-PLUS` (no TLS channel to bind).
+        self.send_authentication_sasl(&[super::scram::MECHANISM])
+            .await?;
+
+        // Client SASLInitialResponse (b'p').
+        let (mechanism, initial) = self.read_sasl_initial_response().await?;
+        if mechanism == "*" {
+            self.send_error("FATAL", "28000", "SASL authentication canceled")
+                .await?;
+            return Err(anyhow!("pgwire SASL canceled by client"));
+        }
+        if mechanism != super::scram::MECHANISM {
+            self.send_error("FATAL", "28000", "unsupported SASL mechanism")
+                .await?;
+            return Err(anyhow!("pgwire SASL: client chose {mechanism}"));
+        }
+
+        // Unknown user: run the full exchange against a mock verifier so the
+        // failure surfaces at client-final with identical message shape and
+        // timing (RFC 5803 anti-enumeration).
+        let server_rng = || {
+            ScramVerifier::mock(&ring::rand::SystemRandom::new())
+                .map_err(|error| anyhow!("server RNG failed: {error:?}"))
+        };
+        let verifier = match coordinator.scram_verifier(&username) {
+            Some(verifier) => verifier,
+            None => match server_rng() {
+                Ok(verifier) => verifier,
+                Err(error) => {
+                    self.send_error("FATAL", "XX000", "internal authentication error")
+                        .await?;
+                    return Err(error);
+                }
+            },
+        };
+        let server_nonce = match generate_nonce() {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                self.send_error("FATAL", "XX000", "internal authentication error")
+                    .await?;
+                return Err(anyhow!("server RNG failed: {error:?}"));
+            }
+        };
+
+        let (exchange, server_first) = match ScramExchange::start(verifier, &initial, &server_nonce)
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.send_scram_failure(&error).await?;
+                return Err(anyhow!("pgwire SASL: bad client-first ({error:?})"));
+            }
+        };
+        self.send_authentication_sasl_continue(server_first.as_bytes())
+            .await?;
+
+        // Client SASLResponse (b'p') — the client-final message.
+        let client_final = self.read_sasl_response().await?;
+        match exchange.finish(&client_final) {
+            Ok(server_final) => {
+                self.send_authentication_sasl_final(server_final.as_bytes())
+                    .await?;
+            }
+            Err(error) => {
+                // Uniform 28P01 for wrong password AND malformed final (and the
+                // unknown-user mock path lands here identically).
+                self.send_scram_failure(&error).await?;
+                return Err(anyhow!("pgwire SASL: authentication failed for {username}"));
+            }
+        }
+
+        // The proof is verified: resolve the credential into the session identity.
+        let resolved = crate::security::request_identity::resolve_request_identity(
+            Some(&coordinator),
+            Some(crate::security::AuthenticationData::ScramAuthenticated {
+                username: username.clone(),
+            }),
+            params.get("database").map(String::as_str),
+            Some(&username),
+            self.tenant_header_trust,
+            &self.tenant_deployment_mode,
+            self.stable_id_resolver.as_deref(),
+        )
+        .await;
+        match resolved {
+            Ok(resolved) => Ok(resolved),
+            Err(error) => {
+                if matches!(
+                    error,
+                    crate::security::request_identity::IdentityError::Assertion(_)
+                ) {
+                    warn!(
+                        target: "proximadb::tenant_audit",
+                        surface = "pgwire",
+                        user = %username,
+                        "tenant assertion rejected after SCRAM authentication"
+                    );
+                }
+                let (code, message) = Self::identity_error_to_pgwire(&error);
+                self.send_error("FATAL", code, &message).await?;
+                Err(anyhow!("pgwire SCRAM identity resolution failed: {error}"))
+            }
+        }
+    }
+
+    /// Map [`crate::security::request_identity::IdentityError`] onto the pgwire
+    /// error vocabulary (template: Arrow's `identity_error_to_flight_status`).
+    fn identity_error_to_pgwire(
+        error: &crate::security::request_identity::IdentityError,
+    ) -> (&'static str, String) {
+        use crate::security::request_identity::IdentityError;
+        match error {
+            IdentityError::Authentication(message) => (
+                "28P01",
+                format!("password authentication failed: {message}"),
+            ),
+            IdentityError::Assertion(_) => (
+                "28000",
+                "invalid authorization: tenant assertion rejected".to_string(),
+            ),
+            IdentityError::TenantResolution(err) => {
+                ("28000", format!("invalid authorization: {err}"))
+            }
+        }
+    }
+
+    /// Uniform FATAL for SCRAM exchange failures. Malformed and
+    /// AuthenticationFailed share one message so a wrong password and a garbage
+    /// message are indistinguishable on the wire.
+    async fn send_scram_failure(&mut self, error: &super::scram::ScramError) -> Result<()> {
+        let (code, message) = match error {
+            super::scram::ScramError::ChannelBindingUnsupported => (
+                "28000",
+                "channel binding is not supported over this connection",
+            ),
+            super::scram::ScramError::Unsupported => ("28000", "unsupported SASL feature"),
+            _ => ("28P01", "password authentication failed"),
+        };
+        self.send_error("FATAL", code, message).await
+    }
+
+    /// AuthenticationSASL (`'R'` + 10): advertise the SASL mechanisms as a
+    /// NUL-terminated list with a list-terminating NUL.
+    async fn send_authentication_sasl(&mut self, mechanisms: &[&str]) -> Result<()> {
+        let mut payload: Vec<u8> = Vec::new();
+        for mechanism in mechanisms {
+            payload.extend_from_slice(mechanism.as_bytes());
+            payload.push(0);
+        }
+        payload.push(0);
+        self.write_buffer.put_u8(b'R');
+        self.write_buffer.put_i32((4 + 4 + payload.len()) as i32);
+        self.write_buffer.put_i32(10);
+        self.write_buffer.put_slice(&payload);
+        self.flush_write_buffer().await
+    }
+
+    /// AuthenticationSASLContinue (`'R'` + 11): the server-first message.
+    async fn send_authentication_sasl_continue(&mut self, data: &[u8]) -> Result<()> {
+        self.write_buffer.put_u8(b'R');
+        self.write_buffer.put_i32((4 + 4 + data.len()) as i32);
+        self.write_buffer.put_i32(11);
+        self.write_buffer.put_slice(data);
+        self.flush_write_buffer().await
+    }
+
+    /// AuthenticationSASLFinal (`'R'` + 12): the `v=<base64 signature>` message.
+    async fn send_authentication_sasl_final(&mut self, data: &[u8]) -> Result<()> {
+        self.write_buffer.put_u8(b'R');
+        self.write_buffer.put_i32((4 + 4 + data.len()) as i32);
+        self.write_buffer.put_i32(12);
+        self.write_buffer.put_slice(data);
+        self.flush_write_buffer().await
+    }
+
+    /// Read a client SASLInitialResponse (b'p'): NUL-terminated mechanism name,
+    /// then an i32 initial-response length (-1 = absent) and that many bytes.
+    async fn read_sasl_initial_response(&mut self) -> Result<(String, Vec<u8>)> {
+        let msg_type = self.read_byte().await?;
+        if msg_type != b'p' {
+            return Err(anyhow!(
+                "expected SASLInitialResponse ('p'), got {:?}",
+                msg_type as char
+            ));
+        }
+        let length = self.read_i32().await? as usize;
+        if length < 4 {
+            return Err(anyhow!("invalid SASLInitialResponse length"));
+        }
+        let body = self.read_bytes(length - 4).await?;
+        let nul = body
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| anyhow!("malformed SASLInitialResponse: no mechanism terminator"))?;
+        let mechanism = String::from_utf8(body[..nul].to_vec())?;
+        let rest = &body[nul + 1..];
+        if rest.len() < 4 {
+            return Err(anyhow!(
+                "malformed SASLInitialResponse: truncated response length"
+            ));
+        }
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&rest[..4]);
+        let initial_len = i32::from_be_bytes(len_bytes);
+        let initial = if initial_len < 0 {
+            Vec::new()
+        } else {
+            let initial_len = initial_len as usize;
+            if rest.len() < 4 + initial_len {
+                return Err(anyhow!("malformed SASLInitialResponse: truncated response"));
+            }
+            rest[4..4 + initial_len].to_vec()
+        };
+        Ok((mechanism, initial))
+    }
+
+    /// Read a client SASLResponse (b'p'): the raw client-final message bytes.
+    async fn read_sasl_response(&mut self) -> Result<Vec<u8>> {
+        let msg_type = self.read_byte().await?;
+        if msg_type != b'p' {
+            return Err(anyhow!(
+                "expected SASLResponse ('p'), got {:?}",
+                msg_type as char
+            ));
+        }
+        let length = self.read_i32().await? as usize;
+        if length < 4 {
+            return Err(anyhow!("invalid SASLResponse length"));
+        }
+        self.read_bytes(length - 4).await
     }
 
     /// Parse startup parameters
