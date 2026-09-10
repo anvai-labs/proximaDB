@@ -128,9 +128,9 @@ pub fn create_v2_router() -> Router<AppState> {
             "/collections/{collection_id}/records/batch",
             post(records::insert_records),
         )
-        // TD-099 (2026-05-31): paginated table scan. Server-side delegation
-        // to RecordScan is deferred; handler returns an empty page so the
-        // OpenAPI contract gate has a real route to dial.
+        // TD-099: paginated scan — SHIPPED (storage-engine delegation landed in
+        // c8050ab1a: handler drives `handle_record_scan_for_tenant` → the shared
+        // WAL/memtable scan, cursor-paginated; see records.rs + services/scan_cursor.rs).
         .route(
             "/collections/{collection_id}/records/scan",
             post(records::scan_records),

@@ -1934,6 +1934,9 @@ fn build_grpc_reflection_service() -> Result<
             "../proto/proximadb_v1_descriptor.bin"
         ))
         .register_encoded_file_descriptor_set(include_bytes!("../proto/proximadb_descriptor.bin"))
+        // D1: the CANONICAL v2 surface must be discoverable too — reflection
+        // previously served only the v1 descriptors after the v1 sunset.
+        .register_encoded_file_descriptor_set(proximadb_proto::V2_FILE_DESCRIPTOR_SET)
         .build_v1()
         .context("failed to build gRPC reflection service")
 }
