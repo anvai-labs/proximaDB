@@ -1479,7 +1479,6 @@ mod tests {
                             "access_token_expiration_minutes":1,
                             "refresh_token_expiration_days":1,"algorithm":"HS256"},
                     "sso":{"enabled":false,"providers":[],"token_cache_ttl_minutes":1,
-                            scram_users: std::collections::HashMap::new(),
                             "aws_iam":null,"azure_ad":null}}"#,
             )
             .expect("minimal auth config")
@@ -1645,7 +1644,6 @@ mod tests {
                             "access_token_expiration_minutes":1,
                             "refresh_token_expiration_days":1,"algorithm":"HS256"},
                     "sso":{"enabled":false,"providers":[],"token_cache_ttl_minutes":1,
-                            scram_users: std::collections::HashMap::new(),
                             "aws_iam":null,"azure_ad":null}}"#,
             )
             .expect("minimal auth config")
