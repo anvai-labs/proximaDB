@@ -962,7 +962,14 @@ async fn register_merged_olap_table(
             .collect();
         let kept = filter_record_batch(batch, &keep)
             .map_err(|e| ExecutionError::Context(format!("olap-merge filter {name}: {e}")))?;
-        batches.push(kept);
+        // TD-185a: `filter_record_batch` preserves the batch's ORIGINAL schema,
+        // which carries the Parquet file's baked-in field metadata. The table
+        // schema is metadata-normalized (recursive-CTE field comparison), so
+        // re-wrap the columns onto it — MemTable requires every partition batch
+        // to match its schema exactly.
+        let conformed = RecordBatch::try_new(base_schema.clone(), kept.columns().to_vec())
+            .map_err(|e| ExecutionError::Context(format!("olap-merge conform {name}: {e}")))?;
+        batches.push(conformed);
     }
 
     // 4. Append the current live rows for the changed oids, encoded with the same

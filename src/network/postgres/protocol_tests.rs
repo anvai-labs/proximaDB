@@ -1325,7 +1325,8 @@ fn test_drop_table_with_if_exists() {
 #[test]
 fn order_by_single_column_default_asc_nulls_last() {
     let keys = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY name")
-        .expect("single-col ORDER BY must parse");
+        .unwrap()
+        .expect("single-col keys");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column, "name");
     assert!(!keys[0].desc);
@@ -1335,8 +1336,9 @@ fn order_by_single_column_default_asc_nulls_last() {
 
 #[test]
 fn order_by_explicit_desc_default_nulls_first() {
-    let keys =
-        PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY score DESC").unwrap();
+    let keys = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY score DESC")
+        .unwrap()
+        .expect("keys");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column, "score");
     assert!(keys[0].desc);
@@ -1348,7 +1350,8 @@ fn order_by_explicit_desc_default_nulls_first() {
 fn order_by_explicit_nulls_first_overrides_default() {
     let keys =
         PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY score ASC NULLS FIRST")
-            .unwrap();
+            .unwrap()
+            .expect("keys");
     assert_eq!(keys.len(), 1);
     assert!(!keys[0].desc);
     // Override: NULLS FIRST under ASC.
@@ -1359,7 +1362,8 @@ fn order_by_explicit_nulls_first_overrides_default() {
 fn order_by_explicit_nulls_last_overrides_default() {
     let keys =
         PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY score DESC NULLS LAST")
-            .unwrap();
+            .unwrap()
+            .expect("keys");
     assert_eq!(keys.len(), 1);
     assert!(keys[0].desc);
     // Override: NULLS LAST under DESC.
@@ -1371,7 +1375,8 @@ fn order_by_multi_column_preserves_declaration_order() {
     let keys = PostgresProtocol::extract_select_order_by(
         "SELECT * FROM t ORDER BY name ASC, score DESC, created_at",
     )
-    .expect("multi-col ORDER BY must parse (Phase 2)");
+    .unwrap()
+    .expect("multi-col keys (Phase 2)");
     assert_eq!(keys.len(), 3);
     assert_eq!(keys[0].column, "name");
     assert!(!keys[0].desc);
@@ -1386,7 +1391,8 @@ fn order_by_multi_column_per_key_nulls() {
     let keys = PostgresProtocol::extract_select_order_by(
         "SELECT * FROM t ORDER BY a NULLS FIRST, b DESC NULLS LAST",
     )
-    .unwrap();
+    .unwrap()
+    .expect("keys");
     assert_eq!(keys.len(), 2);
     assert!(keys[0].nulls_first); // explicit NULLS FIRST on ASC
     assert!(!keys[1].nulls_first); // explicit NULLS LAST on DESC
@@ -1395,7 +1401,8 @@ fn order_by_multi_column_per_key_nulls() {
 #[test]
 fn order_by_terminates_at_limit() {
     let keys = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY name LIMIT 10")
-        .unwrap();
+        .unwrap()
+        .expect("keys");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column, "name");
 }
@@ -1403,14 +1410,44 @@ fn order_by_terminates_at_limit() {
 #[test]
 fn order_by_terminates_at_offset() {
     let keys = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY name OFFSET 5")
-        .unwrap();
+        .unwrap()
+        .expect("keys");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column, "name");
 }
 
 #[test]
 fn order_by_no_clause_returns_none() {
-    assert!(PostgresProtocol::extract_select_order_by("SELECT * FROM t").is_none(),);
+    assert!(
+        PostgresProtocol::extract_select_order_by("SELECT * FROM t")
+            .unwrap()
+            .is_none(),
+    );
+}
+
+// ---------------- TD-185b: ORDER BY fails closed, resolves aliases ----------------
+
+#[test]
+fn order_by_malformed_clause_is_an_error_not_silent_unordered() {
+    // An ORDER BY that is present but unparsable must surface as Err — the
+    // caller fails closed instead of silently returning storage order.
+    let result = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY");
+    assert!(result.is_err(), "empty ORDER BY clause must error");
+    let result = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY ,,");
+    assert!(result.is_err(), "segment-less ORDER BY clause must error");
+}
+
+#[test]
+fn projection_alias_extraction_resolves_order_by_aliases() {
+    let aliases = PostgresProtocol::extract_projection_aliases(
+        "SELECT k.k_person2 AS friend, n.name FROM knows k JOIN nation n ON true",
+    );
+    assert_eq!(aliases.len(), 1, "only explicit AS pairs, got {aliases:?}");
+    assert_eq!(aliases[0], ("k_person2".to_string(), "friend".to_string()));
+
+    // No projection / `SELECT *` → no aliases.
+    assert!(PostgresProtocol::extract_projection_aliases("SELECT * FROM t").is_empty());
+    assert!(PostgresProtocol::extract_projection_aliases("SELECT a FROM t").is_empty());
 }
 
 #[test]
