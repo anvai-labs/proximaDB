@@ -655,7 +655,7 @@ mod tests {
             assert_eq!(heap.pop().unwrap().similarity, 10.0);
         }
 
-    #[cfg(feature = "experimental-engines")]
+        #[cfg(feature = "experimental-engines")]
         #[test]
         fn test_binary_sketch_operations() {
             let vector = vec![0.5, -0.3, 0.8, -0.1, 0.0];
@@ -978,7 +978,7 @@ mod tests {
             assert!(intersection_time.as_millis() < 100);
         }
 
-    #[cfg(feature = "experimental-engines")]
+        #[cfg(feature = "experimental-engines")]
         #[test]
         fn test_binary_sketch_performance() {
             let vectors = create_large_test_dataset(1000, 768);

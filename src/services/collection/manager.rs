@@ -704,7 +704,7 @@ impl CollectionService {
         // Existing VIPER collections remain readable via the context-free
         // factory; only new creations are refused (staged retirement S1 → S2).
         if selected_engine == crate::proto::proximadb_v1::StorageEngine::Viper {
-            return Err(anyhow!(
+            return Err(anyhow::anyhow!(
                 "VIPER is deprecated (ADR-093) and can no longer be selected for new \
                  collections: use SST (default), NOVA (columnar analytics), HELIX, or the \
                  DataFusion/Parquet path for warehouse-shaped analytics"
