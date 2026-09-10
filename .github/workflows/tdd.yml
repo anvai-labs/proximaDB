@@ -49,6 +49,7 @@ jobs:
           components: rustfmt, clippy
           cache: false  # Use custom cache strategy
           rustflags: ""  # Prevent default -D warnings
+          build-warnings: ""  # v2 otherwise exports CARGO_BUILD_WARNINGS=deny
 
       - name: Cache dependencies
         uses: actions/cache@v6
@@ -161,6 +162,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rustflags: ""
+          build-warnings: ""
 
       - name: Cache dependencies
         uses: actions/cache@v6
@@ -220,6 +222,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rustflags: ""
+          build-warnings: ""
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -278,6 +281,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rustflags: ""
+          build-warnings: ""
 
       - name: Install System Dependencies
         run: |
@@ -336,6 +340,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rustflags: ""
+          build-warnings: ""
 
       - name: Install System Dependencies
         run: |
@@ -412,6 +417,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           rustflags: ""
+          build-warnings: ""
 
       - name: Install cargo-audit
         run: |
