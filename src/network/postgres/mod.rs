@@ -15,6 +15,9 @@ pub mod protocol;
 /// Bridge to the new relational pipeline (algebra → planner →
 /// executor → engine). Opt-in via PROXIMADB_PGWIRE_RELATIONAL_PIPELINE.
 pub mod relational_pipeline;
+/// Server-side SCRAM-SHA-256 (RFC 7677) — pure SASL state machine backing the
+/// pgwire `SCRAM-SHA-256` authentication mode (TD-PGWIRE-AUTH-1).
+pub mod scram;
 /// Session management for PostgreSQL client connections
 pub mod session;
 /// SQL-to-ProximaDB query translator (pgvector compatibility)
@@ -131,6 +134,10 @@ pub struct PostgresServer {
     tier_header_trust: proximadb_tenant::HeaderTrustPolicy,
     /// Whether startup may omit the tenant/catalog and use a default.
     tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode,
+    /// TD-PGWIRE-AUTH-1: security coordinator for the SCRAM-SHA-256 mode.
+    security_coordinator: Option<Arc<crate::security::SecurityCoordinator>>,
+    /// TD-PGWIRE-AUTH-1: the resolved pgwire authentication posture.
+    pgwire_auth: protocol::PgwireAuthMode,
     /// The exact composition-root enforcer used by REST/gRPC and mutated by the
     /// live ABAC admin API. Cloned into each pgwire DML façade at accept time.
     #[cfg(feature = "abac-policy")]
@@ -180,6 +187,8 @@ impl PostgresServer {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
+            security_coordinator: None,
+            pgwire_auth: protocol::PgwireAuthMode::Trust,
             #[cfg(feature = "abac-policy")]
             abac_enforcer: None,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -190,6 +199,20 @@ impl PostgresServer {
     /// the same `HeaderTrustPolicy` the REST/gRPC/Arrow Flight surfaces hold.
     pub fn with_tenant_header_trust(mut self, policy: proximadb_tenant::HeaderTrustPolicy) -> Self {
         self.tenant_header_trust = policy;
+        self
+    }
+
+    /// TD-PGWIRE-AUTH-1: attach the security coordinator (verifier lookups +
+    /// post-exchange identity resolution for the SCRAM-SHA-256 mode) and the
+    /// resolved authentication posture. pgwire is the last network surface the
+    /// coordinator is threaded into.
+    pub fn with_security_coordinator(
+        mut self,
+        coordinator: Arc<crate::security::SecurityCoordinator>,
+        auth_mode: protocol::PgwireAuthMode,
+    ) -> Self {
+        self.security_coordinator = Some(coordinator);
+        self.pgwire_auth = auth_mode;
         self
     }
 
@@ -343,6 +366,8 @@ impl PostgresServer {
                     let tenant_header_trust = self.tenant_header_trust;
                     let tier_header_trust = self.tier_header_trust;
                     let tenant_deployment_mode = self.tenant_deployment_mode.clone();
+                    let security_coordinator = self.security_coordinator.clone();
+                    let pgwire_auth = self.pgwire_auth;
                     #[cfg(feature = "abac-policy")]
                     let abac_enforcer = self.abac_enforcer.clone();
 
@@ -367,6 +392,8 @@ impl PostgresServer {
                             tenant_header_trust,
                             tier_header_trust,
                             tenant_deployment_mode,
+                            security_coordinator,
+                            pgwire_auth,
                             #[cfg(feature = "abac-policy")]
                             abac_enforcer,
                         )
@@ -415,6 +442,8 @@ impl PostgresServer {
         tenant_header_trust: proximadb_tenant::HeaderTrustPolicy,
         tier_header_trust: proximadb_tenant::HeaderTrustPolicy,
         tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode,
+        security_coordinator: Option<Arc<crate::security::SecurityCoordinator>>,
+        pgwire_auth: protocol::PgwireAuthMode,
         #[cfg(feature = "abac-policy")] abac_enforcer: Option<
             Arc<crate::security::rls::AbacEnforcer>,
         >,
@@ -485,6 +514,11 @@ impl PostgresServer {
         // ADR-0053 W8: tier-claim gate, same shape as the tenant gate above.
         protocol = protocol.with_tier_header_trust(tier_header_trust);
         protocol = protocol.with_tenant_deployment_mode(tenant_deployment_mode);
+        // TD-PGWIRE-AUTH-1: coordinator + resolved posture for the SCRAM mode.
+        if let Some(coordinator) = security_coordinator {
+            protocol = protocol.with_security_coordinator(coordinator);
+        }
+        protocol = protocol.with_pgwire_auth_mode(pgwire_auth);
 
         // Run protocol loop
         match protocol.run().await {
