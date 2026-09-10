@@ -548,7 +548,9 @@ impl RestServer {
                     ),
                 ),
                 state.model_registry_service.clone(),
-                state.data_dir.clone(),
+                std::sync::Arc::new(crate::services::mlflow_run_store::LocalFsArtifacts::new(
+                    state.data_dir.join("mlflow_artifacts"),
+                )),
             );
             let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
@@ -946,7 +948,9 @@ impl RestServer {
                     ),
                 ),
                 state.model_registry_service.clone(),
-                state.data_dir.clone(),
+                std::sync::Arc::new(crate::services::mlflow_run_store::LocalFsArtifacts::new(
+                    state.data_dir.join("mlflow_artifacts"),
+                )),
             );
             let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);

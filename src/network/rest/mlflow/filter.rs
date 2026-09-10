@@ -7,6 +7,7 @@
 //! one edit here, not four hand-rolled dispatchers downstream.
 
 use super::{MlflowError, MlflowResult};
+use proximadb_catalog::run_store::RunQueryClause;
 use proximadb_catalog::run_store::{ExperimentRecord, ExperimentStage, RunRecord};
 
 pub(crate) enum ExperimentFilter {
@@ -72,6 +73,20 @@ pub(crate) fn parse_experiment_filter(filter: &str) -> MlflowResult<Vec<Experime
         }
     }
     Ok(predicates)
+}
+
+impl From<FieldFilter> for RunQueryClause {
+    fn from(clause: FieldFilter) -> Self {
+        match clause {
+            FieldFilter::ParamEq(k, v) => RunQueryClause::ParamEq(k, v),
+            FieldFilter::ParamNe(k, v) => RunQueryClause::ParamNe(k, v),
+            FieldFilter::ParamLike(k, v) => RunQueryClause::ParamLike(k, v),
+            FieldFilter::TagEq(k, v) => RunQueryClause::TagEq(k, v),
+            FieldFilter::TagNe(k, v) => RunQueryClause::TagNe(k, v),
+            FieldFilter::TagLike(k, v) => RunQueryClause::TagLike(k, v),
+            FieldFilter::MetricCmp(k, v, cmp) => RunQueryClause::MetricCmp(k, v, cmp),
+        }
+    }
 }
 
 pub(crate) enum FieldFilter {
