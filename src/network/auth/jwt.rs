@@ -374,17 +374,54 @@ mod tests {
     #[tokio::test]
     async fn test_validation_rejects_unconfigured_hmac_algorithm() {
         let config = test_jwt_config();
+        let now = chrono::Utc::now().timestamp();
         let secret = config
             .secret
             .clone()
             .expect("test JWT config should contain a secret");
         let jwt_service = JwtService::new(config).expect("Failed to create JWT service for test");
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            iat: now,
+            exp: now + 3_600,
+            nbf: now,
+            iss: "test-proximadb".to_string(),
+            aud: "test-api".to_string(),
+            jti: "wrong-algorithm-token".to_string(),
+            tenant_id: None,
+            roles: vec!["user".to_string()],
+            typ: TokenType::Access,
+            capability_type: None,
+            collection: None,
+            operation: None,
+            protocol: None,
+            mode: None,
+            scopes: vec![],
+            max_records: None,
+            max_bytes: None,
+            tier: None,
+            route_visibility: None,
+            metering_required: None,
+        };
         let token = encode(
             &Header::new(Algorithm::HS384),
-            &serde_json::json!({"sub": "test-user"}),
+            &claims,
             &EncodingKey::from_secret(secret.as_bytes()),
         )
         .expect("HS384 token should encode with an HMAC key");
+
+        let mut hs384_validation = Validation::new(Algorithm::HS384);
+        hs384_validation.set_issuer(&["test-proximadb"]);
+        hs384_validation.set_audience(&["test-api"]);
+        assert!(
+            decode::<Claims>(
+                &token,
+                &DecodingKey::from_secret(secret.as_bytes()),
+                &hs384_validation,
+            )
+            .is_ok(),
+            "the control decoder must accept the otherwise-valid HS384 token"
+        );
 
         let err = jwt_service
             .verify_token(&token)
