@@ -1428,6 +1428,34 @@ fn order_by_no_clause_returns_none() {
 // ---------------- TD-185b: ORDER BY fails closed, resolves aliases ----------------
 
 #[test]
+fn order_by_inside_a_window_clause_is_not_the_result_ordering() {
+    // The pgwire-accuracy lane caught this: the `OVER (… ORDER BY ts)` window
+    // specification matched the keyword probe and the projection tail became
+    // the "key". The scan must be paren-aware.
+    let result = PostgresProtocol::extract_select_order_by(
+        "select hostname, usage_user, usage_user - lag(usage_user) over \
+         (partition by hostname order by ts) as delta from cpu",
+    );
+    assert!(
+        result.unwrap().is_none(),
+        "a window ORDER BY is not a top-level ORDER BY"
+    );
+
+    // A real top-level clause after a window spec is still found, with the
+    // window's inner ORDER BY never contributing keys.
+    let keys = PostgresProtocol::extract_select_order_by(
+        "select hostname, avg(usage_user) over (partition by hostname order by ts \
+         rows between 1 preceding and current row) as moving_avg from cpu \
+         order by hostname, ts",
+    )
+    .unwrap()
+    .expect("top-level keys");
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].column, "hostname");
+    assert_eq!(keys[1].column, "ts");
+}
+
+#[test]
 fn order_by_malformed_clause_is_an_error_not_silent_unordered() {
     // An ORDER BY that is present but unparsable must surface as Err — the
     // caller fails closed instead of silently returning storage order.

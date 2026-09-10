@@ -2709,10 +2709,14 @@ impl PostgresProtocol {
     /// end-of-string (`… ORDER BY` with nothing after — TD-185b must ERROR
     /// on that, not silently return unordered rows) and requires a
     /// non-identifier boundary after `BY`, so `ORDER BYZ`-style text never
-    /// matches. Literal-aware: `ORDER BY` inside a single-quoted string is
-    /// skipped.
+    /// matches. Literal-aware (`ORDER BY` inside a single-quoted string is
+    /// skipped) AND paren-aware: the `ORDER BY` inside a window's
+    /// `OVER (… ORDER BY …)` is a window specification, not the result
+    /// ordering — matching it turned the key into expression tail text (the
+    /// `ts) as delta from cpu` failure the pgwire-accuracy lane caught).
     fn find_order_by_clause(upper: &str) -> Option<usize> {
         let mut in_single_quote = false;
+        let mut paren_depth = 0usize;
         let bytes = upper.as_bytes();
         let mut index = 0usize;
         while index < bytes.len() {
@@ -2727,7 +2731,12 @@ impl PostgresProtocol {
                 index += 1;
                 continue;
             }
-            if !in_single_quote && upper[index..].starts_with(" ORDER BY") {
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                _ => {}
+            }
+            if paren_depth == 0 && !in_single_quote && upper[index..].starts_with(" ORDER BY") {
                 let after = index + " ORDER BY".len();
                 let boundary = bytes
                     .get(after)
