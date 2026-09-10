@@ -722,7 +722,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }  # Required for JWT token
 # v10 made the crypto backend a pluggable `CryptoProvider` (like rustls), with NO provider in
 # default features — without one, every sign/verify panics at runtime (crypto/mod.rs:124). Enable
 # `aws_lc_rs` (aws-lc-rs is already in the tree via rustls; `rust_crypto` would pull new rsa/p256/p384).
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }  # JWT token creation and validation
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }  # JWT token creation and validation
 chrono = { version = "0.4.31", features = ["serde"] }  # Updated for Arrow 51 compatibility
 chrono-tz = "0.10"  # Timezone support for log parsing
 hex = "0.4"  # Hex encoding for bytea types

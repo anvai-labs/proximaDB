@@ -356,6 +356,43 @@ mod tests {
         assert!(jwt_service.is_ok());
     }
 
+    #[test]
+    fn test_key_family_mismatch_is_rejected_before_signing() {
+        let err = encode(
+            &Header::new(Algorithm::RS256),
+            &serde_json::json!({"sub": "test-user"}),
+            &EncodingKey::from_secret(b"hmac-secret"),
+        )
+        .expect_err("an HMAC key must not be accepted for RSA signing");
+
+        assert!(matches!(
+            err.kind(),
+            jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_validation_rejects_unconfigured_hmac_algorithm() {
+        let config = test_jwt_config();
+        let secret = config
+            .secret
+            .clone()
+            .expect("test JWT config should contain a secret");
+        let jwt_service = JwtService::new(config).expect("Failed to create JWT service for test");
+        let token = encode(
+            &Header::new(Algorithm::HS384),
+            &serde_json::json!({"sub": "test-user"}),
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("HS384 token should encode with an HMAC key");
+
+        let err = jwt_service
+            .verify_token(&token)
+            .await
+            .expect_err("a token using an unconfigured algorithm must be rejected");
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
     #[tokio::test]
     async fn test_token_generation_and_verification() {
         let config = test_jwt_config();
