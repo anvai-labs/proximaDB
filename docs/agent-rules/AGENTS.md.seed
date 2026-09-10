@@ -28,6 +28,10 @@ Required flow:
 
 When continuing "next steps", first identify the active worktree/branch, confirm it is based on current `origin/develop`, and continue there. If no appropriate worktree exists, create one before editing.
 
+## Pull-request Branch Targets
+
+Ordinary feature, fix, debug, chore, and dependency PRs target `develop`. The only PR allowed to target `qa` is the exact same-repository `develop` -> `qa` promotion; the only PR allowed to target `main` is the exact same-repository `qa` -> `main` promotion. Snapshot, release, fork, and topic branches must not target `qa` or `main`.
+
 ## PR Verification Regime (before any merge)
 
 Stale PRs drift: green CI on an old base is evidence about that commit, not about the PR's behavior on current `develop`. Before requesting or granting merge for a PR open past the rebase-daily window or touching cross-cutting seams (proto, port traits, feature gates, workflow outputs):
