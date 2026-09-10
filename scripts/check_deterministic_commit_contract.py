@@ -56,6 +56,9 @@ CACHE_INPUT_RE = re.compile(
     r"^\s+(?P<name>prefix-key|shared-key):\s*(?P<value>.*?)\s*$"
 )
 MATRIX_REF_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*}}")
+RUST_TOOLCHAIN_RE = re.compile(
+    r"^(?P<indent>\s*)uses:\s*actions-rust-lang/setup-rust-toolchain@v2\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,18 @@ def check_nextest_contract(findings: list[Finding]) -> None:
 
 
 def check_gate_wiring(findings: list[Finding]) -> None:
+    require_contains(
+        findings,
+        "gate-wiring",
+        ".github/workflows/ci.yml",
+        "- name: Verify Cargo.lock is reproducible",
+    )
+    require_contains(
+        findings,
+        "gate-wiring",
+        ".github/workflows/ci.yml",
+        "run: cargo metadata --locked --format-version 1 >/dev/null",
+    )
     require_contains(
         findings,
         "gate-wiring",
@@ -406,6 +421,42 @@ def check_rust_cache_keys(findings: list[Finding]) -> None:
                             )
 
 
+def check_tdd_rust_warning_contract(findings: list[Finding]) -> None:
+    """Keep the TDD workflow's intentional warning policy across action upgrades."""
+
+    path = ROOT / ".github/workflows/tdd.yml"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        action = RUST_TOOLCHAIN_RE.match(line)
+        if action is None:
+            continue
+
+        action_indent = len(action.group("indent"))
+        cursor = index + 1
+        step: list[str] = []
+        while cursor < len(lines):
+            stripped = lines[cursor].lstrip()
+            indent = len(lines[cursor]) - len(stripped)
+            if indent < action_indent or (
+                indent == action_indent - 2 and stripped.startswith("- ")
+            ):
+                break
+            step.append(lines[cursor])
+            cursor += 1
+
+        if not any(
+            re.match(r'^\s+build-warnings:\s*["\']{2}\s*(?:#.*)?$', item)
+            for item in step
+        ):
+            findings.append(
+                Finding(
+                    "tdd-rust-warning-policy",
+                    f"{rel(path)}:{index + 1} setup-rust-toolchain@v2 must set "
+                    'build-warnings: "" to preserve the workflow warning policy',
+                )
+            )
+
+
 def tracked_files() -> list[Path]:
     try:
         output = subprocess.check_output(
@@ -455,13 +506,15 @@ def main() -> int:
     check_query_conformance_authority(findings)
     check_object_store_proof_authority(findings)
     check_rust_cache_keys(findings)
+    check_tdd_rust_warning_contract(findings)
     check_conflict_markers(findings)
 
     print("Deterministic commit contract")
     if not findings:
         print(
             "OK: nextest, CI/Makefile wiring, architecture guards, Flight/query/object-store "
-            "authorities, rust-cache keys, and conflict-marker checks pass."
+            "authorities, rust-cache keys, TDD Rust warning policy, and conflict-marker "
+            "checks pass."
         )
         return 0
 

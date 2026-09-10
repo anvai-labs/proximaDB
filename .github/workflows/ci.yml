@@ -135,6 +135,8 @@ jobs:
           # Full history so dorny/paths-filter can reach the merge-base across a
           # large develop→main gap (shallow --deepen fails: "shallow file has changed").
           fetch-depth: 0
+      - name: Verify Cargo.lock is reproducible
+        run: cargo metadata --locked --format-version 1 >/dev/null
       - name: Validate rust-cache key inputs before fan-out
         run: python3 scripts/check_deterministic_commit_contract.py
       - uses: dorny/paths-filter@v4
