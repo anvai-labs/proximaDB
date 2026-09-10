@@ -166,50 +166,113 @@ fn test_frontend_message() {
 }
 
 #[test]
-fn transaction_control_is_rejected_until_atomic_semantics_exist() {
-    for statement in [
-        "BEGIN",
-        "BEGIN TRANSACTION;",
-        "BEGIN ISOLATION LEVEL SERIALIZABLE",
-        "START TRANSACTION",
-        "START TRANSACTION READ ONLY",
-        "COMMIT",
-        "COMMIT AND CHAIN",
-        "END WORK",
-        "ROLLBACK",
-        "ROLLBACK AND NO CHAIN",
-        "ABORT TRANSACTION",
-        "SAVEPOINT nested",
-        "RELEASE nested",
-        "RELEASE SAVEPOINT nested",
-        "ROLLBACK TO nested",
-        "PREPARE TRANSACTION 'tx-1'",
-        "COMMIT PREPARED 'tx-1'",
-        "ROLLBACK PREPARED 'tx-1'",
-        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
-        "SET CONSTRAINTS ALL DEFERRED",
-    ] {
-        assert_eq!(
-            transaction_control_policy(statement),
-            Some(TransactionControlPolicy::Unsupported),
-            "{statement} must not report false transaction success"
-        );
-    }
+fn transaction_control_classification_matches_adr018_p2d() {
+    use crate::network::postgres::protocol::{
+        TransactionControl, TransactionStatement, classify_transaction_statement,
+    };
+    let control = |s: &str| match classify_transaction_statement(s) {
+        Some(TransactionStatement::Control(c)) => Some(c),
+        _ => None,
+    };
+    let unsupported = |s: &str| match classify_transaction_statement(s) {
+        Some(TransactionStatement::Unsupported(reason)) => reason,
+        other => panic!("{s} must classify as Unsupported, got {other:?}"),
+    };
 
-    assert_eq!(transaction_control_policy("SELECT 1"), None);
+    // Real control per P2.D.
+    assert_eq!(
+        control("BEGIN"),
+        Some(TransactionControl::Begin { read_only: false })
+    );
+    assert_eq!(
+        control("BEGIN TRANSACTION;"),
+        Some(TransactionControl::Begin { read_only: false })
+    );
+    assert_eq!(
+        control("BEGIN WORK"),
+        Some(TransactionControl::Begin { read_only: false })
+    );
+    assert_eq!(
+        control("START TRANSACTION READ ONLY"),
+        Some(TransactionControl::Begin { read_only: true })
+    );
+    assert_eq!(
+        control("BEGIN READ WRITE"),
+        Some(TransactionControl::Begin { read_only: false })
+    );
+    assert_eq!(
+        control("BEGIN ISOLATION LEVEL READ COMMITTED"),
+        Some(TransactionControl::Begin { read_only: false })
+    );
+    assert_eq!(control("COMMIT"), Some(TransactionControl::Commit));
+    assert_eq!(control("END WORK"), Some(TransactionControl::Commit));
+    assert_eq!(control("ROLLBACK"), Some(TransactionControl::Rollback));
+    assert_eq!(
+        control("ABORT TRANSACTION"),
+        Some(TransactionControl::Rollback)
+    );
+    assert_eq!(
+        control("SET TRANSACTION READ ONLY"),
+        Some(TransactionControl::SetTransaction {
+            read_only: Some(true)
+        })
+    );
+    assert_eq!(
+        control("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+        Some(TransactionControl::SetTransaction { read_only: None })
+    );
+    assert_eq!(
+        control("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),
+        Some(TransactionControl::SetTransaction {
+            read_only: Some(true)
+        })
+    );
+
+    // Recognized-but-unsupported: fail closed WITH the reason, never silently.
+    assert!(unsupported("BEGIN ISOLATION LEVEL SERIALIZABLE").contains("ISOLATION LEVEL"));
+    assert!(unsupported("COMMIT AND CHAIN").contains("CHAIN"));
+    assert!(unsupported("ROLLBACK AND NO CHAIN").contains("CHAIN"));
+    assert!(unsupported("SAVEPOINT nested").contains("savepoint"));
+    assert!(unsupported("RELEASE nested").contains("savepoint"));
+    assert!(unsupported("RELEASE SAVEPOINT nested").contains("savepoint"));
+    assert!(unsupported("ROLLBACK TO nested").contains("SAVEPOINT"));
+    assert!(unsupported("PREPARE TRANSACTION 'tx-1'").contains("two-phase"));
+    assert!(unsupported("COMMIT PREPARED 'tx-1'").contains("two-phase"));
+    assert!(unsupported("ROLLBACK PREPARED 'tx-1'").contains("two-phase"));
+    assert!(unsupported("SET CONSTRAINTS ALL DEFERRED").contains("CONSTRAINTS"));
+
+    // Not control statements at all.
+    assert!(classify_transaction_statement("SELECT 1").is_none());
+    assert!(classify_transaction_statement("SELECT * FROM t LIMIT 5").is_none());
+    assert!(classify_transaction_statement("INSERT INTO t VALUES (1)").is_none());
 }
 
 #[test]
-fn transaction_control_is_detected_before_a_multi_statement_batch_runs() {
+fn transaction_control_classifies_every_statement_in_a_mixed_batch() {
+    // ADR-018 P2.D: `BEGIN; INSERT …; COMMIT;` executes in one batch — the
+    // former whole-batch rejection is gone, replaced by per-statement
+    // classification in the loop (the historical silent-INSERT-drop bug stays
+    // fixed by per-statement dispatch + abort-on-error).
     let statements = PostgresProtocol::split_sql_statements(
         "BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT;",
     );
-
-    assert!(
-        statements
-            .iter()
-            .any(|statement| transaction_control_policy(statement).is_some())
+    let kinds: Vec<bool> = statements
+        .iter()
+        .map(|s| {
+            matches!(
+                classify_transaction_statement(s),
+                Some(TransactionStatement::Control(_))
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            true,  /* BEGIN */
+            false, /* INSERT */
+            true   /* COMMIT */
+        ],
+        "control, DML, control — exactly what the batch loop dispatches on"
     );
 }
 
