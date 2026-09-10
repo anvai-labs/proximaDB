@@ -86,7 +86,7 @@ tracing-subscriber = { workspace = true, optional = true }
 proximadb-storage-common = { workspace = true, optional = true }
 jni = { version = "0.21", optional = true }
 napi = { version = "3.12", features = ["napi9"], optional = true }
-napi-derive = { version = "2.14", optional = true }
+napi-derive = { version = "3.6", optional = true }
 
 [features]
 # Default mirrors the root crate's default (ADR-082): the production feature set
