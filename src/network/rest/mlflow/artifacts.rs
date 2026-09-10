@@ -152,13 +152,19 @@ async fn artifact_proxy(
                 )
                     .into_response()),
                 None => {
-                    // Not a file: list as a directory (missing paths list
-                    // EMPTY — the MLflow convention).
+                    // Not a FILE. A DIRECTORY at this path lists its
+                    // entries; a MISSING path is a download miss — real
+                    // MLflow 404s (RESOURCE_DOES_NOT_EXIST).
                     let entries = state
                         .artifacts
                         .list(&repo_path)
                         .await
                         .map_err(MlflowError::internal)?;
+                    if entries.is_empty() {
+                        return Err(MlflowError::not_found(format!(
+                            "artifact '{path}' does not exist"
+                        )));
+                    }
                     Ok(Json(entries_to_json(&entries, &prefix)).into_response())
                 }
             }
@@ -209,12 +215,17 @@ async fn artifact_root_delete(
     Extension(tenant): Extension<TenantContext>,
     Query(list): Query<ListParams>,
 ) -> MlflowResult<Response> {
+    // The bare-root DELETE with no ?path= would wipe the TENANT's whole
+    // artifact tree — require an explicit path (the client's
+    // delete_artifacts(None) form targets a run's subtree and always
+    // carries one).
     let sub = list.path.clone().unwrap_or_default();
-    let segments = if sub.is_empty() {
-        Vec::new()
-    } else {
-        sanitize_segments(&sub)?
-    };
+    if sub.is_empty() {
+        return Err(MlflowError::invalid(
+            "artifact delete requires an explicit ?path=",
+        ));
+    }
+    let segments = sanitize_segments(&sub)?;
     let repo_path = port_path(&tenant, &segments);
     state
         .artifacts

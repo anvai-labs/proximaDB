@@ -121,19 +121,27 @@ impl proximadb_catalog::run_store::ArtifactRepository for LocalFsArtifacts {
         path: &str,
     ) -> Result<Vec<proximadb_catalog::run_store::ArtifactEntry>, String> {
         let target = self.resolve(path)?;
-        if !target.is_dir() {
+        if !tokio::fs::metadata(&target)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             return Ok(Vec::new());
         }
         let mut entries = Vec::new();
-        let read = std::fs::read_dir(&target).map_err(|e| format!("read dir: {e}"))?;
-        for entry in read {
-            let entry = entry.map_err(|e| format!("iterate: {e}"))?;
-
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let mut read = tokio::fs::read_dir(&target)
+            .await
+            .map_err(|e| format!("read dir: {e}"))?;
+        while let Some(entry) = read
+            .next_entry()
+            .await
+            .map_err(|e| format!("iterate: {e}"))?
+        {
+            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             let size = if is_dir {
                 0
             } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
+                entry.metadata().await.map(|m| m.len()).unwrap_or(0)
             };
             entries.push(proximadb_catalog::run_store::ArtifactEntry {
                 path: entry.file_name().to_string_lossy().to_string(),
@@ -146,10 +154,18 @@ impl proximadb_catalog::run_store::ArtifactRepository for LocalFsArtifacts {
 
     async fn delete(&self, path: &str) -> Result<(), String> {
         let target = self.resolve(path)?;
-        if target.is_dir() {
-            std::fs::remove_dir_all(&target).map_err(|e| format!("delete artifacts: {e}"))
+        if tokio::fs::metadata(&target)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            tokio::fs::remove_dir_all(&target)
+                .await
+                .map_err(|e| format!("delete artifacts: {e}"))
         } else if target.exists() {
-            std::fs::remove_file(&target).map_err(|e| format!("delete artifact: {e}"))
+            tokio::fs::remove_file(&target)
+                .await
+                .map_err(|e| format!("delete artifact: {e}"))
         } else {
             Ok(())
         }

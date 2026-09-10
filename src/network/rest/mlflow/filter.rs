@@ -99,29 +99,6 @@ pub(crate) enum FieldFilter {
     MetricCmp(String, f64, fn(f64, f64) -> bool),
 }
 
-impl FieldFilter {
-    pub(crate) fn matches(&self, run: &RunRecord) -> bool {
-        match self {
-            FieldFilter::ParamEq(k, v) => run.params.get(k) == Some(v),
-            FieldFilter::ParamNe(k, v) => run.params.get(k) != Some(v),
-            FieldFilter::ParamLike(k, pattern) => run
-                .params
-                .get(k)
-                .is_some_and(|actual| like_match(actual, pattern)),
-            FieldFilter::TagEq(k, v) => run.tags.get(k) == Some(v),
-            FieldFilter::TagNe(k, v) => run.tags.get(k) != Some(v),
-            FieldFilter::TagLike(k, pattern) => match run.tags.get(k) {
-                Some(actual) => like_match(actual, pattern),
-                None => false,
-            },
-            FieldFilter::MetricCmp(k, v, cmp) => run
-                .latest_metrics
-                .get(k)
-                .is_some_and(|point| cmp(point.value, *v)),
-        }
-    }
-}
-
 pub(crate) fn parse_run_filter(filter: &str) -> MlflowResult<Vec<FieldFilter>> {
     let mut out = Vec::new();
     for clause in split_filter_clauses(filter)? {

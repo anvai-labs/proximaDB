@@ -353,24 +353,13 @@ pub fn like_match(value: &str, pattern: &str) -> bool {
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
-            c => regex.push_str(&escape_regex_literal(&c.to_string())),
+            c => regex.push_str(&regex::escape(&c.to_string())),
         }
     }
     regex.push('$');
     regex::Regex::new(&regex)
         .map(|re| re.is_match(value))
         .unwrap_or(false)
-}
-
-fn escape_regex_literal(literal: &str) -> String {
-    let mut out = String::new();
-    for c in literal.chars() {
-        if r"\.+*?()|[]{}^$#&-~".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Artifact storage port for the MLflow proxy family (audit #4): the wire's
