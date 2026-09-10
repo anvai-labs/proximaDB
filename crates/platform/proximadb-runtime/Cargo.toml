@@ -41,7 +41,7 @@ proximadb-search-types = { path = "../../foundation/proximadb-search-types" }
 proximadb-proto.workspace = true
 serde = { workspace = true, features = ["derive"] }
 num_cpus = "1.16"
-sysinfo = "0.30"
+sysinfo = "0.39"
 thiserror.workspace = true
 tokio = { version = "1.37", features = ["full"] }
 tracing = "0.1"
