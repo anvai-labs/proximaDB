@@ -936,6 +936,9 @@ jobs:
           # crate compiles against root at every tier. Python-feature + wheel build
           # is a qa→main (FULL) concern (heavy pyo3/numpy deps).
           - { label: "embedded",             pkg: proximadb-embedded, args: "" }
+          # Node.js is optional and invisible to the default embedded build. Keep the
+          # runtime and derive-macro API families aligned by compiling that surface alone.
+          - { label: "embedded-nodejs",      pkg: proximadb-embedded, args: "--no-default-features --features nodejs" }
           # Small extracted crates batched into one runner (each compiles in <1min;
           # the per-runner overhead — checkout + toolchain + apt + cache — dominates).
           # Space-separate additional small crates here as they are extracted; the
