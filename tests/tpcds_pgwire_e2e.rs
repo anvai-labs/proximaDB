@@ -446,6 +446,8 @@ async fn tpcds_pgwire_conformance_inner() {
         "RANGE and GROUPS must differ on ties — else the frame unit was collapsed to ROWS"
     );
     eprintln!("✓ value-correctness: RANGE vs GROUPS frame units honoured on ties");
+    // Anchored accuracy phase (TD-182 P1) — same server, same client.
+    tpcds_accuracy_anchored_phase(&client).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -541,26 +543,11 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
 /// produce its hand-derived full result set over the seed data. Complements
 /// the ROLLUP/CUBE/rank/RANGE-GROUPS/INTERSECT anchors in the conformance
 /// test above — a wrong-but-clean answer can no longer pass.
-#[test]
-fn tpcds_accuracy_anchored() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(tpcds_accuracy_anchored_inner());
-}
-
-async fn tpcds_accuracy_anchored_inner() {
-    let server = PgServer::start().await.expect("server start");
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
+/// Anchored accuracy phase — CALLED from tpcds_pgwire_conformance_inner
+/// so both phases share ONE server boot (the global WAL manifest is a
+/// process-wide set-once; a second boot in the same process silently
+/// reuses the first's manifest pointed at a deleted tempdir).
+async fn tpcds_accuracy_anchored_phase(client: &tokio_postgres::Client) {
     for (name, ddl) in SCHEMA {
         let _ = client
             .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
@@ -593,7 +580,7 @@ async fn tpcds_accuracy_anchored_inner() {
         let sql = by_id
             .get(lookup_id)
             .unwrap_or_else(|| panic!("{lookup_id} missing from tpcds_queries()"));
-        let got = canon_rows(&client, sql).await;
+        let got = canon_rows(client, sql).await;
         let want: Vec<Vec<String>> = want
             .iter()
             .map(|row| row.iter().map(|c| c.to_string()).collect())

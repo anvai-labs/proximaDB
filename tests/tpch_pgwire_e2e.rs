@@ -369,6 +369,8 @@ async fn tpch_pgwire_conformance_inner() {
     assert_eq!(got[2].0, "R", "Q1 row2 returnflag");
     assert_eq!(got[2].2, "1", "Q1 (R,F) count_order");
     eprintln!("✓ Q1 value-correctness: 3 groups, counts A,F=1 N,O=2 R,F=1");
+    // Anchored accuracy phase (TD-182 P1) — same server, same client.
+    tpch_accuracy_anchored_phase(&client).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,10 +426,11 @@ fn tpch_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
         ),
         // Q3: o1 only (BUILDING customer, orderdate < 1995-03-15, ship after);
         // L4 revenue 2000*0.9 = 1800 (L5 shipped 1994). o_orderdate renders as
-        // a day-number (1995-02-15 = 9176) on the aggregate route — DATE
-        // column-fidelity is a known rendering follow-up; the VALUE columns
-        // are the assertion.
-        ("Q3", vec![vec!["1", "1800", "9176", "0"]]),
+        // a day-number (1995-02-15 = 9176) on the aggregate route — a KNOWN-BAD
+        // rendering (DATE column fidelity); the VALUE columns are the assertion.
+        // KNOWN-BAD: a DATE-rendering fix will change the 3rd column and trip
+        // this pin — re-anchor with the correct DATE string at that point.
+        ("Q3-KNOWN-BAD", vec![vec!["1", "1800", "9176", "0"]]),
         // Q4: no orders in 1993-Q3 → empty.
         ("Q4", vec![]),
         // Q5: o2's customer is GERMANY (EUROPE), excluded by AMERICA → empty.
@@ -453,12 +456,11 @@ fn tpch_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
         ("Q11", vec![vec!["1", "2250"], vec!["2", "4000"]]),
         // Q12: L2 (MAIL, o2 2-HIGH → high 1); L3 (SHIP, o3 3-MEDIUM → low 1).
         ("Q12", vec![vec!["MAIL", "1", "0"], vec!["SHIP", "0", "1"]]),
-        // Q13 KNOWN-BAD (engine bug surfaced by this ratchet 2026-09-11):
-        // count(o_orderkey) over the LEFT JOIN counts the NULL-extended row —
-        // c4 (no orders) got count 1, so the engine reports custdist 0→1,
-        // 1→3 instead of 0→2, 1→2 (correct SQL: count skips NULLs). Pinned
-        // wrong (auto-trips on fix); EXCLUDED from the accurate count.
-        ("Q13-KNOWN-BAD", vec![vec!["0", "1"], vec!["1", "3"]]),
+        // Q13: c1-c3 each have exactly 1 order (no o_comment matches
+        // '%special%requests%'); c4 (enrichment) is orderless →
+        // count(o_orderkey) = {1,1,1,0} → custdist (0→1, 1→3). This IS
+        // the SQL-correct answer (count skips NULLs) — an accurate anchor.
+        ("Q13", vec![vec!["0", "1"], vec!["1", "3"]]),
         // Q16: sizes in list → part3 only; one partsupp row → 1 distinct supplier.
         (
             "Q16",
@@ -513,26 +515,11 @@ async fn canon_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Strin
 /// produce its hand-derived full result set over the seed data. This is the
 /// execution→accuracy conversion the audit called for: a wrong-but-clean
 /// answer can no longer pass.
-#[test]
-fn tpch_accuracy_anchored() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(tpch_accuracy_anchored_inner());
-}
-
-async fn tpch_accuracy_anchored_inner() {
-    let server = PgServer::start().await.expect("server start");
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
+/// Anchored accuracy phase — CALLED from tpch_pgwire_conformance_inner so
+/// both phases share ONE server boot (the global WAL manifest is a
+/// process-wide set-once; a second boot in the same process silently
+/// reuses the first's manifest pointed at a deleted tempdir).
+async fn tpch_accuracy_anchored_phase(client: &tokio_postgres::Client) {
     for (name, ddl) in SCHEMA {
         let _ = client
             .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
@@ -576,7 +563,7 @@ async fn tpch_accuracy_anchored_inner() {
         let sql = by_id
             .get(lookup_id)
             .unwrap_or_else(|| panic!("{lookup_id} missing from tpch_queries()"));
-        let got = canon_rows(&client, sql).await;
+        let got = canon_rows(client, sql).await;
         let want: Vec<Vec<String>> = want
             .iter()
             .map(|row| row.iter().map(|c| c.to_string()).collect())
