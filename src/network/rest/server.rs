@@ -554,10 +554,25 @@ impl RestServer {
             );
             let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
-            let artifacts_router = super::mlflow::artifacts_router().with_state(mlflow_state);
+            let artifacts_router =
+                super::mlflow::artifacts_router().with_state(mlflow_state.clone());
             // merge (not nest): the artifacts family carries its full
             // absolute path and must combine with, not nest under, the base.
             base_router = base_router.merge(artifacts_router);
+            // TD-MLOPS-3: the vendored stock MLflow UI at /mlflow-ui —
+            // statics + ajax-api aliases on the SAME base_router, BEFORE
+            // the tenant/auth layers, so a future OIDC middleware gates
+            // UI and API together (the mount-is-the-contract rule).
+            let ui_router = super::mlflow::ui::ui_mount_routes().with_state(mlflow_state);
+            base_router = base_router.nest("/mlflow-ui", ui_router);
+            // axum 0.8 nest: /mlflow-ui/ strips to "//" which neither the
+            // nested "/" route nor its fallback catches — serve index at
+            // the trailing-slash form directly.
+            base_router = base_router.route(
+                "/mlflow-ui/",
+                axum::routing::get(super::mlflow::ui::serve_index_route),
+            );
+            super::mlflow::ui::log_feature_status();
             tracing::info!(
                 "✅ MLflow compatibility wire enabled at /api/2.0/mlflow (+ artifacts proxy)"
             );
@@ -954,10 +969,25 @@ impl RestServer {
             );
             let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
-            let artifacts_router = super::mlflow::artifacts_router().with_state(mlflow_state);
+            let artifacts_router =
+                super::mlflow::artifacts_router().with_state(mlflow_state.clone());
             // merge (not nest): the artifacts family carries its full
             // absolute path and must combine with, not nest under, the base.
             base_router = base_router.merge(artifacts_router);
+            // TD-MLOPS-3: the vendored stock MLflow UI at /mlflow-ui —
+            // statics + ajax-api aliases on the SAME base_router, BEFORE
+            // the tenant/auth layers, so a future OIDC middleware gates
+            // UI and API together (the mount-is-the-contract rule).
+            let ui_router = super::mlflow::ui::ui_mount_routes().with_state(mlflow_state);
+            base_router = base_router.nest("/mlflow-ui", ui_router);
+            // axum 0.8 nest: /mlflow-ui/ strips to "//" which neither the
+            // nested "/" route nor its fallback catches — serve index at
+            // the trailing-slash form directly.
+            base_router = base_router.route(
+                "/mlflow-ui/",
+                axum::routing::get(super::mlflow::ui::serve_index_route),
+            );
+            super::mlflow::ui::log_feature_status();
             tracing::info!(
                 "✅ MLflow compatibility wire enabled at /api/2.0/mlflow (+ artifacts proxy)"
             );

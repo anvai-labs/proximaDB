@@ -31,6 +31,8 @@ default = [
     "otlp-metering",
     "axis",
 ]
+# MLflow UI serving (TD-MLOPS-3) — forwarded to the root crate's feature.
+mlflow-ui = ["proximadb/mlflow-ui"]
 # In-memory ANN index engine (AXIS: HNSW/IVF/RaBitQ). Default ON for the production
 # server — forwarded explicitly (not via workspace feature-unification) so every
 # build path (Dockerfile, `_shared-build`, release) links it. Turn OFF only for the

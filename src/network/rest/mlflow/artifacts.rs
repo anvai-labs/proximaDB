@@ -27,13 +27,19 @@ use super::{MlflowError, MlflowResult, MlflowState};
 const ARTIFACT_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 pub fn artifacts_routes() -> Router<MlflowState> {
+    artifacts_routes_at("/api/2.0")
+}
+
+/// Same routes at an arbitrary prefix (the MLflow UI's ajax-api mount uses
+/// `/mlflow-ui/ajax-api/2.0`); the absolute form stays canonical.
+pub fn artifacts_routes_at(prefix: &str) -> Router<MlflowState> {
     Router::new()
         .route(
-            "/api/2.0/mlflow-artifacts/artifacts",
+            &format!("{prefix}/mlflow-artifacts/artifacts"),
             axum::routing::get(artifact_root_list).delete(artifact_root_delete),
         )
         .route(
-            "/api/2.0/mlflow-artifacts/artifacts/{*path}",
+            &format!("{prefix}/mlflow-artifacts/artifacts/{{*path}}"),
             any(artifact_proxy),
         )
         .layer(axum::extract::DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT))
