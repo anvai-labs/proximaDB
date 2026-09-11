@@ -209,9 +209,9 @@ primitives.
 | Converge every cross-modal blend on the `oid`-keyed fusion seam (`seed -> expand -> calibrate -> fuse-by-oid -> rank`). Do not add one-off entity/vector/document/graph join handlers.
 
 | Entity / SKS
-| gRPC v2 `proximadb.v2.ProximaEntityService` is always registered. The residual REST compatibility routes `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search` remain live; no gRPC v1 entity service is registered.
+| Canonical REST v2 `/api/v2/collections/{id}/entities`, `/{entity_id}`, and `/search` are OpenAPI-published; gRPC v2 `proximadb.v2.ProximaEntityService` is always registered. Equivalent residual REST v1 compatibility routes remain live; no gRPC v1 entity service is registered.
 | Semantic convenience shape: entity id, metadata, embeddings, provenance, relations, temporal fields
-| Do not create another entity substrate. Converge both live facades on orchestration over record/vector + graph + document/provenance + event/temporal history, with `TenantContext` and structural tenant paths at every I/O boundary; retire the REST v1 compatibility routes only with measured client evidence.
+| Do not create another entity substrate. Converge all three live facades on orchestration over record/vector + graph + document/provenance + event/temporal history, with `TenantContext` and structural tenant paths at every I/O boundary; retire the REST v1 compatibility routes only with measured client evidence.
 |===
 
 [NOTE]

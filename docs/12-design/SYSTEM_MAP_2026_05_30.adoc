@@ -661,8 +661,9 @@ catalog seal/path isolation, panic/silent-failure ratchets, env-gate registry, a
 | `make release-check`
 | `work-commit-check` plus `proto-check` (locally: the proto crate and Python gRPC/schema/OpenAPI
 contract tests), focused release smokes, query conformance, and release-server build.
-`verify-openapi-spec` and the four REST SDK codegen-drift jobs (Go, TypeScript, Rust, Python) are
-separate CI gates rather than `release-check` dependencies.
+`verify-openapi-spec`, the enforcing Go/TypeScript/Python REST SDK codegen-drift jobs, the advisory
+Rust regeneration job, and the blocking Python round-trip check are separate CI jobs rather than
+`release-check` dependencies.
 
 | SaaS path isolation
 | `python3 scripts/check_tenant_path_guard.py`; `.github/workflows/layering-check.yml`

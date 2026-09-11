@@ -495,7 +495,7 @@ help:
 	@echo "  check              - Format + lint + test"
 	@echo "  hygiene-check      - Detect tracked backup/disabled/.victor artifacts"
 	@echo "  capability-matrix-check - Validate docs/_internal/roadmap/CAPABILITY_MATRIX.toml"
-	@echo "  deterministic-commit-contract-check - Validate zero-retry/test/docs guard wiring"
+	@echo "  deterministic-commit-contract-check - Validate retry-budget/test/docs guard wiring"
 	@echo "  tenant-path-check  - Enforce DrPathBuilder tenant path guard"
 	@echo "  tenant-ingress-check - Enforce deployment-aware tenant resolution at ingress"
 	@echo "  work-commit-check  - Fast deterministic architecture guard before commit/push"
