@@ -31,7 +31,6 @@ unity-catalog         = ["dep:reqwest", "dep:urlencoding"]
 openapi               = ["dep:utoipa"]
 
 [dependencies]
-regex = { workspace = true }
 anyhow.workspace = true
 arrow-schema = { workspace = true, default-features = false }
 async-trait.workspace = true

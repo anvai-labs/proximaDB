@@ -21,8 +21,7 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use proximadb_catalog::run_store::{
-    ExperimentRecord, ExperimentStage, MetricPoint, RunLifecycle, RunQuery, RunQueryClause,
-    RunRecord, RunStatus, RunStore,
+    ExperimentRecord, ExperimentStage, MetricPoint, RunLifecycle, RunRecord, RunStatus, RunStore,
 };
 use serde::Deserialize;
 
@@ -32,19 +31,19 @@ use serde::Deserialize;
 pub struct MlflowState {
     run_store: std::sync::Arc<dyn proximadb_catalog::run_store::RunStoreFactory>,
     registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
-    pub(crate) artifacts: std::sync::Arc<dyn proximadb_catalog::run_store::ArtifactRepository>,
+    pub(crate) data_dir: std::path::PathBuf,
 }
 
 impl MlflowState {
     pub fn new(
         run_store: std::sync::Arc<dyn proximadb_catalog::run_store::RunStoreFactory>,
         registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
-        artifacts: std::sync::Arc<dyn proximadb_catalog::run_store::ArtifactRepository>,
+        data_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             run_store,
             registry,
-            artifacts,
+            data_dir,
         }
     }
 }
@@ -636,7 +635,7 @@ async fn runs_search(
             )));
         }
     };
-    let mut filter = match &req.filter {
+    let filter = match &req.filter {
         None => None,
         Some(f) => Some(filter::parse_run_filter(f)?),
     };
@@ -659,29 +658,25 @@ async fn runs_search(
         }
     }
     let store = store_for(&tenant, &state)?;
-    // Query pushdown (audit #2): ONE port call; predicates evaluate below
-    // the adapter instead of the wire's per-experiment loop + filter pass.
-    let include_deleted = lifecycle != Some(RunLifecycle::Active);
-    let query = RunQuery {
-        experiment_ids: req
-            .experiment_ids
-            .iter()
-            .map(|exp| parse_id(exp, "experiment"))
-            .collect::<MlflowResult<Vec<u64>>>()?,
-        include_deleted,
-        clauses: filter
-            .take()
-            .unwrap_or_default()
-            .into_iter()
-            .map(RunQueryClause::from)
-            .collect(),
-    };
-    let records = store.search_runs(&query).await?;
-    let mut runs: Vec<RunOut> = records
-        .iter()
-        .filter(|record| lifecycle.is_none_or(|stage| record.lifecycle == stage))
-        .map(run_out)
-        .collect();
+    let mut runs: Vec<RunOut> = Vec::new();
+    for exp in &req.experiment_ids {
+        let id = parse_id(exp, "experiment")?;
+        for record in store
+            .list_runs(id, lifecycle != Some(RunLifecycle::Active))
+            .await?
+        {
+            if lifecycle.is_some_and(|stage| record.lifecycle != stage) {
+                continue;
+            }
+            if filter
+                .as_ref()
+                .is_some_and(|clauses| !clauses.iter().all(|clause| clause.matches(&record)))
+            {
+                continue;
+            }
+            runs.push(run_out(&record));
+        }
+    }
     runs.sort_by(|left, right| {
         let time_order = if descending {
             right.info.start_time.cmp(&left.info.start_time)
@@ -731,9 +726,7 @@ mod tests {
                         Arc::new(crate::catalog::CatalogManager::new()),
                     ),
                 ),
-                std::sync::Arc::new(crate::services::mlflow_run_store::LocalFsArtifacts::new(
-                    std::env::temp_dir().join("mlflow_artifacts_test"),
-                )),
+                std::env::temp_dir(),
             ))
             .layer(axum::Extension(tenant_ctx(tenant)))
     }

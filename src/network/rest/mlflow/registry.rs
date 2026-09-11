@@ -540,9 +540,7 @@ mod tests {
             .with_state(MlflowState::new(
                 run_store,
                 registry.clone(),
-                std::sync::Arc::new(crate::services::mlflow_run_store::LocalFsArtifacts::new(
-                    std::env::temp_dir().join("mlflow_artifacts_test"),
-                )),
+                std::env::temp_dir(),
             ))
             .layer(axum::Extension(TenantContext::new(
                 "default",
