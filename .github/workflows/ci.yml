@@ -386,6 +386,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Validate deterministic guard wiring
         run: python3 scripts/check_deterministic_commit_contract.py
+      - name: Test trusted branch-route workflow contract
+        run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
 
   repository-identity:
     name: Canonical Repository Identity
@@ -2809,14 +2811,10 @@ jobs:
   # PROMOTION FRESHNESS GATE
   # ============================================================================
   # A develop->qa (or qa->main) promotion PR must contain the LATEST commits of
-  # its source branch. Promotion PRs deliberately use a fixed `release/...` head
-  # (so incoming feat->develop merges can't synchronize/cancel the run), but that
-  # means develop can advance *after* the PR is opened, leaving the PR snapshot
-  # stale — merging it would DROP the newer commits (the #992 failure, where 47
-  # paths / #983/#984/#988/#990 were omitted). This gate fails if the source
-  # branch has commits not in the PR head, blocking the merge until the PR is
-  # refreshed. Skips on non-promotion PRs (and push events); ci-success treats a
-  # `skipped` result as pass.
+  # its exact source branch. The source guard rejects snapshot/release branches;
+  # this freshness check remains defense in depth against a stale or unexpected
+  # promotion ref. Skips on non-promotion PRs (and push events); ci-success treats
+  # a `skipped` result as pass.
   promotion-freshness:
     name: Promotion Freshness (head must contain source branch)
     runs-on: ubuntu-latest
@@ -2979,10 +2977,9 @@ jobs:
     if: always()
     steps:
       # HARD GATE — a promotion PR must contain the latest source-branch commits.
-      # Promotion PRs use a fixed `release/...` head (churn-immune), so the source
-      # branch can advance after the PR opens and leave it stale — merging would
-      # DROP commits (#992). `promotion-freshness` skips on non-promotion PRs, so
-      # block only on failure/cancelled and treat skipped as pass.
+      # Exact-source promotion PRs synchronize as their source advances. Keep the
+      # freshness result as defense in depth; block on failure/cancelled and treat
+      # skipped as pass for ordinary PRs.
       - name: Require promotion freshness
         if: ${{ needs.promotion-freshness.result == 'failure' || needs.promotion-freshness.result == 'cancelled' }}
         run: |

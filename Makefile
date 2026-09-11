@@ -1,6 +1,6 @@
 # ProximaDB Build and Test Makefile
 
-.PHONY: env-gate-check all clean build test test-python test-rust test-fast check-fast install-fast-tools benchmark release install help capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check deterministic-commit-contract-check work-commit-check validated-commit-check workspace-rebuild-baseline panic-policy-report panic-policy-no-regression panic-policy-module-guard panic-policy-baseline silent-failure-report silent-failure-no-regression silent-failure-baseline v1-proto-usage-report v1-proto-usage-no-regression v1-proto-usage-baseline hygiene-check proto-check verify-openapi-spec gen-go-sdk gen-ts-sdk gen-rust-sdk gen-python-sdk release-check query-conformance-check docs-claim-check design-status-check status-asof-check release-smoke cloud-emulator-test
+.PHONY: env-gate-check all clean build test test-python test-rust test-fast check-fast install-fast-tools benchmark release install help capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check deterministic-commit-contract-check branch-promotion-policy-check work-commit-check validated-commit-check workspace-rebuild-baseline panic-policy-report panic-policy-no-regression panic-policy-module-guard panic-policy-baseline silent-failure-report silent-failure-no-regression silent-failure-baseline v1-proto-usage-report v1-proto-usage-no-regression v1-proto-usage-baseline hygiene-check proto-check verify-openapi-spec gen-go-sdk gen-ts-sdk gen-rust-sdk gen-python-sdk release-check query-conformance-check docs-claim-check design-status-check status-asof-check release-smoke cloud-emulator-test
 
 # Default target
 all: build test
@@ -133,6 +133,10 @@ deterministic-commit-contract-check:
 	@echo "🧷 Validating deterministic commit contract..."
 	python3 scripts/check_deterministic_commit_contract.py
 
+branch-promotion-policy-check:
+	@echo "🌿 Validating pull-request branch routes..."
+	python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
+
 proto-check:
 	@echo "🧬 Validating protobuf/OpenAPI contract drift..."
 	cargo check -p proximadb-proto
@@ -210,7 +214,7 @@ tenant-ingress-check:
 	@echo "Validating deployment-aware tenant ingress..."
 	python3 scripts/check_tenant_ingress_contract.py
 
-work-commit-check: fmt-check deterministic-commit-contract-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check
+work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check
 	@echo "✅ work-commit-check: deterministic architecture and commit guardrails passed"
 
 validated-commit-check: work-commit-check

@@ -41,7 +41,8 @@ permissions:
   contents: read
 
 jobs:
-  # Enforce the promotion path: main may only be promoted FROM qa.
+  # Defense in depth for the main promotion path. The trusted metadata-only
+  # branch-route-guard workflow enforces all develop/qa/main PR routes.
   promotion-source-guard:
     name: Promotion Source Guard (main <- qa only)
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
