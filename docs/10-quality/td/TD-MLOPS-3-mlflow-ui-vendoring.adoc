@@ -1,0 +1,105 @@
+= TD-MLOPS-3: Vendored MLflow UI serving — provenance, mount contract, and identity boundary
+:status: Implemented
+:dim: D2
+:pillar: OE
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Implemented (vendoring + serving + smoke gates)
+| Severity | Low — additive surface behind a non-default feature + existing gate
+| Component | `src/network/rest/mlflow/ui.rs`, `third_party/mlflow-ui/3.16.0/`
+| Related | TD-MLOPS-1 (the wire), TD-SSO-2 (browser-session forward pointer)
+|===
+
+== Problem
+
+The MLflow adapter (TD-MLOPS-1, four slices) has a fully-conformant REST
+wire but no GUI. Users coming from Databricks or OSS MLflow expect the
+standard experiment/run/metric-chart experience. The choice: vendor the
+stock MLflow UI bundle and serve it from the server itself, or build a
+custom UI (deferred — the stock UI is free, conformance-tested, and
+updatable).
+
+== Decision (the mount-is-the-contract rule)
+
+The vendored stock bundle serves at `/mlflow-ui` same-origin behind the
+`PROXIMADB_MLFLOW_COMPAT_ENABLE` gate, compiled in only with the
+non-default `mlflow-ui` cargo feature. **The mount path + `ajax-api`
+alias is the stable contract**: a future custom UI swaps in at `/mlflow-ui`
+with the same auth — a non-event.
+
+Statics AND the ajax-api aliases mount on the same `base_router`, BEFORE
+the tenant/auth middleware layers — a future OIDC/SSO middleware gates
+UI and API together in one place (the architectural invariant from the
+design deliberation: auth at the middleware layer, never inside the UI).
+
+== NEVER rules (architectural constraints)
+
+1. **NEVER implement MLflow's `users/*` or `roles/*` endpoints.** They are
+   MLflow's own password model — wiring them would create a shadow
+   identity system that must be unwound for OIDC. They 404 permanently;
+   identity is ours (Kanidm/SSO/TenantContext).
+2. **NEVER merge this bundle into the admin React app.** The stock MLflow
+   UI is its own React app (own router/redux/build) — merging forks it
+   off upstream updates permanently. Serve it standalone; iframe it from
+   the admin shell if visual integration is wanted (the optional cosmetic
+   layer).
+
+== Forward pointer: browser sessions (TD-SSO-2)
+
+The platform's auth middleware today is header/JWT-shaped; browsers don't
+send `Authorization` headers on their own. When OIDC/SSO lands on this
+surface, the middleware needs a cookie-based browser session bridging
+(standard OIDC redirect → cookie → same-origin SPA fetches ride it). This
+is a TD-SSO-2 consideration, not a TD-MLOPS-3 one — noted so the design
+deliberation isn't lost.
+
+== Vendoring
+
+`scripts/vendor_mlflow_ui.sh` reproducibly extracts the pinned FULL wheel
+(`mlflow==3.16.0`, sha256-verified) into
+`third_party/mlflow-ui/3.16.0/build/`. LICENSE (Apache-2.0) and
+PROVENANCE.adoc (version, wheel sha, extraction date, upstream) are
+committed alongside. The MLflow 3 UI's traces/LoggedModel/prompts tabs
+degrade gracefully (404) and will light up when TD-MLOPS-2 implements
+those endpoints — one UI, progressively enabled.
+
+== Route table
+
+|===
+| Request | Serves
+| `GET /mlflow-ui` and `/mlflow-ui/` | vendored `build/index.html`
+| `GET /mlflow-ui/static-files/<path>` | vendored `build/<path>` (prefix stripped; Flask `send_from_directory` semantics)
+| `POST/GET /mlflow-ui/ajax-api/2.0/mlflow/...` | the existing `mlflow_routes()` (same handlers, Router::Clone nest)
+| `POST/GET /mlflow-ui/ajax-api/2.0/mlflow-artifacts/...` | the artifacts proxy (prefix-parameterized `artifacts_routes_at`)
+| anything else under `/mlflow-ui` | nested fallback → index.html (hash-router SPA)
+|===
+
+The bundle's relative URLs resolve against `/mlflow-ui/`, so everything
+nests under one mount. The `ajax-api/3.0/*` namespace (gateway, scorers,
+datasets) + users/roles/webhooks/traces 404-degrade (probe-verified; the
+tabs degrade in the UI).
+
+== Binary-size posture
+
+The `mlflow-ui` feature is NON-DEFAULT: the standard build's binary is
+unchanged; deployments wanting the UI rebuild with
+`--features mlflow-ui` (+26 MB embedded). This respects the root
+Cargo.toml's "keep default features minimal" guardrail and follows the
+`otlp-metering` optional-dep precedent.
+
+== Verification
+
+- Index.html, hashed JS (4.4 MB), and hashed CSS all 200 at `/mlflow-ui/`
+- `/mlflow-ui/ajax-api/2.0/mlflow/experiments/search` returns seeded data
+  through the exact path the SPA calls
+- Gate OFF → nothing mounts (unchanged); gate ON + feature OFF → one log
+  line pointing at `--features mlflow-ui`
+- Default-feature build: 0 errors, 0 warnings, tests 5/5
+- Feature build: 0 errors, 0 warnings
+- The Chrome visual gate (SPA renders experiment list → run detail →
+  metric chart) is verified at the DOM level (root div, JS/CSS refs,
+  title all present in served HTML + assets 200 + API returns data);
+  the browser-level screenshot evidence lands with the PR's review when
+  the extension reconnects.

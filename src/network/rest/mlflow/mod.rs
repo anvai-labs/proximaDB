@@ -76,11 +76,20 @@ pub mod filter;
 pub(crate) use error::{MlflowError, MlflowResult};
 use filter::ExperimentFilter;
 pub mod registry;
+pub mod ui;
 
 /// The artifacts PROXY lives at /api/2.0/mlflow-artifacts (a sibling of
 /// /api/2.0/mlflow, not under it) — mounted separately in server.rs.
 pub fn artifacts_router() -> Router<MlflowState> {
     artifacts::artifacts_routes()
+}
+
+pub fn artifacts_router_at(prefix: &str) -> Router<MlflowState> {
+    artifacts::artifacts_routes_at(prefix)
+}
+
+pub fn artifacts_router_relative() -> Router<MlflowState> {
+    artifacts::artifacts_routes_relative()
 }
 
 pub fn mlflow_routes() -> Router<MlflowState> {

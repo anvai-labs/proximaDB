@@ -605,6 +605,9 @@ opentelemetry = { version = "0.32", optional = true }
 # feature transitively enables `experimental_async_runtime`.
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "experimental_metrics_periodicreader_with_async_runtime", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "metrics"], optional = true }
+# MLflow UI embedding (TD-MLOPS-3) — optional behind the `mlflow-ui` feature.
+include_dir = { version = "0.7", optional = true }
+mime_guess = { version = "2", optional = true }
 
 # Storage & Memory Management
 memmap2 = "0.9"
@@ -828,6 +831,11 @@ default = ["sql_frontend", "graph-first-sks", "unified-facade-routing", "canonic
 # builds (smaller binary, no AXIS boot/index-build cost); search then routes to the exact-scan
 # path (TD-AXIS-4 Superseded; ADR-052). Pure cfg gate — AXIS lives in the root crate, no dep.
 axis = []
+# MLflow UI serving (TD-MLOPS-3): embeds the vendored stock MLflow web bundle
+# (third_party/mlflow-ui/) into the server binary behind the
+# PROXIMADB_MLFLOW_COMPAT_ENABLE gate. Non-default: keeps the binary lean
+# for deployments that don't use the compatibility surface.
+mlflow-ui = ["dep:include_dir", "dep:mime_guess"]
 # Optional surfaces; keep off by default to minimize binary size and public API surface
 tenant_access = []
 # Experimental storage engines (RAPTOR, SWIFT); disabled by default to prevent
