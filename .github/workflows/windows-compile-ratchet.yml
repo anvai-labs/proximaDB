@@ -7,9 +7,9 @@
 # regression surfaces on the INTRODUCING PR (Mandate #9), not only at release-tag
 # time when the full wheel build runs. The ratchet only goes up.
 #
-# All three rungs are now GATING and the ratchet has reached compile parity with
-# the release wheel (root lib + `python` feature + C-deps all build on MSVC). The
-# end-to-end guard beyond compile — the actual wheel build/link + PyPI publish —
+# All four rungs are now GATING: the ratchet has reached compile parity with
+# the Python release wheel, and separately covers the optional Node.js binding.
+# The end-to-end guard beyond compile — the actual wheel build/link + PyPI publish —
 # lives in release-python.yml; there is no non-gating "measure tail" left because
 # there is no next blocker to reveal.
 #
@@ -24,6 +24,7 @@ on:
     # PRs — not every src change across concurrent sessions.
     paths:
       - 'crates/storage/**'
+      - 'crates/binding/proximadb-embedded/**'
       - 'crates/platform/proximadb-runtime/**'
       - 'src/storage/**'
       - 'src/embedded/**'
@@ -84,3 +85,10 @@ jobs:
       # deferred to the next release tag.
       - name: Rung 3 — root proximadb lib with python feature (PyO3 + C-deps)
         run: cargo check -p proximadb --lib --features python
+
+      # Rung 4: the extracted embedded crate's Node.js N-API surface is optional
+      # and therefore invisible to every rung above. Compile it explicitly on
+      # MSVC so napi runtime/derive upgrades cannot stay Linux-green while
+      # breaking the Windows native binding.
+      - name: Rung 4 — embedded Node.js binding (N-API)
+        run: cargo check -p proximadb-embedded --tests --no-default-features --features nodejs
