@@ -392,7 +392,11 @@ in the Current Matrix stay authoritative for API-level claims. `StorageEngineStr
 
 | Hybrid (variant)
 | Planned
-| `Hybrid` enum variant reserved; not implemented — factory falls back to SST with a warning.
+| `Hybrid` enum variant reserved; NOT implemented — factory FAILS LOUD (`not implemented`) since 2026-09-10; the former silent SST fallback misreported the deployment.
+| Do not market as implemented.
+| MMAP (variant)
+| Not implemented
+| `MMAP` enum variant reserved; NOT implemented — factory FAILS LOUD (`not implemented`) since 2026-09-10; same silent-fallback removal as Hybrid.
 | Do not market as implemented.
 
 | ORION

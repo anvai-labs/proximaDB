@@ -381,8 +381,14 @@ impl ExtractionFactory {
             StorageEngineType::SST => Arc::new(
                 crate::storage::engines::sst::extraction::SstExtractor::new(filesystem),
             ),
+            #[cfg(feature = "experimental-engines")]
             StorageEngineType::SWIFT => Arc::new(
                 crate::storage::engines::swift::extraction::SwiftExtractor::new(filesystem),
+            ),
+            // SWIFT requires `experimental-engines`; unreachable without it.
+            #[cfg(not(feature = "experimental-engines"))]
+            StorageEngineType::SWIFT => Arc::new(
+                crate::storage::engines::sst::extraction::SstExtractor::new(filesystem),
             ),
             StorageEngineType::HELIX => Arc::new(
                 crate::storage::engines::helix::extraction::HelixExtractor::new(filesystem),

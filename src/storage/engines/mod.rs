@@ -107,6 +107,11 @@ pub mod nova; // Phase 1: Moved from impls/nova/
 #[cfg(feature = "experimental-engines")]
 pub mod raptor; // Phase 1: Moved from impls/raptor/
 pub mod sst; // Phase 1: Moved from impls/sst/
+// SWIFT: deprecated, slated for removal at v1.0 (TD-152). Gated exactly like
+// RAPTOR — dead weight in every default build before this (compiled,
+// unlinted-against, and unroutable since the factory bails without the
+// feature).
+#[cfg(feature = "experimental-engines")]
 pub mod swift; // Phase 1: Moved from impls/swift/
 pub mod viper; // Phase 1: Moved from impls/viper/ // Phase 1: Moved from impls/helix/
 // Phase 2: Moved remaining specialized engines from impls/
@@ -140,6 +145,7 @@ pub use nova::NovaEngine; // Phase 1: Moved from impls/
 pub use raptor::RaptorEngine; // Phase 1: Moved from impls/
 #[allow(deprecated)]
 pub use sst::SstEngine; // Phase 1: Moved from impls/
+#[cfg(feature = "experimental-engines")]
 #[allow(deprecated)]
 pub use swift::SwiftEngine; // Phase 1: Moved from impls/
 #[allow(deprecated)]

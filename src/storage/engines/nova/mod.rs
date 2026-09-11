@@ -592,6 +592,9 @@ mod tests {
     mod progressive_search_tests {
         use super::*;
         use crate::storage::engines::nova::progressive_search::Int8Vector;
+        // SWIFT types exist only under `experimental-engines` (module gated);
+        // tests exercising BinarySketch are compiled in that configuration.
+        #[cfg(feature = "experimental-engines")]
         use crate::storage::engines::swift::progressive_search::BinarySketch;
 
         #[test]
@@ -652,6 +655,7 @@ mod tests {
             assert_eq!(heap.pop().unwrap().similarity, 10.0);
         }
 
+        #[cfg(feature = "experimental-engines")]
         #[test]
         fn test_binary_sketch_operations() {
             let vector = vec![0.5, -0.3, 0.8, -0.1, 0.0];
@@ -943,6 +947,9 @@ mod tests {
 
     mod benchmark_tests {
         use super::*;
+        // SWIFT types exist only under `experimental-engines` (module gated);
+        // tests exercising BinarySketch are compiled in that configuration.
+        #[cfg(feature = "experimental-engines")]
         use crate::storage::engines::swift::progressive_search::BinarySketch;
         use std::time::Instant;
 
@@ -971,6 +978,7 @@ mod tests {
             assert!(intersection_time.as_millis() < 100);
         }
 
+        #[cfg(feature = "experimental-engines")]
         #[test]
         fn test_binary_sketch_performance() {
             let vectors = create_large_test_dataset(1000, 768);

@@ -99,7 +99,11 @@ impl ProgressivePipelineFactory {
             ProgressiveEngineType::SST => self.create_sst_pipeline(stages, hamming_threshold),
             ProgressiveEngineType::HELIX => self.create_helix_pipeline(stages, hamming_threshold),
             ProgressiveEngineType::VIPER => self.create_viper_pipeline(stages, hamming_threshold),
+            #[cfg(feature = "experimental-engines")]
             ProgressiveEngineType::SWIFT => self.create_swift_pipeline(stages, hamming_threshold),
+            // SWIFT requires `experimental-engines`; empty pipeline without it.
+            #[cfg(not(feature = "experimental-engines"))]
+            ProgressiveEngineType::SWIFT => ProgressiveSearchCoordinator::new(),
             ProgressiveEngineType::NOVA => self.create_nova_pipeline(stages, hamming_threshold),
             #[cfg(feature = "experimental-engines")]
             ProgressiveEngineType::RAPTOR => self.create_raptor_pipeline(stages, hamming_threshold),
@@ -223,6 +227,7 @@ impl ProgressivePipelineFactory {
         coordinator
     }
 
+    #[cfg(feature = "experimental-engines")]
     fn create_swift_pipeline(
         &self,
         stages: &[PipelineStage],
