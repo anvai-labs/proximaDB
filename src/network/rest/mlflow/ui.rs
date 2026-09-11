@@ -53,17 +53,16 @@ pub async fn serve_index_route() -> Response {
 
 #[cfg(feature = "mlflow-ui")]
 async fn serve_index() -> Response {
-    serve_file_from("", "index.html", false)
+    serve_file_from("index.html", false)
 }
 
 #[cfg(feature = "mlflow-ui")]
 async fn serve_static_file(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
-    serve_file_from("static-files/", &path, true)
+    serve_file_from(&path, true)
 }
 
 #[cfg(feature = "mlflow-ui")]
-fn serve_file_from(prefix: &str, path: &str, cache: bool) -> Response {
-    let _ = prefix; // prefix already stripped by the route patterns
+fn serve_file_from(path: &str, cache: bool) -> Response {
     let Some(file) = UI_BUILD.get_file(path) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
@@ -93,7 +92,7 @@ pub fn ui_mount_routes() -> Router<MlflowState> {
             .nest("/ajax-api/2.0/mlflow", super::mlflow_routes())
             .nest(
                 "/ajax-api/2.0/mlflow-artifacts",
-                super::artifacts_router_at("/mlflow-ui/ajax-api/2.0/mlflow-artifacts"),
+                super::artifacts_router_relative(),
             )
     }
     #[cfg(not(feature = "mlflow-ui"))]

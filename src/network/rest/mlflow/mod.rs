@@ -88,6 +88,10 @@ pub fn artifacts_router_at(prefix: &str) -> Router<MlflowState> {
     artifacts::artifacts_routes_at(prefix)
 }
 
+pub fn artifacts_router_relative() -> Router<MlflowState> {
+    artifacts::artifacts_routes_relative()
+}
+
 pub fn mlflow_routes() -> Router<MlflowState> {
     Router::new()
         .route("/experiments/create", post(experiments_create))

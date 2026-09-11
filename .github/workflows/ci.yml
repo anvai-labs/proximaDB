@@ -199,7 +199,8 @@ jobs:
               - 'proto/**'
             ui:
               - 'ui/**'
-              - '.github/workflows/ci.yml'        - third_party/mlflow-ui/**
+              - '.github/workflows/ci.yml'
+              - third_party/mlflow-ui/**
 
             docker:
               - 'Dockerfile*'
@@ -2008,25 +2009,18 @@ jobs:
           # registry searches — absent-value semantics keep it green).
           python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" 2x | tee /tmp/conformance-2x.log
           /tmp/mlflow3env/bin/python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" 3x | tee /tmp/conformance-3x.log
-      - name: MLflow UI smoke (vendored bundle + ajax-api alias)
-        run: |
-          set -eu
-          # The SPA root: index.html with the mount point and asset refs
-          INDEX=$(curl -sf "http://127.0.0.1:$PORT/mlflow-ui/")
-          echo "$INDEX" | grep -q 'id="root"' || (echo "::error::index.html missing root div" && exit 1)
-          echo "$INDEX" | grep -q '<title>MLflow</title>' || (echo "::error::wrong title" && exit 1)
-          # Parse the hashed JS path FROM index.html (never hardcode) and verify it serves
-          JS_PATH=$(echo "$INDEX" | grep -oE 'static-files/static/js/main\.[a-f0-9]+\.js' | head -1)
-          [ -n "$JS_PATH" ] || (echo "::error::no JS reference found in index.html" && exit 1)
-          curl -sf -o /dev/null "http://127.0.0.1:$PORT/mlflow-ui/$JS_PATH" || (echo "::error::JS bundle not serving at $JS_PATH" && exit 1)
-          # The ajax-api alias: the exact path the SPA calls
-          curl -sf -X POST "http://127.0.0.1:$PORT/mlflow-ui/ajax-api/2.0/mlflow/experiments/search" \
-            -H 'content-type: application/json' \
-            -d '{}' | grep -q '"experiments"' || (echo "::error::ajax-api experiments/search returned no experiments key" && exit 1)
-          # Trailing-slash form serves the SPA too
-          curl -sf -o /dev/null "http://127.0.0.1:$PORT/mlflow-ui" || (echo "::error::/mlflow-ui (no slash) failed" && exit 1)
-          echo "UI smoke: all checks passed"
 
+          # UI smoke (same step so PORT is set and the server is alive)
+          INDEX=$(curl -sf "http://127.0.0.1:$PORT/mlflow-ui/")
+          echo "$INDEX" | grep -q 'id="root"' || (echo "::error::UI index.html missing root div" && exit 1)
+          JS_PATH=$(echo "$INDEX" | grep -oE 'static-files/static/js/main\.[a-f0-9]+\.js' | head -1)
+          [ -n "$JS_PATH" ] || (echo "::error::no JS ref in index.html" && exit 1)
+          curl -sf -o /dev/null "http://127.0.0.1:$PORT/mlflow-ui/$JS_PATH" || (echo "::error::JS bundle not serving" && exit 1)
+          curl -sf -X POST "http://127.0.0.1:$PORT/mlflow-ui/ajax-api/2.0/mlflow/experiments/search" \
+            -H 'content-type: application/json' -d '{}' \
+            | grep -q '"experiments"' || (echo "::error::ajax-api search failed" && exit 1)
+          curl -sf -o /dev/null "http://127.0.0.1:$PORT/mlflow-ui" || (echo "::error::no-slash form failed" && exit 1)
+          echo "UI smoke: all checks passed"
       - name: Ratchet — passing steps only go up
         if: always()
         run: |

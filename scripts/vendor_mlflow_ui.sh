@@ -5,7 +5,7 @@
 set -euo pipefail
 
 MLFLOW_VERSION="3.16.0"
-WHEEL_SHA256="c4ac5e8634aacad1a3d7d5a1a31be9279593ebd48b84272843682db11970cf71" # placeholder; set on first run
+WHEEL_SHA256="c4ac5e8634aacad1a3d7d5a1a31be9279593ebd48b84272843682db11970cf71"
 DEST="third_party/mlflow-ui/${MLFLOW_VERSION}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

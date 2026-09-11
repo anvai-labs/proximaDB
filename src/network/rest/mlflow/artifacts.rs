@@ -45,6 +45,19 @@ pub fn artifacts_routes_at(prefix: &str) -> Router<MlflowState> {
         .layer(axum::extract::DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT))
 }
 
+/// Routes RELATIVE to an artifacts mount (just `/artifacts/...`, no
+/// `mlflow-artifacts` prefix) — for nesting under a mount that already
+/// carries the full prefix (the UI's `/ajax-api/2.0/mlflow-artifacts`).
+pub fn artifacts_routes_relative() -> Router<MlflowState> {
+    Router::new()
+        .route(
+            "/artifacts",
+            axum::routing::get(artifact_root_list).delete(artifact_root_delete),
+        )
+        .route("/artifacts/{*path}", any(artifact_proxy))
+        .layer(axum::extract::DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT))
+}
+
 fn sanitize_segments(path: &str) -> MlflowResult<Vec<String>> {
     let mut out = Vec::new();
     for segment in path.split('/') {
