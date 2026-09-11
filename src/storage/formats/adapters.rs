@@ -559,6 +559,7 @@ pub type ViperFormatAdapter = InternalFormatAdapter<crate::storage::engines::vip
 pub type NovaFormatAdapter = InternalFormatAdapter<crate::storage::engines::nova::NovaEngine>;
 
 /// Type alias for SWIFT format adapter
+#[cfg(feature = "experimental-engines")]
 #[allow(deprecated)]
 pub type SwiftFormatAdapter = InternalFormatAdapter<crate::storage::engines::swift::SwiftEngine>;
 
@@ -600,6 +601,7 @@ pub fn create_nova_adapter(
 }
 
 /// Create a SWIFT format adapter from an existing engine
+#[cfg(feature = "experimental-engines")]
 #[allow(deprecated)]
 pub fn create_swift_adapter(
     engine: Arc<crate::storage::engines::swift::SwiftEngine>,
