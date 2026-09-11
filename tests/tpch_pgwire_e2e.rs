@@ -22,6 +22,10 @@ use tokio::time::sleep;
 /// Number of TPC-H queries expected to execute cleanly over pgwire. Raised as
 /// SQL wiring/lowering gaps are fixed (the ratchet). Never lower without cause.
 const TPCH_RATCHET: usize = 22;
+/// ADR-040 accuracy ratchet (TD-182 P1): number of TPC-H queries whose FULL
+/// result set is anchored against a hand-derived expected table over the seed
+/// data and passes (`canon_rows` comparison). Only goes up.
+const TPCH_ACCURATE_RATCHET: usize = 15;
 
 fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -156,12 +160,23 @@ const DATA: &[&str] = &[
     // partsupp
     "INSERT INTO partsupp (ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment) VALUES (1, 1, 100, 10.0, 'psc1'), (2, 2, 200, 20.0, 'psc2'), (3, 3, 300, 30.0, 'psc3'), (1, 2, 150, 15.0, 'psc4')",
     // customer
-    "INSERT INTO customer (c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment) VALUES (1, 'Customer#1', 'caddr1', 0, '11-001', 700.0, 'BUILDING', 'cc1'), (2, 'Customer#2', 'caddr2', 1, '22-002', 800.0, 'AUTOMOBILE', 'cc2 special requests'), (3, 'Customer#3', 'caddr3', 2, '33-003', -10.0, 'BUILDING', 'cc3')",
+    "INSERT INTO customer (c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment) VALUES (1, 'Customer#1', 'caddr1', 0, '13-001', 700.0, 'BUILDING', 'cc1'), (2, 'Customer#2', 'caddr2', 1, '22-002', 800.0, 'AUTOMOBILE', 'cc2 special requests'), (3, 'Customer#3', 'caddr3', 2, '33-003', -10.0, 'BUILDING', 'cc3')",
     // orders
     "INSERT INTO orders (o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment) VALUES (1, 1, 'O', 1000.0, DATE '1995-02-15', '1-URGENT', 'Clerk#1', 0, 'oc1'), (2, 2, 'F', 2000.0, DATE '1994-06-10', '2-HIGH', 'Clerk#2', 0, 'oc2'), (3, 3, 'O', 3000.0, DATE '1995-03-20', '3-MEDIUM', 'Clerk#3', 0, 'oc3')",
     // lineitem
     "INSERT INTO lineitem (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) VALUES (1, 1, 1, 1, 17.0, 1700.0, 0.04, 0.02, 'N', 'O', DATE '1995-03-10', DATE '1995-03-12', DATE '1995-03-20', 'DELIVER IN PERSON', 'TRUCK', 'lc1'), (2, 2, 2, 1, 36.0, 7200.0, 0.09, 0.06, 'R', 'F', DATE '1994-07-02', DATE '1994-07-05', DATE '1994-07-10', 'NONE', 'MAIL', 'lc2'), (3, 3, 3, 1, 28.0, 8400.0, 0.06, 0.08, 'A', 'F', DATE '1994-08-01', DATE '1994-08-04', DATE '1994-08-09', 'TAKE BACK RETURN', 'SHIP', 'lc3'), (1, 2, 2, 2, 10.0, 2000.0, 0.10, 0.05, 'N', 'O', DATE '1995-04-01', DATE '1995-04-03', DATE '1995-04-10', 'NONE', 'RAIL', 'lc4')",
+    // ADR-040 accuracy enrichment (TD-182 P1): L5/L6 give 1994 line volume so
+    // Q6 and Q20's availability predicate are non-vacuous on the seed.
+    "INSERT INTO lineitem (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) VALUES (1, 1, 1, 3, 20.0, 4000.0, 0.06, 0.03, 'N', 'O', DATE '1994-05-10', DATE '1994-05-12', DATE '1994-05-20', 'NONE', 'RAIL', 'lc5'), (2, 1, 4, 3, 30.0, 6000.0, 0.05, 0.02, 'N', 'O', DATE '1994-06-01', DATE '1994-06-03', DATE '1994-06-10', 'NONE', 'RAIL', 'lc6')",
 ];
+/// Customer 4 (ADR-040 accuracy enrichment): a phone prefix in Q22's list and
+/// no orders — gives Q22's anti-join a surviving row.
+const CUSTOMER_ENRICHMENT: &str = "INSERT INTO customer (c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment) VALUES (4, 'Customer#4', 'caddr4', 0, '17-004', 900.0, 'AUTOMOBILE', 'cc4')";
+/// CANADA nation + supplier + partsupp for part 1 (ADR-040 accuracy
+/// enrichment): makes Q20's CANADA availability predicate satisfiable.
+const NATION_ENRICHMENT: &str = "INSERT INTO nation (n_nationkey, n_name, n_regionkey, n_comment) VALUES (3, 'CANADA', 0, 'nc3')";
+const SUPPLIER_ENRICHMENT: &str = "INSERT INTO supplier (s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment) VALUES (4, 'Supplier#4', 'caddr4', 3, '44-444', 3000.0, 'sc4')";
+const PARTSUPP_ENRICHMENT: &str = "INSERT INTO partsupp (ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment) VALUES (1, 4, 500, 25.0, 'psc5')";
 
 /// The 22 standard TPC-H queries, substitution parameters fixed to constants that
 /// the tiny dataset can satisfy. Listed (id, sql) so failures report which.
@@ -238,6 +253,20 @@ async fn tpch_pgwire_conformance_inner() {
     }
     eprintln!("✓ data: {} insert batches loaded", DATA.len());
 
+    // 2b. ADR-040 accuracy enrichment rows (TD-182 P1).
+    for sql in [
+        NATION_ENRICHMENT,
+        SUPPLIER_ENRICHMENT,
+        PARTSUPP_ENRICHMENT,
+        CUSTOMER_ENRICHMENT,
+    ] {
+        client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("enrichment failed: {}\n  sql: {sql}", explain_err(&e)));
+    }
+    eprintln!("✓ enrichment rows loaded");
+
     // 3. Materialize each table to Parquet so the router routes SELECTs to the
     //    DataFusion OLAP engine.
     let mut materialized = 0;
@@ -297,8 +326,9 @@ async fn tpch_pgwire_conformance_inner() {
     );
 
     // Value-correctness spot check: Q1 groups lineitem by (l_returnflag,
-    // l_linestatus). Over the seeded data the groups are (A,F)=1 row, (N,O)=2
-    // rows, (R,F)=1 row, ordered by returnflag, linestatus. This proves the
+    // l_linestatus). Over the seeded data the groups are (A,F)=1 row, (N,O)=4
+    // rows (incl. L5/L6 accuracy enrichment), (R,F)=1 row, ordered by
+    // returnflag, linestatus. This proves the
     // DataFusion route computes CORRECT aggregates over the materialized Parquet —
     // not merely that the SQL parses and executes.
     let q1 = &tpch_queries()[0].1;
@@ -332,8 +362,249 @@ async fn tpch_pgwire_conformance_inner() {
     assert_eq!(got[0].0, "A", "Q1 row0 returnflag");
     assert_eq!(got[0].2, "1", "Q1 (A,F) count_order");
     assert_eq!(got[1].0, "N", "Q1 row1 returnflag");
-    assert_eq!(got[1].2, "2", "Q1 (N,O) count_order");
+    assert_eq!(
+        got[1].2, "4",
+        "Q1 (N,O) count_order (incl. L5/L6 enrichment)"
+    );
     assert_eq!(got[2].0, "R", "Q1 row2 returnflag");
     assert_eq!(got[2].2, "1", "Q1 (R,F) count_order");
     eprintln!("✓ Q1 value-correctness: 3 groups, counts A,F=1 N,O=2 R,F=1");
+    // Anchored accuracy phase (TD-182 P1) — same server, same client.
+    tpch_accuracy_anchored_phase(&client).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-040 accuracy ratchet (TD-182 P1): full-row anchors over the seed data.
+//
+// Each entry: (query id, expected rows) where rows are cell-by-cell NORMALIZED
+// (`norm_cell`: numerics rounded to 2 decimals, whole numbers bare, NULL →
+// "NULL") and order-independent (`canon_rows` sorts). Hand-derived from the
+// seed in DATA + the enrichment constants above:
+//
+//   lineitem: L1 (o1,p1,s1, qty17, ext1700, d.04) | L2 (o2,p2,s2, qty36,
+//   ext7200, d.09) | L3 (o3,p3,s3, qty28, ext8400, d.06) | L4 (o1,p2,s2,
+//   qty10, ext2000, d.10) | L5 (o1,p1,s1, qty20, ext4000, d.06, 1994) |
+//   L6 (o2,p1,s4, qty30, ext6000, d.05, 1994)
+//
+// A wrong engine answer (not just a crash) now fails the suite. Queries whose
+// seed result is legitimately EMPTY are anchored as empty — that is a strong
+// assertion against engines that fabricate rows. Q7/Q8/Q21 (multi-supplier
+// late/none choreography), Q14/Q17/Q19 (aggregate over empty = NULL row) and
+// Q6-pre-enrichment stay execution-only here: NULL-rendering and the Q21
+// late-lineitem choreography are documented as follow-up anchors.
+// ─────────────────────────────────────────────────────────────────────────────
+fn tpch_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
+    vec![
+        // Q1: all 4 lineitems ship ≤ 1998-09-01; groups by (flag,status).
+        (
+            "Q1",
+            vec![
+                vec![
+                    "A", "F", "28", "8400", "7896", "8527.68", "28", "8400", "0.06", "1",
+                ],
+                vec![
+                    "N", "O", "77", "13700", "12892", "13241.44", "19.25", "3425", "0.06", "4",
+                ],
+                vec![
+                    "R", "F", "36", "7200", "6552", "6945.12", "36", "7200", "0.09", "1",
+                ],
+            ],
+        ),
+        // Q2: part1 (STEEL, size 15); AMERICA suppliers with min supplycost → s1.
+        (
+            "Q2",
+            vec![vec![
+                "1000",
+                "Supplier#1",
+                "UNITED STATES",
+                "1",
+                "Mfgr#1",
+                "addr1",
+                "11-111",
+                "sc1",
+            ]],
+        ),
+        // Q3: o1 only (BUILDING customer, orderdate < 1995-03-15, ship after);
+        // L4 revenue 2000*0.9 = 1800 (L5 shipped 1994). o_orderdate renders as
+        // a day-number (1995-02-15 = 9176) on the aggregate route — a KNOWN-BAD
+        // rendering (DATE column fidelity); the VALUE columns are the assertion.
+        // KNOWN-BAD: a DATE-rendering fix will change the 3rd column and trip
+        // this pin — re-anchor with the correct DATE string at that point.
+        ("Q3-KNOWN-BAD", vec![vec!["1", "1800", "9176", "0"]]),
+        // Q4: no orders in 1993-Q3 → empty.
+        ("Q4", vec![]),
+        // Q5: o2's customer is GERMANY (EUROPE), excluded by AMERICA → empty.
+        ("Q5", vec![]),
+        // Q6: L5 only (1994, disc 0.06 ∈ [0.05,0.07], qty 20 < 24) → 4000*0.06.
+        ("Q6", vec![vec!["240"]]),
+        // Q8: part2's only 1995/96 lineitem is o1 → customer USA, not EUROPE → empty.
+        ("Q8", vec![]),
+        // Q9: part2 'green'; L2 (1994): 7200*.91 - 20*36 = 5832; L4 (1995):
+        // 2000*.9 - 20*10 = 1600. Nation = s2 GERMANY. Year DESC within nation.
+        // (canon_rows sorts — year ASC in sorted order, not the query's DESC)
+        (
+            "Q9",
+            vec![
+                vec!["GERMANY", "1994", "5832"],
+                vec!["GERMANY", "1995", "1600"],
+            ],
+        ),
+        // Q10: no orders in 1993-Q4 → empty.
+        ("Q10", vec![]),
+        // Q11: GERMANY supplier s2 → partsupp (2,2): 20*200=4000; (1,2): 15*150=2250.
+        // Total 6250*0.0001 = 0.625; both exceed. Value DESC.
+        ("Q11", vec![vec!["1", "2250"], vec!["2", "4000"]]),
+        // Q12: L2 (MAIL, o2 2-HIGH → high 1); L3 (SHIP, o3 3-MEDIUM → low 1).
+        ("Q12", vec![vec!["MAIL", "1", "0"], vec!["SHIP", "0", "1"]]),
+        // Q13: c1-c3 each have exactly 1 order (no o_comment matches
+        // '%special%requests%'); c4 (enrichment) is orderless →
+        // count(o_orderkey) = {1,1,1,0} → custdist (0→1, 1→3). This IS
+        // the SQL-correct answer (count skips NULLs) — an accurate anchor.
+        ("Q13", vec![vec!["0", "1"], vec!["1", "3"]]),
+        // Q16: sizes in list → part3 only; one partsupp row → 1 distinct supplier.
+        (
+            "Q16",
+            vec![vec!["Brand#34", "SMALL PLATED COPPER", "36", "1"]],
+        ),
+        // Q18: max order qty 66 (o2) < 300 → empty.
+        ("Q18", vec![]),
+        // Q20: CANADA supplier s4, part1, availqty 500 > 0.5*30 (L6 1994 volume).
+        ("Q20", vec![vec!["Supplier#4", "caddr4"]]),
+        // Q22: prefix-17 customer c4 (no orders, 900 > avg 800 of prefix set).
+        ("Q22", vec![vec!["17", "1", "900"]]),
+    ]
+}
+
+/// Copy of the tpcds-suite normalizers (same semantics): numeric cells rounded
+/// to 2 decimals / whole numbers bare, NULL → "NULL"; rows sorted for
+/// order-independent comparison.
+fn norm_cell(s: &str) -> String {
+    match s.parse::<f64>() {
+        Ok(f) => {
+            let r = (f * 100.0).round() / 100.0;
+            if r.fract() == 0.0 {
+                format!("{}", r as i64)
+            } else {
+                format!("{r}")
+            }
+        }
+        Err(_) => s.to_string(),
+    }
+}
+
+async fn canon_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(
+                (0..r.len())
+                    .map(|i| norm_cell(r.get(i).unwrap_or("NULL")))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// ADR-040 accuracy ratchet (TD-182 P1): every anchored TPC-H query must
+/// produce its hand-derived full result set over the seed data. This is the
+/// execution→accuracy conversion the audit called for: a wrong-but-clean
+/// answer can no longer pass.
+/// Anchored accuracy phase — CALLED from tpch_pgwire_conformance_inner so
+/// both phases share ONE server boot (the global WAL manifest is a
+/// process-wide set-once; a second boot in the same process silently
+/// reuses the first's manifest pointed at a deleted tempdir).
+async fn tpch_accuracy_anchored_phase(client: &tokio_postgres::Client) {
+    for (name, ddl) in SCHEMA {
+        let _ = client
+            .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
+            .await;
+        client
+            .simple_query(ddl)
+            .await
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+    }
+    for sql in DATA {
+        client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("INSERT failed: {e}"));
+    }
+    for sql in [
+        NATION_ENRICHMENT,
+        SUPPLIER_ENRICHMENT,
+        PARTSUPP_ENRICHMENT,
+        CUSTOMER_ENRICHMENT,
+    ] {
+        client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("enrichment failed: {e}"));
+    }
+    for (name, _) in SCHEMA {
+        client
+            .simple_query(&format!("ALTER TABLE {name} MATERIALIZE"))
+            .await
+            .unwrap_or_else(|e| panic!("MATERIALIZE {name}: {}", explain_err(&e)));
+    }
+
+    let expected = tpch_expected();
+    let by_id: std::collections::HashMap<&str, String> = tpch_queries().into_iter().collect();
+    let mut accurate = 0;
+    let mut failures = Vec::new();
+    for (id, want) in &expected {
+        let is_known_bad = id.ends_with("-KNOWN-BAD");
+        let lookup_id = id.strip_suffix("-KNOWN-BAD").unwrap_or(id);
+        let sql = by_id
+            .get(lookup_id)
+            .unwrap_or_else(|| panic!("{lookup_id} missing from tpch_queries()"));
+        let got = canon_rows(client, sql).await;
+        let want: Vec<Vec<String>> = want
+            .iter()
+            .map(|row| row.iter().map(|c| c.to_string()).collect())
+            .collect();
+        if is_known_bad {
+            if got == *want {
+                // Still returns the pinned wrong answer — known-bad holds.
+                eprintln!("  ✓ {id} still KNOWN-BAD (pinned wrong answer)");
+                continue;
+            }
+            panic!(
+                "{id}: KNOWN-BAD anchor tripped — the engine's answer CHANGED (got \
+                 {got:?}, pinned {want:?}). If the result is now the CORRECT \
+                 {{0→2, 1→2}} mapping, update the anchor to the correct rows, move \
+                 {lookup_id} into the anchored set, and close the bug."
+            );
+        }
+        if got == want {
+            accurate += 1;
+            eprintln!("  ✓ {id} accurate ({} rows)", got.len());
+        } else {
+            failures.push(format!("{id}: want {want:?}, got {got:?}"));
+        }
+    }
+
+    eprintln!(
+        "\n=== TPC-H accuracy: {}/{} anchored queries accurate (ratchet {}) ===",
+        accurate,
+        expected.len(),
+        TPCH_ACCURATE_RATCHET
+    );
+    for f in &failures {
+        eprintln!("  ✗ {f}");
+    }
+    assert!(
+        failures.is_empty(),
+        "TPC-H anchored accuracy failures: {}",
+        failures.join("; ")
+    );
+    assert!(
+        accurate >= TPCH_ACCURATE_RATCHET,
+        "TPC-H accuracy regressed: {accurate} < ratchet {TPCH_ACCURATE_RATCHET}"
+    );
 }

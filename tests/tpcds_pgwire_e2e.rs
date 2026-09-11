@@ -22,6 +22,10 @@ use tokio::time::sleep;
 
 /// TPC-DS subset queries expected to execute cleanly over pgwire (the ratchet).
 const TPCDS_RATCHET: usize = 18;
+/// ADR-040 accuracy ratchet (TD-182 P1): TPC-DS queries with full-row anchors
+/// over the seed (the shapes not already anchored in the conformance test's
+/// ROLLUP/CUBE/rank/RANGE-GROUPS/INTERSECT section). Only goes up.
+const TPCDS_ACCURATE_RATCHET: usize = 10;
 
 fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -442,4 +446,182 @@ async fn tpcds_pgwire_conformance_inner() {
         "RANGE and GROUPS must differ on ties — else the frame unit was collapsed to ROWS"
     );
     eprintln!("✓ value-correctness: RANGE vs GROUPS frame units honoured on ties");
+    // Anchored accuracy phase (TD-182 P1) — same server, same client.
+    tpcds_accuracy_anchored_phase(&client).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-040 accuracy ratchet (TD-182 P1): full-row anchors for the query shapes
+// NOT already anchored in the conformance test above (ROLLUP / CUBE / rank /
+// RANGE-GROUPS / INTERSECT live there). Hand-derived over the 5-row star seed:
+//   SS1 2000-11-01 i1(Elec,brandA,11) cust1 ext 39.98 profit 12
+//   SS2 2000-11-01 i2(Elec,brandB,12) cust2 ext 29.50 profit 8
+//   SS3 2000-11-15 i3(Books,brandC,21) cust1 ext 49.95 profit 20
+//   SS4 2000-12-10 i4(Books,brandD,22) cust3 ext 42.00 profit 10
+//   SS5 1999-11-05 i1(Elec,brandA,11) cust1 ext 19.99 profit 6
+// ─────────────────────────────────────────────────────────────────────────────
+fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
+    vec![
+        // q42: manufact 100 + moy 11 + year 2000 → SS1 only.
+        ("q42", vec![vec!["2000", "1", "Electronics", "39.98"]]),
+        // q52: moy 11 + year 2000 → SS1/SS2/SS3 (canon_rows sorts: brand_id ASC).
+        (
+            "q52",
+            vec![
+                vec!["2000", "11", "brandA", "39.98"],
+                vec!["2000", "12", "brandB", "29.5"],
+                vec!["2000", "21", "brandC", "49.95"],
+            ],
+        ),
+        // q55: single-brand (manufact 100) revenue = SS1.
+        ("q55", vec![vec!["11", "brandA", "39.98"]]),
+        // q3: moy filter only (NO d_year) → SS1 (2000) AND SS5 (1999).
+        (
+            "q3",
+            vec![
+                vec!["1999", "11", "brandA", "19.99"],
+                vec!["2000", "11", "brandA", "39.98"],
+            ],
+        ),
+        // q98: per-item revenue + ratio to class total. classX = 39.98+29.50 =
+        // 69.48 → item1 57.54 / item2 42.46; classY = 49.95+42.00 = 91.95 →
+        // item3 54.32 / item4 45.68.
+        (
+            "q98",
+            vec![
+                vec![
+                    "ITEM001",
+                    "Electronics",
+                    "classX",
+                    "19.99",
+                    "39.98",
+                    "57.54",
+                ],
+                vec!["ITEM002", "Electronics", "classX", "29.5", "29.5", "42.46"],
+                vec!["ITEM003", "Books", "classY", "9.99", "49.95", "54.32"],
+                vec!["ITEM004", "Books", "classY", "14", "42", "45.68"],
+            ],
+        ),
+        // win_running: per-day revenue + running total in date order. d_date
+        // renders as a day-number (1999-11-05 = 10900 …) on this route — DATE
+        // column-fidelity is a known rendering follow-up; the daily/running
+        // VALUE columns are the assertion.
+        (
+            "win_running",
+            vec![
+                vec!["10900", "19.99", "19.99"],
+                vec!["11262", "69.48", "89.47"],
+                vec!["11276", "49.95", "139.42"],
+                vec!["11301", "42", "181.42"],
+            ],
+        ),
+        // cte KNOWN-BAD (TD-185a): `WITH` falls to the pgwire dispatch
+        // fallthrough and silently returns ZERO rows. Correct answer:
+        // Books 91.95, Electronics 89.47 (rev DESC). Pinned wrong; auto-trips
+        // when the WITH-dispatch fix lands on this branch.
+        ("cte-KNOWN-BAD", vec![]),
+        // count_distinct: Electronics buyers {1,2}; Books buyers {1,3}.
+        (
+            "count_distinct",
+            vec![vec!["Books", "2"], vec!["Electronics", "2"]],
+        ),
+        // correlated: items priced above their category average
+        // (Elec avg 24.745 → item2 29.5; Books avg 11.995 → item4 14).
+        ("correlated", vec![vec!["2", "29.5"], vec!["4", "14"]]),
+        // case_agg: profit>10 hi / ≤10 lo — Electronics {12,8,6} → 1/2;
+        // Books {20,10} → 1/1 (10 counts as lo).
+        (
+            "case_agg",
+            vec![vec!["Books", "1", "1"], vec!["Electronics", "1", "2"]],
+        ),
+        // EXCEPT: Electronics buyers {1,2} minus Books buyers {1,3} → {2}.
+        ("except", vec![vec!["2"]]),
+    ]
+}
+
+/// ADR-040 accuracy ratchet (TD-182 P1): every anchored TPC-DS query must
+/// produce its hand-derived full result set over the seed data. Complements
+/// the ROLLUP/CUBE/rank/RANGE-GROUPS/INTERSECT anchors in the conformance
+/// test above — a wrong-but-clean answer can no longer pass.
+/// Anchored accuracy phase — CALLED from tpcds_pgwire_conformance_inner
+/// so both phases share ONE server boot (the global WAL manifest is a
+/// process-wide set-once; a second boot in the same process silently
+/// reuses the first's manifest pointed at a deleted tempdir).
+async fn tpcds_accuracy_anchored_phase(client: &tokio_postgres::Client) {
+    for (name, ddl) in SCHEMA {
+        let _ = client
+            .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
+            .await;
+        client
+            .simple_query(ddl)
+            .await
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+    }
+    for sql in DATA {
+        client
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("INSERT failed: {e}"));
+    }
+    for (name, _) in SCHEMA {
+        client
+            .simple_query(&format!("ALTER TABLE {name} MATERIALIZE"))
+            .await
+            .unwrap_or_else(|e| panic!("MATERIALIZE {name}: {}", explain_err(&e)));
+    }
+
+    let expected = tpcds_expected();
+    let by_id: std::collections::HashMap<&str, String> = tpcds_queries().into_iter().collect();
+    let mut accurate = 0;
+    let mut failures = Vec::new();
+    for (id, want) in &expected {
+        let is_known_bad = id.ends_with("-KNOWN-BAD");
+        let lookup_id = id.strip_suffix("-KNOWN-BAD").unwrap_or(id);
+        let sql = by_id
+            .get(lookup_id)
+            .unwrap_or_else(|| panic!("{lookup_id} missing from tpcds_queries()"));
+        let got = canon_rows(client, sql).await;
+        let want: Vec<Vec<String>> = want
+            .iter()
+            .map(|row| row.iter().map(|c| c.to_string()).collect())
+            .collect();
+        if is_known_bad {
+            if got == *want {
+                // Still returns the pinned wrong answer — known-bad holds.
+                eprintln!("  ✓ {id} still KNOWN-BAD (pinned wrong answer)");
+                continue;
+            }
+            panic!(
+                "{id}: KNOWN-BAD anchor tripped — the engine's answer CHANGED (got \\
+                 {got:?}, pinned {want:?}). If the result is now the CORRECT \\
+                 {{Books 91.95, Electronics 89.47}} set, update the anchor, move \\
+                 {lookup_id} into the anchored set, and close TD-185a on this branch."
+            );
+        }
+        if got == want {
+            accurate += 1;
+            eprintln!("  ✓ {id} accurate ({} rows)", got.len());
+        } else {
+            failures.push(format!("{id}: want {want:?}, got {got:?}"));
+        }
+    }
+
+    eprintln!(
+        "\n=== TPC-DS accuracy: {}/{} anchored queries accurate (ratchet {}) ===",
+        accurate,
+        expected.len(),
+        TPCDS_ACCURATE_RATCHET
+    );
+    for f in &failures {
+        eprintln!("  ✗ {f}");
+    }
+    assert!(
+        failures.is_empty(),
+        "TPC-DS anchored accuracy failures: {}",
+        failures.join("; ")
+    );
+    assert!(
+        accurate >= TPCDS_ACCURATE_RATCHET,
+        "TPC-DS accuracy regressed: {accurate} < ratchet {TPCDS_ACCURATE_RATCHET}"
+    );
 }
