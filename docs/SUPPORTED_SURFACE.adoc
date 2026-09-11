@@ -74,8 +74,9 @@ REST `/api/v2` is the **sole canonical REST surface** for all ProximaDB clients 
 [IMPORTANT]
 ====
 * *REST /api/v2* — canonical; all new clients and integrations must target this prefix.
-* *REST /api/v1* — **REMOVED except for the entity compatibility routes** at
-  `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search`. Those routes still use the
+* *REST /api/v1* — **REMOVED except for the entity compatibility path family** at
+  `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search` (including entity listing).
+  Those routes still use the
   transitional `ProximaEntityStore`; no other v1 REST collection/vector/search surface is mounted.
 * *REST /api/v3* — **removed**. The document-ingest handler lives canonically at
   `POST /api/v2/collections/{id}/documents`; the former v3 308-redirect alias was
@@ -209,7 +210,7 @@ primitives.
 | Converge every cross-modal blend on the `oid`-keyed fusion seam (`seed -> expand -> calibrate -> fuse-by-oid -> rank`). Do not add one-off entity/vector/document/graph join handlers.
 
 | Entity / SKS
-| Canonical REST v2 `/api/v2/collections/{id}/entities`, `/{entity_id}`, and `/search` are OpenAPI-published; gRPC v2 `proximadb.v2.ProximaEntityService` is always registered. Equivalent residual REST v1 compatibility routes remain live; no gRPC v1 entity service is registered.
+| Canonical REST v2 `/api/v2/collections/{id}/entities`, `/{entity_id}`, and `/search` are OpenAPI-published; gRPC v2 `proximadb.v2.ProximaEntityService` is always registered. A residual REST v1 path family remains live on the transitional store and additionally supports entity listing; no gRPC v1 entity service is registered.
 | Semantic convenience shape: entity id, metadata, embeddings, provenance, relations, temporal fields
 | Do not create another entity substrate. Converge all three live facades on orchestration over record/vector + graph + document/provenance + event/temporal history, with `TenantContext` and structural tenant paths at every I/O boundary; retire the REST v1 compatibility routes only with measured client evidence.
 |===

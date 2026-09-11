@@ -61,7 +61,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -115,7 +115,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/collections/{collection_id}:
@@ -149,7 +149,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -184,7 +184,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -217,7 +217,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -260,7 +260,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -303,7 +303,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -352,7 +352,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -394,7 +394,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -448,7 +448,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -493,7 +493,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -588,7 +588,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -626,7 +626,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -667,7 +667,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -724,7 +724,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -778,7 +778,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -816,7 +816,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -862,7 +862,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -906,7 +906,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     post:
@@ -942,7 +942,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/model-registries/{name}:
@@ -960,7 +960,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -991,7 +991,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -1040,7 +1040,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       requestBody:
@@ -1104,7 +1104,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/query/explain:
@@ -1136,7 +1136,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/sql:
@@ -1190,7 +1190,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /health:
@@ -1211,7 +1211,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /health/live:
@@ -1232,7 +1232,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /health/ready:
@@ -1253,7 +1253,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/_meta/capabilities:
@@ -1276,7 +1276,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs:
@@ -1306,7 +1306,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     get:
@@ -1327,7 +1327,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}:
@@ -1353,7 +1353,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -1375,7 +1375,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/schema:
@@ -1414,7 +1414,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/nodes:
@@ -1448,7 +1448,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/nodes/{node_id}:
@@ -1475,7 +1475,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     put:
@@ -1509,7 +1509,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -1532,7 +1532,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/nodes/{node_id}/neighbors:
@@ -1559,7 +1559,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/edges:
@@ -1593,7 +1593,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/edges/{edge_id}:
@@ -1620,7 +1620,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     put:
@@ -1654,7 +1654,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -1677,7 +1677,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/nodes/batch:
@@ -1714,7 +1714,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/edges/batch:
@@ -1751,7 +1751,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/traverse:
@@ -1785,7 +1785,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/walk:
@@ -1822,7 +1822,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/step:
@@ -1859,7 +1859,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/shortest-path:
@@ -1893,7 +1893,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/query:
@@ -1931,7 +1931,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/query/nodes:
@@ -1968,7 +1968,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/query/edges:
@@ -2006,7 +2006,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/components:
@@ -2032,7 +2032,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/cycles:
@@ -2058,7 +2058,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/constraints/unique:
@@ -2092,7 +2092,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -2123,7 +2123,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/graphs/{graph_id}/stats:
@@ -2149,7 +2149,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/timeseries/collections:
@@ -2177,7 +2177,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     get:
@@ -2198,7 +2198,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/timeseries/collections/{collection_id}:
@@ -2229,7 +2229,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/timeseries/collections/{collection_id}/ingest:
@@ -2263,7 +2263,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/timeseries/collections/{collection_id}/query:
@@ -2297,7 +2297,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/timeseries/collections/{collection_id}/aggregate:
@@ -2331,7 +2331,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/execute:
@@ -2378,7 +2378,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/multi-model:
@@ -2425,7 +2425,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/federated:
@@ -2472,7 +2472,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/distributed:
@@ -2519,7 +2519,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/explain:
@@ -2566,7 +2566,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/prepare:
@@ -2613,7 +2613,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/execute/{statement_id}:
@@ -2666,7 +2666,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/prepared/{statement_id}:
@@ -2706,7 +2706,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/unified/prepared/stats:
@@ -2753,7 +2753,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/rank/search:
@@ -2826,7 +2826,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/hybrid/search:
@@ -2871,7 +2871,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/hybrid/index:
@@ -2902,7 +2902,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/document-collections:
@@ -2932,7 +2932,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     get:
@@ -2953,7 +2953,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/document-collections/{collection}:
@@ -2986,7 +2986,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -3007,7 +3007,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/document-collections/{collection}/documents:
@@ -3043,7 +3043,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     get:
@@ -3074,7 +3074,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -3122,7 +3122,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -3164,7 +3164,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -3185,7 +3185,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/document-collections/{collection}/documents/batch:
@@ -3221,7 +3221,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/document-collections/{collection}/documents/aggregate:
@@ -3257,7 +3257,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/document-collections/{collection}/indexes:
@@ -3289,7 +3289,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     get:
@@ -3312,7 +3312,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/observability/namespaces/{namespace}/logs:
@@ -3358,7 +3358,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/observability/namespaces/{namespace}/logs/search:
@@ -3405,7 +3405,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/observability/namespaces:
@@ -3452,7 +3452,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/observability/namespaces/{namespace}/logs/bulk:
@@ -3500,7 +3500,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/observability/namespaces/{namespace}/metrics:
@@ -3548,7 +3548,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/observability/namespaces/{namespace}/metrics/bulk:
@@ -3596,7 +3596,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/observability/namespaces/{namespace}/metrics/aggregate:
@@ -3647,7 +3647,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/nl/translate:
@@ -3689,7 +3689,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/policy-bindings/{tenant}/{object_id}:
@@ -3743,7 +3743,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -3770,7 +3770,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/policy-bindings/{tenant}:
@@ -3810,7 +3810,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/tenant-posture/{tenant}:
@@ -3856,7 +3856,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     put:
@@ -3895,7 +3895,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/grants:
@@ -3939,7 +3939,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/grants/{owner_tenant}:
@@ -3980,7 +3980,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/grants/{owner_tenant}/{grant_id}:
@@ -4021,7 +4021,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/attribute-bindings:
@@ -4053,7 +4053,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     post:
@@ -4092,7 +4092,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/predicate-objects:
@@ -4121,7 +4121,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/abac/predicate-objects/{object_id}:
@@ -4165,7 +4165,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     put:
@@ -4202,7 +4202,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -4228,7 +4228,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/collections/{collection_id}/pin:
@@ -4276,7 +4276,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     get:
@@ -4301,7 +4301,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/collections/pinning:
@@ -4326,7 +4326,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/collections/{collection_id}/affinity:
@@ -4360,7 +4360,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -4385,7 +4385,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/collections/affinity:
@@ -4410,7 +4410,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/primary-pod/{tenant_id}/{collection_id}:
@@ -4453,7 +4453,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     put:
@@ -4494,7 +4494,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
     delete:
@@ -4526,7 +4526,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/primary-pod:
@@ -4558,7 +4558,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
   /api/v2/catalog/table-routing:
@@ -4590,7 +4590,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
       responses:
@@ -4645,7 +4645,7 @@ paths:
       - name: X-Tenant-ID
         in: header
         required: false
-        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+        description: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
         schema:
           type: string
 components:

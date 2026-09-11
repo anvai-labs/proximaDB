@@ -132,6 +132,7 @@ context-benchmark-check:
 deterministic-commit-contract-check:
 	@echo "🧷 Validating deterministic commit contract..."
 	python3 scripts/check_deterministic_commit_contract.py
+	python3 -m unittest discover -s tests/scripts -p 'test_deterministic_commit_contract.py'
 
 branch-promotion-policy-check:
 	@echo "🌿 Validating pull-request branch routes..."

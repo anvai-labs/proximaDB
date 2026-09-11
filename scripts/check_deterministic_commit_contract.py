@@ -125,6 +125,23 @@ def check_nextest_contract(findings: list[Finding]) -> None:
                 '.config/nextest.toml profile.default.final-status-level must be "flaky"',
             )
         )
+    unit_final_status = unit.get("final-status-level")
+    if unit_final_status is not None and unit_final_status != "flaky":
+        findings.append(
+            Finding(
+                "nextest",
+                '.config/nextest.toml profile.unit.final-status-level override must be "flaky"',
+            )
+        )
+    for profile_name in ("default", "unit", "integration"):
+        for override in profiles.get(profile_name, {}).get("overrides", []):
+            if "retries" in override:
+                findings.append(
+                    Finding(
+                        "nextest",
+                        f".config/nextest.toml profile.{profile_name}.overrides must not set retries",
+                    )
+                )
     if unit.get("test-threads", 0) < 2:
         findings.append(
             Finding(
@@ -139,11 +156,11 @@ def check_nextest_contract(findings: list[Finding]) -> None:
                 '.config/nextest.toml profile.unit.failure-output must be "immediate-final"',
             )
         )
-    if integration.get("retries", 0) > 1:
+    if integration.get("retries") != 1:
         findings.append(
             Finding(
                 "nextest",
-                ".config/nextest.toml profile.integration.retries must not exceed 1",
+                ".config/nextest.toml profile.integration.retries must stay at 1",
             )
         )
 

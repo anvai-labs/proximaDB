@@ -44,6 +44,67 @@ class NextestCommitContractTest(unittest.TestCase):
             findings,
         )
 
+    def test_default_retry_budget_drift_is_rejected(self) -> None:
+        config = (REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8")
+        mutated = config.replace("retries = 2", "retries = 3", 1)
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any("profile.default.retries must stay at 2" in finding.message for finding in findings),
+            findings,
+        )
+
+    def test_integration_retry_budget_drift_is_rejected(self) -> None:
+        config = (REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8")
+        marker = "[profile.integration]"
+        before, integration = config.split(marker, maxsplit=1)
+        mutated = before + marker + integration.replace("retries = 1", "retries = 0", 1)
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any(
+                "profile.integration.retries must stay at 1" in finding.message
+                for finding in findings
+            ),
+            findings,
+        )
+
+    def test_unit_cannot_hide_flaky_survivors(self) -> None:
+        config = (REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8")
+        mutated = config.replace(
+            "[profile.unit]\n",
+            '[profile.unit]\nfinal-status-level = "pass"\n',
+            1,
+        )
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any(
+                'profile.unit.final-status-level override must be "flaky"'
+                in finding.message
+                for finding in findings
+            ),
+            findings,
+        )
+
+    def test_unit_retry_overrides_are_rejected(self) -> None:
+        config = (REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8")
+        mutated = config + '\n[[profile.unit.overrides]]\nfilter = "all()"\nretries = 9\n'
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any("profile.unit.overrides must not set retries" in finding.message for finding in findings),
+            findings,
+        )
+
+    def test_default_retry_overrides_are_rejected(self) -> None:
+        config = (REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8")
+        mutated = config + '\n[[profile.default.overrides]]\nfilter = "all()"\nretries = 9\n'
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any(
+                "profile.default.overrides must not set retries" in finding.message
+                for finding in findings
+            ),
+            findings,
+        )
+
     def test_flaky_survivor_reporting_drift_is_rejected(self) -> None:
         config = (REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8")
         mutated = config.replace('final-status-level = "flaky"', 'final-status-level = "pass"', 1)

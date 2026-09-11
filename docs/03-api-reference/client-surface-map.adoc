@@ -48,7 +48,7 @@ header).
 | Supported
 
 | Records
-| `/collections/{id}/records`, `/records/batch`, `/records/{id}`
+| `/collections/{id}/records/batch`, `/collections/{id}/records/scan`, `/collections/{id}/records/{record_id}`
 | `ProximaRecord` CRUD + batch (vector + props). The dim-1 zero-vector record is the KV pattern.
 | Supported
 
@@ -69,7 +69,7 @@ header).
 
 | Query
 | `/query`, `/query/explain`
-| UQL/Federated execution + plan explain; AQL is reserved and rejected until implemented
+| UQL/Federated execution + plan explain; AQL execution is rejected until implemented (the explain request currently accepts the language label but has no AQL-specific lowering)
 | Beta (AQL Planned)
 
 | SQL
@@ -93,7 +93,7 @@ header).
 | Beta
 
 | Entities
-| Canonical `/collections/{id}/entities` (plus `/{entity_id}` and `/search`); gRPC v2 `ProximaEntityService`; equivalent REST v1 routes are compatibility-only
+| Canonical `/collections/{id}/entities` (plus `/{entity_id}` and `/search`); gRPC v2 `ProximaEntityService`; a transitional REST v1 path family also includes entity listing
 | Entity orchestration facade (upsert/search/get); v2 is the client target
 | Beta
 
@@ -250,8 +250,9 @@ legacy separate-port layout.
 
 == Deprecation map (what's going away)
 
-* **v1 (`/api/v1/*`)** — removed except for the transitional entity routes at
-  `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search`. All new clients use v2;
+* **v1 (`/api/v1/*`)** — removed except for the transitional entity path family at
+  `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search` (including `GET` listing on
+  the collection entity path). All new clients use v2;
   retire this residual facade only after measured client evidence.
 * **v3 (`/api/v3/*`)** — **removed**. The document-ingest handler is canonically at
   `/api/v2/collections/{id}/documents`; the v3 alias was deleted. Target `/api/v2`.
