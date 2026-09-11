@@ -23,11 +23,26 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// Build the MCP HTTP router over the given backend (`POST /` and `POST /mcp`).
-pub fn router(backend: Arc<EngineBackend>) -> Router {
-    Router::new()
+/// Build the MCP router. `security_coordinator` (TD-AUTH-FC): when present,
+/// the SAME `auth_middleware_unified` REST uses is attached — MCP is a fully
+/// privileged data-plane surface and no longer serves unauthenticated JSON-RPC
+/// when a security subsystem is active. `None` ⇒ unauthenticated (dev
+/// posture; `api.mcp_port` defaults off).
+pub fn router(
+    backend: Arc<EngineBackend>,
+    security_coordinator: Option<std::sync::Arc<crate::security::SecurityCoordinator>>,
+) -> Router {
+    let router = Router::new()
         .route("/", post(rpc))
         .route("/mcp", post(rpc))
-        .with_state(backend)
+        .with_state(backend);
+    match security_coordinator {
+        Some(coordinator) => router.layer(axum::middleware::from_fn_with_state(
+            coordinator,
+            crate::network::auth::middleware::auth_middleware_unified,
+        )),
+        None => router,
+    }
 }
 
 async fn rpc(State(backend): State<Arc<EngineBackend>>, body: String) -> Json<Value> {
@@ -52,12 +67,21 @@ async fn rpc(State(backend): State<Arc<EngineBackend>>, body: String) -> Json<Va
 
 /// Serve the MCP transport on `addr` until shutdown. Call only when an MCP port
 /// is configured.
-pub async fn serve(addr: std::net::SocketAddr, backend: Arc<EngineBackend>) -> anyhow::Result<()> {
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    backend: Arc<EngineBackend>,
+    security_coordinator: Option<std::sync::Arc<crate::security::SecurityCoordinator>>,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
-        "MCP reference surface listening on {addr} (MCP {})",
-        proximadb_mcp::MCP_PROTOCOL_VERSION
+        "MCP reference surface listening on {addr} (MCP {}; auth: {})",
+        proximadb_mcp::MCP_PROTOCOL_VERSION,
+        if security_coordinator.is_some() {
+            "coordinator"
+        } else {
+            "none (dev posture)"
+        }
     );
-    axum::serve(listener, router(backend)).await?;
+    axum::serve(listener, router(backend, security_coordinator)).await?;
     Ok(())
 }

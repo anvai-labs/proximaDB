@@ -450,8 +450,13 @@ impl MultiServer {
         ));
         let addr = SocketAddr::new(self.config.http_bind_address().ip(), mcp_port);
         info!("🧠 In-process reference MCP surface enabled on {addr}");
+        // TD-AUTH-FC (D3): thread the coordinator so MCP enforces the same
+        // credential posture as REST/gRPC/Flight when a security subsystem is
+        // active (the surface is fully privileged; it previously served
+        // unauthenticated JSON-RPC whenever the port was configured).
+        let mcp_coordinator = self.security_coordinator.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::network::mcp::serve(addr, backend).await {
+            if let Err(e) = crate::network::mcp::serve(addr, backend, mcp_coordinator).await {
                 tracing::error!("MCP reference server failed: {e}");
             }
         });
@@ -559,21 +564,28 @@ impl MultiServer {
                 .layer(crate::network::grpc::auth::GrpcTenantModeLayer::new(
                     self.tenant_deployment_mode.clone(),
                 ))
-                .layer(tower::util::option_layer(if self.rest_auth_enabled {
-                    self.security_coordinator.clone().map(|sc| {
-                        let stable_id_resolver =
-                            Arc::new(crate::security::CatalogTenantStableIdResolver::new(
-                                self.shared_services.catalog_manager.clone(),
-                            ))
-                                as Arc<dyn proximadb_tenant::TenantStableIdResolver>;
-                        crate::network::grpc::auth::GrpcAuthLayer::new(sc)
-                            .with_header_trust(self.tenant_header_trust)
-                            .with_tier_header_trust(self.tier_header_trust)
-                            .with_stable_id_resolver(stable_id_resolver)
-                    })
-                } else {
-                    None
-                }));
+                // TD-AUTH-FC (D3): attach whenever the coordinator exists.
+                // The former `rest_auth_enabled` gate fail-opened posture B
+                // (security enabled + authentication disabled) — every gRPC
+                // call was served unauthenticated despite the security
+                // subsystem being active. Fail closed: credentials required.
+                .layer(tower::util::option_layer(
+                    if self.security_coordinator.is_some() {
+                        self.security_coordinator.clone().map(|sc| {
+                            let stable_id_resolver =
+                                Arc::new(crate::security::CatalogTenantStableIdResolver::new(
+                                    self.shared_services.catalog_manager.clone(),
+                                ))
+                                    as Arc<dyn proximadb_tenant::TenantStableIdResolver>;
+                            crate::network::grpc::auth::GrpcAuthLayer::new(sc)
+                                .with_header_trust(self.tenant_header_trust)
+                                .with_tier_header_trust(self.tier_header_trust)
+                                .with_stable_id_resolver(stable_id_resolver)
+                        })
+                    } else {
+                        None
+                    },
+                ));
 
             // ── Create backend services (doc + observability need data-dir paths) ──
 
@@ -744,11 +756,10 @@ impl MultiServer {
             let arrow_collection = services.collection_service.clone();
             let arrow_graph = services.graph_service.clone();
             let catalog_manager = services.catalog_manager.clone();
-            let security_coordinator = if self.rest_auth_enabled {
-                self.security_coordinator.clone()
-            } else {
-                None
-            };
+            // TD-AUTH-FC (D3): coordinator presence (not the REST auth flag)
+            // decides — Arrow Flight's fail-closed rule ("coordinator present
+            // requires a credential") now holds in posture B too.
+            let security_coordinator = self.security_coordinator.clone();
             let max_message_size = self.config.arrow_ipc_config.max_message_size;
             // Slice 6.2 capture: same `Arc<PrimaryPodRegistry>` /
             // pod-id pair the REST and gRPC v2 surfaces hold, so all
@@ -819,7 +830,6 @@ impl MultiServer {
             let catalog_manager = services.catalog_manager.clone();
             let metrics_collector = services.metrics_collector.clone();
             let security_coordinator = self.security_coordinator.clone();
-            let rest_auth_enabled = self.rest_auth_enabled;
             let tenant_deployment_mode = self.tenant_deployment_mode.clone();
             let tenant_header_trust = self.tenant_header_trust;
             let tier_header_trust = self.tier_header_trust;
@@ -848,7 +858,11 @@ impl MultiServer {
                 use crate::network::rest::server::{RestServer, RestServerSecurityConfig};
 
                 let max_request_size_mb = api_config.map(|c| c.max_request_size_mb);
-                let auth_enabled = security_coordinator.is_some() && rest_auth_enabled;
+                // TD-AUTH-FC (D3): coordinator presence (not the REST auth
+                // flag) decides — posture B (security on, authentication
+                // off) now enforces credentials on REST like every other
+                // surface, instead of failing open.
+                let auth_enabled = security_coordinator.is_some();
                 let mut rest_security = if matches!(
                     &tenant_deployment_mode,
                     proximadb_tenant::TenantDeploymentMode::MultiTenant
@@ -1118,11 +1132,10 @@ impl MultiServer {
             // Some/None as the auth-attach signal — convergent with the
             // multi-port `start_with_security` path which gates on
             // `security_config.auth.enabled` (server.rs line 510).
-            let security_coordinator = if self.rest_auth_enabled {
-                self.security_coordinator.clone()
-            } else {
-                None
-            };
+            // TD-AUTH-FC (D3): coordinator presence (not the REST auth flag)
+            // decides — Arrow Flight's fail-closed rule ("coordinator present
+            // requires a credential") now holds in posture B too.
+            let security_coordinator = self.security_coordinator.clone();
             let data_dir = self.config.data_dir.clone();
             let query_adapter = Some(services.query_adapter());
             let llm_engine = self.llm_engine.clone();
@@ -1194,11 +1207,9 @@ impl MultiServer {
                     services.collection_service.clone(),
                     services.graph_service.clone(),
                 )
-                .with_security_coordinator(if self.rest_auth_enabled {
-                    self.security_coordinator.clone()
-                } else {
-                    None
-                })
+                // TD-AUTH-FC (D3): coordinator presence decides (Flight
+                // fail-closed rule), not the REST auth flag.
+                .with_security_coordinator(self.security_coordinator.clone())
                 .with_tenant_header_trust(self.tenant_header_trust)
                 .with_tier_header_trust(self.tier_header_trust)
                 .with_tenant_deployment_mode(self.tenant_deployment_mode.clone())
@@ -1218,21 +1229,28 @@ impl MultiServer {
                 .layer(crate::network::grpc::auth::GrpcTenantModeLayer::new(
                     self.tenant_deployment_mode.clone(),
                 ))
-                .layer(tower::util::option_layer(if self.rest_auth_enabled {
-                    self.security_coordinator.clone().map(|sc| {
-                        let stable_id_resolver =
-                            Arc::new(crate::security::CatalogTenantStableIdResolver::new(
-                                self.shared_services.catalog_manager.clone(),
-                            ))
-                                as Arc<dyn proximadb_tenant::TenantStableIdResolver>;
-                        crate::network::grpc::auth::GrpcAuthLayer::new(sc)
-                            .with_header_trust(self.tenant_header_trust)
-                            .with_tier_header_trust(self.tier_header_trust)
-                            .with_stable_id_resolver(stable_id_resolver)
-                    })
-                } else {
-                    None
-                }));
+                // TD-AUTH-FC (D3): attach whenever the coordinator exists.
+                // The former `rest_auth_enabled` gate fail-opened posture B
+                // (security enabled + authentication disabled) — every gRPC
+                // call was served unauthenticated despite the security
+                // subsystem being active. Fail closed: credentials required.
+                .layer(tower::util::option_layer(
+                    if self.security_coordinator.is_some() {
+                        self.security_coordinator.clone().map(|sc| {
+                            let stable_id_resolver =
+                                Arc::new(crate::security::CatalogTenantStableIdResolver::new(
+                                    self.shared_services.catalog_manager.clone(),
+                                ))
+                                    as Arc<dyn proximadb_tenant::TenantStableIdResolver>;
+                            crate::network::grpc::auth::GrpcAuthLayer::new(sc)
+                                .with_header_trust(self.tenant_header_trust)
+                                .with_tier_header_trust(self.tier_header_trust)
+                                .with_stable_id_resolver(stable_id_resolver)
+                        })
+                    } else {
+                        None
+                    },
+                ));
 
             // Standard grpc.health.v1.Health service for k8s/LB probes.
             let (health_reporter, standard_health_server) = tonic_health::server::health_reporter();
@@ -1600,21 +1618,28 @@ impl MultiServer {
                 .layer(crate::network::grpc::auth::GrpcTenantModeLayer::new(
                     self.tenant_deployment_mode.clone(),
                 ))
-                .layer(tower::util::option_layer(if self.rest_auth_enabled {
-                    self.security_coordinator.clone().map(|sc| {
-                        let stable_id_resolver =
-                            Arc::new(crate::security::CatalogTenantStableIdResolver::new(
-                                self.shared_services.catalog_manager.clone(),
-                            ))
-                                as Arc<dyn proximadb_tenant::TenantStableIdResolver>;
-                        crate::network::grpc::auth::GrpcAuthLayer::new(sc)
-                            .with_header_trust(self.tenant_header_trust)
-                            .with_tier_header_trust(self.tier_header_trust)
-                            .with_stable_id_resolver(stable_id_resolver)
-                    })
-                } else {
-                    None
-                }));
+                // TD-AUTH-FC (D3): attach whenever the coordinator exists.
+                // The former `rest_auth_enabled` gate fail-opened posture B
+                // (security enabled + authentication disabled) — every gRPC
+                // call was served unauthenticated despite the security
+                // subsystem being active. Fail closed: credentials required.
+                .layer(tower::util::option_layer(
+                    if self.security_coordinator.is_some() {
+                        self.security_coordinator.clone().map(|sc| {
+                            let stable_id_resolver =
+                                Arc::new(crate::security::CatalogTenantStableIdResolver::new(
+                                    self.shared_services.catalog_manager.clone(),
+                                ))
+                                    as Arc<dyn proximadb_tenant::TenantStableIdResolver>;
+                            crate::network::grpc::auth::GrpcAuthLayer::new(sc)
+                                .with_header_trust(self.tenant_header_trust)
+                                .with_tier_header_trust(self.tier_header_trust)
+                                .with_stable_id_resolver(stable_id_resolver)
+                        })
+                    } else {
+                        None
+                    },
+                ));
 
             // Standard grpc.health.v1.Health service for k8s/LB probes.
             let (mut std_health_reporter, standard_health_server) =
@@ -1722,11 +1747,10 @@ impl MultiServer {
             let arrow_collection = services.collection_service.clone();
             let arrow_graph = services.graph_service.clone();
             let catalog_manager = services.catalog_manager.clone();
-            let security_coordinator = if self.rest_auth_enabled {
-                self.security_coordinator.clone()
-            } else {
-                None
-            };
+            // TD-AUTH-FC (D3): coordinator presence (not the REST auth flag)
+            // decides — Arrow Flight's fail-closed rule ("coordinator present
+            // requires a credential") now holds in posture B too.
+            let security_coordinator = self.security_coordinator.clone();
             let max_message_size = self.config.arrow_ipc_config.max_message_size;
             // Slice 6.2 capture: same `Arc<PrimaryPodRegistry>` /
             // pod-id pair the REST and gRPC v2 surfaces hold, so all
@@ -1786,7 +1810,6 @@ impl MultiServer {
                 );
             let metrics_collector = services.metrics_collector.clone();
             let security_coordinator = self.security_coordinator.clone();
-            let rest_auth_enabled = self.rest_auth_enabled;
             let tenant_deployment_mode = self.tenant_deployment_mode.clone();
             let tenant_header_trust = self.tenant_header_trust;
             let tier_header_trust = self.tier_header_trust;
@@ -1810,7 +1833,11 @@ impl MultiServer {
                 };
 
                 let max_request_size_mb = api_config.map(|c| c.max_request_size_mb);
-                let auth_enabled = security_coordinator.is_some() && rest_auth_enabled;
+                // TD-AUTH-FC (D3): coordinator presence (not the REST auth
+                // flag) decides — posture B (security on, authentication
+                // off) now enforces credentials on REST like every other
+                // surface, instead of failing open.
+                let auth_enabled = security_coordinator.is_some();
                 let mut rest_security = if matches!(
                     &tenant_deployment_mode,
                     proximadb_tenant::TenantDeploymentMode::MultiTenant

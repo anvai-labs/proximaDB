@@ -600,6 +600,20 @@ impl ProximaDB {
         let rest_auth_enabled = security_config
             .as_ref()
             .is_some_and(|sec_cfg| sec_cfg.authentication.enabled);
+        // TD-AUTH-FC (D3): posture B (security enabled + authentication
+        // disabled) now ENFORCES credentials on every network surface — the
+        // coordinator is threaded to REST/gRPC/Flight/MCP/pgwire regardless
+        // of the authentication flag, so unauthenticated calls are rejected
+        // instead of served. Operators who want the old fail-open dev posture
+        // should disable `[security]` entirely.
+        if security.is_some() && !rest_auth_enabled {
+            tracing::warn!(
+                "security subsystem active with authentication.enabled = false: ALL network \
+                 surfaces (REST/gRPC/Arrow Flight/MCP) now enforce credentials whenever the \
+                 security coordinator exists (TD-AUTH-FC). To run unauthenticated, disable \
+                 [security] entirely."
+            );
+        }
         let tenant_deployment_mode =
             resolve_server_tenant_mode(&config.server.tenant, security_config.as_ref())?;
         // Capture the drainer's record + vector services BEFORE shared_services
