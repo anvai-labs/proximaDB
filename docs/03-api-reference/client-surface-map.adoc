@@ -4,7 +4,7 @@
 :icons: font
 :source-highlighter: rouge
 :sectnums:
-:last-updated: 2026-06-29
+:last-updated: 2026-09-11
 
 *Audience: client-app developers.* This is the fast on-ramp — one map that ties
 together every external surface, its payload/response shape, and how the SDK and
@@ -88,9 +88,9 @@ header).
 | Beta
 
 | Entities
-| `/collections/{id}/entities`
-| Entity orchestration facade (upsert/search/get)
-| Beta
+| `/api/v1/collections/{id}/entities` (plus `/{entity_id}` and `/search`); gRPC v2 `ProximaEntityService`
+| Transitional entity facade (upsert/search/get); the REST route is the sole residual v1 compatibility surface
+| Beta / compatibility
 
 | External
 | `/external-collections`
@@ -160,7 +160,7 @@ with header `X-Embed-Source: native` (omit `vector` to let the server embed).
 | `X-Tenant-ID` | Multi-tenant scoping ( enforced server-side )
 | `X-Embed-Source` | `native` = server-side embedding (collections documents)
 | `X-Ingest-Mode` | Billing/metering mode
-| `Deprecation` / `X-ProximaDB-API-Status` | Set on deprecated v1 responses
+| `Deprecation` / `X-ProximaDB-API-Status` | Compatibility metadata on the residual REST v1 entity routes
 |====
 
 === Tenant identity per transport
@@ -177,7 +177,7 @@ generated OpenAPI spec (`docs/openapi/proximadb-openapi.yaml`).
 | Transport | Tenant carrier | Notes
 | REST v2 | `X-Tenant-ID` header (optional) | Applied only when there is no authenticated context; a JWT tenant claim takes precedence, and a header disagreeing with the authenticated tenant is rejected.
 | gRPC | `x-tenant-id` metadata | Ambient identity (not a per-message field).
-| Arrow Flight | `x-proximadb-tenant-id` metadata | NOTE: key differs from gRPC/REST (`x-tenant-id`) — a naming inconsistency tracked for unification.
+| Arrow Flight | `x-tenant-id` metadata | Canonical carrier shared with gRPC; former aliases are detected for retirement telemetry but do not grant a tenant.
 | pgwire | `dbname` (fallback `SET proximadb.write.tenant_id`) | Connection-level; `dbname=proximadb` ⇒ default tenant. See link:./postgres.adoc[Postgres Wire Reference].
 |====
 
@@ -245,13 +245,12 @@ legacy separate-port layout.
 
 == Deprecation map (what's going away)
 
-* **v1 (`/api/v1/*`)** — deprecated compatibility facades. Responses carry
-  `Deprecation: true` + `X-ProximaDB-API-Status: deprecated-compatibility`.
-  Sunset: 2026-06-30. Use v2.
+* **v1 (`/api/v1/*`)** — removed except for the transitional entity routes at
+  `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search`. All new clients use v2;
+  retire this residual facade only after measured client evidence.
 * **v3 (`/api/v3/*`)** — **removed**. The document-ingest handler is canonically at
   `/api/v2/collections/{id}/documents`; the v3 alias was deleted. Target `/api/v2`.
-* **gRPC v1** — off by default; opt-in via `enable_grpc_v1_compat`. Sunset
-  2026-06-30. Use gRPC v2.
+* **gRPC v1** — removed; the former `enable_grpc_v1_compat` opt-in no longer exists. Use gRPC v2.
 
 == Where to go next
 

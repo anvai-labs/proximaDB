@@ -74,8 +74,9 @@ REST `/api/v2` is the **sole canonical REST surface** for all ProximaDB clients 
 [IMPORTANT]
 ====
 * *REST /api/v2* — canonical; all new clients and integrations must target this prefix.
-* *REST /api/v1* — **REMOVED**. Some v1-shaped DTO/helper code remains for internal migration, but
-  the server does not mount the prefix; requests receive the normal not-found response.
+* *REST /api/v1* — **REMOVED except for the entity compatibility routes** at
+  `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search`. Those routes still use the
+  transitional `ProximaEntityStore`; no other v1 REST collection/vector/search surface is mounted.
 * *REST /api/v3* — **removed**. The document-ingest handler lives canonically at
   `POST /api/v2/collections/{id}/documents`; the former v3 308-redirect alias was
   deleted (it was never an OpenAPI/released surface). Target `/api/v2` for all clients.
@@ -140,15 +141,14 @@ query endpoint, and `/api/v2/query` is *not* SQL-over-REST. Route by language:
 | Now on v2 `ProximaGraphService`. GREMLIN reserved/unbacked.
 | Beta (subset)
 
-| *Graph `ExecuteHybridQuery` / `CreateGraphWithEngine` / `GetPulsarStats`*
+| *Legacy graph `ExecuteHybridQuery` / `CreateGraphWithEngine` / `GetPulsarStats` names*
 | Cross-modality hybrid query; engine-typed graph create; PULSAR stats
-| **Absent from v2; the v1 surface they were deferred to is REMOVED** (the
-  `enable_grpc_v1_compat` gate no longer exists). Hybrid search is served by
-  REST `/api/v2/hybrid/search`; a v2-native gRPC hybrid RPC would be a new
-  design, not a port. `CreateGraphWithEngine`/`GetPulsarStats` are
-  retired/unimplemented (PULSAR/QUASAR). See TD-124 + the v2 graph.proto
-  service comment.
-| Not planned (absent)
+| The legacy method names are absent because the v1 gRPC service and
+  `enable_grpc_v1_compat` gate are removed. Their vector-seed/graph-expand capability is served by
+  canonical v2 `ProximaFusionService.FusionSearch` and REST
+  `/api/v2/graphs/{graph_id}/fusion-search`. `CreateGraphWithEngine` and `GetPulsarStats` are
+  retired/unimplemented with PULSAR/QUASAR. See TD-124 and the v2 graph/fusion protos.
+| Hybrid capability: Beta on v2; legacy method names: absent
 |===
 
 [NOTE]
@@ -209,9 +209,9 @@ primitives.
 | Converge every cross-modal blend on the `oid`-keyed fusion seam (`seed -> expand -> calibrate -> fuse-by-oid -> rank`). Do not add one-off entity/vector/document/graph join handlers.
 
 | Entity / SKS
-| gRPC v1 `proximadb.v1.EntityService` and REST `/api/v1` routing are removed (no opt-in flag remains); v1-shaped entity DTO/helper code and split `ProximaEntityStore` code remain as internal transition debt but are unreachable through those retired wire prefixes
+| gRPC v2 `proximadb.v2.ProximaEntityService` is always registered. The residual REST compatibility routes `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search` remain live; no gRPC v1 entity service is registered.
 | Semantic convenience shape: entity id, metadata, embeddings, provenance, relations, temporal fields
-| Do not create v2 entity storage. A future v2 entity surface, if exposed, must be an orchestration facade over record/vector + graph + document/provenance + event/temporal history, with `TenantContext` and structural tenant paths at every I/O boundary.
+| Do not create another entity substrate. Converge both live facades on orchestration over record/vector + graph + document/provenance + event/temporal history, with `TenantContext` and structural tenant paths at every I/O boundary; retire the REST v1 compatibility routes only with measured client evidence.
 |===
 
 [NOTE]
@@ -251,7 +251,7 @@ for evidence/provenance, and event/history records for temporal state. The v1
 
 | Vector CRUD and search
 | Supported
-| Canonical REST `/api/v2` record batch/search/get/scan flows, gRPC `proximadb.v2.ProximaRecordService` record operations, and Arrow Flight canonical `type: "vector_search"` `DoGet`. REST `/api/v1` and gRPC v1 are removed wire surfaces; remaining v1 DTO usage is internal migration debt only. Record metadata filters are enforced on typed `/search` (`filters:[{field,op,value}]`) and `/records/scan` (`filter`) across the supported ops (`eq,neq,gt,gte,lt,lte,in,contains,between,starts_with,ends_with`), including tenant/account scoping; array-valued props support `in`/`contains` membership. Canonical REST search/point-get, authenticated gRPC v2 unary search/streaming search/point-get, and authenticated Flight record search have live provisioned-ABAC evidence for deny-before-provision, row-predicate filtering, principal isolation, and hot revoke.
+| Canonical REST `/api/v2` record batch/search/get/scan flows, gRPC `proximadb.v2.ProximaRecordService` record operations, and Arrow Flight canonical `type: "vector_search"` `DoGet`. REST v1 vector/collection/search routes and gRPC v1 are removed wire surfaces; the entity-only REST v1 compatibility exception remains, and other v1 DTO usage is internal migration debt. Record metadata filters are enforced on typed `/search` (`filters:[{field,op,value}]`) and `/records/scan` (`filter`) across the supported ops (`eq,neq,gt,gte,lt,lte,in,contains,between,starts_with,ends_with`), including tenant/account scoping; array-valued props support `in`/`contains` membership. Canonical REST search/point-get, authenticated gRPC v2 unary search/streaming search/point-get, and authenticated Flight record search have live provisioned-ABAC evidence for deny-before-provision, row-predicate filtering, principal isolation, and hot revoke.
 | Keep hybrid retrieval and distributed search claims separate from the supported vector surface. New clients must not target v1 `VectorRecord`/`SqlValue` payloads.
 
 | Federated SQL over function-backed sources
@@ -267,7 +267,7 @@ for evidence/provenance, and event/history records for temporal state. The v1
 | ORION graph operations
 | Beta
 | Node/edge CRUD, traversal, neighbors, shortest-path APIs, canonical node/edge mapping, and adjacency projections are usable. These core operations are served on the canonical v2 gRPC surface (`proximadb.v2.ProximaGraphService`, always registered) and consumed by the Python SDK; `proximadb.v1.GraphService` and its former compatibility gate are removed.
-| The analytic (GetConnectedComponents/HasCycle), batch (BatchCreateNodes/Edges), unique-constraint, server-streaming (StreamTraverse), and declarative `ExecuteQuery` (supported openCypher subset) RPCs are on the canonical v2 gRPC path (TD-124). `ExecuteHybridQuery` has no v2 RPC (use the v2-native REST vector+graph fusion surface); `CreateGraphWithEngine`/`GetPulsarStats` are retired/unimplemented with PULSAR/QUASAR, and GREMLIN is reserved/unbacked. Graph creation/DDL is REST-only (`/api/v2/graphs`). ORION is a rebuildable projection runtime; durable graph authority remains in canonical records, xCatalog, WAL/log/manifest state, policy/RLS, version/time, and provenance.
+| The analytic (GetConnectedComponents/HasCycle), batch (BatchCreateNodes/Edges), unique-constraint, server-streaming (StreamTraverse), and declarative `ExecuteQuery` (supported openCypher subset) RPCs are on the canonical v2 gRPC path (TD-124). The old `ExecuteHybridQuery` method name is gone, but its vector+graph capability is served by v2 `ProximaFusionService.FusionSearch` and the REST fusion route. `CreateGraphWithEngine`/`GetPulsarStats` are retired/unimplemented with PULSAR/QUASAR, and GREMLIN is reserved/unbacked. Graph creation/DDL is REST-only (`/api/v2/graphs`). ORION is a rebuildable projection runtime; durable graph authority remains in canonical records, xCatalog, WAL/log/manifest state, policy/RLS, version/time, and provenance.
 
 | Observability ingestion and query
 | Beta
@@ -282,7 +282,7 @@ for evidence/provenance, and event/history records for temporal state. The v1
 | Hybrid retrieval
 | Beta
 | tantivy BM25 integration, RRF/weighted fusion, and canonical REST `/api/v2/collections/{id}/search` hybrid path (TD-008 resolved). REST `/api/v2/graphs/{graph_id}/fusion-search` is the first vector+graph instance of the shared cross-modal fusion seam (TD-137). The former `/api/v1/hybrid/search` prefix is removed, not an alias. Request `filters` are enforced on both dense/BM25 legs: the vector candidates are filtered server-side, and the text candidates are gated to that filtered id set so a scoped filter cannot leak through the text leg.
-| Backend integration improved; gRPC path parity is still in progress. The removed v1 `GraphService.ExecuteHybridQuery` has no v2 equivalent; use the v2 REST fusion route for vector-seed -> graph-expand experiments. A BM25-only match that passes the filter but falls outside the vector leg's `top_k` (or a hybrid request with no query vector) is dropped rather than risk a leak — safe, but it can under-return; keeping that tail needs a resolving metadata fetch (follow-up). Wider Projection Fusion remains a shared planner contract until runtime implementation, explain output, and benchmarks are complete. The in-process BM25 full-text index behind `/api/v2/hybrid/search` is fed ONLY by explicit `POST /api/v2/hybrid/index` calls: `POST /api/v2/collections/{id}/documents` ingest does NOT feed it (by design — the BM25 index is an in-memory, explicitly-managed sidecar, not a durable index over the record store). Clients that want document text searchable through the hybrid text leg must call `/api/v2/hybrid/index` per ingest batch (issue #951 clarification).
+| Backend integration improved; v2 `ProximaFusionService.FusionSearch` and the v2 REST fusion route both serve vector-seed -> graph-expand fusion, although wider gRPC/REST hybrid parity remains in progress. A BM25-only match that passes the filter but falls outside the vector leg's `top_k` (or a hybrid request with no query vector) is dropped rather than risk a leak — safe, but it can under-return; keeping that tail needs a resolving metadata fetch (follow-up). Wider Projection Fusion remains a shared planner contract until runtime implementation, explain output, and benchmarks are complete. The in-process BM25 full-text index behind `/api/v2/hybrid/search` is fed ONLY by explicit `POST /api/v2/hybrid/index` calls: `POST /api/v2/collections/{id}/documents` ingest does NOT feed it (by design — the BM25 index is an in-memory, explicitly-managed sidecar, not a durable index over the record store). Clients that want document text searchable through the hybrid text leg must call `/api/v2/hybrid/index` per ingest batch (issue #951 clarification).
 
 | PULSAR and QUASAR graph engine names
 | Retired / Not supported

@@ -86,7 +86,7 @@ flowchart TB
   end
 
   subgraph EDGE[Protocol Facades]
-    NET["network/<br/>REST /api/v2, gRPC v2, pgwire, Arrow IPC/Flight"]:::edge
+    NET["network/<br/>REST /api/v2 + entity-only v1 compatibility<br/>external gRPC v2, pgwire, Arrow IPC/Flight"]:::edge
     API["network adapters + proximadb-api<br/>wire parsing, tenant extraction, response shaping"]:::edge
     RT["proximadb-runtime handlers + root server wiring<br/>ports and composition boundary"]:::edge
   end
@@ -345,7 +345,7 @@ flowchart TB
   end
 
   subgraph NET[Network & Protocol]
-    NWK["network/<br/>REST /api/v2 · gRPC v2 · postgres (pgwire 5433) · arrow_ipc<br/>multi_server · router · shared_services"]:::sub
+    NWK["network/<br/>REST /api/v2 + entity-only v1 compatibility · external gRPC v2<br/>postgres (pgwire 5433) · arrow_ipc · multi_server · router · shared_services"]:::sub
     APH["api_handlers/<br/>support modules and record operations; no production ApiHandlersPort impl"]:::sub
     RTH["proximadb-runtime/handlers.rs<br/>sole production UnifiedHandlers / ApiHandlersPort impl"]:::sub
   end
@@ -435,7 +435,8 @@ flowchart TB
   classDef core fill:#4a90e2,stroke:#2e5c8a,color:#000;
 
   R2[REST v2]:::edge --> SVC
-  GR[gRPC v2]:::edge --> SVC
+  R1E[REST v1 entity compatibility]:::edge --> SVC
+  GR[external ProximaDB gRPC v2]:::edge --> SVC
   AF[Arrow Flight]:::edge --> SVC
   PG["pgwire 5433<br/>(pgvector compat)"]:::edge --> SVC
 
@@ -461,10 +462,14 @@ implementation and `src/network/shared_services.rs` constructs it from root serv
 `src/api_handlers` retains support/record-operation modules; `request_handlers.rs` no longer exists.
 
 | Retired wire generations
-| The server mounts REST `/api/v2` and canonical ProximaDB gRPC v2 application services only. REST
-`/api/v1` and `/api/v3` are not routed; `proximadb.v1` service registration is gone. Standard
-`grpc.health.v1` and optional reflection are infrastructure protocols, not a ProximaDB v1 product
-surface. Internal v1 DTO code remains migration debt, not a supported or accepted wire surface.
+| REST `/api/v2` is canonical. One residual compatibility router remains live at
+`/api/v1/collections/{collection_id}/entities` (plus `/{entity_id}` and `/search`) over
+`ProximaEntityStore`; all other ProximaDB REST `/api/v1` routes and `/api/v3` are removed.
+Canonical external ProximaDB application RPCs are `proximadb.v2`; the v2
+`ProximaEntityService` is always registered and `proximadb.v1` service registration is gone.
+Standard `grpc.health.v1`, optional reflection, and experimental cluster-mode
+`proximadb.cluster.v1` RPCs are separate infrastructure/internal protocols, not the retired external
+v1 product surface. Internal v1 DTO code remains migration debt.
 
 | Proto-v1 internal mirrors
 | `VectorRecord`/`SqlValue`/`SqlObject` still used internally; canonical is `ProximaRecord`/`ProximaValue`.
@@ -512,9 +517,11 @@ and v1 DTO migration remains TD-106/TD-123/ADR-024 work; package-version strings
 signal.
 
 | Vector path
-| REST `/api/v2` and gRPC v2 record CRUD/vector search are the supported product path. Multiple
-vector storage engines and AXIS index families exist. REST `/api/v1`, REST `/api/v3`, and gRPC v1
-are not served; internal v1 DTO presence is not wire compatibility.
+| REST `/api/v2` and external gRPC v2 record CRUD/vector search are the supported product path.
+Multiple vector storage engines and AXIS index families exist. REST v1 vector/collection/search
+routes, REST `/api/v3`, and external `proximadb.v1` RPCs are not served; the entity-only REST v1
+compatibility exception does not expose vector CRUD/search. Internal v1 DTO presence is not wire
+compatibility.
 `bench_24_recall_at_k_engine` is registered as a real index-vs-ground-truth Recall@k benchmark with
 deterministic vectors, bounded search-readiness probing, and optional `PROXIMADB_BENCH_TOPK=K`
 single-K runs for isolating low-effort Recall@K/latency curves.
@@ -613,7 +620,8 @@ conformance accuracy, and release-smoke evidence.
 `deterministic-commit-contract`, branch-promotion/design/status/status-as-of checks,
 `docs-claim-check`, MVP contract/smoke checks, context-benchmark validation, capability-matrix and
 workspace-boundary checks, tenant ingress/catalog seal/tenant-path checks, silent-failure and env-gate
-checks, panic-policy checks, and the zero-retry nextest unit profile form the fast guard chain.
+checks, panic-policy checks, and the retry-budgeted nextest unit profile (`retries = 2`, with
+survivors reported as flaky and exhausted failures still failing) form the fast guard chain.
 | Mandatory for commit hygiene. The guard chain validates that deterministic test policy, support
 claims, architecture invariants, SaaS path constraints, and conflict-marker absence stay wired as the
 codebase evolves.
@@ -640,7 +648,7 @@ fast enough to run before commit/push; heavier release smokes remain in `make re
 
 | Deterministic commit contract
 | `python3 scripts/check_deterministic_commit_contract.py`; `make deterministic-commit-contract-check`
-| Zero-retry nextest unit policy, CI/Makefile wiring, support-vs-code-presence architecture text,
+| Retry-budgeted nextest unit policy, CI/Makefile wiring, support-vs-code-presence architecture text,
 `TenantContext` / `DrPathBuilder` visibility, and conflict-marker absence.
 
 | Work commit gate
@@ -651,9 +659,10 @@ catalog seal/path isolation, panic/silent-failure ratchets, env-gate registry, a
 
 | Release gate
 | `make release-check`
-| `work-commit-check` plus `proto-check` (protobuf and generated SDK/contract drift), focused release
-smokes, query conformance, and release-server build. `verify-openapi-spec` is a separate gate rather
-than a `release-check` dependency.
+| `work-commit-check` plus `proto-check` (locally: the proto crate and Python gRPC/schema/OpenAPI
+contract tests), focused release smokes, query conformance, and release-server build.
+`verify-openapi-spec` and the four REST SDK codegen-drift jobs (Go, TypeScript, Rust, Python) are
+separate CI gates rather than `release-check` dependencies.
 
 | SaaS path isolation
 | `python3 scripts/check_tenant_path_guard.py`; `.github/workflows/layering-check.yml`
