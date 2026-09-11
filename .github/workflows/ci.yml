@@ -966,6 +966,40 @@ jobs:
             cargo check -p "$pkg" --tests ${{ matrix.args }}
             echo "::endgroup::"
           done
+      # A compile-only check cannot detect napi-derive changing a registered JS
+      # export name (for example, `ProximaDB` -> `ProximaDb`). Build and load the
+      # native module so the checked-in JS/TypeScript constructor contract is
+      # exercised on every Node binding change.
+      - uses: actions/setup-node@v7
+        if: matrix.label == 'embedded-nodejs'
+        with:
+          node-version: '22'
+      - name: load embedded Node.js binding and verify public exports
+        if: matrix.label == 'embedded-nodejs'
+        env:
+          NAPI_MODULE: ${{ runner.temp }}/proximadb-embedded.node
+        run: |
+          cargo build --locked -p proximadb-embedded --no-default-features --features nodejs
+          cp target/debug/libproximadb_embedded.so "$NAPI_MODULE"
+          node - <<'NODE'
+          const native = require(process.env.NAPI_MODULE)
+          const keys = Object.keys(native).sort()
+          if (typeof native.ProximaDB !== 'function') {
+            throw new Error(`missing ProximaDB constructor; exports: ${keys.join(', ')}`)
+          }
+          const methods = new Set(Object.getOwnPropertyNames(native.ProximaDB.prototype))
+          const requiredMethods = [
+            'createCollection', 'deleteCollection', 'flush', 'getCollection',
+            'insert', 'listCollections', 'search', 'stats'
+          ]
+          const missingMethods = requiredMethods.filter((name) => !methods.has(name))
+          if (missingMethods.length !== 0) {
+            throw new Error(`missing ProximaDB methods: ${missingMethods.join(', ')}`)
+          }
+          if (typeof native.version !== 'function' || native.version().length === 0) {
+            throw new Error(`missing version function; exports: ${keys.join(', ')}`)
+          }
+          NODE
       # TD-V1SUNSET-1 census finding 4: this lane COMPILES enterprise-catalogs
       # but never SERVED it — the /api/v1 path collision survived a green lane.
       # Run the (small, filtered) feature-gated catalog tests so the surface's

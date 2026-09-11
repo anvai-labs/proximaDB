@@ -81,7 +81,10 @@ pub struct NodejsStorageStats {
 }
 
 /// ProximaDB embedded database for Node.js
-#[napi]
+// Keep the public acronym spelling stable across napi-derive case-conversion
+// changes. The JavaScript shim and published type declarations export
+// `ProximaDB`, not the v3-derived `ProximaDb` spelling.
+#[napi(js_name = "ProximaDB")]
 pub struct ProximaDB {
     inner: Arc<EmbeddedProximaDB>,
 }
