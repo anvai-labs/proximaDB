@@ -683,6 +683,33 @@ impl ProximaDB {
         }
         tracing::info!(policy = %tier_header_trust, "🔐 tier-claim trust policy (ADR-0053 W8)");
 
+        // TD-PGWIRE-AUTH-1: resolve the effective pgwire auth posture ONCE
+        // (the same resolved-once shape as the trust policies above). The
+        // ladder lives in `PgwireAuthMode::resolve`; here we only enforce the
+        // boot-time fail-closed invariant: SCRAM required ⇒ a coordinator must
+        // exist (a `password` request with `security` disabled is a
+        // misconfiguration, not a trust fallback).
+        let pgwire_auth_mode = crate::network::postgres::protocol::PgwireAuthMode::resolve(
+            rest_auth_enabled,
+            std::env::var("PROXIMADB_PGWIRE_AUTH").ok().as_deref(),
+            config
+                .security
+                .as_ref()
+                .and_then(|security| security.pgwire.auth.as_deref()),
+        );
+        if pgwire_auth_mode == crate::network::postgres::protocol::PgwireAuthMode::ScramRequired
+            && security.is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "[security.pgwire] auth = \"password\" requires [security] enabled \
+                 (a security coordinator provides the SCRAM verifiers)"
+            ));
+        }
+        tracing::info!(
+            mode = ?pgwire_auth_mode,
+            "🔐 pgwire authentication posture (TD-PGWIRE-AUTH-1)"
+        );
+
         let multi_server = network::MultiServer::new_with_queue_client(
             multi_config,
             shared_services,
@@ -693,7 +720,8 @@ impl ProximaDB {
             queue_client.clone(),
         )
         .with_tenant_header_trust(tenant_header_trust)
-        .with_tier_header_trust(tier_header_trust);
+        .with_tier_header_trust(tier_header_trust)
+        .with_pgwire_auth_mode(pgwire_auth_mode);
         tracing::debug!("✅ ProximaDB::new - MultiServer created");
 
         // Phase 2H wiring (drainer half): spawn the drainer only when
@@ -1787,6 +1815,7 @@ mod security_initialization_tests {
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
                 api_keys: HashMap::new(),
+                scram_users: HashMap::new(),
                 jwt: JwtConfig {
                     enabled: false,
                     secret: String::new(),
@@ -1828,6 +1857,7 @@ mod security_initialization_tests {
             encryption: EncryptionConfig::default(),
             key_store: KeyStoreConfig::default(),
             tenant: TenantTrustConfig::default(),
+            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
         }
     }
 

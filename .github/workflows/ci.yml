@@ -2172,6 +2172,7 @@ jobs:
           RUST_MIN_STACK: "16777216"
         run: |
           for test_name in \
+            pgwire_scram_auth_e2e \
             pgwire_fk_referential_actions_e2e \
             pgwire_relational_engine_e2e \
             pgwire_olap_delta_merge_e2e \

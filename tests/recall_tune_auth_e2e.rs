@@ -92,6 +92,7 @@ fn auth_config_with_dev_key() -> SecurityConfig {
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys,
+            scram_users: std::collections::HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test-secret".to_string(),
@@ -128,6 +129,7 @@ fn auth_config_with_dev_key() -> SecurityConfig {
         encryption: EncryptionConfig::default(),
         key_store: KeyStoreConfig::default(),
         tenant: Default::default(),
+        pgwire: proximadb::security::security_coordinator::PgwireSecurityConfig::default(),
     }
 }
 
