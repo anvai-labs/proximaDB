@@ -8,7 +8,7 @@
 
 use super::{MlflowError, MlflowResult};
 use proximadb_catalog::run_store::RunQueryClause;
-use proximadb_catalog::run_store::{ExperimentRecord, ExperimentStage, RunRecord};
+use proximadb_catalog::run_store::{ExperimentRecord, ExperimentStage};
 
 pub(crate) enum ExperimentFilter {
     NameEq(String),
