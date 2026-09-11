@@ -1,6 +1,0 @@
-# Local, gitignored benchmark corpora (TD-CTXCORR-1 Slice 2b). Benchmark vectors
-# (SIFT1M, Wikipedia embeddings, precomputed ground truth) are large and MUST NOT
-# be committed — fetch + SHA256-verify them with scripts/bench/fetch_corpus.py.
-# The checksum becomes the report dataset_hash.
-*
-!.gitignore

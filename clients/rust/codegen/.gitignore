@@ -1,4 +1,0 @@
-# Build artifacts of the isolated codegen crate (TD-126 Phase 4). This crate is
-# excluded from the parent workspace (own [workspace] table) so its target/ is
-# not covered by the repo-root /target/ ignore.
-/target/

@@ -1,6 +1,0 @@
-# Requirements for BERT vector operations test
-transformers>=5.16.1
-torch>=2.13.0
-sentence-transformers>=2.2.0
-lorem
-numpy

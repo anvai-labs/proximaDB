@@ -5,7 +5,7 @@
 :source-highlighter: rouge
 :sectnums:
 :last-updated: 2026-07-12
-// status-as-of: 2026-07-12
+// status-as-of: 2026-09-11
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the "Current state" sections against HEAD, then bump it.
 

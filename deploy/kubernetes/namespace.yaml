@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: proximadb
-  labels:
-    app.kubernetes.io/name: proximadb
-    app.kubernetes.io/part-of: proximadb
