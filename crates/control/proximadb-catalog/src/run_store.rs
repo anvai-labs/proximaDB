@@ -266,6 +266,131 @@ pub trait RunStore: Send + Sync {
     ) -> Result<(), RunStoreError>;
 
     async fn dataset_inputs(&self, run_id: &str) -> Result<Vec<RunDatasetInput>, RunStoreError>;
+
+    /// Resolve an experiment by NAME (the resolver MLflow clients use for
+    /// set_experiment). Default: linear scan via list_experiments —
+    /// implementations backed by an index override.
+    async fn get_experiment_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<ExperimentRecord>, RunStoreError> {
+        Ok(self
+            .list_experiments(true)
+            .await?
+            .into_iter()
+            .find(|e| e.name == name))
+    }
+
+    /// Query runs with predicates evaluated BELOW the adapter (the wire's
+    /// N+1 per-experiment loops and filter application move here). The
+    /// default impl composes list_runs + the predicate — substrates with
+    /// indexes push down for real.
+    async fn search_runs(&self, query: &RunQuery) -> Result<Vec<RunRecord>, RunStoreError> {
+        let mut runs = Vec::new();
+        for experiment_id in &query.experiment_ids {
+            runs.extend(
+                self.list_runs(*experiment_id, query.include_deleted)
+                    .await?,
+            );
+        }
+        Ok(runs.into_iter().filter(|run| query.matches(run)).collect())
+    }
+}
+
+/// A run search: experiments IN SCOPE, lifecycle view, and predicate
+/// clauses evaluated in order. The wire builds this ONCE from the parsed
+/// filter; the port owns evaluation.
+#[derive(Default, Debug, Clone)]
+pub struct RunQuery {
+    pub experiment_ids: Vec<u64>,
+    pub include_deleted: bool,
+    pub clauses: Vec<RunQueryClause>,
+}
+
+impl RunQuery {
+    pub fn matches(&self, run: &RunRecord) -> bool {
+        self.clauses.iter().all(|clause| clause.matches(run))
+    }
+}
+
+/// One predicate over a run, mirroring the wire grammar's field kinds.
+#[derive(Debug, Clone)]
+pub enum RunQueryClause {
+    ParamEq(String, String),
+    ParamNe(String, String),
+    ParamLike(String, String),
+    TagEq(String, String),
+    TagNe(String, String),
+    TagLike(String, String),
+    MetricCmp(String, f64, fn(f64, f64) -> bool),
+}
+
+impl RunQueryClause {
+    fn matches(&self, run: &RunRecord) -> bool {
+        match self {
+            RunQueryClause::ParamEq(k, v) => run.params.get(k) == Some(v),
+            RunQueryClause::ParamNe(k, v) => run.params.get(k) != Some(v),
+            RunQueryClause::ParamLike(k, pat) => {
+                run.params.get(k).is_some_and(|a| like_match(a, pat))
+            }
+            RunQueryClause::TagEq(k, v) => run.tags.get(k) == Some(v),
+            RunQueryClause::TagNe(k, v) => run.tags.get(k) != Some(v),
+            RunQueryClause::TagLike(k, pat) => run.tags.get(k).is_some_and(|a| like_match(a, pat)),
+            RunQueryClause::MetricCmp(k, v, cmp) => run
+                .latest_metrics
+                .get(k)
+                .map(|p| cmp(p.value, *v))
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// SQL LIKE (% any run, _ one char), case-sensitive — the MLflow filter
+/// convention. Shared by the port's query evaluation (and any adapter).
+pub fn like_match(value: &str, pattern: &str) -> bool {
+    let mut regex = String::from("^");
+    for c in pattern.chars() {
+        match c {
+            '%' => regex.push_str(".*"),
+            '_' => regex.push('.'),
+            c => regex.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    regex.push('$');
+    regex::Regex::new(&regex)
+        .map(|re| re.is_match(value))
+        .unwrap_or(false)
+}
+
+/// Artifact storage port for the MLflow proxy family (audit #4): the wire's
+/// PUT/GET/LIST/DELETE lowers to THIS, so the tracked S3-backed repository
+/// adds an implementation instead of rewriting the handler. Paths are
+/// repo-root-relative (`<exp>/<run>/artifacts/...`); implementations are
+/// tenant-scoped by construction (the factory binds the tenant).
+#[async_trait::async_trait]
+pub trait ArtifactRepository: Send + Sync {
+    /// Store raw bytes at the path. Parent directories are the
+    /// implementation's concern.
+    async fn put(&self, path: &str, bytes: &[u8]) -> Result<(), String>;
+
+    /// Fetch bytes at a FILE path (None when absent).
+    async fn get(&self, path: &str) -> Result<Option<Vec<u8>>, String>;
+
+    /// List entries under a DIRECTORY path (repo-root-relative names; a
+    /// non-directory — missing or a file — lists EMPTY, the MLflow
+    /// convention).
+    async fn list(&self, path: &str) -> Result<Vec<ArtifactEntry>, String>;
+
+    /// Delete a file or directory tree (absent paths are a no-op).
+    async fn delete(&self, path: &str) -> Result<(), String>;
+}
+
+/// One listing entry: repo-root-relative path, directory flag, byte size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactEntry {
+    pub path: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,
 }
 
 /// Model-registry tag evaluation with MLflow absent-value semantics:

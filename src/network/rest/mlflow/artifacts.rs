@@ -1,16 +1,13 @@
-//! MLflow artifacts proxy (TD-MLOPS-1 slice 4).
+//! MLflow artifacts proxy (TD-MLOPS-1 slice 4; ported to the
+//! [`ArtifactRepository`] seam by the TD-MLOPS-2 opening — audit #4).
 //!
 //! Real MLflow clients never fetch artifacts via `/api/2.0/mlflow/*`: the
 //! server returns `artifact_location = mlflow-artifacts:/<exp>` and the
 //! client resolves it against the tracking host's PROXY family at
 //! `/api/2.0/mlflow-artifacts/artifacts/...` (PUT bytes to log, GET to
-//! download / list with `?path=`, DELETE to remove).
-//!
-//! Slice-4 storage backend: local files under
-//! `<data_dir>/mlflow_artifacts/<tenant>/...` — the honest default for a
-//! single-node deployment; the S3-backed repository (object storage via the
-//! platform's storage locations) is the tracked follow-up. Paths are
-//! segment-sanitized (no `..`, no absolute escapes) and tenant-scoped.
+//! download / list with `?path=`, DELETE to remove). This handler is a
+//! pure codec over the port — the local-fs backend is one implementation,
+//! the tracked S3-backed repository is another.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -42,94 +39,6 @@ pub fn artifacts_routes() -> Router<MlflowState> {
         .layer(axum::extract::DefaultBodyLimit::max(ARTIFACT_BODY_LIMIT))
 }
 
-/// The client's directory LIST hits the bare `/artifacts` root with the
-/// target encoded in `?path=<exp>/<run>/artifacts[...]`.
-async fn artifact_root_list(
-    State(state): State<MlflowState>,
-    Extension(tenant): Extension<TenantContext>,
-    Query(list): Query<ListParams>,
-) -> MlflowResult<Json<Value>> {
-    let sub = list.path.clone().unwrap_or_default();
-    let segments = sanitize_segments(&sub)?;
-    let prefix = list_entry_prefix(&segments);
-    let root = tenant_artifact_root(&state, &tenant);
-    let target = segments.iter().fold(root, |acc, s| acc.join(s));
-    if !target.exists() {
-        return Err(MlflowError::not_found(format!(
-            "artifact path '{sub}' does not exist"
-        )));
-    }
-    if !target.is_dir() {
-        // Listing a FILE path yields no entries (the MLflow server
-        // convention) — the client then treats the path itself as the file.
-        return Ok(Json(json!({ "files": [] })));
-    }
-    let mut entries = tokio::fs::read_dir(&target)
-        .await
-        .map_err(|e| MlflowError::internal(format!("read artifact dir: {e}")))?;
-    let mut files = Vec::new();
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| MlflowError::internal(format!("iterate artifacts: {e}")))?
-    {
-        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-        let size = if is_dir {
-            0
-        } else {
-            entry.metadata().await.map(|m| m.len()).unwrap_or(0)
-        };
-        let name = entry.file_name().to_string_lossy().to_string();
-        let path = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        files.push(json!({
-            "path": path,
-            "is_dir": is_dir,
-            "file_size": size,
-        }));
-    }
-    Ok(Json(json!({ "files": files })))
-}
-
-async fn artifact_root_delete(
-    State(state): State<MlflowState>,
-    Extension(tenant): Extension<TenantContext>,
-    Query(list): Query<ListParams>,
-) -> MlflowResult<Response> {
-    let sub = list.path.clone().unwrap_or_default();
-    if sub.is_empty() {
-        return Err(MlflowError::invalid("artifact root delete requires ?path="));
-    }
-    let segments = sanitize_segments(&sub)?;
-    let root = tenant_artifact_root(&state, &tenant);
-    let target = segments.iter().fold(root, |acc, s| acc.join(s));
-    if target.is_dir() {
-        tokio::fs::remove_dir_all(&target)
-            .await
-            .map_err(|e| MlflowError::internal(format!("delete artifacts: {e}")))?;
-    } else if target.exists() {
-        tokio::fs::remove_file(&target)
-            .await
-            .map_err(|e| MlflowError::internal(format!("delete artifact: {e}")))?;
-    }
-    Ok(StatusCode::OK.into_response())
-}
-
-/// Entry names for directory listings are relative to the RUN's artifact
-/// root (`<exp>/<run>/artifacts`), not to the listed subdirectory — the
-/// client passes `file.path` verbatim as the next remote path.
-fn list_entry_prefix(segments: &[String]) -> String {
-    let anchor = segments
-        .iter()
-        .position(|s| s == "artifacts")
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    segments[anchor..].join("/")
-}
-
 fn sanitize_segments(path: &str) -> MlflowResult<Vec<String>> {
     let mut out = Vec::new();
     for segment in path.split('/') {
@@ -149,11 +58,15 @@ fn sanitize_segments(path: &str) -> MlflowResult<Vec<String>> {
     Ok(out)
 }
 
-fn tenant_artifact_root(state: &MlflowState, tenant: &TenantContext) -> std::path::PathBuf {
-    state
-        .data_dir
-        .join("mlflow_artifacts")
-        .join(sanitize(&tenant.tenant_id))
+/// The port path for a request: tenant prefix + the repo-root-relative
+/// path (structural isolation without a per-tenant repository instance).
+fn port_path(tenant: &TenantContext, segments: &[String]) -> String {
+    let mut path = sanitize(&tenant.tenant_id);
+    for segment in segments {
+        path.push('/');
+        path.push_str(segment);
+    }
+    path
 }
 
 fn sanitize(component: &str) -> String {
@@ -167,6 +80,38 @@ fn sanitize(component: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Entry names for directory listings are relative to the RUN's artifact
+/// root (`<exp>/<run>/artifacts`), not to the listed subdirectory — the
+/// client passes `file.path` verbatim as the next remote path.
+fn list_entry_prefix(segments: &[String]) -> String {
+    let anchor = segments
+        .iter()
+        .position(|s| s == "artifacts")
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    segments[anchor..].join("/")
+}
+
+fn entries_to_json(entries: &[proximadb_catalog::run_store::ArtifactEntry], prefix: &str) -> Value {
+    json!({
+        "files": entries
+            .iter()
+            .map(|entry| {
+                let path = if prefix.is_empty() {
+                    entry.path.clone()
+                } else {
+                    format!("{prefix}/{}", entry.path)
+                };
+                json!({
+                    "path": path,
+                    "is_dir": entry.is_dir,
+                    "file_size": entry.size_bytes,
+                })
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 #[derive(Default, Deserialize)]
@@ -183,93 +128,111 @@ async fn artifact_proxy(
     body: axum::body::Bytes,
 ) -> MlflowResult<Response> {
     let segments = sanitize_segments(&path)?;
-    let root = tenant_artifact_root(&state, &tenant);
-    // Segments are traversal-checked verbatim (no .., backslash, NUL) —
-    // file names must round-trip byte-identically.
-    let target = segments.iter().fold(root.clone(), |acc, s| acc.join(s));
-
+    let prefix = list_entry_prefix(&segments);
+    let repo_path = port_path(&tenant, &segments);
     match method {
         axum::http::Method::PUT => {
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("create artifact dir: {e}")))?;
-            }
-            tokio::fs::write(&target, &body)
+            state
+                .artifacts
+                .put(&repo_path, &body)
                 .await
-                .map_err(|e| MlflowError::internal(format!("write artifact: {e}")))?;
+                .map_err(MlflowError::internal)?;
             Ok(StatusCode::OK.into_response())
         }
         axum::http::Method::GET => {
-            if !target.exists() {
-                return Err(MlflowError::not_found(format!(
-                    "artifact '{path}' does not exist"
-                )));
-            }
-            if target.is_dir() {
-                // Directory LIST. Entry names are repo-root-relative
-                // (relative to <exp>/<run>/artifacts) — the client feeds
-                // file.path verbatim into the next remote GET.
-                let prefix = list_entry_prefix(&segments);
-                let list_root = target.clone();
-                let mut entries = tokio::fs::read_dir(&list_root)
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("read artifact dir: {e}")))?;
-                let mut files = Vec::new();
-                while let Some(entry) = entries
-                    .next_entry()
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("iterate artifacts: {e}")))?
-                {
-                    let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                    let size = if is_dir {
-                        0
-                    } else {
-                        entry.metadata().await.map(|m| m.len()).unwrap_or(0)
-                    };
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let entry_path = if prefix.is_empty() {
-                        name
-                    } else {
-                        format!("{prefix}/{name}")
-                    };
-                    files.push(json!({
-                        "path": entry_path,
-                        "is_dir": is_dir,
-                        "file_size": size,
-                    }));
-                }
-                Ok(Json(json!({"files": files})).into_response())
-            } else {
-                let bytes = tokio::fs::read(&target)
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("read artifact: {e}")))?;
-                // Octet-stream: the proxy carries bytes; echoing the
-                // request's Accept header as Content-Type is semantically
-                // wrong and could yield an invalid MIME.
-                Ok((
+            match state
+                .artifacts
+                .get(&repo_path)
+                .await
+                .map_err(MlflowError::internal)?
+            {
+                Some(bytes) => Ok((
                     [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
                     bytes,
                 )
-                    .into_response())
+                    .into_response()),
+                None => {
+                    // Not a FILE. A DIRECTORY at this path lists its
+                    // entries; a MISSING path is a download miss — real
+                    // MLflow 404s (RESOURCE_DOES_NOT_EXIST).
+                    let entries = state
+                        .artifacts
+                        .list(&repo_path)
+                        .await
+                        .map_err(MlflowError::internal)?;
+                    if entries.is_empty() {
+                        return Err(MlflowError::not_found(format!(
+                            "artifact '{path}' does not exist"
+                        )));
+                    }
+                    Ok(Json(entries_to_json(&entries, &prefix)).into_response())
+                }
             }
         }
         axum::http::Method::DELETE => {
-            if target.is_dir() {
-                tokio::fs::remove_dir_all(&target)
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("delete artifacts: {e}")))?;
-            } else if target.exists() {
-                tokio::fs::remove_file(&target)
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("delete artifact: {e}")))?;
-            }
+            state
+                .artifacts
+                .delete(&repo_path)
+                .await
+                .map_err(MlflowError::internal)?;
             Ok(StatusCode::OK.into_response())
         }
         other => Err(MlflowError::invalid(format!(
             "unsupported artifact method {other}"
         ))),
     }
+}
+
+/// The client's directory LIST hits the bare `/artifacts` root with the
+/// target encoded in `?path=<exp>/<run>/artifacts[...]`.
+async fn artifact_root_list(
+    State(state): State<MlflowState>,
+    Extension(tenant): Extension<TenantContext>,
+    Query(list): Query<ListParams>,
+) -> MlflowResult<Json<Value>> {
+    let sub = list.path.clone().unwrap_or_default();
+    // Real MLflow returns an EMPTY listing for any path that is not a
+    // directory (missing or a file) — the client relies on [] for fresh
+    // runs and post-delete walks; a 404 breaks both. The empty `?path=`
+    // form lists the tenant root.
+    let segments = if sub.is_empty() {
+        Vec::new()
+    } else {
+        sanitize_segments(&sub)?
+    };
+    let prefix = list_entry_prefix(&segments);
+    let repo_path = port_path(&tenant, &segments);
+    let entries = state
+        .artifacts
+        .list(&repo_path)
+        .await
+        .map_err(MlflowError::internal)?;
+    Ok(Json(entries_to_json(&entries, &prefix)))
+}
+
+async fn artifact_root_delete(
+    State(state): State<MlflowState>,
+    Extension(tenant): Extension<TenantContext>,
+    Query(list): Query<ListParams>,
+) -> MlflowResult<Response> {
+    // The bare-root DELETE with no ?path= would wipe the TENANT's whole
+    // artifact tree — require an explicit path (the client's
+    // delete_artifacts(None) form targets a run's subtree and always
+    // carries one).
+    let sub = list.path.clone().unwrap_or_default();
+    if sub.is_empty() {
+        return Err(MlflowError::invalid(
+            "artifact delete requires an explicit ?path=",
+        ));
+    }
+    let segments = sanitize_segments(&sub)?;
+    let repo_path = port_path(&tenant, &segments);
+    state
+        .artifacts
+        .delete(&repo_path)
+        .await
+        .map_err(MlflowError::internal)?;
+    Ok(StatusCode::OK.into_response())
 }
 
 /// The artifact URI clients resolve against the tracking host:
@@ -282,6 +245,3 @@ pub(super) fn run_artifact_uri(experiment_id: u64, run_id: &str) -> String {
 pub(super) fn experiment_artifact_location(experiment_id: u64) -> String {
     format!("mlflow-artifacts:/{experiment_id}")
 }
-
-#[allow(dead_code)]
-fn _assert_send(_f: impl Fn() -> MlflowResult<Response>) {}
