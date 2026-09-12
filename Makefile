@@ -132,6 +132,8 @@ context-benchmark-check:
 deterministic-commit-contract-check:
 	@echo "🧷 Validating deterministic commit contract..."
 	python3 scripts/check_deterministic_commit_contract.py
+	python3 -m unittest discover -s tests/scripts -p 'test_deterministic_commit_contract.py'
+	python3 -m unittest discover -s tests/scripts -p 'test_cloud_emulator_harness.py'
 
 branch-promotion-policy-check:
 	@echo "🌿 Validating pull-request branch routes..."
@@ -495,7 +497,7 @@ help:
 	@echo "  check              - Format + lint + test"
 	@echo "  hygiene-check      - Detect tracked backup/disabled/.victor artifacts"
 	@echo "  capability-matrix-check - Validate docs/_internal/roadmap/CAPABILITY_MATRIX.toml"
-	@echo "  deterministic-commit-contract-check - Validate zero-retry/test/docs guard wiring"
+	@echo "  deterministic-commit-contract-check - Validate retry-budget/test/docs guard wiring"
 	@echo "  tenant-path-check  - Enforce DrPathBuilder tenant path guard"
 	@echo "  tenant-ingress-check - Enforce deployment-aware tenant resolution at ingress"
 	@echo "  work-commit-check  - Fast deterministic architecture guard before commit/push"

@@ -4,7 +4,7 @@
 :icons: font
 :source-highlighter: rouge
 :sectnums:
-:last-updated: 2026-06-29
+:last-updated: 2026-09-11
 
 *Audience: client-app developers.* This is the fast on-ramp — one map that ties
 together every external surface, its payload/response shape, and how the SDK and
@@ -48,7 +48,7 @@ header).
 | Supported
 
 | Records
-| `/collections/{id}/records`, `/records/batch`, `/records/{id}`
+| `/collections/{id}/records/batch`, `/collections/{id}/records/scan`, `/collections/{id}/records/{record_id}`
 | `ProximaRecord` CRUD + batch (vector + props). The dim-1 zero-vector record is the KV pattern.
 | Supported
 
@@ -69,13 +69,18 @@ header).
 
 | Query
 | `/query`, `/query/explain`
-| Shared SQL/UQL facade + plan explain
-| Supported
+| UQL/Federated execution + plan explain; AQL execution is rejected until implemented (the explain request currently accepts the language label but has no AQL-specific lowering)
+| Beta (AQL Planned)
+
+| SQL
+| `/sql`
+| One authenticated SQL statement through the shared relational execution authority
+| Beta
 
 | Graph
 | `/graphs`, `/graphs/{id}/{nodes,edges}[/batch]`, `/graphs/{id}/traverse`, `/graphs/{id}/fusion-search`, `/graphs/{id}/impact-analysis`
 | Graph topology CRUD, traversal, vector-seed→graph fusion, blast radius
-| Supported
+| Beta
 
 | Hybrid
 | `/hybrid/index`, `/hybrid/search`
@@ -88,8 +93,8 @@ header).
 | Beta
 
 | Entities
-| `/collections/{id}/entities`
-| Entity orchestration facade (upsert/search/get)
+| Canonical `/collections/{id}/entities` (plus `/{entity_id}` and `/search`); gRPC v2 `ProximaEntityService`; a transitional REST v1 path family also includes entity listing
+| Entity orchestration facade (upsert/search/get); v2 is the client target
 | Beta
 
 | External
@@ -160,14 +165,14 @@ with header `X-Embed-Source: native` (omit `vector` to let the server embed).
 | `X-Tenant-ID` | Multi-tenant scoping ( enforced server-side )
 | `X-Embed-Source` | `native` = server-side embedding (collections documents)
 | `X-Ingest-Mode` | Billing/metering mode
-| `Deprecation` / `X-ProximaDB-API-Status` | Set on deprecated v1 responses
+| `Deprecation` / `X-ProximaDB-API-Status` | Compatibility metadata on the residual REST v1 entity routes
 |====
 
 === Tenant identity per transport
 
-Every transport carries the tenant a different way, but all resolve through the
-single request-tenant resolver — a bare/absent selector maps to the same
-`default` tenant everywhere, and isolation is *structural* (the tenant is composed
+Every transport enforces the shared deployment-mode and tenant-trust primitives. When both an
+explicit selector and an authenticated tenant binding are absent, single-tenant mode selects the
+configured `[server.tenant] default_tenant`; multi-tenant mode rejects the request. Isolation is *structural* (the tenant is composed
 into the storage key at the service boundary, never a per-query predicate). The
 `X-Tenant-ID` REST header is a formal optional parameter on every operation in the
 generated OpenAPI spec (`docs/openapi/proximadb-openapi.yaml`).
@@ -175,10 +180,10 @@ generated OpenAPI spec (`docs/openapi/proximadb-openapi.yaml`).
 [cols="1,2,3", options="header"]
 |====
 | Transport | Tenant carrier | Notes
-| REST v2 | `X-Tenant-ID` header (optional) | Applied only when there is no authenticated context; a JWT tenant claim takes precedence, and a header disagreeing with the authenticated tenant is rejected.
+| REST v2 | `X-Tenant-ID` header (optional) | An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant under gateway-only trust. Without a binding, acceptance follows the configured header trust policy.
 | gRPC | `x-tenant-id` metadata | Ambient identity (not a per-message field).
-| Arrow Flight | `x-proximadb-tenant-id` metadata | NOTE: key differs from gRPC/REST (`x-tenant-id`) — a naming inconsistency tracked for unification.
-| pgwire | `dbname` (fallback `SET proximadb.write.tenant_id`) | Connection-level; `dbname=proximadb` ⇒ default tenant. See link:./postgres.adoc[Postgres Wire Reference].
+| Arrow Flight | `x-tenant-id` metadata | Canonical carrier shared with gRPC; former aliases are detected for retirement telemetry but do not grant a tenant.
+| pgwire | startup `database` (fallback tenant session variable) | A supplied database is literal (`database=proximadb` means tenant `proximadb`). Open trust accepts it; authenticated-only and gateway-only reject non-default assertions because pgwire trust auth has no credential binding. The reserved literal `default` remains accepted. Only an omitted database selects the configured default in single-tenant mode; multi-tenant mode rejects an omission. See link:./postgres.adoc[Postgres Wire Reference].
 |====
 
 == SDK lowering (Python)
@@ -191,8 +196,8 @@ Lowering chain:
 
 ....
 ProximaDBClient  ──(protocol adapter)──▶  BaseProtocolAdapter
-   │                                          ├── RestProtocolAdapter   ── HTTP/JSON ──▶ /api/v2/*
-   │                                          ├── GrpcProtocolAdapter    ── gRPC      ──▶ :5679
+   │                                          ├── RestProtocolAdapter   ── HTTP/JSON ──▶ /api/v2/* on :5678
+   │                                          ├── GrpcProtocolAdapter    ── gRPC      ──▶ :5678 (unified default)
    │                                          └── EmbeddedProtocolAdapter ── in-process (PyO3)
    │
    └──(canonical document write)──▶ ingest_documents() ──▶ generated Client
@@ -204,10 +209,11 @@ ProximaDBClient  ──(protocol adapter)──▶  BaseProtocolAdapter
   route through the **generated** openapi-python-client package
   (`proximadb_sdk._generated.rest.*`) — the spec is the single source of truth
   (ADR-041).
-* The adapter layer abstracts protocol choice (REST default; gRPC opt-in;
-  embedded in-process).
-* **Three modes** via `PROXIMADB_MODE` / constructor: `server`
-  (`url=http://host:5678`), `sdk` / `embedded` (in-process, no server). See
+* The adapter layer abstracts protocol choice (`auto` prefers gRPC; REST and embedded are explicit
+  alternatives).
+* Select the transport with the constructor's `protocol` (`auto`, `grpc`, `rest`, or `embedded`)
+  and select unified versus legacy split ports with `port_mode` (`unified` by default). `PROXIMADB_MODE`
+  is container/runtime plumbing, not a Python-client mode selector. See
   link:../02-guides/sdk-python-guide.adoc[sdk-python-guide] for code.
 
 == pgwire lowering (PostgreSQL wire)
@@ -218,7 +224,7 @@ Port `5433`. SQL in → engine out:
 psql / pgvector client
    └──▶ PostgresServer (src/network/postgres/)
            └──▶ QueryTranslator  ──(pg SQL → ProximaDB SQL, pgvector ops <-> , <=>, <#>)──▶
-                   RelationalPipeline (opt-in PROXIMADB_NEW_RELATIONAL_PIPELINE=1)
+                   RelationalPipeline
                       └──▶ logical plan ─▶ physical plan ─▶ ComputeScheduler
                              ├── NativeVolcanoEngine  (OLTP/relational)
                              └── DataFusionLocal      (OLAP/parquet; feature-gated)
@@ -226,18 +232,18 @@ psql / pgvector client
 
 * Accepts ANSI SQL (DataFusion planner) + pgvector distance operators +
   `VECTOR_SEARCH()`. DDL/DML are tenant-scoped.
-* pgwire shares the query path with the REST `/query` surface (same planner →
-  same engines). See link:postgres.adoc[postgres] for wire details.
+* pgwire shares the SQL execution authority with REST `/api/v2/sql` and gRPC v2 `ExecuteQuery`
+  (same planner → same engines). See link:postgres.adoc[postgres] for wire details.
 
 == Ports + transport
 
 [cols="2,2,3,2", options="header"]
 |====
 | Port | Protocol | Used for | Status
-| 5678 | REST/HTTP | Canonical v2 surface, `ingestDocuments`, records, etc. | Supported
-| 5679 | gRPC | Internal/search; explicit opt-in for ingest | Supported (v2)
-| 5680 | Arrow Flight | Bulk columnar export | Beta
-| 5433 | PostgreSQL wire | SQL clients / pgvector | Supported
+| 5678 | Multiplexed REST, gRPC v2, Arrow Flight | Default unified endpoint; canonical REST v2, typed RPC, and columnar transfer | REST Supported; gRPC/Flight Beta by capability
+| 5679 | gRPC v2 | Legacy multi-port mode only | Beta
+| 5680 | Arrow Flight | Legacy multi-port mode only | Beta
+| 5433 | PostgreSQL wire | SQL clients / pgvector | Beta
 |====
 
 Unified mode (default) serves all protocols on one port; multi-port mode is the
@@ -245,13 +251,13 @@ legacy separate-port layout.
 
 == Deprecation map (what's going away)
 
-* **v1 (`/api/v1/*`)** — deprecated compatibility facades. Responses carry
-  `Deprecation: true` + `X-ProximaDB-API-Status: deprecated-compatibility`.
-  Sunset: 2026-06-30. Use v2.
+* **v1 (`/api/v1/*`)** — removed except for the transitional entity path family at
+  `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search` (including `GET` listing on
+  the collection entity path). All new clients use v2;
+  retire this residual facade only after measured client evidence.
 * **v3 (`/api/v3/*`)** — **removed**. The document-ingest handler is canonically at
   `/api/v2/collections/{id}/documents`; the v3 alias was deleted. Target `/api/v2`.
-* **gRPC v1** — off by default; opt-in via `enable_grpc_v1_compat`. Sunset
-  2026-06-30. Use gRPC v2.
+* **gRPC v1** — removed; the former `enable_grpc_v1_compat` opt-in no longer exists. Use gRPC v2.
 
 == Where to go next
 

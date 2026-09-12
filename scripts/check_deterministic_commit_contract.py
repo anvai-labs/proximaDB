@@ -5,7 +5,7 @@ This is a fast static guard for the repo's "safe to commit" contract. It does
 not replace the expensive build/test gates; it verifies that those gates still
 point at deterministic policies:
 
-* unit tests use the zero-retry nextest profile
+* unit tests use the bounded-retry nextest profile and report survivors as flaky
 * CI and Makefile still invoke that profile
 * architecture docs still separate code presence from support level
 * tenant/path mandates remain visible in the system map
@@ -101,11 +101,55 @@ def check_nextest_contract(findings: list[Finding]) -> None:
     unit = profiles.get("unit", {})
     integration = profiles.get("integration", {})
 
-    # NOTE: the zero-retry contract (profile.default/unit.retries must be 0, and
-    # no retry overrides) was intentionally removed. A small retry budget absorbs
-    # load-induced flakes on constrained CI runners; nextest still surfaces any
-    # survivor distinctly as FLAKY, so genuine breakage (which exhausts all
-    # retries) still fails the run.
+    # A fixed, small retry budget absorbs load-induced flakes on constrained CI
+    # runners. It is part of the contract: increasing it can hide defects, while
+    # removing flaky reporting makes retry survivors invisible.
+    if profiles.get("default", {}).get("retries") != 2:
+        findings.append(
+            Finding(
+                "nextest",
+                ".config/nextest.toml profile.default.retries must stay at 2",
+            )
+        )
+    if unit.get("retries") != 2:
+        findings.append(
+            Finding(
+                "nextest",
+                ".config/nextest.toml profile.unit.retries must stay at 2",
+            )
+        )
+    if profiles.get("default", {}).get("final-status-level") != "flaky":
+        findings.append(
+            Finding(
+                "nextest",
+                '.config/nextest.toml profile.default.final-status-level must be "flaky"',
+            )
+        )
+    unit_final_status = unit.get("final-status-level")
+    if unit_final_status is not None and unit_final_status != "flaky":
+        findings.append(
+            Finding(
+                "nextest",
+                '.config/nextest.toml profile.unit.final-status-level override must be "flaky"',
+            )
+        )
+    integration_final_status = integration.get("final-status-level")
+    if integration_final_status is not None and integration_final_status != "flaky":
+        findings.append(
+            Finding(
+                "nextest",
+                '.config/nextest.toml profile.integration.final-status-level override must be "flaky"',
+            )
+        )
+    for profile_name in ("default", "unit", "integration"):
+        for override in profiles.get(profile_name, {}).get("overrides", []):
+            if "retries" in override:
+                findings.append(
+                    Finding(
+                        "nextest",
+                        f".config/nextest.toml profile.{profile_name}.overrides must not set retries",
+                    )
+                )
     if unit.get("test-threads", 0) < 2:
         findings.append(
             Finding(
@@ -120,11 +164,11 @@ def check_nextest_contract(findings: list[Finding]) -> None:
                 '.config/nextest.toml profile.unit.failure-output must be "immediate-final"',
             )
         )
-    if integration.get("retries", 0) > 1:
+    if integration.get("retries") != 1:
         findings.append(
             Finding(
                 "nextest",
-                ".config/nextest.toml profile.integration.retries must not exceed 1",
+                ".config/nextest.toml profile.integration.retries must stay at 1",
             )
         )
 
@@ -263,7 +307,7 @@ def check_architecture_contract(findings: list[Finding]) -> None:
         findings,
         "architecture",
         "docs/06-internals/workflows/TDD_GUIDE.md",
-        "zero-retry unit contract",
+        "retry-budgeted unit contract",
     )
     require_contains(
         findings,

@@ -4,13 +4,13 @@
 :icons: font
 :source-highlighter: rouge
 :sectnums:
-:last-updated: 2026-07-12
+:last-updated: 2026-09-11
 // status-as-of: 2026-09-11
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the "Current state" sections against HEAD, then bump it.
 
 Status: Apex reference index (active baseline) +
-Date: 2026-07-12 (filename `SYSTEM_MAP_2026_05_30` is the original; content tracks current HEAD) +
+Date: 2026-09-11 (filename `SYSTEM_MAP_2026_05_30` is the original; content tracks current HEAD) +
 Cost spine: the multi-engine routing + cache policy shown here is co-optimized against the *measured
 per-query I/O trace* across the five physical dimensions — see
 `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (the unified cost objective the `ComputeScheduler`
@@ -27,8 +27,9 @@ feeders (see <<feeders>>).
 
 [.lead]
 This is the **single pane of glass** for ProximaDB. It exists to answer one question fast — "where does
-a thing live, and what does it converge on?" Current checkout reality: 91 workspace members
-under `crates/` + `apps/`, and 42 real top-level `src/` module directories. It is navigation-first: it does not
+a thing live, and what does it converge on?" Current checkout reality: 152 workspace members across
+the root package, `crates/`, `apps/`, bindings, integrations, and clients, plus 42 real top-level
+`src/` module directories. It is navigation-first: it does not
 duplicate the per-module detail in the feeder docs, it indexes and ties them together so they stop
 diverging.
 
@@ -42,8 +43,9 @@ fourth competing map**. That rule is itself a convergence gate (see
 link:CONVERGENCE_AUDIT_2026_05_30.adoc[CONVERGENCE_AUDIT_2026_05_30]).
 
 Production composition is still mostly rooted in the root crate (`src/database.rs`,
-`src/network/shared_services.rs`, `src/network/multi_server.rs`). `proximadb-runtime` and
-`proximadb-api` are target extraction boundaries and partial shells, not yet sole owners. Workspace
+`src/network/shared_services.rs`, `src/network/multi_server.rs`). The sole production
+`ApiHandlersPort` implementation has moved to `proximadb-runtime`; `proximadb-api` remains a contract
+and extraction boundary rather than the composition root. Workspace
 decomposition therefore remains a first-principles build-scaling requirement: split ownership only
 where it reduces compile fan-out, enables independent worktrees, and lets CI coverage shards
 (`cargo llvm-cov`, Tarpaulin, and focused `cargo test -p ...`) compile smaller units without timeout
@@ -84,14 +86,14 @@ flowchart TB
   end
 
   subgraph EDGE[Protocol Facades]
-    NET["network/<br/>REST v1/v2/v3, gRPC, pgwire, Arrow IPC/Flight"]:::edge
-    API["api_handlers/ + proximadb-api<br/>request lowering, tenant extraction, response shaping"]:::edge
-    RT["root server wiring + target proximadb-runtime<br/>ports and composition boundary"]:::edge
+    NET["network/<br/>REST /api/v2 + entity-only v1 compatibility<br/>external gRPC v2, pgwire, Arrow IPC/Flight"]:::edge
+    API["network adapters + proximadb-api<br/>wire parsing, tenant extraction, response shaping"]:::edge
+    RT["proximadb-runtime handlers + root server wiring<br/>ports and composition boundary"]:::edge
   end
 
   subgraph PLANE[Logical Plane]
     SVC["services/<br/>collection, DDL/DML, records, search, documents, graph, observability"]:::svc
-    QRY["query/ + query crates<br/>SQL/AQL/UQL, logical lowering, ComputeScheduler, RoutedReadPlan, EXPLAIN"]:::svc
+    QRY["query/ + query crates<br/>SQL/AQL/UQL, logical lowering, ComputeScheduler, route/EXPLAIN telemetry"]:::svc
     CAT["xCatalog / proximadb-catalog<br/>schema, route knobs, projection metadata, policy"]:::core
   end
 
@@ -112,7 +114,7 @@ flowchart TB
   end
 
   subgraph OPS[Operations and SaaS Controls]
-    TEN["TenantContext<br/>request, storage, billing and isolation boundary"]:::guard
+    TEN["TenantContext<br/>request, storage, metering and isolation boundary"]:::guard
     SEC["security/auth/audit"]:::guard
     OBS["metrics/monitoring/observability"]:::guard
     DEP["deployment/operations/backup"]:::guard
@@ -132,7 +134,7 @@ flowchart TB
   VEC --> REC
   MOD --> REC
   REC --> WAL --> PATH --> FS
-  CAT --> REC
+  CAT -. schema, policy, route metadata .-> SVC
   TEN --> PATH
   TEN --> OBS
   SEC --> API
@@ -171,13 +173,13 @@ visual; this snapshot is kept in sync for reviews that cannot render diagrams.
                                       |
                                       v
         +--------------------- Protocol and API Edge ----------------------+
-        | network/ + api_handlers/ + proximadb-api                         |
+        | network adapters + proximadb-api                                 |
         | wire parsing, tenant extraction, auth, compatibility shaping      |
         +-------------------------------+----------------------------------+
                                         |
                                         v
         +--------------------- Runtime Composition ------------------------+
-        | proximadb-runtime + server/database wiring                        |
+        | proximadb-runtime handlers + server/database wiring               |
         | lifecycle, ports, shared services, startup/shutdown               |
         +-------------------------------+----------------------------------+
                                         |
@@ -203,7 +205,7 @@ visual; this snapshot is kept in sync for reviews that cannot render diagrams.
                                   ^
                                   |
         +----------------------- SaaS / Ops Guards ------------------------+
-        | TenantContext | billing metrics | security/audit | validation CI   |
+        | TenantContext | neutral consumption metrics | security/audit | CI  |
         +------------------------------------------------------------------+
 ----
 
@@ -221,12 +223,15 @@ facades, protocol-specific error mapping.
 | Durable schema truth, storage layout decisions, independent business logic per protocol.
 
 | Runtime composition
-| `src/server/`, `src/database.rs`, `crates/platform/proximadb-runtime`, `apps/proximadb-server`
-| Lifecycle, dependency wiring, port composition, startup/shutdown, health exposure.
+| `src/server/`, `src/database.rs`, `src/network/shared_services.rs`,
+`crates/platform/proximadb-runtime`, `apps/proximadb-server`
+| Lifecycle, dependency wiring, the sole production `ApiHandlersPort` implementation, port
+composition, startup/shutdown, health exposure.
 | Protocol-specific behavior or storage-engine policy that should live in services/catalog.
 
 | Service layer
-| `src/services/`, `src/core/record_store`, `src/search/`
+| `src/services/`, `src/services/record_store.rs`, `src/services/record_memtable.rs`,
+`crates/foundation/proximadb-records/src/store.rs`, `src/search/`
 | Collection lifecycle, DDL/DML orchestration, record operations, search/hybrid orchestration,
 document/graph/observability service facades.
 | Raw physical paths, protocol DTO leakage, or duplicated query-planning rules.
@@ -235,7 +240,8 @@ document/graph/observability service facades.
 | `src/query/`, `src/datafusion/`, `crates/query/*`, `crates/foundation/proximadb-functions`
 | Shared logical lowering, SQL/AQL/UQL semantics, function registry, compute-route selection,
 EXPLAIN, route-health signals, `ExecutionControls`, and the `ExecutionEngine` /
-`execute_sql_with_backend` / `NativeVolcanoEngine` physical engine seams.
+`NativeVolcanoEngine` seams. `execute_sql_with_backend` serves DataFusion and optional DuckDB
+compatibility; native execution follows its separate planned-snapshot path.
 | Separate semantics per engine. Volcano and DataFusion should bind the same logical/function
 contract.
 
@@ -248,7 +254,8 @@ authority.
 | Physical storage and indexing
 | `src/storage/`, `crates/storage/*`, `src/index/`, `src/compute/`
 | Storage engines, filesystem/object-store access, block formats, compaction/flush, ANN indexes,
-distance kernels, quantization.
+distance kernels, quantization. `UnifiedStorageFormat` is the canonical trait name;
+`UnifiedStorageEngine` is a compatibility re-export, not a separate engine abstraction.
 | Tenant identity inference from raw strings; path construction outside `DrPathBuilder`.
 
 | Modality runtimes
@@ -259,21 +266,21 @@ facades or rebuildable projections.
 tenant isolation.
 
 | Integration and data movement
-| `src/connectors/`, `src/cdc/`, `src/streaming/`, `src/ingest/`, `src/embedded/`, `clients/`,
-`crates/binding/*`
+| `src/connectors/`, `src/cdc/`, `src/streaming/`, `src/ingest/`, `clients/`,
+`crates/binding/*` (including `proximadb-embedded`)
 | External connectors, ingestion, CDC, SDKs, embedded surfaces, Spark/JVM bridges.
 | Claims of external-authoritative storage unless xCatalog and the supported-surface contract say so.
 
 | SaaS and operations controls
 | `src/security/`, `src/auth/`, `src/audit/`, `src/metrics/`, `src/monitoring/`, `src/deployment/`,
 `src/operations/`, `src/storage/tenant`
-| Identity, tenant context, billing/metrics hooks, auditability, deployment, backup/restore and
+| Identity, tenant context, neutral consumption/metering hooks, auditability, deployment, backup/restore and
 operator visibility.
 | Best-effort add-ons after data paths are designed. These are cross-cutting release gates.
 |===
 
 [#workspace]
-== Layer 1 — Workspace (91 members, layered)
+== Layer 1 — Workspace (152 members, layered)
 
 The workspace follows the stable map from `CLAUDE.md`:
 `Foundation -> Contracts -> Control -> Horizontal -> Modality -> Storage -> Query/Cross-Model -> Platform -> Apps/Bindings`.
@@ -286,17 +293,26 @@ flowchart TB
   classDef layer fill:#4a90e2,stroke:#2e5c8a,color:#000;
   classDef apps fill:#cfe2f7,stroke:#2e5c8a,color:#000;
 
-  FND["<b>Foundation</b> (23)<br/>kernel · data-model · proto · records · tenant · search-types · bloom<br/>filter-expr · distance-kernel/types · compression/encoding/quantization-types<br/>index-traits/types · cache · memory-pool · hardware(-caps)<br/>config · pipeline-operator · relational-types · functions"]:::layer
+  FND["<b>Foundation</b> (31)<br/>leaf types, records, tenant, kernels, config and contracts"]:::layer
   CTR["<b>Contracts</b> (1)<br/>quantization (behavior + compat gates)"]:::layer
-  CTL["<b>Control</b> (1)<br/>proximadb-catalog — xCatalog, 8 backends, route knobs"]:::layer
-  HRZ["<b>Horizontal</b> (9)<br/>codec · compression · serialization · security · tls · telemetry<br/>runtime-common · embedded-common · recall-bench"]:::layer
-  MOD["<b>Modality Runtime</b> (12)<br/>vector · document · graph · observability · embedding · queue<br/>quantization-kernel · rank-core/features/expr/profile/onnx"]:::layer
-  STG["<b>Storage</b> (13)<br/>storage-common/ports/encryption/filesystem-types · block-format (PAX)<br/>object-store · iceberg-engine · storage-kv · storage-operations/optimization<br/>storage-strategy · storage-tenant · storage-transaction"]:::layer
-  QRY["<b>Query / Cross-Model</b> (20)<br/>query · uql · multimodel-{query,plan} · relational-{algebra…engine}<br/>{vector,document,graph,observability}-query · graph-{arrow,subset}<br/>query-{capability,clauses,filter,fusion}"]:::layer
-  PLT["<b>Platform</b> (4)<br/>proximadb-api · proximadb-runtime · proximadb-admin-ui · proximadb-mcp"]:::layer
-  APP["<b>Apps / Bindings</b> (7)<br/>server · migrate · bench · ann-bench · vectordb-compare · root crate<br/>workspace rust client · spark JNI; repo clients include python/go/embedded variants"]:::apps
+  CTL["<b>Control</b> (3)<br/>catalog and authorization control-plane crates"]:::layer
+  HRZ["<b>Horizontal</b> (41)<br/>codec, compression, security, telemetry and shared runtime utilities"]:::layer
+  MOD["<b>Modality Runtime</b> (14)<br/>vector, document, graph, observability, embedding, queue and rank"]:::layer
+  STG["<b>Storage</b> (22)<br/>block format, object store, Iceberg and storage services/ports"]:::layer
+  QRY["<b>Query / Cross-Model</b> (24)<br/>logical, relational, vector, document, graph and fusion query crates"]:::layer
+  PLT["<b>Platform</b> (5)<br/>API, runtime, admin UI, MCP and platform integration"]:::layer
+  APP["<b>Apps</b> (4)"]:::apps
+  BND["<b>Bindings</b> (4)"]:::apps
+  INT["<b>Integration</b> (1)"]:::apps
+  CLI["<b>Client</b> (1)"]:::apps
+  ROOT["<b>Root crate</b> (1)"]:::apps
 
-  FND --> CTR --> CTL --> HRZ --> MOD --> STG --> QRY --> PLT --> APP
+  FND --> CTR --> CTL --> HRZ --> MOD --> STG --> QRY --> PLT
+  PLT --> APP
+  PLT --> BND
+  PLT --> INT
+  PLT --> CLI
+  PLT --> ROOT
 ----
 
 NOTE: Crate-by-crate authority/inputs/outputs live in the feeder
@@ -306,8 +322,9 @@ link:ARCHITECTURE_ATLAS_2026_05_22.adoc[ARCHITECTURE_ATLAS_2026_05_22]. This map
 [#srcmap]
 == Layer 2 — `src/` module map (42 top-level module directories)
 
-The root crate composes the workspace crates and still hosts the load-bearing runtime implementations
-(handler extraction to `proximadb-api` is in progress — see <<seams>>).
+The root crate composes the workspace crates and still hosts many load-bearing services. Handler
+composition is split deliberately: `proximadb-runtime` owns the sole production `ApiHandlersPort`
+implementation, while the root `shared_services` module injects its concrete service ports.
 
 [source,mermaid]
 ----
@@ -328,8 +345,9 @@ flowchart TB
   end
 
   subgraph NET[Network & Protocol]
-    NWK["network/<br/>rest/{v1,v2} · grpc · postgres (pgwire 5433) · arrow_ipc<br/>multi_server · router · shared_services"]:::sub
-    APH["api_handlers/<br/>unified · ai · v1 · v2 (UnifiedHandlers — real impl)"]:::sub
+    NWK["network/<br/>REST /api/v2 + entity-only v1 compatibility · external gRPC v2<br/>postgres (pgwire 5433) · arrow_ipc · multi_server · router · shared_services"]:::sub
+    APH["api_handlers/<br/>support modules and record operations; no production ApiHandlersPort impl"]:::sub
+    RTH["proximadb-runtime/handlers.rs<br/>sole production UnifiedHandlers / ApiHandlersPort impl"]:::sub
   end
 
   subgraph SVC[Services & Catalog]
@@ -349,9 +367,9 @@ flowchart TB
     TXN["transaction/ (mvcc·isolation·locks)"]:::sub
   end
 
-  EMB["embedded/ (PyO3/DataFrame · JNI/NAPI/C FFI direction)"]:::grp
+  EMB["crates/binding/proximadb-embedded<br/>feature-gated Python/JNI/NAPI/C implementations<br/>(code presence is not a support claim)"]:::grp
 
-  NET --> SVC --> DATAEXEC
+  NET --> RTH --> SVC --> DATAEXEC
   SVC --> CTLP
   DATAEXEC --> INTG
   DATAEXEC --> EMB
@@ -366,10 +384,10 @@ flowchart TB
 flowchart LR
   classDef n fill:#4a90e2,stroke:#2e5c8a,color:#000;
   C[Client]:::n --> N["network/<br/>(REST/gRPC/Flight/pgwire)"]:::n
-  N --> H["api_handlers/<br/>UnifiedHandlers"]:::n
+  N --> H["wire adapter<br/>runtime handler or typed DDL/DML port"]:::n
   H --> S["services/<br/>operations·dml"]:::n
   S --> W["storage/persistence/<br/>write_ahead_log (canonical WAL)"]:::n
-  W --> E["UnifiedStorageEngine<br/>(SST/HELIX/VIPER/…)"]:::n
+  W --> E["engine writer + UnifiedStorageFormat<br/>(SST/HELIX/VIPER/…)"]:::n
   E --> F["storage/persistence/<br/>filesystem"]:::n
   S -. authority .-> X["xCatalog<br/>(proximadb-catalog)"]:::n
 ----
@@ -380,30 +398,34 @@ flowchart LR
 [source,mermaid]
 ----
 %%{init: {"theme": "neutral"}}%%
-flowchart LR
+flowchart TB
   classDef n fill:#4a90e2,stroke:#2e5c8a,color:#000;
-  C[Client]:::n --> N["network/"]:::n
-  N --> P["query/<br/>planner + ComputeScheduler + EXPLAIN"]:::n
+  C[Client]:::n --> N["network protocol adapter"]:::n
+  N --> P["relational planner<br/>eligible SQL shapes only"]:::n
+  P --> DEC["SelectRouteDecision.backend<br/>Native or DataFusionLocal"]:::n
+  DEC --> NV["plan_over_snapshot → execute_physical<br/>NativeVolcanoEngine"]:::n
+  DEC --> DF["execute_sql_with_backend<br/>DataFusion; optional DuckDB compatibility"]:::n
+  DEC -. route / EXPLAIN / telemetry .-> RRP["RoutedReadPlan vocabulary<br/>(not a universal dispatcher)"]:::n
+  N --> SR["REST/gRPC vector service<br/>+ index (AXIS/DiskANN)"]:::n
+  N --> GQ["modality services<br/>ORION/document/observability"]:::n
   P -. route knobs .-> X["xCatalog"]:::n
-  P --> RRP["RoutedReadPlan<br/>Native · DataFusionLocal · DataFusionDistributed"]:::n
-  RRP --> SR["core/search<br/>+ index (AXIS/DiskANN)"]:::n
-  RRP --> DF["datafusion/<br/>local scan now; Ballista adapter planned"]:::n
-  RRP --> GQ["graph/<br/>ORION projection runtime"]:::n
-  SR --> E["UnifiedStorageEngine"]:::n
-  DF --> E
-  GQ --> E
+  SR --> E["engine reader + UnifiedStorageFormat"]:::n
   E --> D["compute/distance<br/>(+ quantization)"]:::n
   D --> FU["core/search/hybrid/fusion<br/>(RRF + 11 strategies)"]:::n
   FU --> RK["rank-* (RERANK SRF)<br/>ProductionHybridBackend"]:::n
-  RK --> C
+  RK --> OUT[Results]:::n
+  DF --> OUT
+  NV --> OUT
+  GQ --> OUT
 ----
 
 [#convergence]
 == Layer 4 — Protocol-facade → canonical-authority convergence
 
-Wire protocols are *facades*, not authorities. They lower into the same canonical record + WAL +
-catalog chain. This is the load-bearing invariant the whole architecture rests on: proliferation is
-allowed at the edge, never in the durable core.
+Wire protocols are *facades*, not authorities. The diagram is the convergence target, not a claim
+that every live modality already follows one universal linear pipeline. New work must lower toward
+the shared service/record/WAL spine; xCatalog supplies schema, identity, policy and route metadata as
+a control-plane side path rather than receiving record payloads as a sink.
 
 [source,mermaid]
 ----
@@ -412,15 +434,15 @@ flowchart TB
   classDef edge fill:#cfe2f7,stroke:#2e5c8a,color:#000;
   classDef core fill:#4a90e2,stroke:#2e5c8a,color:#000;
 
-  R1[REST v1]:::edge --> SVC
   R2[REST v2]:::edge --> SVC
-  GR[gRPC]:::edge --> SVC
+  R1E[REST v1 entity compatibility]:::edge --> SVC
+  GR[external ProximaDB gRPC v2]:::edge --> SVC
   AF[Arrow Flight]:::edge --> SVC
   PG["pgwire 5433<br/>(pgvector compat)"]:::edge --> SVC
 
-  SVC["services/ (shared)"]:::core --> REC["ProximaRecord<br/>ProximaType / ProximaValue"]:::core
-  REC --> WAL["canonical WAL"]:::core
-  WAL --> XC["xCatalog (durable authority)"]:::core
+  SVC["services (shared where converged)"]:::core --> REC["ProximaRecord<br/>ProximaType / ProximaValue"]:::core
+  REC --> WAL["canonical WAL / modality recovery spine"]:::core
+  XC["xCatalog<br/>schema · identity · policy · route metadata"]:::core -. control .-> SVC
 ----
 
 [#seams]
@@ -434,25 +456,45 @@ link:CONVERGENCE_AUDIT_2026_05_30.adoc[CONVERGENCE_AUDIT_2026_05_30]. Summary:
 |===
 | Seam | One-line status
 
-| Phase 9 handler/service extraction
-| Real impl in `src/api_handlers/request_handlers.rs`; `proximadb-runtime/src/handlers.rs` is a stub. Migration in progress.
+| Handler/service extraction
+| `crates/platform/proximadb-runtime/src/handlers.rs` is the sole production `ApiHandlersPort`
+implementation and `src/network/shared_services.rs` constructs it from root service ports.
+`src/api_handlers` retains support/record-operation modules; `request_handlers.rs` no longer exists.
 
-| Deprecated gRPC shims
-| `src/network/grpc/*_service.rs` deprecation shims; real impls migrated. Removal targeted for v0.2 (pulls forward from the code's `0.3.0` markers).
+| Retired wire generations
+| REST `/api/v2` is canonical. One residual compatibility router remains live at
+`/api/v1/collections/{collection_id}/entities` (plus `/{entity_id}` and `/search`) over
+`ProximaEntityStore`; all other ProximaDB REST `/api/v1` routes and `/api/v3` are removed.
+Canonical external ProximaDB application RPCs are `proximadb.v2`; the v2
+`ProximaEntityService` is always registered and `proximadb.v1` service registration is gone.
+Standard `grpc.health.v1`, optional reflection, and experimental cluster-mode
+`proximadb.cluster.v1` RPCs are separate infrastructure/internal protocols, not the retired external
+v1 product surface. Internal v1 DTO code remains migration debt.
 
 | Proto-v1 internal mirrors
 | `VectorRecord`/`SqlValue`/`SqlObject` still used internally; canonical is `ProximaRecord`/`ProximaValue`.
 
-| Scattered configs
-| RESOLVED 2026-06-05 at the app-config seam; connector/runtime-local specialization remains local.
+| Record storage
+| The stable store trait lives in `proximadb-records/src/store.rs`; root
+`services/record_store.rs` and `services/record_memtable.rs` are adapters. Avoid reintroducing a root
+contract twin.
 
-| PlanCache B/C/D
-| Four impls; A consolidated, B/C/D intentionally separate (documented as by-design).
+| Relational route and execution
+| `RoutedReadPlan` is typed route/EXPLAIN/telemetry vocabulary, not a universal dispatcher. Live
+relational dispatch consumes `SelectRouteDecision.backend`: native uses
+`plan_over_snapshot` → `execute_physical`/`NativeVolcanoEngine`; `execute_sql_with_backend` handles
+DataFusion and the optional, correctness-floor `DuckDbCompat` path.
 
 | Read-side distributed execution
 | `ComputeScheduler` and `RoutedReadPlan` exist; DataFusionLocal is the first OLAP route, while
 Ballista-backed `DataFusionDistributed` remains a planned/experimental adapter behind the same route
 contract.
+
+| Native-to-Arrow scans
+| SST split discovery is implemented, but `SstBlockStream::poll_next` currently returns EOF without
+reading, decoding, or producing a `RecordBatch`. PAX `PaxSplitReader`/`PaxTableProvider` and ranged
+tests exist; row-group Region D storage writes default ON, while the production PAX OLAP query route
+remains default OFF and is not fully wired.
 |===
 
 [#state]
@@ -470,16 +512,21 @@ link:../SUPPORTED_SURFACE.adoc[docs/SUPPORTED_SURFACE.adoc]; this map summarizes
 target spine. Proto v1 DTOs and legacy `VectorRecord`/`SqlValue`/`SqlObject` remain edge adapters or
 internal migration debt. ADR-024 is accepted and partially rolled out; ADR-031/048 keep identity and
 native catalog authority separate from compatibility collection views.
-| Ready for narrow v0.2 when flows stay on the canonical record path. Full internal type/schema and
-v1 DTO migration remains TD-106/TD-123/ADR-024 work.
+| Usable only through the flows explicitly listed in the support contract. Full internal type/schema
+and v1 DTO migration remains TD-106/TD-123/ADR-024 work; package-version strings are not a maturity
+signal.
 
 | Vector path
-| REST/gRPC v2 record CRUD and vector search are the supported product path. Multiple vector storage
-engines and AXIS index families exist; v1 vector APIs are compatibility facades.
+| REST `/api/v2` and external gRPC v2 record CRUD/vector search are the supported product path.
+Multiple vector storage engines and AXIS index families exist. REST v1 vector/collection/search
+routes, REST `/api/v3`, and external `proximadb.v1` RPCs are not served; the entity-only REST v1
+compatibility exception does not expose vector CRUD/search. Internal v1 DTO presence is not wire
+compatibility.
 `bench_24_recall_at_k_engine` is registered as a real index-vs-ground-truth Recall@k benchmark with
 deterministic vectors, bounded search-readiness probing, and optional `PROXIMADB_BENCH_TOPK=K`
 single-K runs for isolating low-effort Recall@K/latency curves.
-| MVP-ready for single-node canonical vector CRUD/search. Hybrid, per-collection filtered-ANN policy,
+| The MVP trust corridor is single-tenant, single-node SST through canonical REST v2. Hybrid,
+per-collection filtered-ANN policy,
 recall-gate enforcement, and object-economy claims stay Beta/Experimental unless explicitly scoped.
 The real-engine recall benchmark is evidence plumbing, not a published recall SLA until run outputs
 are captured and reviewed.
@@ -494,23 +541,22 @@ maturity as the supported vector surface. Do not infer a separate durable entity
 from compatibility surfaces.
 
 | SQL / pgwire / relational
-| pgwire is a supported SQL surface for scoped v0.2 use, and gRPC `ExecuteQuery` is supported for
-tenant-scoped relational SQL plus vector/graph-extension SQL. Relational
-frontend/algebra/planner/executor crates, DML routing, `ComputeScheduler`, DataFusionLocal route
-vocabulary, read-side `RoutedReadPlan`, and query-layer execution seams exist. pgwire dispatches
-through `execute_sql_with_backend` rather than constructing DataFusion directly. Native physical
-plans execute through `NativeVolcanoEngine`; DataFusion is fenced as a swappable physical backend
-behind ADR-039 and primarily serves parquet-backed / interop paths. Read routing is trace-taught
-(co-design C4): every pgwire relational `SELECT` consults `route_select_advised` against the global
-`RouteCostModel` (EWMA over per-query io_trace snapshots; observer wired at startup, persisted
-across restarts) — observe-mode advisory by default, with a landed but flag-gated live override
+| pgwire and gRPC v2 `ExecuteQuery` are Beta, scoped SQL adapters and remain outside the MVP trust
+corridor. Relational frontend/algebra/planner/executor crates, DML routing, `ComputeScheduler`,
+DataFusionLocal route vocabulary, `RoutedReadPlan` telemetry vocabulary, and query-layer execution
+seams exist. Live dispatch consumes `SelectRouteDecision.backend`: DataFusion and optional DuckDB
+compatibility run through `execute_sql_with_backend`; native physical plans use
+`plan_over_snapshot` → `execute_physical`/`NativeVolcanoEngine`. Eligible pgwire relational OLAP
+shapes consult `route_select_advised` against the global `RouteCostModel`, but pgvector, environment
+opt-out, result-cache, in-memory, and legacy simple-SELECT paths bypass that advice. Observe-mode is
+the default, with a landed but flag-gated live override
 (`PROXIMADB_ROUTE_COST_OVERRIDE`, default OFF; explore/exploit over freshness-safe candidates plus
 the TD-170 round-trip hard gate, enablement gated by TD-ROUTE-1). Full PostgreSQL parity, complete
 constraints, MVCC/index state, HTAP delta union, accuracy ratchets, and distributed consistency gates
 remain TD-076/TD-110/TD-115/ADR-040 work.
-| MVP-ready as a scoped SQL/pgwire compatibility surface, not as a PostgreSQL replacement. Keep
-positioning to supported single-node SQL cases; broad ORM/BI parity, full OLTP/HTAP semantics,
-engine-native streaming/backpressure, and distributed SQL are not v0.2 claims.
+| Beta for explicitly scoped single-node SQL cases, not a PostgreSQL replacement or MVP-corridor
+surface. Broad ORM/BI parity, full OLTP/HTAP semantics, engine-native streaming/backpressure, and
+distributed SQL are not supported claims.
 
 | DataFusion / distributed execution
 | DataFusion integration, local Parquet registration, shared relational lowering, typed
@@ -525,22 +571,32 @@ table schema exists; the Python facade exports the DataFrame expression helpers,
 expressions, exposes a DataFrame `vector_search()` bridge, makes table refresh idempotent for
 long-lived sessions, and returns typed empty PyArrow tables from `to_arrow()`. Blank SQL/table/column
 names, empty aggregate expression lists, keyless joins, and invalid vector-search arguments are
-rejected at the Python and/or DataFusion table-function boundary before execution. Scans still
-require embedded split discovery before collection reads can be claimed row-producing.
+rejected at the Python and/or DataFusion table-function boundary before execution. SST split
+discovery exists, but `SstBlockStream` still returns EOF without reading or decoding its split, so
+that adapter is not row-producing. PAX row-group Region D writes default ON; `PaxSplitReader`,
+`PaxTableProvider`, and ranged-read tests exist, but the production PAX OLAP query route remains
+default OFF and is not fully wired.
 | Local parquet/interop OLAP route is Beta. ADR-052 narrows the near-term aspiration: win
 single-node/vectorized OLAP and PAX-native scan competitiveness before MPP claims. `DataFusionDistributed`
 remains route vocabulary only: Ballista execution, scheduler/executor deployment, distributed
-cross-engine joins, embedded row-producing collection scans, and no-overlap/failure tests are not
+cross-engine joins, SST row-producing scans, production PAX OLAP routing, and no-overlap/failure tests are not
 complete.
 
-| SaaS tenancy and billing boundaries
-| REST and pgwire surfaces propagate tenant identity into service/storage paths; storage has
-`TenantContext`; `DrPathBuilder` owns tenant-isolated physical path construction; telemetry/metrics
-modules provide the billing-observability substrate. Catalog metadata is the known structural gap:
-ADR-032/TD-CAT-2 require tenant-prefixed catalog object paths and a fail-closed deployment mode.
+| SaaS tenancy and metering boundaries
+| REST `/api/v2`, gRPC v2, Arrow Flight, and pgwire use the shared tenant-ingress vocabulary and can
+fail closed when a deployment requires a tenant but none resolves. `TenantContext` reaches storage
+paths and `DrPathBuilder` owns tenant-isolated physical path construction. pgwire currently uses
+trust authentication with a bare tenant assertion; strict header-trust policy therefore rejects
+explicit non-default tenant assertions rather than credential-binding them. The reserved literal
+`default` remains accepted; an omitted database selects the configured default in single-tenant
+mode and fails closed in multi-tenant mode. Neutral consumption signals exist for object GETs/bytes,
+task time, KOU/KEU/cache quantities, and `MeteringEvent`; they are observability inputs,
+not a billing authority or entitlement system. Catalog tenant namespacing remains default OFF/raw,
+and stable-ID, modality, and in-memory isolation gaps remain.
 | Mandatory architectural gate. New I/O and heavy-compute boundaries must accept or derive tenant
 context deliberately, and physical data paths must flow through `DrPathBuilder`. Multi-tenant
-production claims remain scoped until catalog path isolation and fail-closed mode land.
+production claims remain scoped until catalog path isolation/migration, credential-bound pgwire
+identity, stable IDs, and cross-modality isolation close.
 
 | Open formats and object economy
 | Object-store and Iceberg engine crates are in the workspace; Parquet/Arrow/Iceberg are the
@@ -551,25 +607,32 @@ external-authority mode.
 where tested, not default external-table durable authority or warehouse-scale object economy.
 
 | Security / ops / deployment
-| Security runtime, mTLS/JWT/API key hooks, observability, backup/restore, and deployment assets
-exist. Some admin/status APIs and production runbooks still need hardening.
-| Sufficient for developer/private deployments and scoped pilots; enterprise production positioning
-should remain constrained by tenant-catalog isolation, operational runbooks, conformance accuracy,
-and release-smoke evidence.
+| Principal/API-key registry and fail-closed identity-store boot, relational-transport ABAC/grants,
+OIDC role allowlisting, optional REST rate limiting, mTLS/JWT hooks, observability, backup/restore
+code, and deployment assets exist. Remaining gaps include pgwire authentication, audit
+integrity/retention, write and `System` authorization bypasses, key lifecycle/revocation/MFA,
+self-service operations, modality isolation, BYOK/residency, atomic stores, and demonstrated remote
+restore/deployment behavior.
+| Constrain claims to developer and single-node evaluation deployments. Enterprise or disaster-
+recovery positioning requires tenant-catalog isolation, operational evidence, authz closure,
+conformance accuracy, and release-smoke evidence.
 
 | Deterministic validation guardrails
 | `scripts/check_deterministic_commit_contract.py`, `make work-commit-check`, CI
-`deterministic-commit-contract`, `docs-claim-check`, capability-matrix validation, workspace
-boundary checks, tenant-path guard, panic-policy guard, and zero-retry nextest unit profile are now
-the documented fast guard chain.
+`deterministic-commit-contract`, branch-promotion/design/status/status-as-of checks,
+`docs-claim-check`, MVP contract/smoke checks, context-benchmark validation, capability-matrix and
+workspace-boundary checks, tenant ingress/catalog seal/tenant-path checks, silent-failure and env-gate
+checks, panic-policy checks, and the retry-budgeted nextest unit profile (`retries = 2`, with
+survivors reported as flaky and exhausted failures still failing) form the fast guard chain.
 | Mandatory for commit hygiene. The guard chain validates that deterministic test policy, support
 claims, architecture invariants, SaaS path constraints, and conflict-marker absence stay wired as the
 codebase evolves.
 |===
 
-MVP posture: ProximaDB is ready to position as a **single-node context database foundation** with a
-supported canonical vector record path, scoped SQL/pgwire compatibility, and Beta multimodal
-surfaces. It is not yet ready to position as a mature distributed database, full PostgreSQL-compatible
+MVP posture: the trust corridor is **single-tenant, single-node SST through canonical REST v2 record
+operations**. pgwire/gRPC SQL, hybrid retrieval, alternate engines, multimodal projections, cloud
+backends, and distributed execution remain outside that promise at their documented Beta or
+Experimental tiers. ProximaDB is not yet ready to position as a mature distributed database, full PostgreSQL-compatible
 OLTP/HTAP system, or warehouse-scale MPP engine. The architecture is aligned for that aspiration
 through xCatalog, route-once planning, the ADR-039 physical-backend seam, ADR-052's vectorized OLAP
 direction, and canonical record convergence, but the implementation is still slice-based and must
@@ -587,17 +650,22 @@ fast enough to run before commit/push; heavier release smokes remain in `make re
 
 | Deterministic commit contract
 | `python3 scripts/check_deterministic_commit_contract.py`; `make deterministic-commit-contract-check`
-| Zero-retry nextest unit policy, CI/Makefile wiring, support-vs-code-presence architecture text,
+| Retry-budgeted nextest unit policy, CI/Makefile wiring, support-vs-code-presence architecture text,
 `TenantContext` / `DrPathBuilder` visibility, and conflict-marker absence.
 
 | Work commit gate
 | `make work-commit-check`
-| Formatting, deterministic contract, docs/support claims, capability matrix, workspace boundaries,
-tenant-path guard, panic-policy module guard, and tracked-artifact hygiene.
+| Formatting, deterministic contract, branch-promotion policy, docs/support/design/status freshness,
+capability matrix, MVP contract/smoke, context benchmarks, workspace boundaries, tenant ingress,
+catalog seal/path isolation, panic/silent-failure ratchets, env-gate registry, and tracked-artifact hygiene.
 
 | Release gate
 | `make release-check`
-| `work-commit-check` plus protobuf/OpenAPI drift, focused release smokes, and release-server build.
+| `work-commit-check` plus `proto-check` (locally: the proto crate and Python gRPC/schema/OpenAPI
+contract tests), focused release smokes, query conformance, and release-server build.
+`verify-openapi-spec`, the enforcing Go/TypeScript/Python REST SDK codegen-drift jobs, the advisory
+Rust regeneration job, and the blocking Python round-trip check are separate CI jobs rather than
+`release-check` dependencies.
 
 | SaaS path isolation
 | `python3 scripts/check_tenant_path_guard.py`; `.github/workflows/layering-check.yml`

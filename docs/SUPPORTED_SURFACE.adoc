@@ -2,8 +2,8 @@
 :toc: left
 :toclevels: 2
 :icons: font
-:last-updated: 2026-08-03
-// status-as-of: 2026-08-03
+:last-updated: 2026-09-11
+// status-as-of: 2026-09-11
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the support tiers against HEAD, then bump it.
 
@@ -69,14 +69,15 @@ cross-surface REST/gRPC/Flight/pgwire admit/deny matrix passes.
 
 == Canonical API Surface
 
-REST `/api/v2` is the **sole canonical surface** for all ProximaDB clients as of 2026-08-03.
+REST `/api/v2` is the **sole canonical REST surface** for all ProximaDB clients as of 2026-09-11.
 
 [IMPORTANT]
 ====
 * *REST /api/v2* — canonical; all new clients and integrations must target this prefix.
-* *REST /api/v1* — deprecated compatibility adapter. Requests are still accepted but must
-  lower into v2 handlers internally. The v1 prefix will be retired; do not document or
-  advertise it in new collateral.
+* *REST /api/v1* — **REMOVED except for the entity compatibility path family** at
+  `/api/v1/collections/{id}/entities`, `/{entity_id}`, and `/search` (including entity listing).
+  Those routes still use the
+  transitional `ProximaEntityStore`; no other v1 REST collection/vector/search surface is mounted.
 * *REST /api/v3* — **removed**. The document-ingest handler lives canonically at
   `POST /api/v2/collections/{id}/documents`; the former v3 308-redirect alias was
   deleted (it was never an OpenAPI/released surface). Target `/api/v2` for all clients.
@@ -123,7 +124,7 @@ query endpoint, and `/api/v2/query` is *not* SQL-over-REST. Route by language:
   pgwire is also autocommit-only and rejects transaction control with SQLSTATE `0A000`.
 | Beta — programmatic SQL exists, but broader relational and cross-modal parity is not in the MVP corridor
 
-| *REST/gRPC `/api/v2/query`* (unified query port)
+| *REST `POST /api/v2/query`* (unified query port)
 | *UQL* (unified multi-modal), *Federated* SQL extensions, *AQL*
 | ProximaDB-native cross-modal queries (vector + graph + relational) that SQL cannot express.
 | UQL/Federated Beta; AQL Planned
@@ -141,15 +142,14 @@ query endpoint, and `/api/v2/query` is *not* SQL-over-REST. Route by language:
 | Now on v2 `ProximaGraphService`. GREMLIN reserved/unbacked.
 | Beta (subset)
 
-| *Graph `ExecuteHybridQuery` / `CreateGraphWithEngine` / `GetPulsarStats`*
+| *Legacy graph `ExecuteHybridQuery` / `CreateGraphWithEngine` / `GetPulsarStats` names*
 | Cross-modality hybrid query; engine-typed graph create; PULSAR stats
-| **Absent from v2; the v1 surface they were deferred to is REMOVED** (the
-  `enable_grpc_v1_compat` gate no longer exists). Hybrid search is served by
-  REST `/api/v2/hybrid/search`; a v2-native gRPC hybrid RPC would be a new
-  design, not a port. `CreateGraphWithEngine`/`GetPulsarStats` are
-  retired/unimplemented (PULSAR/QUASAR). See TD-124 + the v2 graph.proto
-  service comment.
-| Not planned (absent)
+| The legacy method names are absent because the v1 gRPC service and
+  `enable_grpc_v1_compat` gate are removed. Their vector-seed/graph-expand capability is served by
+  canonical v2 `ProximaFusionService.FusionSearch` and REST
+  `/api/v2/graphs/{graph_id}/fusion-search`. `CreateGraphWithEngine` and `GetPulsarStats` are
+  retired/unimplemented with PULSAR/QUASAR. See TD-124 and the v2 graph/fusion protos.
+| Hybrid capability: Beta on v2; legacy method names: absent
 |===
 
 [NOTE]
@@ -210,9 +210,9 @@ primitives.
 | Converge every cross-modal blend on the `oid`-keyed fusion seam (`seed -> expand -> calibrate -> fuse-by-oid -> rank`). Do not add one-off entity/vector/document/graph join handlers.
 
 | Entity / SKS
-| gRPC v1 `proximadb.v1.EntityService` removed (sunset completed — no opt-in flag remains); legacy REST v1 entity routes and split `ProximaEntityStore` exist as compatibility/transition code
+| Canonical REST v2 `/api/v2/collections/{id}/entities`, `/{entity_id}`, and `/search` are OpenAPI-published; gRPC v2 `proximadb.v2.ProximaEntityService` is always registered. A residual REST v1 path family remains live on the transitional store and additionally supports entity listing; no gRPC v1 entity service is registered.
 | Semantic convenience shape: entity id, metadata, embeddings, provenance, relations, temporal fields
-| Do not create v2 entity storage. A future v2 entity surface, if exposed, must be an orchestration facade over record/vector + graph + document/provenance + event/temporal history, with `TenantContext` and structural tenant paths at every I/O boundary.
+| Do not create another entity substrate. Converge all three live facades on orchestration over record/vector + graph + document/provenance + event/temporal history, with `TenantContext` and structural tenant paths at every I/O boundary; retire the REST v1 compatibility routes only with measured client evidence.
 |===
 
 [NOTE]
@@ -252,7 +252,7 @@ for evidence/provenance, and event/history records for temporal state. The v1
 
 | Vector CRUD and search
 | Supported
-| Canonical REST `/api/v2` record batch/search/get/scan flows, gRPC `proximadb.v2.ProximaRecordService` record operations, and Arrow Flight canonical `type: "vector_search"` `DoGet`. REST `/api/v1` and gRPC v1 vector-shaped flows are deprecated compatibility adapters for existing clients only (see Canonical API Surface above); they lower into canonical v2 handlers and will be retired. Record metadata filters are enforced on typed `/search` (`filters:[{field,op,value}]`) and `/records/scan` (`filter`) across the supported ops (`eq,neq,gt,gte,lt,lte,in,contains,between,starts_with,ends_with`), including tenant/account scoping; array-valued props support `in`/`contains` membership. Canonical REST search/point-get, authenticated gRPC v2 unary search/streaming search/point-get, and authenticated Flight record search have live provisioned-ABAC evidence for deny-before-provision, row-predicate filtering, principal isolation, and hot revoke.
+| Canonical REST `/api/v2` record batch/search/get/scan flows, gRPC `proximadb.v2.ProximaRecordService` record operations, and Arrow Flight canonical `type: "vector_search"` `DoGet`. REST v1 vector/collection/search routes and gRPC v1 are removed wire surfaces; the entity-only REST v1 compatibility exception remains, and other v1 DTO usage is internal migration debt. Record metadata filters are enforced on typed `/search` (`filters:[{field,op,value}]`) and `/records/scan` (`filter`) across the supported ops (`eq,neq,gt,gte,lt,lte,in,contains,between,starts_with,ends_with`), including tenant/account scoping; array-valued props support `in`/`contains` membership. Canonical REST search/point-get, authenticated gRPC v2 unary search/streaming search/point-get, and authenticated Flight record search have live provisioned-ABAC evidence for deny-before-provision, row-predicate filtering, principal isolation, and hot revoke.
 | Keep hybrid retrieval and distributed search claims separate from the supported vector surface. New clients must not target v1 `VectorRecord`/`SqlValue` payloads.
 
 | Federated SQL over function-backed sources
@@ -267,8 +267,8 @@ for evidence/provenance, and event/history records for temporal state. The v1
 
 | ORION graph operations
 | Beta
-| Node/edge CRUD, traversal, neighbors, shortest-path APIs, canonical node/edge mapping, and adjacency projections are usable. These core operations are now served on the canonical v2 gRPC surface (`proximadb.v2.ProximaGraphService`, always-registered) and consumed by the Python SDK; the deprecated `proximadb.v1.GraphService` is off by default (`enable_grpc_v1_compat`).
-| The analytic (GetConnectedComponents/HasCycle), batch (BatchCreateNodes/Edges), unique-constraint, server-streaming (StreamTraverse), and declarative `ExecuteQuery` (supported openCypher subset) RPCs are now on the canonical v2 gRPC path (TD-124). Still v1-only/deferred: `ExecuteHybridQuery` (needs a v2-native vector+graph fusion surface), and the unimplemented `CreateGraphWithEngine`/`GetPulsarStats` (PULSAR/QUASAR retired); GREMLIN is reserved/unbacked. Graph creation/DDL is REST-only (`/api/v2/graphs`). ORION is a rebuildable projection runtime; durable graph authority remains in canonical records, xCatalog, WAL/log/manifest state, policy/RLS, version/time, and provenance.
+| Node/edge CRUD, traversal, neighbors, shortest-path APIs, canonical node/edge mapping, and adjacency projections are usable. These core operations are served on the canonical v2 gRPC surface (`proximadb.v2.ProximaGraphService`, always registered) and consumed by the Python SDK; `proximadb.v1.GraphService` and its former compatibility gate are removed.
+| The analytic (GetConnectedComponents/HasCycle), batch (BatchCreateNodes/Edges), unique-constraint, server-streaming (StreamTraverse), and declarative `ExecuteQuery` (supported openCypher subset) RPCs are on the canonical v2 gRPC path (TD-124). The old `ExecuteHybridQuery` method name is gone, but its vector+graph capability is served by v2 `ProximaFusionService.FusionSearch` and the REST fusion route. `CreateGraphWithEngine`/`GetPulsarStats` are retired/unimplemented with PULSAR/QUASAR, and GREMLIN is reserved/unbacked. Graph creation/DDL is REST-only (`/api/v2/graphs`). ORION is a rebuildable projection runtime; durable graph authority remains in canonical records, xCatalog, WAL/log/manifest state, policy/RLS, version/time, and provenance.
 
 | Observability ingestion and query
 | Beta
@@ -277,13 +277,13 @@ for evidence/provenance, and event/history records for temporal state. The v1
 
 | Security runtime
 | Beta
-| JWT, API key, SSO hooks, mTLS identity, and CRL-backed revocation reload/freshness checks are present. Tenant identity is credential-bound by policy on EVERY network surface (TD-TENANT-1, one shared primitive in `proximadb-tenant`): an assertion that contradicts an authenticated tenant binding is always rejected (HTTP 403 / gRPC PERMISSION_DENIED / SQLSTATE 28000); the bare assertion (REST `X-Tenant-ID`, gRPC/Arrow Flight `x-tenant-id` metadata, pgwire startup `database` + tenant session vars) is governed by `HeaderTrustPolicy` (`open` default / `authenticated-only` in the multi-tenant strict preset / `gateway-only` for trusted-gateway delegation via a first-class gateway-principal role marker), configurable via `[security.tenant] header_trust` and overridable via `PROXIMADB_TENANT_HEADER_TRUST`. Rejections emit `proximadb::tenant_audit` warns. The entitlement claim (`x-tenant-tier` on REST, gRPC, and Arrow Flight; `proximadb_tier` pgwire startup param) is governed by the same ladder via `[security.tenant] tier_header_trust` / `PROXIMADB_TIER_HEADER_TRUST` (ADR-0053 W8): an untrusted claim is dropped — never a 4xx — and the tenant resolves its default tier; under strict policies the pgwire startup parameter is inert (trust auth carries no binding). Generic OIDC bearer authentication is supported via `[security.authentication.oidc]` (TD-SSO-1: Kanidm, Keycloak, Okta, Azure Entra ID, Google Workspace; JWKS-validated RS256/ES256, any-of audience list, issuer aliases for bare-hostname `iss` forms, nested claim paths for Keycloak `realm_access.roles`, custom CA for internal PKI, configurable clock-skew/JWKS-TTL/timeout; IdP role claims cross only through the sanitized seam — gateway/operator delegation markers plus an operator allowlist, everything else dropped). REST request rate limiting is opt-in via `PROXIMADB_REST_RATE_LIMIT_RPM` (TD-RATE-1; default off — unset adds no middleware layer; per observed client IP, `/health` exempt, process-global ceiling at 10x the per-IP cap). Deprecated claim use and dropped tier claims are metered (`proximadb_deprecated_claim_uses_total`, `proximadb_tier_claims_dropped_total`) — the Flight legacy-alias retirement gate is `increase(proximadb_deprecated_claim_uses_total[7d]) == 0`. Claim *names* come from one shared vocabulary across all four surfaces (TD-TENANT-3): `x-tenant-id` / `x-tenant-tier` are canonical everywhere, Arrow Flight additionally DETECTS three deprecated tenant-alias names (`x-proximadb-tenant-id`, `tenant-id`, `tenant_id`) for deprecation warning only — they no longer grant a tenant (honoring removed 2026-08-29; the names are deleted at the next release boundary), and a stamped tier claim is normalized to a canonical tier id at the boundary so an alias and its canonical spelling resolve to the same cache entitlement.
-| Security admin/status APIs and stronger online revocation policy are incomplete. pgwire runs trust auth (no credential binding), so strict policies disable pgwire tenant selection rather than authenticate it; ADR-031 tenant stable-id minting behind the `TenantStableIdResolver` port is pending (TD-TENANT-1).
+| JWT, API key, SSO hooks, mTLS identity, and CRL-backed revocation reload/freshness checks are present. Tenant assertions are reconciled with credential bindings on every network surface through one shared policy primitive (TD-TENANT-1, in `proximadb-tenant`): an assertion that contradicts an authenticated tenant binding is rejected (HTTP 403 / gRPC PERMISSION_DENIED / SQLSTATE 28000), except that an authenticated gateway principal may delegate a different acting tenant under `gateway-only`; the bare assertion (REST `X-Tenant-ID`, gRPC/Arrow Flight `x-tenant-id` metadata, pgwire startup `database` + tenant session vars) is governed by `HeaderTrustPolicy` (`open` default / `authenticated-only` in the multi-tenant strict preset / `gateway-only` for trusted-gateway delegation via a first-class gateway-principal role marker), configurable via `[security.tenant] header_trust` and overridable via `PROXIMADB_TENANT_HEADER_TRUST`. Rejections emit `proximadb::tenant_audit` warns. The entitlement claim (`x-tenant-tier` on REST, gRPC, and Arrow Flight; `proximadb_tier` pgwire startup param) is governed by the same ladder via `[security.tenant] tier_header_trust` / `PROXIMADB_TIER_HEADER_TRUST` (ADR-0053 W8): an untrusted claim is dropped — never a 4xx — and the tenant resolves its default tier; under strict policies the pgwire startup parameter is inert (trust auth carries no binding). Generic OIDC bearer authentication is supported via `[security.authentication.oidc]` (TD-SSO-1: Kanidm, Keycloak, Okta, Azure Entra ID, Google Workspace; JWKS-validated RS256/ES256, any-of audience list, issuer aliases for bare-hostname `iss` forms, nested claim paths for Keycloak `realm_access.roles`, custom CA for internal PKI, configurable clock-skew/JWKS-TTL/timeout; IdP role claims cross only through the sanitized seam — gateway/operator delegation markers plus an operator allowlist, everything else dropped). REST request rate limiting is opt-in via `PROXIMADB_REST_RATE_LIMIT_RPM` (TD-RATE-1; default off — unset adds no middleware layer; per observed client IP, `/health` exempt, process-global ceiling at 10x the per-IP cap). Deprecated claim use and dropped tier claims are metered (`proximadb_deprecated_claim_uses_total`, `proximadb_tier_claims_dropped_total`) — the Flight legacy-alias retirement gate is `increase(proximadb_deprecated_claim_uses_total[7d]) == 0`. Claim *names* come from one shared vocabulary across all four surfaces (TD-TENANT-3): `x-tenant-id` / `x-tenant-tier` are canonical everywhere, Arrow Flight additionally DETECTS three deprecated tenant-alias names (`x-proximadb-tenant-id`, `tenant-id`, `tenant_id`) for deprecation warning only — they no longer grant a tenant (honoring removed 2026-08-29; the names are deleted at the next release boundary), and a stamped tier claim is normalized to a canonical tier id at the boundary so an alias and its canonical spelling resolve to the same cache entitlement.
+| Security admin/status APIs and stronger online revocation policy are incomplete. pgwire runs trust auth (no credential binding), so authenticated-only and gateway-only reject explicit non-default tenant assertions rather than authenticate them; the reserved literal `default` remains accepted, and an omitted startup database selects the configured default only in single-tenant mode. ADR-031 tenant stable-id minting behind the `TenantStableIdResolver` port is pending (TD-TENANT-1).
 
 | Hybrid retrieval
 | Beta
-| tantivy BM25 integration, RRF/weighted fusion, and canonical REST `/api/v2/collections/{id}/search` hybrid path (TD-008 resolved). REST `/api/v2/graphs/{graph_id}/fusion-search` is the first vector+graph instance of the shared cross-modal fusion seam (TD-137). The former `/api/v1/hybrid/search` facade is a deprecated compat alias only. Request `filters` are enforced on both dense/BM25 legs: the vector candidates are filtered server-side, and the text candidates are gated to that filtered id set so a scoped filter cannot leak through the text leg.
-| Backend integration improved; REST v1 hybrid alias is a deprecated compatibility surface (see Canonical API Surface above) and gRPC path parity is still in progress. v1 `GraphService.ExecuteHybridQuery` remains deferred; use the v2 REST fusion route for vector-seed -> graph-expand experiments. A BM25-only match that passes the filter but falls outside the vector leg's `top_k` (or a hybrid request with no query vector) is dropped rather than risk a leak — safe, but it can under-return; keeping that tail needs a resolving metadata fetch (follow-up). Wider Projection Fusion remains a shared planner contract until runtime implementation, explain output, and benchmarks are complete. The in-process BM25 full-text index behind `/api/v2/hybrid/search` is fed ONLY by explicit `POST /api/v2/hybrid/index` calls: `POST /api/v2/collections/{id}/documents` ingest does NOT feed it (by design — the BM25 index is an in-memory, explicitly-managed sidecar, not a durable index over the record store). Clients that want document text searchable through the hybrid text leg must call `/api/v2/hybrid/index` per ingest batch (issue #951 clarification).
+| tantivy BM25 integration, RRF/weighted fusion, and canonical REST `/api/v2/collections/{id}/search` hybrid path (TD-008 resolved). REST `/api/v2/graphs/{graph_id}/fusion-search` is the first vector+graph instance of the shared cross-modal fusion seam (TD-137). The former `/api/v1/hybrid/search` prefix is removed, not an alias. Request `filters` are enforced on both dense/BM25 legs: the vector candidates are filtered server-side, and the text candidates are gated to that filtered id set so a scoped filter cannot leak through the text leg.
+| Backend integration improved; v2 `ProximaFusionService.FusionSearch` and the v2 REST fusion route both serve vector-seed -> graph-expand fusion, although wider gRPC/REST hybrid parity remains in progress. A BM25-only match that passes the filter but falls outside the vector leg's `top_k` (or a hybrid request with no query vector) is dropped rather than risk a leak — safe, but it can under-return; keeping that tail needs a resolving metadata fetch (follow-up). Wider Projection Fusion remains a shared planner contract until runtime implementation, explain output, and benchmarks are complete. The in-process BM25 full-text index behind `/api/v2/hybrid/search` is fed ONLY by explicit `POST /api/v2/hybrid/index` calls: `POST /api/v2/collections/{id}/documents` ingest does NOT feed it (by design — the BM25 index is an in-memory, explicitly-managed sidecar, not a durable index over the record store). Clients that want document text searchable through the hybrid text leg must call `/api/v2/hybrid/index` per ingest batch (issue #951 clarification).
 
 | PULSAR and QUASAR graph engine names
 | Retired / Not supported

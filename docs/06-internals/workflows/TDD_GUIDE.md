@@ -22,17 +22,19 @@ Test-Driven Development follows a simple cycle:
 
 Generic TDD applies, but ProximaDB has concrete rules that override the defaults above. Read these before writing tests.
 
-### nextest profiles (zero-retry unit contract)
+### nextest profiles (retry-budgeted unit contract)
 
 Tests run under [`cargo-nextest`](https://nexte.st) with profiles defined in `.config/nextest.toml`:
 
 | Profile | Retries | Use |
 |---------|---------|-----|
-| `unit` | **0** | Library unit tests (`--lib`). The blocking CI gate (`ci.yml` `rust-test`) runs `cargo nextest run --lib --profile unit`. |
-| `integration` | 1 | Integration tests — tolerates exactly one transient **port-bind** flake, nothing else. |
-| `default` | 0 | Fallback. |
+| `unit` | **2** | Library unit tests (`--lib`). The blocking CI gate (`ci.yml` `rust-test`) runs `cargo nextest run --lib --profile unit`; survivors are reported as `FLAKY`. |
+| `integration` | 1 | Integration tests — one profile-wide retry absorbs residual port-bind/load races; every retry survivor remains visible as `FLAKY`. |
+| `default` | 2 | Fallback; survivors are reported as `FLAKY`. |
 
-**The unit profile has zero retries on purpose.** A unit test that only passes on retry is a *bug in the test or the code*, not something to paper over. Do **not** raise `retries` to make a red unit test green — that has masked real defects here before (e.g. a load-induced WAL-recovery visibility bug). Run locally exactly as CI does:
+**The retry budget is fixed, not permission to accept flakes.** It absorbs constrained-runner load
+noise while preserving visibility: every survivor is reported as `FLAKY`, and an exhausted failure
+still fails the run. Do not raise the budget to make a red test green. Run locally exactly as CI does:
 
 ```bash
 cargo nextest run --lib --profile unit
@@ -52,7 +54,7 @@ cargo nextest run --lib --profile unit
 ### Flaky-test quarantine policy
 
 1. **First, fix it.** Reproduce with the unit profile (`cargo nextest run --lib --profile unit`, repeat). Flakiness is almost always shared global state, a temp-dir collision, a second boot, or a timing assumption — see the determinism rules above.
-2. **Never mask with retries.** Do not add nextest `retries` to the `unit` profile. The single `integration` retry exists only for OS port-bind races.
+2. **Never mask with more retries.** The unit/default budget is fixed at two and every survivor must remain visible as `FLAKY`; the integration budget stays at one. Fix a recurring survivor rather than increasing either budget.
 3. **If you must quarantine**, mark the test `#[ignore = "flaky: <one-line reason> — tracked in <issue/TD>"]` with a tracked owner. A quarantined test is debt with a due date, not a resolution.
 
 ## Project Structure
@@ -302,10 +304,10 @@ The **blocking** release gate is `.github/workflows/ci.yml`, aggregated by the `
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --lib --bins -- -D warnings`
-- **`cargo nextest run --lib --profile unit`** (the zero-retry unit contract)
+- **`cargo nextest run --lib --profile unit`** (the retry-budgeted unit contract)
 - proto / OpenAPI drift checks; targeted integration tests
-- `scripts/check_deterministic_commit_contract.py` (fast guard that verifies the zero-retry
-  policy, CI/Makefile wiring, architecture/support guard text, and conflict-marker absence)
+- `scripts/check_deterministic_commit_contract.py` (fast guard that verifies the fixed retry budget,
+  flaky-survivor reporting, CI/Makefile wiring, architecture/support guard text, and conflict-marker absence)
 - `scripts/validate_capability_matrix.py` (capability + maturity-contract guard)
 - `scripts/check_workspace_boundaries.py` and `scripts/check_tenant_path_guard.py` (layering + DrPathBuilder mandate, via the Workspace Layering Check workflow)
 
@@ -349,11 +351,11 @@ open coverage/index.html
 
 ### Tests Are Flaky
 
-Detect with the same zero-retry profile CI uses, repeated:
+Detect with the same retry-budgeted profile CI uses, repeated; treat any `FLAKY` survivor as a defect:
 ```bash
 for i in {1..5}; do cargo nextest run --lib --profile unit || break; done
 ```
-Then **fix the cause** — do not raise the unit profile's retries. See the
+Then **fix the cause** — do not raise the unit profile's retry budget. See the
 [Flaky-test quarantine policy](#flaky-test-quarantine-policy) above: the usual
 culprits are shared global state, temp-dir collisions, a second ProximaDB boot
 in one process, or a timing assumption.

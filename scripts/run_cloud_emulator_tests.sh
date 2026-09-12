@@ -49,6 +49,11 @@ echo "==> Scope: $SCOPE"
 
 CONTAINER_BUCKET="proximadb-test"
 AZURITE_CONN="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+# Docker Hub's minio/minio repository stopped serving pulls after the OSS
+# project was archived. This is the last official AGPL container image,
+# pulled from MinIO's Quay repository and pinned to its multi-architecture
+# manifest digest.
+MINIO_IMAGE="quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
 
 cleanup() { docker rm -f azurite minio fake-gcs >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -61,26 +66,61 @@ wait_port() { # $1=port $2=name
   echo "::error::$2 (:$1) did not come up"; return 1
 }
 
+wait_http() { # $1=url $2=name
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 2 "$1" >/dev/null; then
+      echo "  $2 ready"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "::error::$2 readiness endpoint did not become healthy"
+  return 1
+}
+
+minio_aws() {
+  AWS_ACCESS_KEY_ID=minioadmin \
+    AWS_SECRET_ACCESS_KEY=minioadmin \
+    AWS_DEFAULT_REGION=us-east-1 \
+    aws --endpoint-url http://127.0.0.1:9000 "$@"
+}
+
+create_minio_bucket() {
+  for _ in $(seq 1 15); do
+    if minio_aws s3api head-bucket --bucket "$CONTAINER_BUCKET" >/dev/null 2>&1; then
+      echo "  minio bucket already exists"
+      return 0
+    fi
+    if minio_aws s3api create-bucket --bucket "$CONTAINER_BUCKET" >/dev/null 2>&1; then
+      echo "  minio bucket created"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "::error::failed to create or verify MinIO bucket '$CONTAINER_BUCKET'"
+  return 1
+}
+
 echo "==> Starting emulators (Docker)"
 cleanup
-docker run -d --name azurite -p 10000:10000 \
+docker run -d --name azurite -p 127.0.0.1:10000:10000 \
   mcr.microsoft.com/azure-storage/azurite \
   azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck >/dev/null
-docker run -d --name minio -p 9000:9000 \
+docker run -d --name minio -p 127.0.0.1:9000:9000 \
   -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  minio/minio server /data >/dev/null
-docker run -d --name fake-gcs -p 4443:4443 \
+  "$MINIO_IMAGE" server /data >/dev/null
+docker run -d --name fake-gcs -p 127.0.0.1:4443:4443 \
   fsouza/fake-gcs-server -scheme http -port 4443 -public-host localhost:4443 >/dev/null
 
 echo "==> Waiting for emulators"
 wait_port 10000 azurite
 wait_port 9000 minio
 wait_port 4443 fake-gcs
+wait_http http://127.0.0.1:9000/minio/health/ready minio
 
 echo "==> Creating bucket/container '$CONTAINER_BUCKET'"
 # MinIO bucket (aws CLI)
-AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_DEFAULT_REGION=us-east-1 \
-  aws --endpoint-url http://127.0.0.1:9000 s3 mb "s3://$CONTAINER_BUCKET" 2>/dev/null || echo "  (minio bucket exists)"
+create_minio_bucket
 # Azurite container (az CLI)
 az storage container create --name "$CONTAINER_BUCKET" --connection-string "$AZURITE_CONN" >/dev/null 2>&1 \
   || echo "  (azurite container exists / az CLI missing)"

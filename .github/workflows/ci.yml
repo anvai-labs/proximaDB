@@ -388,6 +388,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Validate deterministic guard wiring
         run: python3 scripts/check_deterministic_commit_contract.py
+      - name: Test deterministic guard negative controls
+        run: python3 -m unittest discover -s tests/scripts -p 'test_deterministic_commit_contract.py'
+      - name: Test cloud-emulator image contract
+        run: python3 -m unittest discover -s tests/scripts -p 'test_cloud_emulator_harness.py'
       - name: Test trusted branch-route workflow contract
         run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
 
