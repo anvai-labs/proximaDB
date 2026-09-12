@@ -586,9 +586,11 @@ complete.
 | REST `/api/v2`, gRPC v2, Arrow Flight, and pgwire use the shared tenant-ingress vocabulary and can
 fail closed when a deployment requires a tenant but none resolves. `TenantContext` reaches storage
 paths and `DrPathBuilder` owns tenant-isolated physical path construction. pgwire currently uses
-trust authentication with a bare tenant assertion; strict header-trust policy therefore disables
-tenant selection rather than credential-binding it. Neutral consumption signals exist for object
-GETs/bytes, task time, KOU/KEU/cache quantities, and `MeteringEvent`; they are observability inputs,
+trust authentication with a bare tenant assertion; strict header-trust policy therefore rejects
+explicit non-default tenant assertions rather than credential-binding them. The reserved literal
+`default` remains accepted; an omitted database selects the configured default in single-tenant
+mode and fails closed in multi-tenant mode. Neutral consumption signals exist for object GETs/bytes,
+task time, KOU/KEU/cache quantities, and `MeteringEvent`; they are observability inputs,
 not a billing authority or entitlement system. Catalog tenant namespacing remains default OFF/raw,
 and stable-ID, modality, and in-memory isolation gaps remain.
 | Mandatory architectural gate. New I/O and heavy-compute boundaries must accept or derive tenant

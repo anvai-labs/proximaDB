@@ -29,7 +29,7 @@ Tests run under [`cargo-nextest`](https://nexte.st) with profiles defined in `.c
 | Profile | Retries | Use |
 |---------|---------|-----|
 | `unit` | **2** | Library unit tests (`--lib`). The blocking CI gate (`ci.yml` `rust-test`) runs `cargo nextest run --lib --profile unit`; survivors are reported as `FLAKY`. |
-| `integration` | 1 | Integration tests — tolerates exactly one transient **port-bind** flake, nothing else. |
+| `integration` | 1 | Integration tests — one profile-wide retry absorbs residual port-bind/load races; every retry survivor remains visible as `FLAKY`. |
 | `default` | 2 | Fallback; survivors are reported as `FLAKY`. |
 
 **The retry budget is fixed, not permission to accept flakes.** It absorbs constrained-runner load

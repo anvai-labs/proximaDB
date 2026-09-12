@@ -5269,7 +5269,7 @@ export interface operations {
                 include_stats?: boolean;
             };
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -5292,7 +5292,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -5328,7 +5328,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5363,7 +5363,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5398,7 +5398,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5446,7 +5446,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5494,7 +5494,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5542,7 +5542,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5588,7 +5588,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5634,7 +5634,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5673,7 +5673,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5744,7 +5744,7 @@ export interface operations {
                 include_text?: boolean;
             };
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5781,7 +5781,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5809,7 +5809,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5844,7 +5844,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5883,7 +5883,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5922,7 +5922,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -5970,7 +5970,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6018,7 +6018,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6041,7 +6041,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6086,7 +6086,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6121,7 +6121,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6178,7 +6178,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6226,7 +6226,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6262,7 +6262,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6298,7 +6298,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6361,7 +6361,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6384,7 +6384,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6407,7 +6407,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6430,7 +6430,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6453,7 +6453,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6477,7 +6477,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -6506,7 +6506,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6533,7 +6533,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6558,7 +6558,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6590,7 +6590,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6622,7 +6622,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6650,7 +6650,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6683,7 +6683,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6711,7 +6711,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6739,7 +6739,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6771,7 +6771,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6799,7 +6799,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6832,7 +6832,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6860,7 +6860,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6892,7 +6892,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6924,7 +6924,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6956,7 +6956,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -6988,7 +6988,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7020,7 +7020,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7052,7 +7052,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7084,7 +7084,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7116,7 +7116,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7148,7 +7148,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7175,7 +7175,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7202,7 +7202,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7234,7 +7234,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7266,7 +7266,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7293,7 +7293,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7317,7 +7317,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7345,7 +7345,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7371,7 +7371,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7401,7 +7401,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7431,7 +7431,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7461,7 +7461,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7509,7 +7509,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7557,7 +7557,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7605,7 +7605,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7653,7 +7653,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7701,7 +7701,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7749,7 +7749,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7799,7 +7799,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -7844,7 +7844,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7892,7 +7892,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -7964,7 +7964,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -8002,7 +8002,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -8033,7 +8033,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -8057,7 +8057,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -8086,7 +8086,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8113,7 +8113,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8146,7 +8146,7 @@ export interface operations {
                 limit?: number;
             };
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8185,7 +8185,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8219,7 +8219,7 @@ export interface operations {
                 projection?: string;
             };
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8247,7 +8247,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8274,7 +8274,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8306,7 +8306,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8337,7 +8337,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8368,7 +8368,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8395,7 +8395,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8416,7 +8416,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8458,7 +8458,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8500,7 +8500,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -8538,7 +8538,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8578,7 +8578,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8618,7 +8618,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8658,7 +8658,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8698,7 +8698,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -8736,7 +8736,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8770,7 +8770,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8798,7 +8798,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8827,7 +8827,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8865,7 +8865,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8898,7 +8898,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -8929,7 +8929,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8958,7 +8958,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -8986,7 +8986,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -9012,7 +9012,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -9043,7 +9043,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -9069,7 +9069,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9106,7 +9106,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9138,7 +9138,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9164,7 +9164,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9189,7 +9189,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9230,7 +9230,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -9253,7 +9253,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9278,7 +9278,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9303,7 +9303,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -9326,7 +9326,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9354,7 +9354,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9386,7 +9386,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -9414,7 +9414,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -9442,7 +9442,7 @@ export interface operations {
                 table_name?: string;
             };
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -9466,7 +9466,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
