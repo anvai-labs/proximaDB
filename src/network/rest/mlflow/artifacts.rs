@@ -19,8 +19,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Extension, Json, Router};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::io::{Read, Write};
 
 use crate::network::middleware::tenant::TenantContext;
 
@@ -34,6 +38,322 @@ const ARTIFACT_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// and ordinary account/workspace identifiers. Artifact routes revalidate at
 /// this storage boundary instead of relying solely on middleware construction.
 const MAX_ARTIFACT_TENANT_ID_BYTES: usize = 64;
+
+#[derive(Clone)]
+struct ArtifactStore {
+    data_dir: std::path::PathBuf,
+    tenant_root: std::path::PathBuf,
+}
+
+struct ArtifactListEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+enum StoredArtifact {
+    File(Vec<u8>),
+    Directory(Vec<ArtifactListEntry>),
+}
+
+impl ArtifactStore {
+    fn new(state: &MlflowState, tenant: &TenantContext) -> MlflowResult<Self> {
+        Ok(Self {
+            data_dir: state.data_dir.clone(),
+            tenant_root: tenant_artifact_relative_root(&tenant.tenant_id)?,
+        })
+    }
+
+    async fn run<T, F>(&self, operation: &'static str, task: F) -> MlflowResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Self) -> std::io::Result<T> + Send + 'static,
+    {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || task(store))
+            .await
+            .map_err(|error| MlflowError::internal(format!("{operation} task failed: {error}")))?
+            .map_err(|error| map_artifact_io_error(operation, error))
+    }
+
+    async fn read(&self, segments: Vec<String>) -> MlflowResult<Option<StoredArtifact>> {
+        self.run("read artifact", move |store| store.read_sync(&segments))
+            .await
+    }
+
+    async fn write(&self, segments: Vec<String>, bytes: Vec<u8>) -> MlflowResult<()> {
+        self.run("write artifact", move |store| {
+            store.write_sync(&segments, &bytes)
+        })
+        .await
+    }
+
+    async fn list(&self, segments: Vec<String>) -> MlflowResult<Vec<ArtifactListEntry>> {
+        self.run("list artifacts", move |store| store.list_sync(&segments))
+            .await
+    }
+
+    async fn delete(&self, segments: Vec<String>) -> MlflowResult<()> {
+        self.run("delete artifact", move |store| store.delete_sync(&segments))
+            .await
+    }
+
+    fn open_tenant_dir(&self, create: bool) -> std::io::Result<Option<Dir>> {
+        if create {
+            Dir::create_ambient_dir_all(&self.data_dir, ambient_authority())?;
+        }
+        let mut current = match Dir::open_ambient_dir(&self.data_dir, ambient_authority()) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        for component in self.tenant_root.components() {
+            let Some(next) = open_child_dir(&current, component.as_os_str(), create)? else {
+                return Ok(None);
+            };
+            current = next;
+        }
+        Ok(Some(current))
+    }
+
+    fn open_parent(
+        &self,
+        segments: &[String],
+        create: bool,
+    ) -> std::io::Result<Option<(Dir, String)>> {
+        let Some((leaf, parents)) = segments.split_last() else {
+            return Err(unsafe_artifact_path("artifact path must not be empty"));
+        };
+        let Some(mut current) = self.open_tenant_dir(create)? else {
+            return Ok(None);
+        };
+        for component in parents {
+            let Some(next) = open_child_dir(&current, component, create)? else {
+                return Ok(None);
+            };
+            current = next;
+        }
+        Ok(Some((current, leaf.clone())))
+    }
+
+    fn read_sync(&self, segments: &[String]) -> std::io::Result<Option<StoredArtifact>> {
+        let Some((parent, leaf)) = self.open_parent(segments, false)? else {
+            return Ok(None);
+        };
+        let metadata = match parent.symlink_metadata(&leaf) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(unsafe_artifact_path(
+                "artifact path contains a symbolic link",
+            ));
+        }
+        if metadata.is_dir() {
+            let directory = parent
+                .open_dir_nofollow(&leaf)
+                .map_err(|error| nofollow_error(&leaf, error))?;
+            Ok(Some(StoredArtifact::Directory(read_directory_entries(
+                &directory,
+            )?)))
+        } else {
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let mut file = parent
+                .open_with(&leaf, &options)
+                .map_err(|error| nofollow_error(&leaf, error))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Some(StoredArtifact::File(bytes)))
+        }
+    }
+
+    fn list_sync(&self, segments: &[String]) -> std::io::Result<Vec<ArtifactListEntry>> {
+        let directory = if let Some((leaf, parents)) = segments.split_last() {
+            let Some(mut current) = self.open_tenant_dir(false)? else {
+                return Ok(Vec::new());
+            };
+            for component in parents {
+                let Some(next) = open_child_dir(&current, component, false)? else {
+                    return Ok(Vec::new());
+                };
+                current = next;
+            }
+
+            let metadata = match current.symlink_metadata(leaf) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error),
+            };
+            if metadata.file_type().is_symlink() {
+                return Err(unsafe_artifact_path(
+                    "artifact path contains a symbolic link",
+                ));
+            }
+            if !metadata.is_dir() {
+                return Ok(Vec::new());
+            }
+            current
+                .open_dir_nofollow(leaf)
+                .map_err(|error| nofollow_error(leaf, error))?
+        } else {
+            let Some(directory) = self.open_tenant_dir(false)? else {
+                return Ok(Vec::new());
+            };
+            directory
+        };
+
+        read_directory_entries(&directory)
+    }
+
+    fn write_sync(&self, segments: &[String], bytes: &[u8]) -> std::io::Result<()> {
+        let Some((parent, leaf)) = self.open_parent(segments, true)? else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "tenant artifact root disappeared during creation",
+            ));
+        };
+        match parent.symlink_metadata(&leaf) {
+            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
+                return Err(unsafe_artifact_path(
+                    "artifact destination is not a regular file",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .follow(FollowSymlinks::No);
+        let mut file = parent
+            .open_with(&leaf, &options)
+            .map_err(|error| nofollow_error(&leaf, error))?;
+        file.write_all(bytes)
+    }
+
+    fn delete_sync(&self, segments: &[String]) -> std::io::Result<()> {
+        let Some((parent, leaf)) = self.open_parent(segments, false)? else {
+            return Ok(());
+        };
+        let metadata = match parent.symlink_metadata(&leaf) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(unsafe_artifact_path(
+                "artifact path contains a symbolic link",
+            ));
+        }
+        let result = if metadata.is_dir() {
+            parent.remove_dir_all(&leaf)
+        } else {
+            parent.remove_file(&leaf)
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn open_child_dir(
+    parent: &Dir,
+    component: impl AsRef<std::path::Path>,
+    create: bool,
+) -> std::io::Result<Option<Dir>> {
+    let component = component.as_ref();
+    match parent.symlink_metadata(component) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(unsafe_artifact_path(
+                "artifact path component is not a real directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            match parent.create_dir(component) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    match parent.open_dir_nofollow(component) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(nofollow_error(component, error)),
+    }
+}
+
+fn read_directory_entries(directory: &Dir) -> std::io::Result<Vec<ArtifactListEntry>> {
+    let mut entries = Vec::new();
+    for entry in directory.entries()? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(unsafe_artifact_path(
+                "artifact directory contains a symbolic link",
+            ));
+        }
+        let is_dir = file_type.is_dir();
+        let size = if is_dir { 0 } else { entry.metadata()?.len() };
+        entries.push(ArtifactListEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir,
+            size,
+        });
+    }
+    Ok(entries)
+}
+
+fn unsafe_artifact_path(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn nofollow_error(path: impl AsRef<std::path::Path>, error: std::io::Error) -> std::io::Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotADirectory
+    ) || is_symlink_loop(&error)
+    {
+        unsafe_artifact_path(format!(
+            "artifact path '{}' could not be opened without following links: {error}",
+            path.as_ref().display()
+        ))
+    } else {
+        error
+    }
+}
+
+#[cfg(unix)]
+fn is_symlink_loop(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_symlink_loop(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn map_artifact_io_error(operation: &str, error: std::io::Error) -> MlflowError {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        MlflowError::invalid(error.to_string())
+    } else if error.kind() == std::io::ErrorKind::NotFound {
+        MlflowError::not_found(format!("{operation}: artifact path does not exist"))
+    } else {
+        MlflowError::internal(format!("{operation}: {error}"))
+    }
+}
 
 pub fn artifacts_routes() -> Router<MlflowState> {
     artifacts_routes_at("/api/2.0")
@@ -75,48 +395,17 @@ async fn artifact_root_list(
     Query(list): Query<ListParams>,
 ) -> MlflowResult<Json<Value>> {
     let sub = list.path.clone().unwrap_or_default();
-    let segments = sanitize_segments(&sub)?;
-    let prefix = list_entry_prefix(&segments);
-    let root = tenant_artifact_root(&state, &tenant)?;
-    let target = segments.iter().fold(root, |acc, s| acc.join(s));
-    let Some(kind) = artifact_kind(&target, "inspect artifact path").await? else {
-        return Err(MlflowError::not_found(format!(
-            "artifact path '{sub}' does not exist"
-        )));
+    let segments = if sub.is_empty() {
+        Vec::new()
+    } else {
+        sanitize_segments(&sub)?
     };
-    if kind != ArtifactKind::Directory {
-        // Listing a FILE path yields no entries (the MLflow server
-        // convention) — the client then treats the path itself as the file.
-        return Ok(Json(json!({ "files": [] })));
-    }
-    let mut entries = tokio::fs::read_dir(&target)
-        .await
-        .map_err(|e| MlflowError::internal(format!("read artifact dir: {e}")))?;
-    let mut files = Vec::new();
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| MlflowError::internal(format!("iterate artifacts: {e}")))?
-    {
-        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-        let size = if is_dir {
-            0
-        } else {
-            entry.metadata().await.map(|m| m.len()).unwrap_or(0)
-        };
-        let name = entry.file_name().to_string_lossy().to_string();
-        let path = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        files.push(json!({
-            "path": path,
-            "is_dir": is_dir,
-            "file_size": size,
-        }));
-    }
-    Ok(Json(json!({ "files": files })))
+    let prefix = list_entry_prefix(&segments);
+    let store = ArtifactStore::new(&state, &tenant)?;
+    let entries = store.list(segments).await?;
+    Ok(Json(json!({
+        "files": artifact_entries_json(entries, &prefix)
+    })))
 }
 
 async fn artifact_root_delete(
@@ -129,20 +418,28 @@ async fn artifact_root_delete(
         return Err(MlflowError::invalid("artifact root delete requires ?path="));
     }
     let segments = sanitize_segments(&sub)?;
-    let root = tenant_artifact_root(&state, &tenant)?;
-    let target = segments.iter().fold(root, |acc, s| acc.join(s));
-    if let Some(kind) = artifact_kind(&target, "inspect artifact delete target").await? {
-        if kind == ArtifactKind::Directory {
-            tokio::fs::remove_dir_all(&target)
-                .await
-                .map_err(|e| MlflowError::internal(format!("delete artifacts: {e}")))?;
-        } else {
-            tokio::fs::remove_file(&target)
-                .await
-                .map_err(|e| MlflowError::internal(format!("delete artifact: {e}")))?;
-        }
-    }
+    ArtifactStore::new(&state, &tenant)?
+        .delete(segments)
+        .await?;
     Ok(StatusCode::OK.into_response())
+}
+
+fn artifact_entries_json(entries: Vec<ArtifactListEntry>, prefix: &str) -> Vec<Value> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let path = if prefix.is_empty() {
+                entry.name
+            } else {
+                format!("{prefix}/{}", entry.name)
+            };
+            json!({
+                "path": path,
+                "is_dir": entry.is_dir,
+                "file_size": entry.size,
+            })
+        })
+        .collect()
 }
 
 /// Entry names for directory listings are relative to the RUN's artifact
@@ -176,15 +473,6 @@ fn sanitize_segments(path: &str) -> MlflowResult<Vec<String>> {
     Ok(out)
 }
 
-fn tenant_artifact_root(
-    state: &MlflowState,
-    tenant: &TenantContext,
-) -> MlflowResult<std::path::PathBuf> {
-    Ok(state
-        .data_dir
-        .join(tenant_artifact_relative_root(&tenant.tenant_id)?))
-}
-
 /// Encode every tenant id byte-for-byte under a clean versioned root.
 ///
 /// The byte length separates tenant roots before the encoded leaf, so a
@@ -209,24 +497,6 @@ fn tenant_artifact_relative_root(tenant_id: &str) -> MlflowResult<std::path::Pat
     Ok(root)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ArtifactKind {
-    File,
-    Directory,
-}
-
-async fn artifact_kind(
-    target: &std::path::Path,
-    operation: &str,
-) -> MlflowResult<Option<ArtifactKind>> {
-    match tokio::fs::metadata(target).await {
-        Ok(metadata) if metadata.is_dir() => Ok(Some(ArtifactKind::Directory)),
-        Ok(_) => Ok(Some(ArtifactKind::File)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(MlflowError::internal(format!("{operation}: {error}"))),
-    }
-}
-
 #[derive(Default, Deserialize)]
 struct ListParams {
     #[serde(default)]
@@ -241,89 +511,44 @@ async fn artifact_proxy(
     body: axum::body::Bytes,
 ) -> MlflowResult<Response> {
     let segments = sanitize_segments(&path)?;
-    let root = tenant_artifact_root(&state, &tenant)?;
-    // Segments are traversal-checked verbatim (no .., backslash, NUL) —
-    // file names must round-trip byte-identically.
-    let target = segments.iter().fold(root.clone(), |acc, s| acc.join(s));
+    let store = ArtifactStore::new(&state, &tenant)?;
 
     match method {
         axum::http::Method::PUT => {
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("create artifact dir: {e}")))?;
-            }
-            tokio::fs::write(&target, &body)
-                .await
-                .map_err(|e| MlflowError::internal(format!("write artifact: {e}")))?;
+            store.write(segments, body.to_vec()).await?;
             Ok(StatusCode::OK.into_response())
         }
         axum::http::Method::GET => {
-            let Some(kind) = artifact_kind(&target, "inspect artifact").await? else {
+            let Some(artifact) = store.read(segments.clone()).await? else {
                 return Err(MlflowError::not_found(format!(
                     "artifact '{path}' does not exist"
                 )));
             };
-            if kind == ArtifactKind::Directory {
-                // Directory LIST. Entry names are repo-root-relative
-                // (relative to <exp>/<run>/artifacts) — the client feeds
-                // file.path verbatim into the next remote GET.
-                let prefix = list_entry_prefix(&segments);
-                let list_root = target.clone();
-                let mut entries = tokio::fs::read_dir(&list_root)
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("read artifact dir: {e}")))?;
-                let mut files = Vec::new();
-                while let Some(entry) = entries
-                    .next_entry()
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("iterate artifacts: {e}")))?
-                {
-                    let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                    let size = if is_dir {
-                        0
-                    } else {
-                        entry.metadata().await.map(|m| m.len()).unwrap_or(0)
-                    };
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let entry_path = if prefix.is_empty() {
-                        name
-                    } else {
-                        format!("{prefix}/{name}")
-                    };
-                    files.push(json!({
-                        "path": entry_path,
-                        "is_dir": is_dir,
-                        "file_size": size,
-                    }));
-                }
-                Ok(Json(json!({"files": files})).into_response())
-            } else {
-                let bytes = tokio::fs::read(&target)
-                    .await
-                    .map_err(|e| MlflowError::internal(format!("read artifact: {e}")))?;
-                // Octet-stream: the proxy carries bytes; echoing the
-                // request's Accept header as Content-Type is semantically
-                // wrong and could yield an invalid MIME.
-                Ok((
-                    [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                    bytes,
-                )
+            match artifact {
+                StoredArtifact::Directory(entries) => {
+                    // Directory LIST. Entry names are repo-root-relative
+                    // (relative to <exp>/<run>/artifacts) — the client feeds
+                    // file.path verbatim into the next remote GET.
+                    let prefix = list_entry_prefix(&segments);
+                    Ok(Json(json!({
+                        "files": artifact_entries_json(entries, &prefix)
+                    }))
                     .into_response())
+                }
+                StoredArtifact::File(bytes) => {
+                    // Octet-stream: the proxy carries bytes; echoing the
+                    // request's Accept header as Content-Type is semantically
+                    // wrong and could yield an invalid MIME.
+                    Ok((
+                        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                        bytes,
+                    )
+                        .into_response())
+                }
             }
         }
         axum::http::Method::DELETE => {
-            if let Some(kind) = artifact_kind(&target, "inspect artifact delete target").await? {
-                if kind == ArtifactKind::Directory {
-                    tokio::fs::remove_dir_all(&target)
-                        .await
-                        .map_err(|e| MlflowError::internal(format!("delete artifacts: {e}")))?;
-                } else {
-                    tokio::fs::remove_file(&target)
-                        .await
-                        .map_err(|e| MlflowError::internal(format!("delete artifact: {e}")))?;
-                }
-            }
+            store.delete(segments).await?;
             Ok(StatusCode::OK.into_response())
         }
         other => Err(MlflowError::invalid(format!(
@@ -346,6 +571,444 @@ pub(super) fn experiment_artifact_location(experiment_id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::middleware::tenant::TenantIdSource;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn tenant_ctx(name: &str) -> TenantContext {
+        TenantContext::new(name, TenantIdSource::Default)
+    }
+
+    fn test_router(data_dir: &std::path::Path, tenant: &str, relative: bool) -> Router {
+        use proximadb_catalog::run_store::conformance_tests::InMemoryRunStoreFactory;
+
+        let routes = if relative {
+            artifacts_routes_relative()
+        } else {
+            artifacts_routes()
+        };
+        routes
+            .with_state(MlflowState::new(
+                Arc::new(InMemoryRunStoreFactory::new()),
+                Arc::new(
+                    proximadb_catalog::model_registry_service::CatalogModelRegistryService::new(
+                        Arc::new(crate::catalog::CatalogManager::new()),
+                    ),
+                ),
+                data_dir.to_path_buf(),
+            ))
+            .layer(axum::Extension(tenant_ctx(tenant)))
+    }
+
+    async fn request(router: &Router, method: &str, uri: &str, body: &'static [u8]) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::from(body))
+                    .expect("artifact test request must build"),
+            )
+            .await
+            .expect("artifact test router must respond")
+    }
+
+    async fn assert_empty_listing(response: Response, context: &str) {
+        assert_eq!(response.status(), StatusCode::OK, "{context}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("artifact listing body must be readable");
+        let body: Value =
+            serde_json::from_slice(&bytes).expect("artifact listing body must be valid JSON");
+        assert_eq!(body, json!({ "files": [] }), "{context}");
+    }
+
+    #[tokio::test]
+    async fn root_list_preserves_empty_missing_and_file_contract() {
+        let temp = tempfile::tempdir().expect("create artifact list contract directory");
+        for (relative, prefix) in [(false, "/api/2.0/mlflow-artifacts"), (true, "")] {
+            let tenant = if relative {
+                "list-contract-relative"
+            } else {
+                "list-contract-canonical"
+            };
+            let router = test_router(temp.path(), tenant, relative);
+            let root = format!("{prefix}/artifacts");
+            let file = format!("{prefix}/artifacts/exp/run/artifacts/model.bin");
+
+            assert_empty_listing(
+                request(&router, "GET", &root, b"").await,
+                "an absent tenant root must list as empty",
+            )
+            .await;
+            assert_empty_listing(
+                request(
+                    &router,
+                    "GET",
+                    &format!("{root}?path=exp/run/artifacts/missing"),
+                    b"",
+                )
+                .await,
+                "a missing list path must list as empty",
+            )
+            .await;
+
+            assert_eq!(
+                request(&router, "PUT", &file, b"model-bytes")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            assert_empty_listing(
+                request(
+                    &router,
+                    "GET",
+                    &format!("{root}?path=exp/run/artifacts/model.bin"),
+                    b"",
+                )
+                .await,
+                "listing a file must return an empty listing",
+            )
+            .await;
+        }
+    }
+
+    #[test]
+    fn nofollow_mapping_preserves_operational_io_failures() {
+        let permission = nofollow_error(
+            "model.bin",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        );
+        assert_eq!(permission.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let exhausted = nofollow_error(
+            "model.bin",
+            std::io::Error::new(std::io::ErrorKind::StorageFull, "full"),
+        );
+        assert_eq!(exhausted.kind(), std::io::ErrorKind::StorageFull);
+
+        let unsafe_component = nofollow_error(
+            "model.bin",
+            std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a directory"),
+        );
+        assert_eq!(
+            unsafe_component.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "a no-follow path violation remains a client error"
+        );
+
+        #[cfg(unix)]
+        assert_eq!(
+            nofollow_error("model.bin", std::io::Error::from_raw_os_error(libc::ELOOP),).kind(),
+            std::io::ErrorKind::InvalidInput,
+            "a Unix ELOOP remains a client-visible no-follow violation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_handlers_reject_symlinked_version_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create artifact root test directory");
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("create outside directory");
+        symlink(&outside, temp.path().join("mlflow_artifacts_v2"))
+            .expect("replace artifact version root with symlink");
+        let router = test_router(temp.path(), "root-link-tenant", false);
+
+        for (method, uri, body) in [
+            (
+                "PUT",
+                "/api/2.0/mlflow-artifacts/artifacts/model.bin",
+                &b"escaped-write"[..],
+            ),
+            (
+                "GET",
+                "/api/2.0/mlflow-artifacts/artifacts/model.bin",
+                &b""[..],
+            ),
+            (
+                "GET",
+                "/api/2.0/mlflow-artifacts/artifacts?path=model.bin",
+                &b""[..],
+            ),
+            (
+                "DELETE",
+                "/api/2.0/mlflow-artifacts/artifacts/model.bin",
+                &b""[..],
+            ),
+        ] {
+            assert_eq!(
+                request(&router, method, uri, body).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {uri} must reject a symlinked version root"
+            );
+        }
+        assert!(
+            tokio::fs::read_dir(&outside)
+                .await
+                .expect("outside directory remains readable")
+                .next_entry()
+                .await
+                .expect("outside directory iteration succeeds")
+                .is_none(),
+            "no request may create bytes outside the configured artifact root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deleting_directory_with_symlink_preserves_external_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create artifact delete test directory");
+        let outside = temp.path().join("outside.bin");
+        tokio::fs::write(&outside, b"outside-secret")
+            .await
+            .expect("seed outside file");
+        let tenant = "delete-link-tenant";
+        let root = temp.path().join(
+            tenant_artifact_relative_root(tenant)
+                .ok()
+                .expect("test tenant must encode"),
+        );
+        let directory = root.join("exp/run/artifacts/tree");
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .expect("create artifact directory");
+        symlink(&outside, directory.join("external-link")).expect("create contained symlink");
+
+        let router = test_router(temp.path(), tenant, false);
+        let response = request(
+            &router,
+            "DELETE",
+            "/api/2.0/mlflow-artifacts/artifacts/exp/run/artifacts/tree",
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            tokio::fs::read(&outside)
+                .await
+                .expect("external target must survive"),
+            b"outside-secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_handlers_reject_intermediate_symlink_escape_for_all_methods() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create artifact test directory");
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir(&outside)
+            .await
+            .expect("create outside directory");
+        let outside_secret = outside.join("secret.bin");
+        tokio::fs::write(&outside_secret, b"outside-secret")
+            .await
+            .expect("seed outside secret");
+
+        let tenant = "symlink-tenant";
+        let root = temp.path().join(
+            tenant_artifact_relative_root(tenant)
+                .ok()
+                .expect("test tenant must encode"),
+        );
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create tenant root");
+        symlink(&outside, root.join("escape")).expect("create intermediate symlink");
+
+        let router = test_router(temp.path(), tenant, false);
+        for (method, uri, body) in [
+            (
+                "PUT",
+                "/api/2.0/mlflow-artifacts/artifacts/escape/new.bin",
+                &b"escaped-write"[..],
+            ),
+            (
+                "GET",
+                "/api/2.0/mlflow-artifacts/artifacts/escape/secret.bin",
+                &b""[..],
+            ),
+            (
+                "GET",
+                "/api/2.0/mlflow-artifacts/artifacts?path=escape",
+                &b""[..],
+            ),
+            (
+                "DELETE",
+                "/api/2.0/mlflow-artifacts/artifacts/escape/secret.bin",
+                &b""[..],
+            ),
+        ] {
+            let response = request(&router, method, uri, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {uri} must reject a symlinked path"
+            );
+        }
+
+        assert_eq!(
+            tokio::fs::read(&outside_secret)
+                .await
+                .expect("outside secret must survive"),
+            b"outside-secret"
+        );
+        assert!(
+            tokio::fs::symlink_metadata(outside.join("new.bin"))
+                .await
+                .is_err(),
+            "PUT must not create outside bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_handlers_reject_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("create artifact test directory");
+        let outside = temp.path().join("outside.bin");
+        tokio::fs::write(&outside, b"outside-secret")
+            .await
+            .expect("seed outside secret");
+        let tenant = "final-link-tenant";
+        let root = temp.path().join(
+            tenant_artifact_relative_root(tenant)
+                .ok()
+                .expect("test tenant must encode"),
+        );
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create tenant root");
+        symlink(&outside, root.join("link.bin")).expect("create final symlink");
+        let router = test_router(temp.path(), tenant, false);
+
+        for method in ["PUT", "GET", "DELETE"] {
+            let response = request(
+                &router,
+                method,
+                "/api/2.0/mlflow-artifacts/artifacts/link.bin",
+                b"replacement",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
+        }
+        assert_eq!(
+            tokio::fs::read(&outside)
+                .await
+                .expect("outside file must survive"),
+            b"outside-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_and_ui_relative_routes_enforce_identical_validation() {
+        let temp = tempfile::tempdir().expect("create artifact test directory");
+        let overlong = "a".repeat(65);
+        for (relative, prefix) in [(false, "/api/2.0/mlflow-artifacts"), (true, "")] {
+            let valid = test_router(temp.path(), "route-parity", relative);
+            let put_uri = format!("{prefix}/artifacts/exp/run/artifacts/model.bin");
+            assert_eq!(
+                request(&valid, "PUT", &put_uri, b"model").await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                request(&valid, "GET", &put_uri, b"").await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                request(
+                    &valid,
+                    "GET",
+                    &format!("{prefix}/artifacts?path=exp/run/artifacts"),
+                    b"",
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+
+            for tenant in ["", overlong.as_str()] {
+                let invalid = test_router(temp.path(), tenant, relative);
+                let response = request(
+                    &invalid,
+                    "PUT",
+                    &format!("{prefix}/artifacts/model.bin"),
+                    b"model",
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            let traversal = request(
+                &valid,
+                "GET",
+                &format!("{prefix}/artifacts?path=../outside"),
+                b"",
+            )
+            .await;
+            assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                request(&valid, "DELETE", &put_uri, b"").await.status(),
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_routes_isolate_tenant_put_get_list_and_delete() {
+        let temp = tempfile::tempdir().expect("create artifact isolation directory");
+        let tenant_a = test_router(temp.path(), "tenant-a", false);
+        let tenant_b = test_router(temp.path(), "tenant-b", false);
+        let file = "/api/2.0/mlflow-artifacts/artifacts/exp/run/artifacts/model.bin";
+        let list = "/api/2.0/mlflow-artifacts/artifacts?path=exp/run/artifacts";
+
+        assert_eq!(
+            request(&tenant_a, "PUT", file, b"tenant-a-model")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&tenant_b, "GET", file, b"").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(&tenant_b, "GET", list, b"").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&tenant_b, "DELETE", file, b"").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&tenant_a, "GET", file, b"").await.status(),
+            StatusCode::OK,
+            "another tenant's idempotent delete must not remove these bytes"
+        );
+        assert_eq!(
+            request(&tenant_a, "GET", list, b"").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&tenant_a, "DELETE", file, b"").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&tenant_a, "GET", file, b"").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
 
     #[test]
     fn tenant_artifact_components_are_injective_on_common_filesystems() {
@@ -395,29 +1058,27 @@ mod tests {
                     .ok()
                     .expect("valid test tenant must encode"),
             );
-            let kind = artifact_kind(&root, "inspect isolated tenant root").await;
-            assert!(kind.is_ok(), "isolated tenant root inspection must succeed");
-            assert_eq!(
-                kind.ok().flatten(),
-                None,
+            assert!(
+                tokio::fs::symlink_metadata(&root).await.is_err(),
                 "tenant {tenant} must not inherit bytes from the ambiguous legacy layout"
             );
         }
     }
 
     #[test]
-    fn async_artifact_handlers_do_not_use_synchronous_path_probes() {
+    fn artifact_handlers_offload_capability_filesystem_work() {
         let source = include_str!("artifacts.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(production.contains("tokio::task::spawn_blocking"));
         for forbidden in [
             [".", "exists()"].concat(),
             ["target", ".", "is_dir()"].concat(),
             [".", "is_file()"].concat(),
-            ["std", "::", "fs", "::"].concat(),
+            ["tokio", "::", "fs", "::"].concat(),
         ] {
             assert!(
                 !production.contains(&forbidden),
-                "async artifact handlers contain synchronous path probe {forbidden}"
+                "async artifact handlers contain ambient async filesystem access {forbidden}"
             );
         }
     }

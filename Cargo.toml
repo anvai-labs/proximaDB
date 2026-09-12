@@ -569,6 +569,8 @@ crc32fast = "1.4"  # Used for SST codebook checksum
 
 # System information
 libc = "0.2"
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
 
 # Data structures
 once_cell = "1.19"
