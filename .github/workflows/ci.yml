@@ -1950,7 +1950,8 @@ jobs:
   # server, spawns it with PROXIMADB_MLFLOW_COMPAT_ENABLE=1, and drives the
   # canonical workflow through the REAL mlflow client (mlflow-skinny, PINNED
   # — unpinned latest would make the counts-only-up ratchet drift upstream).
-  # The ratchet high-water lives in clients/python/tests/mlflow_conformance_steps.txt.
+  # Generation-specific ratchets live in mlflow_conformance_steps_2x.txt and
+  # mlflow_conformance_steps_3x.txt.
   mlflow-conformance:
     name: MLflow conformance (real client)
     runs-on: ubuntu-latest
@@ -2024,21 +2025,32 @@ jobs:
             -H 'content-type: application/json' -d '{}' \
             | grep -q '"experiments"' || (echo "::error::ajax-api search failed" && exit 1)
           curl -sf -o /dev/null "http://127.0.0.1:$PORT/mlflow-ui" || (echo "::error::no-slash form failed" && exit 1)
+          # TD-MLOPS-2: the v3 traces family serves both at the API mount
+          # and through the UI's ajax-api alias (name-string location enum).
+          curl -sf -X POST "http://127.0.0.1:$PORT/api/3.0/mlflow/traces/search" \
+            -H 'content-type: application/json' \
+            -d '{"locations":[{"type":"MLFLOW_EXPERIMENT","mlflow_experiment":{"experiment_id":"0"}}]}' \
+            | grep -q '"traces"' || (echo "::error::v3 traces search failed" && exit 1)
+          curl -sf -X POST "http://127.0.0.1:$PORT/mlflow-ui/ajax-api/3.0/mlflow/traces/search" \
+            -H 'content-type: application/json' \
+            -d '{"locations":[{"type":"MLFLOW_EXPERIMENT","mlflow_experiment":{"experiment_id":"0"}}]}' \
+            | grep -q '"traces"' || (echo "::error::UI-alias v3 traces search failed" && exit 1)
           echo "UI smoke: all checks passed"
-      - name: Ratchet — passing steps only go up
+      - name: Ratchet — passing steps only go up (per client generation)
         if: always()
         run: |
           set -eu
-          RATCHET=$(cat clients/python/tests/mlflow_conformance_steps.txt)
+          RATCHET2=$(cat clients/python/tests/mlflow_conformance_steps_2x.txt)
+          RATCHET3=$(cat clients/python/tests/mlflow_conformance_steps_3x.txt)
           PASSED=$(grep -c '^PASS ' /tmp/conformance-2x.log || true)
           PASSED3=$(grep -c '^PASS ' /tmp/conformance-3x.log || true)
-          echo "passed-2x=$PASSED passed-3x=$PASSED3 ratchet=$RATCHET"
-          if [ "$PASSED" -lt "$RATCHET" ]; then
-            echo "::error::MLflow 2.x conformance regressed: $PASSED < $RATCHET steps."
+          echo "passed-2x=$PASSED (floor $RATCHET2) passed-3x=$PASSED3 (floor $RATCHET3)"
+          if [ "$PASSED" -lt "$RATCHET2" ]; then
+            echo "::error::MLflow 2.x conformance regressed: $PASSED < $RATCHET2 steps."
             exit 1
           fi
-          if [ "$PASSED3" -lt "$RATCHET" ]; then
-            echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET steps."
+          if [ "$PASSED3" -lt "$RATCHET3" ]; then
+            echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET3 steps."
             exit 1
           fi
 

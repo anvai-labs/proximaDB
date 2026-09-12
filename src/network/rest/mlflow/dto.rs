@@ -118,9 +118,53 @@ pub(crate) struct RunInfo {
 }
 
 #[derive(Serialize)]
+pub(crate) struct RunInputsOut {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) dataset_inputs: Vec<DatasetInputOut>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) model_inputs: Vec<ModelInputOut>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DatasetInputOut {
+    pub(crate) dataset: DatasetOut,
+    pub(crate) tags: Vec<KeyValueOut>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DatasetOut {
+    pub(crate) name: String,
+    pub(crate) digest: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ModelInputOut {
+    pub(crate) model_id: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RunOutputsOut {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) model_outputs: Vec<ModelOutputOut>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ModelOutputOut {
+    pub(crate) model_id: String,
+    pub(crate) step: i64,
+}
+
+#[derive(Serialize)]
 pub(crate) struct RunOut {
     pub(crate) info: RunInfo,
     pub(crate) data: RunData,
+    /// MLflow 3.x run shape: model links ride the record (dataset inputs
+    /// are a separate port collection — embedded only in runs/get, not in
+    /// runs/search, where it would be a per-run N+1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) inputs: Option<RunInputsOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) outputs: Option<RunOutputsOut>,
 }
 
 #[derive(Default, Deserialize)]
@@ -178,6 +222,96 @@ pub(crate) struct LogMetricRequest {
     pub(crate) timestamp: i64,
     #[serde(default)]
     pub(crate) step: i64,
+    /// MLflow 3.x: when set the metric belongs to the logged model (the
+    /// run's latest-value projection is untouched).
+    #[serde(default)]
+    pub(crate) model_id: Option<String>,
+    #[serde(default)]
+    pub(crate) dataset_name: Option<String>,
+    #[serde(default)]
+    pub(crate) dataset_digest: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct ModelOutputIn {
+    #[serde(default)]
+    pub(crate) model_id: String,
+    #[serde(default)]
+    pub(crate) step: i64,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RunOutputsRequest {
+    #[serde(default)]
+    pub(crate) run_id: String,
+    #[serde(default)]
+    pub(crate) models: Vec<ModelOutputIn>,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RunLogModelRequest {
+    #[serde(default)]
+    pub(crate) run_id: String,
+    /// The serialized model memento — appended verbatim to the
+    /// `mlflow.logModel.history` tag (a JSON array), matching the
+    /// reference server's client-visible behavior.
+    #[serde(default)]
+    pub(crate) model_json: String,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct DatasetInputIn {
+    #[serde(default)]
+    pub(crate) dataset: Option<DatasetIn>,
+    /// Accepted for wire compatibility; dataset-input tags are not
+    /// surfaced by this adapter (documented in TD-MLOPS-2).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) tags: Vec<KeyValue>,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct DatasetIn {
+    #[serde(default)]
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) digest: String,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct ModelInputIn {
+    #[serde(default)]
+    pub(crate) model_id: String,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct RunLogInputsRequest {
+    #[serde(default)]
+    pub(crate) run_id: String,
+    #[serde(default)]
+    pub(crate) datasets: Vec<DatasetInputIn>,
+    #[serde(default)]
+    pub(crate) models: Vec<ModelInputIn>,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct TraceTagRequest {
+    #[serde(default)]
+    pub(crate) key: String,
+    #[serde(default)]
+    pub(crate) value: String,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct DeleteTracesRequest {
+    #[serde(default)]
+    pub(crate) experiment_id: String,
+    #[serde(default)]
+    pub(crate) max_timestamp_millis: Option<i64>,
+    #[serde(default)]
+    pub(crate) max_traces: Option<u64>,
+    #[serde(default)]
+    pub(crate) request_ids: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
