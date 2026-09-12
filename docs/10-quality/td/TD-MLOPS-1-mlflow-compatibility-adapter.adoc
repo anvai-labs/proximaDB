@@ -170,23 +170,6 @@ execution; MLflow auth pass-through (tenant identity stays ours).
 
 == Implementation log
 
-* **TD-MLOPS-2 opening (2026-09-10, design-audit refactors #2 + #4, PR
-  #1876)**: query pushdown and the artifact port land as the base of the
-  traces/LoggedModel wave. (1) The RunStore port gains `RunQuery` +
-  `RunQueryClause` (param/tag/metric predicates, shared LIKE) and
-  `search_runs(&RunQuery)` + `get_experiment_by_name` with default
-  implementations — the wire's runs-search is now ONE port call (the
-  per-experiment N+1 and wire-side filter application are gone);
-  `From<FieldFilter> for RunQueryClause` bridges the grammar, and
-  run-filter evaluation lives once, on the port. (2) The
-  `ArtifactRepository` port (put/get/list/delete, `ArtifactEntry`;
-  non-directories list EMPTY) with `LocalFsArtifacts` (tokio::fs) as the
-  first implementation — the tracked S3-backed repository adds an impl
-  instead of rewriting the proxy handler, now a pure codec. Review round
-  1 caught three port-rewrite regressions before merge: missing-file GET
-  must 404 (not empty-list 200), artifact IO must stay async, and the
-  bare-root DELETE must not wipe the tenant tree.
-
 * **Slice 2 (2026-09-07)**: the MLflow tracking wire at `/api/2.0/mlflow/*`
   (`src/network/rest/mlflow/`) — 16 endpoints over the RunStore port:
   experiments create/get/search/delete/restore, runs
@@ -211,13 +194,17 @@ execution; MLflow auth pass-through (tenant identity stays ours).
   list, the convention the client download flow relies on);
   artifact_location/artifact_uri populated (experiments default
   mlflow-artifacts:/<id>; runs mlflow-artifacts:/<exp>/<run>/artifacts);
-  local-file storage under <data_dir>/mlflow_artifacts/<tenant>/...
-  (traversal-sanitized, verbatim filenames, tenant-scoped; S3-backed
+  local-file storage under an injective, byte-encoded tenant root in
+  <data_dir>/mlflow_artifacts_v2/... (traversal-sanitized, verbatim filenames,
+  tenant-scoped; the ambiguous lossy legacy layout is not read; S3-backed
   repository is the tracked follow-up). Conformance 17 -> 18:
   log/list/download artifact round-trip through the real client. ALL
   FOUR SLICES IMPLEMENTED — the wave's remaining item is the flip
   assessment (conformance green across consecutive develop revisions +
   SIFT-bed load measurement + product sign-off).
+  Legacy artifact bytes require an explicit offline ownership audit and
+  migration/quarantine; an automatic read fallback is forbidden because the
+  prior lossy tenant mapping cannot prove which tenant owns colliding bytes.
 * **Slice 3 (2026-09-08)**: the registry wire — registered-models
   create/get/get-by-name/search and model-versions get/search lowering to
   `CatalogModelRegistryService` (create_registry / get / list /
