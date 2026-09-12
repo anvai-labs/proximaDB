@@ -28,12 +28,16 @@ SCRAM-SHA-256 authentication are tracked separately under TD-077.
 === Tenant selection
 
 The connection **`dbname` selects the tenant** — a connection to `dbname=acme`
-scopes every read and write to tenant `acme`. The value is literal, so
+scopes every read and write to tenant `acme` when open header trust is configured. The value is literal, so
 `dbname=proximadb` selects tenant `proximadb`; it is not an alias for a default.
 Only an omitted database selects the configured `[server.tenant] default_tenant`
-in single-tenant mode, while multi-tenant mode rejects an omission. This uses the
-same request-tenant resolver as REST, gRPC, and Flight. A session may also override
-the write tenant with `SET proximadb.write.tenant_id = '<tenant>'`. Tenant
+in single-tenant mode, while multi-tenant mode rejects an omission. Under
+authenticated-only or gateway-only trust, pgwire has no credential binding and
+therefore rejects explicit non-default database and session-variable assertions
+with SQLSTATE `28000`; the reserved literal `default` remains accepted. Pgwire
+uses the same deployment-mode and tenant-trust primitives as REST, gRPC, and
+Flight. Under a policy that accepts the assertion, a session may override the
+write tenant with `SET proximadb.write.tenant_id = '<tenant>'`. Tenant
 isolation is *structural* — the tenant is composed into the storage key at the
 service boundary, never applied as a per-query predicate — so a row written under
 one tenant is invisible to another even under an identical logical

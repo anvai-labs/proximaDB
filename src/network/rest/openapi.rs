@@ -244,7 +244,8 @@ fn openapi_document() -> Result<Value, String> {
     // (generated core ⊕ supplement) — one place, zero per-handler churn, and it sidesteps the
     // `Option<String>: Display` codegen error that blocks a per-handler `params(...)` header.
     // Isolation is structural on the server (the tenant is scoped into the storage key); this
-    // header only SELECTS the tenant when there is no authenticated context.
+    // header selects a tenant subject to the shared trust policy, including authenticated gateway
+    // delegation when GatewayOnly is configured.
     inject_tenant_header(&mut doc);
     Ok(doc)
 }

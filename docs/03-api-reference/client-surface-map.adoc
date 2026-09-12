@@ -170,7 +170,7 @@ with header `X-Embed-Source: native` (omit `vector` to let the server embed).
 
 === Tenant identity per transport
 
-Every transport resolves through the single request-tenant resolver. An absent selector maps to
+Every transport enforces the shared deployment-mode and tenant-trust primitives. An absent selector maps to
 the configured `[server.tenant] default_tenant` only in single-tenant mode; multi-tenant mode rejects it. Isolation is *structural* (the tenant is composed
 into the storage key at the service boundary, never a per-query predicate). The
 `X-Tenant-ID` REST header is a formal optional parameter on every operation in the
@@ -182,7 +182,7 @@ generated OpenAPI spec (`docs/openapi/proximadb-openapi.yaml`).
 | REST v2 | `X-Tenant-ID` header (optional) | An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant under gateway-only trust. Without a binding, acceptance follows the configured header trust policy.
 | gRPC | `x-tenant-id` metadata | Ambient identity (not a per-message field).
 | Arrow Flight | `x-tenant-id` metadata | Canonical carrier shared with gRPC; former aliases are detected for retirement telemetry but do not grant a tenant.
-| pgwire | startup `database` (fallback tenant session variable) | A supplied database is the literal tenant assertion (`database=proximadb` means tenant `proximadb`). Only an omitted database selects the configured default in single-tenant mode; multi-tenant mode rejects an omission. See link:./postgres.adoc[Postgres Wire Reference].
+| pgwire | startup `database` (fallback tenant session variable) | A supplied database is literal (`database=proximadb` means tenant `proximadb`). Open trust accepts it; authenticated-only and gateway-only reject non-default assertions because pgwire trust auth has no credential binding. The reserved literal `default` remains accepted. Only an omitted database selects the configured default in single-tenant mode; multi-tenant mode rejects an omission. See link:./postgres.adoc[Postgres Wire Reference].
 |====
 
 == SDK lowering (Python)
