@@ -1,0 +1,90 @@
+= TD-MLOPS-4: ArtifactRepository seam + query pushdown, v2 (re-land design)
+:status: Open
+:dim: D2
+:pillar: OE
+
+== Problem
+
+The TD-MLOPS-2 "opening" (#1876) introduced two capabilities behind one
+PR — the `RunQuery`/`RunQueryClause` search pushdown and the
+`ArtifactRepository` port — and shipped an unsafe implementation:
+distinct tenant IDs could share artifact bytes through lossy directory
+mapping, and blocking/ambient filesystem operations ran inside async
+request paths. PR #1891 reverted BOTH (keeping the RunStore on the
+pre-port contract) and hardened the local artifact behavior, explicitly
+deferring "ArtifactRepository and query pushdown to a separately
+reviewed design". This TD is that design: the REQUIREMENTS still stand —
+the wire's runs/search is back to per-experiment loops with
+adapter-side filtering (the N+1 the pushdown removed), and the tracked
+S3-backed artifacts future has no seam to plug into.
+
+== What #1891 left us (the foundation v2 builds on)
+
+* `src/network/rest/mlflow/artifacts.rs` carries a hardened CONCRETE
+  `ArtifactStore`: injective tenant roots
+  (`mlflow_artifacts_v2/<byte-length>/<full-UTF-8-hex>`), empty/over-64-
+  byte tenant ids rejected, capability-relative no-follow traversal for
+  intermediate and final components including recursive deletion, the
+  legacy ambiguous layout never read, filesystem work on
+  `spawn_blocking`, Windows fail-closed before any filesystem touch,
+  and the MLflow LIST/GET/DELETE contracts preserved (missing/file
+  lists empty, missing GET 404, DELETE idempotent).
+* `crates/control/proximadb-catalog/src/run_store.rs` is back to the
+  pre-port `RunStore` contract (experiments/runs/params/metrics/tags/
+  datasets + factory).
+
+== Design rule: extract the port FROM the proven implementation
+
+#1876 extracted the interface first and let implementations (including
+an unsafe one) follow. v2 inverts the order: keep #1891's hardened
+`ArtifactStore` byte-for-byte as the FIRST implementation, then derive
+the interface from the code that survived adversarial review. The port
+must encode the lessons as type-level and contract-level rules:
+
+1. **Tenant bound at construction.** The port is built per-tenant (a
+   factory), never takes a tenant string in path arguments — the
+   collision class #1891 found cannot be re-expressed through the seam.
+2. **Async-only surface.** Every operation is `async` and implementations
+   own their blocking strategy (`spawn_blocking` inside), so no ambient
+   blocking can stall the multiplexed runtime — the second #1876 class.
+3. **Capability declaration.** Implementations declare platform support
+   (e.g. Windows fail-closed) rather than discovering it at request
+   time; the wire maps unsupported platforms before any I/O.
+4. **The red evidence becomes the battery.** #1891's adversarial
+   discoveries — tenant collision, symlink/parent-swap traversal — are
+   port conformance tests every implementation must pass (in-memory +
+   hardened local + the eventual tracked-S3 double).
+
+== Query pushdown re-land
+
+The `RunQuery` side was never the unsafe half; it rode the bundle
+revert. Re-land as-is semantically (clause enum over params/tags/metrics
+with absent-value semantics; `search_runs(&RunQuery)` default composing
+`list_runs`, substrates overriding with real pushdown), but landing it
+TOGETHER WITH its consumers (the traces/LoggedModel wave, PR #1889's
+rebase onto #1891) so one adversarial review covers the seam and its
+users instead of an orphan abstraction.
+
+== Sequencing
+
+1. PR #1889 rebases onto #1891 and uses the hardened `ArtifactStore`
+   concretely (no port dependency) — in flight on the repair branch.
+2. THIS TD's port-v2 extraction PR: interface derived from the hardened
+   impl + the conformance battery from #1891's red evidence; the router
+   and the traces/LoggedModel artifact flows move behind the seam.
+3. Tracked-S3 artifacts: an implementation added behind the seam (the
+   original slice-4 motivation), gated by its own conformance run.
+
+== Key files
+
+* `src/network/rest/mlflow/artifacts.rs` — hardened impl (the extraction
+  source of truth)
+* `crates/control/proximadb-catalog/src/run_store.rs` — port home
+* PRs #1876 (reverted design), #1891 (the revert + hardening, with the
+  red evidence), #1889 (the consumer wave)
+
+== References
+
+* TD-MLOPS-1 (adapter laws), TD-MLOPS-2 file riding #1889
+* `docs/10-quality/td/TD-SSO-2-*.adoc` pattern: forward pointers stay
+  with the surface that needs them
