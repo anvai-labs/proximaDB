@@ -170,8 +170,9 @@ with header `X-Embed-Source: native` (omit `vector` to let the server embed).
 
 === Tenant identity per transport
 
-Every transport enforces the shared deployment-mode and tenant-trust primitives. An absent selector maps to
-the configured `[server.tenant] default_tenant` only in single-tenant mode; multi-tenant mode rejects it. Isolation is *structural* (the tenant is composed
+Every transport enforces the shared deployment-mode and tenant-trust primitives. When both an
+explicit selector and an authenticated tenant binding are absent, single-tenant mode selects the
+configured `[server.tenant] default_tenant`; multi-tenant mode rejects the request. Isolation is *structural* (the tenant is composed
 into the storage key at the service boundary, never a per-query predicate). The
 `X-Tenant-ID` REST header is a formal optional parameter on every operation in the
 generated OpenAPI spec (`docs/openapi/proximadb-openapi.yaml`).
