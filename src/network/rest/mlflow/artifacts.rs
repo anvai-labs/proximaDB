@@ -13,6 +13,8 @@
 //! segment-sanitized (no `..`, no absolute escapes) and tenant-scoped. The
 //! lossy legacy `mlflow_artifacts/<sanitized-tenant>` layout is intentionally
 //! not read because distinct tenants may already share one legacy directory.
+//! Local artifact operations fail closed on Windows until every filesystem
+//! operation in the capability stack is handle-relative on that platform.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -54,6 +56,20 @@ struct ArtifactListEntry {
 enum StoredArtifact {
     File(Vec<u8>),
     Directory(Vec<ArtifactListEntry>),
+}
+
+fn windows_artifact_operations_supported() -> bool {
+    false
+}
+
+fn ensure_local_artifact_operations_supported() -> std::io::Result<()> {
+    if cfg!(windows) && !windows_artifact_operations_supported() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "local artifact operations are unavailable on Windows without fully handle-relative filesystem support",
+        ));
+    }
+    Ok(())
 }
 
 impl ArtifactStore {
@@ -137,6 +153,7 @@ impl ArtifactStore {
     }
 
     fn read_sync(&self, segments: &[String]) -> std::io::Result<Option<StoredArtifact>> {
+        ensure_local_artifact_operations_supported()?;
         let Some((parent, leaf)) = self.open_parent(segments, false)? else {
             return Ok(None);
         };
@@ -170,6 +187,7 @@ impl ArtifactStore {
     }
 
     fn list_sync(&self, segments: &[String]) -> std::io::Result<Vec<ArtifactListEntry>> {
+        ensure_local_artifact_operations_supported()?;
         let directory = if let Some((leaf, parents)) = segments.split_last() {
             let Some(mut current) = self.open_tenant_dir(false)? else {
                 return Ok(Vec::new());
@@ -196,9 +214,16 @@ impl ArtifactStore {
             if !metadata.is_dir() {
                 return Ok(Vec::new());
             }
-            current
-                .open_dir_nofollow(leaf)
-                .map_err(|error| nofollow_error(leaf, error))?
+            match current.open_dir_nofollow(leaf) {
+                Ok(directory) => directory,
+                // LIST is intentionally empty for a missing path. Preserve
+                // that contract if the directory disappears after metadata
+                // but before the capability-relative open.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(nofollow_error(leaf, error)),
+            }
         } else {
             let Some(directory) = self.open_tenant_dir(false)? else {
                 return Ok(Vec::new());
@@ -210,6 +235,7 @@ impl ArtifactStore {
     }
 
     fn write_sync(&self, segments: &[String], bytes: &[u8]) -> std::io::Result<()> {
+        ensure_local_artifact_operations_supported()?;
         let Some((parent, leaf)) = self.open_parent(segments, true)? else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -239,6 +265,7 @@ impl ArtifactStore {
     }
 
     fn delete_sync(&self, segments: &[String]) -> std::io::Result<()> {
+        ensure_local_artifact_operations_supported()?;
         let Some((parent, leaf)) = self.open_parent(segments, false)? else {
             return Ok(());
         };
@@ -325,6 +352,7 @@ fn nofollow_error(path: impl AsRef<std::path::Path>, error: std::io::Error) -> s
         error.kind(),
         std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotADirectory
     ) || is_symlink_loop(&error)
+        || is_windows_stopped_on_symlink(&error)
     {
         unsafe_artifact_path(format!(
             "artifact path '{}' could not be opened without following links: {error}",
@@ -333,6 +361,16 @@ fn nofollow_error(path: impl AsRef<std::path::Path>, error: std::io::Error) -> s
     } else {
         error
     }
+}
+
+const WINDOWS_ERROR_STOPPED_ON_SYMLINK: i32 = 681;
+
+fn is_windows_stopped_on_symlink_code(raw_os_error: Option<i32>) -> bool {
+    raw_os_error == Some(WINDOWS_ERROR_STOPPED_ON_SYMLINK)
+}
+
+fn is_windows_stopped_on_symlink(error: &std::io::Error) -> bool {
+    cfg!(windows) && is_windows_stopped_on_symlink_code(error.raw_os_error())
 }
 
 #[cfg(unix)]
@@ -581,24 +619,28 @@ mod tests {
         TenantContext::new(name, TenantIdSource::Default)
     }
 
-    fn test_router(data_dir: &std::path::Path, tenant: &str, relative: bool) -> Router {
+    fn test_state(data_dir: &std::path::Path) -> MlflowState {
         use proximadb_catalog::run_store::conformance_tests::InMemoryRunStoreFactory;
 
+        MlflowState::new(
+            Arc::new(InMemoryRunStoreFactory::new()),
+            Arc::new(
+                proximadb_catalog::model_registry_service::CatalogModelRegistryService::new(
+                    Arc::new(crate::catalog::CatalogManager::new()),
+                ),
+            ),
+            data_dir.to_path_buf(),
+        )
+    }
+
+    fn test_router(data_dir: &std::path::Path, tenant: &str, relative: bool) -> Router {
         let routes = if relative {
             artifacts_routes_relative()
         } else {
             artifacts_routes()
         };
         routes
-            .with_state(MlflowState::new(
-                Arc::new(InMemoryRunStoreFactory::new()),
-                Arc::new(
-                    proximadb_catalog::model_registry_service::CatalogModelRegistryService::new(
-                        Arc::new(crate::catalog::CatalogManager::new()),
-                    ),
-                ),
-                data_dir.to_path_buf(),
-            ))
+            .with_state(test_state(data_dir))
             .layer(axum::Extension(tenant_ctx(tenant)))
     }
 
@@ -616,6 +658,7 @@ mod tests {
             .expect("artifact test router must respond")
     }
 
+    #[cfg(not(windows))]
     async fn assert_empty_listing(response: Response, context: &str) {
         assert_eq!(response.status(), StatusCode::OK, "{context}");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -626,6 +669,7 @@ mod tests {
         assert_eq!(body, json!({ "files": [] }), "{context}");
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn root_list_preserves_empty_missing_and_file_contract() {
         let temp = tempfile::tempdir().expect("create artifact list contract directory");
@@ -706,6 +750,38 @@ mod tests {
             std::io::ErrorKind::InvalidInput,
             "a Unix ELOOP remains a client-visible no-follow violation"
         );
+
+        assert!(is_windows_stopped_on_symlink_code(Some(681)));
+        assert!(!is_windows_stopped_on_symlink_code(Some(5)));
+        assert!(!is_windows_stopped_on_symlink_code(None));
+
+        assert!(
+            !windows_artifact_operations_supported(),
+            "local artifact operations must remain fail-closed on Windows until every path operation is handle-relative"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ambient_capability_operations_fail_closed() {
+        let temp = tempfile::tempdir().expect("create Windows delete test directory");
+        let state = test_state(temp.path());
+        let store = ArtifactStore::new(&state, &tenant_ctx("windows-delete-tenant"))
+            .ok()
+            .expect("construct artifact store");
+        let file = ["tree", "model.bin"].map(str::to_owned);
+        let operations = [
+            store.read_sync(&file).map(|_| ()),
+            store.list_sync(&["tree".to_owned()]).map(|_| ()),
+            store.write_sync(&file, b"model"),
+            store.delete_sync(&file),
+        ];
+        for result in operations {
+            assert!(matches!(
+                result,
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported
+            ));
+        }
     }
 
     #[cfg(unix)]
@@ -912,6 +988,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn canonical_and_ui_relative_routes_enforce_identical_validation() {
         let temp = tempfile::tempdir().expect("create artifact test directory");
@@ -965,6 +1042,31 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "mlflow-ui", not(windows)))]
+    #[tokio::test]
+    async fn actual_ui_mount_serves_nested_artifact_proxy_routes() {
+        let temp = tempfile::tempdir().expect("create UI artifact route directory");
+        let router = Router::new()
+            .nest(
+                "/mlflow-ui",
+                crate::network::rest::mlflow::ui::ui_mount_routes(),
+            )
+            .with_state(test_state(temp.path()))
+            .layer(axum::Extension(tenant_ctx("ui-mount-tenant")));
+        let file = "/mlflow-ui/ajax-api/2.0/mlflow-artifacts/artifacts/exp/run/artifacts/model.bin";
+        assert_eq!(
+            request(&router, "PUT", file, b"ui-model").await.status(),
+            StatusCode::OK
+        );
+        let response = request(&router, "GET", file, b"").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read nested UI artifact response");
+        assert_eq!(&body[..], b"ui-model");
+    }
+
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn artifact_routes_isolate_tenant_put_get_list_and_delete() {
         let temp = tempfile::tempdir().expect("create artifact isolation directory");
@@ -1007,6 +1109,35 @@ mod tests {
         assert_eq!(
             request(&tenant_a, "GET", file, b"").await.status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_artifact_handlers_fail_closed_without_creating_storage() {
+        let temp = tempfile::tempdir().expect("create Windows artifact handler directory");
+        let router = test_router(temp.path(), "windows-handler-tenant", false);
+        let file = "/api/2.0/mlflow-artifacts/artifacts/exp/run/artifacts/model.bin";
+        let list = "/api/2.0/mlflow-artifacts/artifacts?path=exp/run/artifacts";
+
+        for (method, uri, body) in [
+            ("PUT", file, &b"model"[..]),
+            ("GET", file, &b""[..]),
+            ("GET", list, &b""[..]),
+            ("DELETE", file, &b""[..]),
+        ] {
+            assert_eq!(
+                request(&router, method, uri, body).await.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {uri} must fail closed on Windows"
+            );
+        }
+
+        assert!(
+            tokio::fs::symlink_metadata(temp.path().join("mlflow_artifacts_v2"))
+                .await
+                .is_err(),
+            "a rejected Windows artifact operation must not create storage"
         );
     }
 
