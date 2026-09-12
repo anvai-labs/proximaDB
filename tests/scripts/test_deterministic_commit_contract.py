@@ -84,6 +84,23 @@ class NextestCommitContractTest(unittest.TestCase):
             findings,
         )
 
+    def test_integration_cannot_hide_flaky_survivors(self) -> None:
+        config = (REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8")
+        mutated = config.replace(
+            "[profile.integration]\n",
+            '[profile.integration]\nfinal-status-level = "none"\n',
+            1,
+        )
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any(
+                'profile.integration.final-status-level override must be "flaky"'
+                in finding.message
+                for finding in findings
+            ),
+            findings,
+        )
+
     def test_unit_retry_overrides_are_rejected(self) -> None:
         config = (REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8")
         mutated = config + '\n[[profile.unit.overrides]]\nfilter = "all()"\nretries = 9\n'

@@ -133,6 +133,14 @@ def check_nextest_contract(findings: list[Finding]) -> None:
                 '.config/nextest.toml profile.unit.final-status-level override must be "flaky"',
             )
         )
+    integration_final_status = integration.get("final-status-level")
+    if integration_final_status is not None and integration_final_status != "flaky":
+        findings.append(
+            Finding(
+                "nextest",
+                '.config/nextest.toml profile.integration.final-status-level override must be "flaky"',
+            )
+        )
     for profile_name in ("default", "unit", "integration"):
         for override in profiles.get(profile_name, {}).get("overrides", []):
             if "retries" in override:

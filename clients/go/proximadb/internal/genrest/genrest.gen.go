@@ -3554,91 +3554,91 @@ type UnifiedUnsupportedMediaType = UnifiedBareError
 
 // GetCapabilitiesParams defines parameters for GetCapabilities.
 type GetCapabilitiesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListAttributeBindingsParams defines parameters for ListAttributeBindings.
 type ListAttributeBindingsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // PostAttributeBindingParams defines parameters for PostAttributeBinding.
 type PostAttributeBindingParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // PostGrantParams defines parameters for PostGrant.
 type PostGrantParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListGrantsParams defines parameters for ListGrants.
 type ListGrantsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteGrantParams defines parameters for DeleteGrant.
 type DeleteGrantParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListPolicyBindingsParams defines parameters for ListPolicyBindings.
 type ListPolicyBindingsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeletePolicyBindingParams defines parameters for DeletePolicyBinding.
 type DeletePolicyBindingParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // PutPolicyBindingParams defines parameters for PutPolicyBinding.
 type PutPolicyBindingParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListPredicateObjectsParams defines parameters for ListPredicateObjects.
 type ListPredicateObjectsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeletePredicateObjectParams defines parameters for DeletePredicateObject.
 type DeletePredicateObjectParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetPredicateObjectParams defines parameters for GetPredicateObject.
 type GetPredicateObjectParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // PutPredicateObjectParams defines parameters for PutPredicateObject.
 type PutPredicateObjectParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetTenantPostureParams defines parameters for GetTenantPosture.
 type GetTenantPostureParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // PutTenantPostureParams defines parameters for PutTenantPosture.
 type PutTenantPostureParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -3647,13 +3647,13 @@ type GetCatalogTableRoutingParams struct {
 	// TableName Filter to one table (case-insensitive name match).
 	TableName *string `form:"table_name,omitempty" json:"table_name,omitempty"`
 
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExplainTableWriteRouteParams defines parameters for ExplainTableWriteRoute.
 type ExplainTableWriteRouteParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -3668,109 +3668,109 @@ type ListCollectionsParams struct {
 	// IncludeStats Whether to include statistics
 	IncludeStats *bool `form:"include_stats,omitempty" json:"include_stats,omitempty"`
 
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateCollectionParams defines parameters for CreateCollection.
 type CreateCollectionParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListCollectionAffinitiesParams defines parameters for ListCollectionAffinities.
 type ListCollectionAffinitiesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListCollectionPinsParams defines parameters for ListCollectionPins.
 type ListCollectionPinsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteCollectionParams defines parameters for DeleteCollection.
 type DeleteCollectionParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetCollectionParams defines parameters for GetCollection.
 type GetCollectionParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteCollectionAffinityParams defines parameters for DeleteCollectionAffinity.
 type DeleteCollectionAffinityParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetCollectionAffinityParams defines parameters for GetCollectionAffinity.
 type GetCollectionAffinityParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // IngestDocumentsParams defines parameters for IngestDocuments.
 type IngestDocumentsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // UpsertEntityV2Params defines parameters for UpsertEntityV2.
 type UpsertEntityV2Params struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // SearchEntitiesV2Params defines parameters for SearchEntitiesV2.
 type SearchEntitiesV2Params struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteEntityV2Params defines parameters for DeleteEntityV2.
 type DeleteEntityV2Params struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetEntityV2Params defines parameters for GetEntityV2.
 type GetEntityV2Params struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetCollectionPinParams defines parameters for GetCollectionPin.
 type GetCollectionPinParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // PatchCollectionPinParams defines parameters for PatchCollectionPin.
 type PatchCollectionPinParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // InsertRecordsParams defines parameters for InsertRecords.
 type InsertRecordsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ScanRecordsParams defines parameters for ScanRecords.
 type ScanRecordsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteRecordParams defines parameters for DeleteRecord.
 type DeleteRecordParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -3782,49 +3782,49 @@ type GetRecordParams struct {
 	// IncludeText Whether to include TEXT fields in the response
 	IncludeText *bool `form:"include_text,omitempty" json:"include_text,omitempty"`
 
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetCollectionSchemaParams defines parameters for GetCollectionSchema.
 type GetCollectionSchemaParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // UpdateCollectionSchemaParams defines parameters for UpdateCollectionSchema.
 type UpdateCollectionSchemaParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // SearchRecordsParams defines parameters for SearchRecords.
 type SearchRecordsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListDocumentCollectionsParams defines parameters for ListDocumentCollections.
 type ListDocumentCollectionsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateDocumentCollectionParams defines parameters for CreateDocumentCollection.
 type CreateDocumentCollectionParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteDocumentCollectionParams defines parameters for DeleteDocumentCollection.
 type DeleteDocumentCollectionParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetDocumentCollectionParams defines parameters for GetDocumentCollection.
 type GetDocumentCollectionParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -3839,31 +3839,31 @@ type QueryDocumentsParams struct {
 	// Limit Defaults to 100.
 	Limit *uint32 `form:"limit,omitempty" json:"limit,omitempty"`
 
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // InsertDocumentParams defines parameters for InsertDocument.
 type InsertDocumentParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // AggregateDocumentsParams defines parameters for AggregateDocuments.
 type AggregateDocumentsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // BatchInsertDocumentsParams defines parameters for BatchInsertDocuments.
 type BatchInsertDocumentsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteDocumentParams defines parameters for DeleteDocument.
 type DeleteDocumentParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -3872,205 +3872,205 @@ type GetDocumentParams struct {
 	// Projection Comma-separated field list.
 	Projection *string `form:"projection,omitempty" json:"projection,omitempty"`
 
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // UpdateDocumentParams defines parameters for UpdateDocument.
 type UpdateDocumentParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListDocumentIndexesParams defines parameters for ListDocumentIndexes.
 type ListDocumentIndexesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateDocumentIndexParams defines parameters for CreateDocumentIndex.
 type CreateDocumentIndexParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListGraphsParams defines parameters for ListGraphs.
 type ListGraphsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateGraphParams defines parameters for CreateGraph.
 type CreateGraphParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteGraphParams defines parameters for DeleteGraph.
 type DeleteGraphParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetGraphParams defines parameters for GetGraph.
 type GetGraphParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetConnectedComponentsParams defines parameters for GetConnectedComponents.
 type GetConnectedComponentsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // RemoveUniqueConstraintParams defines parameters for RemoveUniqueConstraint.
 type RemoveUniqueConstraintParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // AddUniqueConstraintParams defines parameters for AddUniqueConstraint.
 type AddUniqueConstraintParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CheckCyclesParams defines parameters for CheckCycles.
 type CheckCyclesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateEdgeParams defines parameters for CreateEdge.
 type CreateEdgeParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // BatchCreateEdgesParams defines parameters for BatchCreateEdges.
 type BatchCreateEdgesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteEdgeParams defines parameters for DeleteEdge.
 type DeleteEdgeParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetEdgeParams defines parameters for GetEdge.
 type GetEdgeParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // UpdateEdgeParams defines parameters for UpdateEdge.
 type UpdateEdgeParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // FusionSearchV2Params defines parameters for FusionSearchV2.
 type FusionSearchV2Params struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ImpactAnalysisV2Params defines parameters for ImpactAnalysisV2.
 type ImpactAnalysisV2Params struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateNodeParams defines parameters for CreateNode.
 type CreateNodeParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // BatchCreateNodesParams defines parameters for BatchCreateNodes.
 type BatchCreateNodesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteNodeParams defines parameters for DeleteNode.
 type DeleteNodeParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetNodeParams defines parameters for GetNode.
 type GetNodeParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // UpdateNodeParams defines parameters for UpdateNode.
 type UpdateNodeParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetNodeNeighborsParams defines parameters for GetNodeNeighbors.
 type GetNodeNeighborsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExecuteGraphQueryParams defines parameters for ExecuteGraphQuery.
 type ExecuteGraphQueryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // QueryEdgesParams defines parameters for QueryEdges.
 type QueryEdgesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // QueryNodesParams defines parameters for QueryNodes.
 type QueryNodesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // UpdateGraphSchemaParams defines parameters for UpdateGraphSchema.
 type UpdateGraphSchemaParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ShortestPathParams defines parameters for ShortestPath.
 type ShortestPathParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetGraphStatsParams defines parameters for GetGraphStats.
 type GetGraphStatsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // StepGraphParams defines parameters for StepGraph.
 type StepGraphParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // TraverseGraphParams defines parameters for TraverseGraph.
 type TraverseGraphParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // WalkGraphParams defines parameters for WalkGraph.
 type WalkGraphParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -4079,7 +4079,7 @@ type HybridIndexJSONBody map[string]interface{}
 
 // HybridIndexParams defines parameters for HybridIndex.
 type HybridIndexParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -4095,49 +4095,49 @@ type HybridSearchJSONBody struct {
 
 // HybridSearchParams defines parameters for HybridSearch.
 type HybridSearchParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListModelRegistriesParams defines parameters for ListModelRegistries.
 type ListModelRegistriesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateModelRegistryParams defines parameters for CreateModelRegistry.
 type CreateModelRegistryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetModelRegistryParams defines parameters for GetModelRegistry.
 type GetModelRegistryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ApplyModelRegistryMutationParams defines parameters for ApplyModelRegistryMutation.
 type ApplyModelRegistryMutationParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ResolveModelAliasParams defines parameters for ResolveModelAlias.
 type ResolveModelAliasParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // TranslateNaturalLanguageParams defines parameters for TranslateNaturalLanguage.
 type TranslateNaturalLanguageParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateObservabilityNamespaceParams defines parameters for CreateObservabilityNamespace.
 type CreateObservabilityNamespaceParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -4146,13 +4146,13 @@ type IngestLogJSONBody map[string]interface{}
 
 // IngestLogParams defines parameters for IngestLog.
 type IngestLogParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // IngestLogsParams defines parameters for IngestLogs.
 type IngestLogsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
@@ -4161,181 +4161,181 @@ type QueryLogsJSONBody map[string]interface{}
 
 // QueryLogsParams defines parameters for QueryLogs.
 type QueryLogsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // IngestMetricParams defines parameters for IngestMetric.
 type IngestMetricParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // AggregateMetricsParams defines parameters for AggregateMetrics.
 type AggregateMetricsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // IngestMetricsParams defines parameters for IngestMetrics.
 type IngestMetricsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListPrimaryPodsParams defines parameters for ListPrimaryPods.
 type ListPrimaryPodsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeletePrimaryPodParams defines parameters for DeletePrimaryPod.
 type DeletePrimaryPodParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetPrimaryPodParams defines parameters for GetPrimaryPod.
 type GetPrimaryPodParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // PutPrimaryPodParams defines parameters for PutPrimaryPod.
 type PutPrimaryPodParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExecuteQueryParams defines parameters for ExecuteQuery.
 type ExecuteQueryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExplainQueryParams defines parameters for ExplainQuery.
 type ExplainQueryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // RankSearchParams defines parameters for RankSearch.
 type RankSearchParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExecuteSqlParams defines parameters for ExecuteSql.
 type ExecuteSqlParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ListTimeseriesCollectionsParams defines parameters for ListTimeseriesCollections.
 type ListTimeseriesCollectionsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // CreateTimeseriesCollectionParams defines parameters for CreateTimeseriesCollection.
 type CreateTimeseriesCollectionParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeleteTimeseriesCollectionParams defines parameters for DeleteTimeseriesCollection.
 type DeleteTimeseriesCollectionParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // AggregateTimeseriesParams defines parameters for AggregateTimeseries.
 type AggregateTimeseriesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // IngestTimeseriesParams defines parameters for IngestTimeseries.
 type IngestTimeseriesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // QueryTimeseriesParams defines parameters for QueryTimeseries.
 type QueryTimeseriesParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExecuteDistributedQueryParams defines parameters for ExecuteDistributedQuery.
 type ExecuteDistributedQueryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExecuteUnifiedQueryParams defines parameters for ExecuteUnifiedQuery.
 type ExecuteUnifiedQueryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExecutePreparedStatementParams defines parameters for ExecutePreparedStatement.
 type ExecutePreparedStatementParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExplainUnifiedQueryParams defines parameters for ExplainUnifiedQuery.
 type ExplainUnifiedQueryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExecuteFederatedQueryParams defines parameters for ExecuteFederatedQuery.
 type ExecuteFederatedQueryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // ExecuteMultiModelQueryParams defines parameters for ExecuteMultiModelQuery.
 type ExecuteMultiModelQueryParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // PrepareStatementParams defines parameters for PrepareStatement.
 type PrepareStatementParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetPreparedStatsParams defines parameters for GetPreparedStats.
 type GetPreparedStatsParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // DeletePreparedStatementParams defines parameters for DeletePreparedStatement.
 type DeletePreparedStatementParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetHealthParams defines parameters for GetHealth.
 type GetHealthParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetLivenessParams defines parameters for GetLiveness.
 type GetLivenessParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 
 // GetReadinessParams defines parameters for GetReadiness.
 type GetReadinessParams struct {
-	// XTenantID Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+	// XTenantID Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
 	XTenantID *string `json:"X-Tenant-ID,omitempty"`
 }
 

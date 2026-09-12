@@ -37748,7 +37748,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/_meta/capabilities`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_capabilities()
     /// .x_tenant_id(x_tenant_id)
@@ -37770,7 +37770,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/abac/attribute-bindings`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_attribute_bindings()
     /// .x_tenant_id(x_tenant_id)
@@ -37792,7 +37792,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/abac/attribute-bindings`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.post_attribute_binding()
@@ -37820,7 +37820,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/abac/grants`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.post_grant()
@@ -37844,7 +37844,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `owner_tenant`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_grants()
     /// .owner_tenant(owner_tenant)
@@ -37869,7 +37869,7 @@ impl Client {
     /// Arguments:
     /// - `owner_tenant`
     /// - `grant_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_grant()
     /// .owner_tenant(owner_tenant)
@@ -37894,7 +37894,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `tenant`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_policy_bindings()
     /// .tenant(tenant)
@@ -37921,7 +37921,7 @@ impl Client {
     /// Arguments:
     /// - `tenant`
     /// - `object_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.put_policy_binding()
@@ -37947,7 +37947,7 @@ impl Client {
     /// Arguments:
     /// - `tenant`
     /// - `object_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_policy_binding()
     /// .tenant(tenant)
@@ -37968,7 +37968,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/abac/predicate-objects`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_predicate_objects()
     /// .x_tenant_id(x_tenant_id)
@@ -37990,7 +37990,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `object_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_predicate_object()
     /// .object_id(object_id)
@@ -38014,7 +38014,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `object_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.put_predicate_object()
@@ -38039,7 +38039,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `object_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_predicate_object()
     /// .object_id(object_id)
@@ -38063,7 +38063,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `tenant`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_tenant_posture()
     /// .tenant(tenant)
@@ -38087,7 +38087,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `tenant`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.put_tenant_posture()
@@ -38120,7 +38120,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `table_name`: Filter to one table (case-insensitive name match).
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_catalog_table_routing()
     /// .table_name(table_name)
@@ -38151,7 +38151,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/catalog/table-write/explain`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.explain_table_write_route()
@@ -38187,7 +38187,7 @@ impl Client {
     /// - `include_stats`: Whether to include statistics
     /// - `limit`: Maximum number of collections to return (default: 100)
     /// - `offset`: Offset for pagination (default: 0)
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_collections()
     /// .include_stats(include_stats)
@@ -38221,7 +38221,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/collections`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_collection()
@@ -38244,7 +38244,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/collections/affinity`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_collection_affinities()
     /// .x_tenant_id(x_tenant_id)
@@ -38265,7 +38265,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/collections/pinning`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_collection_pins()
     /// .x_tenant_id(x_tenant_id)
@@ -38296,7 +38296,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection name/ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_collection()
     /// .collection_id(collection_id)
@@ -38317,7 +38317,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection name/ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_collection()
     /// .collection_id(collection_id)
@@ -38343,7 +38343,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_collection_affinity()
     /// .collection_id(collection_id)
@@ -38367,7 +38367,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_collection_affinity()
     /// .collection_id(collection_id)
@@ -38386,7 +38386,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Target collection name/ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.ingest_documents()
@@ -38403,7 +38403,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection backing the entities
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.upsert_entity_v2()
@@ -38420,7 +38420,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection backing the entities
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.search_entities_v2()
@@ -38438,7 +38438,7 @@ impl Client {
     /// Arguments:
     /// - `collection_id`: Collection backing the entities
     /// - `entity_id`: Entity ID
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_entity_v2()
     /// .collection_id(collection_id)
@@ -38455,7 +38455,7 @@ impl Client {
     /// Arguments:
     /// - `collection_id`: Collection backing the entities
     /// - `entity_id`: Entity ID
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_entity_v2()
     /// .collection_id(collection_id)
@@ -38480,7 +38480,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_collection_pin()
     /// .collection_id(collection_id)
@@ -38506,7 +38506,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.patch_collection_pin()
@@ -38541,7 +38541,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection name/ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.insert_records()
@@ -38567,7 +38567,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection name/ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.scan_records()
@@ -38610,7 +38610,7 @@ impl Client {
     /// - `record_id`: Record ID.
     /// - `include_text`: Whether to include TEXT fields in the response
     /// - `include_vector`: Whether to include the vector in the response
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_record()
     /// .collection_id(collection_id)
@@ -38633,7 +38633,7 @@ impl Client {
     /// Arguments:
     /// - `collection_id`: Collection name/ID.
     /// - `record_id`: Record ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_record()
     /// .collection_id(collection_id)
@@ -38666,7 +38666,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection name/ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_collection_schema()
     /// .collection_id(collection_id)
@@ -38709,7 +38709,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection name/ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.update_collection_schema()
@@ -38744,7 +38744,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`: Collection name/ID.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.search_records()
@@ -38762,7 +38762,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/document-collections`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_document_collections()
     /// .x_tenant_id(x_tenant_id)
@@ -38777,7 +38777,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/document-collections`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_document_collection()
@@ -38799,7 +38799,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_document_collection()
     /// .collection(collection)
@@ -38816,7 +38816,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_document_collection()
     /// .collection(collection)
@@ -38836,7 +38836,7 @@ impl Client {
     /// - `filter`: Filter expression (server-parsed).
     /// - `limit`: Defaults to 100.
     /// - `projection`: Comma-separated field list.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.query_documents()
     /// .collection(collection)
@@ -38856,7 +38856,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.insert_document()
@@ -38875,7 +38875,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.aggregate_documents()
@@ -38894,7 +38894,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.batch_insert_documents()
@@ -38915,7 +38915,7 @@ impl Client {
     /// - `collection`
     /// - `id`
     /// - `projection`: Comma-separated field list.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_document()
     /// .collection(collection)
@@ -38935,7 +38935,7 @@ impl Client {
     /// Arguments:
     /// - `collection`
     /// - `id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_document()
     /// .collection(collection)
@@ -38957,7 +38957,7 @@ impl Client {
     /// Arguments:
     /// - `collection`
     /// - `id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.update_document()
@@ -38977,7 +38977,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_document_indexes()
     /// .collection(collection)
@@ -38999,7 +38999,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_document_index()
@@ -39017,7 +39017,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/graphs`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_graphs()
     /// .x_tenant_id(x_tenant_id)
@@ -39032,7 +39032,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/graphs`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_graph()
@@ -39050,7 +39050,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_graph()
     /// .graph_id(graph_id)
@@ -39071,7 +39071,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_graph()
     /// .graph_id(graph_id)
@@ -39088,7 +39088,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_connected_components()
     /// .graph_id(graph_id)
@@ -39105,7 +39105,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.add_unique_constraint()
@@ -39124,7 +39124,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.remove_unique_constraint()
@@ -39143,7 +39143,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.check_cycles()
     /// .graph_id(graph_id)
@@ -39160,7 +39160,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_edge()
@@ -39183,7 +39183,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.batch_create_edges()
@@ -39203,7 +39203,7 @@ impl Client {
     /// Arguments:
     /// - `graph_id`
     /// - `edge_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_edge()
     /// .graph_id(graph_id)
@@ -39226,7 +39226,7 @@ impl Client {
     /// Arguments:
     /// - `graph_id`
     /// - `edge_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.update_edge()
@@ -39247,7 +39247,7 @@ impl Client {
     /// Arguments:
     /// - `graph_id`
     /// - `edge_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_edge()
     /// .graph_id(graph_id)
@@ -39265,7 +39265,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`: Graph ID for traversal expansion
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.fusion_search_v2()
@@ -39285,7 +39285,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`: Graph ID
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.impact_analysis_v2()
@@ -39304,7 +39304,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_node()
@@ -39327,7 +39327,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.batch_create_nodes()
@@ -39347,7 +39347,7 @@ impl Client {
     /// Arguments:
     /// - `graph_id`
     /// - `node_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_node()
     /// .graph_id(graph_id)
@@ -39370,7 +39370,7 @@ impl Client {
     /// Arguments:
     /// - `graph_id`
     /// - `node_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.update_node()
@@ -39391,7 +39391,7 @@ impl Client {
     /// Arguments:
     /// - `graph_id`
     /// - `node_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_node()
     /// .graph_id(graph_id)
@@ -39410,7 +39410,7 @@ impl Client {
     /// Arguments:
     /// - `graph_id`
     /// - `node_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_node_neighbors()
     /// .graph_id(graph_id)
@@ -39433,7 +39433,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.execute_graph_query()
@@ -39457,7 +39457,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.query_edges()
@@ -39480,7 +39480,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.query_nodes()
@@ -39505,7 +39505,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.update_graph_schema()
@@ -39524,7 +39524,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.shortest_path()
@@ -39543,7 +39543,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_graph_stats()
     /// .graph_id(graph_id)
@@ -39564,7 +39564,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.step_graph()
@@ -39583,7 +39583,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.traverse_graph()
@@ -39606,7 +39606,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `graph_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.walk_graph()
@@ -39624,7 +39624,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/hybrid/index`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.hybrid_index()
@@ -39641,7 +39641,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/hybrid/search`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.hybrid_search()
@@ -39656,7 +39656,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/model-registries`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_model_registries()
     /// .x_tenant_id(x_tenant_id)
@@ -39669,7 +39669,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/model-registries`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_model_registry()
@@ -39685,7 +39685,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `name`: Tenant-local registry name.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_model_registry()
     /// .name(name)
@@ -39700,7 +39700,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `name`: Tenant-local registry name.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.apply_model_registry_mutation()
@@ -39717,7 +39717,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `name`: Tenant-local registry name.
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.resolve_model_alias()
@@ -39742,7 +39742,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/nl/translate`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.translate_natural_language()
@@ -39771,7 +39771,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/observability/namespaces`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_observability_namespace()
@@ -39796,7 +39796,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `namespace`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.ingest_log()
@@ -39822,7 +39822,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `namespace`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.ingest_logs()
@@ -39849,7 +39849,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `namespace`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.query_logs()
@@ -39875,7 +39875,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `namespace`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.ingest_metric()
@@ -39904,7 +39904,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `namespace`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.aggregate_metrics()
@@ -39930,7 +39930,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `namespace`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.ingest_metrics()
@@ -39957,7 +39957,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/primary-pod`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_primary_pods()
     /// .x_tenant_id(x_tenant_id)
@@ -39983,7 +39983,7 @@ impl Client {
     /// Arguments:
     /// - `tenant_id`
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_primary_pod()
     /// .tenant_id(tenant_id)
@@ -40015,7 +40015,7 @@ impl Client {
     /// Arguments:
     /// - `tenant_id`
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.put_primary_pod()
@@ -40046,7 +40046,7 @@ impl Client {
     /// Arguments:
     /// - `tenant_id`
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_primary_pod()
     /// .tenant_id(tenant_id)
@@ -40070,7 +40070,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/query`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.execute_query()
@@ -40087,7 +40087,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/query/explain`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.explain_query()
@@ -40119,7 +40119,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/rank/search`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.rank_search()
@@ -40140,7 +40140,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/sql`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.execute_sql()
@@ -40157,7 +40157,7 @@ impl Client {
     /// Sends a `GET` request to `/api/v2/timeseries/collections`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.list_timeseries_collections()
     /// .x_tenant_id(x_tenant_id)
@@ -40172,7 +40172,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/timeseries/collections`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.create_timeseries_collection()
@@ -40194,7 +40194,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_timeseries_collection()
     /// .collection_id(collection_id)
@@ -40211,7 +40211,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.aggregate_timeseries()
@@ -40230,7 +40230,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.ingest_timeseries()
@@ -40249,7 +40249,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `collection_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.query_timeseries()
@@ -40271,7 +40271,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/unified/distributed`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.execute_distributed_query()
@@ -40292,7 +40292,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/unified/execute`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.execute_unified_query()
@@ -40314,7 +40314,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `statement_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.execute_prepared_statement()
@@ -40336,7 +40336,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/unified/explain`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.explain_unified_query()
@@ -40357,7 +40357,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/unified/federated`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.execute_federated_query()
@@ -40378,7 +40378,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/unified/multi-model`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.execute_multi_model_query()
@@ -40399,7 +40399,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/unified/prepare`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.prepare_statement()
@@ -40420,7 +40420,7 @@ impl Client {
     /// Sends a `POST` request to `/api/v2/unified/prepared/stats`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// - `body`
     /// ```text
     /// let response = client.get_prepared_stats()
@@ -40442,7 +40442,7 @@ impl Client {
     ///
     /// Arguments:
     /// - `statement_id`
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.delete_prepared_statement()
     /// .statement_id(statement_id)
@@ -40458,7 +40458,7 @@ impl Client {
     /// Sends a `GET` request to `/health`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_health()
     /// .x_tenant_id(x_tenant_id)
@@ -40473,7 +40473,7 @@ impl Client {
     /// Sends a `GET` request to `/health/live`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_liveness()
     /// .x_tenant_id(x_tenant_id)
@@ -40488,7 +40488,7 @@ impl Client {
     /// Sends a `GET` request to `/health/ready`
     ///
     /// Arguments:
-    /// - `x_tenant_id`: Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant.
+    /// - `x_tenant_id`: Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When absent, a single-tenant deployment selects its configured default tenant; a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant.
     /// ```text
     /// let response = client.get_readiness()
     /// .x_tenant_id(x_tenant_id)

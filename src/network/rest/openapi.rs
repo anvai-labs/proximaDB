@@ -261,12 +261,13 @@ fn inject_tenant_header(doc: &mut Value) {
         "name": "X-Tenant-ID",
         "in": "header",
         "required": false,
-        "description": "Optional explicit tenant selector. Applied only when there is no \
-            authenticated tenant context — a JWT tenant claim takes precedence, and a header that \
-            disagrees with the authenticated tenant is rejected. When absent, a single-tenant \
-            deployment selects its configured default tenant; a multi-tenant deployment rejects \
-            the request. Tenant isolation is structural on the server; this header only selects \
-            the tenant.",
+        "description": "Optional explicit tenant selector. An authenticated tenant binding \
+            takes precedence and a mismatch is rejected, except that an authenticated gateway \
+            principal may delegate an acting tenant when gateway-only trust is configured. Without \
+            an authenticated binding, acceptance depends on the configured header trust policy. \
+            When absent, a single-tenant deployment selects its configured default tenant; a \
+            multi-tenant deployment rejects the request. Tenant isolation is structural on the \
+            server; this header only selects the tenant.",
         "schema": { "type": "string" }
     });
     let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) else {
@@ -366,8 +367,11 @@ mod tests {
                 assert!(
                     description.contains("single-tenant")
                         && description.contains("multi-tenant")
-                        && description.contains("rejected"),
-                    "{method} {route}: tenant default must be deployment-qualified"
+                        && description.contains("rejected")
+                        && description.contains("gateway")
+                        && description.contains("delegate")
+                        && description.contains("trust policy"),
+                    "{method} {route}: tenant selection must describe deployment and gateway trust"
                 );
                 checked += 1;
             }
