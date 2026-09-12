@@ -1551,8 +1551,12 @@ impl PostgresProtocol {
             return self.send_empty_result().await;
         }
 
-        // Handle SELECT queries
-        if upper.starts_with("SELECT") {
+        // Handle SELECT queries. TD-185a: WITH (CTE) statements are dispatched
+        // here too — before this, `WITH …` failed the SELECT gate and fell
+        // through every DML branch to the terminal "OK" fallthrough, returning
+        // a clean success with ZERO rows (the recursive-CTE empty-result bug;
+        // TPC-DS `cte` was a silent false pass for the same reason).
+        if upper.starts_with("SELECT") || upper.starts_with("WITH") {
             // S5c new-pipeline interception. When the env flag is
             // set AND the SQL lowers cleanly against the in-memory
             // relational engine's catalog, route through
@@ -1569,6 +1573,24 @@ impl PostgresProtocol {
                     Ok(pr) => self.emit_pipeline_result(pr).await,
                     Err(msg) => self.send_relational_error(&msg).await,
                 };
+            }
+            // TD-185a fail-closed: the pipeline declined a WITH query (the shared
+            // frontend lowers no CTE over native storage, and a non-materialized
+            // table set never reaches the DataFusion floor). Never hand a WITH to
+            // the legacy single-table path — its FROM-token walk can only misparse
+            // the CTE name. Rewriting into a real error converts the silent
+            // zero-row answer into an actionable one.
+            if upper.starts_with("WITH") {
+                return self
+                    .send_error(
+                        "ERROR",
+                        "0A000",
+                        "WITH (CTE) queries require every referenced table to be \
+                         materialized (ALTER TABLE … MATERIALIZE) so the DataFusion \
+                         route can serve them; the relational frontend declines CTE \
+                         lowering on native storage (TD-185a).",
+                    )
+                    .await;
             }
             if let Some((column, value)) = Self::extract_simple_constant_select(query) {
                 return self.send_single_value_result(&column, &value).await;
@@ -2637,13 +2659,17 @@ impl PostgresProtocol {
     ///
     /// Phase 2 of ADR-018: multi-column ORDER BY + explicit NULLS
     /// placement. Postgres defaults: ASC → NULLS LAST, DESC → NULLS
-    /// FIRST. Returns `None` if no ORDER BY clause is present, or
-    /// if any individual key is malformed (the caller falls back to
-    /// no-ordering — the existing behavior for unsupported clauses).
-    fn extract_select_order_by(query: &str) -> Option<Vec<OrderByKey>> {
+    /// FIRST. `Ok(None)` = no ORDER BY present; `Ok(keys)` = parsed
+    /// keys; `Err(reason)` = an ORDER BY clause IS present but cannot
+    /// be parsed — the caller must FAIL CLOSED (TD-185b): silently
+    /// returning unordered rows for an ordered query is a wrong
+    /// answer, not a graceful degradation.
+    fn extract_select_order_by(query: &str) -> Result<Option<Vec<OrderByKey>>, String> {
         let upper = query.to_ascii_uppercase();
-        let pos = Self::find_keyword_outside_literals(&upper, " ORDER BY ")?;
-        let after = query[pos + " ORDER BY ".len()..].trim();
+        let Some(pos) = Self::find_order_by_clause(&upper) else {
+            return Ok(None);
+        };
+        let after = query[pos + " ORDER BY".len()..].trim();
         // Terminate at LIMIT / OFFSET / `;` / end.
         let upper_after = after.to_ascii_uppercase();
         let mut end = after.len();
@@ -2656,19 +2682,101 @@ impl PostgresProtocol {
         }
         let clause = after[..end].trim().trim_end_matches(';').trim();
         if clause.is_empty() {
-            return None;
+            return Err("ORDER BY clause is empty".to_string());
         }
         // Split on top-level commas (literal-aware).
         let segments = Self::split_top_level_commas(clause);
         if segments.is_empty() {
-            return None;
+            return Err("ORDER BY clause could not be segmented".to_string());
         }
         let mut keys: Vec<OrderByKey> = Vec::with_capacity(segments.len());
         for raw in segments {
-            let parsed = Self::parse_one_order_by_key(raw.trim())?;
+            let Some(parsed) = Self::parse_one_order_by_key(raw.trim()) else {
+                return Err(format!(
+                    "ORDER BY key `{}` is not a supported \
+                     `<col> [ASC|DESC] [NULLS FIRST|LAST]` form on the legacy \
+                     single-table reader (TD-185b)",
+                    raw.trim()
+                ));
+            };
             keys.push(parsed);
         }
-        Some(keys)
+        Ok(Some(keys))
+    }
+
+    /// Locate the top-level `ORDER BY` keyword in an uppercased query.
+    /// Unlike a bare `" ORDER BY "` probe, this also matches a clause at
+    /// end-of-string (`… ORDER BY` with nothing after — TD-185b must ERROR
+    /// on that, not silently return unordered rows) and requires a
+    /// non-identifier boundary after `BY`, so `ORDER BYZ`-style text never
+    /// matches. Literal-aware (`ORDER BY` inside a single-quoted string is
+    /// skipped) AND paren-aware: the `ORDER BY` inside a window's
+    /// `OVER (… ORDER BY …)` is a window specification, not the result
+    /// ordering — matching it turned the key into expression tail text (the
+    /// `ts) as delta from cpu` failure the pgwire-accuracy lane caught).
+    fn find_order_by_clause(upper: &str) -> Option<usize> {
+        let mut in_single_quote = false;
+        let mut paren_depth = 0usize;
+        let bytes = upper.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let ch = upper[index..].chars().next()?;
+            if ch == '\'' {
+                // '' inside a literal is an escaped quote, not a boundary.
+                if in_single_quote && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                in_single_quote = !in_single_quote;
+                index += 1;
+                continue;
+            }
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                _ => {}
+            }
+            if paren_depth == 0 && !in_single_quote && upper[index..].starts_with(" ORDER BY") {
+                let after = index + " ORDER BY".len();
+                let boundary = bytes
+                    .get(after)
+                    .is_none_or(|b| !crate::core::utils::is_identifier_byte(*b));
+                if boundary {
+                    return Some(index);
+                }
+            }
+            index += ch.len_utf8();
+        }
+        None
+    }
+
+    /// Extract `(source_column, alias)` pairs from the projection list so an
+    /// ORDER BY key can resolve through an output alias (TD-185b):
+    /// `SELECT k.k_person2 AS friend … ORDER BY friend` yields
+    /// `("k_person2", "friend")`. Only explicit `AS` aliases are recognized —
+    /// the implicit `expr alias` form is ambiguous with expression text.
+    fn extract_projection_aliases(query: &str) -> Vec<(String, String)> {
+        let Some(select_pos) = find_ascii_ci(query, "SELECT ") else {
+            return Vec::new();
+        };
+        let Some(from_pos) = find_ascii_ci(query, " FROM ") else {
+            return Vec::new();
+        };
+        let projection = query[select_pos + 7..from_pos].trim();
+        if projection.is_empty() || projection == "*" {
+            return Vec::new();
+        }
+        Self::split_top_level_commas(projection)
+            .iter()
+            .filter_map(|item| {
+                let item = item.trim();
+                let item_upper = item.to_ascii_uppercase();
+                let as_pos = Self::find_keyword_outside_literals(&item_upper, " AS ")?;
+                let source = Self::clean_identifier(item[..as_pos].trim());
+                let alias = Self::clean_identifier(item[as_pos + " AS ".len()..].trim());
+                (!source.is_empty() && !alias.is_empty() && alias != "*").then_some((source, alias))
+            })
+            .collect()
     }
 
     /// Parse one `<col> [ASC|DESC] [NULLS FIRST|NULLS LAST]` segment.
@@ -3058,7 +3166,13 @@ impl PostgresProtocol {
         };
 
         let limit = Self::extract_select_limit(query);
-        let order_by = Self::extract_select_order_by(query);
+        let order_by = match Self::extract_select_order_by(query) {
+            Ok(Some(keys)) => Some(keys),
+            Ok(None) => None,
+            // TD-185b: an unparsable ORDER BY must error, never silently
+            // degrade to storage order.
+            Err(reason) => return Err(anyhow!("{reason}")),
+        };
         // Fetch all matching rows BEFORE LIMIT when we need to ORDER BY —
         // sorting then truncating is the only correct semantics. With no
         // ORDER BY the planner keeps the limit pushdown.
@@ -3141,28 +3255,46 @@ impl PostgresProtocol {
         if let Some(keys) = order_by.as_ref() {
             // Resolve each key's column to its row index up-front so
             // the per-row hot path is `Vec<usize>` lookups, not
-            // string matching.
-            let resolved: Vec<(usize, bool, bool)> = keys
-                .iter()
-                .filter_map(|k| {
-                    let idx = result
-                        .selected_columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&k.column));
-                    match idx {
-                        Some(i) => Some((i, k.desc, k.nulls_first)),
-                        None => {
-                            warn!(
-                                target: "proximadb::pgwire::order_by",
-                                column = %k.column,
-                                "ORDER BY column not found in projection; \
-                                 skipping this key"
-                            );
-                            None
-                        }
-                    }
-                })
-                .collect();
+            // string matching. TD-185b: keys resolve against projected
+            // columns AND projection aliases (`SELECT x AS y … ORDER
+            // BY y`); an unresolvable key is a FAIL-CLOSED error, not
+            // a warn-and-skip — silently returning storage order for
+            // an ordered query is a wrong answer (the graph-LDBC
+            // ORDER BY drop this closes).
+            let aliases = Self::extract_projection_aliases(query);
+            let mut resolved: Vec<(usize, bool, bool)> = Vec::with_capacity(keys.len());
+            let mut unresolved: Vec<&str> = Vec::new();
+            for k in keys {
+                let idx = result
+                    .selected_columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&k.column))
+                    .or_else(|| {
+                        aliases
+                            .iter()
+                            .find(|(_, alias)| alias.eq_ignore_ascii_case(&k.column))
+                            .and_then(|(source, _)| {
+                                result
+                                    .selected_columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(source))
+                            })
+                    });
+                match idx {
+                    Some(i) => resolved.push((i, k.desc, k.nulls_first)),
+                    None => unresolved.push(&k.column),
+                }
+            }
+            if !unresolved.is_empty() {
+                return Err(anyhow!(
+                    "ORDER BY column(s) `{}` do not resolve to a projected column or \
+                     alias on the legacy single-table reader (TD-185b). Include them in \
+                     the SELECT projection, order by a projected alias, or rewrite the \
+                     query into a relational-pipeline shape (join/GROUP BY/derived \
+                     table/materialized table).",
+                    unresolved.join("`, `")
+                ));
+            }
             if !resolved.is_empty() {
                 result.rows.sort_by(|a, b| {
                     for (idx, desc, nulls_first) in resolved.iter() {

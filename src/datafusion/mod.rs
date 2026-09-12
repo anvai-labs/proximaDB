@@ -199,9 +199,14 @@ fn build_session_context(
     identity: proximadb_runtime::OwnedPortIdentity,
 ) -> datafusion::error::Result<SessionContext> {
     let tenant = identity.tenant_id.clone();
-    let config = SessionConfig::new()
+    let mut config = SessionConfig::new()
         .with_batch_size(8192)
         .with_target_partitions(num_cpus::get());
+    // TD-185a: recursive CTEs are the graph-in-SQL reachability surface
+    // (graph-LDBC g10, TPC-DS `cte`). The DF default is already `true`;
+    // pinning it here keeps the WITH→DataFusion-floor route explicit and
+    // immune to an upstream default flip.
+    config.options_mut().execution.enable_recursive_ctes = true;
 
     let ctx = SessionContext::new_with_config(config);
 

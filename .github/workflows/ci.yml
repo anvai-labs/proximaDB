@@ -324,6 +324,9 @@ jobs:
               - 'src/services/dml/**'
               - 'src/core/**'
               - 'tests/*pgwire*'
+              - 'tests/rel_*'
+              - 'tests/native_route_pgwire_e2e.rs'
+              - 'tests/native_join_pgwire_e2e.rs'
               - 'tests/document_json*'
               - 'tests/events_tsbs*'
               - 'tests/sql_value_roundtrip.rs'
@@ -2175,6 +2178,10 @@ jobs:
           # once the recursion itself is fixed (see TD-STACK-1).
           RUST_MIN_STACK: "16777216"
         run: |
+          # native_tpch_q18_q20_e2e is held back: it regressed on develop with
+          # #1852 (TD-CONV-1 — "Table 'customer' already exists" on a fresh
+          # server). Re-add it to this list + the pgwire_accuracy_changes filter
+          # when that TD closes.
           for test_name in \
             pgwire_fk_referential_actions_e2e \
             pgwire_relational_engine_e2e \
@@ -2185,7 +2192,26 @@ jobs:
             pgwire_select_or_predicate_e2e \
             sql_value_roundtrip \
             fp16_pgwire_e2e \
-            mem0_pgwire_filter_e2e; do
+            mem0_pgwire_filter_e2e \
+            pgwire_crossmodal_join_e2e \
+            pgwire_extended_param_e2e \
+            pgwire_insert_props_e2e \
+            pgwire_psql_introspection_e2e \
+            pgwire_cancel_e2e \
+            pgwire_relational_native_read_after_write_e2e \
+            pgwire_td064_write_tenant_isolation_e2e \
+            native_route_pgwire_e2e \
+            native_join_pgwire_e2e \
+            rel_agg_arith_projection_e2e \
+            rel_correlated_scalar_arith_e2e \
+            rel_correlated_scalar_multitable_e2e \
+            rel_crossjoin_or_factor_e2e \
+            rel_exec_1_selfjoin_e2e \
+            rel_having_aggregate_e2e \
+            rel_join_reorder_e2e \
+            rel_lower_3_orderby_e2e \
+            rel_lower_native_join_e2e \
+            rel_two_key_correlated_scalar_e2e; do
             echo "Running $test_name..."
             # pgwire_fk_referential_actions_e2e also contains the TD-110 S1 recursive-cascade
             # + concurrency/cycle test (pgwire_cascade_recurses_and_rejects_cycles_depth_and_concurrency),
