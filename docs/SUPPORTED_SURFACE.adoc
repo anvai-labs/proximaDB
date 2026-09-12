@@ -100,7 +100,7 @@ query endpoint, and `/api/v2/query` is *not* SQL-over-REST. Route by language:
 | *pgwire* (PostgreSQL wire)
 | ANSI *SQL* (DataFusion execution)
 | SQL clients and tools — psql, psycopg2/asyncpg, JDBC, BI/ORM ecosystem.
-| Beta — autocommit SQL subset; multi-tenant identity/ABAC closure is still tracked by TD-ABAC-10/11
+| Beta — SQL with P2.D transaction control (BEGIN/COMMIT/ROLLBACK, read-only txns); multi-tenant identity/ABAC closure is still tracked by TD-ABAC-10/11
 
 | *REST `POST /api/v2/sql`*
 | One authenticated *SQL* statement: tenant-scoped relational SELECT/DDL/DML
@@ -158,9 +158,14 @@ query endpoint, and `/api/v2/query` is *not* SQL-over-REST. Route by language:
   unified query port (`/api/v2/query`) or the graph service — they are not replaceable by pgwire.
 * SQL is served by *three adapters over one execution authority* (TD-121/TD-135).
   *pgwire* serves the PostgreSQL ecosystem
-  (psql/JDBC/BI/ORM, Postgres-native auth) in autocommit mode. `BEGIN`, `COMMIT`, `ROLLBACK`,
-  savepoints, and other transaction-control statements return SQLSTATE `0A000`; a simple-query
-  batch containing transaction control is rejected before any statement in the batch executes.
+  (psql/JDBC/BI/ORM, Postgres-native auth). Transaction control is REAL per ADR-018 P2.D
+  (TD-076): `BEGIN` / `COMMIT` / `ROLLBACK` / `END` execute with a per-session write buffer
+  (deferred replay at COMMIT; ROLLBACK discards; connection drop = implicit rollback;
+  store-only reads until COMMIT — the documented divergence until P3.B MVCC);
+  `SET TRANSACTION READ ONLY|WRITE` and `SET statement_timeout` are honored. Savepoints and
+  two-phase commit return SQLSTATE `0A000` with the reason; DDL inside a transaction is
+  rejected (the buffer is DML-only); any statement error fails the transaction (25P02 until
+  ROLLBACK).
   REST `POST /api/v2/sql` serves authenticated HTTP/JSON clients and deliberately supports
   one statement without parameter binding in its initial beta contract. The gRPC
   `ProximaRecordService.ExecuteQuery` RPC is *token/SSO-authenticated* (bearer/JWT in metadata,

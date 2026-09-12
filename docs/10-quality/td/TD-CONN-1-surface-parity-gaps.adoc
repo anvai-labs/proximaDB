@@ -22,7 +22,7 @@ holes for specific modalities:
 | Gap | Evidence
 | **REST graph-write absent** | `network/rest/v2/graphs.rs` exposes `fusion-search` + impact-analysis only; graph edge/node writes go through gRPC `ProximaGraphService` or Arrow Flight `DoExchange`. REST is read-only for graph.
 | **gRPC has no timeseries service** | Timeseries is reachable via REST v2 (`network/rest/v2/timeseries.rs`) and SQL SELECT federation, but there is no dedicated `ProximaTimeSeriesService` in `network/grpc/v2/`.
-| **pgwire COPY partial, transactions stubbed** | `handle_copy_in` vectorizes record batches but Arrow COPY is partial; `BEGIN/COMMIT/ROLLBACK` return SQLSTATE 25P02 (`protocol.rs`). Txns are deferred by owner decision (ADR-018 Phase 3), COPY completion is in-scope.
+| **pgwire COPY partial; transactions = P2.D** | `handle_copy_in` vectorizes record batches but Arrow COPY is partial; `BEGIN/COMMIT/ROLLBACK` are REAL since ADR-018 P2.D delivery (2026-09-10 — buffered writes, read-only txns, 25P02 failed-txn semantics; savepoints/2PC still 0A000). COPY completion is in-scope.
 |===
 
 Cross-referenced (owned elsewhere, listed here for the completion view only): MCP checkpoint write

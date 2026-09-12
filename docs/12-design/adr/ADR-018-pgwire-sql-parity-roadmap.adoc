@@ -415,6 +415,29 @@ Effort: 7–10d.
 
 **Cumulative effort: ~4–6 weeks beyond Phase 2.**
 
+== Amendment 2026-09-10: P2.D DELIVERED (TD-076)
+
+Phase 2.D (real transactions) is implemented exactly as specified here, with the
+following concrete semantics and honestly-documented divergences:
+
+* `BEGIN` / `START TRANSACTION` / `COMMIT` / `END` / `ROLLBACK` / `ABORT` execute for real
+  over both wire protocols. `SET TRANSACTION READ ONLY|WRITE` and `SET statement_timeout`
+  are honored (timeout enforced on COMMIT replay via 57014).
+* **Write buffer**: DML inside an explicit transaction accumulates in a bounded per-connection
+  buffer (10k statements / 8 MiB; exceeding = 54000 + the transaction aborts). The
+  primary-pod and tenant-visibility gates run at BUFFER time. COMMIT drains sequentially.
+* **Documented divergences** (until P3.B MVCC): reads are store-only (a transaction does not
+  see its own uncommitted writes); a mid-COMMIT replay failure leaves already-replayed
+  statements durable and fails the transaction; the connection-drop = implicit-rollback
+  guarantee holds because the buffer is in-memory.
+* **Still fail-closed with reasons**: SAVEPOINT / RELEASE / ROLLBACK TO (Phase 3 savepoints),
+  PREPARE/COMMIT/ROLLBACK PREPARED (no 2PC), SET CONSTRAINTS, AND CHAIN, and any transaction
+  mode we cannot honor (SERIALIZABLE / REPEATABLE READ — only READ COMMITTED is provided).
+* **DDL inside a transaction is rejected** (0A000): the buffer is DML-only — executing DDL
+  immediately would make ROLLBACK silently not undo it.
+* Any ERROR inside an active transaction fails it (25P02 until ROLLBACK), enforced centrally
+  in the protocol error path so every statement path behaves identically.
+
 == Sequencing rules
 
 1. **Phase 1 must ship before any metadata-in-OLTP work proceeds.**
