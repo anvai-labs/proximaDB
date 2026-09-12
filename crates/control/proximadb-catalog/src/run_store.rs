@@ -75,6 +75,13 @@ pub struct RunRecord {
     /// Latest value per metric key; full history is append-only.
     pub latest_metrics: BTreeMap<String, MetricPoint>,
     pub tags: BTreeMap<String, String>,
+    /// Logged models this run CONSUMED (`RunInputs.model_inputs`); the
+    /// default keeps documents written before the field existed readable.
+    #[serde(default)]
+    pub model_inputs: Vec<String>,
+    /// Logged models this run PRODUCED (`RunOutputs.model_outputs`).
+    #[serde(default)]
+    pub model_outputs: Vec<ModelOutputRef>,
 }
 
 /// One append-only metric sample. History preserves insertion (timestamp,
@@ -137,6 +144,137 @@ pub struct RunDatasetInput {
     pub digest: String,
 }
 
+/// MLflow 3.x trace state (`TraceInfoV3.State` proto enum; the wire speaks
+/// the NAME strings OK/ERROR/IN_PROGRESS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceState {
+    Ok,
+    Error,
+    InProgress,
+}
+
+/// How an assessment was produced (`AssessmentSource.SourceType` proto enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssessmentSource {
+    Human,
+    LlmJudge,
+    Code,
+}
+
+/// Structured failure carried by a feedback assessment instead of a value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssessmentError {
+    pub error_code: String,
+    pub error_message: String,
+    pub stack_trace: Option<String>,
+}
+
+/// The assessment payload oneof: exactly one of feedback value / feedback
+/// error / expectation / issue (the client's `Assessment.from_proto` raises
+/// when a response carries none or several).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AssessmentValue {
+    /// `feedback.value` — a `google.protobuf.Value`, arbitrary JSON
+    /// passthrough both ways (we never interpret it).
+    FeedbackValue(serde_json::Value),
+    /// `feedback.error` — the judge/code failed before producing a value.
+    FeedbackError(AssessmentError),
+    /// `expectation.value` — arbitrary JSON passthrough.
+    ExpectationValue(serde_json::Value),
+    /// `issue.issue_name`.
+    Issue { issue_name: String },
+}
+
+/// One evaluation attached to a trace (`mlflow.assessments`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssessmentRecord {
+    pub assessment_id: String,
+    pub assessment_name: String,
+    /// Owning span within the trace (None = trace-level).
+    pub span_id: Option<String>,
+    pub source: AssessmentSource,
+    pub source_id: Option<String>,
+    pub create_time_ms: i64,
+    pub last_update_time_ms: i64,
+    pub value: AssessmentValue,
+    pub rationale: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+    pub valid: bool,
+}
+
+/// MLflow 3.x trace record (`TraceInfoV3` minus spans). Spans NEVER live
+/// here: the client uploads them as trace artifacts (`traces.json`) through
+/// the artifacts proxy and downloads them itself, so the server's Trace
+/// responses always carry `spans: []`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceRecord {
+    pub trace_id: String,
+    pub experiment_id: u64,
+    pub client_request_id: Option<String>,
+    pub state: TraceState,
+    /// Truncated previews only — the client never sends full payloads on
+    /// the wire (request/response stay client-side).
+    pub request_preview: Option<String>,
+    pub response_preview: Option<String>,
+    pub request_time_ms: i64,
+    pub execution_duration_ms: i64,
+    pub metadata: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub assessments: Vec<AssessmentRecord>,
+}
+
+/// Logged-model lifecycle (`LoggedModelStatus` proto enum; the wire speaks
+/// the NAME strings LOGGED_MODEL_PENDING/READY/UPLOAD_FAILED).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoggedModelStatus {
+    Pending,
+    Ready,
+    UploadFailed,
+}
+
+/// MLflow 3.x logged model (`LoggedModel`). Params are immutable after
+/// first write (run-param semantics); status transitions via finalize;
+/// deletes are soft (hidden from search, directly gettable with
+/// `allow_deleted`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoggedModelRecord {
+    pub model_id: String,
+    pub experiment_id: u64,
+    pub name: String,
+    pub model_type: Option<String>,
+    pub source_run_id: Option<String>,
+    pub artifact_uri: String,
+    pub status: LoggedModelStatus,
+    pub lifecycle: RunLifecycle,
+    pub params: BTreeMap<String, String>,
+    pub tags: BTreeMap<String, String>,
+    pub creation_time_ms: i64,
+    pub last_updated_time_ms: i64,
+}
+
+/// One model-owned metric sample: a [`MetricPoint`] plus the dataset
+/// context the wire echoes in `LoggedModel.data.metrics`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelMetricPoint {
+    pub point: MetricPoint,
+    /// Run that produced this model-owned sample. Optional only for reading
+    /// records written before the lineage field was introduced.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub dataset_name: Option<String>,
+    pub dataset_digest: Option<String>,
+}
+
+/// A run's output link to a logged model (`RunOutputs.model_outputs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelOutputRef {
+    pub model_id: String,
+    pub step: i64,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RunStoreError {
     #[error("experiment {experiment_id} not found")]
@@ -147,7 +285,7 @@ pub enum RunStoreError {
     UnknownRun { run_id: String },
     #[error("run '{run_id}' already exists")]
     RunIdConflict { run_id: String },
-    #[error("param '{key}' is immutable once logged on run '{run_id}'")]
+    #[error("param '{key}' is immutable once logged on '{run_id}' (run or logged model)")]
     ParamImmutable { key: String, run_id: String },
     #[error("run '{run_id}' is finished; metric/param writes are rejected")]
     RunFinished { run_id: String },
@@ -155,6 +293,25 @@ pub enum RunStoreError {
     NotTerminal,
     #[error("experiment {experiment_id} is deleted; run creation is rejected")]
     ExperimentDeleted { experiment_id: u64 },
+    #[error("trace '{trace_id}' not found")]
+    UnknownTrace { trace_id: String },
+    #[error("trace '{trace_id}' already exists")]
+    TraceIdConflict { trace_id: String },
+    #[error("trace id '{trace_id}' has invalid characters (allowed: A-Za-z0-9._~-)")]
+    InvalidTraceId { trace_id: String },
+    #[error("assessment '{assessment_id}' not found on trace '{trace_id}'")]
+    UnknownAssessment {
+        trace_id: String,
+        assessment_id: String,
+    },
+    #[error("logged model '{model_id}' not found")]
+    UnknownLoggedModel { model_id: String },
+    #[error("logged model '{model_id}' already exists")]
+    LoggedModelIdConflict { model_id: String },
+    #[error("status '{status}' is not a valid logged-model status")]
+    InvalidModelStatus { status: String },
+    #[error("tag '{key}' not found on logged model '{model_id}'")]
+    UnknownLoggedModelTag { model_id: String, key: String },
     #[error("names and ids must be non-empty")]
     Empty { field: &'static str },
     #[error("tracking store internal error: {message}")]
@@ -266,6 +423,153 @@ pub trait RunStore: Send + Sync {
     ) -> Result<(), RunStoreError>;
 
     async fn dataset_inputs(&self, run_id: &str) -> Result<Vec<RunDatasetInput>, RunStoreError>;
+    /// Create a trace with a client-chosen id (`tr-<32hex>`). Conflicts fail
+    /// loudly; the id lands in document ids and artifact path segments so
+    /// implementations validate a conservative charset.
+    async fn start_trace(&self, trace: TraceRecord) -> Result<TraceRecord, RunStoreError>;
+
+    /// Full trace record including embedded assessments.
+    async fn get_trace(&self, trace_id: &str) -> Result<TraceRecord, RunStoreError>;
+
+    /// Traces of one experiment in creation order (the wire sorts
+    /// newest-first for search).
+    async fn list_traces(&self, experiment_id: u64) -> Result<Vec<TraceRecord>, RunStoreError>;
+
+    /// Bulk delete. With `request_ids`: exactly those traces (that must
+    /// belong to the experiment). Otherwise: traces with
+    /// `request_time_ms <= max_timestamp_ms` (when set), up to `max_traces`
+    /// (when set). Returns the count deleted; repeat calls delete 0.
+    async fn delete_traces(
+        &self,
+        experiment_id: u64,
+        max_timestamp_ms: Option<i64>,
+        max_traces: Option<u64>,
+        request_ids: &[String],
+    ) -> Result<u64, RunStoreError>;
+
+    async fn set_trace_tag(
+        &self,
+        trace_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), RunStoreError>;
+
+    async fn delete_trace_tag(&self, trace_id: &str, key: &str) -> Result<(), RunStoreError>;
+
+    /// Create or fully replace an assessment (PATCH-with-mask is resolved
+    /// by the wire reading the current record first).
+    async fn upsert_assessment(
+        &self,
+        trace_id: &str,
+        assessment: AssessmentRecord,
+    ) -> Result<AssessmentRecord, RunStoreError>;
+
+    async fn get_assessment(
+        &self,
+        trace_id: &str,
+        assessment_id: &str,
+    ) -> Result<AssessmentRecord, RunStoreError>;
+
+    async fn delete_assessment(
+        &self,
+        trace_id: &str,
+        assessment_id: &str,
+    ) -> Result<(), RunStoreError>;
+
+    /// Create a logged model with a server-minted caller-supplied id
+    /// (`m-<32hex>`); the artifact_uri is minted by the wire (URI shape is
+    /// a wire concern) and stored verbatim.
+    async fn create_logged_model(
+        &self,
+        model: LoggedModelRecord,
+    ) -> Result<LoggedModelRecord, RunStoreError>;
+
+    /// Direct get; deleted models 404 unless `allow_deleted`.
+    async fn get_logged_model(
+        &self,
+        model_id: &str,
+        allow_deleted: bool,
+    ) -> Result<LoggedModelRecord, RunStoreError>;
+
+    async fn list_logged_models(
+        &self,
+        experiment_id: u64,
+        include_deleted: bool,
+    ) -> Result<Vec<LoggedModelRecord>, RunStoreError>;
+
+    /// Terminal/any status transition + last_updated bump. Params stay
+    /// writable (the reference server has no freeze here).
+    async fn finalize_logged_model(
+        &self,
+        model_id: &str,
+        status: LoggedModelStatus,
+        now_ms: i64,
+    ) -> Result<LoggedModelRecord, RunStoreError>;
+
+    /// Soft-delete (hidden from search+default get).
+    async fn delete_logged_model(&self, model_id: &str) -> Result<(), RunStoreError>;
+
+    /// Append params with run-param immutability semantics (same value
+    /// idempotent, different value rejected).
+    async fn log_logged_model_params(
+        &self,
+        model_id: &str,
+        params: &BTreeMap<String, String>,
+    ) -> Result<(), RunStoreError>;
+
+    async fn set_logged_model_tags(
+        &self,
+        model_id: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<LoggedModelRecord, RunStoreError>;
+
+    /// Deleting an ABSENT tag is an error (reference server: 404).
+    async fn delete_logged_model_tag(&self, model_id: &str, key: &str)
+    -> Result<(), RunStoreError>;
+
+    /// Append a model-owned metric sample. Model metrics never touch the
+    /// run latest-value projection or the finished-run freeze.
+    async fn log_model_metric(
+        &self,
+        model_id: &str,
+        sample: ModelMetricPoint,
+    ) -> Result<MetricAppend, RunStoreError>;
+
+    async fn model_metric_history(
+        &self,
+        model_id: &str,
+        key: &str,
+    ) -> Result<Vec<ModelMetricPoint>, RunStoreError>;
+
+    /// ALL metric samples of a model across keys, in append order — the
+    /// wire embeds `LoggedModel.data.metrics` with ONE call (no per-key
+    /// N+1).
+    async fn model_metrics(&self, model_id: &str) -> Result<Vec<ModelMetricPoint>, RunStoreError>;
+
+    /// Append output links (run PRODUCED these models).
+    async fn log_run_outputs(
+        &self,
+        run_id: &str,
+        outputs: Vec<ModelOutputRef>,
+    ) -> Result<(), RunStoreError>;
+
+    /// Append input links (run CONSUMED these models).
+    async fn log_run_model_inputs(
+        &self,
+        run_id: &str,
+        model_ids: Vec<String>,
+    ) -> Result<(), RunStoreError>;
+}
+
+/// Conservative trace-id charset: the id lands in substrate document ids
+/// AND artifact path segments, so anything outside the unreserved URI set
+/// is rejected up front (fail closed). Client-generated ids are
+/// `tr-<32hex>`, well inside this set.
+pub fn valid_trace_id(trace_id: &str) -> bool {
+    !trace_id.is_empty()
+        && trace_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'))
 }
 
 /// Model-registry tag evaluation with MLflow absent-value semantics:
@@ -342,6 +646,9 @@ pub mod conformance_tests {
         runs: std::sync::Mutex<Vec<RunRecord>>,
         history: std::sync::Mutex<Vec<(String, MetricPoint)>>,
         datasets: std::sync::Mutex<Vec<(String, RunDatasetInput)>>,
+        traces: std::sync::Mutex<Vec<TraceRecord>>,
+        logged_models: std::sync::Mutex<Vec<LoggedModelRecord>>,
+        model_history: std::sync::Mutex<Vec<(String, ModelMetricPoint)>>,
     }
 
     impl Default for InMemoryRunStore {
@@ -357,6 +664,9 @@ pub mod conformance_tests {
                 runs: std::sync::Mutex::new(Vec::new()),
                 history: std::sync::Mutex::new(Vec::new()),
                 datasets: std::sync::Mutex::new(Vec::new()),
+                traces: std::sync::Mutex::new(Vec::new()),
+                logged_models: std::sync::Mutex::new(Vec::new()),
+                model_history: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -482,6 +792,8 @@ pub mod conformance_tests {
                 params: BTreeMap::new(),
                 latest_metrics: BTreeMap::new(),
                 tags,
+                model_inputs: Vec::new(),
+                model_outputs: Vec::new(),
             };
             self.runs.lock().unwrap().push(record.clone());
             Ok(record)
@@ -731,6 +1043,462 @@ pub mod conformance_tests {
                 .filter(|(id, _)| id == run_id)
                 .map(|(_, input)| input.clone())
                 .collect())
+        }
+
+        async fn start_trace(&self, trace: TraceRecord) -> Result<TraceRecord, RunStoreError> {
+            if trace.trace_id.is_empty() {
+                return Err(RunStoreError::Empty { field: "trace_id" });
+            }
+            if !valid_trace_id(&trace.trace_id) {
+                return Err(RunStoreError::InvalidTraceId {
+                    trace_id: trace.trace_id,
+                });
+            }
+            self.get_experiment(trace.experiment_id).await?;
+            {
+                let experiments = self.experiments.lock().unwrap();
+                let stage = experiments
+                    .iter()
+                    .find(|e| e.experiment_id == trace.experiment_id)
+                    .map(|e| e.stage);
+                if stage == Some(ExperimentStage::Deleted) {
+                    return Err(RunStoreError::ExperimentDeleted {
+                        experiment_id: trace.experiment_id,
+                    });
+                }
+            }
+            let mut traces = self.traces.lock().unwrap();
+            if traces.iter().any(|t| t.trace_id == trace.trace_id) {
+                return Err(RunStoreError::TraceIdConflict {
+                    trace_id: trace.trace_id,
+                });
+            }
+            traces.push(trace.clone());
+            Ok(trace)
+        }
+
+        async fn get_trace(&self, trace_id: &str) -> Result<TraceRecord, RunStoreError> {
+            self.traces
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.trace_id == trace_id)
+                .cloned()
+                .ok_or_else(|| RunStoreError::UnknownTrace {
+                    trace_id: trace_id.to_string(),
+                })
+        }
+
+        async fn list_traces(&self, experiment_id: u64) -> Result<Vec<TraceRecord>, RunStoreError> {
+            self.get_experiment(experiment_id).await?;
+            Ok(self
+                .traces
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.experiment_id == experiment_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn delete_traces(
+            &self,
+            experiment_id: u64,
+            max_timestamp_ms: Option<i64>,
+            max_traces: Option<u64>,
+            request_ids: &[String],
+        ) -> Result<u64, RunStoreError> {
+            self.get_experiment(experiment_id).await?;
+            let mut traces = self.traces.lock().unwrap();
+            let selected: Vec<String> = if !request_ids.is_empty() {
+                traces
+                    .iter()
+                    .filter(|t| {
+                        t.experiment_id == experiment_id && request_ids.contains(&t.trace_id)
+                    })
+                    .map(|t| t.trace_id.clone())
+                    .collect()
+            } else {
+                // Candidate order matches the substrate twin (sorted by
+                // (request_time, trace_id), not insertion order) so
+                // max_traces truncation deletes the SAME set in both.
+                let mut candidates: Vec<(i64, String)> = traces
+                    .iter()
+                    .filter(|t| {
+                        t.experiment_id == experiment_id
+                            && max_timestamp_ms.is_none_or(|ts| t.request_time_ms <= ts)
+                    })
+                    .map(|t| (t.request_time_ms, t.trace_id.clone()))
+                    .collect();
+                candidates.sort();
+                if let Some(max) = max_traces {
+                    candidates.truncate(max as usize);
+                }
+                candidates.into_iter().map(|(_, id)| id).collect()
+            };
+            let deleted = selected.len() as u64;
+            traces.retain(|t| !selected.contains(&t.trace_id));
+            Ok(deleted)
+        }
+
+        async fn set_trace_tag(
+            &self,
+            trace_id: &str,
+            key: &str,
+            value: &str,
+        ) -> Result<(), RunStoreError> {
+            let mut traces = self.traces.lock().unwrap();
+            let trace = traces
+                .iter_mut()
+                .find(|t| t.trace_id == trace_id)
+                .ok_or_else(|| RunStoreError::UnknownTrace {
+                    trace_id: trace_id.to_string(),
+                })?;
+            trace.tags.insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        async fn delete_trace_tag(&self, trace_id: &str, key: &str) -> Result<(), RunStoreError> {
+            let mut traces = self.traces.lock().unwrap();
+            let trace = traces
+                .iter_mut()
+                .find(|t| t.trace_id == trace_id)
+                .ok_or_else(|| RunStoreError::UnknownTrace {
+                    trace_id: trace_id.to_string(),
+                })?;
+            trace.tags.remove(key);
+            Ok(())
+        }
+
+        async fn upsert_assessment(
+            &self,
+            trace_id: &str,
+            assessment: AssessmentRecord,
+        ) -> Result<AssessmentRecord, RunStoreError> {
+            let mut traces = self.traces.lock().unwrap();
+            let trace = traces
+                .iter_mut()
+                .find(|t| t.trace_id == trace_id)
+                .ok_or_else(|| RunStoreError::UnknownTrace {
+                    trace_id: trace_id.to_string(),
+                })?;
+            match trace
+                .assessments
+                .iter_mut()
+                .find(|a| a.assessment_id == assessment.assessment_id)
+            {
+                Some(existing) => *existing = assessment.clone(),
+                None => trace.assessments.push(assessment.clone()),
+            }
+            Ok(assessment)
+        }
+
+        async fn get_assessment(
+            &self,
+            trace_id: &str,
+            assessment_id: &str,
+        ) -> Result<AssessmentRecord, RunStoreError> {
+            self.traces
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.trace_id == trace_id)
+                .ok_or_else(|| RunStoreError::UnknownTrace {
+                    trace_id: trace_id.to_string(),
+                })?
+                .assessments
+                .iter()
+                .find(|a| a.assessment_id == assessment_id)
+                .cloned()
+                .ok_or_else(|| RunStoreError::UnknownAssessment {
+                    trace_id: trace_id.to_string(),
+                    assessment_id: assessment_id.to_string(),
+                })
+        }
+
+        async fn delete_assessment(
+            &self,
+            trace_id: &str,
+            assessment_id: &str,
+        ) -> Result<(), RunStoreError> {
+            let mut traces = self.traces.lock().unwrap();
+            let trace = traces
+                .iter_mut()
+                .find(|t| t.trace_id == trace_id)
+                .ok_or_else(|| RunStoreError::UnknownTrace {
+                    trace_id: trace_id.to_string(),
+                })?;
+            let before = trace.assessments.len();
+            trace
+                .assessments
+                .retain(|a| a.assessment_id != assessment_id);
+            if trace.assessments.len() == before {
+                return Err(RunStoreError::UnknownAssessment {
+                    trace_id: trace_id.to_string(),
+                    assessment_id: assessment_id.to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn create_logged_model(
+            &self,
+            model: LoggedModelRecord,
+        ) -> Result<LoggedModelRecord, RunStoreError> {
+            if model.name.is_empty() {
+                return Err(RunStoreError::Empty { field: "name" });
+            }
+            if model.model_id.is_empty() {
+                return Err(RunStoreError::Empty { field: "model_id" });
+            }
+            self.get_experiment(model.experiment_id).await?;
+            {
+                let experiments = self.experiments.lock().unwrap();
+                let stage = experiments
+                    .iter()
+                    .find(|e| e.experiment_id == model.experiment_id)
+                    .map(|e| e.stage);
+                if stage == Some(ExperimentStage::Deleted) {
+                    return Err(RunStoreError::ExperimentDeleted {
+                        experiment_id: model.experiment_id,
+                    });
+                }
+            }
+            let mut models = self.logged_models.lock().unwrap();
+            if models.iter().any(|m| m.model_id == model.model_id) {
+                return Err(RunStoreError::LoggedModelIdConflict {
+                    model_id: model.model_id,
+                });
+            }
+            models.push(model.clone());
+            Ok(model)
+        }
+
+        async fn get_logged_model(
+            &self,
+            model_id: &str,
+            allow_deleted: bool,
+        ) -> Result<LoggedModelRecord, RunStoreError> {
+            self.logged_models
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|m| m.model_id == model_id)
+                .cloned()
+                .map(|m| {
+                    if !allow_deleted && m.lifecycle == RunLifecycle::Deleted {
+                        Err(RunStoreError::UnknownLoggedModel {
+                            model_id: model_id.to_string(),
+                        })
+                    } else {
+                        Ok(m)
+                    }
+                })
+                .transpose()?
+                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
+                    model_id: model_id.to_string(),
+                })
+        }
+
+        async fn list_logged_models(
+            &self,
+            experiment_id: u64,
+            include_deleted: bool,
+        ) -> Result<Vec<LoggedModelRecord>, RunStoreError> {
+            self.get_experiment(experiment_id).await?;
+            Ok(self
+                .logged_models
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| {
+                    m.experiment_id == experiment_id
+                        && (include_deleted || m.lifecycle != RunLifecycle::Deleted)
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn finalize_logged_model(
+            &self,
+            model_id: &str,
+            status: LoggedModelStatus,
+            now_ms: i64,
+        ) -> Result<LoggedModelRecord, RunStoreError> {
+            let mut models = self.logged_models.lock().unwrap();
+            let model = models
+                .iter_mut()
+                .find(|m| m.model_id == model_id)
+                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
+                    model_id: model_id.to_string(),
+                })?;
+            model.status = status;
+            model.last_updated_time_ms = now_ms;
+            Ok(model.clone())
+        }
+
+        async fn delete_logged_model(&self, model_id: &str) -> Result<(), RunStoreError> {
+            let mut models = self.logged_models.lock().unwrap();
+            let model = models
+                .iter_mut()
+                .find(|m| m.model_id == model_id)
+                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
+                    model_id: model_id.to_string(),
+                })?;
+            model.lifecycle = RunLifecycle::Deleted;
+            Ok(())
+        }
+
+        async fn log_logged_model_params(
+            &self,
+            model_id: &str,
+            params: &BTreeMap<String, String>,
+        ) -> Result<(), RunStoreError> {
+            let mut models = self.logged_models.lock().unwrap();
+            let model = models
+                .iter_mut()
+                .find(|m| m.model_id == model_id)
+                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
+                    model_id: model_id.to_string(),
+                })?;
+            for (key, value) in params {
+                match model.params.get(key) {
+                    Some(existing) if existing == value => {}
+                    Some(_) => {
+                        return Err(RunStoreError::ParamImmutable {
+                            key: key.clone(),
+                            run_id: model_id.to_string(),
+                        });
+                    }
+                    None => {
+                        model.params.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn set_logged_model_tags(
+            &self,
+            model_id: &str,
+            tags: &BTreeMap<String, String>,
+        ) -> Result<LoggedModelRecord, RunStoreError> {
+            let mut models = self.logged_models.lock().unwrap();
+            let model = models
+                .iter_mut()
+                .find(|m| m.model_id == model_id)
+                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
+                    model_id: model_id.to_string(),
+                })?;
+            for (key, value) in tags {
+                model.tags.insert(key.clone(), value.clone());
+            }
+            model.last_updated_time_ms += 1;
+            Ok(model.clone())
+        }
+
+        async fn delete_logged_model_tag(
+            &self,
+            model_id: &str,
+            key: &str,
+        ) -> Result<(), RunStoreError> {
+            let mut models = self.logged_models.lock().unwrap();
+            let model = models
+                .iter_mut()
+                .find(|m| m.model_id == model_id)
+                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
+                    model_id: model_id.to_string(),
+                })?;
+            if model.tags.remove(key).is_none() {
+                return Err(RunStoreError::UnknownLoggedModelTag {
+                    model_id: model_id.to_string(),
+                    key: key.to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        async fn log_model_metric(
+            &self,
+            model_id: &str,
+            sample: ModelMetricPoint,
+        ) -> Result<MetricAppend, RunStoreError> {
+            self.get_logged_model(model_id, false).await?;
+            self.model_history
+                .lock()
+                .unwrap()
+                .push((model_id.to_string(), sample.clone()));
+            let history_len = self
+                .model_history
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, s)| id == model_id && s.point.key == sample.point.key)
+                .count() as u64;
+            Ok(MetricAppend { history_len })
+        }
+
+        async fn model_metric_history(
+            &self,
+            model_id: &str,
+            key: &str,
+        ) -> Result<Vec<ModelMetricPoint>, RunStoreError> {
+            self.get_logged_model(model_id, true).await?;
+            Ok(self
+                .model_history
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, s)| id == model_id && s.point.key == key)
+                .map(|(_, s)| s.clone())
+                .collect())
+        }
+
+        async fn model_metrics(
+            &self,
+            model_id: &str,
+        ) -> Result<Vec<ModelMetricPoint>, RunStoreError> {
+            self.get_logged_model(model_id, true).await?;
+            Ok(self
+                .model_history
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| id == model_id)
+                .map(|(_, s)| s.clone())
+                .collect())
+        }
+
+        async fn log_run_outputs(
+            &self,
+            run_id: &str,
+            outputs: Vec<ModelOutputRef>,
+        ) -> Result<(), RunStoreError> {
+            let mut runs = self.runs.lock().unwrap();
+            let run = runs
+                .iter_mut()
+                .find(|r| r.run_id == run_id)
+                .ok_or_else(|| RunStoreError::UnknownRun {
+                    run_id: run_id.to_string(),
+                })?;
+            run.model_outputs.extend(outputs);
+            Ok(())
+        }
+
+        async fn log_run_model_inputs(
+            &self,
+            run_id: &str,
+            model_ids: Vec<String>,
+        ) -> Result<(), RunStoreError> {
+            let mut runs = self.runs.lock().unwrap();
+            let run = runs
+                .iter_mut()
+                .find(|r| r.run_id == run_id)
+                .ok_or_else(|| RunStoreError::UnknownRun {
+                    run_id: run_id.to_string(),
+                })?;
+            run.model_inputs.extend(model_ids);
+            Ok(())
         }
     }
 
@@ -1054,6 +1822,38 @@ pub mod conformance_tests {
             1
         );
 
+        // Second metric key on the SAME run: per-key seq both start at 1 —
+        // the doc id must disambiguate (MAJOR-2, run side).
+        store
+            .log_metric(
+                "run-0002",
+                MetricPoint {
+                    key: "loss".to_string(),
+                    value: 0.4,
+                    timestamp_ms: 2_600,
+                    step: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .metric_history("run-0002", "rmse")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a second metric key must never clobber the first key's history"
+        );
+        assert_eq!(
+            store
+                .metric_history("run-0002", "loss")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
         // Run creation in a deleted experiment is rejected.
         store.delete_experiment(exp.experiment_id).await.unwrap();
         assert_eq!(
@@ -1100,6 +1900,495 @@ pub mod conformance_tests {
                 .unwrap()
                 .len(),
             2
+        );
+
+        // ---- Traces (TD-MLOPS-2): lifecycle, tags, search, delete. ----
+        let trace_exp = store
+            .create_experiment("traces-models", None, BTreeMap::new())
+            .await
+            .expect("create traces experiment");
+
+        let trace = store
+            .start_trace(TraceRecord {
+                trace_id: "tr-abc123".to_string(),
+                experiment_id: trace_exp.experiment_id,
+                client_request_id: Some("req-1".to_string()),
+                state: TraceState::Ok,
+                request_preview: Some("what is proxima?".to_string()),
+                response_preview: Some("a database".to_string()),
+                request_time_ms: 10_000,
+                execution_duration_ms: 42,
+                metadata: BTreeMap::from([(
+                    "mlflow.sourceRun".to_string(),
+                    "run-0002".to_string(),
+                )]),
+                tags: BTreeMap::from([("team".to_string(), "search".to_string())]),
+                assessments: Vec::new(),
+            })
+            .await
+            .expect("start trace");
+        assert_eq!(trace.trace_id, "tr-abc123");
+
+        let dup_trace = store
+            .start_trace(TraceRecord {
+                trace_id: "tr-abc123".to_string(),
+                experiment_id: trace_exp.experiment_id,
+                client_request_id: None,
+                state: TraceState::InProgress,
+                request_preview: None,
+                response_preview: None,
+                request_time_ms: 0,
+                execution_duration_ms: 0,
+                metadata: BTreeMap::new(),
+                tags: BTreeMap::new(),
+                assessments: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            dup_trace,
+            RunStoreError::TraceIdConflict {
+                trace_id: "tr-abc123".to_string()
+            }
+        );
+
+        // Charset validation: ids with path separators are rejected (the id
+        // reaches document ids + artifact path segments).
+        assert_eq!(
+            store
+                .start_trace(TraceRecord {
+                    trace_id: "tr/../escape".to_string(),
+                    experiment_id: trace_exp.experiment_id,
+                    client_request_id: None,
+                    state: TraceState::InProgress,
+                    request_preview: None,
+                    response_preview: None,
+                    request_time_ms: 0,
+                    execution_duration_ms: 0,
+                    metadata: BTreeMap::new(),
+                    tags: BTreeMap::new(),
+                    assessments: Vec::new(),
+                })
+                .await
+                .unwrap_err(),
+            RunStoreError::InvalidTraceId {
+                trace_id: "tr/../escape".to_string()
+            }
+        );
+
+        // Mutations on an absent trace are UnknownTrace — never internal.
+        assert_eq!(
+            store.set_trace_tag("tr-none", "k", "v").await.unwrap_err(),
+            RunStoreError::UnknownTrace {
+                trace_id: "tr-none".to_string()
+            }
+        );
+        assert_eq!(
+            store.get_trace("tr-none").await.unwrap_err(),
+            RunStoreError::UnknownTrace {
+                trace_id: "tr-none".to_string()
+            }
+        );
+
+        // Trace tags are mutable and PRESERVE assessments (tag writes are
+        // record rewrites — the payload must ride along).
+        store
+            .upsert_assessment(
+                "tr-abc123",
+                AssessmentRecord {
+                    assessment_id: "as-1".to_string(),
+                    assessment_name: "correctness".to_string(),
+                    span_id: None,
+                    source: AssessmentSource::Human,
+                    source_id: Some("tester".to_string()),
+                    create_time_ms: 10_100,
+                    last_update_time_ms: 10_100,
+                    value: AssessmentValue::FeedbackValue(serde_json::json!({"rating": 5})),
+                    rationale: Some("grounded".to_string()),
+                    metadata: BTreeMap::new(),
+                    valid: true,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .set_trace_tag("tr-abc123", "team", "vector")
+            .await
+            .unwrap();
+        let tagged = store.get_trace("tr-abc123").await.unwrap();
+        assert_eq!(tagged.tags["team"], "vector");
+        assert_eq!(
+            tagged.assessments.len(),
+            1,
+            "tag rewrite must not drop assessments"
+        );
+        assert_eq!(
+            tagged.assessments[0].value,
+            AssessmentValue::FeedbackValue(serde_json::json!({"rating": 5}))
+        );
+
+        // Assessment get/delete + unknown ids typed.
+        assert_eq!(
+            store
+                .get_assessment("tr-abc123", "as-none")
+                .await
+                .unwrap_err(),
+            RunStoreError::UnknownAssessment {
+                trace_id: "tr-abc123".to_string(),
+                assessment_id: "as-none".to_string()
+            }
+        );
+        let fetched = store.get_assessment("tr-abc123", "as-1").await.unwrap();
+        assert_eq!(fetched.assessment_name, "correctness");
+        store.delete_assessment("tr-abc123", "as-1").await.unwrap();
+        assert_eq!(
+            store
+                .delete_assessment("tr-abc123", "as-1")
+                .await
+                .unwrap_err(),
+            RunStoreError::UnknownAssessment {
+                trace_id: "tr-abc123".to_string(),
+                assessment_id: "as-1".to_string()
+            }
+        );
+
+        // A second trace exercises deterministic per-experiment listing.
+        store
+            .start_trace(TraceRecord {
+                trace_id: "tr-err456".to_string(),
+                experiment_id: trace_exp.experiment_id,
+                client_request_id: None,
+                state: TraceState::Error,
+                request_preview: None,
+                response_preview: None,
+                request_time_ms: 20_000,
+                execution_duration_ms: 5_000,
+                metadata: BTreeMap::from([(
+                    "mlflow.sourceRun".to_string(),
+                    "run-0002".to_string(),
+                )]),
+                tags: BTreeMap::new(),
+                assessments: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let listed = store.list_traces(trace_exp.experiment_id).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|trace| trace.trace_id == "tr-err456"));
+
+        // delete_traces by explicit ids; repeats delete 0.
+        let deleted = store
+            .delete_traces(
+                trace_exp.experiment_id,
+                None,
+                None,
+                &["tr-abc123".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            store.get_trace("tr-abc123").await.unwrap_err(),
+            RunStoreError::UnknownTrace {
+                trace_id: "tr-abc123".to_string()
+            }
+        );
+        assert_eq!(
+            store
+                .delete_traces(
+                    trace_exp.experiment_id,
+                    None,
+                    None,
+                    &["tr-abc123".to_string()],
+                )
+                .await
+                .unwrap(),
+            0
+        );
+
+        // ---- Logged models (TD-MLOPS-2): lifecycle, params, metrics. ----
+        let model = store
+            .create_logged_model(LoggedModelRecord {
+                model_id: "m-1000".to_string(),
+                experiment_id: trace_exp.experiment_id,
+                name: "greet-classifier".to_string(),
+                model_type: Some("python_function".to_string()),
+                source_run_id: Some("run-0002".to_string()),
+                artifact_uri: format!(
+                    "mlflow-artifacts:/{}/models/m-1000/artifacts",
+                    trace_exp.experiment_id
+                ),
+                status: LoggedModelStatus::Pending,
+                lifecycle: RunLifecycle::Active,
+                params: BTreeMap::new(),
+                tags: BTreeMap::from([("stage".to_string(), "dev".to_string())]),
+                creation_time_ms: 30_000,
+                last_updated_time_ms: 30_000,
+            })
+            .await
+            .expect("create logged model");
+
+        assert_eq!(
+            store.create_logged_model(model.clone()).await.unwrap_err(),
+            RunStoreError::LoggedModelIdConflict {
+                model_id: "m-1000".to_string()
+            }
+        );
+        assert_eq!(
+            store.get_logged_model("m-none", false).await.unwrap_err(),
+            RunStoreError::UnknownLoggedModel {
+                model_id: "m-none".to_string()
+            }
+        );
+
+        // Params: run-param immutability semantics.
+        let mut new_params = BTreeMap::new();
+        new_params.insert("lr".to_string(), "0.1".to_string());
+        new_params.insert("layers".to_string(), "3".to_string());
+        store
+            .log_logged_model_params("m-1000", &new_params)
+            .await
+            .unwrap();
+        store
+            .log_logged_model_params("m-1000", &new_params)
+            .await
+            .unwrap();
+        let mut diverged = BTreeMap::new();
+        diverged.insert("lr".to_string(), "0.2".to_string());
+        assert_eq!(
+            store
+                .log_logged_model_params("m-1000", &diverged)
+                .await
+                .unwrap_err(),
+            RunStoreError::ParamImmutable {
+                key: "lr".to_string(),
+                run_id: "m-1000".to_string()
+            }
+        );
+
+        // Tags: set + delete-absent typed error.
+        let mut tag_batch = BTreeMap::new();
+        tag_batch.insert("owner".to_string(), "genai".to_string());
+        let tagged_model = store
+            .set_logged_model_tags("m-1000", &tag_batch)
+            .await
+            .unwrap();
+        assert_eq!(tagged_model.tags["owner"], "genai");
+        assert_eq!(
+            store
+                .delete_logged_model_tag("m-1000", "absent")
+                .await
+                .unwrap_err(),
+            RunStoreError::UnknownLoggedModelTag {
+                model_id: "m-1000".to_string(),
+                key: "absent".to_string()
+            }
+        );
+        store
+            .delete_logged_model_tag("m-1000", "stage")
+            .await
+            .unwrap();
+
+        // Model metrics: append-only, isolated from run metrics and from
+        // the finished-run freeze.
+        store
+            .log_model_metric(
+                "m-1000",
+                ModelMetricPoint {
+                    point: MetricPoint {
+                        key: "accuracy".to_string(),
+                        value: 0.91,
+                        timestamp_ms: 31_000,
+                        step: 0,
+                    },
+                    run_id: Some("run-0002".to_string()),
+                    dataset_name: None,
+                    dataset_digest: None,
+                },
+            )
+            .await
+            .unwrap();
+        let second = store
+            .log_model_metric(
+                "m-1000",
+                ModelMetricPoint {
+                    point: MetricPoint {
+                        key: "accuracy".to_string(),
+                        value: 0.95,
+                        timestamp_ms: 32_000,
+                        step: 1,
+                    },
+                    run_id: Some("run-0002".to_string()),
+                    dataset_name: Some("holdout".to_string()),
+                    dataset_digest: Some("sha256:def".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.history_len, 2);
+        let history = store
+            .model_metric_history("m-1000", "accuracy")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].dataset_name.as_deref(), Some("holdout"));
+        // Same key on a RUN is a separate history.
+        assert_eq!(
+            store
+                .metric_history("run-0002", "accuracy")
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // Tag rewrites must not disturb model metric history (the substrate
+        // rewrite carries durable counters — the in-memory truth here).
+        store
+            .set_logged_model_tags(
+                "m-1000",
+                &BTreeMap::from([("unrelated".to_string(), "x".to_string())]),
+            )
+            .await
+            .unwrap();
+        store
+            .log_model_metric(
+                "m-1000",
+                ModelMetricPoint {
+                    point: MetricPoint {
+                        key: "accuracy".to_string(),
+                        value: 0.97,
+                        timestamp_ms: 33_000,
+                        step: 2,
+                    },
+                    run_id: Some("run-0002".to_string()),
+                    dataset_name: None,
+                    dataset_digest: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .model_metric_history("m-1000", "accuracy")
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "model metric history must survive tag rewrites"
+        );
+
+        // SECOND metric key on the same model: per-key counters both start
+        // at 1, so a key-less doc id would silently overwrite (MAJOR-2).
+        store
+            .log_model_metric(
+                "m-1000",
+                ModelMetricPoint {
+                    point: MetricPoint {
+                        key: "f1".to_string(),
+                        value: 0.88,
+                        timestamp_ms: 31_500,
+                        step: 0,
+                    },
+                    run_id: Some("run-0002".to_string()),
+                    dataset_name: None,
+                    dataset_digest: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .model_metric_history("m-1000", "accuracy")
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "a second metric key must never clobber the first key's history"
+        );
+        assert_eq!(
+            store
+                .model_metric_history("m-1000", "f1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.model_metrics("m-1000").await.unwrap().len(), 4);
+
+        // Finalize: status + last_updated transition; params stay writable.
+        let finalized = store
+            .finalize_logged_model("m-1000", LoggedModelStatus::Ready, 34_000)
+            .await
+            .unwrap();
+        assert_eq!(finalized.status, LoggedModelStatus::Ready);
+        assert_eq!(finalized.last_updated_time_ms, 34_000);
+        assert!(finalized.last_updated_time_ms > finalized.creation_time_ms);
+        store
+            .log_logged_model_params(
+                "m-1000",
+                &BTreeMap::from([("epochs".to_string(), "10".to_string())]),
+            )
+            .await
+            .unwrap();
+
+        let listed = store
+            .list_logged_models(trace_exp.experiment_id, false)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].model_id, "m-1000");
+
+        // Soft delete: hidden from search + default get, visible with
+        // allow_deleted.
+        store.delete_logged_model("m-1000").await.unwrap();
+        assert_eq!(
+            store
+                .list_logged_models(trace_exp.experiment_id, false)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            store.get_logged_model("m-1000", false).await.unwrap_err(),
+            RunStoreError::UnknownLoggedModel {
+                model_id: "m-1000".to_string()
+            }
+        );
+        assert_eq!(
+            store.get_logged_model("m-1000", true).await.unwrap().status,
+            LoggedModelStatus::Ready
+        );
+
+        // ---- Run <-> model links (TD-MLOPS-2): outputs + inputs embed. ----
+        store
+            .log_run_outputs(
+                "run-0002",
+                vec![ModelOutputRef {
+                    model_id: "m-1000".to_string(),
+                    step: 0,
+                }],
+            )
+            .await
+            .unwrap();
+        store
+            .log_run_model_inputs("run-0002", vec!["m-1000".to_string()])
+            .await
+            .unwrap();
+        let linked = store.get_run("run-0002").await.unwrap();
+        assert_eq!(linked.model_outputs.len(), 1);
+        assert_eq!(linked.model_outputs[0].model_id, "m-1000");
+        assert_eq!(linked.model_inputs, vec!["m-1000".to_string()]);
+        assert_eq!(
+            store
+                .log_run_outputs("no-such-run", Vec::new())
+                .await
+                .unwrap_err(),
+            RunStoreError::UnknownRun {
+                run_id: "no-such-run".to_string()
+            }
         );
     }
 }

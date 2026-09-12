@@ -480,6 +480,31 @@ fn artifact_entries_json(entries: Vec<ArtifactListEntry>, prefix: &str) -> Vec<V
         .collect()
 }
 
+/// Capability-safe directory listing for sibling MLflow handlers. Keeping
+/// this behind the artifact module prevents callers from reconstructing a
+/// host path or bypassing the tenant capability and no-follow checks.
+pub(super) async fn list_directory(
+    state: &MlflowState,
+    tenant: &TenantContext,
+    path: &str,
+) -> MlflowResult<Vec<Value>> {
+    let segments = sanitize_segments(path)?;
+    let entries = ArtifactStore::new(state, tenant)?.list(segments).await?;
+    Ok(artifact_entries_json(entries, ""))
+}
+
+/// Capability-safe recursive removal for an owner-derived artifact directory.
+/// Callers provide only server-owned path components, but this boundary still
+/// performs the same traversal and symlink validation as the public proxy.
+pub(super) async fn delete_directory(
+    state: &MlflowState,
+    tenant: &TenantContext,
+    path: &str,
+) -> MlflowResult<()> {
+    let segments = sanitize_segments(path)?;
+    ArtifactStore::new(state, tenant)?.delete(segments).await
+}
+
 /// Entry names for directory listings are relative to the RUN's artifact
 /// root (`<exp>/<run>/artifacts`), not to the listed subdirectory — the
 /// client passes `file.path` verbatim as the next remote path.
@@ -606,6 +631,11 @@ pub(super) fn experiment_artifact_location(experiment_id: u64) -> String {
     format!("mlflow-artifacts:/{experiment_id}")
 }
 
+/// The logged-model artifact root (minted on create by the wire; the
+/// client round-trips it through this capability-safe proxy).
+pub(super) fn model_artifact_uri(experiment_id: u64, model_id: &str) -> String {
+    format!("mlflow-artifacts:/{experiment_id}/models/{model_id}/artifacts")
+}
 #[cfg(test)]
 mod tests {
     use super::*;

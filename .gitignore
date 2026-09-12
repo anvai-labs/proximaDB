@@ -206,7 +206,6 @@ flamegraph.svg
 !*.txt
 # TD-MLOPS-1: the MLflow conformance ratchet must be tracked (git add -f
 # precedent: the drift ledger beside the other ratchet baselines).
-!clients/python/tests/mlflow_conformance_steps.txt
 
 # Keep configuration examples
 !examples/**/*.toml
@@ -474,6 +473,9 @@ docs/archive/sessions/
 # Project root data and text files
 *.dat
 *.txt
+# MLflow conformance ratchets must stay tracked (negation must FOLLOW the blanket *.txt above)
+!clients/python/tests/mlflow_conformance_steps_2x.txt
+!clients/python/tests/mlflow_conformance_steps_3x.txt
 
 # Consolidated config dir (configs/ merged into config/)
 /configs/

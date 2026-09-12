@@ -32,6 +32,16 @@ impl MlflowError {
         }
     }
 
+    /// Id-existence conflicts (duplicate trace/model ids): the MLflow error
+    /// code with HTTP 409 — the resource state, not a bad parameter.
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "RESOURCE_ALREADY_EXISTS",
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -97,6 +107,37 @@ impl From<RunStoreError> for MlflowError {
             )),
             RunStoreError::ExperimentDeleted { experiment_id } => MlflowError::invalid_state(
                 format!("Experiment '{experiment_id}' is deleted (restore it first)"),
+            ),
+            // Deliberately NOT the reference server's "Trace with ID 'x'
+            // not found" phrasing — the 3.x client pattern-matches exactly
+            // that literal on /traces/get 404s and converts it to
+            // NotImplemented; ours must stay a plain RESOURCE_DOES_NOT_EXIST.
+            RunStoreError::UnknownTrace { trace_id } => {
+                MlflowError::not_found(format!("Could not find trace with ID '{trace_id}'"))
+            }
+            RunStoreError::TraceIdConflict { trace_id } => {
+                MlflowError::conflict(format!("Trace '{trace_id}' already exists"))
+            }
+            RunStoreError::InvalidTraceId { trace_id } => MlflowError::invalid(format!(
+                "trace id '{trace_id}' contains invalid characters (allowed: A-Za-z0-9._~-)"
+            )),
+            RunStoreError::UnknownAssessment {
+                trace_id,
+                assessment_id,
+            } => MlflowError::not_found(format!(
+                "Could not find assessment '{assessment_id}' on trace '{trace_id}'"
+            )),
+            RunStoreError::UnknownLoggedModel { model_id } => {
+                MlflowError::not_found(format!("Logged model with ID '{model_id}' not found"))
+            }
+            RunStoreError::LoggedModelIdConflict { model_id } => {
+                MlflowError::conflict(format!("Logged model '{model_id}' already exists"))
+            }
+            RunStoreError::InvalidModelStatus { status } => MlflowError::invalid(format!(
+                "status '{status}' is not a valid logged-model status"
+            )),
+            RunStoreError::UnknownLoggedModelTag { model_id, key } => MlflowError::not_found(
+                format!("Tag '{key}' not found on logged model '{model_id}'"),
             ),
             RunStoreError::Empty { field } => {
                 MlflowError::invalid(format!("{field} must not be empty"))

@@ -94,6 +94,10 @@ pub fn ui_mount_routes() -> Router<MlflowState> {
                 "/ajax-api/2.0/mlflow-artifacts",
                 super::artifacts_router_relative(),
             )
+            // TD-MLOPS-2: the UI's Traces family calls /ajax-api/3.0/* —
+            // alias the v3 router beside the 2.0 nests (the traces'
+            // 2.0-prefixed stragglers + logged-models ride the 2.0 alias).
+            .nest("/ajax-api/3.0/mlflow", super::traces::traces_routes())
     }
     #[cfg(not(feature = "mlflow-ui"))]
     {

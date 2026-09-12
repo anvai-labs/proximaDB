@@ -235,8 +235,8 @@ execution; MLflow auth pass-through (tenant identity stays ours).
   non-match, terminate semantics, soft delete/restore) through the REAL
   `mlflow` client against a spawned gated server; the
   `mlflow-conformance` CI lane (mlflow-skinny==2.14.3, pinned) counts
-  passing steps against the checked-in ratchet
-  (`mlflow_conformance_steps.txt`, counts only go up). The wire gained
+  passing steps against the checked-in 2.x-generation ratchet
+  (`mlflow_conformance_steps_2x.txt`, counts only go up). The wire gained
   `experiments/get-by-name` (real clients resolve set_experiment by
   name). Follow-up hardening from the parallel-session round — latest-
   metric projection semantics ((timestamp, value) ordering) and

@@ -552,6 +552,11 @@ impl RestServer {
             );
             let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
+            // TD-MLOPS-2: the traces v3 family mounts at /api/3.0/mlflow
+            // (same gate, same state, before the tenant/auth layers).
+            let traces_router =
+                super::mlflow::traces::traces_routes().with_state(mlflow_state.clone());
+            base_router = base_router.nest("/api/3.0/mlflow", traces_router);
             let artifacts_router =
                 super::mlflow::artifacts_router().with_state(mlflow_state.clone());
             // merge (not nest): the artifacts family carries its full
@@ -965,6 +970,11 @@ impl RestServer {
             );
             let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
             base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
+            // TD-MLOPS-2: the traces v3 family mounts at /api/3.0/mlflow
+            // (same gate, same state, before the tenant/auth layers).
+            let traces_router =
+                super::mlflow::traces::traces_routes().with_state(mlflow_state.clone());
+            base_router = base_router.nest("/api/3.0/mlflow", traces_router);
             let artifacts_router =
                 super::mlflow::artifacts_router().with_state(mlflow_state.clone());
             // merge (not nest): the artifacts family carries its full

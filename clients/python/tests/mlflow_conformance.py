@@ -1,11 +1,13 @@
-"""TD-MLOPS-1 slice 2: real-client MLflow conformance (the ratchet).
+"""Real-client MLflow conformance (the ratchet).
 
 Drives the CANONICAL mlflow workflow against a live server with the
-compatibility gate on, counting passing workflow steps. The checked-in
-ratchet (clients/python/tests/mlflow_conformance_steps.txt) records the
-high-water count; CI fails if fewer steps pass (counts only go up).
+compatibility gate on, counting passing workflow steps. Ratchets are
+PER GENERATION (clients/python/tests/mlflow_conformance_steps_2x.txt /
+mlflow_conformance_steps_3x.txt): steps requiring an MLflow 3.x client
+(generation-gated below) never run under the 2.x client and vice versa,
+so each generation's high-water count is independent and only goes up.
 
-Usage: python tests/mlflow_conformance.py <tracking_uri>
+Usage: python tests/mlflow_conformance.py <tracking_uri> [tag]
 """
 
 import sys
@@ -14,11 +16,19 @@ import traceback
 PASSED = []
 FAILED = []
 
+# The active client generation (2 or 3); main() sets it from the imported
+# mlflow version. Steps may declare a MINIMUM generation via `gen=`; the
+# 2-arg call contract (pinned by test_mlflow_conformance_harness) stays.
+_ACTIVE_GEN = 2
 
-def step(name, fn):
+
+def step(name, fn, gen=2):
     """Run one workflow step; a failure records a miss and CONTINUES so the
     ratchet observes the passing count (fewer passing steps = regression).
     Any step failing still exits non-zero at the end via the ratchet."""
+    if gen > _ACTIVE_GEN:
+        print(f"SKIP {name} (requires an MLflow 3.x client)")
+        return
     try:
         fn()
         PASSED.append(name)
@@ -45,6 +55,10 @@ def main() -> int:
 
     import mlflow
     from mlflow.tracking import MlflowClient
+
+    global _ACTIVE_GEN
+    _ACTIVE_GEN = int(mlflow.__version__.split(".")[0])
+    print(f"client generation: mlflow {mlflow.__version__} (gen {_ACTIVE_GEN})")
 
     mlflow.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
@@ -223,6 +237,169 @@ def main() -> int:
                 assert fh.read() == "artifact-bytes"
 
     step("artifact_roundtrip", do_artifact_roundtrip)
+
+    # 8. Logged models (TD-MLOPS-2) — MLflow 3.x clients only.
+    def do_lm_create():
+        model = client.create_logged_model(
+            state["experiment"], name=f"conformance-lm-{tag}"
+        )
+        assert model.model_id.startswith("m-"), model.model_id
+        state["model_id"] = model.model_id
+        fetched = client.get_logged_model(model.model_id)
+        assert fetched.name == f"conformance-lm-{tag}", fetched.name
+        assert fetched.artifact_location.startswith(
+            "mlflow-artifacts:/"
+        ), fetched.artifact_location
+
+    step("logged_model_create+get", do_lm_create, gen=3)
+
+    def do_lm_params_tags():
+        client.log_model_params(state["model_id"], {"lr": "0.1"})
+        client.set_logged_model_tags(state["model_id"], {"stage": "dev"})
+        model = client.get_logged_model(state["model_id"])
+        assert model.params["lr"] == "0.1", model.params
+        assert model.tags["stage"] == "dev", model.tags
+
+    step("logged_model_params+tags", do_lm_params_tags, gen=3)
+
+    def do_lm_metric():
+        client.log_metric(
+            state["run_id"],
+            "lm_accuracy",
+            0.91,
+            step=0,
+            model_id=state["model_id"],
+            dataset_name="holdout",
+            dataset_digest="sha256:aa",
+        )
+        model = client.get_logged_model(state["model_id"])
+        values = [m.value for m in model.metrics if m.key == "lm_accuracy"]
+        assert values == [0.91], model.metrics
+        # The model-owned metric must NOT leak into the run projection.
+        run = client.get_run(state["run_id"])
+        assert "lm_accuracy" not in run.data.metrics, run.data.metrics
+
+    step("logged_model_metric_via_runs_log_metric", do_lm_metric, gen=3)
+
+    def do_lm_search():
+        models = client.search_logged_models(
+            [state["experiment"]],
+            filter_string=f"name LIKE '%conformance-lm-{tag}%'",
+        )
+        assert any(m.model_id == state["model_id"] for m in models), models
+
+    step("logged_model_search_filter", do_lm_search, gen=3)
+
+    def do_lm_finalize():
+        client.finalize_logged_model(state["model_id"], "READY")
+        model = client.get_logged_model(state["model_id"])
+        assert model.status == "READY", model.status
+
+    step("finalize_logged_model", do_lm_finalize, gen=3)
+
+    def do_run_outputs():
+        from mlflow.entities import LoggedModelOutput
+
+        client.log_outputs(
+            state["run_id"], [LoggedModelOutput(model_id=state["model_id"], step=0)]
+        )
+        run = client.get_run(state["run_id"])
+        outputs = [o.model_id for o in run.outputs.model_outputs]
+        assert state["model_id"] in outputs, outputs
+
+    step("run_outputs_embedded_in_get_run", do_run_outputs, gen=3)
+
+    # 9. Traces v3 (TD-MLOPS-2) — MLflow 3.x clients only. Spans ride the
+    # artifact repo (this server deliberately serves no /version), so
+    # get_trace PROVES the client could upload AND download trace data.
+    # The client exports traces on a background processor (optionally an
+    # async queue), and its IN-MEMORY trace info never carries the
+    # server-minted artifactLocation tag — so reads must AWAIT the export
+    # landing (exactly like a real consumer polling a fresh trace).
+    import time as _time
+
+    def _await_trace(trace_id, timeout=20.0):
+        deadline = _time.monotonic() + timeout
+        last = None
+        while _time.monotonic() < deadline:
+            try:
+                trace = client.get_trace(trace_id)
+                if trace.data.spans:
+                    return trace
+                last = AssertionError("trace readable but spans not yet uploaded")
+            except Exception as exc:  # not exported yet / in-memory window
+                last = exc
+            _time.sleep(0.5)
+        raise last if last else AssertionError("trace never became readable")
+
+    def do_start_trace():
+        # Pin the destination experiment — without it the client defaults
+        # to experiment "0", not the conformance experiment.
+        span = client.start_trace(
+            name=f"conformance-trace-{tag}", experiment_id=state["experiment"]
+        )
+        state["trace_id"] = span.trace_id
+        span.end()
+        assert span.trace_id.startswith("tr-"), span.trace_id
+
+    step("start_trace_v3", do_start_trace, gen=3)
+
+    def do_get_trace():
+        trace = _await_trace(state["trace_id"])
+        assert trace.info.request_id == state["trace_id"], trace.info
+        assert trace.data.spans, "span data must round-trip via the artifact repo"
+
+    step("get_trace_v3_spans_via_artifacts", do_get_trace, gen=3)
+
+    def do_search_traces():
+        traces = client.search_traces(experiment_ids=[state["experiment"]])
+        assert any(t.info.request_id == state["trace_id"] for t in traces), [
+            t.info.request_id for t in traces
+        ]
+
+    step("search_traces_v3", do_search_traces, gen=3)
+
+    def do_trace_tags():
+        client.set_trace_tag(state["trace_id"], "reviewed", "yes")
+        trace = client.get_trace(state["trace_id"])
+        assert trace.info.tags.get("reviewed") == "yes", trace.info.tags
+
+    step("trace_tags_set", do_trace_tags, gen=3)
+
+    def do_assessment():
+        import mlflow as mlflow_mod
+        from mlflow.entities.assessment import AssessmentSource, Feedback
+
+        feedback = Feedback(
+            name="quality",
+            value=5,
+            source=AssessmentSource(source_type="HUMAN", source_id="conformance"),
+        )
+        mlflow_mod.log_assessment(state["trace_id"], feedback)
+        trace = client.get_trace(state["trace_id"])
+        # v3 assessments surface as v2 Feedback entities (`.name`).
+        assessments = list(trace.info.assessments or [])
+        assert any(a.name == "quality" for a in assessments), assessments
+        state["assessment_id"] = next(
+            a.assessment_id for a in assessments if a.name == "quality"
+        )
+        fetched = mlflow_mod.get_assessment(state["trace_id"], state["assessment_id"])
+        assert fetched.name == "quality"
+
+    step("assessments_log_get", do_assessment, gen=3)
+
+    def do_delete_traces():
+        client.delete_traces(state["experiment"], trace_ids=[state["trace_id"]])
+        import mlflow as mlflow_mod
+
+        try:
+            client.get_trace(state["trace_id"])
+        except mlflow_mod.exceptions.MlflowException:
+            pass
+        else:
+            raise AssertionError("deleted trace must not be retrievable")
+
+    step("delete_traces_v3", do_delete_traces, gen=3)
 
     total = len(PASSED)
     print(f"CONFORMANCE_STEPS={total}")

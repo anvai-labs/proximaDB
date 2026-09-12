@@ -152,6 +152,23 @@ query endpoint, and `/api/v2/query` is *not* SQL-over-REST. Route by language:
 | Hybrid capability: Beta on v2; legacy method names: absent
 |===
 
+=== Compatibility Projections (adapter surfaces over the platform)
+
+[cols="1,1,3,2"]
+|===
+| Surface | Tier | Scope | Notes
+
+| *MLflow wire* (`/api/2.0/mlflow[-artifacts]/*`, `/api/3.0/mlflow/traces/*`)
+| OSS-bundled, opt-in
+| MLflow 2.x tracking/registry/artifacts plus the implemented MLflow 3.16 client paths for 3.x traces and logged models, as a compatibility wire over the tenant-scoped RunStore (registry lowers to xCatalog read-only; spans ride the artifacts proxy). Deferred 3.x endpoints are listed in TD-MLOPS-2. Real-client conformance is ratcheted per client generation (TD-MLOPS-1/2).
+| Unset `PROXIMADB_MLFLOW_COMPAT_ENABLE` ⇒ absent (platform 404). MLflow's REST is the external contract, NOT our OpenAPI.
+
+| *MLflow UI* (`/mlflow-ui`)
+| OSS-bundled, opt-in
+| Vendored stock MLflow 3.16.0 UI (Apache-2.0), same gate + non-default `mlflow-ui` cargo feature; statics and ajax-api aliases mount together before auth layers (mount-is-the-contract).
+| Solo-user posture today; a future OIDC middleware gates UI and API together (TD-MLOPS-3, TD-SSO-2 pointer).
+|===
+
 [NOTE]
 ====
 * pgwire is *SQL-only* and cannot serve UQL/AQL/Cypher; those non-SQL languages require the
