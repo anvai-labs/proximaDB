@@ -567,6 +567,7 @@ pub trait RunStore: Send + Sync {
 /// `tr-<32hex>`, well inside this set.
 pub fn valid_trace_id(trace_id: &str) -> bool {
     !trace_id.is_empty()
+        && !trace_id.trim_matches('.').is_empty()
         && trace_id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'))

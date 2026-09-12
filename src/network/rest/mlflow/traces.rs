@@ -254,7 +254,7 @@ impl AssessmentIn {
     /// Build the port record. Exactly one payload variant must be present —
     /// the client's `Assessment.from_proto` raises on a response with none
     /// or several, so we reject the same shape on the way in.
-    fn into_record(self, trace_id: &str, now_ms: i64) -> MlflowResult<AssessmentRecord> {
+    fn into_record(self, _trace_id: &str, now_ms: i64) -> MlflowResult<AssessmentRecord> {
         if self.assessment_name.is_empty() {
             return Err(MlflowError::invalid("assessment_name must not be empty"));
         }
@@ -313,12 +313,26 @@ impl AssessmentIn {
             metadata: self.metadata,
             valid: self.valid.unwrap_or(true),
         })
-        .inspect(|_| {
-            // trace_id rides the record's owner (the port call carries
-            // it), not the payload.
-            let _ = trace_id;
-        })
+        // trace_id rides the record's owner (the port call carries it),
+        // not the payload.
     }
+}
+
+/// Protobuf's JSON serializer camelCases FieldMask segments, so the 3.16
+/// client sends "assessmentName" for the proto field `assessment_name`.
+/// Accept both spellings (review MAJOR-1: snake-only matching rejected
+/// EVERY real `mlflow.update_assessment` call).
+fn normalize_mask_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[derive(Serialize)]
@@ -578,6 +592,17 @@ pub(crate) struct CreateAssessmentRequest {
     pub(crate) assessment: Option<AssessmentIn>,
 }
 
+impl CreateAssessmentRequest {
+    /// The caller-supplied assessment id, when the request carried one
+    /// (server-minted ids are always fresh by construction).
+    fn supplied_id(&self) -> Option<&str> {
+        self.assessment
+            .as_ref()
+            .and_then(|a| a.assessment_id.as_deref())
+            .filter(|id| !id.is_empty())
+    }
+}
+
 #[derive(Default, Deserialize)]
 pub(crate) struct UpdateAssessmentRequest {
     #[serde(default)]
@@ -676,11 +701,11 @@ async fn traces_create(
     let record = match store.start_trace(record.clone()).await {
         Ok(saved) => saved,
         Err(conflict @ RunStoreError::TraceIdConflict { .. }) => {
-            let existing = store.get_trace(&record.trace_id).await?;
-            if trace_retry_equivalent(&existing, &record) {
-                existing
-            } else {
-                return Err(conflict.into());
+            // A concurrent delete can race the re-read — the conflict is
+            // the honest answer either way, never a 404.
+            match store.get_trace(&record.trace_id).await {
+                Ok(existing) if trace_retry_equivalent(&existing, &record) => existing,
+                _ => return Err(conflict.into()),
             }
         }
         Err(error) => return Err(error.into()),
@@ -731,8 +756,19 @@ async fn traces_get_by_id(
 async fn traces_batch_get(
     State(state): State<MlflowState>,
     Extension(tenant): Extension<TenantContext>,
-    super::MlflowRead(req): super::MlflowRead<BatchGetTracesRequest>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> MlflowResult<Json<serde_json::Value>> {
+    // The client sends repeated keys (trace_ids=a&trace_ids=b) which
+    // serde_urlencoded cannot deserialize into a Vec (review MAJOR-2) —
+    // collect every occurrence manually, tolerating one bare value.
+    let query = query.unwrap_or_default();
+    let mut trace_ids: Vec<String> = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == "trace_ids" && !value.is_empty() {
+            trace_ids.push(value.into_owned());
+        }
+    }
+    let req = BatchGetTracesRequest { trace_ids };
     let store = store_for(&tenant, &state)?;
     let mut traces = Vec::new();
     // MLflow semantics: absent ids are skipped, not an error.
@@ -830,16 +866,25 @@ async fn assessments_create(
     Path(trace_id): Path<String>,
     Json(req): Json<CreateAssessmentRequest>,
 ) -> MlflowResult<Json<serde_json::Value>> {
+    let supplied_id = req.supplied_id().map(str::to_string);
     let Some(assessment) = req.assessment else {
         return Err(MlflowError::invalid("assessment is required"));
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
     let record = assessment.into_record(&trace_id, now_ms)?;
+    let store = store_for(&tenant, &state)?;
+    // A caller-supplied id that already exists is a create conflict (the
+    // reference errors; upsert semantics belong to PATCH — review NIT-3).
+    if let Some(id) = supplied_id.as_deref()
+        && store.get_assessment(&trace_id, id).await.is_ok()
+    {
+        return Err(MlflowError::conflict(format!(
+            "Assessment '{id}' already exists on trace '{trace_id}'"
+        )));
+    }
     // The trace must exist first (typed UnknownTrace, never a silent
     // orphan).
-    let saved = store_for(&tenant, &state)?
-        .upsert_assessment(&trace_id, record)
-        .await?;
+    let saved = store.upsert_assessment(&trace_id, record).await?;
     Ok(Json(
         serde_json::json!({ "assessment": assessment_out(&trace_id, &saved) }),
     ))
@@ -878,14 +923,14 @@ async fn assessments_update(
     };
     let mask = mask
         .split(',')
-        .map(str::trim)
+        .map(|path| normalize_mask_path(path.trim()))
         .filter(|path| !path.is_empty())
         .collect::<Vec<_>>();
     if mask.is_empty() {
         return Err(MlflowError::invalid("update_mask must not be empty"));
     }
-    for path in mask {
-        match path {
+    for path in &mask {
+        match path.as_str() {
             "assessment_name" => {
                 if incoming.assessment_name.is_empty() {
                     return Err(MlflowError::invalid("assessment_name must not be empty"));

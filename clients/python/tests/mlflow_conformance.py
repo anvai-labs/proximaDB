@@ -388,6 +388,48 @@ def main() -> int:
 
     step("assessments_log_get", do_assessment, gen=3)
 
+    def do_assessment_update():
+        from mlflow.entities.assessment import AssessmentSource, Feedback
+
+        feedback = Feedback(
+            name="quality2",
+            value=4,
+            source=AssessmentSource(source_type="HUMAN", source_id="conformance"),
+        )
+        mlflow.log_assessment(state["trace_id"], feedback)
+        trace = client.get_trace(state["trace_id"])
+        assessment_id = next(
+            a.assessment_id
+            for a in (trace.info.assessments or [])
+            if a.name == "quality2"
+        )
+        # The PUBLIC update path: the client derives the FieldMask from
+        # the non-None kwargs and protobuf JSON camelCases the segments
+        # ("assessmentName") — the round-2 MAJOR-1 shape.
+        updated = Feedback(
+            name="quality2-v2",
+            value=5,
+            source=AssessmentSource(source_type="HUMAN", source_id="conformance"),
+        )
+        result = mlflow.update_assessment(state["trace_id"], assessment_id, updated)
+        assert result.name == "quality2-v2", result.name
+        fetched = mlflow.get_assessment(state["trace_id"], assessment_id)
+        assert fetched.name == "quality2-v2", fetched.name
+
+    step("assessment_update_camel_mask", do_assessment_update, gen=3)
+
+    def do_batch_get_traces():
+        # The client's batch-get sends repeated query keys
+        # (trace_ids=a&trace_ids=b) — the round-2 MAJOR-2 shape (the
+        # public entry point lives on the tracing client).
+        traces = client._tracing_client.batch_get_traces(
+            [state["trace_id"], "tr-doesnotexist"]
+        )
+        by_id = {t.info.request_id for t in traces}
+        assert state["trace_id"] in by_id, by_id
+
+    step("batch_get_traces_repeated_keys", do_batch_get_traces, gen=3)
+
     def do_delete_traces():
         client.delete_traces(state["experiment"], trace_ids=[state["trace_id"]])
         import mlflow as mlflow_mod

@@ -1757,6 +1757,53 @@ mod tests {
             "masked PATCH must not drop unmasked fields",
         );
 
+        // REAL client shape the review proved uncovered (round 2 MAJOR-1):
+        // protobuf JSON camelCases FieldMask segments — "assessmentName".
+        let (status, body) = request_json(
+            &mut router,
+            "PATCH",
+            &format!("/api/3.0/mlflow/traces/tr-abc123def456/assessments/{assessment_id}"),
+            serde_json::json!({
+                "assessment": {"assessment_name": "renamed-camel"},
+                "update_mask": "assessmentName",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "camelCase mask body: {body}");
+        assert_eq!(body["assessment"]["assessment_name"], "renamed-camel");
+
+        // MAJOR-2: repeated query keys (trace_ids=a&trace_ids=b).
+        let (status, body) = get_json(
+            &mut router,
+            "/api/3.0/mlflow/traces/batchGet?trace_ids=tr-abc123def456&trace_ids=tr-none",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "repeated-key batchGet: {body}");
+        assert_eq!(
+            body["traces"].as_array().unwrap().len(),
+            1,
+            "absent ids skipped"
+        );
+
+        // NIT-3: create with a caller-supplied EXISTING id is a 409.
+        let (status, _) = post_json(
+            &mut router,
+            "/api/3.0/mlflow/traces/tr-abc123def456/assessments",
+            serde_json::json!({
+                "assessment": {
+                    "assessment_id": assessment_id,
+                    "assessment_name": "duplicate-id",
+                    "feedback": {"value": 1},
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "caller-supplied existing id must 409"
+        );
+
         // Identity/source/span and the assessment value kind are immutable.
         for immutable_path in ["span_id", "source", "trace_id", "assessment_id"] {
             let (status, _) = request_json(

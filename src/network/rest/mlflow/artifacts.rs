@@ -486,11 +486,22 @@ fn artifact_entries_json(entries: Vec<ArtifactListEntry>, prefix: &str) -> Vec<V
 pub(super) async fn list_directory(
     state: &MlflowState,
     tenant: &TenantContext,
-    path: &str,
+    repo_path: &str,
+    display_sub: &str,
 ) -> MlflowResult<Vec<Value>> {
-    let segments = sanitize_segments(path)?;
+    let segments = sanitize_segments(repo_path)?;
+    // Paths are OWNER-ROOT-relative (MLflow FileInfo semantics — review
+    // MINOR-3): the caller passes the sub-path below the owner root as
+    // the display prefix, so "sub/model.bin" resolves against the
+    // response's root_uri, not the tenant repo root. An empty sub (the
+    // owner root itself) lists unprefixed.
+    let display = if display_sub.is_empty() {
+        String::new()
+    } else {
+        sanitize_segments(display_sub)?.join("/")
+    };
     let entries = ArtifactStore::new(state, tenant)?.list(segments).await?;
-    Ok(artifact_entries_json(entries, ""))
+    Ok(artifact_entries_json(entries, &display))
 }
 
 /// Capability-safe recursive removal for an owner-derived artifact directory.

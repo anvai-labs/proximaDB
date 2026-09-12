@@ -64,6 +64,11 @@ pub(crate) struct SearchLoggedModelsRequest {
     pub(crate) experiment_ids: Vec<String>,
     #[serde(default)]
     pub(crate) filter: Option<String>,
+    /// Metric-dataset scoping the client can send — NOT silently dropped
+    /// (the module's own never-ignore law): a non-empty scope is an honest
+    /// INVALID_PARAMETER_VALUE rather than an over-broad result set.
+    #[serde(default)]
+    pub(crate) datasets: Vec<serde_json::Value>,
     #[serde(default)]
     pub(crate) max_results: Option<u32>,
     #[serde(default)]
@@ -362,6 +367,11 @@ async fn logged_models_search(
             "experiment_ids must list at least one experiment",
         ));
     }
+    if !req.datasets.is_empty() {
+        return Err(MlflowError::invalid(
+            "dataset-scoped logged-model search is not supported (drop the datasets scope)",
+        ));
+    }
     let clauses = req
         .filter
         .as_deref()
@@ -538,7 +548,7 @@ async fn logged_models_list_artifacts(
             path.push_str(segment);
         }
     }
-    let files = super::artifacts::list_directory(&state, &tenant, &path).await?;
+    let files = super::artifacts::list_directory(&state, &tenant, &path, &sub).await?;
     let (files, next_page_token) = super::paginate(files, None, req.page_token.as_deref())?;
     let mut body = serde_json::json!({
         "root_uri": record.artifact_uri,
