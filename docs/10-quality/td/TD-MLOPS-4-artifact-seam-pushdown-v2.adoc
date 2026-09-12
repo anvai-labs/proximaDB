@@ -50,14 +50,24 @@ must encode the lessons as type-level and contract-level rules:
 3. **Capability declaration.** Implementations declare platform support
    (e.g. Windows fail-closed) rather than discovering it at request
    time; the wire maps unsupported platforms before any I/O.
-4. **The red evidence becomes the battery.** #1891's adversarial
+4. **Segments validate IN the port.** The hardened impl's
+   `sanitize_segments` (rejecting `..`/`\`/NUL) is a wire-side free
+   function today; a second caller behind the seam would get no
+   guarantee from rules 1-3 alone (the local impl survives via
+   capability-relative opens — defense OUTSIDE the contract being
+   extracted). The port validates path segments itself (or carries an
+   `ArtifactPath` newtype constructed only through validation).
+5. **The red evidence becomes the battery.** #1891's adversarial
    discoveries — tenant collision, symlink/parent-swap traversal — are
-   port conformance tests every implementation must pass (in-memory +
-   hardened local + the eventual tracked-S3 double).
+   port conformance tests, capability-shaped: filesystem-semantics cases
+   (symlink, parent-swap) run against filesystem-backed implementations;
+   every implementation runs the encoding/isolation cases (in-memory,
+   hardened local, the eventual tracked-S3 double).
 
 == Query pushdown re-land
 
-The `RunQuery` side was never the unsafe half; it rode the bundle
+#1891's body calls the whole port unsafe, but both enumerated
+failure classes are artifact-side; the `RunQuery` side rode the bundle
 revert. Re-land as-is semantically (clause enum over params/tags/metrics
 with absent-value semantics; `search_runs(&RunQuery)` default composing
 `list_runs`, substrates overriding with real pushdown), but landing it
@@ -67,8 +77,10 @@ users instead of an orphan abstraction.
 
 == Sequencing
 
-1. PR #1889 rebases onto #1891 and uses the hardened `ArtifactStore`
-   concretely (no port dependency) — in flight on the repair branch.
+1. PR #1889 is to be rebased onto #1891 (its pushed head predates it)
+   and use the hardened `ArtifactStore` concretely (no port
+   dependency) — the reconciliation was in flight when this TD was
+   filed.
 2. THIS TD's port-v2 extraction PR: interface derived from the hardened
    impl + the conformance battery from #1891's red evidence; the router
    and the traces/LoggedModel artifact flows move behind the seam.
@@ -86,5 +98,6 @@ users instead of an orphan abstraction.
 == References
 
 * TD-MLOPS-1 (adapter laws), TD-MLOPS-2 file riding #1889
-* `docs/10-quality/td/TD-SSO-2-*.adoc` pattern: forward pointers stay
-  with the surface that needs them
+* The TD-MLOPS-3 forward-pointer pattern (see its Related row; cf.
+  `TD-SSO-2-multi-provider-oidc.md`): pointers stay with the surface
+  that needs them
