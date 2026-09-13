@@ -203,6 +203,16 @@ if [ "$SCOPE" = "qa" ]; then
     --test objstore_backend_contract_test \
     -- --ignored --nocapture --test-threads=1
 
+  # TD-MLOPS-4 S1-remainder: the MLflow artifact seam battery against the
+  # REAL S3 protocol (the lane's MinIO). cloud-full is already built; this
+  # is a near-free incremental lib-test run. AWS_ENDPOINT/AWS_* are the
+  # global exports pointing at the lane's MinIO.
+  echo "==> TD-MLOPS-4 S1: MLflow S3 artifact seam conformance (MinIO)"
+  PROXIMADB_MLFLOW_ARTIFACTS_TEST_URL="s3://$CONTAINER_BUCKET/mlflow-seam-conformance" \
+    CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full --lib \
+    services::mlflow_artifact_s3::tests::s3_backend_passes_seam_conformance \
+    -- --exact --nocapture
+
   echo "==> QA tier [1/2]: Azure (Azurite, adls://) — restart proofs + recall ratchet"
   export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
   export AZURE_STORAGE_ACCOUNT=devstoreaccount1 AZURE_STORAGE_ACCOUNT_NAME=devstoreaccount1
