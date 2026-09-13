@@ -385,13 +385,16 @@ mod tests {
         assert_eq!(frame_offset, first.offset);
         assert_eq!(frame_offset, 0, "first message gets offset 0");
 
-        let segment_ids: Vec<u64> = writer
+        let mut segment_ids: Vec<u64> = writer
             .segments()
             .await
             .unwrap()
             .into_iter()
             .map(|segment| segment.segment_id)
             .collect();
+        // Directory iteration order is backend/platform dependent; this test
+        // verifies the rotated segment inventory, not an ordering contract.
+        segment_ids.sort_unstable();
         assert_eq!(segment_ids, vec![0, 1]);
     }
 }
