@@ -1374,6 +1374,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runs_search_lifecycle_views() {
+        let mut router = test_router("default").await;
+        let (_, body) = post_json(
+            &mut router,
+            "/experiments/create",
+            serde_json::json!({"name": "lifecycle-views"}),
+        )
+        .await;
+        let experiment_id = body["experiment_id"].as_str().unwrap().to_string();
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/create",
+            serde_json::json!({"experiment_id": experiment_id, "run_name": "keep"}),
+        )
+        .await;
+        let kept = body["run"]["info"]["run_id"].as_str().unwrap().to_string();
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/create",
+            serde_json::json!({"experiment_id": experiment_id, "run_name": "drop"}),
+        )
+        .await;
+        let dropped = body["run"]["info"]["run_id"].as_str().unwrap().to_string();
+        post_json(
+            &mut router,
+            "/runs/delete",
+            serde_json::json!({"run_id": dropped}),
+        )
+        .await;
+
+        let ids = serde_json::json!([experiment_id]);
+        // Default (ACTIVE_ONLY): only the live run.
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": ids}),
+        )
+        .await;
+        let names: Vec<&str> = body["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["info"]["run_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["keep"], "ACTIVE_ONLY hides deleted runs");
+
+        // DELETED_ONLY: only the deleted run.
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": ids, "run_view_type": "DELETED_ONLY"}),
+        )
+        .await;
+        let names: Vec<&str> = body["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["info"]["run_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["drop"], "DELETED_ONLY shows only deleted runs");
+
+        // ALL: both.
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": ids, "run_view_type": "ALL"}),
+        )
+        .await;
+        assert_eq!(body["runs"].as_array().unwrap().len(), 2);
+
+        // An invalid view fails closed.
+        let (status, _) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": ids, "run_view_type": "BOGUS"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let _ = (kept, dropped);
+    }
+
+    #[tokio::test]
     async fn foreign_tenant_probe_is_uniform_not_found() {
         let mut alice = test_router("alice").await;
         let mut bob = test_router("bob").await;

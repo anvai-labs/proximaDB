@@ -646,12 +646,17 @@ pub fn like_match(value: &str, pattern: &str) -> bool {
     let (mut vi, mut pi) = (0usize, 0usize);
     let (mut star, mut star_v) = (usize::MAX, 0usize);
     while vi < v.len() {
-        if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
-            vi += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == '%' {
+        // The wildcard branch MUST run first: a literal-% in the VALUE can
+        // otherwise satisfy the literal-equality branch while the pattern
+        // cursor sits on a % wildcard — consuming it WITHOUT registering
+        // the backtrack point, so a later mismatch can't re-extend (review
+        // MAJOR 1; 23,986 exhaustively-found false negatives).
+        if pi < p.len() && p[pi] == '%' {
             star = pi;
             star_v = vi;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
+            vi += 1;
             pi += 1;
         } else if star != usize::MAX {
             pi = star + 1;
@@ -2307,13 +2312,15 @@ pub mod conformance_tests {
 
         // Search pushdown (TD-MLOPS-4 S3): the port owns predicate
         // evaluation; the default composes list_runs.
-        // run-0001 is lifecycle=deleted by this point in the battery —
-        // the lifecycle view is part of the query, not the predicate.
+        // The lifecycle view is part of the query, not the predicate
+        // (both runs are Active here; deleted-view coverage is wire-side).
         let query = |clauses: Vec<RunQueryClause>| RunQuery {
             experiment_ids: vec![exp.experiment_id],
             include_deleted: true,
             clauses,
         };
+        // run-0001 has lr=0.01; run-0002 has NO params — eq vs ne
+        // distinguish presence (absent never equals; absent != is true).
         assert_eq!(
             store
                 .search_runs(&query(vec![RunQueryClause::ParamEq(
@@ -2325,8 +2332,62 @@ pub mod conformance_tests {
                 .len(),
             1
         );
+        assert_eq!(
+            store
+                .search_runs(&query(vec![RunQueryClause::ParamNe(
+                    "lr".to_string(),
+                    "9.9".to_string()
+                )]))
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "absent param: != matches (the absent-value semantics)"
+        );
+        assert_eq!(
+            store
+                .search_runs(&query(vec![RunQueryClause::ParamEq(
+                    "lr".to_string(),
+                    "9.9".to_string()
+                )]))
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        // LIKE on runs, including the literal-%-in-value shape that broke
+        // the first matcher revision (review MAJOR 1).
+        store
+            .set_tag("run-0002", "progress", "50%_off")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .search_runs(&query(vec![RunQueryClause::TagLike(
+                    "progress".to_string(),
+                    "%50%_".to_string()
+                )]))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a literal % in the value must still satisfy a trailing _ wildcard"
+        );
+        assert_eq!(
+            store
+                .search_runs(&query(vec![RunQueryClause::TagLike(
+                    "progress".to_string(),
+                    "%nomatch%".to_string()
+                )]))
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
         // run-0001's latest rmse is 0.05 (the post-reopen append), run-0002's
-        // is 0.5 — the comparison rides the LATEST-value projection.
+        // is 0.5 — the comparison rides the LATEST-value projection. An
+        // ABSENT metric never matches a comparison.
         assert_eq!(
             store
                 .search_runs(&query(vec![RunQueryClause::MetricCmp(
@@ -2351,6 +2412,19 @@ pub mod conformance_tests {
                 .unwrap()
                 .len(),
             1
+        );
+        assert_eq!(
+            store
+                .search_runs(&query(vec![RunQueryClause::MetricCmp(
+                    "nonexistent".to_string(),
+                    0.0,
+                    |a, b| a > b
+                )]))
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "an absent metric never satisfies a comparison"
         );
 
         // Run creation in a deleted experiment is rejected.
@@ -2910,6 +2984,55 @@ mod tests {
     async fn in_memory_reference_passes_port_conformance() {
         let store = InMemoryRunStore::new();
         port_conformance(&store).await;
+    }
+
+    /// The port's LIKE matcher, table-driven against SQL-LIKE ground
+    /// truth — seeded from the exhaustive differential in the #1895
+    /// review (literal-% values were the first revision's blind spot).
+    #[test]
+    fn like_match_matches_sql_semantics() {
+        use super::like_match;
+        // (value, pattern, expected)
+        let cases = [
+            ("", "", true),
+            ("", "%", true),
+            ("", "_", false),
+            ("abc", "abc", true),
+            ("abc", "ABC", false),
+            ("abc", "a%", true),
+            ("abc", "%c", true),
+            ("abc", "%b%", true),
+            ("abc", "a_c", true),
+            ("abc", "a__", true),
+            ("abc", "____", false),
+            // Literal % in the VALUE: the wildcard must still backtrack.
+            ("a%", "%a%_", true),
+            ("a%", "%_", true),
+            ("%", "%", true),
+            ("50%_off", "%50%_", true),
+            ("82%", "%82_%", true),
+            ("100%", "1__%", true),
+            // % matches ANY run incl. empty; _ exactly one char.
+            ("ab", "a%b", true),
+            ("ab", "a_b", false),
+            ("axxb", "a%b", true),
+            ("axxb", "a_b", false),
+            // Newlines: % spans them (regex `.` would not — the retired
+            // twin's behavior is gone deliberately; SQL truth wins).
+            ("a\nx", "%x%", true),
+            ("a\nb", "a.b", false),
+            // Unicode operates on CHARS.
+            ("héllo", "hé_o", false),
+            ("héllo", "hé__o", true),
+            ("héllo", "h_llo", true),
+        ];
+        for (value, pattern, expected) in cases {
+            assert_eq!(
+                like_match(value, pattern),
+                expected,
+                "like_match({value:?}, {pattern:?}) should be {expected}"
+            );
+        }
     }
 
     #[tokio::test]
