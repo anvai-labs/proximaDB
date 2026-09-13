@@ -952,7 +952,7 @@ async fn runs_search(
             )));
         }
     };
-    let filter = match &req.filter {
+    let mut filter = match &req.filter {
         None => None,
         Some(f) => Some(filter::parse_run_filter(f)?),
     };
@@ -974,26 +974,30 @@ async fn runs_search(
             }
         }
     }
+    // Query pushdown (TD-MLOPS-4 S3): ONE port call — the per-experiment
+    // loop AND the predicate evaluation live below the adapter now.
     let store = store_for(&tenant, &state)?;
-    let mut runs: Vec<RunOut> = Vec::new();
-    for exp in &req.experiment_ids {
-        let id = parse_id(exp, "experiment")?;
-        for record in store
-            .list_runs(id, lifecycle != Some(RunLifecycle::Active))
-            .await?
-        {
-            if lifecycle.is_some_and(|stage| record.lifecycle != stage) {
-                continue;
-            }
-            if filter
-                .as_ref()
-                .is_some_and(|clauses| !clauses.iter().all(|clause| clause.matches(&record)))
-            {
-                continue;
-            }
-            runs.push(run_out(&record));
-        }
-    }
+    let query = proximadb_catalog::run_store::RunQuery {
+        experiment_ids: req
+            .experiment_ids
+            .iter()
+            .map(|exp| parse_id(exp, "experiment"))
+            .collect::<MlflowResult<Vec<u64>>>()?,
+        include_deleted: lifecycle != Some(RunLifecycle::Active),
+        clauses: filter
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(proximadb_catalog::run_store::RunQueryClause::from)
+            .collect(),
+    };
+    let mut runs: Vec<RunOut> = store
+        .search_runs(&query)
+        .await?
+        .iter()
+        .filter(|record| lifecycle.is_none_or(|stage| record.lifecycle == stage))
+        .map(run_out)
+        .collect();
     runs.sort_by(|left, right| {
         let time_order = if descending {
             right.info.start_time.cmp(&left.info.start_time)
@@ -1367,6 +1371,88 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error_code"], "RESOURCE_ALREADY_EXISTS");
+    }
+
+    #[tokio::test]
+    async fn runs_search_lifecycle_views() {
+        let mut router = test_router("default").await;
+        let (_, body) = post_json(
+            &mut router,
+            "/experiments/create",
+            serde_json::json!({"name": "lifecycle-views"}),
+        )
+        .await;
+        let experiment_id = body["experiment_id"].as_str().unwrap().to_string();
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/create",
+            serde_json::json!({"experiment_id": experiment_id, "run_name": "keep"}),
+        )
+        .await;
+        let kept = body["run"]["info"]["run_id"].as_str().unwrap().to_string();
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/create",
+            serde_json::json!({"experiment_id": experiment_id, "run_name": "drop"}),
+        )
+        .await;
+        let dropped = body["run"]["info"]["run_id"].as_str().unwrap().to_string();
+        post_json(
+            &mut router,
+            "/runs/delete",
+            serde_json::json!({"run_id": dropped}),
+        )
+        .await;
+
+        let ids = serde_json::json!([experiment_id]);
+        // Default (ACTIVE_ONLY): only the live run.
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": ids}),
+        )
+        .await;
+        let names: Vec<&str> = body["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["info"]["run_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["keep"], "ACTIVE_ONLY hides deleted runs");
+
+        // DELETED_ONLY: only the deleted run.
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": ids, "run_view_type": "DELETED_ONLY"}),
+        )
+        .await;
+        let names: Vec<&str> = body["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["info"]["run_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["drop"], "DELETED_ONLY shows only deleted runs");
+
+        // ALL: both.
+        let (_, body) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": ids, "run_view_type": "ALL"}),
+        )
+        .await;
+        assert_eq!(body["runs"].as_array().unwrap().len(), 2);
+
+        // An invalid view fails closed.
+        let (status, _) = post_json(
+            &mut router,
+            "/runs/search",
+            serde_json::json!({"experiment_ids": ids, "run_view_type": "BOGUS"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let _ = (kept, dropped);
     }
 
     #[tokio::test]
