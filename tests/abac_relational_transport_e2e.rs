@@ -45,6 +45,7 @@ use proximadb::proto::proximadb_v2::{
     GetRecordRequest, TypedSearchRequest, V2QueryRequest, V2QueryResponse,
 };
 use proximadb::security::SecurityMode;
+use proximadb::security::auth_service::ScramUserConfig;
 use proximadb::security::auth_service::{
     ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, MtlsConfig, SSOConfig,
 };
@@ -100,7 +101,24 @@ fn transport_security_config() -> SecurityConfig {
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys,
-            scram_users: HashMap::new(),
+            // `authentication.enabled=true` FORCES pgwire to password mode
+            // (the pgwire knob can raise, never lower) — the pgwire setup
+            // connections therefore authenticate with SCRAM too, bound to
+            // the tenant the clients assert via `dbname={TENANT}`.
+            scram_users: ["setup-operator", "alice", "bob"]
+                .into_iter()
+                .map(|user| {
+                    (
+                        user.to_string(),
+                        ScramUserConfig {
+                            password: Some("policy-e2e".to_string()),
+                            verifier: None,
+                            tenant_id: Some(TENANT.to_string()),
+                            roles: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test-secret".to_string(),
@@ -137,7 +155,7 @@ fn transport_security_config() -> SecurityConfig {
         encryption: EncryptionConfig::default(),
         key_store: KeyStoreConfig::default(),
         tenant: Default::default(),
-        pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
+        pgwire: proximadb::security::security_coordinator::PgwireSecurityConfig::default(),
     }
 }
 
@@ -206,7 +224,7 @@ impl LiveServer {
 
     fn pg_conn_str(&self, subject: &str) -> String {
         format!(
-            "host=127.0.0.1 port={} user={subject} dbname={TENANT} sslmode=disable",
+            "host=127.0.0.1 port={} user={subject} password=policy-e2e dbname={TENANT} sslmode=disable",
             self.pg_port
         )
     }
