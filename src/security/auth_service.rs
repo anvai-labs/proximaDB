@@ -364,6 +364,19 @@ impl UnifiedAuthService {
                 },
             );
         }
+        // The verifier is derived (into `scram_verifiers` above) and the
+        // identity metadata is copied out (into `scram_identities`, password/
+        // verifier stripped) — nothing else reads `self.config.scram_users`
+        // (the runtime auth path resolves through the two maps above), so
+        // scrub the plaintext/verifier material out of the retained config
+        // clone too. This is belt-and-suspenders: `ScramUserConfig`'s `Debug`
+        // is already redacted, but the config is `Serialize`, and a future
+        // config-dump/diagnostics path over `self.config` must not be able
+        // to re-emit the plaintext password.
+        for user in service.config.scram_users.values_mut() {
+            user.password = None;
+            user.verifier = None;
+        }
 
         // Initialize JWT service if enabled
         if config.jwt.enabled {

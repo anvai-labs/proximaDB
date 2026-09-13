@@ -55,6 +55,14 @@ fn sql_object_to_json(obj: &crate::proto::proximadb_v1::SqlObject) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Startup packet length ceiling (real postgres caps this at 10000 bytes;
+/// this is generous headroom for connection params, not a real limit).
+const MAX_STARTUP_MESSAGE_LEN: i32 = 65536;
+/// General pgwire message/CopyData length ceiling — bounds a garbage-but-
+/// positive length prefix from requesting an absurd allocation, while
+/// staying well above any legitimate query/batch/bulk-COPY payload.
+const MAX_PGWIRE_MESSAGE_LEN: i32 = 256 * 1024 * 1024;
+
 /// PostgreSQL protocol handler
 pub struct PostgresProtocol {
     /// TCP stream
@@ -1028,10 +1036,9 @@ impl PostgresProtocol {
             }
 
             // Read message length
-            let length = self.read_i32().await? as usize;
-            if length < 4 {
-                return Err(anyhow!("Invalid message length"));
-            }
+            let length = self
+                .read_validated_length(4, MAX_PGWIRE_MESSAGE_LEN, "message")
+                .await?;
 
             // Read message body
             let body_len = length - 4;
@@ -1071,10 +1078,9 @@ impl PostgresProtocol {
     /// Handle startup handshake
     async fn handle_startup(&mut self) -> Result<()> {
         // Read startup message length
-        let length = self.read_i32().await? as usize;
-        if length < 8 {
-            return Err(anyhow!("Invalid startup message length"));
-        }
+        let length = self
+            .read_validated_length(8, MAX_STARTUP_MESSAGE_LEN, "startup message")
+            .await?;
 
         // Read protocol version
         let version = self.read_i32().await?;
@@ -1549,9 +1555,23 @@ impl PostgresProtocol {
     /// and `Vec::with_capacity` on that aborts the `panic = "abort"` release
     /// build). SCRAM frames are always small; 64KiB is generous headroom.
     async fn read_sasl_message_length(&mut self, what: &str) -> Result<usize> {
-        const MAX_SASL_MESSAGE_LEN: i32 = 65536;
+        self.read_validated_length(4, 65536, what).await
+    }
+
+    /// Read and validate an i32 length prefix before it becomes a `usize`
+    /// allocation size. A raw negative value (e.g. a hostile `-1`) sign-
+    /// extends to `usize::MAX` on an unchecked `as usize` cast, which then
+    /// passes any naive `length < N` floor check unchanged and drives
+    /// `Vec::with_capacity(usize::MAX - N)` — a capacity-overflow panic that
+    /// aborts the process under the `release-server` profile's
+    /// `panic = "abort"` (an unauthenticated remote DoS if the reader runs
+    /// pre-auth, as pgwire's startup and main-loop readers do). `min` is the
+    /// frame's own header size (the length field counts itself); `max`
+    /// bounds the body so a garbage-but-positive length can't request an
+    /// absurd allocation either.
+    async fn read_validated_length(&mut self, min: i32, max: i32, what: &str) -> Result<usize> {
         let raw = self.read_i32().await?;
-        if !(4..=MAX_SASL_MESSAGE_LEN).contains(&raw) {
+        if !(min..=max).contains(&raw) {
             return Err(anyhow!("invalid {what} length: {raw}"));
         }
         Ok(raw as usize)
@@ -5082,10 +5102,9 @@ impl PostgresProtocol {
             match msg_type {
                 b'd' => {
                     // CopyData message
-                    let length = self.read_i32().await? as usize;
-                    if length < 4 {
-                        continue;
-                    }
+                    let length = self
+                        .read_validated_length(4, MAX_PGWIRE_MESSAGE_LEN, "CopyData")
+                        .await?;
                     let data = self.read_bytes(length - 4).await?;
                     all_data.extend(data);
                 }
@@ -5097,7 +5116,9 @@ impl PostgresProtocol {
                 }
                 b'f' => {
                     // CopyFail message
-                    let length = self.read_i32().await? as usize;
+                    let length = self
+                        .read_validated_length(4, MAX_PGWIRE_MESSAGE_LEN, "CopyFail")
+                        .await?;
                     let msg = self.read_bytes(length - 4).await?;
                     let error_msg = String::from_utf8_lossy(&msg);
                     warn!("COPY failed: {}", error_msg);
