@@ -1502,10 +1502,7 @@ impl PostgresProtocol {
                 msg_type as char
             ));
         }
-        let length = self.read_i32().await? as usize;
-        if length < 4 {
-            return Err(anyhow!("invalid SASLInitialResponse length"));
-        }
+        let length = self.read_sasl_message_length("SASLInitialResponse").await?;
         let body = self.read_bytes(length - 4).await?;
         let nul = body
             .iter()
@@ -1542,11 +1539,22 @@ impl PostgresProtocol {
                 msg_type as char
             ));
         }
-        let length = self.read_i32().await? as usize;
-        if length < 4 {
-            return Err(anyhow!("invalid SASLResponse length"));
-        }
+        let length = self.read_sasl_message_length("SASLResponse").await?;
         self.read_bytes(length - 4).await
+    }
+
+    /// Read and validate a SASL frame's i32 length prefix (pre-authentication,
+    /// so it must reject a bogus/hostile value before it ever reaches a `usize`
+    /// cast or an allocation — a negative length sign-extends to a huge `usize`,
+    /// and `Vec::with_capacity` on that aborts the `panic = "abort"` release
+    /// build). SCRAM frames are always small; 64KiB is generous headroom.
+    async fn read_sasl_message_length(&mut self, what: &str) -> Result<usize> {
+        const MAX_SASL_MESSAGE_LEN: i32 = 65536;
+        let raw = self.read_i32().await?;
+        if !(4..=MAX_SASL_MESSAGE_LEN).contains(&raw) {
+            return Err(anyhow!("invalid {what} length: {raw}"));
+        }
+        Ok(raw as usize)
     }
 
     /// Parse startup parameters

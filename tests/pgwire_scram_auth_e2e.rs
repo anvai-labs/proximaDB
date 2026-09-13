@@ -284,3 +284,92 @@ async fn pgwire_scram_auth_matrix_impl() {
     // covered by the pure `PgwireAuthMode::resolve` unit tests in
     // protocol_tests.rs; mutating process env here would race other tests.
 }
+
+/// A hostile pre-authentication SASL frame length must be rejected, not
+/// crash the connection handler. Before the fix, a signed `-1` outer length
+/// sign-extended to `usize::MAX` on the `as usize` cast, passed the `< 4`
+/// floor check unchanged, and drove `Vec::with_capacity(usize::MAX - 4)` —
+/// a capacity-overflow panic that aborts the whole process under the
+/// `release-server` profile's `panic = "abort"` (an unauthenticated,
+/// pre-auth remote DoS). This drives the raw wire protocol directly
+/// (tokio_postgres has no way to emit a malformed frame) and asserts the
+/// server both rejects the frame AND keeps accepting other connections
+/// afterward — the second connection is the proof the handler didn't take
+/// the whole listener down with it.
+#[test]
+fn malformed_sasl_length_is_rejected_not_fatal() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("multi-thread test runtime")
+        .block_on(malformed_sasl_length_is_rejected_not_fatal_impl());
+}
+
+async fn malformed_sasl_length_is_rejected_not_fatal_impl() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let server = ScramTestServer::start(Some("password"), Some(scram_users()))
+        .await
+        .expect("scram server start");
+
+    let mut sock = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", server.pg_port)),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("raw connect");
+
+    // Minimal startup packet: length, protocol version 3.0, user=postgres,
+    // database=proximadb, terminating NUL.
+    let mut params = Vec::new();
+    params.extend_from_slice(b"user\0postgres\0database\0proximadb\0\0");
+    let mut startup = Vec::new();
+    startup.extend_from_slice(&(8 + params.len() as i32).to_be_bytes());
+    startup.extend_from_slice(&196608i32.to_be_bytes());
+    startup.extend_from_slice(&params);
+    sock.write_all(&startup).await.expect("write startup");
+
+    // Read the AuthenticationSASL response ('R', subtype 10) in full before
+    // sending our frame — the server is only listening for a SASLInitialResponse
+    // once it has finished writing that message.
+    let mut header = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut header))
+        .await
+        .expect("read auth message header timeout")
+        .expect("read auth message header");
+    assert_eq!(header[0], b'R', "expected AuthenticationSASL ('R')");
+    let body_len = i32::from_be_bytes(header[1..5].try_into().unwrap()) as usize - 4;
+    let mut body = vec![0u8; body_len];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut body))
+        .await
+        .expect("read auth message body timeout")
+        .expect("read auth message body");
+
+    // The hostile frame: type 'p', outer length -1 (0xFFFFFFFF as bytes).
+    let mut evil = Vec::new();
+    evil.push(b'p');
+    evil.extend_from_slice(&(-1i32).to_be_bytes());
+    sock.write_all(&evil).await.expect("write malformed frame");
+
+    // The server must close/error this connection, not hang.
+    let mut buf = [0u8; 64];
+    let outcome = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await;
+    match outcome {
+        Ok(Ok(0)) => {}  // connection closed — acceptable
+        Ok(Ok(_)) => {}  // an ErrorResponse before close — also acceptable
+        Ok(Err(_)) => {} // reset/refused — also acceptable
+        Err(_) => panic!("server hung on a malformed SASL frame instead of rejecting it"),
+    }
+    drop(sock);
+
+    // The decisive assertion: the server process is still alive and the
+    // listener still accepts NEW, well-formed connections. `scram_users()`
+    // provisions "postgres" with password "s3cret".
+    connect(&server.conn_str("postgres", Some("s3cret")))
+        .await
+        .expect("server must survive a malformed pre-auth SASL frame from another client");
+}

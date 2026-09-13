@@ -60,7 +60,11 @@ pub struct AuthenticationConfig {
 /// One pgwire SCRAM identity (TD-PGWIRE-AUTH-1). Exactly one of `password` /
 /// `verifier` is required; a configured plaintext is derived into a verifier at
 /// coordinator build time and then dropped.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (below) to redact `password`/`verifier` — the
+/// containing `Config` is startup-logged with `{:?}` (`ProximaDB::new`), and a
+/// derived `Debug` would print the plaintext password verbatim into that log.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ScramUserConfig {
     /// Plaintext password — converted to a [`ScramVerifierConfig`] at build,
     /// never retained in memory or re-serialized.
@@ -81,14 +85,38 @@ pub struct ScramUserConfig {
     pub roles: Vec<String>,
 }
 
+impl std::fmt::Debug for ScramUserConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScramUserConfig")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("verifier", &self.verifier.as_ref().map(|_| "<redacted>"))
+            .field("tenant_id", &self.tenant_id)
+            .field("roles", &self.roles)
+            .finish()
+    }
+}
+
 /// Precomputed SCRAM verifier material (base64-encoded parts, TD-PGWIRE-AUTH-1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` is hand-written (below) to redact the key material for the same
+/// reason as [`ScramUserConfig`] — it rides the same startup-logged `Config`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ScramVerifierConfig {
     pub salt: String,
     pub stored_key: String,
     pub server_key: String,
     #[serde(default = "default_scram_iterations")]
     pub iterations: u32,
+}
+
+impl std::fmt::Debug for ScramVerifierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScramVerifierConfig")
+            .field("salt", &"<redacted>")
+            .field("stored_key", &"<redacted>")
+            .field("server_key", &"<redacted>")
+            .field("iterations", &self.iterations)
+            .finish()
+    }
 }
 
 fn default_scram_iterations() -> u32 {
@@ -324,9 +352,17 @@ impl UnifiedAuthService {
                 }
             };
             service.scram_verifiers.insert(username.clone(), verifier);
-            service
-                .scram_identities
-                .insert(username.clone(), user.clone());
+            // `scram_identities` backs post-proof identity resolution
+            // (`convert_scram_user_to_unified`, which reads only `tenant_id`/
+            // `roles`) — never retain the credential material past derivation.
+            service.scram_identities.insert(
+                username.clone(),
+                ScramUserConfig {
+                    password: None,
+                    verifier: None,
+                    ..user.clone()
+                },
+            );
         }
 
         // Initialize JWT service if enabled
