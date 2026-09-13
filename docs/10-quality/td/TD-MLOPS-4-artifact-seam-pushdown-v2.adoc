@@ -1,5 +1,5 @@
 = TD-MLOPS-4: ArtifactRepository seam + query pushdown, v2 (re-land design)
-:status: Partial
+:status: Resolved
 :dim: D2
 :pillar: OE
 
