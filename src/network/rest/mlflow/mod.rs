@@ -43,10 +43,22 @@ impl MlflowState {
         registry: Arc<proximadb_catalog::model_registry_service::CatalogModelRegistryService>,
         data_dir: std::path::PathBuf,
     ) -> Self {
+        // TD-MLOPS-4 S1: a tracked object-store URL selects the S3
+        // backend; unset keeps the hardened local store (the default).
         let artifacts: std::sync::Arc<dyn proximadb_catalog::run_store::ArtifactBackendFactory> =
-            std::sync::Arc::new(artifacts::HardenedLocalBackendFactory::new(
-                data_dir.clone(),
-            ));
+            match std::env::var("PROXIMADB_MLFLOW_ARTIFACTS_URL") {
+                Ok(url) if !url.trim().is_empty() => {
+                    tracing::info!(
+                        "MLflow artifacts: tracked object store at {url} (TD-MLOPS-4 S1)"
+                    );
+                    std::sync::Arc::new(
+                        crate::services::mlflow_artifact_s3::S3ArtifactBackendFactory::new(url),
+                    )
+                }
+                _ => std::sync::Arc::new(artifacts::HardenedLocalBackendFactory::new(
+                    data_dir.clone(),
+                )),
+            };
         Self {
             run_store,
             registry,

@@ -1872,11 +1872,14 @@ pub mod conformance_tests {
             &self,
             path: &super::ArtifactPath,
         ) -> Result<(), super::ArtifactBackendError> {
+            // TREE semantics: the exact key AND every key beneath it
+            // (consumers rely on recursive removal).
             let key = path.segments().join("/");
+            let prefix = format!("{key}/");
             self.files
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .remove(&key);
+                .retain(|k, _| k != &key && !k.starts_with(&prefix));
             Ok(())
         }
     }
@@ -1950,6 +1953,17 @@ pub mod conformance_tests {
         assert!(
             entries.iter().any(|e| e.name == "exp"),
             "root listing yields top-level entries: {entries:?}"
+        );
+
+        // TREE delete (the #1896 review's MAJOR-4): consumers rely on
+        // recursive removal — deleting a parent must remove the subtree
+        // (a single-key delete would report success and strand bytes).
+        let subtree = super::ArtifactPath::parse("exp/1/run/artifacts").unwrap();
+        alice.delete(&subtree).await.unwrap();
+        assert_eq!(alice.get(&nested).await.unwrap(), None, "subtree file gone");
+        assert!(
+            alice.list(&subtree).await.unwrap().is_empty(),
+            "tree delete empties the subtree (ancestors may remain empty)"
         );
 
         // Capability declaration is mandatory and honest (rule 3): the

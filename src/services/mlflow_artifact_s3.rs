@@ -32,11 +32,18 @@ mod imp {
     /// Factory from a tracked-store URL (`s3://bucket[/prefix]`).
     pub struct S3ArtifactBackendFactory {
         url: String,
+        /// One client for the process (connection pool + credential chain
+        /// are per-URL, not per-request — review MINOR-2). A malformed URL
+        /// fails the FIRST backend_for loudly instead of every request.
+        store: std::sync::OnceLock<Result<ProximaObjectStore, ArtifactBackendError>>,
     }
 
     impl S3ArtifactBackendFactory {
         pub fn new(url: impl Into<String>) -> Self {
-            Self { url: url.into() }
+            Self {
+                url: url.into(),
+                store: std::sync::OnceLock::new(),
+            }
         }
 
         /// The injective per-tenant prefix (same encoding as the local
@@ -62,7 +69,10 @@ mod imp {
             tenant_id: &str,
         ) -> Result<std::sync::Arc<dyn ArtifactBackend>, ArtifactBackendError> {
             let prefix = Self::tenant_prefix(tenant_id)?;
-            let store = ProximaObjectStore::from_url(&self.url).map_err(err)?;
+            let store = self
+                .store
+                .get_or_init(|| ProximaObjectStore::from_url(&self.url).map_err(err))
+                .clone()?;
             let base = object_store::path::Path::parse(prefix)
                 .map_err(|e| ArtifactBackendError::Internal(format!("tenant prefix: {e}")))?;
             Ok(std::sync::Arc::new(S3ArtifactBackend { store, base }))
@@ -97,31 +107,42 @@ mod imp {
             // caller-relative one (the misaligned slice returned garbage
             // children like the tenant-length segment).
             let prefix_len = self.store.full_path(prefix).as_ref().len();
-            let mut out: std::collections::BTreeMap<String, bool> =
+            let mut out: std::collections::BTreeMap<String, (bool, u64)> =
                 std::collections::BTreeMap::new();
             for meta in metas {
-                let rest = &meta.location.as_ref()[prefix_len..];
-                let rest = rest.trim_start_matches('/');
+                let raw = &meta.location.as_ref()[prefix_len..];
+                // S3 list is a BYTE prefix: a sibling like `…/1` also
+                // matches keys under `…/10/…` — require the `/` boundary
+                // (review MINOR-1; phantom children otherwise).
+                if !raw.is_empty() && !raw.starts_with('/') {
+                    continue;
+                }
+                let rest = raw.trim_start_matches('/');
                 if rest.is_empty() {
                     continue;
                 }
                 match rest.split_once('/') {
                     Some((child, _deeper)) => {
-                        out.insert(child.to_string(), true);
+                        out.entry(child.to_string())
+                            .and_modify(|(dir, _)| *dir = true)
+                            .or_insert((true, 0));
                     }
                     None => {
-                        // A file at this level; is_dir only if also seen
-                        // as a parent elsewhere.
-                        out.entry(rest.to_string()).or_insert(false);
+                        // A file at this level carries its real size
+                        // (review MINOR-3); a name also seen as a parent
+                        // elsewhere stays a directory.
+                        out.entry(rest.to_string())
+                            .and_modify(|(_, size)| *size = meta.size)
+                            .or_insert((false, meta.size));
                     }
                 }
             }
             Ok(out
                 .into_iter()
-                .map(|(name, is_dir)| ArtifactBackendEntry {
+                .map(|(name, (is_dir, size_bytes))| ArtifactBackendEntry {
                     name,
                     is_dir,
-                    size_bytes: 0,
+                    size_bytes,
                 })
                 .collect())
         }
@@ -173,9 +194,37 @@ mod imp {
         }
 
         async fn delete(&self, path: &ArtifactPath) -> Result<(), ArtifactBackendError> {
-            // S3 DELETE of an absent key is a success — idempotence for
-            // free (the port contract).
-            self.store.delete(&self.full(path)).await.map_err(err)
+            // TREE delete (review MAJOR-4): consumers (trace cleanup,
+            // the bare-root DELETE) rely on recursive removal; a single-
+            // key delete would leave the whole subtree behind while
+            // reporting success. List every key under the prefix and
+            // delete each; an absent prefix deletes nothing (idempotence
+            // preserved). The `/` boundary guard skips byte-prefix
+            // siblings (the `1` vs `10` shape).
+            let full = self.full(path);
+            let metas = self.store.list(Some(&full)).await.map_err(err)?;
+            let prefix_len = self.store.full_path(&full).as_ref().len();
+            for meta in metas {
+                let raw = &meta.location.as_ref()[prefix_len..];
+                if !raw.is_empty() && !raw.starts_with('/') {
+                    continue;
+                }
+                // meta.location is the ABSOLUTE key; the store joins its
+                // base prefix onto caller-relative paths — strip the base
+                // or the delete targets a double-prefixed (nonexistent)
+                // key and silently no-ops.
+                let base = self.store.base().as_ref();
+                let absolute = meta.location.as_ref();
+                let relative = absolute
+                    .strip_prefix(base)
+                    .map(|r| r.trim_start_matches('/'))
+                    .unwrap_or(absolute);
+                let key = object_store::path::Path::parse(relative)
+                    .map_err(|e| ArtifactBackendError::Internal(format!("delete key: {e}")))?;
+                self.store.delete(&key).await.map_err(err)?;
+            }
+            // The path itself may ALSO be a plain object.
+            self.store.delete(&full).await.map_err(err)
         }
     }
 }
