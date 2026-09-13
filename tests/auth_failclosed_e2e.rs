@@ -26,7 +26,7 @@ use proximadb::security::auth_service::{
 };
 use proximadb::security::rbac_service::RBACConfig;
 use proximadb::security::security_coordinator::{
-    ComplianceConfig, SecurityConfig, SecurityMode, TlsConfig,
+    ComplianceConfig, PgwireSecurityConfig, SecurityConfig, SecurityMode, TlsConfig,
 };
 use proximadb_security::AuditConfig;
 use tempfile::TempDir;
@@ -133,6 +133,7 @@ impl AuthTestServer {
                 },
                 audit_fail_closed: false,
                 oidc: None,
+                scram_users: std::collections::HashMap::new(),
             };
             config.security = Some(SecurityConfig {
                 enabled: true,
@@ -156,6 +157,7 @@ impl AuthTestServer {
                 encryption: Default::default(),
                 key_store: Default::default(),
                 tenant: Default::default(),
+                pgwire: PgwireSecurityConfig { auth: None },
             });
         }
 
