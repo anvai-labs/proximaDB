@@ -173,6 +173,12 @@ impl ObjectTierUploader {
         // archive_fs — supports cross-scheme deployments (queue on
         // local PVC, archive on ADLS/S3).
         let bytes = self.disk_fs.read(disk_path).await?;
+        // Recovery can leave an empty local bootstrap with an ID that exists
+        // in the archive. It contains no messages and must never replace that
+        // durable archive (or mark itself as a copy of the archived contents).
+        if bytes.is_empty() {
+            return Ok(());
+        }
         // Use a per-call temp path then rename so a concurrent
         // re-upload (shouldn't happen, but defensive) doesn't expose
         // a torn write. On object stores the rename is a copy+delete
@@ -231,5 +237,31 @@ pub(crate) fn resolve_archive_root(archive: &str) -> crate::Result<PathBuf> {
         Ok(PathBuf::new())
     } else {
         Ok(PathBuf::from(archive))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_bootstrap_cannot_overwrite_existing_archive() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let fs = crate::fs::LocalFs::new_arc();
+        let uploader = ObjectTierUploader::new(
+            fs.clone(),
+            fs.clone(),
+            root.path().into(),
+            archive.path().into(),
+        );
+        let source = root.path().join("t/0/0000000000.qseg");
+        fs.create_dir_all(source.parent().unwrap()).await.unwrap();
+        fs.append(&source, &[]).await.unwrap();
+        let target = uploader.archive_segment_path("t", 0, 0);
+        fs.create_dir_all(target.parent().unwrap()).await.unwrap();
+        fs.append(&target, b"archived data").await.unwrap();
+        uploader.upload_segment("t", 0, 0, &source).await.unwrap();
+        assert_eq!(fs.read(&target).await.unwrap(), b"archived data");
     }
 }

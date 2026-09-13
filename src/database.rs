@@ -45,10 +45,32 @@ pub struct ProximaDB {
     /// `queue_client` is present. `shutdown()` signals the drainer
     /// and awaits the join handle so in-flight work completes
     /// before the queue subsystem closes.
-    drainer: Option<(
-        tokio::task::JoinHandle<()>,
-        tokio::sync::oneshot::Sender<()>,
-    )>,
+    drainer: Option<DrainerTask>,
+}
+
+type DrainerTask = (
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    Option<tokio::sync::oneshot::Sender<()>>,
+);
+
+/// Timeout is incomplete shutdown, not permission to detach an effect. Retain
+/// the task and consumed-signal state so callers can retry while storage remains
+/// available to the unfinished operation. The inner result is task completion.
+async fn stop_drainer(
+    task: &mut Option<DrainerTask>,
+    grace: std::time::Duration,
+) -> Result<anyhow::Result<()>, tokio::time::error::Elapsed> {
+    let Some((handle, sender)) = task.as_mut() else {
+        return Ok(Ok(()));
+    };
+    if let Some(sender) = sender.take() {
+        let _ = sender.send(());
+    }
+    let outcome = tokio::time::timeout(grace, handle).await?;
+    task.take();
+    Ok(outcome
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result))
 }
 
 async fn initialize_configured_security(
@@ -785,7 +807,7 @@ impl ProximaDB {
             rl_checkpoint_handle: None,
             rl_policy_path: None,
             queue_client,
-            drainer,
+            drainer: drainer.map(|(handle, sender)| (handle, Some(sender))),
         })
     }
 
@@ -1053,6 +1075,7 @@ impl ProximaDB {
     /// Shutdown the database instance gracefully.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         info!("Graceful shutdown requested");
+        let mut drainer_error = None;
 
         // TD-LIFECYCLE-1: signal every registered background loop FIRST so
         // cooperative exits overlap the rest of the shutdown sequence (no
@@ -1076,10 +1099,17 @@ impl ProximaDB {
         //     The queue subsystem itself is stopped after — its
         //     background tasks (uploader, reaper) need a few ticks to
         //     finish in-flight work.
-        if let Some((handle, tx)) = self.drainer.take() {
-            tracing::info!("Stopping embedding drainer...");
-            let _ = tx.send(());
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
+        match stop_drainer(&mut self.drainer, std::time::Duration::from_secs(5)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "embedding drainer terminated with failure");
+                drainer_error = Some(error);
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "embedding drainer still in flight; shutdown incomplete, task retained; retry shutdown before stopping storage"
+                ));
+            }
         }
         if let Some(client) = self.queue_client.take() {
             tracing::info!("Stopping queue subsystem...");
@@ -1202,11 +1232,18 @@ impl ProximaDB {
         }
 
         tracing::info!("Server shutdown complete");
-        Ok(())
+        drainer_error.map_or(Ok(()), Err)
     }
 
     /// Check if the database instance is healthy.
     pub async fn is_healthy(&self) -> bool {
+        if self
+            .drainer
+            .as_ref()
+            .is_some_and(|(handle, sender)| sender.is_none() || handle.is_finished())
+        {
+            return false;
+        }
         if let Some(ref multi_server) = self.multi_server {
             multi_server.status().await.http_running
         } else {
@@ -1627,7 +1664,7 @@ async fn spawn_embedding_drainer_from_resolved(
     rq: &core::config::ResolvedQueueConfig,
     default_storage_root: String,
 ) -> anyhow::Result<(
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
     tokio::sync::oneshot::Sender<()>,
 )> {
     let bulk_loader = Arc::new(crate::services::bulk_load::BulkLoader::new(
@@ -1736,7 +1773,7 @@ async fn spawn_embedding_drainer(
     record_ops: Arc<dyn proximadb_runtime::RecordOpsPort>,
     vector_operations_service: Arc<crate::services::VectorOperationsService>,
 ) -> anyhow::Result<(
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
     tokio::sync::oneshot::Sender<()>,
 )> {
     // Legacy fallback path; the resolved-from-config helper supplies
@@ -1786,7 +1823,32 @@ fn parse_partition_list(s: &str) -> Option<Vec<u32>> {
 
 #[cfg(test)]
 mod async_ingest_wiring_tests {
-    use super::parse_partition_list;
+    use super::{parse_partition_list, stop_drainer};
+
+    #[tokio::test]
+    async fn timed_out_drainer_shutdown_retains_task_for_awaited_retry() {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let waiting = release.clone();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            waiting.notified().await;
+            Ok(())
+        });
+        let mut task = Some((handle, Some(tx)));
+        assert!(
+            stop_drainer(&mut task, std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert!(!task.as_ref().unwrap().0.is_finished());
+        assert!(task.as_ref().unwrap().1.is_none());
+        release.notify_one();
+        stop_drainer(&mut task, std::time::Duration::from_secs(2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(task.is_none());
+    }
 
     #[test]
     fn parse_partition_list_handles_commas_and_ranges() {

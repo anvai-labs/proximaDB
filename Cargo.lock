@@ -8111,6 +8111,7 @@ dependencies = [
  "arrow-array 59.3.0",
  "arrow-schema 59.3.0",
  "async-trait",
+ "bincode",
  "bytes",
  "chrono",
  "futures",
@@ -8123,6 +8124,8 @@ dependencies = [
  "proximadb-storage-common",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -8359,6 +8362,7 @@ dependencies = [
 name = "proximadb-object-store"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "object_store",
@@ -8646,6 +8650,7 @@ dependencies = [
  "dashmap",
  "once_cell",
  "prometheus",
+ "proximadb-runtime-common",
  "pyo3",
  "serde",
  "serde_json",
@@ -8654,6 +8659,7 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash 1.6.3",
+ "uuid",
 ]
 
 [[package]]
