@@ -458,3 +458,109 @@ async fn archive_bootstrap_survives_append_and_second_restart() {
         "a new local append must not hide unacknowledged archived data on the next restart"
     );
 }
+
+#[tokio::test]
+async fn reaped_acknowledged_history_preserves_offsets_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let first = QueueClient::open(cfg.clone()).await.unwrap();
+    first
+        .producer()
+        .send(Message::new("t", "tenant", vec![42]))
+        .await
+        .unwrap();
+    let consumer = first.consumer("g");
+    consumer.subscribe("t", &[0]).await.unwrap();
+    let batch = consumer.poll(1, Duration::ZERO).await.unwrap();
+    consumer
+        .ack(std::slice::from_ref(&batch[0].message_id))
+        .await
+        .unwrap();
+    first.shutdown().await.unwrap();
+
+    let second = QueueClient::open(cfg.clone()).await.unwrap();
+    let old_segment = dir.path().join("t/0/0000000000.qseg");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while old_segment.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual reaper must remove fully acknowledged sealed history");
+    second.shutdown().await.unwrap();
+
+    let third = QueueClient::open(cfg).await.unwrap();
+    third
+        .producer()
+        .send(Message::new("t", "tenant", vec![43]))
+        .await
+        .unwrap();
+    let consumer = third.consumer("g");
+    consumer.subscribe("t", &[0]).await.unwrap();
+    let batch = consumer.poll(1, Duration::ZERO).await.unwrap();
+    third.shutdown().await.unwrap();
+    assert_eq!(
+        batch.len(),
+        1,
+        "new messages must remain above durable consumer progress after reaping"
+    );
+    assert_eq!(batch[0].message.payload, vec![43]);
+}
+
+fn seed_progress(root: &Path, group: &str, offset: u64) {
+    let directory = root.join("t/0").join(group);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("offset.meta"),
+        serde_json::to_vec(&serde_json::json!({
+            "group": group, "committed_offset": offset,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn recovery_offset_floor_uses_highest_group_without_skipping_slow_group_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), &valid_frame(4));
+    seed_progress(dir.path(), "slow", 3);
+    seed_progress(dir.path(), "fast", 9);
+    let client = QueueClient::open(config(dir.path())).await.unwrap();
+    let consumer = client.consumer("slow");
+    consumer.subscribe("t", &[0]).await.unwrap();
+    let id = client
+        .producer()
+        .send(Message::new("t", "tenant", vec![43]))
+        .await
+        .unwrap();
+    let mut batch = consumer.poll(2, Duration::ZERO).await.unwrap();
+    // The fixture intentionally leaves an offset gap. A memory read stops at
+    // that boundary; the next poll resumes at the next retained frame.
+    batch.extend(consumer.poll(2, Duration::ZERO).await.unwrap());
+    client.shutdown().await.unwrap();
+    assert!(
+        id.message_id.0.ends_with(":10"),
+        "producer floor must use maximum group progress: {}",
+        id.message_id
+    );
+    assert_eq!(
+        batch
+            .iter()
+            .map(|d| d.message.payload.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![42], vec![43]]
+    );
+}
+
+#[tokio::test]
+async fn recovery_rejects_exhausted_durable_progress_without_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_progress(dir.path(), "g", u64::MAX);
+    assert_open_fails(
+        config(dir.path()),
+        LocalFs::new_arc(),
+        "exhausted durable offset floor",
+    )
+    .await;
+}

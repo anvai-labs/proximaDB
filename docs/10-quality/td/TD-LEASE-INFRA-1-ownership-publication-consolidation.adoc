@@ -407,6 +407,28 @@ These results apply to the uncommitted isolated checkpoint based on `3067592f54c
 A develop-targeted PR still requires a fresh rebase/integration audit, exact-head review and CI;
 local verification is not merge authorization or evidence for a later rebased revision.
 
+=== Develop checkpoint review follow-up
+
+Committed and rebased cleanly onto develop `55de7ffa4`; the two incoming MLOps commits
+had no direct file overlap. Fresh zero-context review of `f6536f12a` found a new
+restart/reaper interaction: recovery seals the last populated segment, the reaper deletes it
+after all groups ACK, and a second restart could reset producer allocation to zero while
+consumers retained higher progress. The actual reaper/repeated-restart regression failed
+with no newly accepted message visible (`97d51f0b-e989-45bb-a514-7215d528fb5e`).
+Two additional negatives reproduced ignoring maximum group progress and accepting an
+exhausted durable offset (`97d2ec91-a54c-4bde-b286-53ef374c82f6`).
+
+Recovery now takes the checked successor of maximum durable group progress as an allocation
+floor, combining it with observed frame successors. Minimum group progress still controls
+replay skipping. Existing metadata is reused; no new record format or authority is introduced.
+This assumes group metadata remains retained, as the current reaper does; deleting that
+metadata administratively is not a supported way to reset allocation. Independent follow-up
+cleared the production repair; the intentional-gap test uses two polls to respect the existing
+memory read boundary. Post-repair five-crate run passed *346/346*, no skipped tests or retries
+(`a4c8cdfe-7516-49e1-a1fa-158918170950`). Root production `cargo clippy --lib --bins --
+-D warnings` passed. Remaining assembled rebuild/test and CI outcomes are recorded on the
+develop-targeted PR.
+
 This completes only the queue slice of P2. Shared ownership-core extraction, exact generation
 tokens across restore, typed receipts, new-group admission versus retention, sink fencing and
 sibling connector cutover remain open. No performance uplift, provider-native qualification,

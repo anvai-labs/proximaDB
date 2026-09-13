@@ -134,12 +134,6 @@ async fn replay_partition(
             }
         }
     }
-    // BTreeMap iterator is already sorted by segment_id ascending,
-    // which is the order replay needs (lower offsets first).
-    if segments.is_empty() {
-        return Ok(0);
-    }
-
     let mem = state
         .memory
         .get(partition as usize)
@@ -177,8 +171,24 @@ async fn replay_partition(
 
     let mut replayed = 0usize;
     let mut skipped = 0usize;
-    let mut max_next_offset: Option<u64> = None;
+    // Reaping can remove every frame while leaving durable group progress.
+    // Never reuse those offsets: producer allocation uses the MAX acknowledged
+    // offset as a floor, whereas replay skipping above deliberately uses MIN.
+    // Reuse the existing progress authority rather than add another checkpoint.
+    let mut max_next_offset = groups
+        .iter()
+        .filter_map(|(_, offset)| *offset)
+        .max()
+        .map(|offset| {
+            offset.checked_add(1).ok_or_else(|| {
+                QueueError::Persistence(format!(
+                    "recovery: durable progress exhausted offsets for topic={topic} partition={partition}"
+                ))
+            })
+        })
+        .transpose()?;
     let mut max_recovered_segment = None;
+    // BTreeMap orders the replay by ascending segment ID.
     for (segment_id, (local_path, archive_path)) in segments {
         let (path, bytes) = if let Some(path) = local_path {
             let bytes = fs.read(&path).await?;
