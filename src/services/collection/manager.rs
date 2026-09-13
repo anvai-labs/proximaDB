@@ -2833,7 +2833,7 @@ mod tests {
             embedding_config: None,
             dimension: 128,
             distance_metric: Some(1),
-            storage_engine: Some(1),
+            storage_engine: Some(2), // SST — VIPER is no longer selectable for new collections (ADR-093 S2)
             filterable_columns: vec![],
             index_configs: vec![],
             quantization: None,
@@ -2958,7 +2958,7 @@ mod tests {
                 embedding_config: None,
                 dimension: 128,
                 distance_metric: Some(1),
-                storage_engine: Some(1),
+                storage_engine: Some(2), // SST — VIPER is no longer selectable for new collections (ADR-093 S2)
                 filterable_columns: vec![],
                 index_configs: vec![],
                 quantization: None,
@@ -3559,7 +3559,7 @@ mod tests {
             embedding_config: None,
             dimension: 16,
             distance_metric: Some(1),
-            storage_engine: Some(1),
+            storage_engine: Some(2), // SST — VIPER is no longer selectable for new collections (ADR-093 S2)
             filterable_columns: vec![],
             index_configs: vec![],
             quantization: None,
@@ -3628,7 +3628,7 @@ mod tests {
             embedding_config: None,
             dimension: 128,
             distance_metric: None,
-            storage_engine: Some(StorageEngine::Viper as i32),
+            storage_engine: Some(StorageEngine::Sst as i32), // VIPER is no longer selectable for new collections (ADR-093 S2)
             filterable_columns: vec![],
             index_configs: vec![],
             quantization: None,

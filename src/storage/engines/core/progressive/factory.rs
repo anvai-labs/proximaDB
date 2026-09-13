@@ -339,11 +339,14 @@ mod tests {
             ProgressiveEngineType::SST,
             ProgressiveEngineType::HELIX,
             ProgressiveEngineType::VIPER,
-            ProgressiveEngineType::SWIFT,
             ProgressiveEngineType::NOVA,
         ];
-        // RAPTOR's pipeline is `experimental-engines`-gated (it needs AXIS clustering);
-        // only assert its 3-stage default when that feature is on.
+        // SWIFT and RAPTOR's pipelines are `experimental-engines`-gated (SWIFT's
+        // factory arm returns an empty coordinator without the feature; RAPTOR
+        // needs AXIS clustering) — only assert their 3-stage default when the
+        // feature is on.
+        #[cfg(feature = "experimental-engines")]
+        engines.push(ProgressiveEngineType::SWIFT);
         #[cfg(feature = "experimental-engines")]
         engines.push(ProgressiveEngineType::RAPTOR);
 
