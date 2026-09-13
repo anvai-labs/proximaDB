@@ -8,7 +8,7 @@
 
 use super::{MlflowError, MlflowResult};
 use proximadb_catalog::run_store::{
-    ExperimentRecord, ExperimentStage, LoggedModelRecord, RunRecord, TraceRecord, TraceState,
+    ExperimentRecord, ExperimentStage, LoggedModelRecord, TraceRecord, TraceState,
 };
 
 pub(crate) enum ExperimentFilter {
@@ -76,6 +76,21 @@ pub(crate) fn parse_experiment_filter(filter: &str) -> MlflowResult<Vec<Experime
     Ok(predicates)
 }
 
+impl From<FieldFilter> for proximadb_catalog::run_store::RunQueryClause {
+    fn from(clause: FieldFilter) -> Self {
+        use proximadb_catalog::run_store::RunQueryClause;
+        match clause {
+            FieldFilter::ParamEq(k, v) => RunQueryClause::ParamEq(k, v),
+            FieldFilter::ParamNe(k, v) => RunQueryClause::ParamNe(k, v),
+            FieldFilter::ParamLike(k, v) => RunQueryClause::ParamLike(k, v),
+            FieldFilter::TagEq(k, v) => RunQueryClause::TagEq(k, v),
+            FieldFilter::TagNe(k, v) => RunQueryClause::TagNe(k, v),
+            FieldFilter::TagLike(k, v) => RunQueryClause::TagLike(k, v),
+            FieldFilter::MetricCmp(k, v, cmp) => RunQueryClause::MetricCmp(k, v, cmp),
+        }
+    }
+}
+
 pub(crate) enum FieldFilter {
     ParamEq(String, String),
     ParamNe(String, String),
@@ -84,29 +99,6 @@ pub(crate) enum FieldFilter {
     TagNe(String, String),
     TagLike(String, String),
     MetricCmp(String, f64, fn(f64, f64) -> bool),
-}
-
-impl FieldFilter {
-    pub(crate) fn matches(&self, run: &RunRecord) -> bool {
-        match self {
-            FieldFilter::ParamEq(k, v) => run.params.get(k) == Some(v),
-            FieldFilter::ParamNe(k, v) => run.params.get(k) != Some(v),
-            FieldFilter::ParamLike(k, pattern) => run
-                .params
-                .get(k)
-                .is_some_and(|actual| like_match(actual, pattern)),
-            FieldFilter::TagEq(k, v) => run.tags.get(k) == Some(v),
-            FieldFilter::TagNe(k, v) => run.tags.get(k) != Some(v),
-            FieldFilter::TagLike(k, pattern) => match run.tags.get(k) {
-                Some(actual) => like_match(actual, pattern),
-                None => false,
-            },
-            FieldFilter::MetricCmp(k, v, cmp) => run
-                .latest_metrics
-                .get(k)
-                .is_some_and(|point| cmp(point.value, *v)),
-        }
-    }
 }
 
 pub(crate) fn parse_run_filter(filter: &str) -> MlflowResult<Vec<FieldFilter>> {

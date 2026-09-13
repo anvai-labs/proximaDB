@@ -952,7 +952,7 @@ async fn runs_search(
             )));
         }
     };
-    let filter = match &req.filter {
+    let mut filter = match &req.filter {
         None => None,
         Some(f) => Some(filter::parse_run_filter(f)?),
     };
@@ -974,26 +974,30 @@ async fn runs_search(
             }
         }
     }
+    // Query pushdown (TD-MLOPS-4 S3): ONE port call — the per-experiment
+    // loop AND the predicate evaluation live below the adapter now.
     let store = store_for(&tenant, &state)?;
-    let mut runs: Vec<RunOut> = Vec::new();
-    for exp in &req.experiment_ids {
-        let id = parse_id(exp, "experiment")?;
-        for record in store
-            .list_runs(id, lifecycle != Some(RunLifecycle::Active))
-            .await?
-        {
-            if lifecycle.is_some_and(|stage| record.lifecycle != stage) {
-                continue;
-            }
-            if filter
-                .as_ref()
-                .is_some_and(|clauses| !clauses.iter().all(|clause| clause.matches(&record)))
-            {
-                continue;
-            }
-            runs.push(run_out(&record));
-        }
-    }
+    let query = proximadb_catalog::run_store::RunQuery {
+        experiment_ids: req
+            .experiment_ids
+            .iter()
+            .map(|exp| parse_id(exp, "experiment"))
+            .collect::<MlflowResult<Vec<u64>>>()?,
+        include_deleted: lifecycle != Some(RunLifecycle::Active),
+        clauses: filter
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(proximadb_catalog::run_store::RunQueryClause::from)
+            .collect(),
+    };
+    let mut runs: Vec<RunOut> = store
+        .search_runs(&query)
+        .await?
+        .iter()
+        .filter(|record| lifecycle.is_none_or(|stage| record.lifecycle == stage))
+        .map(run_out)
+        .collect();
     runs.sort_by(|left, right| {
         let time_order = if descending {
             right.info.start_time.cmp(&left.info.start_time)
