@@ -8,7 +8,7 @@
 //! journey:
 //!
 //! ```text
-//! authenticated SQL setup + SELECT ---+
+//! pgwire setup + authenticated SELECT ----+
 //!                                      v
 //! authenticated gRPC ExecuteQuery -> relational DML scan
 //! authenticated REST /api/v2/sql ----> shared typed SQL port
@@ -20,7 +20,7 @@
 //! ```
 //!
 //! The test proves deny-before-provision, hot permit without reconnect/restart,
-//! isolation of an unbound subject, and hot revoke over authenticated SQL and
+//! isolation of an unbound subject, and hot revoke over SCRAM-authenticated pgwire and
 //! the credential-authenticated REST, gRPC, and Flight transports. It also
 //! obtains the table's stable object id through canonical read-only replay of
 //! the isolated fixture's catalog WAL. This is test setup, not policy tooling:
@@ -996,7 +996,7 @@ async fn authenticated_sql_counts_follow_live_policy_provision_and_revoke_inner(
 /// `ProximaRecordService.ExecuteQuery`. Keep this as a separate live ratchet
 /// from REST: gRPC obtains the subject
 /// from a verified API key and therefore proves the load-bearing authenticated
-/// carrier. Trust-auth pgwire is not admitted on this authenticated fixture.
+/// carrier, distinct from pgwire's SCRAM-authenticated session identity.
 #[test]
 fn grpc_reads_follow_live_rest_policy_provision_and_revoke() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
