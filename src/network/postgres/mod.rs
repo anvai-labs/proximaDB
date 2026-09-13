@@ -327,6 +327,7 @@ impl PostgresServer {
             "pgwire",
             self.bind_address,
             false,
+            matches!(self.pgwire_auth, protocol::PgwireAuthMode::ScramRequired),
             &self.tenant_deployment_mode,
         )?;
         let listener = TcpListener::bind(self.bind_address).await?;

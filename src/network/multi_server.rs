@@ -112,7 +112,6 @@ pub struct MultiServer {
     /// Shared services accessible for WAL recovery during startup
     pub shared_services: SharedServices,
     security_coordinator: Option<Arc<SecurityCoordinator>>,
-    rest_auth_enabled: bool,
     /// TD-PGWIRE-AUTH-1: the resolved pgwire authentication posture (resolved
     /// once in `database.rs`, threaded to every pgwire server start path).
     pgwire_auth: crate::network::postgres::protocol::PgwireAuthMode,
@@ -144,8 +143,13 @@ impl MultiServer {
             !self.authentication_required || self.security_coordinator.is_some(),
             "authentication is required but no security coordinator is configured"
         );
+        let pgwire_authenticated = matches!(
+            self.pgwire_auth,
+            crate::network::postgres::protocol::PgwireAuthMode::ScramRequired
+        );
         self.config.validate_listener_security(
             self.security_coordinator.is_some(),
+            pgwire_authenticated,
             &self.tenant_deployment_mode,
         )
     }
@@ -309,7 +313,6 @@ impl MultiServer {
             shared_services,
             security_coordinator,
             authentication_required: rest_auth_enabled,
-            rest_auth_enabled,
             pgwire_auth: crate::network::postgres::protocol::PgwireAuthMode::Trust,
             tenant_deployment_mode,
             server_handles: Arc::new(Mutex::new(Vec::new())),
