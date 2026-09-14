@@ -481,6 +481,15 @@ onto the requested parent, preserving its leading `./` for queue identity checks
 Root-qualified versus root-relative mapping is unchanged; returned backend filename
 case is retained so case-alias detection still rejects mismatched topic identities.
 
+The integration audit after rebasing onto `ca8d98e85` found that incoming pgwire
+authentication validation could return after the queue spawned its background tasks.
+Those tasks retain the client and need awaited shutdown, so constructor failure would
+strand them until runtime teardown. The public constructor rejection test reproduced
+queue state creation before the error (`8120bf08-1804-43e4-9b88-8abfb5560c92`, 95/97 passed).
+The other failure was the valid-startup control missing process embedding initialization;
+its fixture now follows the server prerequisite. Authentication resolution and rejection
+move before queue admission without changing the mode resolver or network wiring.
+
 === Phase exits
 
 [cols="1,4,3",options="header"]

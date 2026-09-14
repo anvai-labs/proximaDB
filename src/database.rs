@@ -646,6 +646,31 @@ impl ProximaDB {
         // EmbeddedRecord.target_precision (fp16 ingest end-to-end).
         let catalog_manager_for_drainer = shared_services.catalog_manager.clone();
 
+        // TD-PGWIRE-AUTH-1: resolve the effective pgwire auth posture ONCE.
+        // Validate before opening the queue: its reaper/uploader tasks retain
+        // the client and require awaited shutdown, so a later constructor error
+        // would leave them alive without an owner able to shut them down.
+        let pgwire_auth_mode = crate::network::postgres::protocol::PgwireAuthMode::resolve(
+            rest_auth_enabled,
+            std::env::var("PROXIMADB_PGWIRE_AUTH").ok().as_deref(),
+            config
+                .security
+                .as_ref()
+                .and_then(|security| security.pgwire.auth.as_deref()),
+        );
+        if pgwire_auth_mode == crate::network::postgres::protocol::PgwireAuthMode::ScramRequired
+            && security.is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "[security.pgwire] auth = \"password\" requires [security] enabled \
+                 (a security coordinator provides the SCRAM verifiers)"
+            ));
+        }
+        tracing::info!(
+            mode = ?pgwire_auth_mode,
+            "🔐 pgwire authentication posture (TD-PGWIRE-AUTH-1)"
+        );
+
         // Open the queue subsystem BEFORE MultiServer so its Arc can
         // thread into AppState (so the v3 `/documents?mode=async` REST
         // handler routes through `producer.send`). The drainer is
@@ -714,33 +739,6 @@ impl ProximaDB {
             tracing::warn!("{warning}");
         }
         tracing::info!(policy = %tier_header_trust, "🔐 tier-claim trust policy (ADR-0053 W8)");
-
-        // TD-PGWIRE-AUTH-1: resolve the effective pgwire auth posture ONCE
-        // (the same resolved-once shape as the trust policies above). The
-        // ladder lives in `PgwireAuthMode::resolve`; here we only enforce the
-        // boot-time fail-closed invariant: SCRAM required ⇒ a coordinator must
-        // exist (a `password` request with `security` disabled is a
-        // misconfiguration, not a trust fallback).
-        let pgwire_auth_mode = crate::network::postgres::protocol::PgwireAuthMode::resolve(
-            rest_auth_enabled,
-            std::env::var("PROXIMADB_PGWIRE_AUTH").ok().as_deref(),
-            config
-                .security
-                .as_ref()
-                .and_then(|security| security.pgwire.auth.as_deref()),
-        );
-        if pgwire_auth_mode == crate::network::postgres::protocol::PgwireAuthMode::ScramRequired
-            && security.is_none()
-        {
-            return Err(anyhow::anyhow!(
-                "[security.pgwire] auth = \"password\" requires [security] enabled \
-                 (a security coordinator provides the SCRAM verifiers)"
-            ));
-        }
-        tracing::info!(
-            mode = ?pgwire_auth_mode,
-            "🔐 pgwire authentication posture (TD-PGWIRE-AUTH-1)"
-        );
 
         let multi_server = network::MultiServer::new_with_queue_client(
             multi_config,
@@ -1950,5 +1948,62 @@ mod security_initialization_tests {
             .expect("disabled security must not initialize its invalid providers");
 
         assert!(security.is_none());
+    }
+
+    async fn constructor_queue_admission(auth: &str) {
+        if proximadb_embedding::EmbeddingService::try_global().is_none() {
+            proximadb_embedding::EmbeddingService::initialize(
+                proximadb_embedding::EmbeddingConfig {
+                    route: proximadb_embedding::EmbedRoute::BgeSmall,
+                },
+                Default::default(),
+            )
+            .expect("initialize process embedding service");
+        }
+        let temp = tempfile::tempdir().expect("isolated database");
+        let queue_root = temp.path().join("queue");
+        let mut config = crate::core::Config::default();
+        config.server.data_dir = temp.path().to_path_buf();
+        config.storage.storage_locations = vec![crate::core::config::StorageLocation {
+            url: format!("file://{}/storage", temp.path().display()),
+            ..Default::default()
+        }];
+        config.storage.metadata_url = format!("file://{}/metadata", temp.path().display());
+        config.storage.wal_config.write_buffer_directory =
+            format!("file://{}/wal", temp.path().display());
+        let mut security = security_config(false);
+        security.pgwire.auth = Some(auth.to_string());
+        config.security = Some(security);
+        config.queue = Some(crate::core::config::QueueRuntimeConfig {
+            root: Some(format!("file://{}", queue_root.display())),
+            drainer_partitions: Some(String::new()),
+            ..Default::default()
+        });
+        match super::ProximaDB::new(config).await {
+            Ok(mut database) => {
+                let admitted = database.queue_client().is_some() && queue_root.exists();
+                database.shutdown().await.expect("await database shutdown");
+                assert_eq!(auth, "trust", "password without security must fail");
+                assert!(admitted, "valid posture must reach queue admission");
+            }
+            Err(error) => {
+                assert_eq!(auth, "password", "valid posture rejected: {error:#}");
+                assert!(error.to_string().contains("requires [security] enabled"));
+                assert!(
+                    !queue_root.exists(),
+                    "authentication rejection must precede queue state and task creation"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn password_without_security_rejects_before_queue_admission() {
+        constructor_queue_admission("password").await;
+    }
+
+    #[tokio::test]
+    async fn explicit_trust_without_security_reaches_queue_admission() {
+        constructor_queue_admission("trust").await;
     }
 }
