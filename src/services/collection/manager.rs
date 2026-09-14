@@ -1794,12 +1794,11 @@ impl CollectionService {
                     existing_config.distance_metric = new_config.distance_metric;
                 }
                 if new_config.storage_engine.unwrap_or(0) != 0 {
-                    // TD-VIPER-1 S2 (ADR-093): the same reject-new-VIPER
-                    // guard `create_collection_with_tenant_context` applies
-                    // — nothing currently calls this with a caller-supplied
-                    // `storage_engine`, but the check must travel with the
-                    // field, not live only at the one call site that
-                    // happens to be wired today.
+                    // TD-VIPER-1 S2 (ADR-093) + the MMAP/Hybrid/experimental-
+                    // gated fail-loud guarantee: the same two checks
+                    // `create_collection_with_tenant_context` applies — the
+                    // guard travels with the field, not just the one call
+                    // site that happens to be wired today.
                     if new_config.storage_engine
                         == Some(crate::proto::proximadb_v1::StorageEngine::Viper as i32)
                     {
@@ -1808,6 +1807,17 @@ impl CollectionService {
                              use SST (default), NOVA (columnar analytics), HELIX, or the \
                              DataFusion/Parquet path for warehouse-shaped analytics"
                         ));
+                    }
+                    if let Ok(engine) = crate::proto::proximadb_v1::StorageEngine::try_from(
+                        new_config.storage_engine.unwrap_or(0),
+                    ) {
+                        crate::storage::engines::factory::StorageFormatFactory::create_from_proto_async(
+                            engine,
+                        )
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("storage engine {engine:?} is unavailable: {error:#}")
+                        })?;
                     }
                     existing_config.storage_engine = new_config.storage_engine;
                 }
