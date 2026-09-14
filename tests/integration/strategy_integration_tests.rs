@@ -3,6 +3,9 @@
 //! These tests validate that all storage engines implement the unified strategy
 //! pattern consistently and that strategy selection works correctly across engines.
 
+// SWIFT is compiled only under `experimental-engines` (TD-152 deprecation gate).
+#![cfg(feature = "experimental-engines")]
+
 use std::sync::Arc;
 use anyhow::Result;
 

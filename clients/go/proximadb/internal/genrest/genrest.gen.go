@@ -1300,8 +1300,9 @@ type CreateCollectionV2Request struct {
 
 	// Engine Storage engine selection
 	//
-	// Options: "auto", "sst", "helix", "viper", "swift", "nova", "raptor", "tst"
+	// Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
 	// Default: "auto" (system selects optimal engine)
+	// ("viper" is no longer accepted — deprecated by ADR-093)
 	Engine *string `json:"engine,omitempty"`
 
 	// IndexConfigs Index configurations (e.g. an explicit IVF or HNSW index).

@@ -3,6 +3,9 @@
 //! Tests all filtering scenarios with typed metadata to ensure SWIFT engine
 //! properly preserves and filters on all data types (String, Integer, Float, Boolean).
 
+// SWIFT is compiled only under `experimental-engines` (TD-152 deprecation gate).
+#![cfg(feature = "experimental-engines")]
+
 use proximadb::compute::distance_computation::UnifiedDistanceCompute;
 use proximadb::core::search::{ComparisonOperator, FilterExpression, SearchParams};
 use proximadb::proto::proximadb_v1::{
