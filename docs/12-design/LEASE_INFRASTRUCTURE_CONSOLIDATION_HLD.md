@@ -460,6 +460,16 @@ can inspect the same `drainer_has_stopped()` predicate and must still await shut
 This is bounded process-level detection, not an immediate per-request admission barrier; work
 accepted during detection/shutdown remains subject to the existing durable queue contract.
 
+Database shutdown retains its bounded, retryable drainer-stop contract. The executable
+must not interpret that incomplete result as process shutdown: it retries while the queue
+remains attached, retaining the same drainer/storage and the `Stopping` runtime record.
+The queue is removed before subsequent shutdown failures, so completed errors propagate
+to a failing process exit without retry. This classifier depends on that database ordering
+and is documented at the call site. The private server sequencing function reuses the
+existing queue accessor and runtime-state writer; no public interface or test env gate is
+added. A permanently stuck effect keeps graceful shutdown pending; externally forced
+termination remains a crash/recovery operation, not proof of completed shutdown.
+
 Upgrade prerequisite: historical unversioned `offset.meta` may contain the old maximum-ACK
 watermark despite earlier gaps. Its JSON cannot prove contiguous completion or reconstruct lost
 work. Operators must audit/replay from an independently trusted checkpoint (including archive or
