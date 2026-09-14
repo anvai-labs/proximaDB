@@ -710,6 +710,20 @@ impl CollectionService {
                  DataFusion/Parquet path for warehouse-shaped analytics"
             ));
         }
+        // Fail loud at creation, not silently at first read/flush: MMAP/Hybrid
+        // (unimplemented) and any experimental engine selected without its
+        // cargo feature would otherwise report `success: true` here and only
+        // surface as a background flush warning or a first-read error.
+        // `create_from_proto_async` is the same stateless, cheap constructor
+        // the read path (`resolver.rs`) calls on every first access; discard
+        // the instance, we only need its constructability as a precondition.
+        crate::storage::engines::factory::StorageFormatFactory::create_from_proto_async(
+            selected_engine,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("storage engine {selected_engine:?} is unavailable: {error:#}")
+        })?;
         let previous_engine_field = enriched_config.storage_engine;
         enriched_config.storage_engine = Some(selected_engine as i32);
         tracing::info!(
@@ -1780,6 +1794,21 @@ impl CollectionService {
                     existing_config.distance_metric = new_config.distance_metric;
                 }
                 if new_config.storage_engine.unwrap_or(0) != 0 {
+                    // TD-VIPER-1 S2 (ADR-093): the same reject-new-VIPER
+                    // guard `create_collection_with_tenant_context` applies
+                    // — nothing currently calls this with a caller-supplied
+                    // `storage_engine`, but the check must travel with the
+                    // field, not live only at the one call site that
+                    // happens to be wired today.
+                    if new_config.storage_engine
+                        == Some(crate::proto::proximadb_v1::StorageEngine::Viper as i32)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "VIPER is deprecated (ADR-093) and can no longer be selected: \
+                             use SST (default), NOVA (columnar analytics), HELIX, or the \
+                             DataFusion/Parquet path for warehouse-shaped analytics"
+                        ));
+                    }
                     existing_config.storage_engine = new_config.storage_engine;
                 }
                 if new_config.description.is_some() {
@@ -4281,6 +4310,53 @@ mod tests {
             .context("read canonical after update")?
             .expect("canonical sidecar survived unrelated update_collection");
         assert_eq!(restored, columns);
+
+        Ok(())
+    }
+
+    /// TD-VIPER-1 S2 (ADR-093): `update_collection` must refuse a VIPER
+    /// storage_engine the same way `create_collection` does — the guard
+    /// travels with the field, not just the one wired creation call site.
+    #[tokio::test]
+    async fn update_collection_rejects_viper_storage_engine() -> Result<()> {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().context("temp dir")?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog("default", &temp_path)
+            .await
+            .context("create test catalog")?;
+        let svc = CollectionService::new(StorageConfig::default())
+            .await
+            .context("collection service")?
+            .with_catalog_manager(mgr);
+
+        let name = "viper_update_reject";
+        let config = CollectionConfig {
+            name: name.to_string(),
+            dimension: 8,
+            storage_engine: Some(StorageEngine::Sst as i32),
+            primary_index: Some("default".to_string()),
+            auto_index_selection: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            svc.create_collection(&config)
+                .await
+                .context("create collection")?
+                .success
+        );
+
+        let update = CollectionConfig {
+            storage_engine: Some(StorageEngine::Viper as i32),
+            ..Default::default()
+        };
+        let result = svc.update_collection(name, Some(update)).await;
+        assert!(
+            result.is_err(),
+            "update_collection must reject a VIPER storage_engine, got: {result:?}"
+        );
 
         Ok(())
     }
