@@ -44,6 +44,7 @@ compile_error!(
 );
 
 mod runtime_state;
+mod shutdown;
 
 use clap::Parser;
 use proximadb::ProximaDB;
@@ -434,15 +435,15 @@ async fn run() -> anyhow::Result<()> {
     }
 
     // Graceful shutdown
-    runtime_state.set_phase(runtime_state::Phase::Stopping);
-    if let Err(e) = db.shutdown().await {
-        error!("Error during shutdown: {}", e);
-    }
-
-    // Clearing the record is the "no owner" signal: a supervisor that sees no
-    // file knows the data dir is free, and one that sees a stale record knows
-    // the previous owner died without cleaning up.
-    runtime_state.finish();
+    shutdown::finish(runtime_state, async || {
+        let result = db.shutdown().await;
+        // A failed shutdown retains the queue only when the drainer is still
+        // in flight. Database shutdown removes it before all later failures.
+        // Keep this classifier aligned with that ordering; do not retry a
+        // completed drainer's terminal error or match error-message strings.
+        (result, db.queue_client().is_some())
+    })
+    .await?;
     info!("ProximaDB server stopped");
     if critical_drainer_stopped {
         anyhow::bail!("critical embedding drainer terminated; server shutdown completed");

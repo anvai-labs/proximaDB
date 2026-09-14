@@ -8,9 +8,102 @@ use std::time::{Duration, Instant};
 
 use proximadb_queue::{Message, QueueClient, QueueConfig, TopicConfig};
 
+#[path = "../src/runtime_state.rs"]
+mod runtime_state;
+#[path = "../src/shutdown.rs"]
+mod shutdown;
 mod support;
 
 const TOPIC: &str = "embed-ingest";
+
+#[tokio::test]
+async fn incomplete_shutdown_retains_ownership_until_drainer_and_storage_finish()
+-> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let temp = tempfile::tempdir()?;
+    let owner = runtime_state::RuntimeStateWriter::start(temp.path(), None);
+    let release = tokio::sync::Notify::new();
+    let effect = release.notified();
+    tokio::pin!(effect);
+    let attempts = AtomicUsize::new(0);
+    let storage_stopped = AtomicBool::new(false);
+    let retry_observed = tokio::sync::Notify::new();
+    let finish = shutdown::finish(owner, async || {
+        if attempts.fetch_add(1, Ordering::SeqCst) > 0 {
+            retry_observed.notify_one();
+        }
+        // Model the existing database contract with a controlled in-flight
+        // effect. Shrink only the test's grace period, not production's five seconds.
+        if tokio::time::timeout(Duration::from_millis(10), &mut effect)
+            .await
+            .is_err()
+        {
+            return (Err(anyhow::anyhow!("drainer still in flight")), true);
+        }
+        storage_stopped.store(true, Ordering::SeqCst);
+        (Ok(()), false)
+    });
+    tokio::pin!(finish);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            _ = &mut finish => anyhow::bail!(
+                "incomplete drainer shutdown must not complete the process lifecycle"
+            ),
+            _ = retry_observed.notified() => Ok(()),
+        }
+    })
+    .await??;
+    anyhow::ensure!(attempts.load(Ordering::SeqCst) >= 2, "must retry shutdown");
+    anyhow::ensure!(!storage_stopped.load(Ordering::SeqCst));
+    let state = runtime_state::read_state(temp.path())
+        .ok_or_else(|| anyhow::anyhow!("in-flight shutdown lost runtime ownership"))?;
+    anyhow::ensure!(state.phase == runtime_state::Phase::Stopping);
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), &mut finish).await??;
+    anyhow::ensure!(storage_stopped.load(Ordering::SeqCst));
+    anyhow::ensure!(runtime_state::read_state(temp.path()).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_shutdown_failure_is_returned_without_retry() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let owner = runtime_state::RuntimeStateWriter::start(temp.path(), None);
+    let mut attempts = 0;
+    let result = shutdown::finish(owner, async || {
+        attempts += 1;
+        (Err(anyhow::anyhow!("terminal shutdown failure")), false)
+    })
+    .await;
+    anyhow::ensure!(
+        result.is_err(),
+        "shutdown failure must produce a failing exit"
+    );
+    anyhow::ensure!(attempts == 1, "completed failures must not be retried");
+    anyhow::ensure!(runtime_state::read_state(temp.path()).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn incomplete_shutdown_retry_preserves_the_eventual_failure() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let owner = runtime_state::RuntimeStateWriter::start(temp.path(), None);
+    let mut attempts = 0;
+    let result = shutdown::finish(owner, async || {
+        attempts += 1;
+        match attempts {
+            1 => (Err(anyhow::anyhow!("drainer still in flight")), true),
+            _ => (Err(anyhow::anyhow!("eventual shutdown failure")), false),
+        }
+    })
+    .await;
+    anyhow::ensure!(attempts == 2);
+    anyhow::ensure!(result.unwrap_err().to_string() == "eventual shutdown failure");
+    anyhow::ensure!(runtime_state::read_state(temp.path()).is_none());
+    Ok(())
+}
 
 fn queue_config(root: &Path) -> QueueConfig {
     QueueConfig {
