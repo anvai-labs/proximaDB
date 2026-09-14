@@ -226,7 +226,7 @@ impl PgwireAuthMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransactionControl {
     /// `BEGIN` / `START TRANSACTION`.
-    Begin { read_only: bool },
+    Begin { read_only: Option<bool> },
     /// `COMMIT` / `END`.
     Commit,
     /// `ROLLBACK` / `ABORT`.
@@ -288,6 +288,17 @@ fn parse_transaction_mode_tail(words: &[&str]) -> Result<Option<bool>, String> {
                             .to_string(),
                     );
                 }
+                // Validate the level itself — "ISOLATION LEVEL READ FROB" is a
+                // syntax error, not a silent accept.
+                let _ = words
+                    .get(index + 3)
+                    .copied()
+                    .filter(|l| *l == "COMMITTED" || *l == "UNCOMMITTED")
+                    .ok_or_else(|| {
+                        "unsupported ISOLATION LEVEL (only READ COMMITTED is provided; \
+                     real MVCC is Phase 3)"
+                            .to_string()
+                    })?;
                 index += 4;
             }
             "WORK" | "TRANSACTION" | "DEFERRABLE" => {
@@ -416,7 +427,7 @@ fn classify_transaction_statement(query: &str) -> Option<TransactionStatement> {
                 }
             };
             Some(TransactionStatement::Control(TransactionControl::Begin {
-                read_only: read_only.unwrap_or(false),
+                read_only,
             }))
         }
         "COMMIT" | "END" => match (second, words.len()) {
@@ -2178,8 +2189,12 @@ impl PostgresProtocol {
                             session.begin_transaction();
                             let buffer = &mut self.transaction_buffer;
                             buffer.clear();
+                            // Explicit BEGIN characteristics override the
+                            // session default (PG): `BEGIN READ WRITE` after
+                            // `SET SESSION CHARACTERISTICS ... READ ONLY` is a
+                            // read-write transaction.
                             buffer.read_only =
-                                read_only || buffer.pending_read_only.unwrap_or(false);
+                                read_only.or(buffer.pending_read_only).unwrap_or(false);
                             buffer.pending_read_only = None;
                         }
                     }
@@ -2513,16 +2528,15 @@ impl PostgresProtocol {
         // ADR-018 P2.D: the extended protocol honors the same control
         // classification. No ReadyForQuery here — Sync sends it from the
         // session status byte.
-        match classify_transaction_statement(query) {
-            Some(TransactionStatement::Control(control)) => {
-                return self.handle_transaction_control(control, false).await;
-            }
-            Some(TransactionStatement::Unsupported(reason)) => {
-                return self.send_error("ERROR", "0A000", &reason).await;
-            }
-            None => {}
-        }
-        if self.transaction_state_is_failed().await {
+        let transaction_statement = classify_transaction_statement(query);
+        // Failed-txn gate FIRST (mirrors handle_query / PG): every
+        // non-control statement in an aborted transaction reports 25P02 —
+        // including otherwise-unsupported forms, so both wire paths agree.
+        if !matches!(
+            &transaction_statement,
+            Some(TransactionStatement::Control(_))
+        ) && self.transaction_state_is_failed().await
+        {
             return self
                 .send_error(
                     "ERROR",
@@ -2530,6 +2544,15 @@ impl PostgresProtocol {
                     "current transaction is aborted, commands ignored until end of transaction block",
                 )
                 .await;
+        }
+        match transaction_statement {
+            Some(TransactionStatement::Control(control)) => {
+                return self.handle_transaction_control(control, false).await;
+            }
+            Some(TransactionStatement::Unsupported(reason)) => {
+                return self.send_error("ERROR", "0A000", &reason).await;
+            }
+            None => {}
         }
         {
             let upper_for_ddl = upper.trim().to_string();
@@ -5283,7 +5306,7 @@ impl PostgresProtocol {
                         .transaction_push(
                             statement,
                             tenant_ctx,
-                            approx_bytes,
+                            approx_bytes.max(query.len()),
                             table.clone(),
                             write_tenant.clone(),
                         )
@@ -5442,7 +5465,7 @@ impl PostgresProtocol {
                         .transaction_push(
                             statement,
                             tenant_ctx,
-                            approx_bytes,
+                            approx_bytes.max(query.len()),
                             table.clone(),
                             write_tenant.clone(),
                         )
@@ -5595,7 +5618,7 @@ impl PostgresProtocol {
                         .transaction_push(
                             statement,
                             tenant_ctx,
-                            approx_bytes,
+                            approx_bytes.max(query.len()),
                             table.clone(),
                             write_tenant.clone(),
                         )
@@ -6435,6 +6458,19 @@ impl PostgresProtocol {
         query: &str,
         max_rows: i32,
     ) -> Result<()> {
+        // Hardening: the fast paths below bypass execute_query_with_controls,
+        // so enforce the failed-transaction gate here too — a Failed txn must
+        // never serve rows regardless of shape (25P02, same as the simple and
+        // batch paths).
+        if self.transaction_state_is_failed().await {
+            return self
+                .send_error(
+                    "ERROR",
+                    "25P02",
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                )
+                .await;
+        }
         if max_rows > 0 {
             if self
                 .portals

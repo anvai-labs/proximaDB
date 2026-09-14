@@ -182,27 +182,31 @@ fn transaction_control_classification_matches_adr018_p2d() {
     // Real control per P2.D.
     assert_eq!(
         control("BEGIN"),
-        Some(TransactionControl::Begin { read_only: false })
+        Some(TransactionControl::Begin { read_only: None })
     );
     assert_eq!(
         control("BEGIN TRANSACTION;"),
-        Some(TransactionControl::Begin { read_only: false })
+        Some(TransactionControl::Begin { read_only: None })
     );
     assert_eq!(
         control("BEGIN WORK"),
-        Some(TransactionControl::Begin { read_only: false })
+        Some(TransactionControl::Begin { read_only: None })
     );
     assert_eq!(
         control("START TRANSACTION READ ONLY"),
-        Some(TransactionControl::Begin { read_only: true })
+        Some(TransactionControl::Begin {
+            read_only: Some(true)
+        })
     );
     assert_eq!(
         control("BEGIN READ WRITE"),
-        Some(TransactionControl::Begin { read_only: false })
+        Some(TransactionControl::Begin {
+            read_only: Some(false)
+        })
     );
     assert_eq!(
         control("BEGIN ISOLATION LEVEL READ COMMITTED"),
-        Some(TransactionControl::Begin { read_only: false })
+        Some(TransactionControl::Begin { read_only: None })
     );
     assert_eq!(control("COMMIT"), Some(TransactionControl::Commit));
     assert_eq!(control("END WORK"), Some(TransactionControl::Commit));
