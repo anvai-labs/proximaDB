@@ -145,8 +145,9 @@ pub struct CreateCollectionV2Request {
     pub dimension: u32,
     /// Storage engine selection
     ///
-    /// Options: "auto", "sst", "helix", "viper", "swift", "nova", "raptor", "tst"
+    /// Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
     /// Default: "auto" (system selects optimal engine)
+    /// ("viper" is no longer accepted — deprecated by ADR-093)
     pub engine: Option<String>,
     /// Schema definition with column types
     pub schema: Option<SchemaDefinition>,

@@ -1,7 +1,9 @@
 //! AXIS Index Integration Edge Case Tests
 //!
 //! Tests edge cases and boundary conditions for AXIS index integration
-//! across all 6 storage engines: SST, HELIX, VIPER, SWIFT, NOVA, RAPTOR.
+//! across the selectable storage engines: SST, HELIX, NOVA (plus SWIFT and
+//! RAPTOR under `experimental-engines`). VIPER left the create matrix at
+//! ADR-093 S2.
 
 use proximadb_embedded::{AccessMode, EmbeddedConfig, EmbeddedProximaDB, StorageLocationConfig};
 use tempfile::TempDir;
@@ -9,11 +11,10 @@ use tempfile::TempDir;
 /// Test engines to validate.
 /// Experimental engines are only included when the feature is enabled.
 fn test_engines() -> Vec<&'static str> {
-    // VIPER is deprecated (ADR-093 / TD-VIPER-1), but remains selectable
-    // through stage 1 and must support legacy reads through stage 2. Keep its
-    // existing coverage until implementation retirement; conformance ratchets
-    // must not go backwards.
-    let mut engines = vec!["sst", "helix", "viper", "nova"];
+    // VIPER is no longer selectable for new collections as of ADR-093 S2
+    // (existing data stays readable via the factory-level reader tests), so
+    // it leaves the create-path conformance matrix here.
+    let mut engines = vec!["sst", "helix", "nova"];
     if cfg!(feature = "experimental-engines") {
         engines.push("swift");
         engines.push("raptor");
@@ -575,8 +576,8 @@ fn test_concurrent_operations_all_engines() {
 fn test_suite_summary() {
     let engines = test_engines();
     assert!(
-        engines.contains(&"viper"),
-        "VIPER must remain in the conformance matrix while its implementation supports legacy reads; see ADR-093"
+        !engines.contains(&"viper"),
+        "VIPER must NOT be in the create-path conformance matrix as of ADR-093 S2"
     );
     let engine_list = engines
         .iter()

@@ -4171,7 +4171,7 @@ pub mod types {
     ///      ]
     ///    },
     ///    "engine": {
-    ///      "description": "Storage engine selection\n\nOptions: \"auto\", \"sst\", \"helix\", \"viper\", \"swift\", \"nova\", \"raptor\", \"tst\"\nDefault: \"auto\" (system selects optimal engine)",
+    ///      "description": "Storage engine selection\n\nOptions: \"auto\", \"sst\", \"helix\", \"swift\", \"nova\", \"raptor\", \"tst\"\nDefault: \"auto\" (system selects optimal engine)\n(\"viper\" is no longer accepted — deprecated by ADR-093)",
     ///      "type": [
     ///        "string",
     ///        "null"
@@ -4255,8 +4255,9 @@ pub mod types {
         pub enable_proxima_record: ::std::option::Option<bool>,
         /// Storage engine selection
         ///
-        /// Options: "auto", "sst", "helix", "viper", "swift", "nova", "raptor", "tst"
+        /// Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
         /// Default: "auto" (system selects optimal engine)
+        /// ("viper" is no longer accepted — deprecated by ADR-093)
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub engine: ::std::option::Option<::std::string::String>,
         /// Index configurations (e.g. an explicit IVF or HNSW index).

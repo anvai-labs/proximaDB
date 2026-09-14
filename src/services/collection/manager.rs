@@ -4324,6 +4324,41 @@ mod tests {
         Ok(())
     }
 
+    /// TD-VIPER-1 S2 (ADR-093) create-path negative control: the manager-level
+    /// guard must refuse BOTH the deprecated VIPER selection AND any engine
+    /// that cannot construct (MMAP/Hybrid are unimplemented) — before the
+    /// collection is persisted, not silently at first flush/read.
+    #[tokio::test]
+    async fn create_collection_rejects_viper_and_unconstructible_engines() -> Result<()> {
+        let service = CollectionService::new(StorageConfig::default())
+            .await
+            .context("collection service")?;
+        for (engine, label) in [
+            (StorageEngine::Viper, "viper (ADR-093 deprecation)"),
+            (StorageEngine::Mmap, "mmap (unimplemented)"),
+            (StorageEngine::Hybrid, "hybrid (unimplemented)"),
+        ] {
+            let config = CollectionConfig {
+                name: format!(
+                    "create_reject_{}",
+                    label.split(' ').next().unwrap_or("engine")
+                ),
+                dimension: 8,
+                storage_engine: Some(engine as i32),
+                primary_index: Some("default".to_string()),
+                auto_index_selection: Some(false),
+                ..Default::default()
+            };
+            let result = service.create_collection(&config).await;
+            assert!(
+                result.is_err(),
+                "create must reject {label}; got: {result:?}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// TD-VIPER-1 S2 (ADR-093): `update_collection` must refuse a VIPER
     /// storage_engine the same way `create_collection` does — the guard
     /// travels with the field, not just the one wired creation call site.
