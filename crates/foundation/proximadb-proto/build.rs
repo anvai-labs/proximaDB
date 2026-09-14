@@ -47,9 +47,16 @@ fn main() {
         model_registry_proto.display(),
         out_dir.display()
     );
+    // D1: also emit the v2 file-descriptor set so gRPC server REFLECTION can
+    // serve the v2 services (the checked-in v1 descriptors are the only ones
+    // registered today — stale after the v1 sunset). Checked in next to the
+    // v1 bins (`src/proto/`) so the runtime registers it without a build step.
+    let file_descriptor_set = out_dir.join("proximadb.v2_descriptor.bin");
+
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .file_descriptor_set_path(&file_descriptor_set)
         .out_dir(&out_dir)
         .compile_protos(
             &[

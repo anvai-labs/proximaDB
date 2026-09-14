@@ -25,12 +25,19 @@
 //! ## Engine Maturity Levels:
 //!
 //! **Production-Ready (Recommended for production use):**
-//! - **SST**: Most mature, write-optimized, 253+ tests (unit + async)
-//! - **VIPER**: Production columnar engine, 120+ tests, Parquet-based
+//! - **SST**: Most mature, write-optimized, 253+ tests (unit + async) — the default
 //!
 //! **Production-Ready (Specialized use cases):**
 //! - **NOVA**: Advanced columnar analytics, 66+ tests, zone maps & predicate pushdown
 //! - **HELIX**: High-dimensional data, 38+ tests, PCA dimension reduction
+//!
+//! **⚠️ DEPRECATED (ADR-093 / TD-VIPER-1):**
+//! - **VIPER**: staged retirement in progress — new collections should use SST
+//!   (default), NOVA, or the DataFusion/Parquet path; existing VIPER collections
+//!   remain readable. (The per-engine latency numbers previously quoted in this
+//!   header (~5.32/13.2/89.5/101.6 ms) have NO entries in
+//!   `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml` and were removed — see the
+//!   evidence ledger for measured claims only.)
 //!
 //! **⚠️ DEPRECATED - Experimental (Requires `experimental-engines` feature flag):**
 //! - **SWIFT**: ⚠️ DEPRECATED - Incomplete hierarchical storage, 30+ DEFERREDs
@@ -47,20 +54,16 @@
 //!
 //! ### Write-Heavy Workloads:
 //! - **SST**: Best for high write throughput, real-time ingestion, streaming data
-//! - Performance: ~5.32ms for 10K vectors with LZ4 compression
 //!
 //! ### Analytical Workloads:
-//! - **VIPER**: Best for batch analytics, read-heavy, Parquet ecosystem integration
 //! - **NOVA**: Best for advanced analytics with predicate pushdown, zone maps
-//! - Performance: VIPER ~89.5ms, NOVA ~101.6ms for 10K vectors
+//!   (the DataFusion/Parquet path serves warehouse-shaped analytics)
 //!
 //! ### Point Lookup Workloads:
-//! - **SWIFT**: Best for low-latency ID lookups (<5K vectors optimal)
-//! - Performance: ~95ms for 10K vectors, optimized for cache-friendly access
+//! - **SWIFT** (experimental-engines, deprecated): low-latency ID lookups (<5K vectors)
 //!
 //! ### High-Dimensional Data:
 //! - **HELIX**: Best for dimensions > 512, uses PCA reduction + Hilbert curves
-//! - Performance: ~13.2ms for 10K vectors with locality optimization
 //!
 //! ### Mixed/Hybrid Workloads:
 //! - **RAPTOR**: Adaptive row-group sizing, Matrix Trinity navigation

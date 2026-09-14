@@ -107,14 +107,19 @@ JOIN LATERAL DOCUMENT_QUERY('reviews', 'product_id = "' || v.product_id || '"') 
 
 ### Storage Engines
 
-4 supported engines tuned for your workload (plus AXIS HNSW/IVF indexes):
+Workload-tuned engines behind one canonical record path (plus AXIS HNSW/IVF indexes).
+Tier status is authoritative in [`SUPPORTED_SURFACE.adoc`](./SUPPORTED_SURFACE.adoc);
+measured performance claims live only in the
+[evidence ledger](./_internal/roadmap/BENCHMARK_EVIDENCE.toml) — numbers quoted anywhere
+else are marketing, and the per-engine latency table previously here had no measured
+ledger entries and was removed.
 
-| Engine | Best For | Performance |
-|--------|----------|-------------|
-| **SST** | Real-time, write-heavy | ~5ms |
-| **HELIX** | Locality-optimized | ~13ms |
-| **VIPER** | Columnar analytics | ~89ms |
-| **NOVA** | Mixed workloads | ~101ms |
+| Engine | Tier | Best For |
+|--------|------|----------|
+| **SST** | Supported (default) | Real-time, write-heavy |
+| **NOVA** | Beta | Columnar analytics, predicate pushdown |
+| **HELIX** | Beta | High-dimensional (PCA + Hilbert locality) |
+| **VIPER** | **Deprecated** (ADR-093) | Legacy columnar — use SST/NOVA/DataFusion-Parquet |
 
 > **Experimental (off by default):** the SWIFT and RAPTOR engines exist behind the
 > `experimental-engines` cargo feature and are disabled in stock builds. Do not target them
