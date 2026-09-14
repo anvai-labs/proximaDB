@@ -366,3 +366,274 @@ async fn pgwire_transaction_matrix_impl() {
         .unwrap_or_default();
     assert_eq!(code, "0A000", "expected 0A000 for SAVEPOINT, got: {err}");
 }
+
+async fn visible_ids(client: &tokio_postgres::Client, t: &str) -> Vec<String> {
+    let mut v: Vec<String> = client
+        .simple_query(&format!("SELECT id FROM {t} WHERE id >= 0"))
+        .await
+        .expect("select")
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                Some(r.get(0).unwrap_or_default().to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// F1 regression: `COMMIT TRANSACTION` and `END TRANSACTION` are valid PG
+/// commit forms — they must run the SAME buffered-replay commit as bare
+/// `COMMIT`, not fall through to the generic executor as a silent no-op
+/// (the pre-fix behavior reported success while stranding the buffer).
+#[test]
+fn pgwire_transaction_commit_forms() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(pgwire_transaction_commit_forms_impl());
+}
+
+async fn pgwire_transaction_commit_forms_impl() {
+    let server = TxnTestServer::start().await.expect("server start");
+    let client = connect(&server).await;
+    let t = format!(
+        "txn_forms_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    setup_table(&client, &t).await;
+
+    // Bare COMMIT with a SIMPLE-path buffered insert (baseline).
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query(&format!("INSERT INTO {t} (id, label) VALUES (41, 'f0')"))
+        .await
+        .expect("buffered insert");
+    client.simple_query("COMMIT").await.expect("commit");
+    let fresh = connect(&server).await;
+    assert_eq!(
+        visible_ids(&fresh, t.as_str()).await,
+        vec!["41"],
+        "bare COMMIT must replay a simple-path buffered insert"
+    );
+
+    // COMMIT TRANSACTION form.
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query(&format!("INSERT INTO {t} (id, label) VALUES (42, 'f1')"))
+        .await
+        .expect("buffered insert");
+    client
+        .simple_query("COMMIT TRANSACTION")
+        .await
+        .expect("COMMIT TRANSACTION must succeed");
+    let fresh = connect(&server).await;
+    assert_eq!(
+        visible_ids(&fresh, t.as_str()).await,
+        vec!["41", "42"],
+        "COMMIT TRANSACTION must actually replay the buffer"
+    );
+
+    // END TRANSACTION form.
+    client.simple_query("BEGIN").await.expect("begin 2");
+    client
+        .simple_query(&format!("INSERT INTO {t} (id, label) VALUES (43, 'f1b')"))
+        .await
+        .expect("buffered insert 2");
+    client
+        .simple_query("END TRANSACTION")
+        .await
+        .expect("END TRANSACTION must succeed");
+    let fresh = connect(&server).await;
+    assert_eq!(
+        visible_ids(&fresh, t.as_str()).await,
+        vec!["41", "42", "43"],
+        "END TRANSACTION must actually replay the buffer"
+    );
+
+    // A typo'd COMMIT tail must fail closed, never silently no-op.
+    client.simple_query("BEGIN").await.expect("begin 3");
+    client
+        .simple_query(&format!("INSERT INTO {t} (id, label) VALUES (44, 'f1c')"))
+        .await
+        .expect("buffered insert 3");
+    let err = client
+        .simple_query("COMMIT TRANSACTON")
+        .await
+        .expect_err("typo'd COMMIT tail must be rejected, not silently ignored");
+    let code = err
+        .as_db_error()
+        .map(|d| d.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        code, "0A000",
+        "expected 0A000 for the typo'd tail, got: {err}"
+    );
+    // The failed-control statement aborted the txn; clean up and confirm the
+    // buffered row is NOT visible (control failure = abort, not commit).
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("rollback recovers the session");
+    let fresh = connect(&server).await;
+    assert_eq!(
+        visible_ids(&fresh, t.as_str()).await,
+        vec!["41", "42", "43"],
+        "aborted control statement must not have committed row 44"
+    );
+}
+
+/// F2 regression: BEGIN inside a FAILED transaction must stay aborted
+/// (PostgreSQL: only ROLLBACK escapes 25P02). The pre-fix behavior silently
+/// discarded the aborted transaction's pending writes and let subsequent
+/// writes commit in a fresh transaction — silent data loss.
+#[test]
+fn pgwire_transaction_begin_in_failed_stays_aborted() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(pgwire_transaction_begin_in_failed_stays_aborted_impl());
+}
+
+async fn pgwire_transaction_begin_in_failed_stays_aborted_impl() {
+    let server = TxnTestServer::start().await.expect("server start");
+    let client = connect(&server).await;
+    let t = format!(
+        "txn_beginfail_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    setup_table(&client, &t).await;
+
+    // BEGIN; buffered write; statement error → 25P02; BEGIN (must NOT reset);
+    client.simple_query("BEGIN").await.expect("begin");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {t} (id, label) VALUES (50, 'doomed')"
+        ))
+        .await
+        .expect("buffered insert");
+    // A statement that genuinely errors (unknown table -> 42P01) fails the
+    // transaction via the send_error hook.
+    let err = client
+        .simple_query(&format!("INSERT INTO no_such_table_{t} VALUES (1)"))
+        .await
+        .expect_err("unknown-table insert must fail the txn");
+    let code = err
+        .as_db_error()
+        .map(|d| d.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(
+        code, "42P01",
+        "expected 42P01 for the unknown table, got: {err}"
+    );
+
+    client.simple_query("BEGIN").await.expect("begin in failed");
+    // The txn must STILL be aborted: a write is refused with 25P02.
+    let err = client
+        .simple_query(&format!(
+            "INSERT INTO {t} (id, label) VALUES (51, 'must-refuse')"
+        ))
+        .await
+        .expect_err("write after BEGIN-in-failed must still be refused");
+    let code = err
+        .as_db_error()
+        .map(|d| d.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "25P02", "expected 25P02, got: {err}");
+
+    // COMMIT in the failed txn discards (PG: behaves as ROLLBACK).
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT in a failed txn completes cleanly");
+    let fresh = connect(&server).await;
+    assert_eq!(
+        visible_ids(&fresh, t.as_str()).await,
+        Vec::<String>::new(),
+        "the aborted transaction's writes must be discarded, never committed"
+    );
+
+    // And the session recovers: a fresh transaction commits normally.
+    client.simple_query("BEGIN").await.expect("begin after");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {t} (id, label) VALUES (52, 'recovered')"
+        ))
+        .await
+        .expect("buffered after recovery");
+    client.simple_query("COMMIT").await.expect("commit");
+    let fresh = connect(&server).await;
+    assert_eq!(
+        visible_ids(&fresh, t.as_str()).await,
+        vec!["52"],
+        "session must recover after the aborted transaction"
+    );
+}
+
+/// Batch-path DDL gate: a multi-statement simple-query batch containing DDL
+/// inside a transaction must be rejected (0A000) exactly like the extended
+/// path — the buffered-write gate must not be bypassable by batching.
+#[test]
+fn pgwire_transaction_batch_ddl_rejected() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let server = TxnTestServer::start().await.expect("server start");
+            let client = connect(&server).await;
+            let t = format!(
+                "txn_batchddl_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            );
+            setup_table(&client, &t).await;
+
+            let err = client
+                .simple_query(&format!(
+                    "BEGIN; INSERT INTO {t} (id, label) VALUES (60, 'batched'); \
+                     CREATE TABLE txn_batch_ddl_{0} (id INT); COMMIT",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                ))
+                .await
+                .expect_err("batched DDL-in-txn must be rejected");
+            let code = err
+                .as_db_error()
+                .map(|d| d.code().code().to_string())
+                .unwrap_or_default();
+            assert_eq!(code, "0A000", "expected 0A000 for batched DDL, got: {err}");
+
+            // The error failed the txn; ROLLBACK recovers and nothing is visible.
+            client
+                .simple_query("ROLLBACK")
+                .await
+                .expect("rollback recovers the session");
+            let fresh = connect(&server).await;
+            assert_eq!(
+                visible_ids(&fresh, t.as_str()).await,
+                Vec::<String>::new(),
+                "the aborted batch must not have committed its writes"
+            );
+        });
+}

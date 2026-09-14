@@ -313,6 +313,12 @@ struct TransactionBufferEntry {
     statement: crate::services::dml::DmlStatement,
     tenant_ctx: Option<crate::storage::tenant::context::TenantContext>,
     approx_bytes: usize,
+    /// Written table + resolved write tenant, captured at push time so COMMIT
+    /// replay can run the SAME mandate-#16b OLAP-result-cache invalidation the
+    /// direct write path runs after every `execute_scoped` — without it a
+    /// committed transaction leaves stale cached results for the table.
+    table: String,
+    write_tenant: String,
 }
 
 /// Bounded in-memory write buffer for one explicit transaction.
@@ -404,11 +410,18 @@ fn classify_transaction_statement(query: &str) -> Option<TransactionStatement> {
         "COMMIT" | "END" => match (second, words.len()) {
             (_, 1) => Some(TransactionStatement::Control(TransactionControl::Commit)),
             ("WORK", 2) => Some(TransactionStatement::Control(TransactionControl::Commit)),
+            ("TRANSACTION", 2) => Some(TransactionStatement::Control(TransactionControl::Commit)),
             ("PREPARED", _) => {
                 unsupported("two-phase commit (COMMIT PREPARED) is not supported (ADR-018 P2.D)")
             }
             ("AND", _) => unsupported("COMMIT AND CHAIN is not supported (ADR-018 P2.D)"),
-            _ => None,
+            // Fail closed on an unrecognized tail: falling through to the
+            // generic executor here made a typo'd COMMIT (e.g. "COMMIT
+            // TRANSACTON") a silent success that committed nothing while the
+            // buffered writes stranded in memory.
+            other => Some(TransactionStatement::Unsupported(format!(
+                "unsupported {first} tail {other:?} (ADR-018 P2.D)"
+            ))),
         },
         "ROLLBACK" | "ABORT" => match (second, words.len()) {
             (_, 1) => Some(TransactionStatement::Control(TransactionControl::Rollback)),
@@ -422,7 +435,9 @@ fn classify_transaction_statement(query: &str) -> Option<TransactionStatement> {
                 unsupported("two-phase commit (ROLLBACK PREPARED) is not supported (ADR-018 P2.D)")
             }
             ("AND", _) => unsupported("ROLLBACK AND [NO] CHAIN is not supported (ADR-018 P2.D)"),
-            _ => None,
+            other => Some(TransactionStatement::Unsupported(format!(
+                "unsupported {first} tail {other:?} (ADR-018 P2.D)"
+            ))),
         },
         "SAVEPOINT" | "RELEASE" => unsupported(
             "SAVEPOINT/RELEASE is not supported yet (ADR-018 P2.D defers \
@@ -1871,7 +1886,11 @@ impl PostgresProtocol {
                 "transactional DDL is not supported yet (ADR-018 P2.D); commit or roll back the current transaction first",
             )
             .await?;
-            self.send_ready_for_query('T').await?;
+            // The send_error hook FAILED the transaction (any error inside an
+            // active txn aborts it) — report the true post-error status byte,
+            // not a hardcoded in-transaction 'T'.
+            self.send_ready_for_query(self.transaction_status_byte().await)
+                .await?;
             return Ok(());
         }
 
@@ -2071,6 +2090,8 @@ impl PostgresProtocol {
         statement: crate::services::dml::DmlStatement,
         tenant_ctx: Option<crate::storage::tenant::context::TenantContext>,
         approx_bytes: usize,
+        table: String,
+        write_tenant: String,
     ) -> Result<(), String> {
         if self.transaction_buffer.entries.len() >= TRANSACTION_MAX_ENTRIES
             || self
@@ -2095,6 +2116,8 @@ impl PostgresProtocol {
                 statement,
                 tenant_ctx,
                 approx_bytes,
+                table,
+                write_tenant,
             });
         Ok(())
     }
@@ -2118,7 +2141,15 @@ impl PostgresProtocol {
                         // transaction (no NoticeResponse helper yet — no-op,
                         // documented in the ADR amendment).
                         TransactionState::InTransaction => {}
-                        _ => {
+                        // BEGIN in an ABORTED transaction is also a no-op in
+                        // PostgreSQL: only ROLLBACK escapes the failed state.
+                        // Treating Failed as fresh here silently discarded the
+                        // aborted transaction's pending writes while letting
+                        // subsequent writes commit in a new transaction — a
+                        // silent data-loss shape, not a PG-compatible
+                        // "warning and stay aborted".
+                        TransactionState::Failed => {}
+                        TransactionState::Idle => {
                             session.begin_transaction();
                             let buffer = &mut self.transaction_buffer;
                             buffer.clear();
@@ -2233,7 +2264,16 @@ impl PostgresProtocol {
                 }
             };
             match replay {
-                Ok(_) => {}
+                Ok(_) => {
+                    // Mandate #16b: same tenant-scoped OLAP result-cache
+                    // invalidation the direct write path runs — replay is a
+                    // real write, not a cache-transparent one.
+                    super::relational_pipeline::invalidate_olap_result_cache_for(
+                        &entry.write_tenant,
+                        &entry.table,
+                    )
+                    .await;
+                }
                 Err(e) => {
                     // Keep the UNREPLAYED remainder so ROLLBACK is a clean
                     // discard; the transaction is FAILED either way.
@@ -5208,7 +5248,13 @@ impl PostgresProtocol {
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
                     if let Err(reason) = self
-                        .transaction_push(statement, tenant_ctx, approx_bytes)
+                        .transaction_push(
+                            statement,
+                            tenant_ctx,
+                            approx_bytes,
+                            table.clone(),
+                            write_tenant.clone(),
+                        )
                         .await
                     {
                         return self.send_error("ERROR", "54000", &reason).await;
@@ -5361,7 +5407,13 @@ impl PostgresProtocol {
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
                     if let Err(reason) = self
-                        .transaction_push(statement, tenant_ctx, approx_bytes)
+                        .transaction_push(
+                            statement,
+                            tenant_ctx,
+                            approx_bytes,
+                            table.clone(),
+                            write_tenant.clone(),
+                        )
                         .await
                     {
                         return self.send_error("ERROR", "54000", &reason).await;
@@ -5508,7 +5560,13 @@ impl PostgresProtocol {
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
                     if let Err(reason) = self
-                        .transaction_push(statement, tenant_ctx, approx_bytes)
+                        .transaction_push(
+                            statement,
+                            tenant_ctx,
+                            approx_bytes,
+                            table.clone(),
+                            write_tenant.clone(),
+                        )
                         .await
                     {
                         return self.send_error("ERROR", "54000", &reason).await;
