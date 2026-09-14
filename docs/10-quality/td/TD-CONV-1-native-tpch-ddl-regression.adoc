@@ -1,0 +1,62 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CONV-1: Converter round-39 regression — `native_tpch_q18_q20_e2e` fails at DDL on fresh server ("Table 'customer' already exists")
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Discovered 2026-09-09 while wiring the orphaned accuracy suites into CI (TD-182 P0, PR-A `fix/correctness-floor`). The test was one of the orphaned suites — exactly the blind spot the TD-182 wiring exists to close.
+| Priority | **HIGH** — a row-exact TPC-H correctness test regressed on `develop` invisibly; the same commit is a candidate to have broken other un-CI'd DDL shapes.
+| Component | SQL converter / pgwire DDL dispatch — `src/network/postgres/protocol.rs`, `src/query/federated/optimizer/sql_parsing.rs`, `src/query/unified_query_port_impl.rs` (files touched by the regressing PR).
+| Relates to | PR #1852 (`fix(query): converter review round 39`, merged as c7134e962), TD-182, TD-185, ADR-040.
+|===
+
+== The regression
+
+`tests/native_tpch_q18_q20_e2e.rs::native_tpch_q18_and_q20_execute_row_exact` fails at its DDL
+setup loop (`tests/native_tpch_q18_q20_e2e.rs:161`) with:
+
+[subs="quotes"]
+----
+[42P01] DDL failed: Table 'customer' already exists
+----
+
+on a **fresh in-process server** (fresh `TempDir` data dir, first client, and the very first
+statements are plain `CREATE TABLE` — no `IF NOT EXISTS`, no re-run within the process).
+
+== Evidence (bisected by commit)
+
+|===
+| Commit | Result
+| `75fe44e3a` (develop BEFORE #1852) | **PASS** (`cargo test --test native_tpch_q18_q20_e2e -- --test-threads=1`, 3 consecutive runs)
+| `c7134e962` (#1852 merged, develop HEAD at filing; PR-A changes stashed) | **FAIL 3/3**, identical signature
+|===
+
+Repro:
+
+----
+cargo test --test native_tpch_q18_q20_e2e -- --test-threads=1 --nocapture
+----
+
+The failing statement is the first `CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_name VARCHAR)`
+of the DDL list (`tests/native_tpch_q18_q20_e2e.rs:137`). Server-side `RUST_LOG=proximadb=info`
+shows no duplicate statement dispatch on the wire — the failure reproduces with only ONE
+`CREATE TABLE customer` observed, so the duplicate-existence signal arises *inside* the DDL
+path (catalog double-registration, or the create flow reporting against a stale/prefilled
+catalog view), not from a re-sent statement.
+
+== Why it went unnoticed
+
+The test was one of the ~20 orphaned accuracy e2e files (TD-182) that no CI tier ran. PR-A
+wires the other 19 into the `rust-integration-test-pgwire-accuracy` named list; this one is
+held back until this TD closes, so the new CI lane lands green.
+
+== How to apply
+
+1. Reproduce with the command above at develop HEAD.
+2. Trace `CREATE TABLE customer` through the pgwire DDL dispatch post-#1852 (the round-39
+   `strip_distinct_prefix` / `parse_ddl` restructure and the `unified_query_port_impl` changes
+   are the touched surfaces) and fix the duplicate/prefilled registration.
+3. Add `native_tpch_q18_q20_e2e` back to the `pgwire_accuracy_changes` filter + the
+   `rust-integration-test-pgwire-accuracy` named list (the entries were removed in the
+   TD-182 wiring PR with a pointer here), then close this TD.

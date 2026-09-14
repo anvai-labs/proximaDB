@@ -335,20 +335,20 @@ async fn graph_ldbc_pgwire_conformance_inner() {
         vec![3],
         "g06: mutual friends of 1 and 4 (INTERSECT) is person 3"
     );
-    // g10 KNOWN-BAD (TD-185): variable-hop reachability via a recursive CTE should
-    // return [6] (all nodes reachable from person 1), but the engine currently
-    // returns NO rows — a silent wrong answer the execution ratchet counted as a
-    // pass. Pinned as known-bad (ADR-040 pattern, cf. document TD-183) so the fix is
-    // auto-detected: when the recursive-CTE path works this assert fails, and g10
-    // graduates to `assert_eq!(… , vec![6])` + TD-185 closes.
-    assert!(
+    // g10 (TD-185a fixed): variable-hop reachability via a recursive CTE returns
+    // ALL nodes reachable from person 1 — the whole triangle + chain. The WITH
+    // header now engages the relational/OLAP route, the CTE name resolves as
+    // engine-local (not a catalog table), and the DataFusion floor plans the
+    // recursive CTE natively. Before the fix this silently returned ZERO rows
+    // (a clean pgwire success the execution ratchet counted as a pass).
+    assert_eq!(
         col_ints(
             &client,
             "with recursive reach(id) as (select 1 union select k.k_person2 from knows k join reach r on k.k_person1 = r.id) select count(distinct id) as reachable from reach"
         )
-        .await
-        .is_empty(),
-        "g10 (TD-185): recursive-CTE reachability now returns rows — fix landed; update g10 to assert == vec![6] and close TD-185"
+        .await,
+        vec![6],
+        "g10 (TD-185a): recursive-CTE reachability from person 1 covers all 6 nodes"
     );
 }
 

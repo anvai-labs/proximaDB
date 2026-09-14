@@ -640,7 +640,7 @@ impl ObjectStoreParquetTable {
                 .map_err(|e| df_err(&format!("parquet metadata {path}"), e))?;
             let file_schema = builder.schema().clone();
             if schema.is_none() {
-                schema = Some(file_schema);
+                schema = Some(Self::normalize_schema_for_planning(file_schema));
             }
             if let Some(size) = size {
                 file_sizes.insert(path.as_ref().to_string(), size);
@@ -671,6 +671,32 @@ impl ObjectStoreParquetTable {
             splits: self.splits.clone(),
             file_sizes: self.file_sizes.clone(),
         }
+    }
+
+    /// TD-185a: strip per-field metadata from a footer-derived schema before it
+    /// becomes the table's planning schema. The materializer bakes the catalog's
+    /// field tags (`proxima_column_id`, `comment`) into the Parquet Arrow schema;
+    /// nothing on the DataFusion route reads them, and DataFusion's recursive-CTE
+    /// planning compares the recursive term's fields against the SQL-declared
+    /// CTE schema INCLUDING metadata — a tagged scan field can never match a
+    /// SQL-declared column, which failed every recursive CTE over materialized
+    /// tables at planning time (`Cannot project plan column … field metadata
+    /// differs`). Schema-level (file) metadata is kept: it does not participate
+    /// in field comparison.
+    fn normalize_schema_for_planning(schema: SchemaRef) -> SchemaRef {
+        let fields: Vec<arrow_schema::Field> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let field = f.as_ref().clone();
+                if field.metadata().is_empty() {
+                    field
+                } else {
+                    field.with_metadata(Default::default())
+                }
+            })
+            .collect();
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
     }
 
     /// Assemble a table from a cached [`TableOpenDiscovery`](super::table_open_cache::TableOpenDiscovery)
@@ -1422,6 +1448,35 @@ mod tests {
             Operator::Gt,
             Box::new(Expr::Literal(DfScalarValue::Int64(Some(value)), None)),
         ))
+    }
+
+    #[test]
+    fn normalize_schema_for_planning_strips_field_metadata_only() {
+        let mut field_meta = std::collections::HashMap::new();
+        field_meta.insert("proxima_column_id".to_string(), "2".to_string());
+        let mut file_meta = std::collections::HashMap::new();
+        file_meta.insert("format".to_string(), "proximadb".to_string());
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, true).with_metadata(field_meta),
+                Field::new("name", DataType::Utf8, false),
+            ],
+            file_meta.clone(),
+        ));
+
+        let normalized = ObjectStoreParquetTable::normalize_schema_for_planning(schema);
+        // Field metadata (the catalog's proxima_column_id / comment tags) is
+        // stripped — it can never match a SQL-declared CTE column in DataFusion's
+        // recursive-CTE field comparison.
+        assert!(normalized.field(0).metadata().is_empty());
+        assert!(normalized.field(1).metadata().is_empty());
+        // Names / types / nullability are preserved.
+        assert_eq!(normalized.field(0).name(), "id");
+        assert_eq!(normalized.field(0).data_type(), &DataType::Int64);
+        assert!(normalized.field(0).is_nullable());
+        assert_eq!(normalized.field(1).name(), "name");
+        // Schema-level (file) metadata is kept.
+        assert_eq!(normalized.metadata(), &file_meta);
     }
 
     #[tokio::test]

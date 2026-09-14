@@ -987,7 +987,7 @@ pub async fn try_run_select(
     // lazily per scan in `DmlTableReader::open`, with the executor's
     // projection/predicate/limit pushed into storage.
     let mut names = Vec::new();
-    collect_table_names(query, &mut names);
+    let cte_names = collect_table_names(query, &mut names);
     let mut tables: HashMap<String, PreparedTable> = HashMap::new();
     // P1: per-table Parquet location (object-store backed), populated only under the
     // `datafusion-integration` feature so the OLAP DataFusion route is never taken
@@ -1011,6 +1011,11 @@ pub async fn try_run_select(
     let mut pax_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw in &names {
         let key = normalize_table_key(raw);
+        // TD-185a: a WITH-defined name is resolved by the SQL engine, not the
+        // catalog — it must never fail snapshot preparation.
+        if cte_names.contains(&key) {
+            continue;
+        }
         if tables.contains_key(&key) {
             continue;
         }
@@ -2982,10 +2987,14 @@ async fn build_snapshot(
 ) -> Option<SnapshotCatalog> {
     let tenant = identity.tenant_id;
     let mut names = Vec::new();
-    collect_table_names(query, &mut names);
+    let cte_names = collect_table_names(query, &mut names);
     let mut tables: HashMap<String, PreparedTable> = HashMap::new();
     for raw in &names {
         let key = normalize_table_key(raw);
+        // TD-185a: WITH-defined names resolve by the SQL engine, not the catalog.
+        if cte_names.contains(&key) {
+            continue;
+        }
         if tables.contains_key(&key) {
             continue;
         }
@@ -3069,11 +3078,15 @@ async fn route_and_plan_select(
     #[cfg(feature = "datafusion-integration")]
     {
         let mut names = Vec::new();
-        collect_table_names(query, &mut names);
+        let cte_names = collect_table_names(query, &mut names);
         if !names.is_empty() {
             let mut all_parquet = true;
             let mut locations = Vec::with_capacity(names.len());
             for raw in &names {
+                // TD-185a: WITH-defined names resolve by the SQL engine.
+                if cte_names.contains(&normalize_table_key(raw)) {
+                    continue;
+                }
                 match dml.resolve_relational_schema(raw, tenant).await {
                     Ok(schema) => match catalog_table_is_parquet_backed(&schema) {
                         Some(location) => locations.push(location),
@@ -3502,11 +3515,16 @@ mod route_explain_tests {
 // =========================================================================
 
 /// True iff the query uses a feature the legacy single-table path can't serve
-/// (join / GROUP BY / HAVING / aggregate projection / set-op), so it should be
-/// routed to the algebra engine over real data. Simple single-table SELECTs
-/// return false and stay on the legacy path.
+/// (join / GROUP BY / HAVING / aggregate projection / set-op / WITH), so it
+/// should be routed to the algebra engine over real data. Simple single-table
+/// SELECTs return false and stay on the legacy path.
 fn query_engages_relational_engine(query: &SqlQuery) -> bool {
-    set_expr_engages(&query.body)
+    // TD-185a: a WITH (CTE) header is itself beyond the legacy single-table
+    // path — the CTE name is not a catalog table, so the legacy FROM-token
+    // walk can only misparse it. Engage the relational/OLAP route; the
+    // frontend's CTE decline then falls the query through to the DataFusion
+    // floor (which plans CTEs, recursive included, natively).
+    query.with.is_some() || set_expr_engages(&query.body)
 }
 
 /// TD-OLAP-4 operation dimension: classify the SELECT's OLAP operation from the AST
@@ -4077,28 +4095,64 @@ fn expr_has_aggregate(expr: &SqlExpr) -> bool {
     }
 }
 
-fn collect_table_names(query: &SqlQuery, out: &mut Vec<String>) {
-    collect_from_set_expr(&query.body, out);
+/// Collect every catalog table referenced by `query`, returning the set of
+/// CTE-local names declared by any (possibly nested) `WITH` clause.
+///
+/// TD-185a: base tables inside CTE bodies must resolve into the snapshot
+/// (the executor/DATAFusion floor needs their schemas), while a FROM
+/// reference to a CTE name must NOT be resolved as a catalog table — before
+/// this, the CTE name was collected as a table, schema resolution failed,
+/// and the whole WITH query silently bounced to the legacy single-table
+/// path (the recursive-CTE empty-result bug).
+fn collect_table_names(
+    query: &SqlQuery,
+    out: &mut Vec<String>,
+) -> std::collections::HashSet<String> {
+    let mut cte_names = std::collections::HashSet::new();
+    collect_query_tables(query, out, &mut cte_names);
+    cte_names
 }
 
-fn collect_from_set_expr(body: &SetExpr, out: &mut Vec<String>) {
+fn collect_query_tables(
+    query: &SqlQuery,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
+    // Nested WITH scopes add their CTE names to the shared set. SQL shadowing
+    // semantics would confine a CTE name to its own scope; the shared set is
+    // wider, and only in the pathological case of a real table shadowed by a
+    // same-named CTE outside its scope — acceptable for snapshot preparation.
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            cte_names.insert(normalize_table_key(&cte.alias.name.value));
+            collect_query_tables(&cte.query, out, cte_names);
+        }
+    }
+    collect_from_set_expr(&query.body, out, cte_names);
+}
+
+fn collect_from_set_expr(
+    body: &SetExpr,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
     match body {
         SetExpr::Select(select) => {
             for twj in &select.from {
-                collect_from_table_with_joins(twj, out);
+                collect_from_table_with_joins(twj, out, cte_names);
             }
             // Also descend into WHERE subqueries (IN/EXISTS lower to Semi/Anti joins
             // whose right side scans the subquery's tables) so those tables get
             // prepared in the snapshot — otherwise the subquery fails to lower and
             // the query silently falls through to the legacy path.
             if let Some(where_expr) = &select.selection {
-                collect_subquery_tables_in_expr(where_expr, out);
+                collect_subquery_tables_in_expr(where_expr, out, cte_names);
             }
         }
-        SetExpr::Query(q) => collect_table_names(q, out),
+        SetExpr::Query(q) => collect_query_tables(q, out, cte_names),
         SetExpr::SetOperation { left, right, .. } => {
-            collect_from_set_expr(left, out);
-            collect_from_set_expr(right, out);
+            collect_from_set_expr(left, out, cte_names);
+            collect_from_set_expr(right, out, cte_names);
         }
         _ => {}
     }
@@ -4106,18 +4160,22 @@ fn collect_from_set_expr(body: &SetExpr, out: &mut Vec<String>) {
 
 /// Collect table names referenced by subqueries inside a WHERE expression
 /// (`IN (…)`, `EXISTS`, scalar subqueries), recursing through boolean structure.
-fn collect_subquery_tables_in_expr(expr: &SqlExpr, out: &mut Vec<String>) {
+fn collect_subquery_tables_in_expr(
+    expr: &SqlExpr,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
     match expr {
         SqlExpr::InSubquery { subquery, .. } | SqlExpr::Exists { subquery, .. } => {
-            collect_table_names(subquery, out);
+            collect_query_tables(subquery, out, cte_names);
         }
-        SqlExpr::Subquery(q) => collect_table_names(q, out),
+        SqlExpr::Subquery(q) => collect_query_tables(q, out, cte_names),
         SqlExpr::BinaryOp { left, right, .. } => {
-            collect_subquery_tables_in_expr(left, out);
-            collect_subquery_tables_in_expr(right, out);
+            collect_subquery_tables_in_expr(left, out, cte_names);
+            collect_subquery_tables_in_expr(right, out, cte_names);
         }
         SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => {
-            collect_subquery_tables_in_expr(expr, out);
+            collect_subquery_tables_in_expr(expr, out, cte_names);
         }
         _ => {}
     }
@@ -4134,14 +4192,22 @@ fn table_with_joins_has_derived(twj: &TableWithJoins) -> bool {
             .any(|j| matches!(j.relation, TableFactor::Derived { .. }))
 }
 
-fn collect_from_table_with_joins(twj: &TableWithJoins, out: &mut Vec<String>) {
-    collect_from_table_factor(&twj.relation, out);
+fn collect_from_table_with_joins(
+    twj: &TableWithJoins,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
+    collect_from_table_factor(&twj.relation, out, cte_names);
     for join in &twj.joins {
-        collect_from_table_factor(&join.relation, out);
+        collect_from_table_factor(&join.relation, out, cte_names);
     }
 }
 
-fn collect_from_table_factor(factor: &TableFactor, out: &mut Vec<String>) {
+fn collect_from_table_factor(
+    factor: &TableFactor,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
     match factor {
         // A `FROM name(args)` item is a table-valued function (cross-modal source:
         // vector_search / timeseries_range / graph_traverse), NOT a catalog table.
@@ -4152,10 +4218,16 @@ fn collect_from_table_factor(factor: &TableFactor, out: &mut Vec<String>) {
         // table-valued function (cross-modal source: vector_search / timeseries_range /
         // graph_traverse) — it matches neither arm below, falls through to `_`, and is left for
         // the DataFusion `ctx.sql` fallback (where the UDTFs are registered) to resolve.
+        // TD-185a: a reference to a WITH-defined name resolves by the SQL
+        // engine, not the catalog — the match guard skips it so it can't fail
+        // snapshot preparation.
         TableFactor::Table {
             name, args: None, ..
-        } => out.push(name.to_string()),
-        TableFactor::Derived { subquery, .. } => collect_table_names(subquery, out),
+        } if !cte_names.contains(&normalize_table_key(&name.to_string())) => {
+            out.push(name.to_string());
+        }
+        TableFactor::Table { args: None, .. } => {}
+        TableFactor::Derived { subquery, .. } => collect_query_tables(subquery, out, cte_names),
         _ => {}
     }
 }
@@ -4919,6 +4991,48 @@ mod tests {
         // snapshot prepares `dept` (else the Semi-join subquery can't lower).
         assert!(keys.contains(&"emp".to_string()), "got {keys:?}");
         assert!(keys.contains(&"dept".to_string()), "got {keys:?}");
+    }
+
+    #[test]
+    fn collect_table_names_treats_cte_names_as_engine_local_not_catalog_tables() {
+        // TD-185a: the CTE name must not be collected as a catalog table (that
+        // resolution failure bounced WITH queries to the legacy path), while the
+        // base tables INSIDE the CTE body must be collected for the snapshot.
+        let query = parse_query(
+            "WITH reach(id) AS (SELECT 1 UNION SELECT k.k_person2 FROM knows k \
+             JOIN reach r ON k.k_person1 = r.id) \
+             SELECT count(distinct id) FROM reach",
+        );
+        let mut names = Vec::new();
+        let cte_names = collect_table_names(&query, &mut names);
+        let keys: Vec<String> = names.iter().map(|n| normalize_table_key(n)).collect();
+        assert!(
+            keys.contains(&"knows".to_string()),
+            "CTE body base table must be collected, got {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k == "reach"),
+            "CTE name must not be collected as a catalog table, got {keys:?}"
+        );
+        assert!(
+            cte_names.contains("reach"),
+            "got {cte_keys:?}",
+            cte_keys = cte_names
+        );
+    }
+
+    #[test]
+    fn with_header_always_engages_the_relational_engine() {
+        // TD-185a: a WITH header is beyond the legacy single-table path even
+        // when the outer body is a plain single-table scan over the CTE — the
+        // legacy FROM-token walk can only misparse the CTE name.
+        assert!(query_engages_relational_engine(&parse_query(
+            "WITH x AS (SELECT id FROM t) SELECT id FROM x"
+        )));
+        assert!(query_engages_relational_engine(&parse_query(
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 9) \
+             SELECT sum(n) FROM r"
+        )));
     }
 
     #[test]
