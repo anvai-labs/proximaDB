@@ -399,7 +399,7 @@ functions only — plpgsql is a separate multi-month effort).
   is a stub).
 * `LISTEN` / `NOTIFY` (optional — most ORMs don't need it).
 * SSL / TLS native pgwire negotiation.
-* SCRAM-SHA-256 authentication (today is cleartext-only).
+* SCRAM-SHA-256 authentication — **DELIVERED** (TD-PGWIRE-AUTH-1, 2026-09: fail-closed `[security.pgwire]` ladder; channel binding with native TLS stays open here).
 * Connection pooling-friendly: pgwire flow respects `Sync` boundaries
   cleanly under pgBouncer transaction-pool mode.
 

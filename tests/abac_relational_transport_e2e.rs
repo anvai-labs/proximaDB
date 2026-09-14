@@ -8,7 +8,7 @@
 //! journey:
 //!
 //! ```text
-//! authenticated SQL setup + SELECT ---+
+//! pgwire setup + authenticated SELECT ----+
 //!                                      v
 //! authenticated gRPC ExecuteQuery -> relational DML scan
 //! authenticated REST /api/v2/sql ----> shared typed SQL port
@@ -20,7 +20,7 @@
 //! ```
 //!
 //! The test proves deny-before-provision, hot permit without reconnect/restart,
-//! isolation of an unbound subject, and hot revoke over authenticated SQL and
+//! isolation of an unbound subject, and hot revoke over SCRAM-authenticated pgwire and
 //! the credential-authenticated REST, gRPC, and Flight transports. It also
 //! obtains the table's stable object id through canonical read-only replay of
 //! the isolated fixture's catalog WAL. This is test setup, not policy tooling:
@@ -45,6 +45,7 @@ use proximadb::proto::proximadb_v2::{
     GetRecordRequest, TypedSearchRequest, V2QueryRequest, V2QueryResponse,
 };
 use proximadb::security::SecurityMode;
+use proximadb::security::auth_service::ScramUserConfig;
 use proximadb::security::auth_service::{
     ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, MtlsConfig, SSOConfig,
 };
@@ -100,6 +101,24 @@ fn transport_security_config() -> SecurityConfig {
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys,
+            // `authentication.enabled=true` FORCES pgwire to password mode
+            // (the pgwire knob can raise, never lower) — the pgwire setup
+            // connections therefore authenticate with SCRAM too, bound to
+            // the tenant the clients assert via `dbname={TENANT}`.
+            scram_users: ["setup-operator", "alice", "bob"]
+                .into_iter()
+                .map(|user| {
+                    (
+                        user.to_string(),
+                        ScramUserConfig {
+                            password: Some("policy-e2e".to_string()),
+                            verifier: None,
+                            tenant_id: Some(TENANT.to_string()),
+                            roles: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test-secret".to_string(),
@@ -136,6 +155,7 @@ fn transport_security_config() -> SecurityConfig {
         encryption: EncryptionConfig::default(),
         key_store: KeyStoreConfig::default(),
         tenant: Default::default(),
+        pgwire: proximadb::security::security_coordinator::PgwireSecurityConfig::default(),
     }
 }
 
@@ -204,7 +224,7 @@ impl LiveServer {
 
     fn pg_conn_str(&self, subject: &str) -> String {
         format!(
-            "host=127.0.0.1 port={} user={subject} dbname={TENANT} sslmode=disable",
+            "host=127.0.0.1 port={} user={subject} password=policy-e2e dbname={TENANT} sslmode=disable",
             self.pg_port
         )
     }
@@ -976,7 +996,7 @@ async fn authenticated_sql_counts_follow_live_policy_provision_and_revoke_inner(
 /// `ProximaRecordService.ExecuteQuery`. Keep this as a separate live ratchet
 /// from REST: gRPC obtains the subject
 /// from a verified API key and therefore proves the load-bearing authenticated
-/// carrier. Trust-auth pgwire is not admitted on this authenticated fixture.
+/// carrier, distinct from pgwire's SCRAM-authenticated session identity.
 #[test]
 fn grpc_reads_follow_live_rest_policy_provision_and_revoke() {
     let runtime = tokio::runtime::Builder::new_multi_thread()

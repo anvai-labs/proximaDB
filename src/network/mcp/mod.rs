@@ -70,6 +70,7 @@ pub async fn serve(
         "MCP",
         addr,
         security_coordinator.is_some(),
+        false,
         &proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
     )?;
     let router = router(backend, security_coordinator)?;

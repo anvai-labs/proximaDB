@@ -658,21 +658,28 @@ impl TLSConfig {
 }
 
 /// Admission for surfaces without request-bound credentials and permissions.
-/// TLS or a caller-supplied tenant assertion cannot substitute for those.
+/// TLS or a caller-supplied tenant assertion cannot substitute for those —
+/// UNLESS the listener enforces its own per-connection authentication
+/// (`listener_authenticated`, e.g. pgwire SCRAM, TD-PGWIRE-AUTH-1), in which
+/// case the single-tenant/loopback/no-coordinator restriction doesn't apply:
+/// the listener is no longer trust-only.
 pub fn validate_trust_only_listener(
     surface: &str,
     address: SocketAddr,
     coordinator_present: bool,
+    listener_authenticated: bool,
     mode: &proximadb_tenant::TenantDeploymentMode,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        !coordinator_present
-            && matches!(
-                mode,
-                proximadb_tenant::TenantDeploymentMode::SingleTenant { .. }
-            )
-            && address.ip().is_loopback(),
-        "{surface} currently supports only unauthenticated single-tenant loopback access; \
+        listener_authenticated
+            || (!coordinator_present
+                && matches!(
+                    mode,
+                    proximadb_tenant::TenantDeploymentMode::SingleTenant { .. }
+                )
+                && address.ip().is_loopback()),
+        "{surface} currently supports only unauthenticated single-tenant loopback access \
+         unless the listener enforces its own per-connection authentication; \
          disable this listener in authenticated, multi-tenant, or non-loopback deployments"
     );
     Ok(())
@@ -680,9 +687,13 @@ pub fn validate_trust_only_listener(
 
 impl MultiServerConfig {
     /// Validate the entire listener set before binding any of its sockets.
+    /// `pgwire_authenticated` is true when pgwire enforces its own
+    /// per-connection authentication (SCRAM, TD-PGWIRE-AUTH-1) — MCP has no
+    /// such capability and stays trust-only regardless.
     pub fn validate_listener_security(
         &self,
         coordinator_present: bool,
+        pgwire_authenticated: bool,
         mode: &proximadb_tenant::TenantDeploymentMode,
     ) -> anyhow::Result<()> {
         self.tls_config
@@ -708,6 +719,7 @@ impl MultiServerConfig {
                 "pgwire",
                 self.postgres_config.active_bind_address(),
                 coordinator_present,
+                pgwire_authenticated,
                 mode,
             )?;
         }
@@ -720,6 +732,7 @@ impl MultiServerConfig {
                 "MCP",
                 SocketAddr::new(self.http_bind_address().ip(), port),
                 coordinator_present,
+                false,
                 mode,
             )?;
         }
@@ -812,12 +825,13 @@ mod tests {
         let local = SocketAddr::from(([127, 0, 0, 1], 5433));
         let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
         for surface in ["pgwire", "MCP"] {
-            assert!(validate_trust_only_listener(surface, local, false, &single).is_ok());
-            assert!(validate_trust_only_listener(surface, local, true, &single).is_err());
+            assert!(validate_trust_only_listener(surface, local, false, false, &single).is_ok());
+            assert!(validate_trust_only_listener(surface, local, true, false, &single).is_err());
             assert!(
                 validate_trust_only_listener(
                     surface,
                     local,
+                    false,
                     false,
                     &proximadb_tenant::TenantDeploymentMode::MultiTenant
                 )
@@ -830,14 +844,21 @@ mod tests {
                 "[::ffff:192.0.2.1]:5433",
             ] {
                 assert!(
-                    validate_trust_only_listener(surface, address.parse().unwrap(), false, &single)
-                        .is_err()
+                    validate_trust_only_listener(
+                        surface,
+                        address.parse().unwrap(),
+                        false,
+                        false,
+                        &single
+                    )
+                    .is_err()
                 );
             }
             assert!(
                 validate_trust_only_listener(
                     surface,
                     "[::1]:5433".parse().unwrap(),
+                    false,
                     false,
                     &single
                 )
@@ -846,27 +867,86 @@ mod tests {
         }
     }
 
+    /// TD-PGWIRE-AUTH-1: a listener that enforces its own per-connection
+    /// authentication (SCRAM) is no longer trust-only — it's admitted with a
+    /// coordinator present, in multi-tenant mode, and on a non-loopback
+    /// address, none of which are individually sufficient without
+    /// `listener_authenticated`.
+    #[test]
+    fn trust_only_listener_admits_an_authenticated_listener_anywhere() {
+        assert!(
+            validate_trust_only_listener(
+                "pgwire",
+                "0.0.0.0:5433".parse().unwrap(),
+                true,
+                true,
+                &proximadb_tenant::TenantDeploymentMode::MultiTenant
+            )
+            .is_ok()
+        );
+        // Not authenticated: the exact same shared/multi-tenant/remote
+        // deployment is still rejected.
+        assert!(
+            validate_trust_only_listener(
+                "pgwire",
+                "0.0.0.0:5433".parse().unwrap(),
+                true,
+                false,
+                &proximadb_tenant::TenantDeploymentMode::MultiTenant
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn listener_preflight_checks_optional_surfaces_before_startup() {
         let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
         let mut config = MultiServerConfig::default();
         config.postgres_config.bind_address = SocketAddr::from(([127, 0, 0, 1], 5433));
-        assert!(config.validate_listener_security(true, &single).is_err());
+        assert!(
+            config
+                .validate_listener_security(true, false, &single)
+                .is_err()
+        );
         config.postgres_config.enable_postgres = false;
-        assert!(config.validate_listener_security(true, &single).is_ok());
+        assert!(
+            config
+                .validate_listener_security(true, false, &single)
+                .is_ok()
+        );
         config.api_config = Some(proximadb_config::ApiConfig {
             mcp_port: Some(5700),
             ..Default::default()
         });
-        assert!(config.validate_listener_security(true, &single).is_err());
+        assert!(
+            config
+                .validate_listener_security(true, false, &single)
+                .is_err()
+        );
         config.api_config = None;
         assert!(
             config
                 .validate_listener_security(
                     false,
+                    false,
                     &proximadb_tenant::TenantDeploymentMode::MultiTenant
                 )
                 .is_err()
+        );
+    }
+
+    /// TD-PGWIRE-AUTH-1: an authenticated pgwire listener bypasses the
+    /// trust-only restriction the previous test exercises above — the
+    /// otherwise-identical shared-coordinator deployment now admits it.
+    #[test]
+    fn listener_preflight_admits_authenticated_pgwire_with_a_coordinator() {
+        let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+        let mut config = MultiServerConfig::default();
+        config.postgres_config.bind_address = SocketAddr::from(([127, 0, 0, 1], 5433));
+        assert!(
+            config
+                .validate_listener_security(true, true, &single)
+                .is_ok()
         );
     }
 
@@ -880,11 +960,23 @@ mod tests {
             mcp_port: Some(5700),
             ..Default::default()
         });
-        assert!(config.validate_listener_security(false, &single).is_ok());
+        assert!(
+            config
+                .validate_listener_security(false, false, &single)
+                .is_ok()
+        );
         config.uds_socket_dir = Some(PathBuf::from("unused-test-sockets"));
-        assert!(config.validate_listener_security(false, &single).is_err());
+        assert!(
+            config
+                .validate_listener_security(false, false, &single)
+                .is_err()
+        );
         config.api_config.as_mut().unwrap().mcp_port = None;
-        assert!(config.validate_listener_security(false, &single).is_ok());
+        assert!(
+            config
+                .validate_listener_security(false, false, &single)
+                .is_ok()
+        );
     }
 
     #[test]

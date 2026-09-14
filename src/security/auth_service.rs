@@ -7,6 +7,7 @@
 use super::rbac_service::{UnifiedAuthMethod, UnifiedPermission, UnifiedUserContext};
 use crate::audit::logger::AuditLogger;
 use crate::network::auth::{JwtService, TokenPair};
+use crate::network::postgres::scram;
 use proximadb_catalog::principal_registry::{
     FileSystemPrincipalRegistry, KEY_PREFIX as REGISTRY_KEY_PREFIX,
 };
@@ -47,6 +48,86 @@ pub struct AuthenticationConfig {
     /// verifier exists).
     #[serde(default)]
     pub oidc: Option<crate::network::auth::oidc::OidcProviderConfig>,
+    /// pgwire SCRAM-SHA-256 identities (`[security.authentication.scram_users]`,
+    /// TD-PGWIRE-AUTH-1). Deliberately a SEPARATE namespace from `api_keys`: the
+    /// identity payload maps to a key-equivalent `UnifiedUserContext`, but the
+    /// secret material lives apart so a leaked StoredKey/ServerKey can never be
+    /// replayed as an API key and vice versa.
+    #[serde(default)]
+    pub scram_users: HashMap<String, ScramUserConfig>,
+}
+
+/// One pgwire SCRAM identity (TD-PGWIRE-AUTH-1). Exactly one of `password` /
+/// `verifier` is required; a configured plaintext is derived into a verifier at
+/// coordinator build time and then dropped.
+///
+/// `Debug` is hand-written (below) to redact `password`/`verifier` — the
+/// containing `Config` is startup-logged with `{:?}` (`ProximaDB::new`), and a
+/// derived `Debug` would print the plaintext password verbatim into that log.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ScramUserConfig {
+    /// Plaintext password — converted to a [`ScramVerifierConfig`] at build,
+    /// never retained in memory or re-serialized. `skip_serializing` (not
+    /// just the redacted `Debug` below) so EVERY retained `SecurityConfig`
+    /// clone in the process (`UnifiedAuthService`, `SecurityCoordinator`,
+    /// `ProximaDB::_config` each keep their own) is safe to serialize —
+    /// scrubbing one clone's field isn't enough, the type itself must never
+    /// emit it.
+    #[serde(default, skip_serializing)]
+    pub password: Option<String>,
+    /// Precomputed verifier (salt/StoredKey/ServerKey, base64) for deployments
+    /// that refuse plaintext passwords in config files. Also never
+    /// re-serialized — same reasoning as `password` (it's still a bare
+    /// SCRAM verifier, equivalent sensitivity to a password hash).
+    #[serde(default, skip_serializing)]
+    pub verifier: Option<ScramVerifierConfig>,
+    /// Tenant binding: on successful authentication the session identity binds
+    /// to this tenant (the credential's `AuthenticatedTenantBinding`).
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// Delegation-ONLY role claims, same policy as `ApiKeyInfo::roles`: only
+    /// the exact strings `gateway`/`operator` are recognized, and a role grants
+    /// NO `UnifiedPermission`.
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+impl std::fmt::Debug for ScramUserConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScramUserConfig")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("verifier", &self.verifier.as_ref().map(|_| "<redacted>"))
+            .field("tenant_id", &self.tenant_id)
+            .field("roles", &self.roles)
+            .finish()
+    }
+}
+
+/// Precomputed SCRAM verifier material (base64-encoded parts, TD-PGWIRE-AUTH-1).
+/// `Debug` is hand-written (below) to redact the key material for the same
+/// reason as [`ScramUserConfig`] — it rides the same startup-logged `Config`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ScramVerifierConfig {
+    pub salt: String,
+    pub stored_key: String,
+    pub server_key: String,
+    #[serde(default = "default_scram_iterations")]
+    pub iterations: u32,
+}
+
+impl std::fmt::Debug for ScramVerifierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScramVerifierConfig")
+            .field("salt", &"<redacted>")
+            .field("stored_key", &"<redacted>")
+            .field("server_key", &"<redacted>")
+            .field("iterations", &self.iterations)
+            .finish()
+    }
+}
+
+fn default_scram_iterations() -> u32 {
+    crate::network::postgres::scram::DEFAULT_ITERATIONS
 }
 
 /// Count of audit writes that failed on the authentication path. Exposed so an
@@ -169,6 +250,13 @@ pub struct UnifiedAuthService {
     /// API key store
     api_keys: Arc<DashMap<String, ApiKeyInfo>>,
 
+    /// pgwire SCRAM verifiers (TD-PGWIRE-AUTH-1): derived once at build from
+    /// `config.scram_users` (plaintext passwords are converted here and the
+    /// verifier is what authentication consumes).
+    scram_verifiers: Arc<DashMap<String, scram::ScramVerifier>>,
+    /// The identity side of [`Self::scram_verifiers`] (tenant binding + roles).
+    scram_identities: Arc<DashMap<String, ScramUserConfig>>,
+
     /// ADR-090 L0: catalog-resident principal/key registry. When present it is
     /// AUTHORITATIVE for the `pxk_` key namespace; the config-table keys above
     /// remain only as the legacy bootstrap path.
@@ -216,12 +304,86 @@ impl UnifiedAuthService {
             jwt_service: None,
             oidc_verifier: None,
             api_keys: Arc::new(DashMap::new()),
+            scram_verifiers: Arc::new(DashMap::new()),
+            scram_identities: Arc::new(DashMap::new()),
             principal_registry: None,
             rate_limiter: None,
             config: config.clone(),
             audit_logger: None,
             ca_cert_der,
         };
+
+        // TD-PGWIRE-AUTH-1: derive SCRAM verifiers once at build. A configured
+        // plaintext is converted to a verifier here; the runtime auth path
+        // never touches it. Malformed verifier material fails the boot.
+        for (username, user) in &config.scram_users {
+            let verifier = match (&user.password, &user.verifier) {
+                // This arm only matches when `user.verifier` is `None`, so
+                // there is no configured iteration count to honor here —
+                // every plaintext password derives at the documented default.
+                (Some(password), None) => scram::ScramVerifier::generate(
+                    password,
+                    crate::network::postgres::scram::DEFAULT_ITERATIONS,
+                )
+                .map_err(|error| {
+                    anyhow!("scram_users[{username}]: verifier derivation failed: {error:?}")
+                })?,
+                (None, Some(material)) => {
+                    use base64::Engine as _;
+                    let decode32 = |s: &str| -> Result<[u8; 32]> {
+                        let raw = base64::engine::general_purpose::STANDARD
+                            .decode(s)
+                            .map_err(|e| anyhow!("scram_users[{username}]: bad base64: {e}"))?;
+                        raw.try_into()
+                            .map_err(|_| anyhow!("scram_users[{username}]: key must be 32 bytes"))
+                    };
+                    let salt = base64::engine::general_purpose::STANDARD
+                        .decode(&material.salt)
+                        .map_err(|e| anyhow!("scram_users[{username}]: bad salt base64: {e}"))?;
+                    scram::ScramVerifier {
+                        salt,
+                        stored_key: decode32(&material.stored_key)?,
+                        server_key: decode32(&material.server_key)?,
+                        iterations: material.iterations,
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    return Err(anyhow!(
+                        "scram_users[{username}]: configure exactly one of `password` or `verifier`"
+                    ));
+                }
+                (None, None) => {
+                    return Err(anyhow!(
+                        "scram_users[{username}]: one of `password` or `verifier` is required"
+                    ));
+                }
+            };
+            service.scram_verifiers.insert(username.clone(), verifier);
+            // `scram_identities` backs post-proof identity resolution
+            // (`convert_scram_user_to_unified`, which reads only `tenant_id`/
+            // `roles`) — never retain the credential material past derivation.
+            service.scram_identities.insert(
+                username.clone(),
+                ScramUserConfig {
+                    password: None,
+                    verifier: None,
+                    ..user.clone()
+                },
+            );
+        }
+        // The verifier is derived (into `scram_verifiers` above) and the
+        // identity metadata is copied out (into `scram_identities`, password/
+        // verifier stripped) — nothing else reads `self.config.scram_users`
+        // (the runtime auth path resolves through the two maps above), so
+        // scrub the plaintext/verifier material out of the retained config
+        // clone too. This is belt-and-suspenders: `ScramUserConfig`'s `Debug`
+        // is already redacted, but the config is `Serialize`, and a future
+        // config-dump/diagnostics path over `self.config` must not be able
+        // to re-emit the plaintext password.
+        for user in service.config.scram_users.values_mut() {
+            user.password = None;
+            user.verifier = None;
+        }
 
         // Initialize JWT service if enabled
         if config.jwt.enabled {
@@ -310,6 +472,9 @@ impl UnifiedAuthService {
             AuthenticationData::ApiKey(key) => self.authenticate_api_key(key).await,
             AuthenticationData::ClientCertificate(cert_data) => {
                 self.authenticate_client_certificate(cert_data).await
+            }
+            AuthenticationData::ScramAuthenticated { username } => {
+                self.authenticate_scram_user(username).await
             }
         };
 
@@ -1056,6 +1221,98 @@ impl UnifiedAuthService {
         }
     }
 
+    /// The SCRAM verifier for `username`, if configured (TD-PGWIRE-AUTH-1).
+    /// Consumed by the pgwire protocol layer to run the SASL exchange.
+    pub fn scram_verifier(&self, username: &str) -> Option<scram::ScramVerifier> {
+        self.scram_verifiers.get(username).map(|e| e.clone())
+    }
+
+    /// True when any pgwire SCRAM identity is configured.
+    pub fn has_scram_users(&self) -> bool {
+        !self.scram_verifiers.is_empty()
+    }
+
+    /// Authenticate a pgwire SCRAM identity (TD-PGWIRE-AUTH-1). The client
+    /// proof has ALREADY been verified by the protocol layer's
+    /// `ScramExchange` — this resolves the verified username into a
+    /// `UnifiedUserContext` from the config tables. Failure here is a
+    /// configuration mismatch (identity removed between exchange and resolve),
+    /// never a secret comparison.
+    async fn authenticate_scram_user(&self, username: &str) -> Result<AuthenticationResult> {
+        if self.scram_verifiers.is_empty() {
+            return Ok(AuthenticationResult {
+                user_context: UnifiedUserContext::anonymous(),
+                auth_method: UnifiedAuthMethod::Internal,
+                success: false,
+                error_message: Some("SCRAM authentication not configured".to_string()),
+                requires_mfa: false,
+            });
+        }
+        let Some(identity) = self
+            .scram_identities
+            .get(username)
+            .map(|entry| entry.clone())
+        else {
+            return Ok(AuthenticationResult {
+                user_context: UnifiedUserContext::anonymous(),
+                auth_method: UnifiedAuthMethod::Internal,
+                success: false,
+                error_message: Some("Invalid SCRAM credentials".to_string()),
+                requires_mfa: false,
+            });
+        };
+        Ok(AuthenticationResult {
+            user_context: self.convert_scram_user_to_unified(username, &identity),
+            auth_method: UnifiedAuthMethod::Internal,
+            success: true,
+            error_message: None,
+            requires_mfa: false,
+        })
+    }
+
+    /// Build the [`UnifiedUserContext`] for a verified SCRAM identity. Role
+    /// claims follow the SAME delegation-only sanitize policy as API keys:
+    /// only the exact `gateway`/`operator` markers pass (an arbitrary role
+    /// string would satisfy RLS RoleBased predicates — an escalation).
+    fn convert_scram_user_to_unified(
+        &self,
+        username: &str,
+        user: &ScramUserConfig,
+    ) -> UnifiedUserContext {
+        const DELEGATION_ROLES: [&str; 2] = [
+            proximadb_tenant::GATEWAY_ROLE,
+            proximadb_tenant::OPERATOR_ROLE,
+        ];
+        let mut roles = vec!["api_user".to_string()];
+        for r in &user.roles {
+            if DELEGATION_ROLES.contains(&r.as_str()) {
+                if !roles.iter().any(|existing| existing == r) {
+                    roles.push(r.clone());
+                }
+            } else {
+                warn!(
+                    scram_user = %username,
+                    dropped_role = %r,
+                    "SCRAM role ignored: only the gateway/operator delegation \
+                     markers are honored (same escalation rule as API keys)"
+                );
+            }
+        }
+        UnifiedUserContext {
+            user_id: username.to_string(),
+            tenant_id: user.tenant_id.clone(),
+            roles,
+            // No configured permissions: authorization stays permission/RBAC-
+            // driven exactly as for a zero-permission API key.
+            effective_permissions: HashSet::new(),
+            auth_method: UnifiedAuthMethod::Internal,
+            session_id: format!("scram_{}", uuid::Uuid::new_v4()),
+            expires_at: None,
+            created_at: Utc::now(),
+            metadata: HashMap::new(),
+        }
+    }
+
     /// Parse permission string to UnifiedPermission enum
     fn parse_permission_string(&self, permission_str: &str) -> Option<UnifiedPermission> {
         match permission_str {
@@ -1115,6 +1372,13 @@ pub enum AuthenticationData {
     JWTToken(String),
     ApiKey(String),
     ClientCertificate(ClientCertificateData),
+    /// pgwire SCRAM-SHA-256, server-side-only (TD-PGWIRE-AUTH-1): the
+    /// protocol layer constructs this ONLY after the SASL exchange verified
+    /// the client proof. `parse_authorization` can never produce it, so no
+    /// HTTP surface can forge this shape.
+    ScramAuthenticated {
+        username: String,
+    },
 }
 
 /// Client certificate data for mTLS
@@ -1180,6 +1444,8 @@ fn attempted_principal(auth_data: &AuthenticationData) -> String {
         AuthenticationData::JWTToken(token) => fingerprint(token),
         AuthenticationData::SSOToken(_) => "sso:unverified".to_string(),
         AuthenticationData::ClientCertificate(cert) => format!("cert:{}", cert.subject),
+        // The username is not secret (it is presented in the clear on the wire).
+        AuthenticationData::ScramAuthenticated { username } => format!("scram:{username}"),
     }
 }
 
@@ -1193,6 +1459,7 @@ fn create_auth_audit_event(
         AuthenticationData::JWTToken(_) => "jwt",
         AuthenticationData::ApiKey(_) => "api_key",
         AuthenticationData::ClientCertificate(_) => "client_certificate",
+        AuthenticationData::ScramAuthenticated { .. } => "scram_sha_256",
     };
 
     AuditEvent {
@@ -1354,6 +1621,7 @@ mod tests {
             require_authentication: false,
             default_session_timeout_minutes: 30,
             api_keys: HashMap::new(),
+            scram_users: HashMap::new(),
             jwt: super::JwtConfig {
                 enabled: false,
                 secret: "x".to_string(),
@@ -1613,6 +1881,7 @@ ip_restrictions = []
             require_authentication: false,
             default_session_timeout_minutes: 480,
             api_keys,
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test-secret".to_string(),
@@ -1719,6 +1988,7 @@ ip_restrictions = []
             require_authentication: false,
             default_session_timeout_minutes: 480,
             api_keys: HashMap::new(),
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test-secret".to_string(),
@@ -1758,6 +2028,7 @@ ip_restrictions = []
             require_authentication: false,
             default_session_timeout_minutes: 480,
             api_keys: HashMap::new(),
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test".to_string(),
@@ -1807,6 +2078,7 @@ ip_restrictions = []
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys,
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "t".to_string(),
@@ -1978,6 +2250,7 @@ ip_restrictions = []
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys: HashMap::new(),
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test".to_string(),
@@ -2025,6 +2298,7 @@ ip_restrictions = []
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys: HashMap::new(),
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test".to_string(),
@@ -2073,6 +2347,7 @@ ip_restrictions = []
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys: HashMap::new(),
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test".to_string(),
@@ -2118,6 +2393,7 @@ ip_restrictions = []
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys: HashMap::new(),
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test".to_string(),
@@ -2156,6 +2432,7 @@ ip_restrictions = []
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys: HashMap::new(),
+            scram_users: HashMap::new(),
             jwt: JwtConfig {
                 enabled: false,
                 secret: "test".to_string(),
