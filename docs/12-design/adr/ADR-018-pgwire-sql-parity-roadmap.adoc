@@ -422,7 +422,9 @@ following concrete semantics and honestly-documented divergences:
 
 * `BEGIN` / `START TRANSACTION` / `COMMIT` / `END` / `ROLLBACK` / `ABORT` execute for real
   over both wire protocols. `SET TRANSACTION READ ONLY|WRITE` and `SET statement_timeout`
-  are honored (timeout enforced on COMMIT replay via 57014).
+  are honored (timeout enforced on COMMIT replay: the replayed statement
+  errors with 25P02 and the transaction aborts; 57014 is the cancel-path
+  code).
 * **Write buffer**: DML inside an explicit transaction accumulates in a bounded per-connection
   buffer (10k statements / 8 MiB; exceeding = 54000 + the transaction aborts). The
   primary-pod and tenant-visibility gates run at BUFFER time. COMMIT drains sequentially.

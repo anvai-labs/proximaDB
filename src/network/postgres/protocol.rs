@@ -258,13 +258,25 @@ fn parse_transaction_mode_tail(words: &[&str]) -> Result<Option<bool>, String> {
             "READ" => {
                 let next = words.get(index + 1).copied().unwrap_or_default();
                 match next {
-                    "ONLY" => read_only = Some(true),
-                    "WRITE" => read_only = Some(false),
-                    // ISOLATION LEVEL READ COMMITTED — the "READ" here belongs
-                    // to the isolation level, handled below.
-                    _ => {}
+                    "ONLY" => {
+                        read_only = Some(true);
+                        index += 2;
+                    }
+                    "WRITE" => {
+                        read_only = Some(false);
+                        index += 2;
+                    }
+                    // A bare/dangling READ (e.g. "BEGIN READ", "BEGIN READ
+                    // FROB") is a syntax error in PostgreSQL — fail closed
+                    // instead of silently granting a read-write BEGIN. (The
+                    // "READ" inside ISOLATION LEVEL READ <level> never starts
+                    // this arm: it arrives via the ISOLATION arm below.)
+                    _ => {
+                        return Err("syntax error in transaction mode (expected READ ONLY | \
+                             READ WRITE | ISOLATION LEVEL ...)"
+                            .to_string());
+                    }
                 }
-                index += 2;
             }
             "ISOLATION" => {
                 // ISOLATION LEVEL <level>
@@ -1841,7 +1853,15 @@ impl PostgresProtocol {
 
         // ADR-018 P2.D (TD-076): classify once; real control executes,
         // recognized-but-unsupported forms fail closed with the reason.
-        let transaction_statement = classify_transaction_statement(&query);
+        // SINGLE statements only: a multi-statement batch is split below and
+        // classified per statement — whole-string classification would
+        // mis-read a mid-batch word ("BEGIN WORK; ..." tokenizes
+        // words[1] as "WORK;") and reject valid PG batches with 0A000.
+        let transaction_statement = if Self::split_sql_statements(&query).len() == 1 {
+            classify_transaction_statement(&query)
+        } else {
+            None
+        };
 
         // In a FAILED transaction every non-control statement errors until
         // ROLLBACK (PostgreSQL 25P02 semantics).
@@ -1877,7 +1897,12 @@ impl PostgresProtocol {
         // and executing DDL immediately would make ROLLBACK silently not undo
         // it (worse than a clean rejection).
         let upper = query.to_uppercase();
-        if (upper.starts_with("CREATE") || upper.starts_with("ALTER") || upper.starts_with("DROP"))
+        // COPY too: its writes bypass the DML-only buffer, so executing one
+        // inside a transaction would make ROLLBACK silently not undo it.
+        if (upper.starts_with("CREATE")
+            || upper.starts_with("ALTER")
+            || upper.starts_with("DROP")
+            || upper.starts_with("COPY"))
             && self.transaction_in_progress().await
         {
             self.send_error(
@@ -2194,8 +2219,13 @@ impl PostgresProtocol {
                             // for ROLLBACK. The error response is already on
                             // the wire.
                             error!("transaction COMMIT replay failed: {error:#}");
-                            self.send_ready_for_query(self.transaction_status_byte().await)
-                                .await?;
+                            // Only the single-statement path owns its RFQ here —
+                            // batch/extended paths send exactly one RFQ at
+                            // Sync/batch end; an extra one desyncs the wire.
+                            if send_rfq {
+                                self.send_ready_for_query(self.transaction_status_byte().await)
+                                    .await?;
+                            }
                             return Ok(());
                         }
                         self.transaction_buffer.clear();
@@ -2503,9 +2533,11 @@ impl PostgresProtocol {
         }
         {
             let upper_for_ddl = upper.trim().to_string();
+            // COPY gates like DDL: un-buffered writes are un-rollbackable.
             if (upper_for_ddl.starts_with("CREATE")
                 || upper_for_ddl.starts_with("ALTER")
-                || upper_for_ddl.starts_with("DROP"))
+                || upper_for_ddl.starts_with("DROP")
+                || upper_for_ddl.starts_with("COPY"))
                 && self.transaction_in_progress().await
             {
                 return self

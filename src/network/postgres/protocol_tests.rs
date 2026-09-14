@@ -206,6 +206,13 @@ fn transaction_control_classification_matches_adr018_p2d() {
     );
     assert_eq!(control("COMMIT"), Some(TransactionControl::Commit));
     assert_eq!(control("END WORK"), Some(TransactionControl::Commit));
+    // Both spelled-out commit forms are real PG grammar — they must classify
+    // as Control, never fall through to the generic executor's silent OK.
+    assert_eq!(
+        control("COMMIT TRANSACTION"),
+        Some(TransactionControl::Commit)
+    );
+    assert_eq!(control("END TRANSACTION"), Some(TransactionControl::Commit));
     assert_eq!(control("ROLLBACK"), Some(TransactionControl::Rollback));
     assert_eq!(
         control("ABORT TRANSACTION"),
@@ -238,6 +245,14 @@ fn transaction_control_classification_matches_adr018_p2d() {
     assert!(unsupported("ROLLBACK TO nested").contains("SAVEPOINT"));
     assert!(unsupported("PREPARE TRANSACTION 'tx-1'").contains("two-phase"));
     assert!(unsupported("COMMIT PREPARED 'tx-1'").contains("two-phase"));
+    // Unrecognized COMMIT/END/ROLLBACK tails fail closed — a typo'd COMMIT
+    // ("COMMIT TRANSACTON") must never silently no-op as a generic statement.
+    assert!(unsupported("COMMIT TRANSACTON").contains("unsupported"));
+    assert!(unsupported("END FROB").contains("unsupported"));
+    assert!(unsupported("ROLLBACK FROB").contains("unsupported"));
+    // A dangling READ mode is a syntax error, not a silent read-write BEGIN.
+    assert!(unsupported("BEGIN READ").contains("syntax error"));
+    assert!(unsupported("BEGIN READ FROB").contains("syntax error"));
     assert!(unsupported("ROLLBACK PREPARED 'tx-1'").contains("two-phase"));
     assert!(unsupported("SET CONSTRAINTS ALL DEFERRED").contains("CONSTRAINTS"));
 
