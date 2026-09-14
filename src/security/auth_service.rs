@@ -67,12 +67,19 @@ pub struct AuthenticationConfig {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScramUserConfig {
     /// Plaintext password — converted to a [`ScramVerifierConfig`] at build,
-    /// never retained in memory or re-serialized.
-    #[serde(default)]
+    /// never retained in memory or re-serialized. `skip_serializing` (not
+    /// just the redacted `Debug` below) so EVERY retained `SecurityConfig`
+    /// clone in the process (`UnifiedAuthService`, `SecurityCoordinator`,
+    /// `ProximaDB::_config` each keep their own) is safe to serialize —
+    /// scrubbing one clone's field isn't enough, the type itself must never
+    /// emit it.
+    #[serde(default, skip_serializing)]
     pub password: Option<String>,
     /// Precomputed verifier (salt/StoredKey/ServerKey, base64) for deployments
-    /// that refuse plaintext passwords in config files.
-    #[serde(default)]
+    /// that refuse plaintext passwords in config files. Also never
+    /// re-serialized — same reasoning as `password` (it's still a bare
+    /// SCRAM verifier, equivalent sensitivity to a password hash).
+    #[serde(default, skip_serializing)]
     pub verifier: Option<ScramVerifierConfig>,
     /// Tenant binding: on successful authentication the session identity binds
     /// to this tenant (the credential's `AuthenticatedTenantBinding`).
@@ -311,12 +318,12 @@ impl UnifiedAuthService {
         // never touches it. Malformed verifier material fails the boot.
         for (username, user) in &config.scram_users {
             let verifier = match (&user.password, &user.verifier) {
+                // This arm only matches when `user.verifier` is `None`, so
+                // there is no configured iteration count to honor here —
+                // every plaintext password derives at the documented default.
                 (Some(password), None) => scram::ScramVerifier::generate(
                     password,
-                    user.verifier
-                        .as_ref()
-                        .map(|v| v.iterations)
-                        .unwrap_or(crate::network::postgres::scram::DEFAULT_ITERATIONS),
+                    crate::network::postgres::scram::DEFAULT_ITERATIONS,
                 )
                 .map_err(|error| {
                     anyhow!("scram_users[{username}]: verifier derivation failed: {error:?}")
