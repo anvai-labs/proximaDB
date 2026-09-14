@@ -434,6 +434,53 @@ tokens across restore, typed receipts, new-group admission versus retention, sin
 sibling connector cutover remain open. No performance uplift, provider-native qualification,
 power-loss certification, CI, PR or merge is claimed.
 
+=== Factory queue upgrade admission follow-up
+
+Fresh merge review of `47244fea8` found that correcting the factory adapter's
+double-root mapping could leave previously accepted queue frames and progress invisible.
+Four old-mapping fixtures reproduced unsafe startup on the rebased branch
+(`4052c57b-8000-4151-9a94-d97f47f6e7a1`). Root admission now inspects the old location
+before any topic or writer is constructed, refusing nonempty/ambiguous layouts and
+inspection errors while leaving all source bytes untouched. Missing/empty directories
+are admitted; unchanged explicit filesystem-root/dot mappings skip the probe.
+
+A second review found that bare relative roots could bypass a custom local backend's
+`root_dir` when normalized to `file://`. The initial custom-root fixture inadvertently
+used an absolute TempDir path, so its failed runs (`c5ebad8c-1dfc-42b9-9734-723e06f4cc97`
+and `576fe7e7-9db6-411f-87a7-f567a66e1c85`) are NOT proof of that relative-root bug.
+The corrected fixtures explicitly construct and assert relative paths. Bare relative
+roots are refused before filesystem access, with explicit offline-migration guidance;
+absolute roots and explicitly scheme-qualified relative roots remain supported. Neither
+merely adding a scheme nor deleting the old directory is a migration. Operators must
+exclude old writers and reconcile both histories from backups and trusted progress.
+This reuses root-directory admission and the filesystem's existing LIST method, adding
+no format or public interface. Subsequent green validation and merge status are recorded
+on the develop-targeted PR; these red runs are regression evidence, not release clearance.
+
+A further public-boundary check found that QueueClient may use a descendant of the adapter's
+root. Matching only the adapter root skipped that queue's first admission call. Both public
+integration fixtures failed for frames and retained progress
+(`6c306b00-0529-4c0f-9b33-e78432c01fce`). Admission now compares old and corrected locations
+for each root-qualified directory creation, inspecting the exact legacy location when they
+differ. A clean descendant can still restart beside another descendant's legacy data. The
+probe does not run on unchanged root-relative operations or steady-state ACK/renewal/append.
+
+The positive custom-backend/explicit-relative-URL journey then reproduced a LIST spelling
+mismatch: the local backend returns an extra `./` while the adapter required a literal URL
+prefix (`5e5869e3-42a3-415a-873a-04813d647652`: 91/92 passed; only this journey failed).
+Local LIST confinement now compares path components after rejecting parent traversal;
+normalizing current-directory components also keeps dotted relative operation paths coherent.
+Nonlocal URL validation is unchanged. The public fixture exercises open/send/shutdown/restart
+and confirms explicit file URLs do not silently adopt a backend-relative anchor.
+
+The dotted root-relative public journey also failed before its repair: running the
+newly compiled integration binary's `dotted_root_relative_queue_preserves_list_caller_coordinates`
+test directly returned "did not list the exact directory identity" (0 passed, 1 failed).
+After confinement and direct-child validation, LIST now joins the validated child name
+onto the requested parent, preserving its leading `./` for queue identity checks.
+Root-qualified versus root-relative mapping is unchanged; returned backend filename
+case is retained so case-alias detection still rejects mismatched topic identities.
+
 === Phase exits
 
 [cols="1,4,3",options="header"]

@@ -458,6 +458,40 @@ upstream source when local history was reaped) before relying on new contiguous-
 Do not reset or reinterpret legacy progress automatically. This patch prevents new ACK gaps;
 it does not repair historical loss or certify uninterrupted mixed-writer upgrades.
 
+Factory-adapter upgrade admission also checks the historical duplicated-root location before
+creating root-qualified directories, including when a queue is a descendant of its adapter root.
+For `file:///var/lib/q`, the old adapter wrote
+under `/var/lib/q/var/lib/q`; the corrected mapping uses `/var/lib/q`. A nonempty legacy location
+blocks startup even when canonical data also exists. An empty or missing legacy directory is safe
+to admit; inspection errors other than absence fail closed. Roots whose old and new mappings are
+identical (filesystem root or explicitly scheme-qualified dot-only roots) need no layout cutover.
+This is a private check at the existing directory-creation seam, not another filesystem capability
+or format. The probe is scoped to the requested directory: another descendant's legacy history
+does not prevent a clean descendant queue from opening. Explicit root-relative operations retain
+their old mapping and need no probe.
+Bare relative adapter roots are refused before filesystem access: the old backend may have
+anchored them under its configured `root_dir`, while adding `file://` bypasses that anchor.
+Locate and reconcile that history using the original backend configuration before selecting an
+explicit URL. Merely adding a scheme is not a migration. Bare absolute paths and explicitly
+scheme-qualified relative roots (including `file://./`) remain supported, as do relative operation
+paths under a configured root.
+Local LIST results are confined by path components, not literal URL spelling: equivalent `./`
+components are normalized, while parent traversal, foreign roots and non-child entries remain
+errors. Explicit relative file URLs retain working-directory coordinates even with a custom
+backend root directory; bare relative roots are not silently converted into that interpretation.
+After validating confinement and direct-child membership, LIST returns each backend child name
+under the caller's original parent spelling, preserving `./` and exact filename case for identity checks.
+
+Operators must stop all queue writers/readers/reapers, preserve backups of both layouts, and
+explicitly reconcile legacy topics, segments, leases and progress before retrying. Never delete
+legacy state or merge colliding segment names blindly; when both histories exist, use an
+independently trusted checkpoint/source to resolve them. Even a legitimate canonical subtree at
+the possible legacy location is ambiguous and requires explicit operator resolution. No automatic
+move, progress reset, concurrent-old-writer fencing, or live migration is provided. The check adds
+an inspection at each root-qualified directory creation whose mapping changed (queue/partition
+creation and new topic/group directories); steady-state ACK, renewal, and append gain no probe.
+No performance uplift is claimed.
+
 Scope limits: expiry is eligibility at authoritative admission, not a clock predicate checked at
 rename; this is not fencing for external effects. New-group admission versus retention, dropping the
 last consumer without awaited shutdown, network filesystems, restore/ABA across authority histories,

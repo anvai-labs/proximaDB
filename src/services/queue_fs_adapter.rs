@@ -31,6 +31,9 @@
 //! `root_url = "adls://acct.dfs.core.windows.net/queue"` and the queue
 //! asks for `path = "embed-ingest/0/0000000000.qseg"`, the adapter calls
 //! `factory.get_filesystem("adls://.../queue/embed-ingest/0/0000000000.qseg")`.
+//! Bare relative roots are refused: adding `file://` would bypass a backend's
+//! configured root directory and may abandon its history. Explicit relative
+//! file URLs retain their original working-directory semantics.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,6 +113,11 @@ impl FactoryQueueFs {
             ));
         }
         if !root_url.contains("://") {
+            if !Path::new(&root_url).is_absolute() {
+                return Err(QueueError::Persistence(format!(
+                    "bare relative queue root {root_url:?} is backend-dependent; locate existing history using the original backend root_dir and working directory, then perform explicit offline migration before selecting an absolute root or file:// URL; merely adding a scheme is not a migration"
+                )));
+            }
             root_url = format!("file://{root_url}");
         }
         // Retain the third slash in the filesystem root `file:///`.
@@ -140,6 +148,13 @@ impl FactoryQueueFs {
         Ok(())
     }
 
+    // Lexical normalization only: never resolve symlinks or discard ParentDir.
+    fn without_current_dir(path: &Path) -> PathBuf {
+        path.components()
+            .filter(|component| *component != std::path::Component::CurDir)
+            .collect()
+    }
+
     /// Return the root-relative suffix plus whether the input used the queue's
     /// root-qualified coordinate system.
     fn relative_path(&self, path: &Path) -> QueueResult<(PathBuf, bool)> {
@@ -147,7 +162,7 @@ impl FactoryQueueFs {
         if let Some(root) = &self.local_root
             && let Ok(relative) = path.strip_prefix(root)
         {
-            return Ok((relative.to_path_buf(), true));
+            return Ok((Self::without_current_dir(relative), true));
         }
         if path.is_absolute() {
             return Err(QueueError::Persistence(format!(
@@ -155,7 +170,7 @@ impl FactoryQueueFs {
                 self.root_url
             )));
         }
-        Ok((path.to_path_buf(), false))
+        Ok((Self::without_current_dir(path), false))
     }
 
     fn root_child_prefix(&self) -> String {
@@ -163,6 +178,62 @@ impl FactoryQueueFs {
             self.root_url.clone()
         } else {
             format!("{}/", self.root_url)
+        }
+    }
+
+    /// Reproduce the old adapter's double-prefix mapping without sending it
+    /// through `url_for`, which intentionally uses the corrected coordinates.
+    fn legacy_directory_url(&self, path: &Path) -> QueueResult<Option<String>> {
+        let Some(root) = &self.local_root else {
+            return Ok(None);
+        };
+        let (relative, root_qualified) = self.relative_path(path)?;
+        if !root_qualified {
+            // Explicit root-relative operations did not change their mapping.
+            return Ok(None);
+        }
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| QueueError::Persistence("queue filesystem path is not UTF-8".into()))?;
+        let suffix = path_text.trim_start_matches('/');
+        let legacy = root.join(suffix);
+        let canonical = root.join(relative);
+        // `/` and dot-only relative roots never changed physical layouts.
+        let significant =
+            |component: &std::path::Component<'_>| *component != std::path::Component::CurDir;
+        if canonical
+            .components()
+            .filter(significant)
+            .eq(legacy.components().filter(significant))
+        {
+            return Ok(None);
+        }
+        Ok(Some(format!("{}{suffix}", self.root_child_prefix())))
+    }
+
+    /// QueueClient calls create_dir_all before constructing any topic or writer.
+    /// Its root may be a descendant of this adapter's root, so check the actual
+    /// requested directory. This is admission, not fencing of old writers.
+    async fn reject_legacy_layout(&self, path: &Path) -> QueueResult<()> {
+        let Some(legacy_url) = self.legacy_directory_url(path)? else {
+            return Ok(());
+        };
+        let fs = self
+            .factory
+            .get_filesystem(&legacy_url)
+            .map_err(Self::map_err)?;
+        match fs.list(&legacy_url).await {
+            Ok(entries) if entries.is_empty() => Ok(()),
+            Ok(_) => Err(QueueError::Persistence(format!(
+                "legacy queue layout at {legacy_url}; refusing to initialize queue directory {path:?}: stop all queue writers, back up both layouts, and perform explicit offline migration before retrying; do not overwrite or discard either history"
+            ))),
+            Err(FilesystemError::NotFound(_)) => Ok(()),
+            Err(FilesystemError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(())
+            }
+            Err(error) => Err(QueueError::Persistence(format!(
+                "cannot inspect legacy queue layout at {legacy_url}; refusing queue startup: {error}"
+            ))),
         }
     }
 
@@ -180,18 +251,37 @@ impl FactoryQueueFs {
     }
 
     fn relative_from_listed_url(&self, entry_url: &str) -> QueueResult<PathBuf> {
-        let relative = if entry_url == self.root_url {
-            ""
-        } else {
-            let prefix = self.root_child_prefix();
-            entry_url.strip_prefix(&prefix).ok_or_else(|| {
-                QueueError::Persistence(format!(
-                    "queue filesystem LIST returned entry outside configured root {}: {entry_url}",
-                    self.root_url
-                ))
-            })?
+        let outside_root = || {
+            QueueError::Persistence(format!(
+                "queue filesystem LIST returned entry outside configured root {}: {entry_url}",
+                self.root_url
+            ))
         };
-        let relative = PathBuf::from(relative);
+        let relative = if let Some(root) = &self.local_root {
+            let entry = Path::new(
+                entry_url
+                    .strip_prefix("file://")
+                    .ok_or_else(&outside_root)?,
+            );
+            Self::reject_parent_components(entry, "queue filesystem LIST entry")?;
+            // Some local backends preserve an additional `./` in LIST URLs.
+            // Compare path components, not raw URL spelling, without relaxing
+            // traversal or root confinement.
+            let entry = Self::without_current_dir(entry);
+            let root = Self::without_current_dir(root);
+            entry
+                .strip_prefix(&root)
+                .map_err(|_| outside_root())?
+                .to_path_buf()
+        } else {
+            let relative = if entry_url == self.root_url {
+                ""
+            } else {
+                let prefix = self.root_child_prefix();
+                entry_url.strip_prefix(&prefix).ok_or_else(outside_root)?
+            };
+            PathBuf::from(relative)
+        };
         if relative.is_absolute() {
             return Err(QueueError::Persistence(format!(
                 "queue filesystem LIST returned absolute child suffix: {entry_url}"
@@ -202,21 +292,21 @@ impl FactoryQueueFs {
     }
 
     fn listed_path(&self, requested_dir: &Path, entry_url: &str) -> QueueResult<PathBuf> {
-        let (requested_relative, root_qualified) = self.relative_path(requested_dir)?;
+        let (requested_relative, _) = self.relative_path(requested_dir)?;
         let relative = self.relative_from_listed_url(entry_url)?;
         if relative.parent() != Some(requested_relative.as_path()) {
             return Err(QueueError::Persistence(format!(
                 "queue filesystem LIST returned non-child entry for {requested_dir:?}: {entry_url}"
             )));
         }
-        if root_qualified {
-            let root = self.local_root.as_ref().ok_or_else(|| {
-                QueueError::Persistence("root-qualified path used without local root".into())
-            })?;
-            Ok(root.join(relative))
-        } else {
-            Ok(relative)
-        }
+        let name = relative.file_name().ok_or_else(|| {
+            QueueError::Persistence(format!(
+                "queue filesystem LIST returned entry without a child name: {entry_url}"
+            ))
+        })?;
+        // Preserve the caller's coordinates, including a leading `./`. Queue
+        // identity checks strip this exact parent from each listed child.
+        Ok(requested_dir.join(name))
     }
 
     fn map_err(e: impl std::fmt::Display) -> QueueError {
@@ -232,6 +322,7 @@ impl QueueFs for FactoryQueueFs {
     }
 
     async fn create_dir_all(&self, path: &Path) -> QueueResult<()> {
+        self.reject_legacy_layout(path).await?;
         let url = self.url_for(path)?;
         let fs = self.factory.get_filesystem(&url).map_err(Self::map_err)?;
         fs.create_dir_all(&url).await.map_err(Self::map_err)
@@ -462,6 +553,17 @@ mod tests {
         );
         assert_eq!(
             adapter
+                .list(Path::new("./relative"))
+                .await
+                .expect("dotted relative list"),
+            vec![PathBuf::from("./relative/child")]
+        );
+        let listed_traversal = adapter
+            .listed_path(&root, &format!("{root_url}/./../foreign/entry"))
+            .expect_err("component normalization must not admit parent traversal");
+        assert!(listed_traversal.to_string().contains("parent traversal"));
+        assert_eq!(
+            adapter
                 .list(&root.join("relative"))
                 .await
                 .expect("absolute list"),
@@ -625,5 +727,333 @@ mod tests {
                     .contains("without conditional ownership publication support")
             );
         }
+    }
+
+    #[cfg(unix)]
+    async fn assert_legacy_root_rejected(mixed: bool, progress_only: bool, relative: bool) {
+        let dir = if relative {
+            tempfile::tempdir_in(".").expect("relative tempdir")
+        } else {
+            tempfile::tempdir().expect("tempdir")
+        };
+        let root = if relative {
+            // TempDir may return an absolute path even for tempdir_in(".").
+            PathBuf::from(".")
+                .join(dir.path().file_name().expect("fixture name"))
+                .join("queue")
+        } else {
+            dir.path().join("queue")
+        };
+        assert_eq!(root.is_relative(), relative);
+        // Reproduce the old adapter's literal URL concatenation, independently
+        // of the new mapper. The normal frame encoder still writes the fixture.
+        let legacy_root = PathBuf::from(format!(
+            "{}/{}",
+            root.display(),
+            root.to_str()
+                .expect("UTF-8 fixture")
+                .trim_start_matches('/')
+        ));
+        let config_for = |path: &Path| QueueConfig {
+            root: format!("file://{}", path.display()),
+            topics: HashMap::from([(
+                "events".into(),
+                TopicConfig {
+                    partition_count: 1,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let legacy_file = if progress_only {
+            let file = legacy_root.join("events/0/podA/offset.meta");
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("legacy group");
+            std::fs::write(&file, br#"{"group":"podA","committed_offset":42}"#)
+                .expect("legacy progress");
+            file
+        } else {
+            let old = QueueClient::open(config_for(&legacy_root))
+                .await
+                .expect("legacy fixture");
+            old.producer()
+                .send(Message::new(
+                    "events",
+                    "tenant-a",
+                    b"legacy-unacked".to_vec(),
+                ))
+                .await
+                .expect("persist legacy frame");
+            old.shutdown().await.expect("stop fixture queue");
+            drop(old);
+            legacy_root.join("events/0/0000000000.qseg")
+        };
+        let legacy_bytes = std::fs::read(&legacy_file).expect("legacy bytes");
+        let canonical_file = root.join("events/0/0000000000.qseg");
+        let canonical_bytes = if mixed {
+            let current = QueueClient::open(config_for(&root))
+                .await
+                .expect("canonical fixture");
+            current
+                .producer()
+                .send(Message::new(
+                    "events",
+                    "tenant-a",
+                    b"canonical-unacked".to_vec(),
+                ))
+                .await
+                .expect("persist canonical frame");
+            current.shutdown().await.expect("stop canonical queue");
+            drop(current);
+            Some(std::fs::read(&canonical_file).expect("canonical bytes"))
+        } else {
+            None
+        };
+        let factory = Arc::new(FilesystemFactory::create_default().await.expect("factory"));
+        let adapter =
+            FactoryQueueFs::new(factory, format!("file://{}/", root.display())).expect("adapter");
+        let error = match QueueClient::open_with_fs(config_for(&root), Some(adapter)).await {
+            Err(error) => error,
+            Ok(queue) => {
+                queue
+                    .shutdown()
+                    .await
+                    .expect("stop unexpectedly opened queue");
+                panic!("upgrade must reject legacy queue layout before creating canonical state");
+            }
+        };
+        assert!(error.to_string().contains("legacy queue layout"), "{error}");
+        assert!(error.to_string().contains("migration"), "{error}");
+        assert_eq!(
+            std::fs::read(legacy_file).expect("preserved legacy bytes"),
+            legacy_bytes
+        );
+        match canonical_bytes {
+            Some(bytes) => assert_eq!(
+                std::fs::read(canonical_file).expect("preserved canonical bytes"),
+                bytes
+            ),
+            None => assert!(
+                !root.join("events").exists(),
+                "no fresh topic state on rejection"
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_rejects_legacy_queue_frames_before_initializing() {
+        assert_legacy_root_rejected(false, false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_rejects_mixed_queue_layouts_without_overwriting_either() {
+        assert_legacy_root_rejected(true, false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_rejects_legacy_progress_after_frames_were_reaped() {
+        assert_legacy_root_rejected(false, true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_rejects_relative_legacy_queue_root() {
+        assert_legacy_root_rejected(false, false, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_admission_allows_empty_legacy_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("queue");
+        let legacy = root.join(root.strip_prefix("/").expect("absolute fixture"));
+        std::fs::create_dir_all(&legacy).expect("empty legacy directory");
+        let factory = Arc::new(FilesystemFactory::create_default().await.expect("factory"));
+        // Bare roots use the same admission check as file URLs.
+        let adapter =
+            FactoryQueueFs::new(factory, root.to_str().expect("UTF-8 fixture")).expect("adapter");
+        let queue = QueueClient::open_with_fs(
+            QueueConfig {
+                root: root.display().to_string(),
+                topics: HashMap::from([(
+                    "events".into(),
+                    TopicConfig {
+                        partition_count: 1,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            Some(adapter),
+        )
+        .await
+        .expect("empty legacy directory is safe");
+        queue.shutdown().await.expect("shutdown");
+        assert!(root.join("events/0/0000000000.qseg").is_file());
+        assert_eq!(
+            std::fs::read_dir(legacy)
+                .expect("legacy directory preserved")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_admission_rejects_invalid_and_unknown_legacy_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let factory = Arc::new(FilesystemFactory::create_default().await.expect("factory"));
+        for name in ["non-directory", "unknown-topic"] {
+            let root = dir.path().join(name);
+            let legacy = root.join(root.strip_prefix("/").expect("absolute fixture"));
+            std::fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("parent");
+            if name == "non-directory" {
+                std::fs::write(&legacy, b"not a directory").expect("invalid legacy root");
+            } else {
+                // Unknown/dynamically created topics must not be missed just
+                // because they are absent from the new queue configuration.
+                std::fs::create_dir_all(legacy.join("unconfigured-topic")).expect("legacy topic");
+            }
+            let adapter =
+                FactoryQueueFs::new(factory.clone(), format!("file://{}", root.display()))
+                    .expect("adapter");
+            let error = adapter
+                .create_dir_all(&root)
+                .await
+                .expect_err("must fail before creating state");
+            assert!(error.to_string().contains("legacy queue layout"), "{error}");
+            if name == "non-directory" {
+                assert!(error.to_string().contains("cannot inspect"), "{error}");
+                assert_eq!(
+                    std::fs::read(&legacy).expect("preserved invalid root"),
+                    b"not a directory"
+                );
+            } else {
+                assert!(legacy.join("unconfigured-topic").is_dir());
+            }
+            assert!(!root.join("events").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_mapping_skips_only_unchanged_layouts() {
+        let factory = Arc::new(FilesystemFactory::create_default().await.expect("factory"));
+        for root in ["file:///", "/", "file://./", "file://./."] {
+            let adapter = FactoryQueueFs::build(factory.clone(), root).expect("adapter");
+            assert_eq!(
+                adapter
+                    .legacy_directory_url(adapter.local_root.as_deref().expect("local root"))
+                    .expect("mapping"),
+                None,
+                "{root}"
+            );
+        }
+        for (root, expected) in [
+            ("file:///var/lib/q/", "file:///var/lib/q/var/lib/q"),
+            ("/var/./lib/q", "file:///var/./lib/q/var/./lib/q"),
+            ("file://./queue", "file://./queue/./queue"),
+            ("file://queue", "file://queue/queue"),
+        ] {
+            let adapter = FactoryQueueFs::build(factory.clone(), root).expect("adapter");
+            assert_eq!(
+                adapter
+                    .legacy_directory_url(adapter.local_root.as_deref().expect("local root"))
+                    .expect("mapping")
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        for root in ["queue", "./queue", ".", "./."] {
+            let error = FactoryQueueFs::build(factory.clone(), root)
+                .expect_err("bare relative roots can have a different backend anchor");
+            assert!(error.to_string().contains("migration"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_rejects_bare_relative_root_with_custom_backend_root() {
+        use crate::storage::persistence::filesystem::{FilesystemConfig, local::LocalConfig};
+
+        let backend = tempfile::tempdir().expect("backend root");
+        let cwd_fixture = tempfile::tempdir_in(".").expect("relative fixture");
+        let root = PathBuf::from(".")
+            .join(cwd_fixture.path().file_name().expect("fixture name"))
+            .join("queue");
+        assert!(root.is_relative(), "exercise backend-relative semantics");
+        let legacy = backend.path().join(&root).join(&root);
+        let topics = HashMap::from([(
+            "events".into(),
+            TopicConfig {
+                partition_count: 1,
+                ..Default::default()
+            },
+        )]);
+        let old = QueueClient::open(QueueConfig {
+            root: legacy.display().to_string(),
+            topics: topics.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("legacy backend-root fixture");
+        old.producer()
+            .send(Message::new(
+                "events",
+                "tenant-a",
+                b"backend-root-history".to_vec(),
+            ))
+            .await
+            .expect("legacy send");
+        old.shutdown().await.expect("legacy shutdown");
+        drop(old);
+        let legacy_file = legacy.join("events/0/0000000000.qseg");
+        let before = std::fs::read(&legacy_file).expect("legacy bytes");
+        let factory = Arc::new(
+            FilesystemFactory::create(FilesystemConfig {
+                local: Some(LocalConfig {
+                    root_dir: Some(backend.path().to_path_buf()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("custom-root factory"),
+        );
+        let root_text = root.to_str().expect("UTF-8 fixture");
+        let error = match FactoryQueueFs::new(factory, root_text) {
+            Err(error) => error,
+            Ok(adapter) => match QueueClient::open_with_fs(
+                QueueConfig {
+                    root: root_text.into(),
+                    topics,
+                    ..Default::default()
+                },
+                Some(adapter),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(queue) => {
+                    queue
+                        .shutdown()
+                        .await
+                        .expect("stop incorrectly admitted queue");
+                    panic!("bare relative root must not abandon custom-backend history");
+                }
+            },
+        };
+        assert!(error.to_string().contains("migration"), "{error}");
+        assert_eq!(
+            std::fs::read(legacy_file).expect("preserved backend history"),
+            before
+        );
+        assert!(!root.exists(), "no queue state may be created under CWD");
+        assert!(
+            !backend.path().join(&root).join("events").exists(),
+            "no fresh backend queue state"
+        );
     }
 }
