@@ -1233,12 +1233,23 @@ impl ProximaDB {
         drainer_error.map_or(Ok(()), Err)
     }
 
+    /// Whether a configured async-ingest drainer has terminated, including
+    /// unexpected successful completion or panic. Disabled drainers return false.
+    /// Supervisors must still await `shutdown` to collect its result and release
+    /// ownership; this query does not restart consumers or depend on HTTP being enabled.
+    pub fn drainer_has_stopped(&self) -> bool {
+        self.drainer
+            .as_ref()
+            .is_some_and(|(handle, _)| handle.is_finished())
+    }
+
     /// Check if the database instance is healthy.
     pub async fn is_healthy(&self) -> bool {
-        if self
-            .drainer
-            .as_ref()
-            .is_some_and(|(handle, sender)| sender.is_none() || handle.is_finished())
+        if self.drainer_has_stopped()
+            || self
+                .drainer
+                .as_ref()
+                .is_some_and(|(_, sender)| sender.is_none())
         {
             return false;
         }

@@ -1587,6 +1587,14 @@ jobs:
             -p proximadb-bench \
             -p proximadb-migrate
 
+      - name: Verify critical drainer lifecycle (real server)
+        if: matrix.profile == 'dev'
+        env:
+          RUST_MIN_STACK: "8388608"
+        # Subprocess isolation is owned by this suite. Reuse the dev server
+        # build; serialize its process fixtures on memory-constrained runners.
+        run: cargo test -p proximadb-server --test drainer_lifecycle_integration_test -- --test-threads=1
+
       - name: Upload Server Binary
         if: matrix.profile == 'release' && needs.changes.outputs.medium_tier == 'true'
         uses: actions/upload-artifact@v7

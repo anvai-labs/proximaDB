@@ -451,6 +451,15 @@ Mixed-case historical names such as `podA` remain valid; directory enumeration r
 conflicting `poda` spelling before acquisition. Topic names must also be exact path components,
 validated before any producer/subscriber path creation. No absolute paths or traversal are allowed.
 
+The production executable treats unexpected drainer termination as a critical failure:
+it observes the existing task handle at one-second intervals, awaits normal database shutdown,
+then exits nonzero for the deployment supervisor to restart. It does not retry uncertain
+consumers in place or add a second supervisor service. The predicate is independent of HTTP
+enablement, so gRPC-only deployments are not mistaken for failed drainers. Embedded owners
+can inspect the same `drainer_has_stopped()` predicate and must still await shutdown themselves.
+This is bounded process-level detection, not an immediate per-request admission barrier; work
+accepted during detection/shutdown remains subject to the existing durable queue contract.
+
 Upgrade prerequisite: historical unversioned `offset.meta` may contain the old maximum-ACK
 watermark despite earlier gaps. Its JSON cannot prove contiguous completion or reconstruct lost
 work. Operators must audit/replay from an independently trusted checkpoint (including archive or

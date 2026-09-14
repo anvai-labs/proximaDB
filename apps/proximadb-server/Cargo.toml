@@ -83,6 +83,7 @@ serde_json.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+proximadb-queue = { path = "../../crates/horizontal/proximadb-queue" }
 reqwest = { version = "0.11", features = ["json"] }
 serde_json.workspace = true
 tempfile.workspace = true

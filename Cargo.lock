@@ -9076,6 +9076,7 @@ dependencies = [
  "libc",
  "proximadb",
  "proximadb-embedding",
+ "proximadb-queue",
  "proximadb-runtime-common",
  "reqwest 0.11.27",
  "serde",

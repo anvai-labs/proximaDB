@@ -490,6 +490,21 @@ The other failure was the valid-startup control missing process embedding initia
 its fixture now follows the server prerequisite. Authentication resolution and rejection
 move before queue admission without changing the mode resolver or network wiring.
 
+Fresh review after the engine-policy rebase found that the production binary never
+observed the drainer's terminal task result: async work could keep arriving while
+consumption had stopped. A real-server regression reproduced this
+(`da535d64-e093-45ee-913f-065588db0909`): the failure was logged but the process
+remained alive past the deadline; the healthy signal-shutdown control passed.
+The initial fixture run failed config loading due to missing storage-location tags
+and is not defect evidence. Production now observes the existing drainer handle,
+performs awaited shutdown, and exits nonzero; a deployment supervisor owns restart.
+This deliberately does not reuse HTTP-dependent health or restart uncertain consumers
+in place. The binary tests require the specific supervisor path, completed shutdown,
+and replay of the unACKed message, and run in the dev-build CI lane.
+The corrected suite passed all three tests after the fix
+(`25a44937-19c5-4532-896b-4198f2626a9c`), and the exact serialized CI command
+also passed all three tests. Fresh source review cleared the supervision change.
+
 === Phase exits
 
 [cols="1,4,3",options="header"]

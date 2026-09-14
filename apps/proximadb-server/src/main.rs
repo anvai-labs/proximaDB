@@ -386,19 +386,51 @@ async fn run() -> anyhow::Result<()> {
     // (immediate process kill), so containerized stops bypassed `db.shutdown()`
     // entirely — no shutdown flush, no clean close, and any unflushed memtable
     // rode solely on WAL replay (issue #1125, finding A).
+    // Terminal consumer failures cannot be retried in place without reacquiring
+    // authority. Observe the existing task handle and leave replacement policy
+    // to the process supervisor after normal awaited shutdown. Do not use
+    // is_healthy(): its HTTP predicate excludes valid gRPC-only deployments.
+    let drainer_stopped = async {
+        if db.queue_client().is_none() {
+            std::future::pending::<()>().await;
+        }
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            if db.drainer_has_stopped() {
+                break;
+            }
+        }
+    };
     #[cfg(unix)]
-    {
+    let critical_drainer_stopped = {
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => info!("Received SIGINT, stopping server..."),
-            _ = sigterm.recv() => info!("Received SIGTERM, stopping server..."),
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, stopping server...");
+                false
+            },
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, stopping server...");
+                false
+            },
+            _ = drainer_stopped => true,
         }
-    }
+    };
     #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await?;
-        info!("Received shutdown signal, stopping server...");
+    let critical_drainer_stopped = {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                info!("Received shutdown signal, stopping server...");
+                false
+            },
+            _ = drainer_stopped => true,
+        }
+    };
+    if critical_drainer_stopped {
+        error!("Critical embedding drainer stopped; shutting down server");
     }
 
     // Graceful shutdown
@@ -412,6 +444,9 @@ async fn run() -> anyhow::Result<()> {
     // the previous owner died without cleaning up.
     runtime_state.finish();
     info!("ProximaDB server stopped");
+    if critical_drainer_stopped {
+        anyhow::bail!("critical embedding drainer terminated; server shutdown completed");
+    }
     Ok(())
 }
 
