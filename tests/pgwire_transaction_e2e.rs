@@ -94,8 +94,13 @@ impl TxnTestServer {
     }
 
     fn conn_str(&self) -> String {
+        // `user=anonymous` = no subject assertion ⇒ an UNGOVERNED connection:
+        // transaction control (TD-076) is session/wire semantics, orthogonal
+        // to governance, and an ungoverned session is the sanctioned way to
+        // keep bare single-table SELECTs off the TD-ABAC-10c fail-closed gate
+        // (which refuses legacy-path shapes for policy-governed subjects).
         format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
+            "host=127.0.0.1 port={} user=anonymous dbname=proximadb sslmode=disable",
             self.pg_port
         )
     }
