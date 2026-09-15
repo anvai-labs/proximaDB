@@ -335,6 +335,7 @@ jobs:
               - 'tests/document_json*'
               - 'tests/events_tsbs*'
               - 'tests/sql_value_roundtrip.rs'
+              - 'tests/native_tpch_q18_q20_e2e.rs'
               - '.github/workflows/ci.yml'
             # SDK filters
             go_sdk:
@@ -2197,10 +2198,11 @@ jobs:
           # once the recursion itself is fixed (see TD-STACK-1).
           RUST_MIN_STACK: "16777216"
         run: |
-          # native_tpch_q18_q20_e2e is held back: it regressed on develop with
-          # #1852 (TD-CONV-1 — "Table 'customer' already exists" on a fresh
-          # server). Re-add it to this list + the pgwire_accuracy_changes filter
-          # when that TD closes.
+          # native_tpch_q18_q20_e2e joined this list when TD-CONV-1 closed: the
+          # "already exists on a fresh server" failure was never a #1852 converter
+          # regression — the harnesses shared the CWD-relative default catalog WAL
+          # (file://./metadata), so a previous run's DDL replayed at boot. All
+          # literal-TPC-H-name harnesses now anchor metadata_url into their tempdir.
           for test_name in \
             pgwire_scram_auth_e2e \
             pgwire_transaction_e2e \
@@ -2232,7 +2234,8 @@ jobs:
             rel_join_reorder_e2e \
             rel_lower_3_orderby_e2e \
             rel_lower_native_join_e2e \
-            rel_two_key_correlated_scalar_e2e; do
+            rel_two_key_correlated_scalar_e2e \
+            native_tpch_q18_q20_e2e; do
             echo "Running $test_name..."
             # pgwire_fk_referential_actions_e2e also contains the TD-110 S1 recursive-cascade
             # + concurrency/cycle test (pgwire_cascade_recurses_and_rejects_cycles_depth_and_concurrency),

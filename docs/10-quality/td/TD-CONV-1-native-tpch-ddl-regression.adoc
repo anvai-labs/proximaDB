@@ -1,62 +1,84 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-CONV-1: Converter round-39 regression — `native_tpch_q18_q20_e2e` fails at DDL on fresh server ("Table 'customer' already exists")
+= TD-CONV-1: `native_tpch_q18_q20_e2e` "Table 'customer' already exists" on a fresh server — shared CWD-relative catalog WAL (converter round-39 exonerated)
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Discovered 2026-09-09 while wiring the orphaned accuracy suites into CI (TD-182 P0, PR-A `fix/correctness-floor`). The test was one of the orphaned suites — exactly the blind spot the TD-182 wiring exists to close.
-| Priority | **HIGH** — a row-exact TPC-H correctness test regressed on `develop` invisibly; the same commit is a candidate to have broken other un-CI'd DDL shapes.
-| Component | SQL converter / pgwire DDL dispatch — `src/network/postgres/protocol.rs`, `src/query/federated/optimizer/sql_parsing.rs`, `src/query/unified_query_port_impl.rs` (files touched by the regressing PR).
-| Relates to | PR #1852 (`fix(query): converter review round 39`, merged as c7134e962), TD-182, TD-185, ADR-040.
+| Status | **Resolved (2026-09-14).** Root cause was NOT a converter regression: the harnesses shared one CWD-relative catalog WAL, so a previous run's DDL replayed at boot. Fixed by anchoring `metadata_url` into each harness's tempdir; the test joined the `rust-integration-test-pgwire-accuracy` lane.
+| Priority | **HIGH** at filing — a row-exact TPC-H correctness test appeared to regress invisibly; the flake also fouled the original commit bisect.
+| Component | Test harnesses (`tests/native_tpch_q18_q20_e2e.rs` + 9 sibling literal-TPC-H-name harnesses); `Config::default()`'s CWD-relative `storage.metadata_url` (`src/core/config.rs`).
+| Relates to | PR #1852 (exonerated — see root cause), TD-182, TD-185, ADR-040.
 |===
 
-== The regression
+== Symptom
 
 `tests/native_tpch_q18_q20_e2e.rs::native_tpch_q18_and_q20_execute_row_exact` fails at its DDL
-setup loop (`tests/native_tpch_q18_q20_e2e.rs:161`) with:
+setup loop with:
 
 [subs="quotes"]
 ----
 [42P01] DDL failed: Table 'customer' already exists
 ----
 
-on a **fresh in-process server** (fresh `TempDir` data dir, first client, and the very first
-statements are plain `CREATE TABLE` — no `IF NOT EXISTS`, no re-run within the process).
+on a **fresh in-process server** (fresh `TempDir` data dir, first client, first statement a plain
+`CREATE TABLE` — no `IF NOT EXISTS`, no re-run within the process). Exactly ONE `CREATE TABLE
+customer` appears on the wire. **Flaky, not deterministic**: the same binary passes and fails
+across consecutive runs, and every failure seeds every later run in the same working directory.
 
-== Evidence (bisected by commit)
+== Root cause (corrected 2026-09-14)
 
-|===
-| Commit | Result
-| `75fe44e3a` (develop BEFORE #1852) | **PASS** (`cargo test --test native_tpch_q18_q20_e2e -- --test-threads=1`, 3 consecutive runs)
-| `c7134e962` (#1852 merged, develop HEAD at filing; PR-A changes stashed) | **FAIL 3/3**, identical signature
-|===
+The filing originally implicated #1852 (converter round 39) via a commit bisect. That bisect was
+**fouled by leaked machine state** — the real mechanism:
 
-Repro:
+* `Config::default()` sets `storage.metadata_url = "file://./metadata"` — a **CWD-relative** path
+  (`src/core/config.rs`, `StorageConfig` default).
+* `resolve_default_catalog_backend` (`src/services/catalog_backend_choice.rs`) sees the `file://`
+  scheme and selects `SystemCatalogLocal { base: "./metadata" }` → the WAL-backed SystemCatalog
+  persists at **`<process-cwd>/metadata/system-catalog.wal`**, regardless of `server.data_dir`,
+  `storage_locations`, or `wal_config` — which is what every e2e harness points into its TempDir.
+* A hand-rolled harness that does not override `metadata_url` therefore **shares one catalog WAL
+  across every test process on the machine** (cargo/nextest run test binaries with the workspace
+  root as CWD). Run N creates `customer` …; run N+1 boots, **replays the stale WAL**, and the
+  first `CREATE TABLE customer` hits the already-exists error.
+* The literal-name correlation ("`customer`/`orders` fail, `txn_t_<nanos>` passes") is exactly
+  this: only names a *previous* run created are in the stale WAL.
+* Within one CI job the hazard is worse: nextest/cargo runs these binaries **in parallel in one
+  working directory**, so concurrent harnesses both read and append the same WAL.
 
-----
-cargo test --test native_tpch_q18_q20_e2e -- --test-threads=1 --nocapture
-----
+**Why the bisect implicated #1852:** the PASS runs at the parent commit seeded
+`metadata/system-catalog.wal` in the shared checkout; the c7134e962 runs then replayed it and
+"failed 3/3, identical signature". The converter PR was innocent. Verified 2026-09-14 by probe:
+the exists-check resolves to `cat="native"`, `id=TableIdentifier{namespace:["proximadb","default"],name:"customer"}`, and
+`metadata/system-catalog.wal` in the worktree root contained the literal `customer` DDL entries
+from earlier runs; the TempDir itself was empty of catalog state.
 
-The failing statement is the first `CREATE TABLE customer (c_custkey INT PRIMARY KEY, c_name VARCHAR)`
-of the DDL list (`tests/native_tpch_q18_q20_e2e.rs:137`). Server-side `RUST_LOG=proximadb=info`
-shows no duplicate statement dispatch on the wire — the failure reproduces with only ONE
-`CREATE TABLE customer` observed, so the duplicate-existence signal arises *inside* the DDL
-path (catalog double-registration, or the create flow reporting against a stale/prefilled
-catalog view), not from a re-sent statement.
+== The fix
 
-== Why it went unnoticed
+* All **10 harnesses that CREATE literal TPC-H/TPC-DS-named tables** now anchor the system catalog
+  next to their own data dir (the pattern `tests/common/integration_test_helpers.rs` already used):
+  `native_tpch_q18_q20_e2e`, `tpch_pgwire_e2e`, `tpcds_pgwire_e2e`, `duckdb_route_pgwire_e2e`,
+  `iceberg_interop_e2e`, `rel_correlated_scalar_arith_e2e`, `rel_exec_1_selfjoin_e2e`,
+  `rel_lower_native_join_e2e`, `route_cost_override_pgwire_eval`, `route_geometry_calibration_e2e`:
+  `config.storage.metadata_url = format!("file://{}", tmp.path().join("metadata").display());`
+* `native_tpch_q18_q20_e2e` joined the `rust-integration-test-pgwire-accuracy` named list and the
+  `pgwire_accuracy_changes` filter (it does not match the `tests/*pgwire*` glob).
 
-The test was one of the ~20 orphaned accuracy e2e files (TD-182) that no CI tier ran. PR-A
-wires the other 19 into the `rust-integration-test-pgwire-accuracy` named list; this one is
-held back until this TD closes, so the new CI lane lands green.
+== Verification
 
-== How to apply
+* With a deliberately stale, poisoned `metadata/system-catalog.wal` left in the workspace root
+  (the exact state that produced every historical failure): 5/5 consecutive passes.
+* Without the anchor the same binary failed 2/3 on a clean tree (first pass seeded the WAL; the
+  next runs failed) — reproducing the filing's signature exactly.
 
-1. Reproduce with the command above at develop HEAD.
-2. Trace `CREATE TABLE customer` through the pgwire DDL dispatch post-#1852 (the round-39
-   `strip_distinct_prefix` / `parse_ddl` restructure and the `unified_query_port_impl` changes
-   are the touched surfaces) and fix the duplicate/prefilled registration.
-3. Add `native_tpch_q18_q20_e2e` back to the `pgwire_accuracy_changes` filter + the
-   `rust-integration-test-pgwire-accuracy` named list (the entries were removed in the
-   TD-182 wiring PR with a pointer here), then close this TD.
+== Residual
+
+* ~55 other harnesses boot `db.start()` without anchoring `metadata_url`. They do not create
+  colliding literal table names today, so they are dev-machine-flake carriers only; anchor them
+  when touched.
+* The production-shaped version of this hazard stands: a **relative** `metadata_url` makes the
+  catalog location depend on the process CWD, so two servers started from the same directory
+  share (and can corrupt) one catalog WAL. The principled fix — anchor a relative
+  `metadata_url` to `server.data_dir` inside `resolve_default_catalog_backend` — moves the
+  on-disk catalog location for default-config deployments and needs its own migration story
+  (mixed-read-safe per the storage-format mandate). Filed here as the pointer; not done in this PR.
