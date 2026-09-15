@@ -1,0 +1,50 @@
+= TD-CAT-11: catalog rows outlive a fresh server instance with a fresh data_dir
+:status: Open
+:dim: D1
+:pillar: REL
+
+== Problem
+
+A **freshly booted server process with a brand-new `config.server.data_dir`**
+(tempdir) can see tables created by a *previous, unrelated server process*:
+an adversarial-review probe created `CREATE TABLE advp_copy_t` on a fresh
+instance and got `42P01`-class failure `DDL failed: Table 'advp_copy_t'
+already exists` — a table first created by an earlier probe run's server,
+whose data dir no longer exists. Reproduced deterministically across probe
+retries (2026-09-14, during the pgwire-transactions review round 3).
+
+This is why every e2e/pgwire suite in the repo suffixes table names with
+nanos timestamps ("Unique-per-run table name — same pattern as the other
+pgwire suites"): the uniqueness discipline engineers around catalog state
+that escapes the per-test `data_dir` boundary.
+
+== Why it matters
+
+1. **Test isolation is load-bearing but accidental** — suites that forget
+   the suffix flake or false-fail against leaked catalog rows (exactly the
+   failure mode the probe hit).
+2. **The durability boundary is wrong somewhere**: either (a) some catalog
+   write path ignores `config.server.data_dir` and lands in a shared/global
+   location, or (b) the bootstrap re-hydrates from a default location when
+   the configured one is empty. For the embedded/test topology this leaks
+   state across processes; the same mechanism, if present in a deployed
+   topology, would be a cross-instance visibility hazard.
+3. It masks real failures: a DDL "already exists" error on a pristine
+   instance looks like app-level duplication instead of an isolation leak.
+
+== Next action
+
+1. Reproduce minimally: boot with a fresh tempdir data_dir; `CREATE TABLE
+   isolation_probe_x`; shut down; boot a second fresh instance; `SELECT`
+   for the table — confirm visibility; then strace/audit which paths the
+   first instance's catalog write touched outside its data_dir.
+2. Fix the write (or bootstrap-read) to honor `config.server.data_dir`
+   strictly.
+3. Then decide whether the nanos-suffix discipline can be relaxed in the
+   e2e suites (it currently papers over this).
+
+Deps: none. Discovered by the pgwire-transactions adversarial review
+round 3 (2026-09-14); related isolation context in TD-CONV-1's e2e
+tempdir anchoring (which this TD complements — TD-CONV-1 anchors the
+system catalog INTO tempdirs for the suites that opt in; this TD is the
+underlying leak for everything else).
