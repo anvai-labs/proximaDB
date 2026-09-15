@@ -4861,22 +4861,31 @@ impl PostgresProtocol {
     }
 
     /// Execute a graph query
+    /// TD-GRAPH-PGWIRE-1: a plain `SELECT * FROM <graph collection>` over
+    /// pgwire has no query semantics to serve — pgwire is documented as NOT
+    /// the graph query surface (`docs/SUPPORTED_SURFACE.adoc`: "unified query
+    /// port (`/api/v2/query`) or the graph service — they are not replaceable
+    /// by pgwire"). This used to fabricate a `(table_name, 0, 0)` row
+    /// regardless of whether the collection existed or had data — a silent
+    /// wrong answer, not a real query. Decline honestly instead: calling
+    /// `GraphService::get_stats` here would be unsafe, not just
+    /// unimplemented — it resolves via `get_or_create_graph_engine`, so a
+    /// bare stats lookup on a nonexistent/misspelled name would silently
+    /// provision a new empty graph collection as a side effect of a stray
+    /// SELECT, which is worse than today's placeholder.
     async fn execute_graph_query(&mut self, table_name: &str, _query: &str) -> Result<()> {
-        debug!("Executing graph query on table: {}", table_name);
-
-        // For now, return basic graph info
-        // Full graph query support requires integration with GraphService
-
-        let fields = vec![
-            FieldDescription::new("graph_name", PgType::Text),
-            FieldDescription::new("node_count", PgType::Int8),
-            FieldDescription::new("edge_count", PgType::Int8),
-        ];
-        self.send_row_description(&fields).await?;
-
-        // Return placeholder data - actual implementation would query GraphService
-        self.send_data_row(&[table_name, "0", "0"]).await?;
-        self.send_command_complete("SELECT 1").await
+        debug!("Declining unsupported graph query on table: {}", table_name);
+        self.send_error(
+            "ERROR",
+            "0A000",
+            &format!(
+                "SELECT over graph collection '{table_name}' is not supported over pgwire — \
+                 the SQL/pgwire surface does not implement graph query or traversal semantics. \
+                 Use gRPC proximadb.v2.ProximaGraphService (node/edge/traversal/stats RPCs, or \
+                 the openCypher ExecuteQuery subset) or REST GET /api/v2/graphs/{table_name}."
+            ),
+        )
+        .await
     }
 
     /// Extract time range from WHERE clause

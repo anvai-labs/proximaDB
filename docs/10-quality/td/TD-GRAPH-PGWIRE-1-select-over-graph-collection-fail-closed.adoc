@@ -1,0 +1,79 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GRAPH-PGWIRE-1: `SELECT * FROM <graph collection>` over pgwire fabricated a zero-row/zero-count answer — now fails closed
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (this filing).** The naive single-table dispatch now declines honestly (SQLSTATE `0A000`) instead of returning fabricated data.
+| Priority | **HIGH** at discovery — a query against a real, populated graph collection over pgwire silently returned `(table_name, 0, 0)` regardless of whether the collection existed or had data: a client could not distinguish "empty graph" from "query not implemented" from "table does not exist".
+| Component | `src/network/postgres/protocol.rs` (`execute_graph_query`, dispatched from `DataModel::Graph` in the legacy single-table SELECT path).
+| Relates to | the gap-closure program's PR-G (moat convergence) slice 2 — "graph-over-pgwire: replace the placeholder with either graph_traverse UDTF lowering or an honest decline"; `docs/SUPPORTED_SURFACE.adoc` (documents pgwire as NOT the graph query surface); TD-GRAPH-2 (v2 proto migration — different, unrelated module-relocation topic despite the adjacent numbering territory); TD-GRAPH-TENANT-1 (graph collection creation scoping).
+|===
+
+== The bug
+
+`detect_select_store_type` classifies a plain `SELECT * FROM <table>` as `DataModel::Graph` for
+tables recognized as graph collections (naming/catalog heuristic, not necessarily a full catalog
+existence check). Dispatch then called `execute_graph_query`, which — unlike its sibling
+`execute_collection_query` (the vector case, which does a real `collection_port.get_collection()`
+lookup and returns real dimension/count) — did **no lookup at all**:
+
+[source,rust]
+----
+// Return placeholder data - actual implementation would query GraphService
+self.send_data_row(&[table_name, "0", "0"]).await?;
+self.send_command_complete("SELECT 1").await
+----
+
+Every such query — against an existing graph with real nodes/edges, an empty graph, or a table
+that does not exist at all — returned the identical fabricated `(name, 0, 0)` row with a
+`SELECT 1` success tag. This is a silent-wrong-answer class bug (mandate #1: fail closed, never
+silently wrong).
+
+== Why the naive fix (call `GraphService::get_stats`) is unsafe
+
+The obvious symmetric fix — mirror the vector path and call `graph_service.get_stats(table_name)`
+to return real counts — was investigated and rejected. `GraphService::get_stats` resolves via
+`get_or_create_graph_engine`, which calls
+`self.collection_service.ensure_or_create_graph(graph_id)` — **a nonexistent or misspelled table
+name would silently provision a new, empty graph collection as a side effect of a stray SELECT**,
+which is a worse bug than the one being fixed (now with a storage-mutation side effect). A correct
+"real stats" fix needs an existence pre-check against the catalog (confirmed collection + confirmed
+`DataModel::Graph`) before it is safe to call `get_stats` — meaningfully larger scope than a
+docs/protocol-only PR, and not attempted here.
+
+== Verified: no test depended on the fabricated response
+
+Searched for any test asserting on the placeholder's exact `(graph_name, node_count, edge_count)`
+shape or exercising `execute_graph_query` via a live pgwire connection:
+`tests/graph_ldbc_pgwire_e2e.rs` models its LDBC dataset as plain relational tables (materialized
+Parquet, DataFusion path) — it never reaches `DataModel::Graph` dispatch.
+`tests/graph_comprehensive_e2e_test.rs` and `tests/integration/multimodel_e2e_test.rs` exercise
+`GraphService` directly or unit-test the dispatch classifier (`detect_store_type_from_create`) —
+neither opens a pgwire connection. The placeholder was untested, dead-in-practice code.
+
+== The fix
+
+`execute_graph_query` now declines with SQLSTATE `0A000` (the established pgwire
+feature-not-supported code, used throughout this file), pointing at the real, documented,
+tested graph surfaces per `docs/SUPPORTED_SURFACE.adoc`:
+
+* gRPC `proximadb.v2.ProximaGraphService` (node/edge/query/traversal/shortest-path/stats RPCs;
+  Beta) — or its openCypher `ExecuteQuery` subset.
+* REST `GET /api/v2/graphs/{graph_id}` (and the sibling nodes/edges/shortest-path routes).
+
+No attempt was made to add a real graph_traverse-style SQL table function over pgwire in this
+PR — `GRAPH_TRAVERSE(...)`/`GRAPH_CONNECTED(...)` exist only as `WHERE`-clause condition
+predicates in the separate UQL parser (`crates/query/proximadb-uql`), not as a callable
+table-valued function reachable from pgwire SQL; no test anywhere calls one as executable SQL.
+Building that is a materially larger, separate feature.
+
+== Residual
+
+* A real `graph_traverse(...)`-shaped pgwire/SQL table function (cross-modal `JOIN
+  graph_traverse(...)`, referenced only in a preparatory comment threading `graph_service`
+  into `try_run_select` today) remains unbuilt — future work, not this TD.
+* The "real stats over pgwire" fix (existence-checked, side-effect-free `get_stats`) is a
+  reasonable follow-up once a catalog pre-check pattern for graph collections exists; not
+  filed as its own TD since the honest decline is a complete, correct resolution on its own.
