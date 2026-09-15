@@ -21,7 +21,7 @@
 # DO NOT promote an entry to `measured` without real provenance. Numbers in
 # README/BENCHMARKS are claims, not evidence, until an artifact backs them.
 
-as_of_date = "2026-08-24"
+as_of_date = "2026-09-15"
 source_of_truth = "benches/ + checked-in dated artifacts"
 header_status = "ran the benches 2026-06-16 (docs/_internal/status/BENCH_RUN_2026_06_16.adoc): object_economy_e2e promoted to measured; the other e2e claims' benches measure COMPONENT kernels (fusion-merge µs, recall computation, quantization speed) or small-scale per-engine search, NOT the claimed end-to-end metric/scale — they stay unverified with corrected notes; real e2e benches are the follow-up"
 
@@ -377,37 +377,38 @@ date = "2026-07-16"
 version = "develop @ 549b77fa6 (+ perf/coalesced-pr2-cache-geometry PR2 stack)"
 notes = "Full SIFT1M, single-file collection, 100 queries, top-10, Euclidean, provided GT. IVF OFF = sign-bit bootstrap = the production L0 flush path. Baseline IVF ON (PR2): recall 0.990, 36 GETs, 250 MB, ~47 min flush. The 0.985 recall / 40 GETs here are the production-representative numbers (no eval-only IVF opt-in). The bytes rise (250->430 MB) is the block dead weight Region B will remove via SQ8 density. NOTE: the PROXIMADB_SIFT_IVF_FLUSH=0 knob was added transiently to the eval (gates the set_var at line 486) for this measurement; landing it as a committed eval feature is a pending harness follow-up so the bench_command is reproducible as-is. Indicative dev-machine run, not an SLA."
 
+[[claims]]
+id = "vector_search_latency"
+claim = "SST ~4.4-5.3 ms avg / ~7.3 ms p99 search latency at 97% recall@10 (10K vectors, dim 128, top-10); NOVA ~18.7-23.3 ms avg at 100% recall@10 — re-scoped from the original unsubstantiated '~8ms avg, ~15ms p99 (HNSW, M=32)' 10M-vector claim, which stays unmeasured at that scale (ProximaDB does not build an HNSW graph index; SST/HELIX/NOVA are the storage-engine families)"
+metric = "search_latency_ms"
+status = "measured"
+asserted_in = ["docs/10-quality/benchmarks/BENCHMARKS.adoc:16"]
+bench_source = "tests/all_engines_50k_benchmark.rs"
+bench_command = "cargo test --release --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored"
+artifact = "docs/_internal/status/BENCH_RUN_2026_09_15.adoc"
+hardware = "AMD Ryzen 9 7950X, 16 cores, 125 GB RAM (shared dev machine — indicative, not an SLA)"
+date = "2026-09-15"
+version = "develop @ db6fa75b5 (TD-CONV-2 merged)"
+notes = "Ran 2026-09-15 (10K vectors, dim 128, top-10, 10 queries, brute-force ground truth): SST avg 4.44/5.34 ms across two runs (p99 7.29 ms, recall 97.0%), NOVA avg 18.70/23.28 ms (recall 100.0%). Genuinely measures per-engine search latency at this scale — promoted from unverified. Does NOT substantiate a 10M-vector/HNSW claim (different scale, different index architecture); the 10M headline in BENCHMARKS.adoc stays unmeasured. HELIX (2.0% recall) and SWIFT (3.0% recall, experimental) were also measured but EXCLUDED from this claim — near-random search results, filed as TD-HELIX-3. Indicative dev-machine run, not an SLA."
+
+[[claims]]
+id = "ingest_throughput"
+claim = "187K-334K vectors/sec single-batch insert across default engines (SST/NOVA) at 10K vectors, dim 128 — re-scoped from the original unsubstantiated '~125K vectors/sec (small-batch WAL path)' claim, which specified neither scale nor dimension"
+metric = "ingest_vectors_per_sec"
+status = "measured"
+asserted_in = ["docs/10-quality/benchmarks/BENCHMARKS.adoc:17"]
+bench_source = "tests/all_engines_50k_benchmark.rs"
+bench_command = "cargo test --release --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored"
+artifact = "docs/_internal/status/BENCH_RUN_2026_09_15.adoc"
+hardware = "AMD Ryzen 9 7950X, 16 cores, 125 GB RAM (shared dev machine — indicative, not an SLA)"
+date = "2026-09-15"
+version = "develop @ db6fa75b5 (TD-CONV-2 merged)"
+notes = "Ran 2026-09-15 (single 10,000-vector insert batch, dim 128): SST 186,551-212,848 vec/s, NOVA 285,747-333,507 vec/s across two runs (RAPTOR, experimental-only, 345,103 vec/s). Both default engines exceed the original ~125K/s claim at THIS scale/shape — genuinely measures the route's insert throughput, so promoted from unverified. Not evidence for a 10M-vector / streaming small-batch WAL claim (different workload shape); that framing stays unmeasured. HELIX/SWIFT insert numbers were also captured but excluded — see TD-HELIX-3 (their SEARCH correctness fails, not ingest, but neither is cited here to keep this claim tied only to engines whose numbers are trustworthy end-to-end). Indicative dev-machine run, not an SLA."
+
 # ---------------------------------------------------------------------------
 # UNVERIFIED — a bench exists, but no dated artifact backs the claimed number.
 # ---------------------------------------------------------------------------
 
-[[claims]]
-id = "vector_search_latency"
-claim = "~8 ms avg, ~15 ms p99 search latency (HNSW, M=32)"
-metric = "search_latency_ms"
-status = "unverified"
-asserted_in = ["docs/10-quality/benchmarks/BENCHMARKS.adoc:16"]
-bench_source = "benches/bench_04_storage_unified.rs"
-bench_command = "cargo bench --bench bench_04_storage_unified"
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "Ran 2026-06-16: bench_04 measures per-engine search at only 128 vectors (SST pure ~1.44 ms, filtered ~1.42 ms) — it does NOT measure the '~8 ms p99 over 10M-vector HNSW' claim (scale + engine differ). A real 10M-scale HNSW latency bench is needed. README carries a 'not an SLA / YMMV' caveat."
-
-[[claims]]
-id = "ingest_throughput"
-claim = "~125K vectors/sec ingest (small-batch WAL path)"
-metric = "ingest_vectors_per_sec"
-status = "unverified"
-asserted_in = ["docs/10-quality/benchmarks/BENCHMARKS.adoc:17"]
-bench_source = "benches/bench_08_quantization_sst.rs"
-bench_command = "cargo bench --bench bench_08_quantization_sst"
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "Ran 2026-06-16: bench_08 measures the quantization-speed kernel (dim 128 ~1.02 ms … dim 1536 ~10.74 ms) and progressive-search latency (1024 → ~6.6 µs), NOT an end-to-end '~125K vectors/sec' ingest throughput. A real ingest-throughput bench is needed."
 
 [[claims]]
 id = "recall_at_10"
