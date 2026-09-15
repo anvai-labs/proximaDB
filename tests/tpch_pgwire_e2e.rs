@@ -536,7 +536,7 @@ async fn tpch_accuracy_anchored_phase(client: &tokio_postgres::Client) {
         client
             .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("INSERT failed: {e}"));
+            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", explain_err(&e)));
     }
     for sql in [
         NATION_ENRICHMENT,

@@ -2730,6 +2730,7 @@ impl SharedServices {
         // PartitionLeaseManager the DML write-gate uses (`lease_manager_for_writes`),
         // so DDL and DML share one ownership view.
         let mut ddl = crate::services::DdlService::new(catalog_manager.clone())
+            .with_record_store(dml_service_for_grpc.record_store())
             .with_primary_pod_registry(primary_pod_registry.clone())
             .with_self_pod_id(crate::cluster::primary_pod_registry::resolve_self_pod_id(
                 None,
