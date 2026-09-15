@@ -63,12 +63,16 @@ permissions:
   contents: read
 
 jobs:
+  # Keep the Linux image explicit: org overflow containers also advertise
+  # ubuntu-latest but lack this workflow's Python/compiler/swap capabilities.
+  # Self-hosted runners must not reuse this label without equivalent image/VM
+  # qualification. The deterministic commit contract guards routing drift.
   # ============================================================================
   # CHANGES DETECTION - Determine what to build/test
   # ============================================================================
   changes:
     name: Detect Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       # Three-tier CI (feat -> develop -> qa -> main):
       #   * feat -> develop runs the LIGHT jobs (compile + fmt/clippy + layering
@@ -374,7 +378,7 @@ jobs:
   # ============================================================================
   hygiene-check:
     name: Hygiene Guardrails
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -391,7 +395,7 @@ jobs:
 
   deterministic-commit-contract:
     name: Deterministic Commit Contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -406,7 +410,7 @@ jobs:
 
   repository-identity:
     name: Canonical Repository Identity
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -415,7 +419,7 @@ jobs:
 
   docs-authority:
     name: Docs Authority (no retired/engine drift)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.docs == 'true'
     steps:
@@ -427,7 +431,7 @@ jobs:
 
   risk-coverage:
     name: Risk-Coverage Contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.docs == 'true'
     steps:
@@ -437,7 +441,7 @@ jobs:
 
   oss-docs-decontamination:
     name: OSS Docs Decontamination
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -448,7 +452,7 @@ jobs:
 
   rust-format:
     name: Rust Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -464,7 +468,7 @@ jobs:
 
   capability-matrix:
     name: Capability Matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     # Run on rust changes (evidence refs point at source) AND on docs changes:
     # the validator now also guards the maturity-contract reconciliation in
@@ -502,7 +506,7 @@ jobs:
   # drift from `git`.
   proto-compat:
     name: Proto Compatibility (T4.2)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.proto == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     steps:
@@ -553,7 +557,7 @@ jobs:
   #   UPDATE_OPENAPI_SPEC=1 cargo test -p proximadb --test openapi_spec_gen
   openapi-spec-drift:
     name: OpenAPI Spec From Code (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -581,7 +585,7 @@ jobs:
   # Regenerate locally with: make gen-go-sdk
   go-sdk-codegen-drift:
     name: Go SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.go_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -613,7 +617,7 @@ jobs:
   # make gen-ts-sdk
   ts-sdk-codegen-drift:
     name: TS SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.nodejs_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -640,7 +644,7 @@ jobs:
   # openapi-spec-drift / proto-sync. Regenerate locally with: make gen-rust-sdk
   rust-sdk-codegen-drift:
     name: Rust SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -690,7 +694,7 @@ jobs:
   # / openapi-spec-drift. Regenerate locally with: make gen-python-sdk
   python-sdk-codegen-drift:
     name: Python SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -722,7 +726,7 @@ jobs:
   # without it.
   python-sdk-round-trip:
     name: Python SDK round-trip (ADR-068 D5)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -764,7 +768,7 @@ jobs:
 
   panic-policy-report:
     name: Panic Policy Report (WS-2 Stage 1)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -786,7 +790,7 @@ jobs:
 
   panic-policy-no-regression:
     name: Panic Policy No Regression (WS-2 Stage 2)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, panic-policy-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -802,7 +806,7 @@ jobs:
 
   panic-policy-module-guard:
     name: Panic Policy Critical Modules (WS-2 Stage 3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, panic-policy-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -822,7 +826,7 @@ jobs:
   # INCREASE so the migration only moves one direction. Pure-python (no compile).
   v1-proto-usage-report:
     name: v1 Proto Usage Report (TD-123)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.v1_proto_usage == 'true'
     steps:
@@ -844,7 +848,7 @@ jobs:
 
   v1-proto-usage-no-regression:
     name: v1 Proto Usage No Regression (TD-123)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, v1-proto-usage-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.v1_proto_usage == 'true'
     steps:
@@ -860,7 +864,7 @@ jobs:
 
   rust-clippy:
     name: Rust Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -911,7 +915,7 @@ jobs:
   # combos pass with `--tests` (and with `--all-targets`) as of TD-CAT-8.
   feature-matrix:
     name: Feature Matrix (${{ matrix.label }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true'
     strategy:
@@ -1009,7 +1013,7 @@ jobs:
 
   rust-security:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -1023,7 +1027,7 @@ jobs:
 
   python-lint:
     name: Python Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.proto == 'true'
     steps:
@@ -1060,7 +1064,7 @@ jobs:
 
   go-lint:
     name: Go SDK Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.go_sdk == 'true'
     steps:
@@ -1082,7 +1086,7 @@ jobs:
 
   nodejs-lint:
     name: Node.js SDK Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.nodejs_sdk == 'true'
     steps:
@@ -1099,7 +1103,7 @@ jobs:
 
   ui-build:
     name: Admin UI Install + Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     steps:
@@ -1118,7 +1122,7 @@ jobs:
 
   rust-sdk-lint:
     name: Rust SDK Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true'
     steps:
@@ -1150,7 +1154,7 @@ jobs:
   # ===========================================================================
   sdk-contract-gates:
     name: SDK OpenAPI Contract Gate (${{ matrix.sdk }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1229,7 +1233,7 @@ jobs:
   # ===========================================================================
   connectors-contract-gates:
     name: Connectors Contract Gate (${{ matrix.kind }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1277,7 +1281,7 @@ jobs:
   # ===========================================================================
   spark-jni-smoke:
     name: Spark Connector JNI Smoke (TD-097)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.spark_jni == 'true'
     steps:
@@ -1302,7 +1306,7 @@ jobs:
 
   sdk-security-scan:
     name: SDK Security Scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: |
       needs.changes.outputs.python == 'true' ||
@@ -1386,7 +1390,7 @@ jobs:
 
   docs-validation:
     name: Docs Validation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.docs == 'true'
     steps:
@@ -1435,7 +1439,7 @@ jobs:
   # excluded (separate rot).
   rust-compile:
     name: Rust Compile (${{ matrix.shape }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.compile == 'true'
     # CARGO_BUILD_JOBS=1: serial compilation keeps peak memory bounded. The
@@ -1490,7 +1494,7 @@ jobs:
   # time per feat→develop PR.
   rust-compile-benches:
     name: Rust Compile (benches)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.compile == 'true' && needs.changes.outputs.medium_tier == 'true'
     env:
@@ -1530,7 +1534,7 @@ jobs:
   # ============================================================================
   rust-build:
     name: Rust Build (${{ matrix.profile }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.rust == 'true' && !inputs.skip_tests
     strategy:
@@ -1587,6 +1591,14 @@ jobs:
             -p proximadb-bench \
             -p proximadb-migrate
 
+      - name: Verify critical drainer lifecycle (real server)
+        if: matrix.profile == 'dev'
+        env:
+          RUST_MIN_STACK: "8388608"
+        # Subprocess isolation is owned by this suite. Reuse the dev server
+        # build; serialize its process fixtures on memory-constrained runners.
+        run: cargo test -p proximadb-server --test drainer_lifecycle_integration_test -- --test-threads=1
+
       - name: Upload Server Binary
         if: matrix.profile == 'release' && needs.changes.outputs.medium_tier == 'true'
         uses: actions/upload-artifact@v7
@@ -1597,7 +1609,7 @@ jobs:
 
   rust-test:
     name: Rust Tests (${{ matrix.test-type }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Fail fast instead of the 360-min default if a hang sneaks in; the healthy
     # job finishes in ~30-45 min (compile-bound at CARGO_BUILD_JOBS=1).
     timeout-minutes: 90
@@ -1734,7 +1746,7 @@ jobs:
     name: Rust touched-crate fast check (advisory)
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true        # advisory — never a merge gate (also not in ci-success.needs)
     # 10m is a CANARY, not a budget: with the selection fixed this lane is a
     # cheap leaf compile plus fast unit tests. Production-scale ratchets stay in
@@ -1811,7 +1823,7 @@ jobs:
   # (Azurite/MinIO/fake-gcs), preinstalled on ubuntu-latest.
   object-store-emulator-tests:
     name: Object-store Cool tier (emulators)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [changes]
     if: |
@@ -1844,7 +1856,7 @@ jobs:
   # (skipped otherwise) and in ci-success.needs so it gates when it runs.
   object-store-restart-recovery:
     name: Object-store restart recovery (Azurite)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The `--restart` scope (scripts/run_cloud_emulator_tests.sh) builds 3 test
     # targets across distinct cloud feature sets (azure; aws,azure,gcp) at
     # CARGO_BUILD_JOBS=1 (OOM-safe on the 16GB runner). No other CI job builds
@@ -1924,7 +1936,7 @@ jobs:
   # Targeted integration tests based on changed components
   rust-integration-test-storage:
     name: Rust Integration Tests (storage)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -1963,7 +1975,7 @@ jobs:
   # mlflow_conformance_steps_3x.txt.
   mlflow-conformance:
     name: MLflow conformance (real client)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: changes
     if: |
@@ -2065,7 +2077,7 @@ jobs:
 
   rust-integration-test-authz:
     name: Rust Integration Tests (authz e2e)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       RUST_MIN_STACK: "8388608"
@@ -2120,7 +2132,7 @@ jobs:
 
   rust-integration-test-query:
     name: Rust Integration Tests (query)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -2157,7 +2169,7 @@ jobs:
 
   rust-integration-test-pgwire-accuracy:
     name: Rust Integration Tests (pgwire accuracy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes]
     if: |
@@ -2251,7 +2263,7 @@ jobs:
 
   rust-integration-test-graph:
     name: Rust Integration Tests (graph)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -2283,7 +2295,7 @@ jobs:
 
   rust-integration-test-cluster:
     name: Rust Integration Tests (cluster)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -2326,7 +2338,7 @@ jobs:
   # `cdc_*` tests — a deliberate, narrower scope.)
   rust-integration-test-api:
     name: Rust Integration Tests (api surface)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -2360,7 +2372,7 @@ jobs:
 
   rust-coverage:
     name: Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # FULL tier only (qa -> main). rust-test runs at the MEDIUM tier (qa), but
     # coverage is expensive, so gate it to the main-promotion gate explicitly.
     needs: [changes, rust-test]
@@ -2424,7 +2436,7 @@ jobs:
   # ============================================================================
   python-test:
     name: Python SDK Tests (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Defense-in-depth: the suite runs in ~9min (measured, TD-CI-2; the "~5min"
     # this comment used to claim was stale). If a future test leaks a
     # non-daemon thread / unshutdown pool, the interpreter's atexit join can hang
@@ -2534,7 +2546,7 @@ jobs:
   # coverage, not pass/fail (the python-test matrix owns per-file correctness).
   sdk-coverage-ratchet:
     name: SDK Coverage Ratchet
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     needs: changes
     if: ${{ !inputs.skip_tests && needs.changes.outputs.python == 'true' }}
@@ -2589,7 +2601,7 @@ jobs:
   # it to the whole directory is a step in TD-CG2, not here.
   chunking-conformance:
     name: Chunking Conformance + Quality Evals (TD-CHUNK-1/3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: changes
     if: ${{ !inputs.skip_tests && needs.changes.outputs.python == 'true' }}
@@ -2629,7 +2641,7 @@ jobs:
   # ============================================================================
   integration-test:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [changes, rust-build, python-test]
     if: ${{ !inputs.skip_tests && needs.changes.outputs.extensive == 'true' }}
@@ -2751,7 +2763,7 @@ jobs:
   # ============================================================================
   docker-build:
     name: Docker Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: changes
     if: (needs.changes.outputs.docker == 'true' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.extensive == 'true'
@@ -2801,7 +2813,7 @@ jobs:
   # ============================================================================
   benchmarks:
     name: Benchmarks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build]
     if: |
       inputs.run_benchmarks ||
@@ -2840,7 +2852,7 @@ jobs:
   # ============================================================================
   tpc-perf-ledger:
     name: TPC Perf Evidence Ledger (advisory)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build]
     continue-on-error: true
     timeout-minutes: 60
@@ -2888,7 +2900,7 @@ jobs:
   # a `skipped` result as pass.
   promotion-freshness:
     name: Promotion Freshness (head must contain source branch)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request' && contains(fromJson('["qa", "main"]'), github.base_ref)
     steps:
       - uses: actions/checkout@v7
@@ -2925,7 +2937,7 @@ jobs:
   sift-recall-ratchet:
     name: SIFT PAX recall ratchet (N=10k)
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Release-mode compile of the recall test binary (pulls the full root crate) +
     # 10k-vector ingest measured 30m17s on 2026-08-09 (#1552) — right at the prior
     # 30m cap, so it tipped to CANCELLED under normal runner variance and blocked
@@ -2987,7 +2999,7 @@ jobs:
   # ============================================================================
   ci-success:
     name: CI Success
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - deterministic-commit-contract
       - rust-format

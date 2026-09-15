@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Negative controls for the nextest portion of the commit contract."""
+"""Negative controls for nextest and CI runner selection in the commit contract."""
 
 from __future__ import annotations
 
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import check_deterministic_commit_contract as contract
 
@@ -133,6 +134,70 @@ class NextestCommitContractTest(unittest.TestCase):
             ),
             findings,
         )
+
+
+class CiRunnerCommitContractTest(unittest.TestCase):
+    def findings_for(self, workflow: str) -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / ".github/workflows/ci.yml"
+            path.parent.mkdir(parents=True)
+            path.write_text(workflow, encoding="utf-8")
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_ci_runner_contract(findings)
+                return findings
+
+    def test_checked_in_ci_runner_selection_is_accepted(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(self.findings_for(workflow), [])
+
+    def test_explicit_image_is_accepted(self) -> None:
+        for label in ("ubuntu-24.04", "'ubuntu-24.04'", '"ubuntu-24.04" # pinned'):
+            with self.subTest(label=label):
+                self.assertEqual(self.findings_for(f"    runs-on: {label}\n"), [])
+
+    def test_generic_overflow_alias_is_rejected(self) -> None:
+        for label in ("ubuntu-latest", "'ubuntu-latest'", '"ubuntu-latest"'):
+            with self.subTest(label=label):
+                findings = self.findings_for(f"    runs-on: {label}\n")
+                self.assertTrue(any(f.check == "ci-runner" for f in findings), findings)
+
+    def test_unqualified_runner_selection_is_rejected(self) -> None:
+        for label in (
+            "[self-hosted, ubuntu-latest]",
+            "${{ matrix.runner }}",
+            "\n      group: public-overflow",
+        ):
+            with self.subTest(label=label):
+                self.assertTrue(self.findings_for(f"    runs-on: {label}\n"))
+
+    def test_every_runner_selection_is_checked(self) -> None:
+        workflow = "    runs-on: ubuntu-24.04\n    runs-on: ubuntu-latest\n"
+        findings = self.findings_for(workflow)
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("ci.yml:2", findings[0].message)
+
+    def test_missing_runner_selection_is_rejected(self) -> None:
+        self.assertTrue(self.findings_for("# runs-on: ubuntu-24.04\n"))
+
+    def test_quoted_runner_key_is_checked(self) -> None:
+        for key in ('"runs-on"', "'runs-on'"):
+            with self.subTest(key=key):
+                workflow = f"    runs-on: ubuntu-24.04\n    {key}: ubuntu-latest\n"
+                self.assertTrue(self.findings_for(workflow))
+
+    def test_inline_job_cannot_bypass_the_block_style_guard(self) -> None:
+        for key in ("runs-on", '"runs-on"', "'runs-on'"):
+            with self.subTest(key=key):
+                workflow = (
+                    "    runs-on: ubuntu-24.04\n"
+                    f"  other: {{{key}: ubuntu-latest}}\n"
+                )
+                self.assertTrue(self.findings_for(workflow))
+
+    def test_hash_without_whitespace_is_part_of_the_label(self) -> None:
+        self.assertTrue(self.findings_for("    runs-on: ubuntu-24.04#different-label\n"))
 
 
 if __name__ == "__main__":

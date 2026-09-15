@@ -234,7 +234,10 @@ mod tests {
         }
 
         async fn metadata(&self, _path: &std::path::Path) -> Result<Metadata> {
-            Ok(Metadata { size_bytes: 0 })
+            Ok(Metadata {
+                size_bytes: 0,
+                is_directory: false,
+            })
         }
     }
 

@@ -3,7 +3,12 @@
 //! The warehouse base tier needs a way to publish a new table snapshot **atomically**
 //! over decoupled object storage, where there is no transaction manager — only
 //! per-object operations. This module supplies the optimistic-concurrency commit
-//! primitive built on [`ProximaObjectStore::put_if_absent`] (create-only put):
+//! primitive. Legacy logs use [`ProximaObjectStore::put_if_absent`] (create-only
+//! put); legacy pruning is disabled and writes reject presently gapped history.
+//! Legacy writers/pruners must be externally excluded at deployment and migration:
+//! continuity cannot establish whether a deleted slot was historically refilled.
+//! The experimental, explicit-opt-in versioned format instead uses conditional
+//! head replacement; see [`ManifestCommitter::create_versioned`].
 //!
 //! - Snapshots are immutable, **monotonically-versioned** manifest objects named
 //!   `{prefix}/v{version}.manifest` (zero-padded so a lexical `list` is in numeric order).
@@ -18,17 +23,36 @@
 //! counts / column stats). This crate owns the *atomicity*, not the manifest schema.
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use object_store::path::Path;
 use proximadb_kernel::error::StorageError;
 use proximadb_object_store::ProximaObjectStore;
 pub use proximadb_storage_common::object_store_bridge::CommitOutcome;
+
+#[path = "manifest/head.rs"]
+mod head;
+
+#[cfg(test)]
+#[path = "manifest/head_tests.rs"]
+mod head_tests;
+
+#[cfg(test)]
+#[path = "manifest/legacy_policy_tests.rs"]
+mod legacy_policy_tests;
 
 /// Floor for [`ManifestCommitter::prune_retention`]'s `keep_k`. Below this the log
 /// would collapse to little more than the tip, eliminating the concurrency window in
 /// which a reader may still hold a just-read parent and leaving a single point of
 /// failure for the generation fence.
 const MIN_PRUNE_KEEP_K: usize = 2;
+
+/// Required interpretation of unmarked historical bytes. Never infer this from
+/// payload contents; current lease/catalog callers declare GenerationPrefixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LegacyEncoding {
+    Plain,
+    GenerationPrefixed,
+}
 
 /// Atomic, optimistic-concurrency manifest committer over a [`ProximaObjectStore`].
 ///
@@ -37,6 +61,10 @@ const MIN_PRUNE_KEEP_K: usize = 2;
 pub struct ManifestCommitter {
     store: ProximaObjectStore,
     prefix: String,
+    // Pinned on explicit provisioning/open or detection of a persisted authority.
+    // Format creation/migration remains explicit, never default-on.
+    authority: std::sync::OnceLock<[u8; 16]>,
+    legacy_encoding: LegacyEncoding,
 }
 
 impl ManifestCommitter {
@@ -47,7 +75,29 @@ impl ManifestCommitter {
         while prefix.ends_with('/') {
             prefix.pop();
         }
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            authority: std::sync::OnceLock::new(),
+            legacy_encoding: LegacyEncoding::Plain,
+        }
+    }
+
+    /// Declare the encoding of an existing legacy log. This changes no persisted
+    /// bytes and does not migrate or convert a log. Plain is the default.
+    pub fn with_legacy_encoding(mut self, encoding: LegacyEncoding) -> Self {
+        self.legacy_encoding = encoding;
+        self
+    }
+
+    fn decode_legacy(&self, bytes: &Bytes) -> Result<(u64, Bytes), StorageError> {
+        match self.legacy_encoding {
+            LegacyEncoding::Plain => Ok((0, bytes.clone())),
+            LegacyEncoding::GenerationPrefixed if bytes.len() >= 8 => Ok(decode_fenced(bytes)),
+            LegacyEncoding::GenerationPrefixed => Err(StorageError::Corruption(
+                "manifest: truncated declared generation header".into(),
+            )),
+        }
     }
 
     /// Object path of the manifest for `version`. Zero-padded to 20 digits (covers all
@@ -67,16 +117,41 @@ impl ManifestCommitter {
 
     /// The highest committed version, or `None` if the log is empty.
     pub async fn latest_version(&self) -> Result<Option<u64>, StorageError> {
+        if let Some(head) = self.load_head().await? {
+            return Ok(head.record.version());
+        }
+        self.latest_legacy_version().await
+    }
+
+    async fn latest_legacy_version(&self) -> Result<Option<u64>, StorageError> {
+        Ok(self.legacy_versions().await?.last().copied())
+    }
+
+    async fn legacy_versions(&self) -> Result<Vec<u64>, StorageError> {
         let prefix = Path::from(self.prefix.as_str());
         let metas = self.store.list(Some(&prefix)).await?;
-        Ok(metas
-            .iter()
-            .filter_map(|m| m.location.filename().and_then(Self::parse_version))
-            .max())
+        let mut versions: Vec<_> = metas
+            .into_iter()
+            .filter_map(|m| {
+                let version = Self::parse_version(m.location.filename()?)?;
+                (m.location == self.store.full_path(&self.manifest_path(version)))
+                    .then_some(version)
+            })
+            .collect();
+        versions.sort_unstable();
+        versions.dedup();
+        Ok(versions)
     }
 
     /// Read the raw manifest bytes for a specific `version`.
     pub async fn read_manifest(&self, version: u64) -> Result<Bytes, StorageError> {
+        if let Some(head) = self.load_head().await? {
+            return Ok(self.read_versioned(head, version).await?.1);
+        }
+        self.read_legacy_manifest(version).await
+    }
+
+    async fn read_legacy_manifest(&self, version: u64) -> Result<Bytes, StorageError> {
         self.store.get(&self.manifest_path(version)).await
     }
 
@@ -91,6 +166,51 @@ impl ManifestCommitter {
         parent: Option<u64>,
         manifest: Bytes,
     ) -> Result<CommitOutcome, StorageError> {
+        if let Some(head) = self.load_head().await? {
+            return self.commit_versioned(head, parent, 0, manifest).await;
+        }
+        self.commit_legacy(parent, None, manifest).await
+    }
+
+    async fn commit_legacy(
+        &self,
+        parent: Option<u64>,
+        generation: Option<u64>,
+        payload: Bytes,
+    ) -> Result<CommitOutcome, StorageError> {
+        let versions = self.legacy_versions().await?;
+        let latest = versions.last().copied();
+        if parent != latest {
+            return Ok(CommitOutcome::Conflict { latest });
+        }
+        if versions
+            .iter()
+            .enumerate()
+            .any(|(index, version)| u64::try_from(index).ok() != Some(*version))
+        {
+            return Err(StorageError::TransactionCommitFailed(
+                "manifest: legacy history has gaps; migrate to versioned authority before writing"
+                    .into(),
+            ));
+        }
+        if generation.is_some() != (self.legacy_encoding == LegacyEncoding::GenerationPrefixed) {
+            return Err(StorageError::Serialization(
+                "manifest: write operation disagrees with declared legacy encoding".into(),
+            ));
+        }
+        if let (Some(latest), Some(generation)) = (latest, generation) {
+            // This is the SAME tip whose parent and continuity were validated.
+            let (existing, _) = self.decode_legacy(&self.read_legacy_manifest(latest).await?)?;
+            if generation < existing {
+                return Ok(CommitOutcome::Conflict {
+                    latest: Some(latest),
+                });
+            }
+        }
+        let manifest = match generation {
+            Some(g) => encode_fenced(g, &payload),
+            None => payload,
+        };
         let target = match parent {
             Some(p) => p.checked_add(1).ok_or_else(|| {
                 StorageError::Serialization("manifest: version counter overflow".into())
@@ -104,7 +224,7 @@ impl ManifestCommitter {
         {
             Ok(()) => Ok(CommitOutcome::Committed(target)),
             Err(StorageError::AlreadyExists(_)) => Ok(CommitOutcome::Conflict {
-                latest: self.latest_version().await?,
+                latest: self.latest_legacy_version().await?,
             }),
             Err(other) => Err(other),
         }
@@ -119,53 +239,45 @@ impl ManifestCommitter {
     /// generation single-writer guarantee — a resurrected/forked writer carrying an old
     /// generation cannot clobber a branch that a newer writer has taken over.
     ///
-    /// The generation is stored as an 8-byte big-endian header prepended to `payload`;
-    /// read it back with [`read_fenced`](Self::read_fenced). Existing manifests written by
-    /// plain [`commit`](Self::commit) decode as generation `0`, so an unfenced log upgrades
-    /// transparently.
+    /// Legacy logs store an unmarked 8-byte generation header; arbitrary plain
+    /// payloads of eight or more bytes cannot be distinguished from that format.
+    /// They do NOT transparently upgrade. The opt-in head format stores generation
+    /// separately and checks generation/parent at the conditional update boundary.
+    /// Legacy prechecks do not prevent a delayed writer from reusing a pruned slot.
     pub async fn commit_fenced(
         &self,
         parent: Option<u64>,
         generation: u64,
         payload: Bytes,
     ) -> Result<CommitOutcome, StorageError> {
-        if let Some(latest) = self.latest_version().await? {
-            let (existing_generation, _) = decode_fenced(&self.read_manifest(latest).await?);
-            if generation < existing_generation {
-                // Stale writer: a newer generation already owns this log.
-                return Ok(CommitOutcome::Conflict {
-                    latest: Some(latest),
-                });
-            }
+        if let Some(head) = self.load_head().await? {
+            return self
+                .commit_versioned(head, parent, generation, payload)
+                .await;
         }
-        self.commit(parent, encode_fenced(generation, &payload))
-            .await
+        self.commit_legacy(parent, Some(generation), payload).await
     }
 
     /// Read a generation-fenced manifest, returning `(generation, payload)`.
-    /// Manifests written by plain [`commit`](Self::commit) decode as generation `0`.
+    /// Legacy interpretation is explicitly selected by `with_legacy_encoding`:
+    /// Plain returns generation zero without stripping bytes; GenerationPrefixed
+    /// requires at least eight header bytes. No content-based codec guessing.
     pub async fn read_fenced(&self, version: u64) -> Result<(u64, Bytes), StorageError> {
-        Ok(decode_fenced(&self.read_manifest(version).await?))
+        if let Some(head) = self.load_head().await? {
+            return self.read_versioned(head, version).await;
+        }
+        self.decode_legacy(&self.read_legacy_manifest(version).await?)
     }
 
-    /// Best-effort retention prune of superseded manifest objects.
-    ///
-    /// The manifest log is append-only — every commit creates a new `v{N}.manifest`
-    /// via a create-only put, and historically **nothing reclaimed the stale tail**.
-    /// A long-lived lease renewed every few seconds therefore grows without bound
-    /// (observed: ~48k objects per collection, ~562 MB), which made every
-    /// [`latest_version`](Self::latest_version) a full O(n) `list` that pinned a CPU
-    /// core; on a cloud store each such `list` is a paginated HTTP LIST that grows
-    /// slower and costlier as `n` grows. Pruning the tail caps `n` — which is *itself*
-    /// the read-path fix, so no mutable tip pointer is needed (a pointer would
-    /// reintroduce the lost-update/ABA hazard the create-only-put protocol avoids).
+    /// Best-effort retention of versioned history. Legacy logs always return an
+    /// error without deleting anything, including empty logs; migrate explicitly
+    /// before pruning. This trades metadata growth for preventing slot reuse.
     ///
     /// # Safety
     ///
-    /// Only the **tip** (the max version) is ever read — by
-    /// [`commit_fenced`](Self::commit_fenced), [`read_fenced`](Self::read_fenced) and
-    /// the version CAS — so it is **never deleted**. A version becomes eligible only
-    /// when it is **both**:
+    /// The versioned head and marker are never deleted. Historical reads are not
+    /// pinned. An archived version becomes eligible when
+    /// it is **both**:
     ///
     /// - ranked `keep_k` or more behind the tip (rank is the position in the sorted
     ///   version list, **not** `tip - v` arithmetic, so a log with gaps from a prior
@@ -184,64 +296,12 @@ impl ManifestCommitter {
         keep_k: usize,
         min_age: std::time::Duration,
     ) -> Result<usize, StorageError> {
-        // Defense in depth — the call sites clamp too, but never let the log collapse
-        // past the tip-plus-predecessor concurrency window.
-        let keep_k = keep_k.max(MIN_PRUNE_KEEP_K);
-        let min_age = chrono::Duration::from_std(min_age).unwrap_or(chrono::Duration::zero());
-
-        let prefix = Path::from(self.prefix.as_str());
-        let mut entries: Vec<(u64, DateTime<Utc>)> = self
-            .store
-            .list(Some(&prefix))
-            .await?
-            .into_iter()
-            .filter_map(|m| {
-                let version = Self::parse_version(m.location.filename()?)?;
-                Some((version, m.last_modified))
-            })
-            .collect();
-        if entries.len() <= keep_k {
-            return Ok(0);
+        if let Some(head) = self.load_head().await? {
+            return self.prune_versioned(head, keep_k, min_age).await;
         }
-
-        // Oldest first; the tip is the last element and is never eligible.
-        entries.sort_unstable_by_key(|(v, _)| *v);
-        let now = Utc::now();
-        let count = entries.len();
-
-        let mut deleted = 0usize;
-        for (idx, (version, last_modified)) in entries.iter().enumerate() {
-            // rank 0 == the tip; rank grows toward the head of the list. Newer entries
-            // have smaller rank, so once rank drops below `keep_k` everything that
-            // remains is within the keep window — stop early.
-            let rank_from_tip = count - 1 - idx;
-            if rank_from_tip < keep_k {
-                break;
-            }
-            // `age < min_age` also covers a future-dated mtime (negative age) from cloud
-            // clock skew — such an object is never reaped early.
-            let age = now.signed_duration_since(*last_modified);
-            if age < min_age {
-                continue;
-            }
-            // Delete via the canonical `manifest_path(version)` — the same form `get` /
-            // `put_if_absent` address. A list-returned `location` is not always
-            // delete-safe across backends (the local store returns a root-relative form
-            // that `delete` would double-prefix), but the constructed path round-trips.
-            match self.store.delete(&self.manifest_path(*version)).await {
-                Ok(()) => deleted += 1,
-                // A concurrent pass (or a cross-pod owner) already removed it.
-                Err(StorageError::NotFound(_)) => {}
-                Err(e) => tracing::warn!(
-                    target: "proximadb::manifest::prune",
-                    prefix = %self.prefix,
-                    version,
-                    error = %e,
-                    "best-effort manifest delete failed; continuing pass"
-                ),
-            }
-        }
-        Ok(deleted)
+        Err(StorageError::TransactionCommitFailed(
+            "manifest: legacy retention is disabled; migrate before pruning".into(),
+        ))
     }
 }
 
@@ -267,10 +327,87 @@ fn decode_fenced(bytes: &Bytes) -> (u64, Bytes) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream::BoxStream;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Notify;
+
+    /// All operations delegate to the same real in-memory object store. Only
+    /// this client's PUT is suspended, after the committer has validated state.
+    #[derive(Debug)]
+    struct PausedPutStore {
+        inner: Arc<InMemory>,
+        reached_put: Notify,
+        resume_put: Notify,
+    }
+
+    impl std::fmt::Display for PausedPutStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("PausedPutStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PausedPutStore {
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            if path.filename() == Some("_publication.head") {
+                self.reached_put.notify_one();
+                self.resume_put.notified().await;
+            }
+            self.inner.put_opts(path, payload, options).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+        async fn get_opts(
+            &self,
+            path: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     fn committer() -> ManifestCommitter {
         ManifestCommitter::new(
@@ -390,7 +527,7 @@ mod tests {
     /// can claim a slot; a current/newer generation commits and round-trips.
     #[tokio::test]
     async fn fenced_commit_rejects_stale_generation() {
-        let c = committer();
+        let c = committer().with_legacy_encoding(LegacyEncoding::GenerationPrefixed);
         // Generation 5 takes ownership of the log at v0.
         assert_eq!(
             c.commit_fenced(None, 5, Bytes::from_static(b"g5"))
@@ -431,17 +568,158 @@ mod tests {
 
     // ---- prune_retention ----
 
-    fn committer_with_store() -> (ManifestCommitter, Arc<InMemory>) {
-        let backend = Arc::new(InMemory::new());
-        let c = ManifestCommitter::new(
-            ProximaObjectStore::new(backend.clone()),
+    async fn assert_paused_publication_conflicts(successor_generation: u64) {
+        let (current, backend) = committer_with_store().await;
+        seed_fenced(&current, 1, 5).await;
+        let paused_store = Arc::new(PausedPutStore {
+            inner: backend,
+            reached_put: Notify::new(),
+            resume_put: Notify::new(),
+        });
+        let delayed = ManifestCommitter::new(
+            ProximaObjectStore::new(paused_store.clone()),
             "data/t/ns/_manifests",
         );
+
+        let (_, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                async {
+                    paused_store.reached_put.notified().await;
+                    for version in 1..=5 {
+                        assert_eq!(
+                            current
+                                .commit_fenced(
+                                    Some(version - 1),
+                                    successor_generation,
+                                    Bytes::from_static(b"current")
+                                )
+                                .await
+                                .unwrap(),
+                            CommitOutcome::Committed(version)
+                        );
+                    }
+                    assert_eq!(current.prune_retention(2, Duration::ZERO).await.unwrap(), 4);
+                    paused_store.resume_put.notify_one();
+                },
+                delayed.commit_fenced(Some(0), 5, Bytes::from_static(b"delayed")),
+            )
+        })
+        .await
+        .expect("paused publication schedule must finish");
+
+        assert_eq!(current.latest_version().await.unwrap(), Some(5));
+        // Its exact receipt was pruned. A conditional error may follow a
+        // client's successful retry, so the protocol must report uncertainty
+        // while proving that this delayed request cannot alter authority.
+        assert!(
+            matches!(outcome, Err(StorageError::TransactionCommitFailed(ref e)) if e.contains("indeterminate")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            current.read_fenced(5).await.unwrap(),
+            (successor_generation, Bytes::from_static(b"current"))
+        );
+        assert!(matches!(
+            current.read_manifest(1).await,
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    /// A preflight latest-parent check cannot fix a PUT suspended across GC.
+    #[tokio::test]
+    async fn lease_invariant_prune_during_validated_put_cannot_reuse_slot() {
+        assert_paused_publication_conflicts(5).await;
+    }
+
+    /// A generation check before PUT cannot fence a writer suspended across
+    /// both a successor's generation change and subsequent retention.
+    #[tokio::test]
+    async fn lease_invariant_takeover_during_validated_put_fences_old_generation() {
+        assert_paused_publication_conflicts(6).await;
+    }
+
+    /// A deleted successor is not an available CAS slot: the caller's parent
+    /// remains stale even when its generation still matches the current owner.
+    #[tokio::test]
+    async fn lease_invariant_pruning_does_not_revalidate_stale_parent() {
+        let (current, backend) = committer_with_store().await;
+        let delayed =
+            ManifestCommitter::new(ProximaObjectStore::new(backend), "data/t/ns/_manifests");
+        let tip = seed_fenced(&current, 6, 5).await;
+        assert_eq!(current.prune_retention(2, Duration::ZERO).await.unwrap(), 4);
+        assert!(matches!(
+            current.read_manifest(1).await,
+            Err(StorageError::NotFound(_))
+        ));
+
+        let outcome = delayed
+            .commit_fenced(Some(0), 5, Bytes::from_static(b"stale checkpoint"))
+            .await
+            .unwrap();
+
+        assert_eq!(current.latest_version().await.unwrap(), Some(tip));
+        assert_eq!(outcome, CommitOutcome::Conflict { latest: Some(tip) });
+        assert!(matches!(
+            current.read_manifest(1).await,
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn lease_invariant_pruning_does_not_revalidate_empty_parent() {
+        let (c, _) = committer_with_store().await;
+        let tip = seed_fenced(&c, 6, 5).await;
+        c.prune_retention(2, Duration::ZERO).await.unwrap();
+
+        let outcome = c
+            .commit(None, Bytes::from_static(b"late initial commit"))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Conflict { latest: Some(tip) });
+        assert_eq!(c.latest_version().await.unwrap(), Some(tip));
+    }
+
+    #[tokio::test]
+    async fn lease_invariant_nonexistent_parent_cannot_advance_head() {
+        let c = committer();
+        c.commit(None, Bytes::from_static(b"initial"))
+            .await
+            .unwrap();
+
+        let outcome = c
+            .commit(Some(100), Bytes::from_static(b"not based on head"))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Conflict { latest: Some(0) });
+        assert_eq!(c.latest_version().await.unwrap(), Some(0));
+    }
+
+    /// The documented plain-to-fenced compatibility must hold beyond the
+    /// existing five-byte fixture; ordinary JSON is longer than eight bytes.
+    #[tokio::test]
+    async fn lease_invariant_plain_payload_is_not_a_generation_header() {
+        let c = committer();
+        let payload = Bytes::from_static(br#"{"checkpoint":"source-cursor"}"#);
+        c.commit(None, payload.clone()).await.unwrap();
+
+        assert_eq!(c.read_fenced(0).await.unwrap(), (0, payload));
+    }
+
+    async fn committer_with_store() -> (ManifestCommitter, Arc<InMemory>) {
+        let backend = Arc::new(InMemory::new());
+        let c = ManifestCommitter::create_versioned(
+            ProximaObjectStore::new(backend.clone()),
+            "data/t/ns/_manifests",
+        )
+        .await
+        .unwrap();
         (c, backend)
     }
 
     /// Seed `n` fenced commits at a fixed generation; returns the final version.
-    async fn seed_fenced(c: &ManifestCommitter, n: u64, generation: u64) -> u64 {
+    pub(super) async fn seed_fenced(c: &ManifestCommitter, n: u64, generation: u64) -> u64 {
         let mut parent: Option<u64> = None;
         let mut last = 0;
         for v in 0..n {
@@ -460,7 +738,7 @@ mod tests {
     /// Pruning deletes only the stale tail; the tip is always retained and readable.
     #[tokio::test]
     async fn prune_never_deletes_tip() {
-        let (c, _backend) = committer_with_store();
+        let (c, _backend) = committer_with_store().await;
         let tip = seed_fenced(&c, 50, 5).await;
         assert_eq!(tip, 49);
 
@@ -475,7 +753,7 @@ mod tests {
     /// generation header survives. This is the load-bearing fence test.
     #[tokio::test]
     async fn prune_preserves_fenced_commit_after_prune() {
-        let (c, _backend) = committer_with_store();
+        let (c, _backend) = committer_with_store().await;
         let tip = seed_fenced(&c, 50, 5).await;
         assert_eq!(c.prune_retention(5, Duration::ZERO).await.unwrap(), 45);
 
@@ -489,7 +767,7 @@ mod tests {
     /// A stale writer (generation below the tip's) is still fenced after pruning.
     #[tokio::test]
     async fn prune_then_stale_writer_still_fenced() {
-        let (c, _backend) = committer_with_store();
+        let (c, _backend) = committer_with_store().await;
         let tip = seed_fenced(&c, 50, 5).await;
         c.prune_retention(5, Duration::ZERO).await.unwrap();
 
@@ -507,7 +785,7 @@ mod tests {
     /// then dropping it to zero reaps the stale tail while the keep window stays intact.
     #[tokio::test]
     async fn prune_respects_min_age_grace_window() {
-        let (c, _backend) = committer_with_store();
+        let (c, _backend) = committer_with_store().await;
         seed_fenced(&c, 50, 5).await;
 
         // Everything was written moments ago → all within the grace window.
@@ -532,10 +810,10 @@ mod tests {
     /// prior partial prune) is still ranked correctly — not by `tip - v` arithmetic.
     #[tokio::test]
     async fn prune_rank_robust_to_gaps() {
-        let (c, backend) = committer_with_store();
+        let (c, backend) = committer_with_store().await;
         seed_fenced(&c, 50, 5).await;
         // Simulate a prior partial prune that already removed v25.
-        let gap_path = c.manifest_path(25);
+        let gap_path = Path::from("data/t/ns/_manifests/_history/v00000000000000000025.snapshot");
         backend.delete(&gap_path).await.unwrap();
         assert!(c.read_manifest(25).await.is_err());
 
@@ -552,7 +830,7 @@ mod tests {
     /// always well-formed and the tip stays readable.
     #[tokio::test]
     async fn prune_concurrent_with_commit_fenced_is_safe() {
-        let (c, _backend) = committer_with_store();
+        let (c, _backend) = committer_with_store().await;
         let mut tip = seed_fenced(&c, 40, 5).await;
 
         for _ in 0..20 {
@@ -578,7 +856,7 @@ mod tests {
     /// An empty log is a no-op (never errors, deletes nothing).
     #[tokio::test]
     async fn prune_empty_log_is_noop() {
-        let (c, _backend) = committer_with_store();
+        let (c, _backend) = committer_with_store().await;
         assert_eq!(
             c.prune_retention(10, Duration::from_secs(60))
                 .await
@@ -592,7 +870,7 @@ mod tests {
     /// the tip-plus-predecessor window.
     #[tokio::test]
     async fn prune_clamps_keep_k_below_minimum() {
-        let (c, _backend) = committer_with_store();
+        let (c, _backend) = committer_with_store().await;
         seed_fenced(&c, 10, 5).await;
         // keep_k=0 → clamped to MIN_PRUNE_KEEP_K (2): delete 8, keep newest 2.
         let deleted = c.prune_retention(0, Duration::ZERO).await.unwrap();

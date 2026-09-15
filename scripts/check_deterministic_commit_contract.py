@@ -7,6 +7,7 @@ point at deterministic policies:
 
 * unit tests use the bounded-retry nextest profile and report survivors as flaky
 * CI and Makefile still invoke that profile
+* the main CI workflow uses its qualified, explicit Ubuntu image label
 * architecture docs still separate code presence from support level
 * tenant/path mandates remain visible in the system map
 * Arrow Flight exports bind client paths to the selected collection
@@ -171,6 +172,39 @@ def check_nextest_contract(findings: list[Finding]) -> None:
                 ".config/nextest.toml profile.integration.retries must stay at 1",
             )
         )
+
+
+def check_ci_runner_contract(findings: list[Finding]) -> None:
+    """Guard this workflow's explicit block-style routing, without a YAML dependency."""
+    path = ".github/workflows/ci.yml"
+    selections = 0
+    key = r'''(?:runs-on|'runs-on'|"runs-on")'''
+    for line_number, line in enumerate(read_text(path).splitlines(), start=1):
+        if line.lstrip().startswith("#"):
+            continue
+        if re.search(rf"[{{,]\s*{key}\s*:", line):
+            findings.append(
+                Finding(
+                    "ci-runner",
+                    f"{path}:{line_number} must use block-style runner selection",
+                )
+            )
+            continue
+        match = re.match(rf"^\s*{key}\s*:\s*(.*?)\s*$", line)
+        if match is None:
+            continue
+        selections += 1
+        label = re.split(r"\s+#", match.group(1), maxsplit=1)[0].strip()
+        if label not in ("ubuntu-24.04", "'ubuntu-24.04'", '"ubuntu-24.04"'):
+            findings.append(
+                Finding(
+                    "ci-runner",
+                    f"{path}:{line_number} must use explicit ubuntu-24.04; "
+                    "ubuntu-latest aliases unqualified overflow runners",
+                )
+            )
+    if selections == 0:
+        findings.append(Finding("ci-runner", f"{path} has no runner selections"))
 
 
 def check_gate_wiring(findings: list[Finding]) -> None:
@@ -544,6 +578,7 @@ def main() -> int:
     findings: list[Finding] = []
 
     check_nextest_contract(findings)
+    check_ci_runner_contract(findings)
     check_gate_wiring(findings)
     check_architecture_contract(findings)
     check_flight_export_authority(findings)
@@ -556,7 +591,7 @@ def main() -> int:
     print("Deterministic commit contract")
     if not findings:
         print(
-            "OK: nextest, CI/Makefile wiring, architecture guards, Flight/query/object-store "
+            "OK: nextest, CI runner/Makefile wiring, architecture guards, Flight/query/object-store "
             "authorities, rust-cache keys, TDD Rust warning policy, and conflict-marker "
             "checks pass."
         )

@@ -32,6 +32,8 @@ python = ["dep:pyo3"]
 # Async runtime
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time", "macros", "fs"] }
 async-trait.workspace = true
+uuid = { version = "1.0", features = ["v4"] }
+proximadb-runtime-common.workspace = true
 
 # Lock-free bounded queues for the memory tier
 crossbeam-queue = "0.3"

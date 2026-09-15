@@ -272,8 +272,24 @@ impl FileSystem for CountingFileSystem {
     async fn append(&self, path: &str, data: &[u8]) -> FsResult<()> {
         self.inner.append(path, data).await
     }
+
+    async fn compare_exchange(
+        &self,
+        path: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        guards: &[(&str, Option<&[u8]>)],
+    ) -> FsResult<bool> {
+        self.inner
+            .compare_exchange(path, expected, replacement, guards)
+            .await
+    }
     fn supports_append(&self) -> bool {
         self.inner.supports_append()
+    }
+
+    fn supports_conditional_replace(&self) -> bool {
+        self.inner.supports_conditional_replace()
     }
     async fn delete(&self, path: &str) -> FsResult<()> {
         self.inner.delete(path).await

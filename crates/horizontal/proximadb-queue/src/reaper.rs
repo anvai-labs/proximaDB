@@ -14,8 +14,8 @@
 //!    `{segment_path}.uploaded` sidecar marker exists. If no archive
 //!    is configured, this condition is vacuously satisfied (the user
 //!    has opted into "local disk only" durability).
-//! 2. **Consumer condition**: the default consumer group's
-//!    `committed_offset` (via `offset_store::read`) is `Some(c)` with
+//! 2. **Consumer condition**: the minimum inclusive committed offset across
+//!    every discovered group (including lease-only groups) is `Some(c)` with
 //!    `c >= segment.last_offset`. If no `offset.meta` exists yet, the
 //!    segment is NOT reapable (no consumer has acked anything; the
 //!    messages may still be needed).
@@ -115,7 +115,7 @@ impl Reaper {
                 // past it — take the min committed offset across groups.
                 // None ⇒ no group has acked yet ⇒ keep the segment (pub/sub
                 // safety: never delete before the slowest group has read).
-                let committed = groups.iter().map(|(_, o)| *o).min();
+                let committed = groups.iter().map(|(_, o)| *o).min().flatten();
                 for segment in segments {
                     // Skip the active segment — producers are still
                     // appending to it.

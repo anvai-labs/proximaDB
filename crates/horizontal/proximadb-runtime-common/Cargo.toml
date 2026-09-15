@@ -20,7 +20,5 @@ tracing.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 libc = "0.2"
-proximadb-memory-pool.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+proximadb-memory-pool.workspace = true
