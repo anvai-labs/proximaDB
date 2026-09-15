@@ -43,6 +43,10 @@ impl MemtableRecordStorage {
                     self.delete_record(&RecordKey::new(oid)).await?;
                     summary.deletes_replayed += 1;
                 }
+                // A partition drop is scoped by the DirectWal replay (which owns
+                // the partition map and discards the whole memtable); a single
+                // memtable has no cross-collection scope to clear.
+                CanonicalOperation::RecordPartitionDrop { .. } => {}
                 // Checkpoints, CDC barriers, and system-catalog mutations carry
                 // no record state for the memtable to replay.
                 CanonicalOperation::Checkpoint(_)

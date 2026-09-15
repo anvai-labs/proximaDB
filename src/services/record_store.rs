@@ -549,6 +549,30 @@ pub trait TableRecordStore: Send + Sync {
         tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult>;
 
+    /// Drop ALL record state for the table (the record-tier half of
+    /// `DROP TABLE`; the catalog entry is the caller's concern).
+    ///
+    /// SQL semantics: a table recreated after a drop starts EMPTY. SQL-row
+    /// record oids are the PK text by design, so without this purge a
+    /// recreated table would collide with (or silently serve) the dropped
+    /// rows on its first re-INSERT/scan. Restart-safety contract: an
+    /// implementation that appends record operations to the canonical WAL
+    /// must also append the `RecordPartitionDrop` marker so replay voids the
+    /// partition too. Default: warn-and-continue — stores without drop
+    /// support say so rather than silently keeping dropped rows.
+    async fn drop_table_records(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<()> {
+        let _ = tenant_context;
+        tracing::warn!(
+            table = %table_schema.name,
+            "record store does not support drop_table_records; a table recreated with the same name may see the dropped rows"
+        );
+        Ok(())
+    }
+
     /// Get the current visible record for a key.
     ///
     /// `read_context` (present only under `abac-policy`) is the FA-b required
@@ -1090,6 +1114,16 @@ impl CatalogRoutingTableRecordStore {
 
 #[async_trait]
 impl TableRecordStore for CatalogRoutingTableRecordStore {
+    async fn drop_table_records(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<()> {
+        self.store_for_schema(table_schema)
+            .drop_table_records(table_schema, tenant_context)
+            .await
+    }
+
     async fn write_mutations(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1721,6 +1755,19 @@ impl DirectWalTableRecordStore {
             .clone()
     }
 
+    /// Remove ALL in-RAM state for one `(tenant, collection)` partition: the
+    /// partition itself (recreated empty on demand) and any lazily built
+    /// UNIQUE/secondary index for it. The WAL marker that keeps this
+    /// restart-safe is appended by [`Self::drop_table_records`].
+    fn drop_partition_state(&self, tenant_id: &str, collection_id: &str) {
+        self.partitions
+            .write()
+            .remove(&(tenant_id.to_string(), collection_id.to_string()));
+        let index_key = (tenant_id.to_string(), collection_id.to_string());
+        self.unique_index.write().remove(&index_key);
+        self.secondary_index.write().remove(&index_key);
+    }
+
     /// ADR-031 O3: the primary record partition for a table, plus — during an oid
     /// cutover with pre-flip data resident — the legacy name-keyed partition, so the
     /// hot path is mixed-read-safe (dual-read + migrate-on-write). With the gate off,
@@ -1772,6 +1819,12 @@ impl DirectWalTableRecordStore {
                         .delete_record(&RecordKey::new(oid))
                         .await?;
                     summary.deletes_replayed += 1;
+                }
+                CanonicalOperation::RecordPartitionDrop { collection_id } => {
+                    // DROP TABLE: void the partition (+ its lazily built index
+                    // state). Upserts replayed after this entry re-seed the
+                    // partition — a table recreated post-drop starts empty.
+                    self.drop_partition_state(&tenant_id, &collection_id);
                 }
                 // Checkpoints, CDC barriers, and system-catalog mutations carry
                 // no record state for this partitioned store to replay.
@@ -1913,6 +1966,65 @@ impl DirectWalTableRecordStore {
 
 #[async_trait]
 impl TableRecordStore for DirectWalTableRecordStore {
+    /// Record-tier DROP TABLE: purge the table's `(tenant, collection)`
+    /// partition (+ legacy cutover alias, + lazily built index state) and
+    /// append the `RecordPartitionDrop` WAL marker FIRST so replay after a
+    /// restart voids the partition too (crash between marker and purge is
+    /// the fail-safe direction: the marker replays, the partition resets).
+    async fn drop_table_records(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<()> {
+        let tenant_scope = Self::tenant_key(tenant_context);
+        let (collection_id, legacy_key) = memtable_partition_keys(table_schema);
+
+        // Shared-storage mode (`new`): every partition key routes to ONE
+        // backing Arc, so a partition-scoped purge is impossible — probing the
+        // factory detects it. Fail soft (the catalog drop already happened);
+        // that shape is documented non-isolated (unit tests only).
+        let partition_key = (tenant_scope.clone(), collection_id.clone());
+        let shared_mode = {
+            let partitions = self.partitions.read();
+            partitions
+                .get(&partition_key)
+                .is_some_and(|partition| Arc::ptr_eq(&(self.storage_factory)(), partition))
+        };
+        if shared_mode {
+            tracing::warn!(
+                table = %table_schema.name,
+                "DirectWalTableRecordStore in shared-storage mode cannot purge one table's records; a table recreated with the same name may see the dropped rows"
+            );
+            return Ok(());
+        }
+
+        // Restart-safety first: the marker must be durable before the live
+        // purge, or a crash in between replays the dropped rows back.
+        let tenant_id = tenant_context.map(|tenant| tenant.tenant_id.clone());
+        let mut operations = vec![CanonicalOperation::RecordPartitionDrop {
+            collection_id: collection_id.clone(),
+        }];
+        if let Some(legacy) = &legacy_key {
+            operations.push(CanonicalOperation::RecordPartitionDrop {
+                collection_id: legacy.clone(),
+            });
+        }
+        self.wal_appender
+            .append_operations(operations, tenant_id)
+            .await?;
+
+        self.drop_partition_state(&tenant_scope, &collection_id);
+        if let Some(legacy) = &legacy_key {
+            self.drop_partition_state(&tenant_scope, legacy);
+        }
+        tracing::info!(
+            table = %table_schema.name,
+            collection = %collection_id,
+            "🗑️ dropped record partition (+ WAL marker) for table"
+        );
+        Ok(())
+    }
+
     /// CDC change-feed over the canonical WAL: surface every RecordUpsert/RecordDelete for
     /// `collection_id` (the table name) with sequence number > `since_lsn`, oldest first.
     /// Tenant-agnostic (all tenants) — see [`read_changes_since_scoped`] for the
@@ -2943,6 +3055,80 @@ mod tests {
             oids,
             vec!["keep-1".to_string(), "keep-2".to_string()],
             "only rows that belong to the table AND match the predicate"
+        );
+    }
+
+    /// TD-CONV-2: DROP TABLE must purge the record tier so a table recreated
+    /// with the same name starts EMPTY. SQL-row record oids are the PK text, so
+    /// without the purge the recreated table's first re-INSERT hits
+    /// INSERT_CONFLICT against the dropped rows (or scans silently serve them).
+    /// Restart-safety: the appended `RecordPartitionDrop` marker must void the
+    /// partition on replay too.
+    #[tokio::test]
+    async fn drop_table_records_purges_partition_and_wal_marker_replays_the_drop() {
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::new_partitioned(wal.clone());
+        let schema = CatalogTableSchema::new("region");
+        let insert = |oid: &str| {
+            TableRecordMutation::new(
+                TableRecordMutationKind::Insert,
+                ProximaRecord {
+                    oid: oid.to_string(),
+                    local_id: Some(oid.to_string()),
+                    variation_id: Some("region".to_string()),
+                    ..Default::default()
+                },
+            )
+        };
+
+        // First insert of PK '0' succeeds.
+        let first = store
+            .write_mutations(&schema, vec![insert("0")], None)
+            .await
+            .unwrap();
+        assert!(first.success);
+
+        // DROP TABLE purges the record tier…
+        store.drop_table_records(&schema, None).await.unwrap();
+
+        // …the drop marker is durable in the WAL…
+        let entries = wal
+            .entries
+            .lock()
+            .expect("recording WAL append lock")
+            .clone();
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.operation,
+                CanonicalOperation::RecordPartitionDrop { collection_id } if collection_id == "region"
+            )),
+            "drop marker must be appended"
+        );
+
+        // …the recreated table's first re-INSERT of the same PK succeeds…
+        let reinsert = store
+            .write_mutations(&schema, vec![insert("0")], None)
+            .await
+            .unwrap();
+        assert!(
+            reinsert.success,
+            "recreated table must not see the dropped rows: {:?}",
+            reinsert.error_code
+        );
+
+        // …and replaying [upsert, drop] into a FRESH store leaves the
+        // partition void (restart-safe: no resurrection).
+        let replay_wal = Arc::new(RecordingWalAppender::default());
+        let replayed = DirectWalTableRecordStore::new_partitioned(replay_wal);
+        replayed.replay_wal_entries(entries).await.unwrap();
+        let resurrect = replayed
+            .write_mutations(&schema, vec![insert("0")], None)
+            .await
+            .unwrap();
+        assert!(
+            resurrect.success,
+            "replayed drop must void the partition: {:?}",
+            resurrect.error_code
         );
     }
 

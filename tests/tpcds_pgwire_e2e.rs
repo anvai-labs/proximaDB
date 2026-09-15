@@ -518,11 +518,12 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
                 vec!["11301", "42", "181.42"],
             ],
         ),
-        // cte KNOWN-BAD (TD-185a): `WITH` falls to the pgwire dispatch
-        // fallthrough and silently returns ZERO rows. Correct answer:
-        // Books 91.95, Electronics 89.47 (rev DESC). Pinned wrong; auto-trips
-        // when the WITH-dispatch fix lands on this branch.
-        ("cte-KNOWN-BAD", vec![]),
+        // cte (TD-185a closed by #1860): WITH now executes; anchored to the
+        // hand-derived correct set — Books 91.95, Electronics 89.47 (rev DESC).
+        (
+            "cte",
+            vec![vec!["Books", "91.95"], vec!["Electronics", "89.47"]],
+        ),
         // count_distinct: Electronics buyers {1,2}; Books buyers {1,3}.
         (
             "count_distinct",

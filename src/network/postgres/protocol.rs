@@ -865,8 +865,10 @@ impl PostgresProtocol {
         vector_ops: Arc<VectorOperationsService>,
         catalog_manager: Arc<CatalogManager>,
     ) -> Self {
-        let ddl_service = Arc::new(DdlService::new(catalog_manager.clone()));
         let dml_service = Arc::new(DmlService::new(catalog_manager.clone(), vector_ops.clone()));
+        let ddl_service = Arc::new(
+            DdlService::new(catalog_manager.clone()).with_record_store(dml_service.record_store()),
+        );
 
         Self {
             stream,
@@ -915,12 +917,14 @@ impl PostgresProtocol {
         catalog_manager: Arc<CatalogManager>,
         canonical_store: Arc<crate::services::record_store::DirectWalTableRecordStore>,
     ) -> Self {
-        let ddl_service = Arc::new(DdlService::new(catalog_manager.clone()));
         let dml_service = Arc::new(DmlService::with_direct_record_storage(
             catalog_manager.clone(),
             vector_ops.clone(),
-            canonical_store,
+            canonical_store.clone(),
         ));
+        let ddl_service = Arc::new(
+            DdlService::new(catalog_manager.clone()).with_record_store(dml_service.record_store()),
+        );
 
         Self {
             stream,
@@ -1169,11 +1173,14 @@ impl PostgresProtocol {
 
     /// Attach catalog-backed DDL/DML services to an existing protocol handler.
     pub fn with_catalog_manager(mut self, catalog_manager: Arc<CatalogManager>) -> Self {
-        self.ddl_service = Some(Arc::new(DdlService::new(catalog_manager.clone())));
-        self.dml_service = Some(Arc::new(DmlService::new(
+        let dml_service = Arc::new(DmlService::new(
             catalog_manager.clone(),
             self.vector_ops.clone(),
-        )));
+        ));
+        self.ddl_service = Some(Arc::new(
+            DdlService::new(catalog_manager.clone()).with_record_store(dml_service.record_store()),
+        ));
+        self.dml_service = Some(dml_service);
         self.catalog_manager = Some(catalog_manager);
         self
     }
@@ -1186,7 +1193,6 @@ impl PostgresProtocol {
         canonical_store: Arc<crate::services::record_store::DirectWalTableRecordStore>,
         conditional_key_store: Option<Arc<dyn proximadb_storage_ports::ConditionalKeyStore>>,
     ) -> Self {
-        self.ddl_service = Some(Arc::new(DdlService::new(catalog_manager.clone())));
         // F5 / TD-OLTP-WIRING-1: fence pgwire writes on the SAME shared CKS as
         // gRPC/REST (threaded from SharedServices via DirectPgwireWriteServices).
         let mut dml = DmlService::with_direct_record_storage(
@@ -1197,7 +1203,11 @@ impl PostgresProtocol {
         if let Some(cks) = conditional_key_store {
             dml = dml.with_conditional_key_store(cks);
         }
-        self.dml_service = Some(Arc::new(dml));
+        let dml = Arc::new(dml);
+        self.ddl_service = Some(Arc::new(
+            DdlService::new(catalog_manager.clone()).with_record_store(dml.record_store()),
+        ));
+        self.dml_service = Some(dml);
         self.catalog_manager = Some(catalog_manager);
         self
     }
@@ -1220,12 +1230,14 @@ impl PostgresProtocol {
         let Some(catalog_manager) = self.catalog_manager.clone() else {
             return self;
         };
-        self.ddl_service = Some(Arc::new(
-            DdlService::new(catalog_manager)
-                .with_rank_profile_store(store)
-                .with_rank_services(services)
-                .with_function_store(function_store),
-        ));
+        let mut ddl = DdlService::new(catalog_manager)
+            .with_rank_profile_store(store)
+            .with_rank_services(services)
+            .with_function_store(function_store);
+        if let Some(dml) = self.dml_service.as_ref() {
+            ddl = ddl.with_record_store(dml.record_store());
+        }
+        self.ddl_service = Some(Arc::new(ddl));
         self
     }
 

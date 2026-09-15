@@ -84,6 +84,20 @@ pub enum CanonicalOperation {
         oid: String,
         projections: Vec<ProjectionDirective>,
     },
+    /// Void ALL record state for one `(tenant, collection_id)` partition from
+    /// this point on (DROP TABLE / DROP COLLECTION).
+    ///
+    /// Live stores purge the partition when appending this entry; recovery
+    /// replay must do the same when it folds it, so a table recreated after
+    /// the drop starts empty instead of resurrecting the dropped rows (the
+    /// record oid for SQL rows is the PK text by design, so a recreated table
+    /// would otherwise collide with — or silently serve — the dropped rows).
+    /// Upserts replayed AFTER this entry re-seed the partition normally.
+    RecordPartitionDrop {
+        /// The dropped partition's collection key (the same id the upserts
+        /// were routed under — stable object id or legacy bare name).
+        collection_id: String,
+    },
     /// Durable checkpoint. Recovery can start from the latest `Checkpoint`
     /// and replay only subsequent entries rather than the full log.
     Checkpoint(SnapshotManifest),
@@ -392,6 +406,10 @@ pub fn recover_from_canonical_wal<R: ProjectionRebuilder>(
                     }
                 }
             }
+            // A partition drop voids whole-partition state; projection state for
+            // the partition is reset by the record-store replay (which owns the
+            // partitions), not per-directive here.
+            CanonicalOperation::RecordPartitionDrop { .. } => {}
             // Checkpoints, CDC barriers, and catalog mutations do not trigger
             // record/projection rebuilds; the caller uses the checkpoint LSN to
             // scope the replay window, and catalog mutations are folded by the

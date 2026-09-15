@@ -19,7 +19,7 @@ use proximadb_catalog::{
     SchemaChange,
 };
 use proximadb_data_model::ProximaType;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::catalog::CatalogManager;
 
@@ -483,6 +483,12 @@ pub struct DdlService {
     primary_pod_registry: Option<Arc<crate::cluster::primary_pod_registry::PrimaryPodRegistry>>,
     /// This pod's identity for write-routing comparisons.
     self_pod_id: Option<String>,
+    /// Canonical table-record store (shared with DML). When present, `DROP
+    /// TABLE` also purges the table's record rows + WAL partition so a table
+    /// recreated with the same name starts empty (SQL-row record oids are the
+    /// PK text — without the purge the first re-INSERT hits INSERT_CONFLICT,
+    /// or scans silently serve the dropped rows). Absent ⇒ warn-only legacy.
+    record_store: Option<Arc<dyn crate::services::record_store::TableRecordStore>>,
 }
 
 impl DdlService {
@@ -497,6 +503,7 @@ impl DdlService {
             partition_lease_manager: None,
             primary_pod_registry: None,
             self_pod_id: None,
+            record_store: None,
         }
     }
 
@@ -504,6 +511,16 @@ impl DdlService {
     /// callers that don't wire it get a clean error when that statement is issued.
     pub fn with_materializer(mut self, materializer: Arc<dyn TableMaterializer>) -> Self {
         self.materializer = Some(materializer);
+        self
+    }
+
+    /// Attach the canonical table-record store (the SAME instance DML uses) so
+    /// `DROP TABLE` can purge the table's record rows and WAL partition.
+    pub fn with_record_store(
+        mut self,
+        record_store: Arc<dyn crate::services::record_store::TableRecordStore>,
+    ) -> Self {
+        self.record_store = Some(record_store);
         self
     }
 
@@ -994,8 +1011,32 @@ impl DdlService {
             }
         }
 
+        // Snapshot the schema BEFORE the catalog drop: the record purge keys
+        // partitions off the schema's stable identity + name.
+        let dropped_schema = catalog.get_table(&table_id).await.ok();
+
         // Drop the table
         catalog.drop_table(&table_id, purge).await?;
+
+        // TD-CONV-2: purge the record tier so a table recreated with the same
+        // name starts empty. Best-effort — the catalog drop already committed;
+        // stores without drop support warn (trait default).
+        if let (Some(record_store), Some(schema)) = (&self.record_store, dropped_schema.as_ref())
+            && let Err(e) = record_store
+                .drop_table_records(
+                    schema,
+                    tenant
+                        .map(crate::storage::tenant::context::TenantContext::for_tenant_id)
+                        .as_ref(),
+                )
+                .await
+        {
+            warn!(
+                table = %table_name,
+                error = %e,
+                "record-tier purge after DROP TABLE failed; a recreated table may see dropped rows"
+            );
+        }
 
         info!(table = %table_name, purge = purge, "Dropped table");
         Ok(DdlResult::success(format!(

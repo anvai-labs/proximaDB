@@ -847,6 +847,9 @@ fn filter_canonical_wal_for_collection(
             proximadb_storage_common::CanonicalOperation::RecordDelete {
                 collection_id, ..
             } => collection_id == collection,
+            proximadb_storage_common::CanonicalOperation::RecordPartitionDrop { collection_id } => {
+                collection_id == collection
+            }
             proximadb_storage_common::CanonicalOperation::Checkpoint(_)
             | proximadb_storage_common::CanonicalOperation::CdcBarrier { .. }
             | proximadb_storage_common::CanonicalOperation::CatalogMutation { .. } => false,
