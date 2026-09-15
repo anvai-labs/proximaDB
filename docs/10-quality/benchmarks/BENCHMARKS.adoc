@@ -18,6 +18,22 @@ ProximaDB delivers industry-leading vector search performance with sub-10ms late
 * **Recall@10**: 97.3% (HNSW, M=32)
 * **Memory Efficiency**: 1.2GB for 10M vectors (FP32)
 
+[NOTE]
+====
+The headline numbers above are the project's original target framing and remain
+**unmeasured at 10M-vector / 768-dim scale** — no dated artifact exists for a run at that size,
+and ProximaDB does not build an HNSW graph index today (SST/HELIX/NOVA are the storage-engine
+families, not an HNSW variant). A real, dated, measured baseline exists at a smaller scale
+(10K vectors, dim 128, per default engine) in
+`docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`'s `vector_search_latency` and
+`ingest_throughput` entries, with the run captured in
+`docs/_internal/status/BENCH_RUN_2026_09_15.adoc`. That baseline's insert throughput
+(187K-334K vectors/sec) exceeds this page's 125K figure at the measured scale; its search
+latency (SST 4.4-5.3ms avg / 7.3ms p99 at 97% recall) is in the same range as the 8.2ms figure
+here, but at 1,000x fewer vectors and a different dimension — not a substantiation of the 10M
+claim.
+====
+
 == Hardware Configuration
 
 [.table-striped]

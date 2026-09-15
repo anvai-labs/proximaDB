@@ -1,0 +1,97 @@
+= Benchmark Run — 2026-09-15
+:toc: left
+:last-updated: 2026-09-15
+
+[.lead]
+Captured results from running `tests/all_engines_50k_benchmark.rs` (already committed,
+previously never executed against the ledger) to promote the `vector_search_latency` and
+`ingest_throughput` link:../roadmap/BENCHMARK_EVIDENCE.toml[benchmark evidence ledger] claims
+from `unverified` to `measured`, per the gap-closure program's PR-F evidence sprint.
+
+[IMPORTANT]
+====
+These numbers are an **indicative, local, non-SLA baseline** gathered on a shared developer
+machine. They are not a published performance claim. They measure a small deterministic
+workload (10,000 vectors, 128 dimensions) — not the 10M-vector / 768-dimension headline in
+`docs/10-quality/benchmarks/BENCHMARKS.adoc`, which stays an unmeasured aspirational target at
+that scale (no dated artifact exists for a 10M-vector run on any hardware).
+====
+
+== Environment
+
+[%header%autowidth]
+|===
+| Field | Value
+
+| Hardware | AMD Ryzen 9 7950X, 16 cores, 125 GB RAM (shared dev machine — indicative, not an SLA)
+| OS | Linux 6.18.33.2-microsoft-standard-WSL2 (x86_64)
+| Toolchain | rustc 1.95.0, `--release` profile
+| Date | 2026-09-15
+| Version | `develop @ db6fa75b5` (TD-CONV-2 merged)
+| Command | `cargo test --release --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored` (default features; a second run added `--features experimental-engines` for RAPTOR/SWIFT)
+|===
+
+== Results and bench→claim mapping
+
+=== vector_search_latency / ingest_throughput — MEASURED (promoted)
+
+Workload: 10,000 unit-normalized random vectors, dim 128, single 10,000-vector insert batch,
+flush, 5s async-index-build wait, 10 brute-force-verified top-10 queries per engine.
+
+[%header%autowidth]
+|===
+| Engine | Recall@10 | Insert QPS | Avg search latency | P99 search latency | Flush time
+
+| SST (run 1) | 97.0% | 212,848/s | 4.44ms | 7.29ms | 0.10s
+| SST (run 2) | 97.0% | 186,551/s | 5.34ms | — | 0.10s
+| NOVA (run 1) | 100.0% | 333,507/s | 18.70ms | 19.74ms | 0.12s
+| NOVA (run 2) | 100.0% | 285,747/s | 23.28ms | — | 0.20s
+| RAPTOR (experimental) | 100.0% | 345,103/s | 11.86ms | — | 1.80s
+|===
+
+SST and NOVA are the default (non-experimental) engines that pass the harness's own
+correctness gate (recall ≥ 50%); RAPTOR (behind `experimental-engines`) also passes and is
+shown for completeness. **HELIX and SWIFT are excluded from this promotion** — both showed
+2–3% recall (see below) — a fast wrong answer is not evidence for a latency/throughput claim.
+
+This genuinely measures both the route's insert throughput and its search latency at this
+scale, so the ledger entries are promoted to `measured`. The two claims' text is re-scoped from
+the original unsubstantiated 10M-vector/768-dim/"HNSW M=32" framing (ProximaDB does not build an
+HNSW graph index today — SST/HELIX/NOVA are the storage-engine families) to what is actually
+measured: per-engine numbers at 10K vectors / dim 128 on this hardware.
+
+Run-to-run variance (SST: 213K vs 187K vec/s; NOVA: 334K vs 286K vec/s) reflects ordinary
+wall-clock noise on a shared machine across two separate `cargo test` invocations, not a
+methodology change — both are reported rather than cherry-picking the more flattering run.
+
+=== HELIX / SWIFT — anomaly discovered, NOT promoted, filed as TD-HELIX-3
+
+[%header%autowidth]
+|===
+| Engine | Recall@10 | Insert QPS | Avg search latency | Rating
+
+| HELIX | 2.0% | 253,187–261,823/s | 1.43–1.51ms | POOR
+| SWIFT (experimental) | 3.0% | 304,709/s | 26.91ms | POOR
+|===
+
+HELIX is a **default, non-experimental** engine returning near-random search results (2% of
+100 possible correct results) while reporting the *fastest* latency of all five engines — the
+low latency is a symptom, not a feature: it strongly suggests the search is not walking a real
+built index. SWIFT (experimental) shows a similar recall collapse but with the *highest*
+latency of the five, suggesting a different failure shape. Neither number is used to back any
+ledger claim. Filed as `docs/10-quality/td/TD-HELIX-3-multi-engine-benchmark-low-recall-helix-swift.adoc`
+for a focused follow-up session — root-causing a per-engine index/search bug is out of scope for
+an evidence-sprint PR.
+
+Also discovered: this benchmark file is `#[ignore]`d and referenced by no CI workflow, so
+neither this recall regression nor the harness's own stale `successful_count >= 4` engine-count
+assertion (broken on default features since VIPER's retirement left only 3 default engines) has
+ever been visible in CI. Noted in TD-HELIX-3; not fixed here to keep this PR's diff scoped to
+docs/ledger content only.
+
+== Prior claims (unchanged from the 2026-06-16 run)
+
+`qps_throughput`, `hybrid_search_latency`, and the other claims examined in
+link:BENCH_RUN_2026_06_16.adoc[the 2026-06-16 run] are untouched by this pass — this run only
+targeted `vector_search_latency` and `ingest_throughput` per the gap-closure program's PR-F
+scope.
