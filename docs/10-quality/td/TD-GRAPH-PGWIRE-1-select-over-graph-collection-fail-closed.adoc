@@ -63,17 +63,22 @@ tested graph surfaces per `docs/SUPPORTED_SURFACE.adoc`:
   Beta) — or its openCypher `ExecuteQuery` subset.
 * REST `GET /api/v2/graphs/{graph_id}` (and the sibling nodes/edges/shortest-path routes).
 
-No attempt was made to add a real graph_traverse-style SQL table function over pgwire in this
-PR — `GRAPH_TRAVERSE(...)`/`GRAPH_CONNECTED(...)` exist only as `WHERE`-clause condition
-predicates in the separate UQL parser (`crates/query/proximadb-uql`), not as a callable
-table-valued function reachable from pgwire SQL; no test anywhere calls one as executable SQL.
-Building that is a materially larger, separate feature.
+No attempt was made to build a graph SQL surface in this PR. **Correction (2026-09-15, filed as
+TD-XMODAL-10 after this TD merged):** the original text here overclaimed — `graph_traverse(...)`
+is in fact registered as a real DataFusion UDTF (`src/datafusion/mod.rs`, F6) with live
+`graph_ops` wiring threaded all the way from pgwire, the same mechanism that makes
+`vector_search(...)` genuinely pgwire-reachable (TD-XMODAL-4/6/7/8). Whether `graph_traverse`
+itself is *actually* reachable in practice was not verified before this TD merged; a follow-up
+probe found both a bare and a JOIN-shaped call hit an identical generic decline, with the real
+cause not yet root-caused. See TD-XMODAL-10 for the grounded finding — this TD's job (the
+naive placeholder no longer fabricating data) stands regardless of that separate question.
+`GRAPH_TRAVERSE(...)`/`GRAPH_CONNECTED(...)` as `WHERE`-clause condition predicates in the
+separate UQL parser (`crates/query/proximadb-uql`) remains a distinct, unrelated thing from
+either the DataFusion UDTF or this TD's naive-dispatch fix.
 
 == Residual
 
-* A real `graph_traverse(...)`-shaped pgwire/SQL table function (cross-modal `JOIN
-  graph_traverse(...)`, referenced only in a preparatory comment threading `graph_service`
-  into `try_run_select` today) remains unbuilt — future work, not this TD.
+* `graph_traverse(...)` pgwire reachability: tracked in TD-XMODAL-10, not this TD.
 * The "real stats over pgwire" fix (existence-checked, side-effect-free `get_stats`) is a
   reasonable follow-up once a catalog pre-check pattern for graph collections exists; not
   filed as its own TD since the honest decline is a complete, correct resolution on its own.
