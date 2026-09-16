@@ -19,8 +19,11 @@
 //!   output; no TPC-official claim may cite this ledger.
 //! - temperature: `first` vs `repeat` against a warm process (true cold-cache
 //!   runs need a server restart per query — a future slice).
-//! - scale: `TPC_PERF_SCALE` (default 0.001 ≈ 9k TPC-H rows; SF1 ≡ 1.0 —
-//!   impractical over per-row INSERTs until a bulk-load path exists).
+//! - scale: `TPC_PERF_SCALE` (default 0.001 ≈ 9k TPC-H rows; SF1 ≡ 1.0).
+//!   Runs whose estimated peak exceeds 8 GiB fail before data generation unless
+//!   `TPC_PERF_ALLOW_LARGE_SCALE=I_ACCEPT_ISOLATED_OOM` is set and the process
+//!   is inside a finite cgroup that leaves at least 16 GiB for the host. Use
+//!   `scripts/run_tpc_perf_ledger.sh`; never launch SF-sized runs directly.
 //!
 //! `#[ignore]` — advisory, never a merge gate. Run on demand:
 //!
@@ -202,6 +205,101 @@ fn scaled(base: u64, scale: f64, floor: u64) -> u64 {
     ((base as f64 * scale) as u64).max(floor)
 }
 
+const SAFE_ESTIMATED_PEAK_MIB: u64 = 8 * 1024;
+const REQUIRED_HOST_HEADROOM_MIB: u64 = 16 * 1024;
+const LARGE_SCALE_ACK: &str = "I_ACCEPT_ISOLATED_OOM";
+// Calibrated conservatively from the 2026-09-15 SF1 incident. The generator,
+// pgwire load path, native tables, and materialized parquet can coexist during
+// a run, so source-row text size alone substantially understates peak RSS.
+const ESTIMATED_BYTES_PER_SOURCE_ROW: f64 = 16_384.0;
+const TPCH_SF1_ROWS: u64 = 8_660_030;
+const TPCDS_SF1_ROWS: u64 = 5_722_000;
+
+#[derive(Debug, PartialEq)]
+struct PerfRunPreflight {
+    estimated_peak_mib: u64,
+    cgroup_limit_mib: Option<u64>,
+    host_total_mib: Option<u64>,
+}
+
+fn estimated_peak_mib(scale: f64, benchmark_filter: Option<&str>) -> u64 {
+    let base_rows = match benchmark_filter {
+        Some("tpch") => TPCH_SF1_ROWS,
+        Some("tpcds") => TPCDS_SF1_ROWS,
+        // The suites run sequentially, so the larger suite determines peak.
+        _ => TPCH_SF1_ROWS.max(TPCDS_SF1_ROWS),
+    };
+    ((base_rows as f64 * scale * ESTIMATED_BYTES_PER_SOURCE_ROW) / (1024.0 * 1024.0)).ceil() as u64
+}
+
+fn validate_perf_run(
+    scale: f64,
+    benchmark_filter: Option<&str>,
+    acknowledgement: Option<&str>,
+    cgroup_limit_mib: Option<u64>,
+    host_total_mib: Option<u64>,
+) -> Result<PerfRunPreflight, String> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("TPC_PERF_SCALE must be a finite number greater than zero".to_string());
+    }
+
+    let estimated_peak_mib = estimated_peak_mib(scale, benchmark_filter);
+    let preflight = PerfRunPreflight {
+        estimated_peak_mib,
+        cgroup_limit_mib,
+        host_total_mib,
+    };
+    if estimated_peak_mib <= SAFE_ESTIMATED_PEAK_MIB {
+        return Ok(preflight);
+    }
+    if acknowledgement != Some(LARGE_SCALE_ACK) {
+        return Err(format!(
+            "estimated peak {estimated_peak_mib} MiB exceeds the unisolated {SAFE_ESTIMATED_PEAK_MIB} MiB ceiling; run scripts/run_tpc_perf_ledger.sh and set TPC_PERF_ALLOW_LARGE_SCALE={LARGE_SCALE_ACK}"
+        ));
+    }
+
+    let limit = cgroup_limit_mib.ok_or_else(|| {
+        "large-scale TPC runs require a finite cgroup memory.max; use scripts/run_tpc_perf_ledger.sh"
+            .to_string()
+    })?;
+    let host_total = host_total_mib.ok_or_else(|| {
+        "large-scale TPC runs require readable host memory capacity for the headroom check"
+            .to_string()
+    })?;
+    if limit >= host_total || host_total - limit < REQUIRED_HOST_HEADROOM_MIB {
+        return Err(format!(
+            "cgroup limit {limit} MiB leaves less than {REQUIRED_HOST_HEADROOM_MIB} MiB host headroom (host {host_total} MiB)"
+        ));
+    }
+    Ok(preflight)
+}
+
+fn current_cgroup_memory_limit_mib() -> Option<u64> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim_start_matches('/');
+    let path = std::path::Path::new("/sys/fs/cgroup")
+        .join(relative)
+        .join("memory.max");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let bytes = raw.trim().parse::<u64>().ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
+fn host_total_memory_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo.lines().find_map(|line| {
+        line.strip_prefix("MemTotal:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })?;
+    Some(kib / 1024)
+}
+
 // --- TPC-H (schema copied from tests/tpch_pgwire_e2e.rs) -------------------
 
 const TPCH_SCHEMA: &[(&str, &str)] = &[
@@ -271,7 +369,7 @@ const NATIONS: &[(&str, u64)] = &[
 ];
 
 fn gen_tpch(scale: f64) -> Vec<String> {
-    let mut rng = Rng::new(0x7C_0FFE_E5EED);
+    let mut rng = Rng::new(0x07C0_FFEE_5EED);
     let n_supp = scaled(10_000, scale, 10);
     let n_part = scaled(200_000, scale, 20);
     let n_cust = scaled(150_000, scale, 15);
@@ -564,7 +662,7 @@ const TPCDS_SCHEMA: &[(&str, &str)] = &[
 ];
 
 fn gen_tpcds(scale: f64) -> Vec<String> {
-    let mut rng = Rng::new(0xD5_0FFE_E5EED);
+    let mut rng = Rng::new(0x0D50_FFEE_5EED);
     let n_item = scaled(18_000, scale, 20);
     let n_cust = scaled(100_000, scale, 10);
     let n_sales = scaled(2_880_000, scale, 300);
@@ -1497,7 +1595,7 @@ async fn measure_duckdb_inprocess(
 /// ledger stays ProximaDB-self). Mirrors `tests/clickbench_ledger_e2e.rs`. No
 /// new dependency (uses `std::process` + the operator-provided binary); the
 /// result cache (#708) is default-OFF so ProximaDB's latency is already fair.
-
+///
 /// Strip a terminal `WITH (…) ` storage-parameter clause from a `CREATE TABLE`
 /// DDL. ProximaDB accepts `WITH (cluster_key = '<col>')` (the TD-OLAP-6
 /// sort-on-materialize hint); DuckDB's parser rejects it. The clause is always
@@ -1748,14 +1846,22 @@ fn tpc_perf_ledger() {
 }
 
 async fn tpc_perf_ledger_inner() {
-    let scale: f64 = std::env::var("TPC_PERF_SCALE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.001);
+    let scale_raw = std::env::var("TPC_PERF_SCALE").unwrap_or_else(|_| "0.001".to_string());
+    let scale: f64 = scale_raw
+        .parse()
+        .unwrap_or_else(|_| panic!("TPC_PERF_SCALE must be numeric, got {scale_raw:?}"));
     // Iteration filters (diagnostic / gate-comparison runs): restrict to one
     // benchmark and/or a comma-separated query-id list. Unset ⇒ the full
     // advisory ledger. Used by the TD-OLAP-3 baseline-vs-gate re-measure.
     let benchmark_filter = std::env::var("TPC_PERF_BENCHMARK").ok();
+    let preflight = validate_perf_run(
+        scale,
+        benchmark_filter.as_deref(),
+        std::env::var("TPC_PERF_ALLOW_LARGE_SCALE").ok().as_deref(),
+        current_cgroup_memory_limit_mib(),
+        host_total_memory_mib(),
+    )
+    .unwrap_or_else(|message| panic!("TPC performance preflight rejected the run: {message}"));
     let query_filter: Option<Vec<String>> = std::env::var("TPC_PERF_QUERIES")
         .ok()
         .map(|s| s.split(',').map(|q| q.trim().to_string()).collect());
@@ -1770,7 +1876,10 @@ async fn tpc_perf_ledger_inner() {
         }
     };
     apply_ledger_env_defaults("TPC_PERF_QUERY_TIMEOUT_MS");
-    eprintln!("=== tpc-perf-ledger harness (TPC_PERF_SCALE={scale}) ===");
+    eprintln!(
+        "=== tpc-perf-ledger harness (TPC_PERF_SCALE={scale}, estimated_peak={} MiB, cgroup_limit={:?} MiB) ===",
+        preflight.estimated_peak_mib, preflight.cgroup_limit_mib
+    );
     // Fresh partial sidecar per run — stale lines from a prior run must not
     // mix into this run's crash-safe trail.
     let _ = std::fs::remove_file(format!("{}.partial.jsonl", ledger_out_path()));
@@ -1920,6 +2029,66 @@ async fn tpc_perf_ledger_inner() {
             n_queries * n_routes * 2, /* first + repeat */
             "native+datafusion baseline incomplete (expected one record per query x route x temperature)"
         );
+    }
+}
+
+#[test]
+fn perf_preflight_accepts_default_scale_without_cgroup() {
+    let result = validate_perf_run(0.001, Some("tpch"), None, None, Some(128 * 1024))
+        .expect("the default diagnostic scale must remain easy to run");
+    assert!(result.estimated_peak_mib < SAFE_ESTIMATED_PEAK_MIB);
+}
+
+#[test]
+fn perf_preflight_rejects_sf1_without_explicit_acknowledgement() {
+    let error = validate_perf_run(1.0, Some("tpch"), None, Some(64 * 1024), Some(128 * 1024))
+        .expect_err("SF1 must fail closed without the exact acknowledgement");
+    assert!(error.contains("TPC_PERF_ALLOW_LARGE_SCALE"));
+}
+
+#[test]
+fn perf_preflight_rejects_large_run_in_unbounded_cgroup() {
+    let error = validate_perf_run(
+        1.0,
+        Some("tpch"),
+        Some(LARGE_SCALE_ACK),
+        None,
+        Some(128 * 1024),
+    )
+    .expect_err("an acknowledgement alone must never bypass resource isolation");
+    assert!(error.contains("finite cgroup memory.max"));
+}
+
+#[test]
+fn perf_preflight_rejects_limit_that_starves_host() {
+    let error = validate_perf_run(
+        1.0,
+        Some("tpch"),
+        Some(LARGE_SCALE_ACK),
+        Some(120 * 1024),
+        Some(128 * 1024),
+    )
+    .expect_err("the benchmark cgroup must reserve memory for CI and the host");
+    assert!(error.contains("host headroom"));
+}
+
+#[test]
+fn perf_preflight_accepts_isolated_large_run_with_headroom() {
+    let result = validate_perf_run(
+        1.0,
+        Some("tpch"),
+        Some(LARGE_SCALE_ACK),
+        Some(64 * 1024),
+        Some(128 * 1024),
+    )
+    .expect("a bounded SF1 run with substantial host headroom is allowed");
+    assert!(result.estimated_peak_mib > SAFE_ESTIMATED_PEAK_MIB);
+}
+
+#[test]
+fn perf_preflight_rejects_non_finite_or_non_positive_scale() {
+    for scale in [0.0, -0.1, f64::INFINITY, f64::NAN] {
+        assert!(validate_perf_run(scale, None, None, None, None).is_err());
     }
 }
 
