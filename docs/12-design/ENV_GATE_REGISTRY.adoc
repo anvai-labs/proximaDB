@@ -230,6 +230,7 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_QUEUE_ROOT` | Filesystem/object root that enables async ingest; unset keeps it off. | falls back to toml `root`, else `None` (async ingest off) | config-mirror; — | src/core/config.rs:341
 | `PROXIMADB_QUEUE_SYNC_MODE` | Durability/sync mode for the ingest queue. | falls back to toml, else `"strict"` | config-mirror; — | src/core/config.rs:350
 | `PROXIMADB_RELATIONAL_BOOTSTRAP_DEMO_TABLE` | Opt-in to bootstrap a demo table in the relational pipeline. | OFF | opt-in; — | src/network/postgres/relational_pipeline.rs:76
+| `PROXIMADB_RELATIONAL_MEMTABLE_MAX_RECORDS` | Cap on live records per relational memtable partition; the write that would exceed it fails closed instead of growing the heap without bound. Zero/unparsable reads as unset (never as a zero cap). | unset ⇒ unbounded | opt-in; TD-USUB-1/ADR-094 | `src/services/record_memtable.rs`
 | `PROXIMADB_ROUTER_QUANT_HELIX` | Under `index_policy.mode=auto` + quantization, route the collection to the HELIX engine instead of SST cold path. | OFF | opt-in; ADR-028 | src/services/collection/engine_selector.rs
 | `PROXIMADB_ROUTE_COST_OVERRIDE` | Enables the live route-cost override (global bool or comma-list of shape-class prefixes). | OFF (observe-only; unparseable → OFF) | eval; ADR-058 / TD-EXEC-2 | src/query/route_cost_model.rs:70
 | `PROXIMADB_ROUTE_RTT_BUDGET` | Hard physical-read round-trip (`get_ops`, full or ranged GET) budget for route costing. | `None` (disabled) | opt-in; TD-170 | src/query/route_cost_model.rs:854
