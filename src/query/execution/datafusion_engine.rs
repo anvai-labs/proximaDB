@@ -153,6 +153,58 @@ impl DataFusionLocalEngine {
             );
         }
 
+        // TD-USUB-2: register native (non-Parquet) relational tables so the full ANSI
+        // SQL surface — CTEs, window functions, joins, subqueries — is reachable
+        // regardless of physical storage format. Before this, `ctx.sql` (the fallback
+        // for every shape the shared frontend declines) was reachable only when a table
+        // had been manually `ALTER TABLE … MATERIALIZE`'d into Parquet.
+        //
+        // Rows arrive already ABAC-governed: `full_table_records` is backed by
+        // `scan_table_relational`, which resolves the row filter itself. Registering
+        // them therefore adds no enforcement bypass.
+        if let Some(native) = context.native_tables.as_ref() {
+            use proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch;
+            for name in native.tables.values() {
+                let scanned = native
+                    .source
+                    .full_table_records(
+                        name,
+                        context.identity.tenant_id.as_deref(),
+                        context.identity.as_borrowed(),
+                        native.row_cap,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ExecutionError::Context(format!("native table scan {name}: {e}"))
+                    })?;
+                // `None` ⇒ the table exceeds the row cap. Leave it unregistered: planning
+                // then fails with an explicit unresolved-table error, which the caller
+                // surfaces. Registering a truncated scan would be a silently wrong answer.
+                let Some((schema, records)) = scanned else {
+                    continue;
+                };
+                let row_count = records.len();
+                let batch = proxima_records_to_record_batch(&records, &schema).map_err(|e| {
+                    ExecutionError::Context(format!("native table batch {name}: {e}"))
+                })?;
+                let mem =
+                    datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch]])
+                        .map_err(|e| {
+                            ExecutionError::Context(format!("native table memtable {name}: {e}"))
+                        })?;
+                ctx.register_table(name.as_str(), std::sync::Arc::new(mem))
+                    .map_err(|e| {
+                        ExecutionError::Context(format!("register native table {name}: {e}"))
+                    })?;
+                tracing::debug!(
+                    target: "proximadb::compute_route",
+                    table = %name,
+                    rows = row_count,
+                    "registered native relational table for DataFusion (TD-USUB-2)"
+                );
+            }
+        }
+
         crate::observability::io_trace::record_open_ms(open_start.elapsed().as_millis() as u64);
 
         context.controls.check_cancelled()?;

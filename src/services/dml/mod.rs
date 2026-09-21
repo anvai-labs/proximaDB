@@ -903,6 +903,54 @@ impl crate::query::execution::olap_delta_merge::OlapDeltaSource for DmlService {
     }
 }
 
+/// TD-USUB-2: native relational rows for DataFusion registration.
+///
+/// Rows come from [`DmlService::scan_table_relational`], which resolves the ABAC row
+/// filter itself — a `Denied` subject yields zero rows, `Restricted(p)` applies the
+/// predicate, and an identity/storage tenant mismatch errors. So the rows returned here
+/// are already governed; registering them adds no enforcement bypass.
+#[async_trait::async_trait]
+impl crate::query::execution::native_table_provider::NativeTableSource for DmlService {
+    async fn full_table_records(
+        &self,
+        table: &str,
+        tenant: Option<&str>,
+        identity: PortIdentity<'_>,
+        row_cap: usize,
+    ) -> anyhow::Result<Option<(CatalogTableSchema, Vec<ProximaRecord>)>> {
+        let tenant_ctx = tenant.map(TenantContext::for_tenant_id);
+        // Fetch one MORE than the cap so an over-cap table is detected exactly rather
+        // than silently truncated — a truncated scan is a wrong answer, which is
+        // strictly worse than declining (mandate #1: fail closed, never silently wrong).
+        let (schema, rows) = self
+            .scan_table_relational(
+                table,
+                None,
+                None,
+                Some(row_cap.saturating_add(1)),
+                tenant_ctx.as_ref(),
+                identity,
+            )
+            .await?;
+        if rows.len() > row_cap {
+            tracing::debug!(
+                target: "proximadb::compute_route",
+                table,
+                row_cap,
+                "native table exceeds the registration row cap; declining to register"
+            );
+            return Ok(None);
+        }
+        let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let records: Vec<ProximaRecord> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| Self::value_row_to_relational_record(&i.to_string(), &col_names, row))
+            .collect();
+        Ok(Some((schema, records)))
+    }
+}
+
 impl DmlService {
     /// Create a new DML service
     pub fn new(catalog_manager: Arc<CatalogManager>, vector_ops: Arc<VectorOps>) -> Self {

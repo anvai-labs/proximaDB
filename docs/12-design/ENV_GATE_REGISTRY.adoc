@@ -174,6 +174,8 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_NATIVE_MORSEL` | Enables TD-OLAP-12 morsel-parallel scheduler for native pipelines | OFF | opt-in; TD-OLAP-12 | `src/query/execution/native_engine.rs`
 | `PROXIMADB_NATIVE_ROUTE` | Routes native-winning op classes to native engine as PRIMARY over parquet | OFF | opt-in; TD-OLAP-4 | `src/query/execution/native_engine.rs`
 | `PROXIMADB_NATIVE_SHADOW` | Runs native vectorized engine as a shadow alongside DataFusion (doubles work) | OFF | eval; TD-OLAP-4 | `src/query/execution/native_engine.rs`
+| `PROXIMADB_NATIVE_TABLE_PROVIDER` | Registers native (non-Parquet) relational tables with DataFusion, so CTE/window/join/subquery work without a manual `ALTER TABLE … MATERIALIZE` | OFF | opt-in; TD-USUB-2/ADR-094 | `src/query/execution/native_table_provider.rs`
+| `PROXIMADB_NATIVE_TABLE_ROW_CAP` | Per-table cap on rows materialized by the native table provider; an over-cap table is left unregistered (declines rather than truncating) | 1000000 | opt-in tuning; TD-USUB-2 | `src/query/execution/native_table_provider.rs`
 | `PROXIMADB_NATIVE_VECTORIZED` | Enables native-over-parquet vectorized engine (FilterProject/HashAgg) | OFF | opt-in; ADR-054 | `src/query/execution/native_engine.rs`
 | `PROXIMADB_NETWORK_SCOPE_MAP` | JSON file path for CIDR→client-locality scope map (result-egress) | default-empty (clients classify Unknown) | config-mirror; Co-design KOU | `src/metrics/consumption_metrics.rs`
 | `PROXIMADB_NOVA_MAX_ROW_GROUP_SIZE` | Forces smaller NOVA parquet row-group size (exercise row-group pruning) | 50,000 | test-only/opt-in; TD-040 | `src/storage/engines/nova/operations/flush.rs`
