@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 1.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). Slice 2 (durable store + WAL rotation) remains open.
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -37,7 +37,48 @@ Consequences, all present today:
   (`src/services/dml/mod.rs:948-952`) — no Parquet is written on INSERT. The name should be
   corrected as part of this work.
 
-== How to apply
+== Slicing — why slice 1 adds no persistence
+
+The obvious move is "spill the memtable to a durable segment". That is slice 2, deliberately,
+for two reasons.
+
+**The module contract forbids it today.** `record_memtable.rs` states that the store "is
+rebuildable from Layer 0 entries and **must not grow independent persistence**" — the
+ADR-010/ADR-020 position that the canonical WAL is the authority. Adding a durable copy is a
+change to that contract, not an implementation detail, and it is exactly what ADR-094's new
+**WAL truncation rule** exists to govern: once the WAL is truncated, a segment becomes
+recovery-authoritative *by reference*.
+
+**Mandate #6 says measure first.** This TD's own evidence gate asks for resident-heap growth
+per 1M rows and WAL size/replay time. Building a durable store before those numbers exist is
+building against an assumption.
+
+So **slice 1 does two things that cannot regress anything**:
+
+* **Observe** — `proximadb_relational_memtable_records`, a gauge of live records, so growth is
+  visible in the existing Prometheus surface.
+* **Bound, fail-closed** — an optional per-partition record cap
+  (`PROXIMADB_RELATIONAL_MEMTABLE_MAX_RECORDS`). The write that would exceed it is rejected
+  with an actionable error naming the knob, instead of the process being OOM-killed. Default
+  is **unbounded**, so with no configuration behaviour is byte-identical to before.
+
+Slice 1 changes no recovery semantics and adds no durable state, so it **cannot lose data** —
+the property worth having in a first increment that touches durability.
+
+Two design details worth recording:
+
+* **An update at the cap is admitted.** Only a write that *adds* an oid can exceed the bound.
+  Rejecting in-place updates would make a full table permanently un-correctable — you could
+  not even shrink it — which is worse than the condition being guarded.
+* **An invalid cap reads as unset, never as zero.** A typo'd env var must not silently turn
+  the database read-only.
+
+**Known limitation, stated rather than hidden:** the cap counts *records*, not bytes. Row
+width varies, so it is a proxy for memory, not a guarantee. Byte accounting needs a size
+estimator `ProximaRecord` does not have; it belongs with slice 2, where eviction becomes
+possible.
+
+== How to apply (slice 2 — the durable store)
 
 Implement a durable relational record store behind the **existing `RecordStore` trait**, so
 no caller changes. Precedent to mirror: `src/graph/cold_segment_store.rs:399`.

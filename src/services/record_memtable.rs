@@ -4,8 +4,35 @@
 //! relational DML wiring while PAX/LSM current-state storage is still being
 //! connected. Durability remains in the canonical WAL; this structure is
 //! rebuildable from Layer 0 entries and must not grow independent persistence.
+//!
+//! # TD-USUB-1 slice 1 — make the growth visible and boundable
+//!
+//! Every pgwire relational table lands here, and this map had **no flush, evict,
+//! spill or compact path** — so a long-lived table grew the heap without bound,
+//! and (because the canonical WAL is never truncated) the WAL alongside it.
+//! ADR-094 records this as defect (a).
+//!
+//! The durable fix is a real record store plus WAL rotation (TD-USUB-1 slice 2).
+//! That work needs to know how fast this actually grows, and mandate #6 says
+//! measure before you build. So this slice does exactly two things, neither of
+//! which can regress anything:
+//!
+//! * **Observe** — export the live record count as a gauge, so growth is visible
+//!   in the same Prometheus surface as everything else.
+//! * **Bound, fail-closed** — an optional cap that rejects the write which would
+//!   exceed it, instead of letting the process OOM. Default is **unbounded**, so
+//!   with no configuration the behaviour is byte-identical to before.
+//!
+//! Deliberately NOT done here: this slice adds no persistence, honouring the
+//! module contract above. It does not change recovery semantics, so it cannot
+//! lose data.
+//!
+//! **Known limitation, stated plainly:** the cap counts *records*, not bytes. Row
+//! width varies, so a record count is a proxy for memory, not a guarantee. Byte
+//! accounting needs a size estimator `ProximaRecord` does not have today; it is
+//! slice 2's job, alongside the durable store that makes eviction possible.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use proximadb_records::{
@@ -14,16 +41,73 @@ use proximadb_records::{
 };
 use proximadb_storage_common::{CanonicalOperation, CanonicalWalEntry};
 
+/// Cap on live records per relational memtable partition. Unset ⇒ **unbounded**
+/// (the shipped default; byte-identical to the pre-TD-USUB-1 behaviour).
+const MEMTABLE_MAX_RECORDS_ENV: &str = "PROXIMADB_RELATIONAL_MEMTABLE_MAX_RECORDS";
+
+/// Live records held across all relational memtable partitions.
+///
+/// Registered lazily and tolerantly: a duplicate registration (multiple servers in
+/// one test process) must never take down the write path, so failure degrades to a
+/// detached gauge rather than a panic.
+static MEMTABLE_RECORDS: std::sync::LazyLock<prometheus::IntGauge> =
+    std::sync::LazyLock::new(|| {
+        let gauge = prometheus::IntGauge::new(
+            "proximadb_relational_memtable_records",
+            "Live records held in relational memtables (TD-USUB-1: unbounded until slice 2)",
+        )
+        .expect("static gauge opts are valid");
+        // Ignore AlreadyReg — the gauge still works, it is simply not re-exported.
+        let _ = prometheus::register(Box::new(gauge.clone()));
+        gauge
+    });
+
+/// Read the configured per-partition record cap. `None` ⇒ unbounded.
+///
+/// A zero or unparsable value is treated as unset rather than as "reject every
+/// write" — a typo in an env var must not silently make the database read-only.
+fn configured_max_records() -> Option<usize> {
+    std::env::var(MEMTABLE_MAX_RECORDS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
 /// Rebuildable current-state memtable keyed by canonical record OID.
 #[derive(Debug, Default)]
 pub struct MemtableRecordStorage {
     records: DashMap<String, ProximaRecord>,
+    /// Max live records; `None` ⇒ unbounded (default).
+    max_records: Option<usize>,
 }
 
 impl MemtableRecordStorage {
-    /// Create an empty current-state memtable.
+    /// Create an empty current-state memtable, bounded per
+    /// `PROXIMADB_RELATIONAL_MEMTABLE_MAX_RECORDS` (unset ⇒ unbounded).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            records: DashMap::new(),
+            max_records: configured_max_records(),
+        }
+    }
+
+    /// Create an empty memtable with an explicit cap — used by tests and by callers
+    /// that configure the bound directly rather than through the environment.
+    pub fn with_max_records(max_records: Option<usize>) -> Self {
+        Self {
+            records: DashMap::new(),
+            max_records,
+        }
+    }
+
+    /// The configured cap, if any.
+    pub fn max_records(&self) -> Option<usize> {
+        self.max_records
+    }
+
+    /// Publish the current record count to the process gauge.
+    fn publish_len(&self) {
+        MEMTABLE_RECORDS.set(self.records.len() as i64);
     }
 
     /// Rebuild current state from canonical WAL entries.
@@ -72,7 +156,22 @@ impl MemtableRecordStorage {
 #[async_trait]
 impl RecordStore for MemtableRecordStorage {
     async fn upsert_record(&self, record: ProximaRecord) -> RecordStoreResult<ProximaRecord> {
+        // TD-USUB-1: fail closed at the cap rather than growing without bound.
+        // Only a write that ADDS an oid can exceed it — updating a record already
+        // resident does not grow the set, so it is always admitted (rejecting it
+        // would make a full table permanently un-correctable, which is worse).
+        if let Some(max) = self.max_records
+            && self.records.len() >= max
+            && !self.records.contains_key(&record.oid)
+        {
+            bail!(
+                "relational memtable is full: {max} live records \
+                 ({MEMTABLE_MAX_RECORDS_ENV}). This store has no spill path yet \
+                 (TD-USUB-1); raise the cap, or reduce resident rows."
+            );
+        }
         self.records.insert(record.oid.clone(), record.clone());
+        self.publish_len();
         Ok(record)
     }
 
@@ -84,7 +183,11 @@ impl RecordStore for MemtableRecordStorage {
     }
 
     async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool> {
-        Ok(self.records.remove(&key.oid).is_some())
+        let removed = self.records.remove(&key.oid).is_some();
+        if removed {
+            self.publish_len();
+        }
+        Ok(removed)
     }
 }
 
@@ -278,5 +381,100 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].oid, "keep");
         Ok(())
+    }
+
+    // --- TD-USUB-1 slice 1: the bound ---------------------------------------
+
+    /// The shipped default must stay unbounded, so enabling nothing changes nothing.
+    #[tokio::test]
+    async fn default_memtable_is_unbounded() -> Result<()> {
+        let storage = MemtableRecordStorage::with_max_records(None);
+        for i in 0..64 {
+            storage
+                .upsert_record(record(&format!("oid-{i}"), "t"))
+                .await?;
+        }
+        assert_eq!(storage.len(), 64);
+        assert_eq!(storage.max_records(), None);
+        Ok(())
+    }
+
+    /// At the cap a NEW oid is rejected — fail closed with an actionable message,
+    /// rather than growing until the process is OOM-killed.
+    #[tokio::test]
+    async fn insert_past_cap_fails_closed() -> Result<()> {
+        let storage = MemtableRecordStorage::with_max_records(Some(2));
+        storage.upsert_record(record("a", "t")).await?;
+        storage.upsert_record(record("b", "t")).await?;
+
+        let err = storage
+            .upsert_record(record("c", "t"))
+            .await
+            .expect_err("a third distinct oid must be rejected at cap 2");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memtable is full") && msg.contains(MEMTABLE_MAX_RECORDS_ENV),
+            "error must name the limit and the knob that raises it, got: {msg}"
+        );
+
+        // The rejected write must not have been applied.
+        assert_eq!(storage.len(), 2);
+        assert!(
+            storage
+                .get_record(&RecordKey::new("c".to_string()))
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// Updating a record already resident does not grow the set, so it must still be
+    /// admitted at the cap — otherwise a full table becomes permanently
+    /// un-correctable (you could not even delete rows by updating them first).
+    #[tokio::test]
+    async fn update_at_cap_is_admitted_and_delete_frees_room() -> Result<()> {
+        let storage = MemtableRecordStorage::with_max_records(Some(2));
+        storage.upsert_record(record("a", "t")).await?;
+        storage.upsert_record(record("b", "t")).await?;
+
+        // In-place update of an existing oid: allowed at cap.
+        storage
+            .upsert_record(record("a", "t2"))
+            .await
+            .expect("updating a resident oid must be admitted at cap");
+        assert_eq!(storage.len(), 2);
+
+        // Deleting frees a slot, so the previously-rejected insert now succeeds —
+        // proving the bound is a live property, not a one-way latch.
+        assert!(
+            storage
+                .delete_record(&RecordKey::new("b".to_string()))
+                .await?
+        );
+        storage
+            .upsert_record(record("c", "t"))
+            .await
+            .expect("a freed slot must be reusable");
+        assert_eq!(storage.len(), 2);
+        Ok(())
+    }
+
+    /// A typo'd or zero cap must read as "unset", never as "reject every write" —
+    /// a bad env value must not silently make the database read-only.
+    #[test]
+    fn invalid_cap_reads_as_unbounded() {
+        // SAFETY: single-threaded unit test mutating process env, restored below.
+        for bad in ["0", "-1", "abc", ""] {
+            unsafe { std::env::set_var(MEMTABLE_MAX_RECORDS_ENV, bad) };
+            assert_eq!(
+                configured_max_records(),
+                None,
+                "invalid cap {bad:?} must read as unbounded, not as a zero cap"
+            );
+        }
+        unsafe { std::env::set_var(MEMTABLE_MAX_RECORDS_ENV, "500") };
+        assert_eq!(configured_max_records(), Some(500));
+        unsafe { std::env::remove_var(MEMTABLE_MAX_RECORDS_ENV) };
+        assert_eq!(configured_max_records(), None);
     }
 }
