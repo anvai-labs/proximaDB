@@ -24,6 +24,17 @@
 //!   `TPC_PERF_ALLOW_LARGE_SCALE=I_ACCEPT_ISOLATED_OOM` is set and the process
 //!   is inside a finite cgroup that leaves at least 16 GiB for the host. Use
 //!   `scripts/run_tpc_perf_ledger.sh`; never launch SF-sized runs directly.
+//!   `TPC_PERF_LOAD_PARALLELISM` (default 1) spreads bulk-load INSERTs across
+//!   N pgwire connections to cut load wall-time; it does NOT reduce peak RSS
+//!   (the generated `Vec<String>` is fully resident either way), so it changes
+//!   nothing about the preflight ceiling above. Load + materialize wall times
+//!   land in `ledger.load_stats`. **True SF1 remains blocked**: at scale=1.0
+//!   the estimated peak (~132 GiB) exceeds any cgroup cap this harness's host
+//!   can safely offer alongside the required 16 GiB headroom — the generator
+//!   materializes the whole row set as text before any INSERT runs, so no
+//!   isolation setting fixes it. Closing that needs a streaming/chunked
+//!   generate-and-load path (a distinct, larger TD-172 slice; not attempted
+//!   here).
 //!
 //! `#[ignore]` — advisory, never a merge gate. Run on demand:
 //!
@@ -1358,6 +1369,20 @@ struct LedgerRecord {
 struct Ledger {
     methodology: Methodology,
     records: Vec<LedgerRecord>,
+    /// Per-benchmark bulk-load + materialize timings (TD-172: the load floor is
+    /// part of the evidence, not scaffolding to hide).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    load_stats: Vec<LoadStats>,
+}
+
+#[derive(serde::Serialize)]
+struct LoadStats {
+    benchmark: String,
+    insert_batches: usize,
+    load_parallelism: usize,
+    load_wall_ms: u128,
+    materialize_ok: usize,
+    materialize_wall_ms: u128,
 }
 
 /// Run one query: clear the capture, time the client round-trip, drain the
@@ -1730,7 +1755,13 @@ fn run_duckdb_baseline(
     }
 }
 
-async fn seed(client: &Client, schema: &[(&str, &str)], inserts: Vec<String>) {
+async fn seed(
+    client: &Client,
+    conn_str: &str,
+    benchmark: &str,
+    schema: &[(&str, &str)],
+    inserts: Vec<String>,
+) -> LoadStats {
     for (name, ddl) in schema {
         let _ = client
             .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
@@ -1740,25 +1771,95 @@ async fn seed(client: &Client, schema: &[(&str, &str)], inserts: Vec<String>) {
             .await
             .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
     }
-    for sql in &inserts {
-        client
-            .simple_query(sql)
-            .await
-            .unwrap_or_else(|e| panic!("INSERT: {}", explain_err(&e)));
+
+    // Insert lane: sequential on the calling client by default (the CI shape);
+    // `TPC_PERF_LOAD_PARALLELISM=N` spreads statements across N pgwire
+    // connections. INSERTs are mutually independent (DDL already committed), so
+    // cross-connection execution order is irrelevant to correctness. This
+    // shortens WALL time only — it does not reduce peak RSS (the full
+    // `inserts` Vec<String> is already resident regardless of load fan-out),
+    // so it does NOT change the #1905 preflight math and must still go
+    // through `scripts/run_tpc_perf_ledger.sh` at any scale that trips it.
+    let parallelism: usize = std::env::var("TPC_PERF_LOAD_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    let t0 = Instant::now();
+    if parallelism == 1 {
+        for sql in &inserts {
+            client
+                .simple_query(sql)
+                .await
+                .unwrap_or_else(|e| panic!("INSERT: {}", explain_err(&e)));
+        }
+    } else {
+        let mut set = tokio::task::JoinSet::new();
+        for k in 0..parallelism {
+            let stmts: Vec<String> = inserts
+                .iter()
+                .skip(k)
+                .step_by(parallelism)
+                .cloned()
+                .collect();
+            let cs = conn_str.to_string();
+            set.spawn(async move {
+                let (c, conn) = tokio_postgres::connect(&cs, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| format!("load connection: {e}"))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                for sql in stmts {
+                    c.simple_query(&sql).await.map_err(|e| {
+                        let head = &sql[..sql.len().min(120)];
+                        format!("INSERT: {} :: {}", explain_err(&e), head)
+                    })?;
+                }
+                Ok(())
+            });
+        }
+        let mut first_err: Option<String> = None;
+        while let Some(res) = set.join_next().await {
+            match res.expect("load task join") {
+                Ok(()) => {}
+                Err(e) if first_err.is_none() => first_err = Some(e),
+                Err(_) => {}
+            }
+        }
+        if let Some(e) = first_err {
+            panic!("{e}");
+        }
+    }
+    let load_wall_ms = t0.elapsed().as_millis();
+    eprintln!(
+        "[{benchmark}] loaded {} insert batches (parallelism {parallelism}) in {load_wall_ms} ms",
+        inserts.len()
+    );
+
+    LoadStats {
+        benchmark: benchmark.to_string(),
+        insert_batches: inserts.len(),
+        load_parallelism: parallelism,
+        load_wall_ms,
+        materialize_ok: 0,
+        materialize_wall_ms: 0,
     }
 }
 
-/// Measure every query on both routes, first + repeat run each.
+/// Measure every query on both routes, first + repeat run each. Returns the
+/// bulk-load + materialize stats for `ledger.load_stats`.
 async fn run_benchmark(
     client: &Client,
+    conn_str: &str,
     benchmark: &str,
     schema: &[(&str, &str)],
     inserts: Vec<String>,
     queries: Vec<(&'static str, String)>,
     out: &mut Vec<LedgerRecord>,
-) {
+) -> LoadStats {
     let n_inserts = inserts.len();
-    seed(client, schema, inserts).await;
+    let mut stats = seed(client, conn_str, benchmark, schema, inserts).await;
     eprintln!(
         "[{benchmark}] seeded ({n_inserts} insert batches across {} tables)",
         schema.len()
@@ -1781,15 +1882,26 @@ async fn run_benchmark(
         eprintln!("[{benchmark}] · skipping native/Volcano route (TPC_PERF_SKIP_NATIVE)");
     }
 
-    // Flip to parquet-backed → DataFusion route.
+    // Flip to parquet-backed → DataFusion route. Timed: the materialize cost
+    // is part of the load-path evidence (TD-172), not free scaffolding.
+    let t_mat = Instant::now();
+    let mut materialize_ok = 0usize;
     for (name, _) in schema {
-        if let Err(e) = client
+        match client
             .simple_query(&format!("ALTER TABLE {name} MATERIALIZE"))
             .await
         {
-            eprintln!("[{benchmark}] · MATERIALIZE {name}: {}", explain_err(&e));
+            Ok(_) => materialize_ok += 1,
+            Err(e) => eprintln!("[{benchmark}] · MATERIALIZE {name}: {}", explain_err(&e)),
         }
     }
+    stats.materialize_ok = materialize_ok;
+    stats.materialize_wall_ms = t_mat.elapsed().as_millis();
+    eprintln!(
+        "[{benchmark}] materialized {materialize_ok}/{} tables in {} ms",
+        schema.len(),
+        stats.materialize_wall_ms
+    );
 
     // DataFusion route (post-MATERIALIZE).
     for (id, sql) in &queries {
@@ -1820,6 +1932,8 @@ async fn run_benchmark(
             }
         }
     }
+
+    stats
 }
 
 async fn connect(server: &PgServer) -> Client {
@@ -1885,13 +1999,15 @@ async fn tpc_perf_ledger_inner() {
     let _ = std::fs::remove_file(format!("{}.partial.jsonl", ledger_out_path()));
 
     let mut records = Vec::new();
+    let mut load_stats: Vec<LoadStats> = Vec::new();
 
     // Fresh server per benchmark: TPC-H and TPC-DS both define `customer`.
     if benchmark_filter.as_deref().is_none_or(|b| b == "tpch") {
         let server = PgServer::start().await.expect("server start (tpch)");
         let client = connect(&server).await;
-        run_benchmark(
+        let tpch_stats = run_benchmark(
             &client,
+            &server.conn_str(),
             "tpch",
             TPCH_SCHEMA,
             gen_tpch(scale),
@@ -1899,6 +2015,7 @@ async fn tpc_perf_ledger_inner() {
             &mut records,
         )
         .await;
+        load_stats.push(tpch_stats);
         server.shutdown().await;
         #[cfg(not(feature = "duckdb"))]
         {
@@ -1914,8 +2031,9 @@ async fn tpc_perf_ledger_inner() {
     if benchmark_filter.as_deref().is_none_or(|b| b == "tpcds") {
         let server = PgServer::start().await.expect("server start (tpcds)");
         let client = connect(&server).await;
-        run_benchmark(
+        let tpcds_stats = run_benchmark(
             &client,
+            &server.conn_str(),
             "tpcds",
             TPCDS_SCHEMA,
             gen_tpcds(scale),
@@ -1923,6 +2041,7 @@ async fn tpc_perf_ledger_inner() {
             &mut records,
         )
         .await;
+        load_stats.push(tpcds_stats);
         server.shutdown().await;
         #[cfg(not(feature = "duckdb"))]
         {
@@ -1973,6 +2092,7 @@ async fn tpc_perf_ledger_inner() {
             ],
         },
         records,
+        load_stats,
     };
 
     let out_path = ledger_out_path();
