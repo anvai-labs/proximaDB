@@ -1,0 +1,85 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-3: ABAC composition silently removes SQL capability — the same table behaves differently per connection identity
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 1.
+| Priority | **HIGH** — a security-adjacent correctness trap: enabling row-level security silently *downgrades the SQL surface* rather than failing closed or enforcing in-plan.
+| Component | `src/services/dml/mod.rs` (`relational_abac_required`, `abac_row_filter`), `src/network/postgres/relational_pipeline.rs`
+| Relates to | ADR-094 (Phase 1, defect **c**), ADR-087 (ABAC enforcement), TD-USUB-2 (same mechanism, storage-derived sibling), TD-ABAC-10c
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`relational_abac_required(&self, identity: PortIdentity<'_>)`
+(`src/services/dml/mod.rs:1423`) derives entirely from:
+
+[source,rust]
+----
+proximadb_tenant::read_enforcement_composition(
+    self.abac_enforcer.is_some(),
+    identity.subject.is_some(),
+    identity.tenant_stable_id.is_some(),
+    identity.auth_class,
+)
+----
+
+It takes **no storage input whatsoever**. When the composition is anything other than
+`Passthrough`, the relational pipeline forces `parquet_backed = false`
+(`src/network/postgres/relational_pipeline.rs:1049`) and the entire DataFusion dispatch block
+is skipped.
+
+Combined with TD-USUB-2 — where the `ctx.sql` fallback is reachable only on the DataFusion
+route — the consequence is:
+
+[IMPORTANT]
+====
+The **same table** serves CTEs, window functions, joins and subqueries to a *passthrough*
+connection, and silently loses all of them for an *authenticated tenant user*. SQL capability
+varies by **who connects**, not by what is stored.
+====
+
+This is worse than a storage-derived cliff because it is invisible at the schema level:
+nothing about the table indicates that its query surface shrinks under an authenticated
+session. It also means no storage change — publication, format unification, or otherwise —
+can fix it.
+
+== Why it is currently shaped this way
+
+The fail-closed intent is correct and must be preserved. The legacy single-table reader has
+no row-filter wiring, so serving an ABAC-scoped subject through it would return unenforced
+rows — the bypass TD-ABAC-10c closes. The defect is not the caution; it is that the caution
+is expressed as a **silent capability downgrade** instead of either in-plan enforcement or an
+explicit decline.
+
+== How to apply
+
+Preferred — **enforce in-plan**:
+
+. Push `AbacScanResult` (`src/services/dml/mod.rs:1436`) into the registered table provider
+  (TD-USUB-2) so the row filter is applied inside the scan, and the DataFusion route becomes
+  safe for ABAC-scoped subjects.
+. `parquet_backed` then no longer needs to be forced false, and capability stops varying by
+  identity.
+
+Fallback, if in-plan enforcement is deferred — **fail closed, visibly**:
+
+* Emit an explicit, documented SQLSTATE naming ABAC as the reason the shape was declined, so
+  the user sees *"this query shape is not supported for a policy-governed subject"* rather
+  than silently losing a feature. A decline of this kind already exists at
+  `relational_pipeline.rs:4310`-style sites and should be the model.
+
+Either way, the invariant to establish is: **enabling security must never silently change
+which SQL is accepted.**
+
+== Evidence gate (mandate #6)
+
+* A test matrix running an identical query set as (i) passthrough and (ii) an authenticated
+  ABAC-scoped subject, asserting either identical results (in-plan enforcement) or an
+  explicit typed error — never a silent difference in accepted SQL.
+* A row-leak test proving the filter is actually applied in-plan for every shape newly
+  admitted to the DataFusion route.
+* `auth_failclosed_e2e` and the ABAC ratchets stay green.

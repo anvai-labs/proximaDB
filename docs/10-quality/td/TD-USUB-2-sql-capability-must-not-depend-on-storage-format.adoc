@@ -1,0 +1,73 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-2: SQL capability depends on storage format — CTEs, window functions and joins work only on Parquet-backed tables
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 1.
+| Priority | **HIGH** — a user-visible correctness/usability cliff: which SQL works depends on whether someone ran a manual DDL statement.
+| Component | `src/network/postgres/relational_pipeline.rs`, `src/query/execution/datafusion_engine.rs`, `src/datafusion/engine_adapters/`
+| Relates to | ADR-094 (Phase 1, defect **b**), ADR-039 (leakage ratchet — lane discipline), TD-USUB-3 (the identity-derived sibling), TD-USUB-5
+| Blocked by | Nothing. **This is not a storage-format problem** and does not wait on the format work.
+|===
+
+== The finding
+
+`allow_engine_sql_fallback = true` appears at **exactly one call site**:
+`src/network/postgres/relational_pipeline.rs:1336`, the DataFusion floor. It is defined at
+`src/query/execution/engine.rs:196-199` as an escape hatch for SQL-dialect gaps and defaults
+to `false` everywhere else.
+
+Because `ctx.sql` (`src/query/execution/datafusion_engine.rs:249`) is the fallback for every
+shape the shared relational frontend declines, the entire `classify_unsupported` set —
+subquery, having, join, group_by, distinct, **window** — plus `DISTINCT ON`, `GROUP BY ALL`,
+`ORDER BY ALL`, `NATURAL JOIN`/`USING`, correlated scalar subqueries, `EXISTS`/`IN (SELECT)`,
+table-valued functions and `SELECT` without `FROM` is reachable **only on the DataFusion
+route**. That route requires `parquet_backed`, which per
+`catalog_table_is_parquet_backed` (`relational_pipeline.rs:2064-2085`) means the table was
+explicitly `ALTER TABLE … MATERIALIZE`'d.
+
+A second tier behaves identically: shapes the frontend accepts but
+`src/datafusion/logical_lowering.rs` declines — semi/anti join without `ON` (`:261`),
+null-aware anti join (`:272`), `SUM`/`AVG(DISTINCT)` (`:379`/`:386`), `StringAgg` (`:392`),
+`||` concat (`:611`) — are served on Parquet-backed tables and hard-error otherwise.
+
+The user-visible artifact is the CTE decline, which names the workaround outright:
+*"WITH (CTE) queries require every referenced table to be materialized (ALTER TABLE …
+MATERIALIZE) so the DataFusion route can serve them."*
+
+== Why this is not a storage problem
+
+Parquet is **incidental**. It is merely the only format with a **registered table provider**
+on the relational path. The seam already exists and is ADR-039-legal:
+
+* `impl TableProvider for SstTableProvider` — `src/datafusion/engine_adapters/sst_adapter.rs:280`
+* `impl ProximaTableProvider for SstTableProvider` — `:345`
+
+`PaxTableProvider` (`engine_adapters/pax_table_provider.rs:39`) and `register_pax_location`
+also exist but are referenced only from tests.
+
+So the cliff closes by **registering a provider for non-Parquet relational tables**, with
+**zero format change, zero publication and zero write amplification**.
+
+== How to apply
+
+. Register a table provider for relational tables regardless of physical format, reusing the
+  existing `ProximaTableProvider` seam (do **not** add a new adapter — ADR-039 confines
+  `use datafusion::` to the sanctioned allow-list).
+. Change the `allow_engine_sql_fallback` gate from `parquet_backed` to **"this query's tables
+  all have a registered provider."**
+. A table with no registered provider must produce an **explicit, observable decline** with a
+  documented SQLSTATE — never a silent capability downgrade.
+. Keep lane discipline: the DataFusion route may use `PaxSplitReader`; the native route must
+  not (TD-USUB-5).
+
+Ship default-OFF behind an `ENV_GATE_REGISTRY`-registered gate.
+
+== Evidence gate (mandate #6)
+
+* A conformance test asserting the **same SQL surface** on a non-materialized table and a
+  materialized one — CTE, window function, join, correlated subquery, `EXISTS`, `DISTINCT ON`.
+* TPC-H and TPC-DS ratchets stay green (currently 15/16 and 11/11).
+* No regression in the native/OLTP point-lookup path.

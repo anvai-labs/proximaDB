@@ -4,8 +4,9 @@
 
 [cols="1,3"]
 |===
-|Status|Accepted
+|Status|Accepted — **amended by ADR-094 (2026-09-21)**: adds an explicit WAL truncation rule (see "Stacked Durability Alignment")
 |Date|2026-05-18
+|Amended by|ADR-094 (unified storage substrate and compute seam)
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-007 (Iceberg REST), ADR-008 (OLTP Backends), ADR-009 (Schema Modes)
 |Supersedes|—
@@ -142,6 +143,32 @@ Layer 3: Iceberg REST / Arrow Flight / pgwire facades        — protocol adapte
 PAX blocks are rebuilt from Layer 1 records on compaction. They are NOT a new WAL path, and they do
 not replace the native row/delta commit tier required for PostgreSQL-style constraint-sensitive
 OLTP. Block corruption triggers rebuild from Layer 0/1.
+
+[IMPORTANT]
+====
+**Amendment — the WAL truncation rule (ADR-094, 2026-09-21).**
+
+"Corruption triggers rebuild from Layer 0/1" holds only while Layer 0 is complete. That is
+true today because the canonical WAL is **never truncated** — which is also precisely the
+defect ADR-094 sets out to fix (relational tables currently have unbounded WAL growth, and
+Layer 1 for them is only `MemtableRecordStorage`, itself WAL-derived, so there is no
+independent Layer 1 to rebuild from).
+
+The moment a checkpoint truncates the WAL, any segment holding pre-checkpoint data becomes
+**recovery-authoritative by reference** — not an authority over schema or transactions
+(that remains false, and this ADR's core claim is unchanged), but the sole surviving copy
+of those records. The rule is therefore:
+
+[.text-center]
+**Truncate the WAL only below the minimum LSN durably committed in a catalog-referenced
+segment.**
+
+Corollaries: a segment referenced by the catalog may not be deleted while it is the minimum
+LSN holder; and segment durability must be established (object durably written *and*
+catalog-referenced) before the corresponding WAL range is eligible for truncation. ADR-045's
+Layer A/B stratification is what makes Layer A sufficient for this — Layer B is rebuildable
+and therefore never load-bearing for recovery.
+====
 
 == Iceberg / Arrow Flight Integration
 

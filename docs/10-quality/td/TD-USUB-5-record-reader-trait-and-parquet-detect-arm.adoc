@@ -1,0 +1,69 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-5: One `RecordReader` seam — the trait ADR-027 assumes does not exist, and format detection cannot see Parquet
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 2. **Absorbs and supersedes legacy TD-162a-3 and TD-162b** (see Reconciliation).
+| Priority | MEDIUM-HIGH — the seam every other unification step reads through.
+| Component | `src/storage/engines/sst/segment_format.rs`, `crates/storage/proximadb-storage-common/src/segment_layout.rs`, `src/datafusion/engine_adapters/`, `src/query/execution/native_scan.rs`
+| Relates to | ADR-094 (Decision 3), ADR-027 (Decision 1 "one record reader"), ADR-039 (leakage ratchet), TD-OLAP-14, TD-USUB-2, TD-USUB-4
+| Blocked by | ADR-027 `Accepted` — **gate lifted by ADR-094**.
+|===
+
+== The finding
+
+**(1) There is no `RecordReader` trait.** ADR-027 Decision 1 assumes one ("one record
+reader"), and ADR-027's own text concedes it is new work. Reading is an inline `match`:
+`src/storage/engines/sst/segment_format.rs:76-86`. Every consumer therefore couples to
+concrete layouts.
+
+**(2) Format detection cannot see Parquet.** `SegmentFormat` has exactly two variants,
+`ProximaBlocks` and `Pax` (`crates/storage/proximadb-storage-common/src/segment_layout.rs:77-99`).
+`detect()` (`:91-97`) recognizes `PBLK` / `PXH1` heads plus a trailing `SEGMENT_MAGIC`.
+There is **no `PAR1` arm** — Parquet magic is recognized only in unrelated metadata-cache
+code (`src/storage/persistence/filesystem/metadata_cache.rs:257-258`). So the Parquet arm is
+unreachable from segment dispatch, which is precisely why the warehouse is a separate
+substrate rather than another format behind one reader.
+
+== Reconciliation with the legacy TD table
+
+Legacy `TECHNICAL_DEBT.adoc` rows **TD-162a-3** (the `RecordReader` trait) and **TD-162b**
+(the `PAR1` arm) describe this work and remain `Open`. This TD absorbs both; those rows
+should be marked superseded-by-TD-USUB-5 rather than worked separately.
+
+Note also a **status contradiction to resolve while here**: TD-OLAP-1 states that
+"TD-154/TD-162a-2/TD-162a-3 were satisfied by the existing reader", while the legacy table
+still lists them Open. The reader satisfied TD-OLAP-1's *needs*; it did not introduce the
+trait. The table rows are correct; TD-OLAP-1's claim is the loose one.
+
+== How to apply
+
+. Introduce `RecordReader` with implementations for PAX (`PBLK`/`PXH1`), legacy
+  `ProximaBlocks`, and Parquet (`PAR1`). Keep the magic-byte dispatch O(1) and the precedence
+  disjoint: `PBLK` / `PXH1` / `0x01` / `PAR1`.
+. Add the `PAR1` variant to `SegmentFormat` + `detect()`, behind the `datafusion-integration`
+  feature, default-off.
+. Convert `read_segment_records`'s inline match into trait dispatch, leaving behaviour
+  byte-identical for existing formats.
+
+=== Lane discipline is a hard constraint (ADR-039)
+
+[cols="1,2", options="header"]
+|===
+| Route | Permitted PAX reader
+| DataFusion | `PaxSplitReader` (`src/datafusion/engine_adapters/pax_adapter.rs`) — inside the sanctioned adapter allow-list.
+| Native / Volcano | `PaxSegmentScanner` / `PaxScanOperator` **only** — must never reference `PaxSplitReader`, which would import DataFusion into the native lane and break the no-DataFusion build guard (TD-181).
+|===
+
+The resulting ~30 lines of decode duplication are deliberate and already the recorded
+position of TD-OLAP-14. Do not "fix" it by sharing the reader across lanes.
+
+== Evidence gate (mandate #6)
+
+* Detect-precedence test covering all four magics, including adversarial inputs where a
+  `PAR1` tail coexists with a PAX head.
+* Byte-identical round-trip for existing `PBLK`/`PXH1`/legacy segments through the new trait
+  (no behavioural change).
+* The no-DataFusion build guard stays green, proving the native lane took no new dependency.

@@ -1,0 +1,273 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= ADR-094: Unified Storage Substrate and Compute Seam — format follows modality, capability follows nothing
+
+[cols="1,3"]
+|===
+|Status|Proposed
+|Date|2026-09-21
+|Deciders|Vijaykumar Singh
+|Relates to|ADR-010 (PAX block format), ADR-026 (PAX canonical vector path), ADR-027 (unified storage + metering substrate), ADR-033 (primary storage format strategy), ADR-034 (object-store access-path co-design), ADR-039 (OLAP engine boundary), ADR-045 (PAX durable core vs serving metadata), ADR-052 (analytics execution competitiveness), ADR-054 (operator plane), ADR-055 (document canonical format), ADR-062 (coalesced RaBitQ + self-describing footer), ADR-090 (identity, grants, BYOB storage)
+|Supersedes|—
+|Narrows|ADR-027 Decision 1 (see "The unblock")
+|Amends|ADR-010 (WAL truncation rule), ADR-033 (post-survey evidence + premise caveat), ADR-045 (Layer-A encoding for the relational arm)
+|Tracked under|TD-USUB-1 … TD-USUB-10
+|===
+
+== Context
+
+ProximaDB's design documents describe a *dual* path — PAX for vectors, Parquet for
+relational. The code has **three** substrates, and the third is where the damage is:
+
+[cols="1,2,2,2", options="header"]
+|===
+| # | Substrate | Written by | Reached how
+| 1 | Canonical WAL + in-memory memtable | pgwire `CREATE TABLE` / `INSERT` | default for all relational DDL
+| 2 | PAX segments (`PBLK` / `PXH1`) | SST flush (size / interval trigger) | vector collections only
+| 3 | Parquet + Iceberg warehouse | `materialize_table_to_parquet` | **manual `ALTER TABLE … MATERIALIZE`**
+|===
+
+A survey of the write paths, the compute seams, and the ADR/TD landscape (three
+parallel code surveys plus an adversarial design review; every claim below verified
+against source) shows the problem decomposes into **four separable defects**. Only one
+is blocked on the ADR conflict. Treating them as one bundle — as an earlier draft of
+this decision did — is what has kept all four open.
+
+=== (a) A durability and scale defect
+
+`MemtableRecordStorage` (`src/services/record_memtable.rs:19-21`) is a `DashMap` whose
+complete method set is `new` / `replay_wal_entries` / `len` / `is_empty` / `upsert` /
+`get` / `delete` / `scan`. There is **no flush, evict, spill, or compact path**.
+Durability for every relational table is therefore 100% replay of a *single* file,
+`{data_dir}/pgwire/canonical-records.wal` (`src/network/shared_services.rs:1971-1977`).
+
+Relational tables have **unbounded WAL growth and unbounded heap growth, with no
+tiering**. This is an operability bug, not an architectural preference, and it needs no
+ADR to fix.
+
+=== (b) A capability cliff — which is not a storage problem
+
+`allow_engine_sql_fallback = true` appears at exactly **one** call site:
+`src/network/postgres/relational_pipeline.rs:1336`, the DataFusion floor. Because
+`ctx.sql` is the escape hatch for every shape the shared relational frontend declines,
+CTEs, window functions, joins, subqueries, `HAVING`, `DISTINCT`, correlated subqueries
+and `EXISTS`/`IN` work **if and only if a table is Parquet-backed**.
+
+Parquet is *incidental* to that. It is merely the only format with a **registered table
+provider** on the relational path. The seam already exists and is ADR-039-legal:
+`impl TableProvider for SstTableProvider` (`src/datafusion/engine_adapters/sst_adapter.rs:280`)
+and `impl ProximaTableProvider for SstTableProvider` (`:345`). Registering a provider for
+non-Parquet relational tables closes the cliff with **zero format change and zero
+publication**.
+
+Recording this plainly because it has been mis-attributed: *the capability cliff is a
+provider-registration gap, not evidence for or against any storage format.*
+
+=== (c) Identity-dependent capability — a security-composition bug
+
+`relational_abac_required(&self, identity: PortIdentity<'_>)`
+(`src/services/dml/mod.rs:1423`) derives purely from
+`read_enforcement_composition(abac_enforcer, subject, tenant_stable_id, auth_class)`.
+It takes **no storage input at all**.
+
+Consequence: the *same table* yields window functions to a passthrough connection and
+denies them to an authenticated tenant user. Capability varies by **who connects**. No
+storage-format decision can fix this; it needs `AbacScanResult`
+(`src/services/dml/mod.rs:1436`) pushed into the provider, or a decline that is explicit
+and observable rather than a silent capability downgrade.
+
+=== (d) The storage fork — the genuinely blocked part
+
+* **ADR-027** (*Proposed*, 2026-06-26) decides PAX is the single internal format for
+  every modality and demotes Parquet to the interop seam. It carries a governance
+  clause: **"the format-unification work (TD-162) must not begin until this ADR is
+  `Accepted`."**
+* **ADR-033** (*Proposed*, 2026-06-27 — one day later, backed by a 22-source
+  adversarially-verified survey) decides the opposite for the scan arm: Parquet stays
+  **primary** for relational-OLAP scan, being within ~2× of a custom format on scans and
+  the Iceberg interop seam.
+
+ADR-027 reconciles itself only against the 2026-06-04 course-correction. ADR-033
+effectively restored the clauses ADR-027 superseded. **Neither document cites the
+other.** The result is a deadlock that has frozen TD-162 for roughly three months while
+the fork widened.
+
+== The unblock — narrow ADR-027; do not write a fourth thesis
+
+ADR-027's Decision 1 is not one decision but **three couplings**: one *format*, one
+*reader*, one *SQL lowering* ("relational SQL lowers to a PAX scan… DataFusion is
+interim"). Only the third collides with ADR-033.
+
+And the third is **already dead**, settled without reference to either document by
+**ADR-052 invariant 1** (OLAP execution is vectorized-over-Arrow via DataFusion; native
+Volcano is the OLTP/point-lookup floor) and **ADR-054** (operator plane, ledger-gated).
+
+Therefore:
+
+[IMPORTANT]
+====
+**Narrow ADR-027 Decision 1 to _landing / LSM output_ and withdraw its "one SQL
+lowering" row, deferring the executor question to ADR-052/054. With that row withdrawn,
+ADR-027 and ADR-033 no longer conflict and both can be `Accepted`.**
+====
+
+This is deliberately the *minimum* intervention. Authoring a new synthesis that kept the
+lowering clause alive would produce a fourth unreconciled document and reproduce the
+failure mode. ADR-094 exists to record the narrowing and specify the end state, not to
+re-litigate settled ground.
+
+== Decision 1 — Format follows modality
+
+[IMPORTANT]
+====
+**One physical copy per table, with the landing format chosen by modality.
+Relational-only tables land in a Parquet-encoded Layer A carrying PAX layout discipline
+(zone maps, row-group geometry, MVCC columns). Vector and multimodal tables land in
+`PBLK`/`PXH1` as today. A second representation is optional, catalog-expressed and
+cost-justified — never the default.**
+====
+
+This satisfies ADR-027's intent (one landing format per modality; no ad-hoc third
+substrate) and honours ADR-033's evidence (Parquet is the right physical representation
+for relational scans, and it is the Iceberg seam) without paying for both.
+
+The rejected alternative was "land everything in PAX, publish Parquet as an
+engine-managed projection." It fails on three verified counts:
+
+. **Republication is O(table), not O(delta).** `materialize_table_to_parquet` writes a
+  single `{prefix}/data/part-0.parquet` as a **full overwrite**
+  (`src/services/dml/mod.rs:2028-2031`), fed from resident records — so it is also bounded
+  by memory. Publication frequency × table size is the write-amplification curve.
+. **Freshness inverts the scan win.** With `snapshot_lsn` + the delta merge
+  (`read_changes_since_scoped`, `src/services/dml/mod.rs:860`), every strong-freshness
+  scan over a stale projection pays a merge — coupling publication interval to read cost,
+  a control loop the route cost model does not contain.
+. **Capability becomes nondeterministic.** `parquet_backed` requires *all* tables in a
+  query to be Parquet. Engine-chosen publication would make "does my CTE work?" depend on
+  background publisher state — strictly worse for users than today's explicit DDL.
+
+=== Latent inconsistency this resolves
+
+ADR-045 asserts Layer A "ships 1:1 as an Iceberg data file." Iceberg data files may only
+be Avro, ORC or Parquet. That claim therefore holds **only if Layer A is Parquet-encoded**.
+Decision 1 turns that crack into the rule for the relational arm, and ADR-045 is amended
+to say so.
+
+== Decision 2 — Multi-layout catalog is a hard prerequisite
+
+`catalog.set_storage_layouts(&table_id, vec![layout])` (`src/services/dml/mod.rs:2052`)
+**replaces** the layout list. A table can therefore hold exactly one representation, and
+**cost-based routing across representations is not expressible today** — no amount of
+router work can select among alternatives that cannot be recorded.
+
+The catalog already models multi-layout (`CatalogAuthorityMode`,
+`crates/foundation/proximadb-catalog-schema/src/lib.rs:1459-1477`) and both backing
+predicates iterate it. Making `MATERIALIZE` **additive** is the gating step for every
+routing decision downstream (TD-USUB-4).
+
+== Decision 3 — One reader seam; capability is storage-independent
+
+* A single `RecordReader` trait (TD-162a-3; does not exist today — `read_segment_records`
+  is an inline `match` at `src/storage/engines/sst/segment_format.rs:76-86`), plus a
+  `PAR1` arm in `SegmentFormat::detect` (TD-162b; today only `ProximaBlocks` and `Pax`
+  exist, `crates/storage/proximadb-storage-common/src/segment_layout.rs:91-97`).
+* **SQL capability must not depend on physical format.** The `ctx.sql` fallback gates on
+  *provider registration*, never on `parquet_backed`.
+* **Lane discipline (ADR-039 leakage ratchet).** The DataFusion route reads PAX via
+  `PaxSplitReader` (inside the sanctioned adapter allow-list). The native route reads via
+  `PaxSegmentScanner` / `PaxScanOperator` and must **never** reference `PaxSplitReader`.
+
+== Decision 4 — Catalog-resident serving metadata, with an in-object copy
+
+A cold PAX read today is a **3-deep dependent GET chain** — 32-byte footer tail →
+metadata ranges (column footer + vector params + row-group index) → surviving stripes
+(`crates/storage/proximadb-block-format/src/ranged.rs`, read-order doc comment). That is
+exactly the DEPTH term ADR-033 ranks as dominant
+(`DEPTH ≫ WIDTH ≫ BYTES ≫ CPU`).
+
+Promote ADR-045 **Layer B** — RowDirectory, ColumnMeta statistics, blooms, SegmentIndex,
+deletion vector, all already classified *rebuildable serving metadata* — into xCatalog, so
+planning becomes one catalog query and the cold chain collapses to **1 GET**. This is the
+DuckLake insight applied at the layer where ProximaDB already owns a catalog.
+
+**The object retains a self-describing footer copy.** It must stay standalone-readable for
+disaster recovery, external tools, and BYOB buckets (ADR-090), where the customer owns the
+storage and ProximaDB's catalog may be unavailable. Catalog is the fast path; the object
+remains the truthful one.
+
+== Consequences
+
+* ADR-027 becomes `Accepted (as narrowed by ADR-094)`; **TD-162's governance gate lifts.**
+* ADR-033's targeting decision stands, but its load-bearing "< 2× on sequential scans"
+  premise is marked **unverified-pending-measurement** — see Evidence.
+* ADR-010 gains an explicit **WAL truncation rule**. Today Layer 1 is only the
+  WAL-derived memtable; once the WAL is truncated, the segment becomes recovery-authoritative
+  *by reference*, which ADR-010's "corruption → rebuild from Layer 0/1" (l.142) does not
+  currently cover. Rule: **truncate only below the minimum LSN durably committed in a
+  catalog-referenced segment.**
+* ADR-045 is amended for the Layer-A encoding point above.
+* Two live defects are recorded for cleanup: Iceberg publish failure is **swallowed with a
+  `warn!`** (`src/services/dml/mod.rs:2107-2111`), so manifests can be silently absent while
+  the table still reads; and `src/storage/formats/open/iceberg.rs` (1507 lines) is **dead
+  code with zero non-doc references**.
+
+== Invariant compliance
+
+[cols="2,3", options="header"]
+|===
+| Invariant | How this ADR complies
+| **ADR-062 D1** one-object atomicity | No sidecar is introduced. Decision 4 keeps the footer in-object; the catalog copy is an additive fast path, not a second object.
+| **ADR-045** Layer-A filter+vector co-location is inviolable | Untouched. Only Layer B (explicitly *rebuildable*) is promoted to the catalog.
+| **ADR-039** DataFusion leakage ratchet | Decision 3 fixes the lanes: `PaxSplitReader` stays inside the adapter allow-list; the native path uses `PaxSegmentScanner` only.
+| **ADR-010** PAX is not a schema/WAL/txn authority | Unchanged — xCatalog + canonical WAL + `ProximaRecord` remain authoritative. The one real change (truncation) is made explicit rather than assumed.
+| **ADR-052 / ADR-054** executor settled | Honoured by *withdrawing* ADR-027's competing lowering clause rather than restating it.
+| **Mandate #8** mixed-read-safe, default-off | Every format change dispatches on the version byte; v2 keeps decoding. All flips ship default-OFF behind an `ENV_GATE_REGISTRY`-registered gate.
+| **Mandate #6** measured, not asserted | Each phase names its evidence gate; no default flip without a `BENCHMARK_EVIDENCE.toml` entry.
+|===
+
+== Rollout
+
+Ordered so the system is never left in a worse state than today.
+
+* **Phase 0 (docs only)** — this ADR; the ADR-027/033/010/045 amendments; the format+seam
+  spec. Lifts the TD-162 gate. No source changes.
+* **Phase 1 (needs no ADR; may run in parallel with Phase 0)** — TD-USUB-1 durable
+  relational `RecordStore` + WAL rotation (defect **a**); TD-USUB-2 provider registration
+  (defect **b**); TD-USUB-3 ABAC capability composition (defect **c**).
+* **Phase 2 (make routing expressible)** — TD-USUB-4 additive layouts; TD-USUB-5
+  `RecordReader` + `PAR1` arm.
+* **Phase 3 (format evolution, evidence-gated)** — TD-USUB-6 typed columns authoritative;
+  TD-USUB-7 adaptive structural encoding; TD-USUB-8 catalog-resident Layer B.
+* **Phase 4 (integrity)** — TD-USUB-9 route-stamp integrity + dead-code removal;
+  TD-USUB-10 incremental publication.
+
+Note on ordering: ADR-034 deliberately ranks TD-162a-2 (typed user columns) **last**
+because it buys < 2× on scans. TD-USUB-6 does not overturn that ranking — it re-justifies
+the work on *unification and routing* grounds (one store, a real second cost arm, uniform
+pruning), which is the rationale ADR-033 already recast it to.
+
+== Evidence
+
+* **ADR-033's "< 2× on sequential scans" premise is now contested and must be measured.**
+  Vortex — absent from ADR-033's 22-source survey — reports 100× random access *and*
+  10–20× faster scans at similar compression, and is now a Linux Foundation project with a
+  DuckDB extension. If that holds for our shapes, ADR-033's targeting logic weakens. The
+  scale harness landed in #1914 can settle it; until then the premise is flagged, not
+  relied upon.
+* **Lance 2.1 adaptive structural encodings** supply the mechanism for "one format, both
+  access patterns": separate *structural* encoding from *compressive* encoding, and choose
+  structure by value width — full-zip for ≥128 B values (1 IOP fixed-width, 2 variable),
+  mini-block below. A 768-d `f32` embedding is ~3 KB, so it is squarely the full-zip case:
+  a 1-IOP random vector fetch, which is exactly the ANN rerank path.
+* **DuckLake** demonstrates the catalog-resident metadata win that Decision 4 applies.
+* **Iceberg v3** (deletion vectors, row lineage, Variant **with shredding**) is the export
+  target. Note the convergence: ProximaDB's P-Shred (ADR-055) independently arrived at
+  variant shredding, which both validates the design and argues for aligning its semantics.
+
+== Sources
+
+Lance: "Adaptive Structural Encodings for Columnar Storage" (arXiv 2504.15247).
+Vortex file format documentation and DuckDB integration (2026-01).
+DuckLake architecture (MotherDuck, 2025-2026).
+Apache Iceberg v3 specification — deletion vectors, row lineage, Variant shredding.
+Databricks Mosaic AI Vector Search (index-synced-from-Delta model, for contrast).

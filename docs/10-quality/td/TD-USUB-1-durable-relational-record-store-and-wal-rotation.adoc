@@ -1,0 +1,63 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-1: Relational tables have no durable store — unbounded WAL and unbounded memtable growth
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 1.
+| Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
+| Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
+| Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
+| Blocked by | Nothing. **Independent of the ADR-027/033 reconciliation** — it may proceed immediately.
+|===
+
+== The finding
+
+`MemtableRecordStorage` (`src/services/record_memtable.rs:19-21`) is a
+`DashMap<String, ProximaRecord>`. Its complete method set is `new`, `replay_wal_entries`,
+`len`, `is_empty`, `upsert_record`, `get_record`, `delete_record`, `scan_records`,
+`scan_records_with_options`, `scan_records_filtered`. There is **no flush, evict, spill, or
+compact path of any kind**.
+
+Durability for every pgwire relational table is therefore 100% replay of a **single file**,
+`{data_dir}/pgwire/canonical-records.wal` (`src/network/shared_services.rs:1971-1977`),
+appended by `FramedTableWalAppender::append_operations` (`src/services/canonical_wal.rs:133`)
+via `DirectWalTableRecordStore::write_mutations` (`src/services/record_store.rs:1973`).
+
+Consequences, all present today:
+
+* **Unbounded heap.** Every row ever inserted stays resident for the process lifetime.
+* **Unbounded WAL.** Nothing truncates or rotates it; recovery time grows without bound.
+* **No tiering.** Relational data never reaches object storage, so none of the PAX/Parquet
+  pruning, caching or cost machinery applies to it.
+* **Misleading route name.** `TableRecordStoreRoute::for_schema` sends relational/HTAP/OLAP
+  to a `ParquetIcebergStorage` arm (`src/services/record_store.rs:194-196`), but the pgwire
+  wiring passes the canonical WAL store into that slot
+  (`src/services/dml/mod.rs:948-952`) — no Parquet is written on INSERT. The name should be
+  corrected as part of this work.
+
+== How to apply
+
+Implement a durable relational record store behind the **existing `RecordStore` trait**, so
+no caller changes. Precedent to mirror: `src/graph/cold_segment_store.rs:399`.
+
+. Memtable gains a size/age threshold and flushes to a durable segment (format per ADR-094
+  Decision 1 — Parquet-encoded Layer A for relational-only tables).
+. Segment is registered in the catalog (see TD-USUB-4 for additive layouts).
+. **Only then** is the corresponding WAL range eligible for truncation, per the WAL
+  truncation rule ADR-094 adds to ADR-010: *truncate only below the minimum LSN durably
+  committed in a catalog-referenced segment.*
+. Background compaction merges small segments.
+
+Ship default-OFF behind an env gate registered in `ENV_GATE_REGISTRY` (the guard rejects
+unregistered vars), so the existing WAL-only path remains the default until the gate flips.
+
+== Evidence gate (mandate #6)
+
+Before any default flip, record in `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`:
+
+* resident-heap growth per 1M inserted rows, before vs after;
+* WAL size and recovery (replay) time at a fixed row count, before vs after;
+* a crash-recovery test proving no data loss across flush + truncation, including the
+  boundary case where a crash lands between segment write and catalog reference.
