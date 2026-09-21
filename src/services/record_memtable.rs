@@ -47,19 +47,21 @@ const MEMTABLE_MAX_RECORDS_ENV: &str = "PROXIMADB_RELATIONAL_MEMTABLE_MAX_RECORD
 
 /// Live records held across all relational memtable partitions.
 ///
-/// Registered lazily and tolerantly: a duplicate registration (multiple servers in
-/// one test process) must never take down the write path, so failure degrades to a
-/// detached gauge rather than a panic.
-static MEMTABLE_RECORDS: std::sync::LazyLock<prometheus::IntGauge> =
+/// Registered lazily and tolerantly. Observability must never take down the write
+/// path, so every failure mode degrades instead of panicking: a construction error
+/// yields `None` (no gauge, writes unaffected), and a duplicate registration —
+/// several servers in one test process — leaves a working but un-exported gauge.
+/// No `.expect()` here: this is `src/` production code (mandate #4).
+static MEMTABLE_RECORDS: std::sync::LazyLock<Option<prometheus::IntGauge>> =
     std::sync::LazyLock::new(|| {
         let gauge = prometheus::IntGauge::new(
             "proximadb_relational_memtable_records",
             "Live records held in relational memtables (TD-USUB-1: unbounded until slice 2)",
         )
-        .expect("static gauge opts are valid");
+        .ok()?;
         // Ignore AlreadyReg — the gauge still works, it is simply not re-exported.
         let _ = prometheus::register(Box::new(gauge.clone()));
-        gauge
+        Some(gauge)
     });
 
 /// Read the configured per-partition record cap. `None` ⇒ unbounded.
@@ -105,9 +107,11 @@ impl MemtableRecordStorage {
         self.max_records
     }
 
-    /// Publish the current record count to the process gauge.
+    /// Publish the current record count to the process gauge, if one exists.
     fn publish_len(&self) {
-        MEMTABLE_RECORDS.set(self.records.len() as i64);
+        if let Some(gauge) = MEMTABLE_RECORDS.as_ref() {
+            gauge.set(self.records.len() as i64);
+        }
     }
 
     /// Rebuild current state from canonical WAL entries.
