@@ -1057,6 +1057,25 @@ pub async fn try_run_select(
     #[cfg(not(feature = "datafusion-integration"))]
     let parquet_backed = false;
 
+    // TD-USUB-2: every referenced table is a native relational table (no Parquet
+    // layout) that can be registered with the DataFusion destination directly. This
+    // is what makes CTEs / window functions / joins reachable without a manual
+    // `ALTER TABLE … MATERIALIZE` — the capability cliff ADR-094 records as defect (b).
+    //
+    // Mixed Parquet+native queries stay `false` (the Parquet arm already serves those,
+    // and cross-representation joins are a later phase). ABAC-scoped sessions are
+    // excluded here even though the row source is governed, because the rest of this
+    // dispatch block is not yet ABAC-safe — relaxing that is TD-USUB-3's job, not this
+    // one's.
+    #[cfg(feature = "datafusion-integration")]
+    let native_registerable =
+        crate::query::execution::native_table_provider::native_table_provider_enabled()
+            && !relational_abac_required
+            && !tables.is_empty()
+            && tables.keys().all(|k| !parquet_loc_by_key.contains_key(k));
+    #[cfg(not(feature = "datafusion-integration"))]
+    let native_registerable = false;
+
     // TD-OLAP-1 Test 2.1: compute the per-query PAX-backed signal from catalog
     // PAX format detection. A table is PAX-backed if it has ANY storage layout
     // with ProximaBlock format (the native vector+relational hybrid format).
@@ -1103,6 +1122,7 @@ pub async fn try_run_select(
         parquet_backed,
         // TD-OLAP-1 Test 2.1: Route flip from catalog signals (no longer hard-coded)
         pax_backed,
+        native_registerable,
         partition_fanout,
         cardinality,
         operation_class,
@@ -1152,7 +1172,9 @@ pub async fn try_run_select(
     // through to the Volcano path below — exactly as before.
     #[cfg(feature = "datafusion-integration")]
     if !relational_abac_required
-        && parquet_backed
+        // TD-USUB-2: admit natively-registerable tables too, so SQL capability stops
+        // depending on whether someone ran `ALTER TABLE … MATERIALIZE`.
+        && (parquet_backed || native_registerable)
         && matches!(
             decision.backend,
             crate::query::table_write_plan::ComputeBackend::DataFusionLocal
@@ -1165,9 +1187,16 @@ pub async fn try_run_select(
         // keyed by table_name (matching `parquet_tables`) and derived from
         // `parquet_trust_by_key` (keyed by the canonical table key). Drives adapter
         // elision gating.
+        // TD-USUB-2: `filter_map`, not index. A natively-registerable query has no
+        // Parquet location for its tables, and indexing would panic. When every table
+        // IS Parquet-backed this is byte-identical to the previous `map`.
         let parquet_tables: Vec<(String, String)> = tables
             .iter()
-            .map(|(k, t)| (t.table_name.clone(), parquet_loc_by_key[k].clone()))
+            .filter_map(|(k, t)| {
+                parquet_loc_by_key
+                    .get(k)
+                    .map(|loc| (t.table_name.clone(), loc.clone()))
+            })
             .collect();
         let parquet_table_trust: HashMap<String, StatsTrust> = tables
             .iter()
@@ -1324,6 +1353,24 @@ pub async fn try_run_select(
             // ADR-025: reconcile opted-in parquet-backed tables with their
             // post-snapshot WAL delta at scan time. `None` (no opted-in table)
             // keeps the legacy bare-Parquet read (default-OFF).
+            // TD-USUB-2: native relational tables registered as MemTables, so the
+            // DataFusion floor (and its `ctx.sql` fallback) can serve them. `None`
+            // whenever the gate is off or any table is Parquet-backed.
+            native_tables: if native_registerable {
+                Some(
+                    crate::query::execution::native_table_provider::NativeTableConfig {
+                        source: dml.clone(),
+                        tables: tables
+                            .iter()
+                            .map(|(k, t)| (k.clone(), t.table_name.clone()))
+                            .collect(),
+                        row_cap:
+                            crate::query::execution::native_table_provider::native_table_row_cap(),
+                    },
+                )
+            } else {
+                None
+            },
             olap_delta: if olap_delta_tables.is_empty() {
                 None
             } else {

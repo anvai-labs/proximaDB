@@ -293,6 +293,17 @@ pub struct QueryShape {
     /// TD-OLAP-1 slice 2: tables backed by PAX segments (not Parquet). When
     /// true + `pax_reader_enabled()`, routes to DataFusion via PaxSplitReader.
     pub pax_backed: bool,
+    /// TD-USUB-2: every referenced table can be registered with the DataFusion
+    /// destination as a native (non-Parquet) relational table, so the full ANSI SQL
+    /// surface is reachable without a manual `ALTER TABLE … MATERIALIZE`.
+    ///
+    /// This is a genuine *route* input, not a dispatch-time override: DataFusion
+    /// really does execute the query, so stamping `DataFusionLocal` is accurate.
+    /// Deciding it here keeps decision and dispatch in one place — overriding the
+    /// backend at dispatch instead would mis-attribute cost-model cells, the exact
+    /// failure TD-USUB-9 tracks. Default-OFF behind
+    /// `PROXIMADB_NATIVE_TABLE_PROVIDER`; `false` default.
+    pub native_registerable: bool,
     /// TD-OLAP-4: the OLAP operation class (metadata-elidable / scalar-aggregate /
     /// grouped / string-heavy) — the geometry dimension the engines win/lose on.
     pub operation_class: OperationClass,
@@ -753,6 +764,20 @@ impl ComputeScheduler {
                         workload_profile: CatalogWorkloadProfile::Olap,
                         reason: "OLAP shape on PAX-backed table(s) — DataFusion via PaxSplitReader"
                             .to_string(),
+                        reasons: Vec::new(),
+                        source: RouteSource::Static,
+                    }
+                } else if shape.native_registerable {
+                    // TD-USUB-2: the tables are registerable with DataFusion directly,
+                    // so the full ANSI surface (CTE / window / join / subquery) is
+                    // reachable without a manual MATERIALIZE. DataFusion genuinely
+                    // executes here, so this stamp is accurate.
+                    SelectRouteDecision {
+                        backend: ComputeBackend::DataFusionLocal,
+                        workload_profile: CatalogWorkloadProfile::Olap,
+                        reason:
+                            "OLAP shape on native relational table(s) — DataFusion over registered rows"
+                                .to_string(),
                         reasons: Vec::new(),
                         source: RouteSource::Static,
                     }
