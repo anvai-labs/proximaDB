@@ -4,8 +4,9 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|**Accepted (as narrowed by ADR-094, 2026-09-21).** Decision 1 is scoped to *landing / LSM output*; its "one SQL lowering" clause is **withdrawn** — see the amendment note in Decision 1. With that clause withdrawn this ADR no longer conflicts with ADR-033, and the TD-162 governance gate below is **lifted**.
 |Date|2026-06-26
+|Narrowed by|ADR-094 (unified storage substrate and compute seam)
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-024 (single canonical type/schema), ADR-026 (PAX canonical vector path), ADR-020 (canonical WAL authority), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (vertical-inside/standard-outside), `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc`, `NATIVE_OLAP_ENGINE_BLUEPRINT_2026_06_22.adoc`, `OUTGRESS_KOU_MULTICLOUD_COST_MODEL_2026_06_21.adoc`
 |Supersedes|—
@@ -38,13 +39,54 @@ This Decision must not start before ADR-027 is `Accepted` with the course-correc
 reconciled (see "Reconciliation" below).
 ====
 
+[IMPORTANT]
+====
+**Amendment (ADR-094, 2026-09-21) — three corrections to the note above.**
+
+. **The gate is lifted.** This ADR is now `Accepted` as narrowed, so TD-162 may begin.
+. **The audit note is stale on two facts.** (i) `write_pax_segment` does **not** hard-require
+  embeddings: centroid accumulation early-returns on empty vectors
+  (`proximadb-storage-common/src/pax_block.rs:1476-1478`) and coalesced-RaBitQ falls back to
+  the legacy layout "rather than failing the flush" (`:1669-1671`); only an *empty segment*
+  bails (`:1665-1667`). (ii) A typed user-column stripe now exists — ADR-055's P-Shred
+  (`ColumnRole::UserDefined`, `block-format/src/writer.rs:1250`) — though it is currently a
+  **duplicated** advisory index rather than authoritative; making it authoritative is
+  TD-USUB-6.
+. **Decision 1 is narrowed to _landing / LSM output_.** "PAX is the single internal format"
+  is retained as the statement that the LSM emits one landing format per modality — not as a
+  claim about which engine executes queries, and not as a claim that relational tables must
+  land in `PBLK`. Per ADR-094, **format follows modality**: relational-only tables land in a
+  Parquet-encoded Layer A carrying PAX layout discipline; vector/multimodal tables land in
+  `PBLK`/`PXH1`.
+====
+
 * **One record reader** — `read_segment_records` → `PaxSegmentScanner` for all data (magic-detect router exists for PAX + legacy `ProximaBlocks`; the `RecordReader` trait + the Parquet `PAR1` arm are **new work**, TD-162a-3 / TD-162b).
-* **One SQL lowering** — relational SQL lowers to a PAX scan; the native OLAP engine's natural input is PAX columnar (DataFusion is interim, per the native-OLAP blueprint).
+* [.line-through]#**One SQL lowering** — relational SQL lowers to a PAX scan; the native OLAP engine's natural input is PAX columnar (DataFusion is interim, per the native-OLAP blueprint).#
++
+**WITHDRAWN by ADR-094 (2026-09-21).** This clause is the *only* part of Decision 1 that
+conflicted with ADR-033, and it was already settled against — without reference to either
+document — by **ADR-052 invariant 1** (OLAP execution is vectorized-over-Arrow via
+DataFusion; native Volcano is the OLTP/point-lookup floor) and **ADR-054** (operator plane,
+ledger-gated). The native investment is a PAX **scan operator** feeding DataFusion, not a
+replacement lowering. Withdrawing this row is what allows ADR-027 and ADR-033 to both be
+`Accepted`.
 * **One I/O-trace path** — TD-158's emission, one place, all data.
 * **One quant/zone-map/prune stack** — PAX column stripes + zone maps + RaBitQ/SQ8 tiers serve ANN *and* relational projection/pruning uniformly.
 * **Completes ADR-024** — the type unified to `ProximaRecord`; unifying the *format* to PAX closes the loop.
 
 **Parquet stays at the interop seam, not the hot path**: external tools (Spark/DuckDB/Trino/Iceberg), federated/external tables, warehouse *export*. Read/written at the boundary via the format-agnostic router; never scanned in the internal query path. This is "vertical inside (PAX), standard outside (Parquet)" made concrete.
+
+[IMPORTANT]
+====
+**Amended by ADR-094 (2026-09-21).** The clause "never scanned in the internal query path"
+is withdrawn. ADR-033's survey established that Parquet is within ~2× of a custom format on
+sequential scans *and* is the Iceberg seam, so for the **relational-only** arm it is the
+correct landing format, not merely an export target — it is scanned internally, by
+DataFusion, by design. Parquet remains "interop-only" for the **vector/multimodal** arm,
+where the custom format's ~100× random-access advantage is decisive. The principle survives
+in its precise form: *vertical where the access pattern pays for it, standard everywhere
+else.*
+====
 
 **If a second internal format is ever needed, the router makes it safe** — `SegmentFormat::detect` is O(1) magic-byte (**today**: `PBLK` + legacy `0x01`; the `PAR1`/Parquet arm is **TD-162b**, default-off behind `datafusion-integration`); a `RecordReader` trait (PAX/Parquet/legacy each implement) — **new work, TD-162a-3** (it does not exist yet; `read_segment_records` is an inline `match` today) — decouples SQL lowering from on-disk layout; Arrow Flight serves *decoded records* (Arrow batches), so on-disk format is invisible to clients. No fork in the hot path; the fork (if any) is at the boundary where it is cheap and standard. Mixed-read-safe (mandate #8).
 
@@ -68,6 +110,18 @@ same PAX column stripes the LSM writes; DataFusion-over-Parquet remains the inte
 and the standard interop seam. Nothing here removes Parquet/DataFusion (see Non-goals).
 **Governance:** because this overturns a clause currently labelled "non-negotiable", the
 format-unification work (TD-162) must not begin until this ADR is `Accepted`.
+
+[IMPORTANT]
+====
+**Gate lifted (ADR-094, 2026-09-21).** This ADR is now `Accepted` as narrowed, so TD-162
+may begin. Note also that the reconciliation table above is partly overtaken: the
+"DataFusion = interim executor" row is **withdrawn** (ADR-052/054 settled it), and the
+Parquet row now reads *landing format for the relational-only arm, interop seam for the
+vector/multimodal arm* (ADR-094 Decision 1). The unreconciled gap this ADR left — it
+reconciled against the 2026-06-04 course-correction but never against ADR-033, published
+one day later — is what froze TD-162 for three months. ADR-094 closes it, and requires
+reciprocal citation on any future supersession to prevent a recurrence.
+====
 
 == Decision 2 — two trace/metering classes
 

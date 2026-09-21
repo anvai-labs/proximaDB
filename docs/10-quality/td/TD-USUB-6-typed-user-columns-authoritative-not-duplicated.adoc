@@ -1,0 +1,73 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-6: Typed user columns are a duplicated advisory index — make declared columns authoritative
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 3. **Evolves legacy TD-162a-2** (see Reconciliation).
+| Priority | MEDIUM — every shredded value is currently written twice; and typed columns cannot be trusted for correctness, only for pruning.
+| Component | `crates/storage/proximadb-block-format/src/writer.rs`, `.../stripe.rs`, `.../reader.rs`
+| Relates to | ADR-094 (spec §2.1), ADR-055 (P-Shred), ADR-033 / ADR-034 (which rank this work's scan value < 2×), Iceberg v3 Variant shredding
+| Blocked by | ADR-027 `Accepted` — **gate lifted by ADR-094**. Sequenced after TD-USUB-5.
+|===
+
+== The finding
+
+P-Shred (ADR-055) writes typed user-column stripes, but they are explicitly **not
+authoritative**:
+
+[quote, 'crates/storage/proximadb-block-format/src/writer.rs:209-213']
+____
+These columns are a DUPLICATED pruning/projection index; the msgpack `PROPS` tail stays the
+source of truth (the reader reconstructs from the tail and ignores `USER_BASE+` columns), so
+this is additive and mixed-read-safe with no format-version bump.
+____
+
+That was the right call for an additive, no-version-bump change. Its costs are now the
+blockers:
+
+* **Every shredded value is written twice** — once in the typed stripe, once in the msgpack
+  tail (`writer.rs:470-476` buffers by clone, deliberately never `remove`).
+* **Typed columns are advisory only.** `build_shred_stripe` (`writer.rs:1250-1262`) infers
+  the physical type from the *first non-null value* and coerces any value that does not fit
+  to `None`. That is explicitly safe "because the msgpack `PROPS` tail is the source of truth
+  for reconstruction" — so projection and pruning are best-effort by construction.
+
+== How to apply
+
+For columns **declared in `CatalogTableSchema`** (as distinct from schemaless props):
+
+. The typed `ColumnRole::UserDefined` stripe **is** the value; readers read it directly.
+. The msgpack `PROPS` tail carries only the **residual** — undeclared props.
+. Column type comes from the catalog schema, not from first-value inference. A value that
+  does not conform is a **write error**, not a silent `None` — the fallback that made
+  coercion safe no longer exists.
+. Requires the PAX v3 version byte (spec §2), and is mixed-read-safe: v2 blocks keep
+  decoding via the existing tail-reconstruction path.
+
+**Align the semantics with Iceberg v3 Variant shredding** (shredded fields authoritative,
+residual blob for the rest). ProximaDB arrived at this design independently, which both
+validates it and makes the §6 export mapping near-mechanical.
+
+== Reconciliation and the ROI caveat
+
+Legacy **TD-162a-2** describes the typed stripe + per-column zone maps and remains `Open`;
+this TD evolves it (ADR-055 has since landed the *duplicated* form) and should supersede that
+row.
+
+Record honestly: **ADR-034 deliberately ranks TD-162a-2 last**, because typed columns buy
+< 2× on scans. This TD does **not** overturn that ranking. It is justified on the grounds
+ADR-033 already recast the work to — one unified store, a real second cost arm for the
+router, uniform projection/pruning — plus the write-amplification removal above. It must not
+be re-argued as a scan-throughput win.
+
+== Evidence gate (mandate #6)
+
+* **Losslessness ratchet:** declared columns + residual reconstruct the original
+  `ProximaRecord` exactly, including nulls, type edge cases, and props whose declared type
+  changed via schema evolution.
+* Write-amplification delta (bytes written per row, before vs after) recorded in
+  `BENCHMARK_EVIDENCE.toml`.
+* Mixed-read test: a v2 segment and a v3 segment in the same collection both read correctly.
+* Recall ratchet (recall@10 ≥ 0.93) stays green.

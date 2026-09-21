@@ -1,0 +1,84 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-9: Route stamps can misreport the executing engine, poisoning cost cells; plus two dead/silent interop defects
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 4.
+| Priority | **HIGH for the stamp half** — it silently corrupts the cost model that every future routing decision reads. MEDIUM for the hygiene half.
+| Component | `src/query/compute_scheduler.rs`, `src/datafusion/engine_adapters/pax_adapter.rs`, `src/query/route_cost_model.rs`, `src/services/dml/mod.rs`, `src/storage/formats/open/iceberg.rs`
+| Relates to | ADR-094 (spec §5, §6), ADR-058 (routing), TD-USUB-4, TD-USUB-5
+| Blocked by | Nothing. **Should land before any cost-based routing flip.**
+|===
+
+== Defect 1 — the route stamp can lie
+
+Enabling `PROXIMADB_DF_PAX_READER` flips the scheduler's decision to `DataFusionLocal`
+"via PaxSplitReader" (`src/query/compute_scheduler.rs:750-758`), but the relational dispatch
+still requires `parquet_backed` (`src/network/postgres/relational_pipeline.rs:1150`). So
+**Volcano actually serves the query while `io_trace` stamps `DataFusionLocal`**. Both files
+carry warnings saying exactly this (`compute_scheduler.rs:392-396`,
+`pax_adapter.rs:73-82`).
+
+The stamp is not cosmetic. `finalize_route` feeds `io_trace::record_route`
+(`compute_scheduler.rs:1115-1122`), which drives the route-cost observer
+(`src/query/route_cost_model.rs:59`) and accumulates per-cell EWMA samples keyed by
+`{olap|oltp}/{parquet|native}/card/fanout/op/geom` (`:547-572`). A mis-stamped sample
+attributes **Volcano's latency to DataFusion's cost cell**.
+
+[IMPORTANT]
+====
+Every future cost-based routing decision reads these cells. A cost model trained on
+mis-attributed samples will make confidently wrong choices, and the error is invisible —
+there is no signal distinguishing a poisoned cell from a legitimate one.
+====
+
+Note also a duplicated gate: `compute_scheduler.rs:397` re-declares a private
+`pax_reader_enabled()` reading the same env var as `pax_adapter.rs:83-90`, deliberately so the
+scheduler compiles without `datafusion-integration`. Two `OnceLock`s, one variable — they can
+drift.
+
+**Fix.** The stamp must record what *executed*, not what was *decided*. Either make the
+decision binding (dispatch actually honours it), or stamp at execution. Until then, a decision
+that cannot be honoured must not produce a cost sample at all.
+
+== Defect 2 — Iceberg publish fails silently
+
+`publish_iceberg_table` failure is swallowed with a `tracing::warn!`
+(`src/services/dml/mod.rs:2107-2111`). ProximaDB's own reads use the catalog storage layout
+rather than the manifest, so **Iceberg metadata can be absent while the table still reads
+perfectly locally** — the failure surfaces only when an external engine tries to read the
+table and finds nothing.
+
+An interop seam that fails silently is worse than one that fails closed: it converts a
+publish error into a later, harder-to-diagnose absence. Make the failure explicit (surface it,
+or record an unpublished state in the catalog).
+
+== Defect 3 — a dead parallel Iceberg implementation
+
+`src/storage/formats/open/iceberg.rs` (1507 lines, `IcebergFormat` / `IcebergConfig`) has
+**zero non-doc references** in the tree. It is exported
+(`src/storage/formats/open/mod.rs:72,76`) but never constructed. The live implementation is
+`crates/storage/proximadb-iceberg-engine` (real Avro manifests, `ManifestCommitter` with
+optimistic concurrency).
+
+Two implementations of one seam is exactly the drift ADR-094 exists to remove. Delete it, or
+merge anything worth keeping into the live crate.
+
+Related naming defect worth correcting in the same pass:
+`TableRecordStoreRoute::for_schema` routes relational/HTAP/OLAP to a `ParquetIcebergStorage`
+arm (`src/services/record_store.rs:194-196`) that the pgwire wiring fills with the canonical
+WAL store (`src/services/dml/mod.rs:948-952`) — the name asserts a behaviour that does not
+happen.
+
+== Evidence gate (mandate #6)
+
+* A test asserting the stamped route equals the engine that executed, across every gate
+  combination — including the `PROXIMADB_DF_PAX_READER`-on case that is currently wrong.
+* Cost cells recorded during the mis-stamp window identified and invalidated, not silently
+  carried forward.
+* Iceberg publish failure surfaces in a test (external reader sees either a valid manifest or
+  an explicit error, never silent absence).
+* Dead-code removal verified by the no-DataFusion build guard and a clean `cargo clippy
+  --lib --bins -- -D warnings`.

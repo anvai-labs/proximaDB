@@ -1,0 +1,64 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-10: Publication is a full-table overwrite bounded by memory — make it incremental before automating it
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 4.
+| Priority | MEDIUM — a correctness-adjacent scaling limit, and a hard prerequisite for any automated publication policy.
+| Component | `src/services/dml/mod.rs` (`materialize_table_to_parquet`), `crates/storage/proximadb-iceberg-engine/src/manifest.rs`
+| Relates to | ADR-094 (Decision 1 rationale), ADR-062 (fresh-name + atomic manifest advance), TD-USUB-4 (additive layouts), TD-USUB-9
+| Blocked by | TD-USUB-4 (a table must be able to hold more than one representation).
+|===
+
+== The finding
+
+`materialize_table_to_parquet` (`src/services/dml/mod.rs:1926`) is a **full overwrite**:
+
+* it snapshots the table's *entire* current row set via `scan_table_relational` (`:1948`),
+  materializing it in memory;
+* it writes **one** object, `{prefix}/data/part-0.parquet` (`:2028-2031`);
+* it then replaces the catalog layout wholesale (`:2052` — see TD-USUB-4).
+
+Three consequences:
+
+. **Republication is O(table), not O(delta).** Publishing a table that gained one row rewrites
+  every row. Publication frequency × table size is the write-amplification curve.
+. **It is bounded by memory.** The snapshot is resident, so the largest publishable table is
+  capped by RAM, not by storage.
+. **Single-object output** forecloses parallel scan and per-column-group pruning on the read
+  side.
+
+This is why ADR-094 **rejected** automated "publish a Parquet projection" as the
+architecture: automating an O(table) rewrite would convert a manual, predictable cost into a
+continuous background one, with the publication interval silently coupled to read cost
+through the `snapshot_lsn` delta merge (`read_changes_since_scoped`, `:860`/`:872`).
+
+== How to apply
+
+. **Incremental publication.** Publish only rows changed since the layout's `snapshot_lsn`
+  (already captured at `:1938` and persisted at `:2047-2048`) as *additional* objects.
+. **Fresh-name + atomic manifest advance** — the mechanism ADR-062 already specifies, and the
+  one `ManifestCommitter` (`crates/storage/proximadb-iceberg-engine/src/manifest.rs:89`,
+  `commit_fenced` `:126`) already implements with optimistic concurrency. Never rename to
+  commit: rename-commit is unsafe on S3, as ADR-045 records.
+. **Multi-object layout** with per-object row ranges so scans parallelize and prune.
+. **Streaming write** — do not materialize the whole table in memory.
+. **Only then** consider an automated publication policy, and ship it **default-OFF** with an
+  explicit publication-lag SLO, so staleness is a declared bound rather than an emergent
+  property.
+
+Retain `ALTER TABLE … MATERIALIZE` as an explicit user-invoked hint throughout; this TD
+changes how publication *works*, not who triggers it.
+
+== Evidence gate (mandate #6)
+
+* Republication cost measured as a function of delta size, demonstrating O(delta) rather than
+  O(table).
+* Peak RSS during publication of a table larger than available RAM — the case that fails today.
+* Atomicity test: a crash mid-publication leaves the previous manifest readable and no
+  partially-visible rows.
+* Concurrency test exercising `commit_fenced` under two racing publishers.
+* If an automated policy is later enabled: publication lag measured against its declared SLO,
+  and the read-side delta-merge cost attributed correctly in the cost model (TD-USUB-9).

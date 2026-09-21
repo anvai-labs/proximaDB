@@ -1,0 +1,71 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-4: `set_storage_layouts` clobbers — a table cannot hold two representations, so cost-based routing is inexpressible
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 2.
+| Priority | **HIGH** — this is the *gating prerequisite* for every cost-based routing decision. No router work can select among representations the catalog cannot record.
+| Component | `src/services/dml/mod.rs` (`materialize_table_to_parquet`), `crates/control/proximadb-catalog/src/native.rs`, `crates/foundation/proximadb-catalog-schema/src/lib.rs`
+| Relates to | ADR-094 (Decision 2), ADR-033 (representation choice), TD-USUB-5, TD-USUB-10, TD-OLAP-1 (slice 2 route flip)
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`materialize_table_to_parquet` publishes with:
+
+[source,rust]
+----
+catalog.set_storage_layouts(&table_id, vec![layout]).await?;   // src/services/dml/mod.rs:2052
+----
+
+The call **replaces** the layout list with a single-element vector. A table can therefore
+hold exactly **one** physical representation at a time. Materializing a table does not *add*
+a Parquet representation alongside its native one — it *replaces* the record of how that
+table is stored.
+
+The consequence is structural, not cosmetic:
+
+[IMPORTANT]
+====
+Cost-based routing across representations is **not expressible today**. The router cannot
+choose between "scan the Parquet copy" and "scan the native copy" because the catalog has no
+way to say both exist.
+====
+
+This is the silent prerequisite behind several stalled efforts — TD-OLAP-1's slice-2 route
+flip, the Native cost-router arm ADR-033 wants, and ADR-094's §5 routing contract all assume
+a choice the data model cannot represent.
+
+The catalog itself is not the obstacle. It **already models multi-layout**
+(`CatalogAuthorityMode`, `crates/foundation/proximadb-catalog-schema/src/lib.rs:1459-1477`),
+and both backing predicates iterate a list. Only the write path collapses it.
+
+== How to apply
+
+. Make publication **additive**: append or upsert a layout keyed by
+  `(physical_format, location)` rather than replacing the list.
+. Preserve a designated **primary/landing** layout (per ADR-094 Decision 1, chosen by
+  modality) so reads have a deterministic default when no cost signal is available.
+. Teach the backing predicates (`catalog_table_is_parquet_backed` and the PAX-backed sibling
+  in `src/network/postgres/relational_pipeline.rs:2064-2085`) to answer
+  *"does a layout of kind K exist?"* rather than *"is the single layout of kind K?"*.
+. Carry each layout's freshness: `snapshot_lsn` is already captured and persisted
+  (`src/services/dml/mod.rs:1938`, `:2047-2048`) — it becomes per-layout, so a stale
+  representation is usable with a delta merge rather than silently wrong.
+. Retain `ALTER TABLE … MATERIALIZE` as an explicit user hint that adds a representation. It
+  stops being the thing that *defines* how a table is stored.
+
+Mixed-read-safe: existing single-layout tables read unchanged; a one-element list is a valid
+degenerate case.
+
+== Evidence gate (mandate #6)
+
+* A test creating a table with both a native and a Parquet layout, asserting both are
+  recorded, both are discoverable, and the primary is deterministic.
+* Round-trip: a table materialized under the old clobbering behaviour still reads correctly
+  after upgrade (no migration required).
+* `snapshot_lsn` per layout proven to drive the delta merge correctly for a stale
+  representation.

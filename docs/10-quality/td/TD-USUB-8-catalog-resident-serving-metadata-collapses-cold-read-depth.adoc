@@ -1,0 +1,81 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-8: Cold PAX reads pay a 3-deep dependent GET chain — promote rebuildable serving metadata to the catalog
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 3.
+| Priority | MEDIUM-HIGH — targets DEPTH, the term ADR-033's cost spine ranks highest (`DEPTH ≫ WIDTH ≫ BYTES ≫ CPU`).
+| Component | `crates/storage/proximadb-block-format/src/ranged.rs`, `crates/control/proximadb-catalog/`, `src/storage/engines/sst/`
+| Relates to | ADR-094 (Decision 4, spec §3), ADR-045 (Layer A/B split — this promotes Layer B only), ADR-034 (read-path GET depth), ADR-062 (D1 one-object atomicity), ADR-090 (BYOB)
+| Blocked by | TD-USUB-4 (catalog must model per-table representations first).
+|===
+
+== The finding
+
+`ranged.rs` documents the cold read order for a single block:
+
+. `head`/size → `footer_tail_range` → fetch trailing 32 B → `BlockFooter`
+. `metadata_ranges` → fetch column footer + vector params + row-group index
+. `BlockLayout::assemble` → in-memory metadata view (no stripe bytes)
+. prune (zone maps / row groups) → `column_stripe_range` → fetch surviving slabs
+
+Steps 1 → 2 → 4 are **serially dependent**: three round-trips before the first data byte.
+ADR-034 records the same shape at segment scale (`1+3K` serial dependent GETs for a pruned
+ranged read).
+
+ADR-033's spine is explicit that **latency is the depth of the dependent-request chain**, not
+the byte total or the request count — 100 parallel GETs cost about one GET's latency, three
+serial GETs cost 3×. So this chain, not bytes, is the dominant cold-read cost.
+
+ADR-062's per-segment invariants cache already elides steps 1–2 **on hot queries**. The cold
+path is untouched, and cold is where the 444 ms → 10 ms cliff lives.
+
+== The change
+
+Promote ADR-045 **Layer B** — RowDirectory, ColumnMeta statistics, blooms, SegmentIndex,
+deletion vector — into xCatalog. ADR-045 already classifies all of it as *rebuildable serving
+metadata*, so **nothing authoritative moves**.
+
+Cold read becomes: **catalog query (ms, no S3 round-trip) → fetch surviving slabs**.
+
+[.text-center]
+**Dependent GET depth 3 → 1.**
+
+This is the DuckLake insight — metadata as queryable rows rather than files-in-bucket,
+collapsing the `metadata.json → manifest list → manifest → data` chain — applied at the
+segment layer, where ProximaDB already owns a catalog and does not need to invent one.
+
+== The object must stay self-describing
+
+The in-object footer copy is **retained, not replaced**. An object must remain readable with
+no catalog present, for:
+
+* disaster recovery and catalog rebuild;
+* external tools reading the bucket directly;
+* **BYOB storage** (ADR-090), where the customer owns the bucket and may read it independently
+  of ProximaDB.
+
+Catalog is the fast path; the object remains the truthful one. **On divergence the object
+wins** and the catalog entry is rebuilt — which is sound precisely because Layer B is
+rebuildable by definition.
+
+== Constraints
+
+* **ADR-062 D1** — no sidecar object is introduced; a catalog row is not an object in the
+  data path.
+* **ADR-045** — Layer A (including the inviolable filter + vector stripe co-location) does not
+  move.
+* Catalog size and write rate become a scaling dimension: Layer B for a large collection is
+  not small. Bound it (per-segment granularity, eviction, lazy population) before enabling.
+
+== Evidence gate (mandate #6)
+
+* **Cold-read dependent-GET depth measured 3 → 1** via `io_trace` `range_gets` on a genuinely
+  cold cache — the headline claim, and the one that justifies the work.
+* Catalog growth (bytes and write rate) per 1 TB of segments recorded.
+* **Catalog-unavailable recovery exercised**: read a segment with the catalog offline, then
+  rebuild Layer B from the object and verify byte-equality with the catalog copy.
+* Divergence handling tested: a deliberately stale catalog entry must not produce wrong
+  results.

@@ -4,8 +4,9 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|**Accepted (as amended by ADR-094, 2026-09-21).** The targeting decision stands. Its load-bearing "< 2× on sequential scans" premise is **flagged unverified-pending-measurement** — see "Post-survey evidence" below.
 |Date|2026-06-27
+|Amended by|ADR-094 (unified storage substrate and compute seam)
 |Deciders|Vijaykumar Singh
 |Relates to|`CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (dominant cost = I/O round-trips + egress), `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc` (the dual-path pivot), ADR-026 (PAX canonical vector path), ADR-027 (unified storage + metering)
 |Supersedes|—
@@ -111,6 +112,29 @@ to keep the decision honest:
 selective / round-trip-bound workloads (100×+), and is small (< 2×) for
 sequential OLAP scans.**
 
+[IMPORTANT]
+====
+**Amendment — this "Net" is the load-bearing premise of the whole Decision below, and it is
+now contested. Treat it as unverified until measured (ADR-094, 2026-09-21).**
+
+The survey did not include **Vortex**, which reports **100× faster random access *and*
+10–20× faster scans and 5× faster writes at similar compression** — i.e. it claims the
+random-access win *without* the scan trade-off this Net asserts is unavoidable. Vortex is
+now a Linux Foundation project with a DuckDB extension (2026-01), so it is not a paper
+design. **Lance 2.1** independently reports near-Parquet scan speed alongside fast random
+access, achieved by separating *structural* from *compressive* encoding and choosing
+structure by value width.
+
+If either result holds for ProximaDB's shapes, "you must trade scans for random access"
+is not a law, and this ADR's *targeting* logic (spend the custom-format budget only on the
+vector path) weakens accordingly.
+
+This is deliberately **not** resolved by assertion in either direction. The scale harness
+landed in #1914 can measure it. Until a dated entry exists in
+`docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`, no decision may cite "< 2× on scans" as
+established fact — per mandate #6.
+====
+
 == Decision
 
 . **The dual-path is vindicated, with a sharper rationale.** Keep **Parquet as the
@@ -154,6 +178,38 @@ as-is; it is correct and ratcheted (TPC-H 22/22).
 * The thesis "no serious DB uses Parquet as primary" is confirmed across 5 incumbents + 4 columnar/vector systems.
 * The "own a custom format" win is **quantified and bounded**: 100×+ on random access / vector; < 2× on sequential scans — so the investment is targeted, not wholesale.
 * Out of scope (not decided here): the specific PAX stripe encoding (TD-162a-2 LLD), and whether the relational Native arm should ever supersede DataFusion for scans (it should not, on this evidence).
+
+== Post-survey evidence (added by ADR-094, 2026-09-21)
+
+Developments that postdate or were missed by the 2026-06-27 survey, recorded so the
+Decision above is read against current facts:
+
+* **Vortex** — extensible columnar format; reports 100× random access, 10–20× scans, 5×
+  writes at similar compression, using lightweight encodings, late decompression and
+  compute-on-compressed. Now an LF AI & Data incubation project with a DuckDB extension
+  (2026-01). **Absent from this ADR's 22 sources.** Directly contests the "< 2× on scans"
+  Net above.
+* **Lance 2.1 adaptive structural encodings** (arXiv 2504.15247) — the *mechanism* for
+  "one format, both access patterns": structural encoding (nesting/repetition/validity)
+  separated from compressive encoding, with structure chosen by value width — full-zip for
+  ≥128 B values (1 IOP fixed-width, 2 variable), mini-block below. Cuts the search cache
+  from Parquet's ~20 GiB to ~1.28 GiB per billion-row vector column, reportedly without
+  sacrificing scan speed or requiring per-column tuning.
+* **DuckLake** — puts table metadata in a SQL database rather than files-in-bucket,
+  collapsing Iceberg's `metadata.json → manifest list → manifest → data` dependent chain
+  into one query. This is the *depth* lever this ADR's own cost spine ranks highest, applied
+  at the table layer; ADR-094 Decision 4 applies it at the segment layer, where ProximaDB
+  already owns a catalog.
+* **Iceberg v3 is GA** (ratified mid-2025; shipped through 1.11 by May 2026) — deletion
+  vectors (Roaring bitmaps in Puffin sidecars), row lineage, geospatial, and **Variant with
+  shredding**. Delta and Iceberg are converging on identical deletion-vector encodings and
+  compatible row tracking. Notably, ProximaDB's P-Shred (ADR-055) arrived at variant
+  shredding independently — convergent evolution that both validates the design and argues
+  for aligning its semantics with the spec for interop.
+* **Databricks Mosaic AI Vector Search**, for contrast — the vector index is a *separate
+  artifact synced from* the Delta table, which buys sync lag, double storage, and no
+  transactional table↔index consistency. ProximaDB's one-substrate model is the
+  differentiator this ADR's dual-path framing does not name.
 
 == Sources
 
