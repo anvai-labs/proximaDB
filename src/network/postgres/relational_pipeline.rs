@@ -3981,6 +3981,17 @@ fn set_expr_engages(body: &SetExpr) -> bool {
                 .from
                 .iter()
                 .any(|twj| matches!(&twj.relation, TableFactor::Table { args: Some(_), .. }));
+            // TD-187: a bare window function (`LAG`/`LEAD`/`ROW_NUMBER`/`RANK`/etc.)
+            // in the projection, with no GROUP BY/derived-table/aggregate-named
+            // wrapper to accidentally trip one of the checks above, previously fell
+            // through to the legacy single-table path — whose `extract_selected_column_names`
+            // has no expression parser and mis-extracts the first bare token of a
+            // computed projection as a literal column name (`usage_user - lag(usage_user)
+            // over (...) as delta` was read as requesting the plain `usage_user` column
+            // a second time), silently returning `delta == usage_user` instead of the
+            // real lagged difference. Engage the relational/OLAP route so ANY windowed
+            // projection reaches DataFusion's real window executor.
+            let has_window = select.projection.iter().any(select_item_has_window);
             has_join
                 || has_group_by
                 || select.having.is_some()
@@ -3990,6 +4001,7 @@ fn set_expr_engages(body: &SetExpr) -> bool {
                 || has_derived
                 || has_json_extract
                 || has_table_function
+                || has_window
         }
         _ => false,
     }
@@ -4481,6 +4493,37 @@ mod tests {
         // Default-safe: a plain single-table SELECT does NOT engage via this signal
         // (it has `args: None`) — it stays on the hardened legacy OLTP path.
         assert!(!gate("SELECT id, name FROM users WHERE id = 1"));
+    }
+
+    /// TD-187: a bare window function in the projection — with no GROUP BY,
+    /// derived-table wrapper, or aggregate-named function to accidentally trip
+    /// one of the other checks — must engage the relational/OLAP route. Before
+    /// this, `SELECT a, a - lag(a) OVER (...) AS delta FROM t` fell through to
+    /// the legacy single-table path, whose projection extractor has no
+    /// expression parser and silently mis-read the computed column as a second
+    /// request for the bare column `a`, returning `delta == a` for every row
+    /// (never NULL for the first row, never the true lagged difference).
+    #[test]
+    fn bare_window_function_engages() {
+        assert!(
+            gate(
+                "SELECT hostname, usage_user, usage_user - lag(usage_user) OVER (PARTITION BY hostname ORDER BY ts) AS delta FROM cpu"
+            ),
+            "a bare LAG in an arithmetic projection must engage"
+        );
+        assert!(
+            gate(
+                "SELECT hostname, rank() OVER (PARTITION BY hostname ORDER BY usage_user DESC) AS r FROM cpu"
+            ),
+            "RANK (not an aggregate name) must engage too"
+        );
+        assert!(
+            gate("SELECT hostname, lead(usage_user) OVER (ORDER BY ts) FROM cpu"),
+            "LEAD must engage"
+        );
+        // A plain single-table SELECT with no window function still does not
+        // engage via this signal (unchanged default-safe behavior).
+        assert!(!gate("SELECT hostname, usage_user FROM cpu"));
     }
 
     /// ADR-058 D5 / §9.A: the stats-trust derivation is the load-bearing security
