@@ -446,11 +446,19 @@ async fn events_tsbs_pgwire_conformance() {
         vec![row(&["host_0", "70"]), row(&["host_1", "42"])],
         "range: per-host max-min usage_user (host_0 95-25=70, host_1 92-50=42)"
     );
-    // lag_delta KNOWN-BAD (TD-187): the LAG window currently evaluates to 0 (not the
-    // previous row's value, nor NULL for the first row), so `usage_user - lag(...)`
-    // returns usage_user unchanged. Pinned known-bad (ADR-040 pattern, cf. TD-185)
-    // so the fix auto-trips this; when LAG works, replace with the real deltas
-    // (host_0: NULL/10/-55/60, host_1: NULL/-32/10/42) and close TD-187.
+    // lag_delta (TD-187, CLOSED): bare window functions (LAG/LEAD/ROW_NUMBER/RANK/…)
+    // with no GROUP BY/derived-table/aggregate-named wrapper previously fell through
+    // to the legacy single-table path — whose projection extractor has no expression
+    // parser and mis-read `usage_user - lag(usage_user) over (...) as delta` as a
+    // second request for the bare `usage_user` column, silently returning
+    // `delta == usage_user`. Fixed by engaging the relational/OLAP route on any
+    // windowed projection (`set_expr_engages`) and having the shared relational
+    // frontend explicitly decline `OVER (...)` calls so they reach DataFusion's real
+    // window executor via the `ctx.sql()` fallback, instead of a lowering that
+    // silently dropped the window spec. Real deltas, ts-ordered per host:
+    // host_0 25(00:00)→NULL, 35(00:10)→10, 95(00:20)→60, 40(01:00)→-55;
+    // host_1 50(00:00)→NULL, 92(00:10)→42, 60(00:20)→-32, 70(01:00)→10 — listed
+    // below sorted by (hostname, usage_user) per `canon_rows`.
     assert_eq!(
         canon_rows(
             &client,
@@ -458,15 +466,15 @@ async fn events_tsbs_pgwire_conformance() {
         )
         .await,
         vec![
-            row(&["host_0", "25", "25"]),
-            row(&["host_0", "35", "35"]),
-            row(&["host_0", "40", "40"]),
-            row(&["host_0", "95", "95"]),
-            row(&["host_1", "50", "50"]),
-            row(&["host_1", "60", "60"]),
-            row(&["host_1", "70", "70"]),
-            row(&["host_1", "92", "92"]),
+            row(&["host_0", "25", "NULL"]),
+            row(&["host_0", "35", "10"]),
+            row(&["host_0", "40", "-55"]),
+            row(&["host_0", "95", "60"]),
+            row(&["host_1", "50", "NULL"]),
+            row(&["host_1", "60", "-32"]),
+            row(&["host_1", "70", "10"]),
+            row(&["host_1", "92", "42"]),
         ],
-        "lag_delta (TD-187): LAG now returns the previous value — fix landed; replace with real deltas and close TD-187"
+        "lag_delta (TD-187): LAG returns the previous row's value per partition, NULL for the first row"
     );
 }
