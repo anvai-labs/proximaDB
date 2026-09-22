@@ -5,9 +5,9 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 2.
-| Priority | **HIGH** — this is the *gating prerequisite* for every cost-based routing decision. No router work can select among representations the catalog cannot record.
-| Component | `src/services/dml/mod.rs` (`materialize_table_to_parquet`), `crates/control/proximadb-catalog/src/native.rs`, `crates/foundation/proximadb-catalog-schema/src/lib.rs`
+| Status | **Resolved** 2026-09-22 under ADR-094 Phase 2. Publication is additive (upsert by layout `name`); a table can now hold more than one representation, so cost-based routing is expressible.
+| Priority | **HIGH** — this was the *gating prerequisite* for every cost-based routing decision. No router work can select among representations the catalog cannot record.
+| Component | `src/services/dml/mod.rs` (`upsert_storage_layout`, `materialize_table_to_parquet`)
 | Relates to | ADR-094 (Decision 2), ADR-033 (representation choice), TD-USUB-5, TD-USUB-10, TD-OLAP-1 (slice 2 route flip)
 | Blocked by | Nothing.
 |===
@@ -43,7 +43,81 @@ The catalog itself is not the obstacle. It **already models multi-layout**
 (`CatalogAuthorityMode`, `crates/foundation/proximadb-catalog-schema/src/lib.rs:1459-1477`),
 and both backing predicates iterate a list. Only the write path collapses it.
 
-== How to apply
+== Resolution (2026-09-22)
+
+Smaller than the filing assumed, because **only the write side was broken**:
+
+* `set_storage_layouts` is a legitimate *set* primitive with its own tests — left alone.
+* Both read-side predicates already iterate the list —
+  `catalog_table_is_parquet_backed` uses `.iter().find_map(…)` and
+  `catalog_table_is_pax_backed` uses `.iter().any(…)`. They already answer *"does a
+  layout of kind K exist?"*, so step 3 of the original plan was already satisfied.
+* The single defect was the caller: `materialize_table_to_parquet` passed
+  `vec![layout]`, discarding everything else.
+
+The fix is a pure, unit-testable merge — `upsert_storage_layout(existing, incoming)` —
+keyed on `CatalogStorageLayout::name`, which the schema already documents as the stable
+layout identifier. The call site reads the table's current layouts fresh from the catalog
+(not the pre-write `schema`, so a layout added between the snapshot scan and publication is
+not lost) and upserts. A failed read degrades to "no existing layouts", i.e. exactly the
+pre-TD-USUB-4 behaviour, rather than failing the materialize.
+
+Semantics: same-named layout replaced **in place** (so repeat `MATERIALIZE` cannot
+duplicate), differently-named layout **preserved**, order **stable** so a reader treating
+the first match as the default sees no churn across republications. Per-layout freshness
+(`snapshot_lsn` in `properties`) rides along with the upsert, which is what a future
+delta-merge-per-representation needs.
+
+=== Discovered while testing — publication was *destroying* the native layout
+
+The filing assumed no code path creates a layout before publication, so the change would be
+inert until something else produced a second representation. **That was wrong.** The
+catalog's own test states it plainly: *"A freshly created table defaults to one
+`InternalCanonical`/`ProximaBlock` layout."*
+
+So every `CREATE TABLE` already carries a native landing layout, and `MATERIALIZE` was
+**replacing** it — the catalog simply forgot the table was ever natively backed. Two existing
+tests asserted exactly that (`storage_layouts.len() == 1` with the sole entry Parquet); they
+encoded the defect, and are updated to assert the stronger property.
+
+The practical consequence is larger than the filing claimed: multi-representation is now
+**immediately real**, not hypothetical — a materialized table records both its native landing
+layout and its published Parquet projection, which is precisely the state ADR-094 Decision 1
+describes.
+
+Routing is unaffected, and this was checked rather than assumed. `catalog_table_is_pax_backed`
+(`.any(ProximaBlock)`) now returns true for a materialized table where it previously returned
+false — but `pax_backed` is only consulted in `route_select_inner`'s `(engages_relational,
+parquet_backed) == (true, false)` arm. A materialized table has a Parquet layout, so
+`parquet_backed` is true and the `(true, true)` arm wins before `pax_backed` is read. The
+TPC-H / TPC-DS / TSBS suites — all of which `MATERIALIZE` — confirm it empirically.
+
+=== Verified
+
+* Unit: `upsert_storage_layout_is_additive_and_idempotent` — asserts preservation,
+  in-place replacement, field/`snapshot_lsn` update, stable order, and the empty-list
+  degenerate case.
+* E2E: `tests/additive_storage_layouts_e2e.rs` — materialize three times over a live
+  server; rows and values stay correct, and re-publication captures post-snapshot writes.
+
+=== Recorded while testing, deliberately *not* fixed here
+
+A write landing after publication is **not** visible over the published base by default —
+the ADR-025 read-merge that would reconcile it is a per-table opt-in. This is pre-existing
+and unaffected by this change (with no prior layouts, the additive upsert produces exactly
+the single-element list the old write did). It is now pinned in the e2e because ADR-094
+names publication staleness as a live design constraint — one of the three reasons "land
+in PAX, publish Parquet" was rejected as the architecture — so a silent change to that
+default should trip a test rather than surprise someone.
+
+=== Scope note — the primary/landing marker moved, not dropped
+
+Step 2 of the original plan ("preserve a designated primary/landing layout") is intentionally
+**not** part of this TD. With a single layout the default is unambiguous, so a primary marker
+before a second representation exists would be speculative design. It is carried forward on
+**TD-USUB-10**, the first change that actually creates two representations for one table.
+
+== Original plan (superseded by the resolution above)
 
 . Make publication **additive**: append or upsert a layout keyed by
   `(physical_format, location)` rather than replacing the list.

@@ -260,6 +260,35 @@ pub(crate) fn publish_ndv_statistics(
     crate::core::statistics::statistics_registry().put(summary);
 }
 
+/// TD-USUB-4: merge `incoming` into `existing` by layout `name`, rather than
+/// replacing the whole list.
+///
+/// `MATERIALIZE` published with `set_storage_layouts(&id, vec![layout])`, which
+/// **discards every other layout a table had**. A table could therefore hold exactly
+/// one physical representation, which makes cost-based routing across representations
+/// *inexpressible* — the router cannot choose between alternatives the catalog has no
+/// way to record (ADR-094 Decision 2).
+///
+/// `CatalogStorageLayout::name` is documented as the stable layout identifier, so it
+/// is the upsert key: re-publishing the same layout replaces it in place (no
+/// duplicates on repeat `MATERIALIZE`), while a layout of a different name is
+/// preserved.
+///
+/// Order is stable — the replaced layout keeps its original position, and a genuinely
+/// new one is appended — so a reader that treats the first match as the default sees
+/// no reordering churn across republications.
+pub(crate) fn upsert_storage_layout(
+    mut existing: Vec<CatalogStorageLayout>,
+    incoming: CatalogStorageLayout,
+) -> Vec<CatalogStorageLayout> {
+    if let Some(slot) = existing.iter_mut().find(|l| l.name == incoming.name) {
+        *slot = incoming;
+    } else {
+        existing.push(incoming);
+    }
+    existing
+}
+
 pub(crate) fn resolve_materialize_prefix(
     tenant_id: &str,
     namespace_id: &str,
@@ -2097,7 +2126,22 @@ impl DmlService {
             )]),
             ..Default::default()
         };
-        catalog.set_storage_layouts(&table_id, vec![layout]).await?;
+        // TD-USUB-4: additive publication. Read the table's current layouts and upsert
+        // this one by name, instead of replacing the list. Passing `vec![layout]` here
+        // dropped every other representation the table had, which is what made
+        // cost-based routing across representations inexpressible (ADR-094 Decision 2).
+        //
+        // Read fresh from the catalog rather than reusing the pre-write `schema`, so a
+        // layout added between the snapshot scan and here is not lost. A failed read
+        // degrades to "no existing layouts" — the pre-TD-USUB-4 behaviour — rather than
+        // failing the materialize.
+        let existing_layouts = catalog
+            .get_table(&table_id)
+            .await
+            .map(|s| s.storage_layouts)
+            .unwrap_or_default();
+        let layouts = upsert_storage_layout(existing_layouts, layout);
+        catalog.set_storage_layouts(&table_id, layouts).await?;
 
         // 5b. TD-OLAP-2 (A2): publish per-column NDV sketches (HLL) from the
         //     just-written records to the ADR-037 resident statistics registry,
