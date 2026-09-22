@@ -54,6 +54,7 @@ use arrow_array::{
     StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use proximadb_kernel::error::StorageError;
 use proximadb_records::{
     EmbeddingCell, EmbeddingValues, ProximaRecord, ProximaTreeNode, ProximaValue, tree_get,
@@ -83,6 +84,175 @@ pub fn proxima_records_to_record_batch(
 
     RecordBatch::try_new(arrow_schema, columns).map_err(|e| {
         StorageError::Serialization(format!("proxima_arrow: RecordBatch::try_new failed: {e}"))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// TD-USUB-11 — reserved system columns for a FAITHFUL canonical-record round trip
+// ---------------------------------------------------------------------------
+//
+// `proxima_records_to_record_batch` above materializes **only declared schema
+// columns**, reading each value out of `props`. Every field that lives on
+// `ProximaRecord` itself rather than in `props` — identity and lifecycle — is
+// therefore absent from the Parquet copy. `reconstruct_oid` on the record-store
+// read path exists precisely because of that gap.
+//
+// That is survivable while Parquet is only an *export* of rows already filtered
+// live: nothing downstream needs the lifecycle fields back. It is NOT survivable
+// once Parquet is a **landing** format (ADR-094 Decision 1), because a landed
+// segment is immutable — deleting a row already written can no longer remove it,
+// so deletion must become a `valid_to_ns` tombstone, and a tombstone that does
+// not round-trip is a **resurrected row**: the silent wrong answer mandate #1
+// forbids. A faithful encoding is therefore a prerequisite for durable
+// relational storage (TD-USUB-1 slice 2), not an optimisation.
+//
+// **Mixed-read-safe (mandate #8).** These columns are additive and opt-in: the
+// legacy writer is untouched and still byte-identical, and the reader lifts a
+// system column only when present, falling back to exactly today's behaviour
+// otherwise. No flag day and no version byte to coordinate — presence of the
+// column IS the marker.
+
+/// Canonical record `oid` (identity). Without it, identity depends on the table
+/// declaring a primary key, which `reconstruct_oid` can only infer.
+pub const SYS_COL_OID: &str = "__proxima_oid";
+/// Canonical record `tenant_id`. Isolation is structural (path/partition), so
+/// this is fidelity rather than enforcement — but a record that returns with an
+/// empty tenant is not the record that was written.
+pub const SYS_COL_TENANT_ID: &str = "__proxima_tenant_id";
+/// Canonical record `variation_id`.
+pub const SYS_COL_VARIATION_ID: &str = "__proxima_variation_id";
+/// Canonical record `created_at_ns`.
+pub const SYS_COL_CREATED_AT_NS: &str = "__proxima_created_at_ns";
+/// Canonical record `updated_at_ns`.
+pub const SYS_COL_UPDATED_AT_NS: &str = "__proxima_updated_at_ns";
+/// Canonical record `valid_from_ns`.
+pub const SYS_COL_VALID_FROM_NS: &str = "__proxima_valid_from_ns";
+/// Canonical record `valid_to_ns` — **the load-bearing one**. This is the
+/// tombstone/TTL field the canonical dead-record predicate reads
+/// (`ProximaRecord::is_dead`, mandate #16a). Losing it turns a deleted or expired
+/// row into a live one on read-back.
+pub const SYS_COL_VALID_TO_NS: &str = "__proxima_valid_to_ns";
+
+/// Every reserved system column, in the order they are appended to a batch.
+pub const SYSTEM_COLUMNS: &[&str] = &[
+    SYS_COL_OID,
+    SYS_COL_TENANT_ID,
+    SYS_COL_VARIATION_ID,
+    SYS_COL_CREATED_AT_NS,
+    SYS_COL_UPDATED_AT_NS,
+    SYS_COL_VALID_FROM_NS,
+    SYS_COL_VALID_TO_NS,
+];
+
+/// True iff `name` is a reserved system column.
+///
+/// Callers that surface user-visible column lists (projection, `SELECT *`, schema
+/// introspection) must exclude these so the encoding stays invisible to SQL.
+pub fn is_system_column(name: &str) -> bool {
+    SYSTEM_COLUMNS.contains(&name)
+}
+
+/// Like [`proxima_records_to_record_batch`], but appends the reserved system
+/// columns so the batch round-trips a canonical record **faithfully** — identity
+/// and lifecycle included.
+///
+/// Use this wherever the Parquet object is authoritative for live state (a
+/// landing segment). The plain encoder stays correct, and byte-identical, for an
+/// export of rows that were already filtered live.
+pub fn proxima_records_to_record_batch_with_system_columns(
+    records: &[ProximaRecord],
+    schema: &ProximaSchema,
+) -> Result<RecordBatch, StorageError> {
+    let user_schema = schema.to_arrow_schema();
+
+    // A declared user column colliding with a reserved name would put two Arrow
+    // fields of the same name in one batch, making read-back ambiguous. Fail
+    // closed and name the offender rather than silently shadowing one of them.
+    if let Some(clash) = user_schema
+        .fields()
+        .iter()
+        .find(|f| is_system_column(f.name()))
+    {
+        return Err(StorageError::Serialization(format!(
+            "proxima_arrow: user column '{}' collides with a reserved system column; \
+             reserved names are {SYSTEM_COLUMNS:?}",
+            clash.name()
+        )));
+    }
+
+    let mut fields: Vec<ArrowField> = user_schema.fields().iter().map(|f| (**f).clone()).collect();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len() + SYSTEM_COLUMNS.len());
+    for col in schema.columns.iter().filter(|c| !c.is_deleted) {
+        columns.push(build_column(records, col)?);
+    }
+
+    let str_col = |values: Vec<Option<String>>| -> ArrayRef {
+        let mut b = StringBuilder::new();
+        for v in values {
+            match v {
+                Some(s) => b.append_value(s),
+                None => b.append_null(),
+            }
+        }
+        Arc::new(b.finish()) as ArrayRef
+    };
+    let i64_col = |values: Vec<Option<i64>>| -> ArrayRef {
+        let mut b = Int64Builder::with_capacity(values.len());
+        for v in values {
+            match v {
+                Some(x) => b.append_value(x),
+                None => b.append_null(),
+            }
+        }
+        Arc::new(b.finish()) as ArrayRef
+    };
+
+    let sys: Vec<(&str, ArrowDataType, ArrayRef)> = vec![
+        (
+            SYS_COL_OID,
+            ArrowDataType::Utf8,
+            str_col(records.iter().map(|r| Some(r.oid.clone())).collect()),
+        ),
+        (
+            SYS_COL_TENANT_ID,
+            ArrowDataType::Utf8,
+            str_col(records.iter().map(|r| Some(r.tenant_id.clone())).collect()),
+        ),
+        (
+            SYS_COL_VARIATION_ID,
+            ArrowDataType::Utf8,
+            str_col(records.iter().map(|r| r.variation_id.clone()).collect()),
+        ),
+        (
+            SYS_COL_CREATED_AT_NS,
+            ArrowDataType::Int64,
+            i64_col(records.iter().map(|r| Some(r.created_at_ns)).collect()),
+        ),
+        (
+            SYS_COL_UPDATED_AT_NS,
+            ArrowDataType::Int64,
+            i64_col(records.iter().map(|r| Some(r.updated_at_ns)).collect()),
+        ),
+        (
+            SYS_COL_VALID_FROM_NS,
+            ArrowDataType::Int64,
+            i64_col(records.iter().map(|r| r.valid_from_ns).collect()),
+        ),
+        (
+            SYS_COL_VALID_TO_NS,
+            ArrowDataType::Int64,
+            i64_col(records.iter().map(|r| r.valid_to_ns).collect()),
+        ),
+    ];
+    for (name, dt, array) in sys {
+        fields.push(ArrowField::new(name, dt, true));
+        columns.push(array);
+    }
+
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).map_err(|e| {
+        StorageError::Serialization(format!(
+            "proxima_arrow: RecordBatch::try_new (with system columns) failed: {e}"
+        ))
     })
 }
 
@@ -523,9 +693,19 @@ pub fn arrow_cell_to_proxima_value(array: &ArrayRef, row: usize) -> Option<Proxi
 /// `proxima_records_to_record_batch` writes for [`ProximaType::DenseVector`]) into
 /// `record.embeddings`.
 ///
-/// Identity (`oid`) and `variation_id` are NOT inferred here — a self-describing
+/// **Reserved system columns are lifted onto the record, not into `props`**
+/// (TD-USUB-11). A batch written by
+/// [`proxima_records_to_record_batch_with_system_columns`] therefore restores
+/// identity and lifecycle — `oid`, `tenant_id`, `variation_id`, the timestamps
+/// and, critically, `valid_to_ns` — so a tombstoned or TTL-expired row does not
+/// come back looking live.
+///
+/// When those columns are ABSENT this behaves exactly as before: identity
+/// (`oid`) and `variation_id` are not inferred, because a plain self-describing
 /// Arrow batch does not carry them (the canonical write path stores the key as a
-/// PK column value). The catalog-aware caller stamps them after this returns.
+/// PK column value), and the catalog-aware caller stamps them after this returns.
+/// That fallback is what makes the encoding mixed-read-safe — presence of the
+/// column is the marker, so old and new objects coexist with no flag day.
 pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord> {
     let n = batch.num_rows();
     let mut out: Vec<ProximaRecord> = (0..n).map(|_| ProximaRecord::default()).collect();
@@ -553,6 +733,48 @@ pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord
             continue;
         }
         let name = field.name();
+
+        // TD-USUB-11: a reserved system column restores a RECORD FIELD; it must
+        // never land in `props`, or it would reappear as a user-visible column.
+        if is_system_column(name) {
+            for (row, record) in out.iter_mut().enumerate() {
+                let Some(value) = arrow_cell_to_proxima_value(array, row) else {
+                    continue; // NULL — leave the field at its default.
+                };
+                match name.as_str() {
+                    SYS_COL_OID => {
+                        if let ProximaValue::String(s) = value {
+                            record.oid = s;
+                        }
+                    }
+                    SYS_COL_TENANT_ID => {
+                        if let ProximaValue::String(s) = value {
+                            record.tenant_id = s;
+                        }
+                    }
+                    SYS_COL_VARIATION_ID => {
+                        if let ProximaValue::String(s) = value {
+                            record.variation_id = Some(s);
+                        }
+                    }
+                    SYS_COL_CREATED_AT_NS => {
+                        if let Some(n) = pv_as_i64(&value) {
+                            record.created_at_ns = n;
+                        }
+                    }
+                    SYS_COL_UPDATED_AT_NS => {
+                        if let Some(n) = pv_as_i64(&value) {
+                            record.updated_at_ns = n;
+                        }
+                    }
+                    SYS_COL_VALID_FROM_NS => record.valid_from_ns = pv_as_i64(&value),
+                    SYS_COL_VALID_TO_NS => record.valid_to_ns = pv_as_i64(&value),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
         for (row, record) in out.iter_mut().enumerate() {
             if let Some(value) = arrow_cell_to_proxima_value(array, row) {
                 record
@@ -597,6 +819,157 @@ mod tests {
             r.props.insert(k.to_string(), leaf(v));
         }
         r
+    }
+
+    // --- TD-USUB-11: faithful canonical-record round trip -------------------
+
+    fn sys_schema() -> ProximaSchema {
+        ProximaSchema::from_columns(
+            "orders".to_string(),
+            vec![col(1, "status", ProximaType::String, true)],
+            vec![1],
+        )
+    }
+
+    /// **The load-bearing test.** A tombstoned row (`valid_to_ns == Some(0)`) must
+    /// come back tombstoned. Without the system columns it returns with
+    /// `valid_to_ns == None` — i.e. LIVE — which is how a deleted row resurrects
+    /// out of an immutable landing segment.
+    #[test]
+    fn tombstone_survives_the_round_trip_and_is_lost_without_system_columns() {
+        let mut deleted =
+            record_with_props("o1", vec![("status", ProximaValue::String("x".into()))]);
+        deleted.valid_to_ns = Some(0);
+        let schema = sys_schema();
+
+        // WITH system columns: the tombstone survives.
+        let batch = proxima_records_to_record_batch_with_system_columns(
+            std::slice::from_ref(&deleted),
+            &schema,
+        )
+        .expect("encode");
+        let back = record_batch_to_proxima_records(&batch);
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0].valid_to_ns,
+            Some(0),
+            "tombstone must round-trip, or a deleted row comes back live"
+        );
+        assert!(
+            back[0].is_dead(1),
+            "the canonical dead-record predicate must still see it as dead"
+        );
+
+        // WITHOUT them: the tombstone is LOST. This is the defect the system
+        // columns exist to close — asserted so the gap cannot silently reappear.
+        let legacy = proxima_records_to_record_batch(std::slice::from_ref(&deleted), &schema)
+            .expect("legacy encode");
+        let legacy_back = record_batch_to_proxima_records(&legacy);
+        assert_eq!(
+            legacy_back[0].valid_to_ns, None,
+            "legacy encoding drops the tombstone — this is why the system columns exist"
+        );
+        assert!(
+            !legacy_back[0].is_dead(1),
+            "legacy round trip resurrects a deleted row (documented, not endorsed)"
+        );
+    }
+
+    /// Identity and lifecycle all survive, and the reserved columns stay OUT of
+    /// `props` so they never surface as user-visible columns.
+    #[test]
+    fn system_columns_restore_identity_and_stay_out_of_props() {
+        let mut r = record_with_props(
+            "order-7",
+            vec![("status", ProximaValue::String("open".into()))],
+        );
+        r.tenant_id = "tenant-a".into();
+        r.variation_id = Some("orders".into());
+        r.created_at_ns = 111;
+        r.updated_at_ns = 222;
+        r.valid_from_ns = Some(333);
+        r.valid_to_ns = Some(444);
+
+        let batch = proxima_records_to_record_batch_with_system_columns(
+            std::slice::from_ref(&r),
+            &sys_schema(),
+        )
+        .expect("encode");
+        let back = &record_batch_to_proxima_records(&batch)[0];
+
+        assert_eq!(back.oid, "order-7");
+        assert_eq!(back.tenant_id, "tenant-a");
+        assert_eq!(back.variation_id.as_deref(), Some("orders"));
+        assert_eq!(back.created_at_ns, 111);
+        assert_eq!(back.updated_at_ns, 222);
+        assert_eq!(back.valid_from_ns, Some(333));
+        assert_eq!(back.valid_to_ns, Some(444));
+
+        // The user column is still a prop; no reserved name leaked in.
+        assert!(back.props.contains_key("status"));
+        for sys in SYSTEM_COLUMNS {
+            assert!(
+                !back.props.contains_key(*sys),
+                "reserved column {sys} must not surface as a user prop"
+            );
+        }
+    }
+
+    /// Mixed-read safety (mandate #8): a batch with no system columns decodes
+    /// EXACTLY as it did before this change — same props, no fabricated identity.
+    #[test]
+    fn legacy_batches_decode_unchanged() {
+        let r = record_with_props(
+            "ignored",
+            vec![("status", ProximaValue::String("open".into()))],
+        );
+        let batch = proxima_records_to_record_batch(std::slice::from_ref(&r), &sys_schema())
+            .expect("encode");
+        let back = &record_batch_to_proxima_records(&batch)[0];
+
+        assert_eq!(
+            back.oid, "",
+            "identity is still not inferred for legacy batches"
+        );
+        assert_eq!(back.tenant_id, "");
+        assert_eq!(back.valid_to_ns, None);
+        assert!(back.props.contains_key("status"));
+    }
+
+    /// The legacy encoder must remain byte-identical — adding the opt-in variant
+    /// must not perturb existing Parquet output (MATERIALIZE included).
+    #[test]
+    fn legacy_encoder_output_is_unchanged_by_the_new_variant() {
+        let r = record_with_props("o", vec![("status", ProximaValue::String("open".into()))]);
+        let schema = sys_schema();
+        let batch =
+            proxima_records_to_record_batch(std::slice::from_ref(&r), &schema).expect("encode");
+        assert_eq!(
+            batch.num_columns(),
+            1,
+            "legacy encoder must emit ONLY declared user columns"
+        );
+        assert_eq!(batch.schema().field(0).name(), "status");
+    }
+
+    /// A user column colliding with a reserved name must fail closed and name the
+    /// column — two same-named Arrow fields would make read-back ambiguous.
+    #[test]
+    fn reserved_name_collision_fails_closed() {
+        let schema = ProximaSchema::from_columns(
+            "orders".to_string(),
+            vec![col(1, SYS_COL_VALID_TO_NS, ProximaType::Int64, true)],
+            vec![1],
+        );
+        let r = record_with_props("o", vec![]);
+        let err =
+            proxima_records_to_record_batch_with_system_columns(std::slice::from_ref(&r), &schema)
+                .expect_err("a reserved-name collision must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(SYS_COL_VALID_TO_NS) && msg.contains("collides"),
+            "error must name the colliding column, got: {msg}"
+        );
     }
 
     #[test]

@@ -127,6 +127,26 @@ Relational-only tables land in a Parquet-encoded Layer A carrying PAX layout dis
 cost-justified — never the default.**
 ====
 
+[IMPORTANT]
+====
+**Prerequisite discovered 2026-09-22 (TD-USUB-11), resolved.** "Parquet-encoded Layer A"
+was not implementable as written: the canonical encoder
+(`proxima_records_to_record_batch`) materializes only *declared schema columns* from
+`props`, so `oid`, `tenant_id` and — critically — **`valid_to_ns`** were not persisted at
+all.
+
+This does not matter while Parquet is an *export* of rows already filtered live, which is
+all it was when this ADR was written. It matters absolutely once Parquet is a **landing**
+format: a landed segment is immutable, so deletion must become a `valid_to_ns` tombstone,
+and a tombstone that does not round-trip is a **resurrected row** — mandate #16a's
+dead-record predicate reading a live value for a deleted one.
+
+Closed by TD-USUB-11: opt-in reserved `__proxima_*` system columns carrying identity and
+lifecycle, additive and mixed-read-safe (presence of the column is the version marker; the
+legacy encoder and `MATERIALIZE` output are unchanged). Decision 1 stands as written; it
+now has the encoding it requires.
+====
+
 This satisfies ADR-027's intent (one landing format per modality; no ad-hoc third
 substrate) and honours ADR-033's evidence (Parquet is the right physical representation
 for relational scans, and it is the Iceberg seam) without paying for both.
