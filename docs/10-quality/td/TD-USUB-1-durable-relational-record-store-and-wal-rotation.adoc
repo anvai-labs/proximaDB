@@ -78,6 +78,44 @@ width varies, so it is a proxy for memory, not a guarantee. Byte accounting need
 estimator `ProximaRecord` does not have; it belongs with slice 2, where eviction becomes
 possible.
 
+== Slice 2 re-scoped (2026-09-22) — two findings from starting it
+
+**Finding 1 — the encoder could not round-trip a tombstone.** Slice 2 spills to an immutable
+segment, so deleting a row already written can no longer remove it: deletion *necessarily*
+becomes a `valid_to_ns` tombstone. The canonical Parquet encoder did not persist
+`valid_to_ns` (nor `oid`, nor `tenant_id`), so a deleted row would have read back **live** —
+a resurrection bug that would have been *built in* rather than found. Closed first as
+**TD-USUB-11**; slice 2 is its first consumer.
+
+**Finding 2 — eviction breaks UNIQUE/PK unless reads are served through.**
+`ensure_unique_index_built` (`record_store.rs:1866`) builds UNIQUE/PK enforcement by
+**scanning the partition store**. A store that evicts flushed rows from memory must therefore
+still return them from `scan_records`, or duplicate-key enforcement silently stops catching
+duplicates. The durable store is consequently a read-merge (memtable ∪ segments, memtable
+wins, tombstones suppress), not a simple spill.
+
+**Consequent slicing.** The filed step list below is more than one reviewable PR, and its
+riskiest element (WAL truncation) is the one that can lose data. So:
+
+* **Slice 2a — the durable spill path.** Read-merge store behind the existing `RecordStore`
+  trait, flush at a threshold, catalog registration, default-OFF. **No WAL truncation**, so
+  the WAL stays authoritative and the change cannot lose data: recovery replays exactly as
+  today, and segments are a read-side representation of already-durable rows. Bounds the heap
+  *within a process run* — the operational failure mode, since the process OOMs long before
+  it restarts. Honest limitation: it does **not** bound the heap across restarts, because
+  replay repopulates the memtable. That needs truncation.
+* **Slice 2b — WAL truncation**, under ADR-094's rule (truncate only below the minimum LSN
+  durably committed in a catalog-referenced segment), plus the crash-recovery evidence gate.
+  This is what makes the bound survive restart, and it is legal only once 2a proves the
+  segment is readable.
+* **Slice 2c — background compaction.**
+
+A further prerequisite for 2a: `storage_factory` is `Fn() -> Arc<dyn RecordStorage>`
+(`record_store.rs:1727`) and receives **no partition identity**, so a durable store cannot
+derive its own `DrPathBuilder` path. The signature must take `(tenant_id, collection)`. Note
+the shared-mode probe at `:1991` calls the factory purely for an `Arc::ptr_eq` comparison and
+must be updated with it.
+
 == How to apply (slice 2 — the durable store)
 
 Implement a durable relational record store behind the **existing `RecordStore` trait**, so
