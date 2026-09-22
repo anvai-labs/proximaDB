@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 2. **Absorbs and supersedes legacy TD-162a-3 and TD-162b** (see Reconciliation).
+| Status | **Resolved 2026-09-22.** Filed 2026-09-21 under ADR-094 Phase 2. **Absorbs and supersedes legacy TD-162a-3 and TD-162b** (see Reconciliation). `RecordReader` + the `PAR1` detect arm landed; see Resolution.
 | Priority | MEDIUM-HIGH — the seam every other unification step reads through.
 | Component | `src/storage/engines/sst/segment_format.rs`, `crates/storage/proximadb-storage-common/src/segment_layout.rs`, `src/datafusion/engine_adapters/`, `src/query/execution/native_scan.rs`
 | Relates to | ADR-094 (Decision 3), ADR-027 (Decision 1 "one record reader"), ADR-039 (leakage ratchet), TD-OLAP-14, TD-USUB-2, TD-USUB-4
@@ -67,3 +67,64 @@ position of TD-OLAP-14. Do not "fix" it by sharing the reader across lanes.
 * Byte-identical round-trip for existing `PBLK`/`PXH1`/legacy segments through the new trait
   (no behavioural change).
 * The no-DataFusion build guard stays green, proving the native lane took no new dependency.
+
+== Resolution (2026-09-22)
+
+`RecordReader` lives in `crates/storage/proximadb-storage-common/src/segment_reader.rs` with
+the two format-layer implementations (`PaxRecordReader`, `ParquetRecordReader`) beside the
+formats they read. `ProximaBlocksRecordReader` and the dispatch table `record_reader_for()`
+live in `src/storage/engines/sst/segment_format.rs`, because `ProximaDataBlock` is defined in
+`proximadb-engine-core`, which sits *above* the format layer. `read_segment_records` is now
+`record_reader_for(SegmentFormat::detect(bytes)).read_records(bytes, &ctx)`.
+
+The three catalog-derived decoder inputs are bundled into a borrowed `SegmentReadContext`, so
+the trait stays object-safe with a signature that does not change as formats are added. The
+dispatch `match` is exhaustive with no `_` arm: a future `SegmentFormat` variant is a compile
+error at the table rather than a silent fall-back to the legacy decoder.
+
+=== Deviation from "How to apply" step 2, and why
+
+The filed plan said to add the `PAR1` variant "behind the `datafusion-integration` feature,
+default-off". **That was not done, deliberately.** Two premises behind it do not hold:
+
+. **Parquet is not a DataFusion dependency here.** `parquet` is a *non-optional* workspace
+  dependency of `proximadb-storage-common`, and the canonical in-memory codec
+  (`proxima_parquet::parquet_bytes_to_record_batches`) is already unguarded. Nothing needed to
+  be gated for availability.
+. **The gate would preserve the defect where it is least observable.** Under
+  `--no-default-features` a gated arm means `detect()` cannot name Parquet, so a Parquet
+  object falls back to `ProximaBlocks` and reaches a decoder that cannot read it — precisely
+  the mis-route this TD exists to remove, retained in the one build configuration with the
+  fewest eyes on it. Correctness would then differ by feature flag.
+
+Mandate #8's default-OFF rule targets *coexistence* hazards — a new on-disk representation
+that old readers might mis-read. There is none here: nothing writes Parquet into this router,
+and the arm changes behaviour only for bytes that previously produced an error. Naming the
+format converts a mis-route into either a decode or an honest Parquet error. The arm is
+therefore unconditional, and `detect()` documents that the legacy default is a *routing*
+choice, not a claim of validity.
+
+=== Evidence
+
+* `segment_format_detect_precedence_all_four_magics` (`segment_layout.rs`) — all four heads
+  (`PBLK`, `PXH1`, `PAR1`, legacy `0x01..=0x0E`), both adversarial hybrids (PAX head + `PAR1`
+  tail, `PAR1` head + `PAXSEG01` tail), the lone-`PAR1` `starts_with`/`ends_with` trap, and
+  the head-disjointness invariant that makes arm ordering irrelevant.
+* `trait_dispatch_is_byte_identical_for_existing_formats` (`segment_format.rs`) — router
+  output compared for **whole-record equality** against `ProximaDataBlock::deserialize` and
+  `read_pax_segment_records` called directly, so any perturbation of embeddings, props,
+  timestamps or tenant fails the test.
+* `parquet_segment_routes_to_the_parquet_reader` — end-to-end through `read_segment_records`,
+  including tenant stamping, and asserts the legacy decoder genuinely rejects the same bytes
+  (non-vacuity: the new arm is doing real work, not shadowing a path that already succeeded).
+* `parquet_reader_errors_on_corrupt_input` — corrupt Parquet with both magics intact fails
+  closed rather than decoding to an empty result (mandate #1).
+* `cargo check -p proximadb --tests --no-default-features` green — the native lane took no new
+  dependency.
+
+=== Not done here
+
+Registering the Parquet arm at the *call sites* of `read_segment_records` (cold-search,
+compaction, recovery) is out of scope: no writer emits Parquet into a vector segment path
+today, and doing so is the ADR-094 Phase 3 landing-format work. This TD makes the seam able
+to express Parquet; it does not change which format anything writes.

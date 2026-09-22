@@ -51,18 +51,73 @@ use crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache;
 // reference (and the router below) resolves unchanged (behavior-neutral move).
 pub use proximadb_storage_common::segment_layout::SegmentFormat;
 
+// TD-USUB-5 / ADR-094 §4: the decode seam. `RecordReader` and its two
+// format-layer implementations live beside the formats they read; re-exported
+// here so the router and its callers keep one import path.
+pub use proximadb_storage_common::segment_reader::{
+    ParquetRecordReader, PaxRecordReader, RecordReader, SegmentReadContext,
+};
+
+/// Reads legacy row-based [`ProximaDataBlock`] segments (raw f32).
+///
+/// This implementation lives in the root crate rather than beside its two
+/// siblings in `proximadb-storage-common` because [`ProximaDataBlock`] is defined
+/// in `proximadb-engine-core`, which sits *above* the format layer. The trait is
+/// the seam that lets all three readers be selected uniformly anyway.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProximaBlocksRecordReader;
+
+impl RecordReader for ProximaBlocksRecordReader {
+    fn format(&self) -> SegmentFormat {
+        SegmentFormat::ProximaBlocks
+    }
+
+    fn read_records(
+        &self,
+        bytes: &[u8],
+        _ctx: &SegmentReadContext<'_>,
+    ) -> Result<Vec<ProximaRecord>> {
+        // The legacy block is self-describing — it carries its own column names,
+        // embeddings and tenant — so the catalog-derived context is unused.
+        Ok(ProximaDataBlock::deserialize(bytes, None)?.records)
+    }
+}
+
+/// The dispatch table: one [`RecordReader`] per [`SegmentFormat`].
+///
+/// This is the substance of TD-USUB-5's compute-seam change — the decode rule for
+/// a format is now addressable on its own, so adding a format is adding an arm
+/// here plus a magic in `SegmentFormat::detect`, never editing a decode body.
+///
+/// The `match` is deliberately exhaustive (no `_` arm) so a future
+/// [`SegmentFormat`] variant is a compile error here rather than a silent
+/// fall-back to the legacy decoder.
+pub fn record_reader_for(format: SegmentFormat) -> Box<dyn RecordReader> {
+    match format {
+        SegmentFormat::Pax => Box::new(PaxRecordReader),
+        SegmentFormat::Parquet => Box::new(ParquetRecordReader),
+        SegmentFormat::ProximaBlocks => Box::new(ProximaBlocksRecordReader),
+    }
+}
+
 /// Decode a persisted vector segment back to records, routing on the detected format.
 ///
-/// PAX segments are decoded via the format-layer inverse
-/// ([`proximadb_storage_common::pax_block::read_pax_segment_records`]); legacy
-/// segments via [`ProximaDataBlock::deserialize`]. This root-level router is the
-/// single mixed-read entry called from the cold-search, compaction, and recovery
-/// paths. Its signature is unchanged from before the detection + PAX-decode logic
-/// moved down to `proximadb-storage-common` — the move is behavior-neutral.
+/// Detection ([`SegmentFormat::detect`]) picks the format from the bytes' magic;
+/// [`record_reader_for`] picks the reader. PAX decodes via the format-layer
+/// inverse (`read_pax_segment_records`), Parquet via the canonical
+/// `parquet_bytes_to_record_batches` + Arrow→records mapping, legacy via
+/// [`ProximaDataBlock::deserialize`]. This root-level router is the single
+/// mixed-read entry called from the cold-search, compaction, and recovery paths.
+///
+/// Its signature and its behaviour on `PBLK`/`PXH1`/legacy bytes are unchanged by
+/// the move to trait dispatch — the same detection feeds the same decoders. The
+/// one behavioural difference is that Parquet bytes, which previously fell to the
+/// legacy default and were handed to a decoder that cannot read them, now reach a
+/// reader that can.
 ///
 /// `embedding_model_ids` / `user_column_keys` are the collection's schema keys used
 /// to reconstruct PAX records positionally (empty slices = best-effort defaults);
-/// they are ignored for the legacy format, which is self-describing.
+/// they are ignored for the legacy and Parquet formats, which are self-describing.
 ///
 /// `tenant_ctx` is the segment's owning tenant (from the catalog/path); it is
 /// stamped onto rows whose tenant column was dropped (catalog-resolution) and is
@@ -73,17 +128,8 @@ pub fn read_segment_records(
     user_column_keys: &[String],
     tenant_ctx: Option<&str>,
 ) -> Result<Vec<ProximaRecord>> {
-    match SegmentFormat::detect(bytes) {
-        SegmentFormat::Pax => Ok(
-            proximadb_storage_common::pax_block::read_pax_segment_records(
-                bytes,
-                embedding_model_ids,
-                user_column_keys,
-                tenant_ctx,
-            )?,
-        ),
-        SegmentFormat::ProximaBlocks => Ok(ProximaDataBlock::deserialize(bytes, None)?.records),
-    }
+    let ctx = SegmentReadContext::new(embedding_model_ids, user_column_keys, tenant_ctx);
+    record_reader_for(SegmentFormat::detect(bytes)).read_records(bytes, &ctx)
 }
 
 /// Write `records` as a PAX vector segment at `path` — the write-side inverse of
@@ -6224,6 +6270,134 @@ mod tests {
             pax_oids,
             vec!["pax_c", "pax_d"],
             "PAX segment oids (disjoint from legacy)"
+        );
+    }
+
+    /// TD-USUB-5 / ADR-094 §4 — converting [`read_segment_records`] from an
+    /// inline `match` to [`RecordReader`] dispatch must be **behaviour-neutral**
+    /// for the formats that already existed.
+    ///
+    /// The assertion is equality against the canonical decoders called
+    /// DIRECTLY — `ProximaDataBlock::deserialize` for the legacy format and
+    /// `read_pax_segment_records` for PAX — on whole `ProximaRecord`s, not just
+    /// oids. So the test fails if the trait indirection perturbs any field
+    /// (embeddings, props, timestamps, tenant), which a shape-only assertion
+    /// would miss.
+    #[test]
+    fn trait_dispatch_is_byte_identical_for_existing_formats() {
+        let legacy_records = vec![
+            rec(
+                "legacy_a",
+                1_700_000_000_000_000_000,
+                vec![1.0, 2.0, 3.0, 4.0],
+            ),
+            rec(
+                "legacy_b",
+                1_700_000_000_000_000_001,
+                vec![5.0, 6.0, 7.0, 8.0],
+            ),
+        ];
+        let legacy_bytes = ProximaDataBlock::new(legacy_records, BlockCompressionConfig::default())
+            .serialize()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let pax_path = dir.path().join("dispatch.pax");
+        let pax_records = vec![
+            rec(
+                "pax_c",
+                1_700_000_000_000_000_002,
+                vec![9.0, 10.0, 11.0, 12.0],
+            ),
+            rec(
+                "pax_d",
+                1_700_000_000_000_000_003,
+                vec![13.0, 14.0, 15.0, 16.0],
+            ),
+        ];
+        write_pax_segment(
+            &pax_path,
+            &pax_records,
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            None,
+            None,
+        )
+        .unwrap();
+        let pax_bytes = std::fs::read(&pax_path).unwrap();
+
+        // Legacy: router output == `ProximaDataBlock::deserialize` output.
+        let via_router = read_segment_records(&legacy_bytes, &[], &[], Some("t1")).unwrap();
+        let direct = ProximaDataBlock::deserialize(&legacy_bytes, None)
+            .unwrap()
+            .records;
+        assert_eq!(via_router, direct, "legacy decode changed under dispatch");
+
+        // PAX: router output == `read_pax_segment_records` output, with the
+        // catalog-derived context threaded through unchanged.
+        let via_router = read_segment_records(&pax_bytes, &[], &[], Some("t1")).unwrap();
+        let direct = proximadb_storage_common::pax_block::read_pax_segment_records(
+            &pax_bytes,
+            &[],
+            &[],
+            Some("t1"),
+        )
+        .unwrap();
+        assert_eq!(via_router, direct, "PAX decode changed under dispatch");
+
+        // The dispatch table agrees with detection for every format — the
+        // invariant that keeps "detected as X" and "decoded as X" from drifting.
+        for bytes in [&legacy_bytes[..], &pax_bytes[..]] {
+            let format = SegmentFormat::detect(bytes);
+            assert_eq!(record_reader_for(format).format(), format);
+        }
+    }
+
+    /// TD-USUB-5 — a Parquet object reaching the router is now DECODED rather
+    /// than handed to the legacy decoder that cannot read it.
+    ///
+    /// The second half is the part that matters for mandate #1: even without the
+    /// Parquet arm the old code did not return wrong rows here, it returned an
+    /// error — but it was an error about the wrong format. Naming the format
+    /// turns a mis-route into a decode.
+    #[test]
+    fn parquet_segment_routes_to_the_parquet_reader() {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("city", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["pune", "austin"]))],
+        )
+        .unwrap();
+        let bytes = proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes(
+            &[batch],
+            schema,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(SegmentFormat::detect(&bytes), SegmentFormat::Parquet);
+        assert_eq!(
+            record_reader_for(SegmentFormat::Parquet).format(),
+            SegmentFormat::Parquet
+        );
+
+        let records = read_segment_records(&bytes, &[], &[], Some("tenant-9")).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records.iter().all(|r| r.tenant_id == "tenant-9"),
+            "tenant context must be stamped on the Parquet arm too"
+        );
+
+        // Non-vacuity: the legacy decoder genuinely cannot read these bytes, so
+        // the new arm is doing real work rather than shadowing a path that
+        // already happened to succeed.
+        assert!(
+            ProximaDataBlock::deserialize(&bytes, None).is_err(),
+            "legacy decoder must reject Parquet bytes — otherwise this test proves nothing"
         );
     }
 

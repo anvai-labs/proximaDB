@@ -167,10 +167,19 @@ routing decision downstream (TD-USUB-4).
 
 == Decision 3 — One reader seam; capability is storage-independent
 
-* A single `RecordReader` trait (TD-162a-3; does not exist today — `read_segment_records`
-  is an inline `match` at `src/storage/engines/sst/segment_format.rs:76-86`), plus a
-  `PAR1` arm in `SegmentFormat::detect` (TD-162b; today only `ProximaBlocks` and `Pax`
-  exist, `crates/storage/proximadb-storage-common/src/segment_layout.rs:91-97`).
+* A single `RecordReader` trait (TD-162a-3; at filing it did not exist — `read_segment_records`
+  was an inline `match` at `src/storage/engines/sst/segment_format.rs:76-86`), plus a
+  `PAR1` arm in `SegmentFormat::detect` (TD-162b; at filing only `ProximaBlocks` and `Pax`
+  existed, `crates/storage/proximadb-storage-common/src/segment_layout.rs:91-97`).
++
+**Implemented 2026-09-22 (TD-USUB-5).** `RecordReader` +
+`SegmentReadContext` live in `proximadb-storage-common/src/segment_reader.rs` with the PAX
+and Parquet implementations; the legacy `ProximaBlocks` implementation and the exhaustive
+`record_reader_for` dispatch table live in the root crate, because `ProximaDataBlock` is
+defined above the format layer. `SegmentFormat` gained a `Parquet` variant with head+tail
+`PAR1` detection. The arm is **unconditional, not feature-gated** — TD-USUB-5 §Resolution
+records why gating it on `datafusion-integration` (as TD-162b originally proposed) would
+have preserved the mis-route under `--no-default-features`.
 * **SQL capability must not depend on physical format.** The `ctx.sql` fallback gates on
   *provider registration*, never on `parquet_backed`.
 * **Lane discipline (ADR-039 leakage ratchet).** The DataFusion route reads PAX via

@@ -60,7 +60,7 @@ reconciled (see "Reconciliation" below).
   `PBLK`/`PXH1`.
 ====
 
-* **One record reader** — `read_segment_records` → `PaxSegmentScanner` for all data (magic-detect router exists for PAX + legacy `ProximaBlocks`; the `RecordReader` trait + the Parquet `PAR1` arm are **new work**, TD-162a-3 / TD-162b).
+* **One record reader** — `read_segment_records` → `PaxSegmentScanner` for all data (magic-detect router exists for PAX + legacy `ProximaBlocks`; the `RecordReader` trait + the Parquet `PAR1` arm were **new work**, TD-162a-3 / TD-162b — **both landed 2026-09-22 via TD-USUB-5** under ADR-094; the router now names three formats and dispatches through the trait).
 * [.line-through]#**One SQL lowering** — relational SQL lowers to a PAX scan; the native OLAP engine's natural input is PAX columnar (DataFusion is interim, per the native-OLAP blueprint).#
 +
 **WITHDRAWN by ADR-094 (2026-09-21).** This clause is the *only* part of Decision 1 that
@@ -88,7 +88,7 @@ in its precise form: *vertical where the access pattern pays for it, standard ev
 else.*
 ====
 
-**If a second internal format is ever needed, the router makes it safe** — `SegmentFormat::detect` is O(1) magic-byte (**today**: `PBLK` + legacy `0x01`; the `PAR1`/Parquet arm is **TD-162b**, default-off behind `datafusion-integration`); a `RecordReader` trait (PAX/Parquet/legacy each implement) — **new work, TD-162a-3** (it does not exist yet; `read_segment_records` is an inline `match` today) — decouples SQL lowering from on-disk layout; Arrow Flight serves *decoded records* (Arrow batches), so on-disk format is invisible to clients. No fork in the hot path; the fork (if any) is at the boundary where it is cheap and standard. Mixed-read-safe (mandate #8).
+**If a second internal format is ever needed, the router makes it safe** — `SegmentFormat::detect` is O(1) magic-byte (**at filing**: `PBLK`/`PXH1` + legacy `0x01`; the `PAR1`/Parquet arm was **TD-162b**. *Landed 2026-09-22 via TD-USUB-5, and deliberately NOT behind `datafusion-integration` as proposed here — `parquet` is a non-optional dependency, and gating the arm would leave `--no-default-features` builds mis-routing Parquet to the legacy decoder; see TD-USUB-5 §Resolution*); a `RecordReader` trait (PAX/Parquet/legacy each implement) — **was new work, TD-162a-3**, *landed in the same change* — decouples SQL lowering from on-disk layout; Arrow Flight serves *decoded records* (Arrow batches), so on-disk format is invisible to clients. No fork in the hot path; the fork (if any) is at the boundary where it is cheap and standard. Mixed-read-safe (mandate #8).
 
 == Reconciliation with the 2026-06-04 course-correction
 
