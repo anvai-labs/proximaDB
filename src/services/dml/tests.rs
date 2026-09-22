@@ -6370,3 +6370,68 @@ mod abac_relational_enforcement_tests {
         );
     }
 }
+
+/// TD-USUB-4: publication must be **additive**. `MATERIALIZE` previously wrote
+/// `set_storage_layouts(&id, vec![layout])`, discarding every other representation a
+/// table had — which is what made cost-based routing across representations
+/// inexpressible, since the catalog had no way to record an alternative.
+#[test]
+fn upsert_storage_layout_is_additive_and_idempotent() {
+    fn layout(
+        name: &str,
+        format: proximadb_catalog::CatalogPhysicalFormat,
+    ) -> CatalogStorageLayout {
+        CatalogStorageLayout {
+            name: name.to_string(),
+            physical_format: format,
+            location: Some(format!("file:///{name}")),
+            ..Default::default()
+        }
+    }
+
+    // A genuinely new layout is APPENDED, not substituted for what is there. This is
+    // the whole point: a table can now hold a native landing layout AND a published
+    // Parquet projection at the same time.
+    let native = layout(
+        "proxima-native",
+        proximadb_catalog::CatalogPhysicalFormat::ProximaBlock,
+    );
+    let parquet = layout(
+        "parquet-snapshot",
+        proximadb_catalog::CatalogPhysicalFormat::Parquet,
+    );
+    let merged = upsert_storage_layout(vec![native.clone()], parquet.clone());
+    assert_eq!(merged.len(), 2, "a new layout must be added, not replace");
+    assert_eq!(merged[0].name, "proxima-native", "existing layout survives");
+    assert_eq!(merged[1].name, "parquet-snapshot");
+
+    // Re-publishing the SAME layout name replaces in place — no duplicate rows from a
+    // repeated MATERIALIZE, and the updated location/properties win.
+    let mut republished = parquet.clone();
+    republished.location = Some("file:///new-location".to_string());
+    republished
+        .properties
+        .insert("snapshot_lsn".to_string(), "42".to_string());
+    let merged = upsert_storage_layout(merged, republished);
+    assert_eq!(merged.len(), 2, "re-publishing must not duplicate");
+    assert_eq!(
+        merged[1].location.as_deref(),
+        Some("file:///new-location"),
+        "the re-published layout's fields must win"
+    );
+    assert_eq!(
+        merged[1].properties.get("snapshot_lsn").map(String::as_str),
+        Some("42"),
+        "per-layout freshness must be carried by the upsert"
+    );
+
+    // Order is stable across republication: the replaced layout keeps its position, so
+    // a reader treating the first match as the default sees no churn.
+    assert_eq!(merged[0].name, "proxima-native");
+
+    // Degenerate case: an empty starting list behaves like a plain insert (the
+    // pre-TD-USUB-4 shape, so a first publication is unchanged).
+    let fresh = upsert_storage_layout(Vec::new(), parquet.clone());
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].name, "parquet-snapshot");
+}
