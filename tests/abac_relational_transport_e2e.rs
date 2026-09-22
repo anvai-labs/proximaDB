@@ -1619,3 +1619,175 @@ async fn grant_ratchet_inner() {
         "posture Off must restore the pre-enforcement baseline"
     );
 }
+
+/// TD-USUB-3: a governed subject must get the **same SQL surface** as an ungoverned
+/// one, and the rows it sees must still be the governed ones.
+///
+/// Before this, `relational_abac_required` forced `parquet_backed = false` and the
+/// whole DataFusion dispatch block was skipped, so an ABAC-scoped session silently
+/// lost CTEs, window functions, joins and subqueries — capability varied by **who
+/// connected**, not by what was stored. Worse, on a native table a bare window
+/// function did not decline but returned a silently wrong answer (the TD-187
+/// residual: `val - lag(val)` came back as `val`).
+///
+/// The native table provider is safe for a governed subject because every row it
+/// registers comes from `scan_table_relational`, which resolves the ABAC row filter
+/// itself. This test is the proof of that claim: it asserts both halves — the
+/// capability is restored **and** the row filtering still holds.
+#[test]
+fn governed_subject_gets_full_sql_surface_with_rows_still_filtered() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(governed_subject_gets_full_sql_surface_with_rows_still_filtered_inner());
+}
+
+async fn governed_subject_gets_full_sql_surface_with_rows_still_filtered_inner() {
+    // SAFETY: this integration test is its own process; the gate is read per-query
+    // via `std::env::var`, which is exactly how an operator enables the feature.
+    unsafe { std::env::set_var("PROXIMADB_NATIVE_TABLE_PROVIDER", "1") };
+
+    let server = LiveServer::start().await.expect("start live server");
+    let alice = connect(&server, "alice").await;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let table = format!("usub3_{suffix}");
+
+    exec(
+        &alice,
+        &format!("CREATE TABLE {table} (id INT PRIMARY KEY, val INT)"),
+    )
+    .await;
+    for (id, val) in [(1, 5), (2, 20), (3, 12), (4, 40)] {
+        exec(&alice, &format!("INSERT INTO {table} VALUES ({id}, {val})")).await;
+    }
+
+    let object_id = table_object_id(&alice, &table).await;
+    let table_scope = u32::try_from(object_id).expect("ABAC table scope is u32");
+
+    // Deny-by-default: nothing is provisioned yet, so a governed read sees nothing.
+    assert_eq!(
+        scalar(&alice, &format!("SELECT COUNT(*) FROM {table}")).await,
+        "0",
+        "unprovisioned governed reads must fail closed"
+    );
+
+    let http = HttpClient::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .expect("HTTP client");
+    let auth = format!("Api-Key {OPERATOR_KEY}");
+
+    let response = http
+        .post(server.admin_url("/api/v2/abac/attribute-bindings"))
+        .header(reqwest::header::AUTHORIZATION, &auth)
+        .json(&json!({"subject_id": "alice", "tenant": TENANT, "attrs": {}}))
+        .send()
+        .await
+        .expect("provision alice binding");
+    assert_admin_success(response, "provision attribute binding").await;
+
+    let policy_object_id = object_id + 1_000_000_000;
+    let policy_path = format!("/api/v2/abac/policy-bindings/{TENANT}/{policy_object_id}");
+    let response = http
+        .put(server.admin_url(&policy_path))
+        .header(reqwest::header::AUTHORIZATION, &auth)
+        .json(&json!({"scope": {"Table": table_scope}, "effect": "Permit"}))
+        .send()
+        .await
+        .expect("provision table permit");
+    assert_admin_success(response, "provision table permit").await;
+
+    // Baseline: the permit is live and all four rows are visible to alice.
+    assert_eq!(
+        scalar(&alice, &format!("SELECT COUNT(*) FROM {table}")).await,
+        "4",
+        "the table permit must be hot-visible"
+    );
+
+    // --- Capability half: shapes that were silently lost under ABAC -------------
+
+    // CTE — previously unreachable for a governed subject (the `ctx.sql` fallback
+    // lives on the DataFusion route, which ABAC skipped entirely).
+    assert_eq!(
+        scalar(
+            &alice,
+            &format!(
+                "WITH hot AS (SELECT val FROM {table} WHERE val > 10) SELECT COUNT(*) FROM hot"
+            )
+        )
+        .await,
+        "3",
+        "a CTE must serve for a governed subject (20, 12, 40 exceed 10)"
+    );
+
+    // Window function — previously returned a SILENTLY WRONG answer on a native
+    // table (delta == val). Assert the real lagged difference, not merely that it ran.
+    assert_eq!(
+        scalar(
+            &alice,
+            &format!(
+                "SELECT SUM(d) FROM (SELECT val - lag(val) OVER (ORDER BY id) AS d FROM {table}) t"
+            )
+        )
+        .await,
+        "35",
+        "LAG must produce real deltas for a governed subject: (20-5)+(12-20)+(40-12) = 35"
+    );
+
+    // --- Enforcement half: the rows are still governed -------------------------
+
+    // A subject with no authority binding must see nothing, through the SAME shapes.
+    // This is the assertion that would fail if the native provider had bypassed ABAC.
+    let bob = connect(&server, "bob").await;
+    assert_eq!(
+        scalar(&bob, &format!("SELECT COUNT(*) FROM {table}")).await,
+        "0",
+        "a table permit must not admit a subject without an authority binding"
+    );
+    assert_eq!(
+        scalar(
+            &bob,
+            &format!(
+                "WITH hot AS (SELECT val FROM {table} WHERE val > 10) SELECT COUNT(*) FROM hot"
+            )
+        )
+        .await,
+        "0",
+        "the CTE route must not leak rows to an unbound subject"
+    );
+    assert_eq!(
+        scalar(
+            &bob,
+            &format!(
+                "SELECT COUNT(*) FROM (SELECT val - lag(val) OVER (ORDER BY id) AS d FROM {table}) t"
+            )
+        )
+        .await,
+        "0",
+        "the window-function route must not leak rows to an unbound subject"
+    );
+
+    // Hot revoke must be observed through the new route too, not just the legacy one.
+    revoke_live_policy(&http, &server, &policy_path).await;
+    assert_eq!(
+        scalar(
+            &alice,
+            &format!(
+                "WITH hot AS (SELECT val FROM {table} WHERE val > 10) SELECT COUNT(*) FROM hot"
+            )
+        )
+        .await,
+        "0",
+        "a revoke must be hot-visible through the DataFusion route as well"
+    );
+
+    // SAFETY: restore the default so the process leaves no gate set.
+    unsafe { std::env::remove_var("PROXIMADB_NATIVE_TABLE_PROVIDER") };
+}
