@@ -3063,20 +3063,44 @@ async fn materialize_table_writes_parquet_and_flips_catalog_layout() {
     }
     assert_eq!(total, 3, "all rows materialized into the snapshot");
 
-    // The catalog layout is now a published Parquet projection at the location.
+    // TD-USUB-4: publication is ADDITIVE. A freshly created table already carries one
+    // `InternalCanonical`/`ProximaBlock` layout, and publication previously *replaced*
+    // it — so the catalog forgot the table was natively backed at all. The table now
+    // records BOTH its native landing layout and the published Parquet projection,
+    // which is what makes multi-representation — and therefore cost-based routing —
+    // expressible (ADR-094 Decision 2).
     let (catalog, id) = manager.resolve_table("inv").await.expect("resolve");
     let schema = catalog.get_table(&id).await.expect("get table");
-    assert_eq!(schema.storage_layouts.len(), 1);
-    let layout = &schema.storage_layouts[0];
+    assert_eq!(
+        schema.storage_layouts.len(),
+        2,
+        "publication must ADD the projection, not replace the native layout"
+    );
+    assert!(
+        schema.storage_layouts.iter().any(|l| matches!(
+            l.physical_format,
+            proximadb_catalog::CatalogPhysicalFormat::ProximaBlock
+        )),
+        "the native ProximaBlock layout must survive publication"
+    );
+
+    // The published Parquet projection is present at the location — this is what
+    // `catalog_table_is_parquet_backed` finds, so OLAP routing is unaffected.
+    let published = schema
+        .storage_layouts
+        .iter()
+        .find(|l| {
+            matches!(
+                l.physical_format,
+                proximadb_catalog::CatalogPhysicalFormat::Parquet
+            )
+        })
+        .expect("a published Parquet layout must exist");
     assert!(matches!(
-        layout.physical_format,
-        proximadb_catalog::CatalogPhysicalFormat::Parquet
-    ));
-    assert!(matches!(
-        layout.authority,
+        published.authority,
         proximadb_catalog::CatalogAuthorityMode::ProjectionPublication
     ));
-    assert_eq!(layout.location.as_deref(), Some(location.as_str()));
+    assert_eq!(published.location.as_deref(), Some(location.as_str()));
 }
 
 /// P3.3: `ALTER TABLE … MATERIALIZE` routed through DdlService + a wired
@@ -3146,17 +3170,32 @@ async fn alter_table_materialize_via_ddl_flips_catalog_layout() {
         .await
         .expect("materialize via DDL");
 
-    // The catalog layout is now a published Parquet projection.
+    // TD-USUB-4: the published Parquet projection is ADDED alongside the table's
+    // native landing layout, not substituted for it — so this looks the projection up
+    // by format rather than assuming it is the only (or first) entry.
     let (catalog, id) = manager.resolve_table("inv").await.expect("resolve");
     let schema = catalog.get_table(&id).await.expect("get table");
+    let published = schema
+        .storage_layouts
+        .iter()
+        .find(|l| {
+            matches!(
+                l.physical_format,
+                proximadb_catalog::CatalogPhysicalFormat::Parquet
+            )
+        })
+        .expect("a published Parquet layout must exist after MATERIALIZE");
     assert!(matches!(
-        schema.storage_layouts[0].physical_format,
-        proximadb_catalog::CatalogPhysicalFormat::Parquet
-    ));
-    assert!(matches!(
-        schema.storage_layouts[0].authority,
+        published.authority,
         proximadb_catalog::CatalogAuthorityMode::ProjectionPublication
     ));
+    assert!(
+        schema.storage_layouts.iter().any(|l| matches!(
+            l.physical_format,
+            proximadb_catalog::CatalogPhysicalFormat::ProximaBlock
+        )),
+        "the native ProximaBlock layout must survive publication"
+    );
 
     // A DdlService WITHOUT a materializer rejects the statement cleanly.
     let ddl_bare = DdlService::new(manager.clone());

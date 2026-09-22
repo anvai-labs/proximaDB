@@ -68,6 +68,30 @@ the first match as the default sees no churn across republications. Per-layout f
 (`snapshot_lsn` in `properties`) rides along with the upsert, which is what a future
 delta-merge-per-representation needs.
 
+=== Discovered while testing — publication was *destroying* the native layout
+
+The filing assumed no code path creates a layout before publication, so the change would be
+inert until something else produced a second representation. **That was wrong.** The
+catalog's own test states it plainly: *"A freshly created table defaults to one
+`InternalCanonical`/`ProximaBlock` layout."*
+
+So every `CREATE TABLE` already carries a native landing layout, and `MATERIALIZE` was
+**replacing** it — the catalog simply forgot the table was ever natively backed. Two existing
+tests asserted exactly that (`storage_layouts.len() == 1` with the sole entry Parquet); they
+encoded the defect, and are updated to assert the stronger property.
+
+The practical consequence is larger than the filing claimed: multi-representation is now
+**immediately real**, not hypothetical — a materialized table records both its native landing
+layout and its published Parquet projection, which is precisely the state ADR-094 Decision 1
+describes.
+
+Routing is unaffected, and this was checked rather than assumed. `catalog_table_is_pax_backed`
+(`.any(ProximaBlock)`) now returns true for a materialized table where it previously returned
+false — but `pax_backed` is only consulted in `route_select_inner`'s `(engages_relational,
+parquet_backed) == (true, false)` arm. A materialized table has a Parquet layout, so
+`parquet_backed` is true and the `(true, true)` arm wins before `pax_backed` is read. The
+TPC-H / TPC-DS / TSBS suites — all of which `MATERIALIZE` — confirm it empirically.
+
 === Verified
 
 * Unit: `upsert_storage_layout_is_additive_and_idempotent` — asserts preservation,
