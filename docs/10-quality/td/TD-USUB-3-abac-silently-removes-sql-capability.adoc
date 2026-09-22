@@ -5,9 +5,9 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 1.
-| Priority | **HIGH** — a security-adjacent correctness trap: enabling row-level security silently *downgrades the SQL surface* rather than failing closed or enforcing in-plan.
-| Component | `src/services/dml/mod.rs` (`relational_abac_required`, `abac_row_filter`), `src/network/postgres/relational_pipeline.rs`
+| Status | **Resolved (in-plan enforcement)** 2026-09-21, under ADR-094 Phase 1. A governed subject now reaches the DataFusion route through the native table provider, with rows filtered at the source. Gated with the rest of TD-USUB-2 behind `PROXIMADB_NATIVE_TABLE_PROVIDER` (default OFF).
+| Priority | **HIGH** — a security-adjacent correctness trap: enabling row-level security silently *downgraded the SQL surface* rather than failing closed or enforcing in-plan.
+| Component | `src/network/postgres/relational_pipeline.rs` (`native_registerable`, `query_has_table_function`, the dispatch gate), `src/services/dml/mod.rs` (`relational_abac_required`, `scan_table_relational`)
 | Relates to | ADR-094 (Phase 1, defect **c**), ADR-087 (ABAC enforcement), TD-USUB-2 (same mechanism, storage-derived sibling), TD-ABAC-10c
 | Blocked by | Nothing.
 |===
@@ -55,7 +55,53 @@ rows — the bypass TD-ABAC-10c closes. The defect is not the caution; it is tha
 is expressed as a **silent capability downgrade** instead of either in-plan enforcement or an
 explicit decline.
 
-== How to apply
+== Resolution (2026-09-21) — in-plan enforcement, the preferred option
+
+Taken: **enforce in-plan**, not "decline visibly". The enabler landed with TD-USUB-2 — the
+native table provider registers rows obtained from `scan_table_relational`, which resolves
+the ABAC row filter itself (`Denied` → zero rows, `Restricted(p)` → predicate applied,
+identity/storage tenant mismatch → error). Rows reaching DataFusion are therefore **already
+governed**, so the route can be opened to a governed subject without adding an enforcement
+bypass.
+
+Three changes:
+
+. `native_registerable` no longer requires `!relational_abac_required`.
+. The dispatch gate splits the ABAC condition **per arm** rather than gating the whole block:
+  the **Parquet** arm still requires `!relational_abac_required` (it reads files directly and
+  cannot apply a row filter — the original, correct reason for the restriction), while the
+  **native** arm may serve a governed subject.
+. A new fail-closed guard, `query_has_table_function`, is the one thing that keeps this safe.
+
+=== The hole the guard closes
+
+`collect_table_names` gathers only `TableFactor::Table { args: None, .. }` — plain catalog
+tables — so a **table-valued function never appears in the prepared `tables` map**. A UDTF
+resolves instead through its registered DataFusion table function, backed by
+`vector_ops`/`graph_ops`, which do **not** apply the relational ABAC row filter.
+
+Without a guard, `SELECT … FROM governed_table JOIN vector_search(…)` would have satisfied
+`native_registerable` (its only *catalog* table is native) and mixed governed rows with an
+ungoverned source. `query_has_table_function` detects a UDTF at every nesting level —
+including one hidden in a CTE body, which a FROM-clause-only check would miss — and fails
+closed on shapes it does not decompose (set-ops, exotic factors).
+
+=== Verification
+
+The e2e (`tests/abac_relational_transport_e2e.rs::governed_subject_gets_full_sql_surface_with_rows_still_filtered`)
+asserts **both halves**, which is the point — a test that only proved capability was restored
+would not have proved enforcement survived:
+
+* *Capability* — a CTE serves, and a window function returns the **real** lagged deltas
+  (previously a silently wrong answer on the native path, the TD-187 residual).
+* *Enforcement* — an unbound subject sees **zero** rows through those same shapes, and a hot
+  revoke is observed through the new route.
+
+The test was confirmed **non-vacuous**: reverting just the ABAC relaxation makes it fail, and
+restoring it makes it pass. All 9 ABAC transport tests, plus the REST-record-search (16) and
+vector-pushdown (7) suites, stay green.
+
+== Original options considered (superseded by the resolution above)
 
 Preferred — **enforce in-plan**:
 

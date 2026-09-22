@@ -1063,16 +1063,24 @@ pub async fn try_run_select(
     // `ALTER TABLE … MATERIALIZE` — the capability cliff ADR-094 records as defect (b).
     //
     // Mixed Parquet+native queries stay `false` (the Parquet arm already serves those,
-    // and cross-representation joins are a later phase). ABAC-scoped sessions are
-    // excluded here even though the row source is governed, because the rest of this
-    // dispatch block is not yet ABAC-safe — relaxing that is TD-USUB-3's job, not this
-    // one's.
+    // and cross-representation joins are a later phase).
+    //
+    // TD-USUB-3: a governed (ABAC-scoped) session IS admitted here, unlike the Parquet
+    // arm. That asymmetry is the whole point — every row this path registers comes from
+    // `scan_table_relational`, which resolves the ABAC row filter itself, so the rows
+    // handed to DataFusion are already governed. The Parquet arm reads files directly
+    // and cannot apply a row filter, which is why it stays excluded under ABAC.
+    //
+    // The one hole is a table-valued function: a UDTF never appears in `tables` and
+    // resolves through `vector_ops`/`graph_ops`, which do not apply the relational row
+    // filter. `query_has_table_function` is the fail-closed guard that keeps a governed
+    // query from mixing governed rows with an ungoverned source.
     #[cfg(feature = "datafusion-integration")]
     let native_registerable =
         crate::query::execution::native_table_provider::native_table_provider_enabled()
-            && !relational_abac_required
             && !tables.is_empty()
-            && tables.keys().all(|k| !parquet_loc_by_key.contains_key(k));
+            && tables.keys().all(|k| !parquet_loc_by_key.contains_key(k))
+            && (!relational_abac_required || !query_has_table_function(query));
     #[cfg(not(feature = "datafusion-integration"))]
     let native_registerable = false;
 
@@ -1171,10 +1179,16 @@ pub async fn try_run_select(
     // other `decision.backend` (never produced for a parquet-OLAP shape) falls
     // through to the Volcano path below — exactly as before.
     #[cfg(feature = "datafusion-integration")]
-    if !relational_abac_required
-        // TD-USUB-2: admit natively-registerable tables too, so SQL capability stops
-        // depending on whether someone ran `ALTER TABLE … MATERIALIZE`.
-        && (parquet_backed || native_registerable)
+    // TD-USUB-2 admits natively-registerable tables, so SQL capability stops depending
+    // on whether someone ran `ALTER TABLE … MATERIALIZE`.
+    //
+    // TD-USUB-3 splits the ABAC condition per arm rather than gating the whole block:
+    // the **Parquet** arm still requires `!relational_abac_required` (it reads files
+    // directly and cannot apply a row filter), while the **native** arm may serve a
+    // governed subject because its rows arrive pre-filtered by `scan_table_relational`.
+    // `native_registerable` already carries the no-UDTF guard, so it is safe to admit
+    // on its own here.
+    if ((!relational_abac_required && parquet_backed) || native_registerable)
         && matches!(
             decision.backend,
             crate::query::table_write_plan::ComputeBackend::DataFusionLocal
@@ -3623,6 +3637,62 @@ fn query_operation_class(query: &SqlQuery) -> crate::query::compute_scheduler::O
 /// signal — a `JOIN … GROUP BY` classifies as `Grouped` (the FROM clause is
 /// never inspected there) — hence a dedicated shape bit. Fail-closed: set-op /
 /// non-`SELECT` bodies count as join-bearing.
+/// TD-USUB-3: does the query reference a table-valued function anywhere?
+///
+/// **This is a security guard, not an optimization.** `collect_table_names` only
+/// gathers `TableFactor::Table { args: None, .. }` — plain catalog tables — so a
+/// UDTF (`vector_search(...)`, `graph_traverse(...)`, `timeseries_range(...)`,
+/// `documents(...)`) never appears in the prepared `tables` map. A UDTF resolves
+/// instead through its registered DataFusion table function, backed by
+/// `vector_ops`/`graph_ops`, which do **not** apply the relational ABAC row filter.
+///
+/// The native table provider (TD-USUB-2) is safe for a governed subject precisely
+/// because every row it registers came from `scan_table_relational`, which resolves
+/// the row filter itself. That argument covers catalog tables only. A query that
+/// also reaches a UDTF would mix governed rows with an ungoverned source, so under
+/// ABAC such a query must keep declining rather than be admitted to the DataFusion
+/// route.
+///
+/// Fail-closed by construction: anything that is not a plain
+/// `TableFactor::Table { args: None }` — including set-ops and non-`SELECT` bodies,
+/// via the wildcard arms — counts as carrying a table function.
+fn query_has_table_function(query: &SqlQuery) -> bool {
+    fn factor_has_tvf(factor: &TableFactor) -> bool {
+        match factor {
+            TableFactor::Table { args: Some(_), .. } => true,
+            TableFactor::Table { args: None, .. } => false,
+            TableFactor::Derived { subquery, .. } => query_has_table_function(subquery),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => twj_has_tvf(table_with_joins),
+            // Unknown/exotic factors are treated as carrying one — fail closed.
+            _ => true,
+        }
+    }
+    fn twj_has_tvf(twj: &TableWithJoins) -> bool {
+        factor_has_tvf(&twj.relation) || twj.joins.iter().any(|j| factor_has_tvf(&j.relation))
+    }
+    fn set_expr_has_tvf(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(select) => select.from.iter().any(twj_has_tvf),
+            SetExpr::Query(q) => query_has_table_function(q),
+            // A set operation is not decomposed here; treat it as carrying one.
+            SetExpr::SetOperation { .. } => true,
+            _ => true,
+        }
+    }
+    // A CTE body can hide the UDTF the outer query then scans.
+    if let Some(with) = &query.with
+        && with
+            .cte_tables
+            .iter()
+            .any(|cte| query_has_table_function(&cte.query))
+    {
+        return true;
+    }
+    set_expr_has_tvf(&query.body)
+}
+
 fn query_join_bearing(query: &SqlQuery) -> bool {
     // Generic expression traversal covers scalar/IN/EXISTS subqueries in
     // projection, WHERE, HAVING, GROUP BY, ORDER BY, and other query clauses.
@@ -4969,6 +5039,51 @@ mod tests {
             panic!("expected query");
         };
         (**query).clone()
+    }
+
+    /// TD-USUB-3: the UDTF guard is a **security** boundary — it is what keeps a
+    /// governed (ABAC) session from being admitted to the DataFusion route when the
+    /// query also reaches an ungoverned source. A false negative here leaks rows, so
+    /// the guard must see a table function at every nesting level, and must fail
+    /// closed on shapes it does not decompose.
+    #[test]
+    fn table_function_guard_sees_udtfs_at_every_nesting_level() {
+        // Plain catalog tables: no UDTF, so a governed session may use the native route.
+        assert!(!query_has_table_function(&parse_query(
+            "SELECT id FROM users WHERE id = 1"
+        )));
+        assert!(!query_has_table_function(&parse_query(
+            "SELECT u.id FROM users u JOIN orders o ON u.id = o.uid"
+        )));
+        assert!(!query_has_table_function(&parse_query(
+            "WITH hot AS (SELECT id FROM users) SELECT id FROM hot"
+        )));
+        assert!(!query_has_table_function(&parse_query(
+            "SELECT id, rank() OVER (ORDER BY id) FROM users"
+        )));
+
+        // Bare UDTF in FROM.
+        assert!(query_has_table_function(&parse_query(
+            "SELECT * FROM vector_search('c', '[0.1]', 5)"
+        )));
+        // UDTF on the right of a join — the mixed governed/ungoverned shape.
+        assert!(query_has_table_function(&parse_query(
+            "SELECT u.id FROM users u JOIN vector_search('c', '[0.1]', 5) v ON u.id = v.id"
+        )));
+        // UDTF inside a derived table.
+        assert!(query_has_table_function(&parse_query(
+            "SELECT * FROM (SELECT id FROM graph_traverse('g', 'n1', 'E', 2)) t"
+        )));
+        // UDTF hidden in a CTE body the outer query then scans — the case a
+        // FROM-clause-only check would miss.
+        assert!(query_has_table_function(&parse_query(
+            "WITH v AS (SELECT * FROM timeseries_range('c', 0, 100)) SELECT * FROM v"
+        )));
+
+        // Fail-closed: a set-op body is not decomposed, so it counts as carrying one.
+        assert!(query_has_table_function(&parse_query(
+            "SELECT id FROM users UNION ALL SELECT id FROM orders"
+        )));
     }
 
     #[test]
