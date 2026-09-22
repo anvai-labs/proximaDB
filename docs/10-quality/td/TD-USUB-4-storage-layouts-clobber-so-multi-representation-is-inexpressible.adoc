@@ -86,12 +86,12 @@ names publication staleness as a live design constraint — one of the three rea
 in PAX, publish Parquet" was rejected as the architecture — so a silent change to that
 default should trip a test rather than surprise someone.
 
-=== Still open (was step 2 of the original plan)
+=== Scope note — the primary/landing marker moved, not dropped
 
-A designated **primary/landing** layout is not yet modelled: with one layout the default is
-unambiguous, and inventing a primary marker before a second representation actually exists
-would be speculative. It belongs with the first change that creates two representations for
-one table — TD-USUB-10 (incremental publication) or the TD-USUB-1 slice-2 durable store.
+Step 2 of the original plan ("preserve a designated primary/landing layout") is intentionally
+**not** part of this TD. With a single layout the default is unambiguous, so a primary marker
+before a second representation exists would be speculative design. It is carried forward on
+**TD-USUB-10**, the first change that actually creates two representations for one table.
 
 == Original plan (superseded by the resolution above)
 

@@ -52,6 +52,29 @@ through the `snapshot_lsn` delta merge (`read_changes_since_scoped`, `:860`/`:87
 Retain `ALTER TABLE … MATERIALIZE` as an explicit user-invoked hint throughout; this TD
 changes how publication *works*, not who triggers it.
 
+== Inherited scope — the primary/landing layout marker (from TD-USUB-4)
+
+TD-USUB-4 made publication **additive**, so a table *can* now hold more than one storage
+layout. It deliberately did **not** model a designated **primary/landing** layout: with a
+single layout the default is unambiguous, and inventing a primary marker before a second
+representation existed would have been speculative design.
+
+This TD is the first change that genuinely creates two representations for one table
+(multi-object incremental publication alongside the landing format), so it inherits that
+scope:
+
+* Mark one layout as the **landing/primary** representation, so reads have a deterministic
+  default when no cost signal is available — ADR-094 Decision 1 makes the landing format,
+  chosen by modality, the natural primary.
+* Teach the read predicates to prefer the primary rather than the **first match**, which is
+  what `catalog_table_is_parquet_backed` (`.iter().find_map`) and
+  `catalog_table_is_pax_backed` (`.iter().any`) do today.
+* Keep `snapshot_lsn` per layout — TD-USUB-4 already carries it through the upsert — so a
+  non-primary representation's staleness stays explicit.
+
+Without this, *"which representation answers when the cost model has no sample?"* is decided
+by list order: an accident rather than a decision.
+
 == Evidence gate (mandate #6)
 
 * Republication cost measured as a function of delta size, demonstrating O(delta) rather than
