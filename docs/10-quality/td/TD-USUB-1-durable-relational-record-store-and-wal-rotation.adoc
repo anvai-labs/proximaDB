@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). Slice 2 (durable store + WAL rotation) remains open.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Open:** wiring 2a into the production partition factory, slice 2b (WAL truncation), slice 2c (compaction).
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -115,6 +115,48 @@ A further prerequisite for 2a: `storage_factory` is `Fn() -> Arc<dyn RecordStora
 derive its own `DrPathBuilder` path. The signature must take `(tenant_id, collection)`. Note
 the shared-mode probe at `:1991` calls the factory purely for an `Arc::ptr_eq` comparison and
 must be updated with it.
+
+== Slice 2a as landed (2026-09-22)
+
+`src/services/record_spill.rs` — `SpillRecordStorage`, implementing the existing
+`RecordStore` + `RecordScan` traits so no caller signature changes.
+
+* **Flush** at a resident-row threshold: infer the schema from the resident rows
+  (`infer_proxima_schema`), encode with TD-USUB-11's system-column encoder, write one
+  fresh-named Parquet object, then evict. Resident rows are dropped only **after** the
+  object is durable; a crash before that leaves them resident and the WAL replays them
+  either way.
+* **Read-merge** over `memtable ∪ segments`: memtable wins (strictly newer), a newer segment
+  wins over an older one, tombstones suppress. Segments are decoded through
+  `read_segment_records` — the canonical mixed-format router, which can decode Parquet only
+  because TD-USUB-5 added the `PAR1` arm. The three slices compose exactly as ADR-094
+  intended.
+* **Tombstones** because a segment is immutable: once flushed, a row can only be suppressed,
+  not removed. Re-inserting an oid clears its tombstone.
+* **Default OFF** (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` unset ⇒ never flush), so the
+  shipped behaviour is the plain memtable's.
+
+=== What it bounds, stated honestly
+
+Resident memory **within a process run** — the operational failure mode, since the process is
+OOM-killed long before it restarts. It does **not** bound the heap across restarts: the WAL
+is still authoritative and replay repopulates the memtable in full. That needs slice 2b.
+
+Keeping truncation out is precisely what makes 2a **unable to lose data**: recovery is
+byte-for-byte what it is today, and a segment is a read-side representation of rows the WAL
+already made durable. Deleting every segment would leave the store correct after replay.
+
+=== Known costs, not hidden
+
+* `merged_records` reads **every segment on every scan**. Bounding that needs compaction plus
+  a per-segment oid index — slice 2c. Acceptable here only because the path is default-OFF.
+* Tombstones are in-memory. They are rebuilt by WAL replay (a delete is a WAL entry), so they
+  are not a durability hole today — but slice 2b must persist them into the segment/catalog
+  before truncation removes the WAL entries that reconstruct them. **This is a hard
+  precondition on 2b, recorded here so it is not discovered late.**
+* Segment registration in the catalog (additive layouts, TD-USUB-4) is **not** wired yet;
+  segments are tracked in memory. Catalog registration is required before truncation can
+  reference a segment, i.e. also a 2b precondition.
 
 == How to apply (slice 2 — the durable store)
 
