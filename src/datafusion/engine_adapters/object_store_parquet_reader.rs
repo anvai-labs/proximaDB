@@ -550,6 +550,10 @@ pub struct ObjectStoreParquetTable {
     stats_trust: proximadb_data_model::StatsTrust,
 }
 
+/// Metadata subdirectory beneath the table base, matching the writer's
+/// `format!("{prefix}/metadata")` in `materialize_table_to_parquet`.
+const METADATA_SUBPREFIX: &str = "metadata";
+
 impl ObjectStoreParquetTable {
     /// Open either a ProximaDB base-prefix location (`data/*.parquet`) or a
     /// direct external `.parquet` object.
@@ -560,7 +564,67 @@ impl ObjectStoreParquetTable {
         Self::open_bridge_base(location).await
     }
 
+    /// Derive the table base from a published data location.
+    ///
+    /// Publication writes parquet to `{base}/data/` and Iceberg metadata to the
+    /// SIBLING `{base}/metadata/` (`materialize_table_to_parquet`), so the
+    /// manifest is only reachable from the base, never from the data dir itself.
+    /// `None` for anything that is not that shape — an external parquet
+    /// directory has no manifest and must keep using the listing path.
+    fn table_base_of(location: &str) -> Option<String> {
+        let trimmed = location.trim_end_matches('/');
+        trimmed
+            .strip_suffix("/data")
+            .map(|base| base.to_string())
+            .filter(|base| !base.is_empty())
+    }
+
+    /// TD-USUB-10 slice 0 — select data files from the **snapshot manifest**
+    /// rather than by listing the directory.
+    ///
+    /// Listing takes every `*.parquet` present, which is correct today only
+    /// because publication writes ONE object at a FIXED name and overwrites it,
+    /// so "every parquet present" and "the current snapshot" are the same set.
+    /// Incremental publication breaks that identity in both directions:
+    /// fresh-name writes accumulate generations, and a re-publish with fewer
+    /// parts leaves a stale tail — and a listing reader would silently UNION
+    /// them into one answer. Reading the manifest is what makes those schemes
+    /// expressible at all.
+    ///
+    /// Returns `None` — falling back to listing — whenever the manifest cannot
+    /// be used: a non-published layout, no metadata yet, an unreadable or empty
+    /// snapshot. That fallback is what keeps this mixed-read-safe, and it is
+    /// also why enabling it changes nothing today: with a single fixed-name
+    /// object, the manifest lists exactly what listing would find.
+    async fn manifest_selected_files(
+        location: &str,
+    ) -> Option<(Arc<IcebergObjectStoreBridge>, Vec<Path>)> {
+        let base = Self::table_base_of(location)?;
+        let bridge = Arc::new(IcebergObjectStoreBridge::from_url(&base).ok()?);
+        let version = bridge
+            .latest_metadata_version(METADATA_SUBPREFIX)
+            .await
+            .ok()??;
+        let mut paths: Vec<Path> = bridge
+            .read_iceberg_snapshot(METADATA_SUBPREFIX, version)
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|p| p.as_ref().ends_with(".parquet"))
+            .collect();
+        if paths.is_empty() {
+            return None;
+        }
+        paths.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        Some((bridge, paths))
+    }
+
     async fn open_bridge_base(location: &str) -> DFResult<Self> {
+        // Manifest first; listing is the fallback (see `manifest_selected_files`).
+        if let Some((bridge, paths)) = Self::manifest_selected_files(location).await {
+            return Self::open_relative(bridge, paths, location).await;
+        }
+
         let bridge = Arc::new(
             IcebergObjectStoreBridge::from_url(location)
                 .map_err(|e| df_err(&format!("object-store bridge({location})"), e))?,
@@ -595,6 +659,18 @@ impl ObjectStoreParquetTable {
             ));
         }
 
+        Self::open_relative(bridge, parquet_paths, location).await
+    }
+
+    /// Resolve bridge-relative parquet paths to full keys and open them.
+    ///
+    /// Shared by the manifest and listing paths so both resolve identically —
+    /// the only difference between them is WHICH files were chosen.
+    async fn open_relative(
+        bridge: Arc<IcebergObjectStoreBridge>,
+        parquet_paths: Vec<Path>,
+        location: &str,
+    ) -> DFResult<Self> {
         // Wrap the store so footer + row-group reads land in the per-query
         // I/O trace (ADR-030/TD-158) — the DataFusion route's bytes-scanned
         // was previously invisible to the co-design cost model.
@@ -1490,6 +1566,113 @@ mod tests {
         let table = ObjectStoreParquetTable::open(&location).await.unwrap();
         assert_eq!(table.split_count(), 2);
         assert_eq!(table.schema().fields().len(), 2);
+    }
+
+    /// TD-USUB-10 slice 0 — **the decisive test.** When a snapshot manifest
+    /// exists, file selection comes from the manifest, so a parquet object that
+    /// is present on disk but NOT in the snapshot is excluded.
+    ///
+    /// Directory listing would union it. That is exactly the failure incremental
+    /// publication would otherwise introduce: fresh-name writes accumulate
+    /// generations, and a re-publish with fewer parts leaves a stale tail — and a
+    /// listing reader silently merges them into one wrong answer. Nothing errors;
+    /// the row set is simply from several generations at once.
+    #[tokio::test]
+    async fn manifest_selection_excludes_a_parquet_not_in_the_snapshot() {
+        use proximadb_storage_common::object_store_bridge::{
+            IcebergSnapshotField, ObjectStoreBridge,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        write_two_row_group_parquet(&data_dir.join("part-0.parquet"));
+
+        // Publish a snapshot while ONLY part-0 exists, so the manifest names it alone.
+        let base_url = format!("file://{}", tmp.path().display());
+        let bridge = IcebergObjectStoreBridge::from_url(&base_url).unwrap();
+        let fields = vec![
+            IcebergSnapshotField {
+                id: 1,
+                name: "k".into(),
+                type_name: "string".into(),
+                required: true,
+            },
+            IcebergSnapshotField {
+                id: 2,
+                name: "x".into(),
+                type_name: "long".into(),
+                required: true,
+            },
+        ];
+        bridge
+            .publish_iceberg_table(
+                &Path::from("data"),
+                METADATA_SUBPREFIX,
+                "00000000-0000-0000-0000-000000000001",
+                &format!("{base_url}/data"),
+                &fields,
+                1,
+                1,
+                true,
+            )
+            .await
+            .expect("publish snapshot");
+
+        // NOW add a stray object the snapshot does not reference — a stale part
+        // from an earlier/later generation.
+        write_two_row_group_parquet(&data_dir.join("part-9-stale.parquet"));
+
+        let location = format!("{base_url}/data");
+        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+
+        // 2 row groups from part-0 ONLY. Listing would have produced 4.
+        assert_eq!(
+            table.split_count(),
+            2,
+            "manifest-driven selection must exclude the unreferenced parquet; \
+             a listing reader would union it and return two generations of rows"
+        );
+    }
+
+    /// Control: with no metadata present, selection falls back to listing —
+    /// today's behaviour, and what keeps this mixed-read-safe for external
+    /// parquet directories and for tables published before manifests existed.
+    #[tokio::test]
+    async fn without_a_manifest_selection_falls_back_to_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        write_two_row_group_parquet(&data_dir.join("part-0.parquet"));
+        write_two_row_group_parquet(&data_dir.join("part-1.parquet"));
+
+        let location = format!("file://{}/data", tmp.path().display());
+        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        assert_eq!(
+            table.split_count(),
+            4,
+            "no manifest ⇒ list the directory, which sees both objects"
+        );
+    }
+
+    /// Only the published `{base}/data` shape can reach a sibling `metadata/`
+    /// directory, so anything else must not attempt manifest selection.
+    #[test]
+    fn table_base_is_derived_only_from_a_data_location() {
+        assert_eq!(
+            ObjectStoreParquetTable::table_base_of("file:///w/t/data"),
+            Some("file:///w/t".to_string())
+        );
+        assert_eq!(
+            ObjectStoreParquetTable::table_base_of("file:///w/t/data/"),
+            Some("file:///w/t".to_string())
+        );
+        // Not a published data dir — external parquet directory.
+        assert_eq!(ObjectStoreParquetTable::table_base_of("file:///w/t"), None);
+        assert_eq!(
+            ObjectStoreParquetTable::table_base_of("file:///w/t/other"),
+            None
+        );
     }
 
     #[tokio::test]
