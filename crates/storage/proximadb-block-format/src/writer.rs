@@ -703,6 +703,48 @@ impl PaxBlockWriter {
             cursor += s.meta.stripe_len;
         }
 
+        // ---- P-Shred self-describing directory (TD-USUB-6 slice 2a) ----
+        // Emit the block's OWN (col_id -> prop_key) map so reconstruction is
+        // driven by what was WRITTEN, not by a caller-supplied positional key
+        // list that can drift with schema evolution. Carries no stripe
+        // (`stripe_len == 0`); the payload rides the footer-extras region via the
+        // existing pointer pair, so this is additive in v2.
+        let mut shred_dir_payload: Vec<u8> = Vec::new();
+        if !self.shred_spec.is_empty() {
+            let dir: Vec<(i32, String)> = self
+                .shred_spec
+                .iter()
+                .map(|(key, col)| (*col, key.clone()))
+                .collect();
+            let payload = rmp_serde::to_vec(&dir)?;
+            let meta = ColumnMeta {
+                column_id: col_id::SHRED_DIRECTORY,
+                // Opaque msgpack, like PROPS — deliberately NOT a new role byte,
+                // which an older build's `ColumnRole::from_u8` would reject and
+                // so would break mixed reads of v2 blocks.
+                role: ColumnRole::Props,
+                data_type_id: 0xff,
+                encoding_id: 0,
+                nullable: false,
+                has_bloom: false,
+                is_sorted: false,
+                is_lz4_compressed: false,
+                stripe_offset: 0,
+                stripe_len: 0,
+                null_count: 0,
+                distinct_hint: 0,
+                min_val: [0u8; 16],
+                max_val: [0u8; 16],
+                bloom_offset: 0,
+                bloom_len: 0,
+            };
+            // Pointer fields are filled after the bloom loop below so that
+            // `has_bloom` stays FALSE — this entry has no bloom, it only borrows
+            // the pointer pair.
+            stripes.push(ColumnStripe::new(meta, Vec::new()));
+            shred_dir_payload = payload;
+        }
+
         // ---- Build column footer and footer-resident pruning payloads ----
         let col_footer_offset = cursor;
         let mut footer_extra_bytes = Vec::new();
@@ -714,6 +756,18 @@ impl PaxBlockWriter {
                 s.meta.bloom_len = s.bloom.len() as u32;
                 footer_extra_bytes.extend_from_slice(&s.bloom);
             }
+        }
+
+        // Place the shred directory in the same footer-extras region, addressed
+        // by the same pointer pair but WITHOUT claiming a bloom filter.
+        if !shred_dir_payload.is_empty()
+            && let Some(dir_stripe) = stripes
+                .iter_mut()
+                .find(|s| s.meta.column_id == col_id::SHRED_DIRECTORY)
+        {
+            dir_stripe.meta.bloom_offset = (bloom_base_offset + footer_extra_bytes.len()) as u32;
+            dir_stripe.meta.bloom_len = shred_dir_payload.len() as u32;
+            footer_extra_bytes.extend_from_slice(&shred_dir_payload);
         }
 
         let mut col_footer_bytes =
@@ -2268,6 +2322,104 @@ mod tests {
         assert_eq!(
             record.props, original_props,
             "shredding must preserve the full props tail byte-for-byte (clone-not-remove)"
+        );
+    }
+
+    /// TD-USUB-6 slice 2a: the block names its OWN shredded columns.
+    ///
+    /// Without this, `FlatRow::into_record` names user columns from the CALLER's
+    /// `user_column_keys`, positionally — so a short, stale or reordered caller
+    /// list silently drops values. That is harmless while the msgpack tail is
+    /// complete, and becomes silent data loss the moment the tail is reduced to a
+    /// residual (slice 2b). This test proves the naming can come from the block
+    /// instead, which is the precondition for reducing the tail at all.
+    #[test]
+    fn block_carries_its_own_shred_directory() {
+        use crate::reader::PaxBlockReader;
+        let rec = record_with_props("d1", 100);
+
+        let spec = vec![
+            ("status".to_string(), col_id::USER_BASE),
+            ("age".to_string(), col_id::USER_BASE + 1),
+        ];
+        let mut w = PaxBlockWriter::new(BlockMode::Pax, BlockCompression::None, "c", 0, 0)
+            .with_shred_spec(spec.clone());
+        w.add_record(&rec).unwrap();
+        let block = w.flush().unwrap();
+
+        let reader = PaxBlockReader::open(&block).unwrap();
+        let dir = reader
+            .shred_directory()
+            .expect("a block written with a shred spec must carry its directory");
+
+        // The directory is (col_id, prop_key) and must mirror the spec exactly —
+        // including the ids, since position is precisely what must stop mattering.
+        let expected: Vec<(i32, String)> = spec.iter().map(|(k, c)| (*c, k.clone())).collect();
+        assert_eq!(dir, expected);
+
+        // Naming is now answerable WITHOUT any caller-supplied key list — the
+        // property that makes a residual tail safe.
+        let name_of = |col: i32| dir.iter().find(|(c, _)| *c == col).map(|(_, k)| k.as_str());
+        assert_eq!(name_of(col_id::USER_BASE), Some("status"));
+        assert_eq!(name_of(col_id::USER_BASE + 1), Some("age"));
+    }
+
+    /// A block written with NO shred spec carries no directory, and asking for one
+    /// is a clean `None` rather than an error — every v2 block on disk today is
+    /// this shape, so the caller-key fallback must stay reachable.
+    #[test]
+    fn no_shred_spec_means_no_directory_and_no_error() {
+        use crate::reader::PaxBlockReader;
+        let rec = record_with_props("d1", 100);
+        let mut w = PaxBlockWriter::new(BlockMode::Pax, BlockCompression::None, "c", 0, 0);
+        w.add_record(&rec).unwrap();
+        let block = w.flush().unwrap();
+
+        let reader = PaxBlockReader::open(&block).unwrap();
+        assert!(reader.shred_directory().is_none());
+    }
+
+    /// The directory must not disturb what was already there: the full props tail
+    /// still round-trips, and the shredded stripes still decode. It is additive in
+    /// v2 — no version bump, no footer growth, no new `ColumnRole` byte.
+    #[test]
+    fn shred_directory_is_additive_and_disturbs_nothing() {
+        use crate::reader::PaxBlockReader;
+        let rec = record_with_props("d1", 100);
+        let original_props = rec.props.clone();
+
+        let spec = vec![("status".to_string(), col_id::USER_BASE)];
+        let mut w = PaxBlockWriter::new(BlockMode::Pax, BlockCompression::None, "c", 0, 0)
+            .with_shred_spec(spec);
+        w.add_record(&rec).unwrap();
+        let block = w.flush().unwrap();
+
+        let reader = PaxBlockReader::open(&block).unwrap();
+        assert_eq!(
+            reader.header().format_version,
+            crate::FORMAT_VERSION,
+            "the directory must NOT require a format bump"
+        );
+        assert!(reader.shred_directory().is_some());
+
+        // The tail is still complete and byte-identical.
+        let flat = FlatRow::from_block_reader(&reader).unwrap().remove(0);
+        let record = flat.into_record(&[], &[], None).unwrap();
+        assert_eq!(record.props, original_props);
+
+        // The directory entry itself claims no bloom and no stripe.
+        let meta = reader
+            .column_metas()
+            .iter()
+            .find(|m| m.column_id == col_id::SHRED_DIRECTORY)
+            .expect("directory meta present");
+        assert_eq!(
+            meta.stripe_len, 0,
+            "the directory carries no per-row stripe"
+        );
+        assert!(
+            !meta.has_bloom,
+            "it borrows the pointer pair, it is not a bloom"
         );
     }
 
