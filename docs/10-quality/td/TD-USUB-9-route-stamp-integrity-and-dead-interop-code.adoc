@@ -161,3 +161,29 @@ physical format that the route does not produce. The slot is a plain
 no Parquet is written on INSERT and no Iceberg manifest is involved; publication is the
 separate, explicit `ALTER TABLE … MATERIALIZE` step. The route selects a *destination slot*,
 not a format, and the name now says only that.
+
+=== Correction: a test encoded the defect (found in CI, not locally)
+
+The first push failed `Rust Tests (unit)` on
+`src/datafusion/pax_olap_tests.rs::pax_backed_shape_routes_to_datafusion_under_gate`, which
+asserted *"PAX-backed analytical shape + gate ON must route DataFusion"* — precisely the
+behaviour removed here.
+
+Before changing it, the claim was re-verified against source rather than assumed: the pgwire
+dispatch gate is
+`((!relational_abac_required && parquet_backed) || native_registerable) && matches!(decision.backend, …)`
+(`relational_pipeline.rs`). For `pax_backed: true, parquet_backed: false` with no native
+registration, the DataFusion block is never entered and **Volcano serves**. The test therefore
+pinned a stamp that dispatch never honoured — it encoded the defect, in the same way the
+`storage_layouts.len() == 1` assertions did in TD-USUB-4.
+
+It was **rewritten, not deleted**, to assert the truthful property (the stamp equals the
+backend that serves), keeping `PROXIMADB_DF_PAX_READER=1` set because "gate on" is exactly the
+case the old code got wrong. Its sibling control 2.8b was also corrected: it claimed to prove
+"the `pax_backed` flag flips the route", which is no longer true of anything, so its stated
+rationale was replaced with what it actually guards.
+
+**Process lesson (recurrence).** The pre-change search for dependants was scoped to `tests/`
+and `compute_scheduler.rs`; this test lives in `src/datafusion/`. A behaviour-removal change
+must sweep **all of `src/`**, and must be validated with a full `--lib` run rather than a
+module-filtered one — the same filtered-run trap recorded in TD-USUB-4.
