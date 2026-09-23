@@ -170,3 +170,51 @@ bloom). 93/93 in the crate including the rabitq recall@10 ratchet.
 populate `user_columns` at all today (documented as a follow-up in its own doc comment), so
 there is nothing to name until the residual reader exists. Consuming it — preferring the
 block's directory over caller keys, falling back when absent — is slice 2b's first step.
+
+=== Slice 2b design correction (2026-09-23): the residual tail needs the DECLARED type
+
+Starting 2b surfaced that "How to apply" step 3 — *"column type comes from the catalog schema,
+not from first-value inference"* — is not a refinement. It is **load-bearing**, and the
+current writer cannot satisfy it. Three verified facts:
+
+. **Stripe typing is inferred from the first non-null value.** `build_shred_stripe` is
+  `match vals.iter().flatten().next().map(shred_class)`, and every other row is then coerced
+  with `.and_then(pv_to_i64 | pv_to_f64 | pv_to_str)` — a non-conforming value becomes
+  **`None`**. Harmless while the tail is complete; under a residual tail that value is simply
+  **gone**.
+. **Even a SUCCESSFUL coercion loses the variant.** `shred_class` folds every integer-like and
+  temporal value into one i64 class, so `Int32` reconstructs as `Int64`. The round trip is
+  type-lossy even on the happy path.
+. **A variant tag in the directory is not enough.** `ProximaValue` has ~25 variants and several
+  carry extra state — `Time(i64, TimeUnit)`, `Timestamp`, `TimestampTz` — which no physical
+  class preserves. A one-byte tag cannot reconstruct them.
+
+So type fidelity, unlike **naming**, cannot be solved by making the block self-describing.
+Slice 2a could record what it wrote because the writer knew the key. It does not know the
+declared type: `with_shred_spec` takes `Vec<(String, i32)>` — name and column id only.
+
+==== Consequent prerequisite for 2b
+
+**Plumb the declared `ProximaType` from `CatalogTableSchema` into the shred spec**, through
+`with_shred_spec` and its production callers (`src/services/record_store.rs`,
+`src/storage/engines/sst/segment_format.rs`, and the `pax_block.rs` wrapper), and record it in
+the shred directory alongside the key. Reconstruction then rebuilds the declared variant
+rather than whichever physical class the value was coerced into.
+
+==== And a better rule than the filed one
+
+Step 3 says a non-conforming value should be **a write error**. That is the wrong trade for a
+schemaless `props` tree: it turns a legal heterogeneous prop set into a failed write.
+
+Prefer: **the residual carries exactly what the stripe did not take losslessly.** Per row, per
+key — if the value round-trips exactly under the declared type, drop it from the tail;
+otherwise keep it. Losslessness then holds **by construction** rather than by type discipline,
+heterogeneous keys degrade gracefully instead of failing, and the losslessness ratchet becomes
+a property of the encoding rather than a hope about the data.
+
+==== Status
+
+2b is **not** implemented. The directory (2a) and the version dispatch (slice 1) are in place;
+the declared-type plumbing above is the remaining prerequisite. Implementing 2b without it
+would silently change column types on read — which the TD's own losslessness gate forbids, and
+which no existing test would catch, because nothing reconstructs user columns today.
