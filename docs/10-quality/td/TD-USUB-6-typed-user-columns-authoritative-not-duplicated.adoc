@@ -218,3 +218,56 @@ a property of the encoding rather than a hope about the data.
 the declared-type plumbing above is the remaining prerequisite. Implementing 2b without it
 would silently change column types on read — which the TD's own losslessness gate forbids, and
 which no existing test would catch, because nothing reconstructs user columns today.
+
+=== Declared-type plumbing landed (2026-09-23) — and a NARROWING of the end-state
+
+The prerequisite from the previous section is done: `ShredColumn { key, column_id,
+declared_type: Option<ProximaType> }` replaces the bare `(String, i32)` pair, and the shred
+directory records the declared type beside the key.
+
+**The `Option` is the finding, not an implementation convenience.** The two production paths
+that shred are not equally informed:
+
+[cols="1,2,1", options="header"]
+|===
+| Path | Declared type available | Exact reconstruction
+| Relational (`record_store.rs`) | full `ProximaType` from `CatalogColumn`, already resolved at the call site | **possible**
+| Vector/SST flush (`flush/mod.rs`) | only the v1 `FilterableDataType` from `filterable_columns` | **impossible**
+|===
+
+`FilterableDataType` is **coarse**: `FilterableInteger` carries no width and
+`FilterableDatetime` no `TimeUnit`, so it cannot distinguish `Int32` from `Int64`, or
+`Timestamp(Millis)` from `Timestamp(Micros)`. A typed stripe stores one of three physical
+classes (i64/f64/string), so without an exact declared type there is nothing that says which
+variant to rebuild.
+
+==== Consequence: "declared columns authoritative" cannot be uniform
+
+ADR-094 spec §2.1 and this TD's headline both read as a global property. They cannot be. The
+end-state is narrower, and the narrowing is structural rather than a matter of sequencing:
+
+**Declared columns may become authoritative ONLY for columns carrying an exact declared type.
+Everywhere else the typed stripe stays an advisory pruning index and the msgpack `PROPS` tail
+stays complete — indefinitely, not "until a later slice".**
+
+Which also means the write-amplification win this TD is justified on applies to the relational
+arm, and *not* to the SST/vector arm, unless that arm later gains an exact per-column type.
+That should be measured per-path rather than claimed globally.
+
+This is recorded in the code too: `with_shred_spec` is retained as a shim that produces
+`declared_type: None`, so a path that cannot declare exactly cannot accidentally be treated as
+one that can. `untyped_shim_records_no_declared_type` pins that.
+
+**Evidence:** `directory_records_the_declared_type_when_the_caller_has_one` (exact type
+round-trips; absence is recorded rather than guessed) and `untyped_shim_records_no_declared_type`.
+95/95 in the crate including the rabitq recall@10 ratchet.
+
+==== Noted overlap, for whoever does 2b
+
+A **segment-level** `shred_field_map` already exists in the PAX segment footer (TD-FPRUNE-1
+P2), mapping field name → col-id for filtered reads. It overlaps in content with the
+**block-level** shred directory added in slice 2a, but differs in scope and guarantee: the
+footer map is gated behind `footer_stats_enabled()` and lives once per segment, whereas the
+block directory is ungated and self-contained, which is what reconstruction requires. Worth a
+deliberate decision in 2b whether the two should converge; they should not both grow
+independently.

@@ -5033,7 +5033,7 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
         // policy — each promoted prop key maps to a typed user-column (by name → id). Sorted by
         // column id for deterministic stripe layout. Empty ⇒ no shredding (byte-for-byte today's
         // output). The msgpack PROPS tail stays authoritative; these columns are a pruning index.
-        let mut shred_spec: Vec<(String, i32)> = schema
+        let mut shred_spec: Vec<proximadb_block_format::ShredColumn> = schema
             .props_auto_promotion
             .promoted_keys
             .iter()
@@ -5042,10 +5042,21 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
                     .columns
                     .iter()
                     .find(|c| &c.name == col_name)
-                    .map(|c| (prop_key.clone(), c.id))
+                    // TD-USUB-6: carry the EXACT declared type, not just the id.
+                    // This path resolves against `CatalogTableSchema`, so it knows
+                    // `Int32` from `Int64` and `Timestamp(Micros)` from
+                    // `Timestamp(Millis)` — the only paths that do can ever make a
+                    // typed stripe authoritative.
+                    .map(|c| {
+                        proximadb_block_format::ShredColumn::typed(
+                            prop_key.clone(),
+                            c.id,
+                            c.data_type.clone(),
+                        )
+                    })
             })
             .collect();
-        shred_spec.sort_by_key(|(_, id)| *id);
+        shred_spec.sort_by_key(|c| c.column_id);
         let mut writer = PaxSegmentWriter::new(
             &local_path,
             BlockMode::Pax,
@@ -5055,7 +5066,7 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
             embedding_count_for_records(&records),
             None,
         )
-        .with_shred_spec(shred_spec);
+        .with_shred_columns(shred_spec);
         for record in &records {
             writer.add_record(record).map_err(|err| {
                 anyhow!(
