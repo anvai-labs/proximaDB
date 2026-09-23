@@ -918,7 +918,7 @@ pub struct PaxSegmentWriter {
     record_version_stripe: bool,
     /// P-Shred (ADR-055): `(prop_key, user_col_id)` to shred into typed user-columns —
     /// re-applied to every block writer so all blocks in the segment shred uniformly.
-    shred_spec: Vec<(String, i32)>,
+    shred_spec: Vec<proximadb_block_format::ShredColumn>,
 
     current_writer: PaxBlockWriter,
     index: SegmentIndex,
@@ -1170,7 +1170,18 @@ impl PaxSegmentWriter {
     /// P-Shred (ADR-055): shred the given props keys `(prop_key, user_col_id)` into
     /// typed user-columns for every block in this segment. Builder form mirroring
     /// [`with_quant`]; empty ⇒ no shredding (byte-for-byte today's output).
-    pub fn with_shred_spec(mut self, spec: Vec<(String, i32)>) -> Self {
+    pub fn with_shred_spec(self, spec: Vec<(String, i32)>) -> Self {
+        // Coarse/unknown declared types (SST flush path) — see `ShredColumn`.
+        self.with_shred_columns(
+            spec.into_iter()
+                .map(|(key, id)| proximadb_block_format::ShredColumn::untyped(key, id))
+                .collect(),
+        )
+    }
+
+    /// Declare shred columns with their exact types where the caller has them
+    /// (TD-USUB-6) — the relational path resolves them from `CatalogTableSchema`.
+    pub fn with_shred_columns(mut self, spec: Vec<proximadb_block_format::ShredColumn>) -> Self {
         self.shred_spec = spec;
         self.current_writer = self.fresh_block_writer();
         self
@@ -1299,7 +1310,7 @@ impl PaxSegmentWriter {
         .with_record_version(self.record_version_stripe)
         .with_hoist_vector_tier(self.coalesced_rabitq)
         .with_suppress_rgdir(self.rg_layout)
-        .with_shred_spec(self.shred_spec.clone())
+        .with_shred_columns(self.shred_spec.clone())
     }
 
     /// Encoding-aware per-row byte estimate (uncompressed). Controls the block
@@ -1952,7 +1963,13 @@ impl PaxSegmentWriter {
             // filtered read resolves a user-tag field name → col-id with no
             // catalog lookup. Gated with the footer stats (useless without them).
             shred_field_map: if footer_stats_enabled() {
-                self.shred_spec.clone()
+                // The SEGMENT footer's map is (name -> col_id) only; the exact
+                // declared type lives in the per-BLOCK shred directory, which is
+                // ungated and self-contained.
+                self.shred_spec
+                    .iter()
+                    .map(|c| (c.key.clone(), c.column_id))
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -2472,7 +2489,13 @@ impl PaxSegmentWriter {
             // TD-FPRUNE-1 P2: self-describe shredded user columns (see the other
             // footer builder). Gated with the footer stats.
             shred_field_map: if footer_stats_enabled() {
-                self.shred_spec.clone()
+                // The SEGMENT footer's map is (name -> col_id) only; the exact
+                // declared type lives in the per-BLOCK shred directory, which is
+                // ungated and self-contained.
+                self.shred_spec
+                    .iter()
+                    .map(|c| (c.key.clone(), c.column_id))
+                    .collect()
             } else {
                 Vec::new()
             },

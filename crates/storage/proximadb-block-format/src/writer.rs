@@ -43,6 +43,74 @@ use crate::{
 /// Size of the trailing `BlockFooter` in bytes.
 pub const BLOCK_FOOTER_SIZE: usize = 32;
 
+/// One P-Shred column: which prop key goes to which typed stripe, and — when the
+/// caller can supply one — the EXACT declared type (TD-USUB-6).
+///
+/// `declared_type` is `Option` on purpose, because the two production paths that
+/// shred are not equally informed:
+///
+/// * The **relational** path resolves each key against `CatalogTableSchema` and
+///   therefore has a full [`ProximaType`] (`Int32`, `Timestamp(Micros)`, …).
+/// * The **vector/SST flush** path builds its spec from the v1
+///   `FilterableColumnSpec`, whose `FilterableDataType` is **coarse** —
+///   `FilterableInteger` carries no width, `FilterableDatetime` no `TimeUnit`.
+///   It cannot distinguish `Int32` from `Int64`, so it supplies `None`.
+///
+/// That distinction is load-bearing rather than cosmetic: a typed stripe stores
+/// one of three physical classes (i64 / f64 / string), so reconstructing the
+/// ORIGINAL `ProximaValue` variant is only possible where an exact declared type
+/// says what to rebuild. Where it is absent, the msgpack `PROPS` tail must stay
+/// complete and the stripe stays an advisory pruning index — which is why
+/// "declared columns authoritative" (ADR-094 spec §2.1) can only ever apply to
+/// the paths that declare exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShredColumn {
+    /// Prop key promoted into the stripe.
+    pub key: String,
+    /// Target stripe id (>= `col_id::USER_BASE`).
+    pub column_id: i32,
+    /// Exact declared type, when the caller has one.
+    pub declared_type: Option<proximadb_data_model::ProximaType>,
+}
+
+impl ShredColumn {
+    /// A column whose declared type is unknown or only coarsely known.
+    pub fn untyped(key: impl Into<String>, column_id: i32) -> Self {
+        Self {
+            key: key.into(),
+            column_id,
+            declared_type: None,
+        }
+    }
+
+    /// A column with an exact declared type from the catalog schema.
+    pub fn typed(
+        key: impl Into<String>,
+        column_id: i32,
+        declared_type: proximadb_data_model::ProximaType,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            column_id,
+            declared_type: Some(declared_type),
+        }
+    }
+}
+
+/// One entry of the on-disk shred directory (`col_id::SHRED_DIRECTORY`).
+///
+/// Serialized as msgpack. Readers that fail to parse it fall back to
+/// caller-supplied key lists, so extending this shape stays mixed-read-safe.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShredDirectoryEntry {
+    pub column_id: i32,
+    pub key: String,
+    /// `None` where the writer had no exact declared type — the signal that this
+    /// stripe can never be authoritative and the tail must stay complete.
+    #[serde(default)]
+    pub declared_type: Option<proximadb_data_model::ProximaType>,
+}
+
 /// Trailing block footer: encodes offsets for the column meta, row directory,
 /// and the v2 footer-resident side regions (vector params + row-group index).
 ///
@@ -211,7 +279,7 @@ pub struct PaxBlockWriter {
     /// the msgpack `PROPS` tail stays the source of truth (the reader reconstructs
     /// from the tail and ignores `USER_BASE+` columns), so this is additive and
     /// mixed-read-safe with no format-version bump.
-    shred_spec: Vec<(String, i32)>,
+    shred_spec: Vec<ShredColumn>,
     /// One buffer per `shred_spec` entry: the CLONED prop value per row (never
     /// removed from `props` — the tail must remain complete).
     user_col_buffers: Vec<Vec<Option<proximadb_data_model::ProximaValue>>>,
@@ -364,7 +432,19 @@ impl PaxBlockWriter {
     /// (`USER_BASE`+) for future zone-map/bloom pruning + projection pushdown, while
     /// keeping the full msgpack `PROPS` tail intact. `spec` is `(prop_key, col_id)`;
     /// empty ⇒ no shredding. Builder form mirroring [`with_quant`].
-    pub fn with_shred_spec(mut self, spec: Vec<(String, i32)>) -> Self {
+    pub fn with_shred_spec(self, spec: Vec<(String, i32)>) -> Self {
+        // Shim for callers whose declared type is unknown or only coarsely known
+        // (the SST flush path's `FilterableDataType`). Such columns can never be
+        // authoritative, so they carry `declared_type: None`.
+        self.with_shred_columns(
+            spec.into_iter()
+                .map(|(key, id)| ShredColumn::untyped(key, id))
+                .collect(),
+        )
+    }
+
+    /// Declare the shred columns with their exact types where known (TD-USUB-6).
+    pub fn with_shred_columns(mut self, spec: Vec<ShredColumn>) -> Self {
         self.user_col_buffers = vec![Vec::new(); spec.len()];
         self.shred_spec = spec;
         self
@@ -470,7 +550,8 @@ impl PaxBlockWriter {
         // above kept the FULL props tree in `props_bytes` (the source of truth), so
         // reading each key here with `.get(..).cloned()` — never `.remove(..)` —
         // guarantees the shredded column equals the tail value and loses nothing.
-        for (i, (key, _col_id)) in self.shred_spec.iter().enumerate() {
+        for (i, col) in self.shred_spec.iter().enumerate() {
+            let key = &col.key;
             let v = match record.props.get(key) {
                 Some(proximadb_records::ProximaTreeNode::Value(v)) => Some(v.clone()),
                 _ => None,
@@ -689,8 +770,8 @@ impl PaxBlockWriter {
             // projection index — the `PROPS` tail above is authoritative, so the
             // reader ignores these on reconstruction (mixed-read-safe). Empty spec ⇒
             // this loop is a no-op ⇒ byte-for-byte today's output.
-            for (i, (_key, col_id)) in self.shred_spec.iter().enumerate() {
-                stripes.push(self.build_shred_stripe(*col_id, &self.user_col_buffers[i])?);
+            for (i, col) in self.shred_spec.iter().enumerate() {
+                stripes.push(self.build_shred_stripe(col.column_id, &self.user_col_buffers[i])?);
             }
         }
 
@@ -711,10 +792,14 @@ impl PaxBlockWriter {
         // existing pointer pair, so this is additive in v2.
         let mut shred_dir_payload: Vec<u8> = Vec::new();
         if !self.shred_spec.is_empty() {
-            let dir: Vec<(i32, String)> = self
+            let dir: Vec<ShredDirectoryEntry> = self
                 .shred_spec
                 .iter()
-                .map(|(key, col)| (*col, key.clone()))
+                .map(|c| ShredDirectoryEntry {
+                    column_id: c.column_id,
+                    key: c.key.clone(),
+                    declared_type: c.declared_type.clone(),
+                })
                 .collect();
             let payload = rmp_serde::to_vec(&dir)?;
             let meta = ColumnMeta {
@@ -2355,13 +2440,82 @@ mod tests {
         // The directory is (col_id, prop_key) and must mirror the spec exactly —
         // including the ids, since position is precisely what must stop mattering.
         let expected: Vec<(i32, String)> = spec.iter().map(|(k, c)| (*c, k.clone())).collect();
-        assert_eq!(dir, expected);
+        let actual: Vec<(i32, String)> = dir.iter().map(|e| (e.column_id, e.key.clone())).collect();
+        assert_eq!(actual, expected);
 
         // Naming is now answerable WITHOUT any caller-supplied key list — the
         // property that makes a residual tail safe.
-        let name_of = |col: i32| dir.iter().find(|(c, _)| *c == col).map(|(_, k)| k.as_str());
+        let name_of = |col: i32| {
+            dir.iter()
+                .find(|e| e.column_id == col)
+                .map(|e| e.key.as_str())
+        };
         assert_eq!(name_of(col_id::USER_BASE), Some("status"));
         assert_eq!(name_of(col_id::USER_BASE + 1), Some("age"));
+    }
+
+    /// TD-USUB-6: the directory records the EXACT declared type when the caller
+    /// has one, and records its ABSENCE when the caller does not.
+    ///
+    /// That distinction is the whole point. A typed stripe stores one of three
+    /// physical classes (i64/f64/string), so `Int32` and `Int64` land in the same
+    /// stripe and are indistinguishable on read. Only a column with an exact
+    /// declared type can be reconstructed back to its original variant — and only
+    /// such a column can ever become authoritative. Columns without one must keep
+    /// a complete `PROPS` tail.
+    #[test]
+    fn directory_records_the_declared_type_when_the_caller_has_one() {
+        use crate::reader::PaxBlockReader;
+        use proximadb_data_model::ProximaType;
+
+        let rec = record_with_props("d1", 100);
+        let mut w = PaxBlockWriter::new(BlockMode::Pax, BlockCompression::None, "c", 0, 0)
+            .with_shred_columns(vec![
+                ShredColumn::typed("age", col_id::USER_BASE, ProximaType::Int32),
+                ShredColumn::untyped("status", col_id::USER_BASE + 1),
+            ]);
+        w.add_record(&rec).unwrap();
+        let block = w.flush().unwrap();
+
+        let reader = PaxBlockReader::open(&block).unwrap();
+        let dir = reader.shred_directory().expect("directory present");
+        assert_eq!(dir.len(), 2);
+
+        let age = dir.iter().find(|e| e.key == "age").expect("age entry");
+        assert_eq!(age.column_id, col_id::USER_BASE);
+        assert_eq!(
+            age.declared_type,
+            Some(ProximaType::Int32),
+            "an exact declared type must round-trip — Int32 must NOT come back as Int64"
+        );
+
+        let status = dir
+            .iter()
+            .find(|e| e.key == "status")
+            .expect("status entry");
+        assert_eq!(
+            status.declared_type, None,
+            "absence must be recorded, not guessed: this stripe can never be authoritative"
+        );
+    }
+
+    /// The `with_shred_spec` shim (the SST flush path, whose only declared type is
+    /// the coarse v1 `FilterableDataType`) yields untyped columns — so that path
+    /// can never be mistaken for one that declares exactly.
+    #[test]
+    fn untyped_shim_records_no_declared_type() {
+        use crate::reader::PaxBlockReader;
+        let rec = record_with_props("d1", 100);
+        let mut w = PaxBlockWriter::new(BlockMode::Pax, BlockCompression::None, "c", 0, 0)
+            .with_shred_spec(vec![("status".to_string(), col_id::USER_BASE)]);
+        w.add_record(&rec).unwrap();
+        let block = w.flush().unwrap();
+
+        let reader = PaxBlockReader::open(&block).unwrap();
+        let dir = reader.shred_directory().expect("directory present");
+        assert_eq!(dir.len(), 1);
+        assert_eq!(dir[0].key, "status");
+        assert_eq!(dir[0].declared_type, None);
     }
 
     /// A block written with NO shred spec carries no directory, and asking for one

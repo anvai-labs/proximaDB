@@ -116,4 +116,6 @@ pub use stripe::{BlockStats, COLUMN_META_SIZE, ColumnMeta, ColumnRole, ColumnStr
 pub use vparam::{
     QUANT_RABITQ, QUANT_RAW_F32, QUANT_SQ8, RaBitQColumn, VectorParamBlock, VectorParamEntry,
 };
-pub use writer::{BLOCK_FOOTER_SIZE, BlockFooter, PaxBlockWriter, VectorQuant};
+pub use writer::{
+    BLOCK_FOOTER_SIZE, BlockFooter, PaxBlockWriter, ShredColumn, ShredDirectoryEntry, VectorQuant,
+};

@@ -401,7 +401,7 @@ impl<'a> PaxBlockReader<'a> {
     /// The payload rides the footer-extras region addressed by the `ColumnMeta`
     /// pointer pair; it deliberately does NOT set `has_bloom`, so it is resolved
     /// here rather than through [`Self::read_bloom_raw`].
-    pub fn shred_directory(&self) -> Option<Vec<(i32, String)>> {
+    pub fn shred_directory(&self) -> Option<Vec<crate::writer::ShredDirectoryEntry>> {
         let meta = self
             .columns
             .iter()
