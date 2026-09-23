@@ -53,6 +53,32 @@ pub mod col_id {
     /// (the resolver's legacy version-1 sentinel), making this additive stripe
     /// mixed-read-safe.
     pub const RECORD_VERSION: i32 = 14;
+    /// Shred directory (ID 15) — the block's OWN record of which prop key each
+    /// `USER_BASE`+ stripe carries, as msgpack `Vec<(col_id, prop_key)>`
+    /// (TD-USUB-6 slice 2a).
+    ///
+    /// **Why the block must name its own columns.** `FlatRow::into_record`
+    /// otherwise names user columns from the CALLER's `user_column_keys`,
+    /// *positionally* — so a caller list that is short, stale or reordered
+    /// silently drops values. That is harmless while the msgpack `PROPS` tail is
+    /// complete (the tail already holds every value, so the typed stripes are
+    /// advisory). It becomes silent data loss the moment the tail is reduced to a
+    /// residual, which is the whole point of making declared columns
+    /// authoritative — and schema evolution is exactly when a caller's key list
+    /// and the block's stripes disagree.
+    ///
+    /// **This entry carries NO stripe** (`stripe_len == 0`). Its payload lives in
+    /// the footer-extras region, addressed by the `ColumnMeta` pointer pair
+    /// `bloom_offset`/`bloom_len` reused as a generic footer-payload pointer —
+    /// which is what lets the directory be **additive in v2** with no format
+    /// version bump, no footer growth, and no new `ColumnRole` byte (it declares
+    /// `ColumnRole::Props`, since the payload is opaque msgpack). Both the
+    /// 32-byte `BlockFooter` and the 64-byte `ColumnMeta` are fully consumed, so
+    /// there was no spare field to grow instead.
+    ///
+    /// Readers locate columns by `find(|m| m.column_id == X)`, so a reader that
+    /// does not know this id simply never asks for it.
+    pub const SHRED_DIRECTORY: i32 = 15;
     /// First column ID for embedding stripes (embedding_0, embedding_1, …).
     pub const EMBED_BASE: i32 = 20;
     /// First column ID for user-defined columns from CatalogTableSchema.

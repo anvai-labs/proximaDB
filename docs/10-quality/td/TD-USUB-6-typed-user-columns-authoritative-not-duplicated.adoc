@@ -123,9 +123,7 @@ and verified *before* any v3 block exists.
 
 Revised order for the remaining work:
 
-. **Slice 2a** — self-describing shred directory in the block; written in v2, ignored by
-  existing readers, verified by a round-trip that reconstructs props using ONLY the block's
-  own directory and a deliberately wrong caller key list.
+. **Slice 2a (LANDED 2026-09-22)** — self-describing shred directory in the block; see below.
 . **Slice 2b** — v3 writer: residual tail + authoritative stripes, stamping `FORMAT_VERSION_V3`,
   default-OFF; v3 reader merging stripes + residual via the directory.
 . **Slice 2c** — write-amplification measurement (bytes/row v2 vs v3) into
@@ -133,3 +131,42 @@ Revised order for the remaining work:
   collection) and the recall ratchet.
 
 Doing 2b without 2a would ship a data-loss hazard whose trigger is routine schema evolution.
+
+=== Slice 2a as landed (2026-09-22) — and a correction to how it had to be done
+
+`col_id::SHRED_DIRECTORY = 15` carries msgpack `Vec<(col_id, prop_key)>`: the block's own
+record of which prop key each `USER_BASE`+ stripe holds. Written whenever a shred spec is
+present; read back via `PaxBlockReader::shred_directory()`.
+
+**Correction to the plan above.** The earlier note assumed the directory could simply be
+"additive in v2", and separately that a v3 footer would carry it. Investigating showed
+neither was straightforward: **the PAX block format has no extensibility headroom left.**
+Both fixed structures are fully consumed — the 32-byte `BlockFooter` (whose last 12 reserved
+bytes were already reclaimed by `vparam_*`/`rgdir_offset`) and the 64-byte `ColumnMeta`
+(bytes 0..64 all assigned). There was no spare field to grow.
+
+The way through avoids growing anything: the directory is a `ColumnMeta` entry that carries
+**no stripe** (`stripe_len == 0`) and borrows the existing `bloom_offset`/`bloom_len` pointer
+pair to address its payload in the footer-extras region. That makes it additive **in v2** —
+no format version bump, no footer growth — and invisible to existing readers, which locate
+columns by `find(|m| m.column_id == X)` and so never ask for id 15. It declares
+`ColumnRole::Props` rather than a new role byte, deliberately: an older build's
+`ColumnRole::from_u8` rejects unknown roles, so a new role would have broken mixed reads of
+**v2** blocks — the one thing this must not do. `has_bloom` is left false so the entry does
+not claim to be something it is not.
+
+So slice 2a did **not** need the v3 header after all. Slice 1 is still a genuine prerequisite
+for 2b (the residual tail does need the version byte), but the ordering dependency between 2a
+and the version bump was wrong in the note above.
+
+**Evidence:** `block_carries_its_own_shred_directory` (directory mirrors the spec exactly, and
+naming is answerable with no caller key list — the property that makes a residual tail safe);
+`no_shred_spec_means_no_directory_and_no_error` (clean `None`, so the caller-key fallback stays
+reachable for every v2 block on disk); `shred_directory_is_additive_and_disturbs_nothing`
+(format version unchanged, full props tail still byte-identical, entry claims no stripe and no
+bloom). 93/93 in the crate including the rabitq recall@10 ratchet.
+
+**Not done here:** nothing consumes the directory yet. `FlatRow::from_block_reader` does not
+populate `user_columns` at all today (documented as a follow-up in its own doc comment), so
+there is nothing to name until the residual reader exists. Consuming it — preferring the
+block's directory over caller keys, falling back when absent — is slice 2b's first step.

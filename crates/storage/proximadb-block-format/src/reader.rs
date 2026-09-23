@@ -391,6 +391,37 @@ impl<'a> PaxBlockReader<'a> {
         Some(&self.data[start..end])
     }
 
+    /// The block's self-describing P-Shred directory: `(col_id, prop_key)` for
+    /// every `USER_BASE`+ stripe the writer promoted (TD-USUB-6 slice 2a).
+    ///
+    /// `None` for any block written before the directory existed — every v2 block
+    /// on disk today — which is exactly why the caller-supplied key list remains
+    /// the documented fallback rather than being removed.
+    ///
+    /// The payload rides the footer-extras region addressed by the `ColumnMeta`
+    /// pointer pair; it deliberately does NOT set `has_bloom`, so it is resolved
+    /// here rather than through [`Self::read_bloom_raw`].
+    pub fn shred_directory(&self) -> Option<Vec<(i32, String)>> {
+        let meta = self
+            .columns
+            .iter()
+            .find(|m| m.column_id == crate::col_id::SHRED_DIRECTORY)?;
+        if meta.bloom_len == 0 {
+            return None;
+        }
+        let footer_start = self.footer.col_footer_offset as usize;
+        let block_footer_start = self.data.len().checked_sub(BLOCK_FOOTER_SIZE)?;
+        let start = footer_start.checked_add(meta.bloom_offset as usize)?;
+        let end = start.checked_add(meta.bloom_len as usize)?;
+        if end > block_footer_start {
+            return None;
+        }
+        // A malformed directory degrades to `None` (fall back to caller keys)
+        // rather than failing the whole block read: it is naming metadata, and
+        // the tail still carries every value in v2.
+        rmp_serde::from_slice(&self.data[start..end]).ok()
+    }
+
     /// Decode all i64 values from a timestamp/temporal column stripe.
     ///
     /// Returns `None` if the column is absent; returns null sentinel `i64::MIN`
