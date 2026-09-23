@@ -26,6 +26,24 @@ pub const BLOCK_MAGIC: [u8; 4] = *b"PBLK";
 /// mixed-read-safe — readers dispatch on the byte and keep decoding v2 rather
 /// than flag-day rejecting it. See `docs/12-design/adr/ADR-010-pax-block-format.adoc`.
 pub const FORMAT_VERSION: u8 = 2;
+
+/// PAX v3 — declared columns authoritative, msgpack `PROPS` reduced to a residual
+/// (ADR-094 spec §2.1 / TD-USUB-6).
+///
+/// **No writer emits this yet.** It is defined so the reader can *dispatch* on the
+/// version byte instead of equality-rejecting it, which is the precondition the
+/// paragraph above states for any v3 to exist. Accepting the byte is separable
+/// from — and strictly precedes — implementing the semantics.
+pub const FORMAT_VERSION_V3: u8 = 3;
+
+/// Every block format version this build can decode, oldest first.
+///
+/// [`BlockHeader::from_bytes`] dispatches on membership here rather than
+/// `== FORMAT_VERSION`, so a v3 block is readable rather than rejected outright.
+/// That is mandate #8's mixed-read rule; the v1→v2 clean break was an explicit
+/// pre-release exception to it, not a precedent.
+pub const SUPPORTED_FORMAT_VERSIONS: &[u8] = &[FORMAT_VERSION, FORMAT_VERSION_V3];
+
 /// Fixed header size in bytes.
 pub const HEADER_SIZE: usize = 64;
 
@@ -149,6 +167,34 @@ pub struct BlockHeader {
     pub max_timestamp_ns: i64,
     /// xxhash64 of the tenant_id string (for RLS block-skip without row decode).
     pub tenant_id_hash: u64,
+    /// On-disk format version of THIS block, as read from byte 4.
+    ///
+    /// Previously the version byte was validated and then **discarded**, so a
+    /// reader had no way to dispatch on it even once v3 was accepted — the
+    /// information simply was not carried. Retaining it is what makes
+    /// version-dependent decode possible (TD-USUB-6).
+    ///
+    /// Construct with [`BlockHeader::current_version`] to stamp the version this
+    /// build writes; `to_bytes` serializes this field rather than a constant, so
+    /// a header round-trips its own version instead of silently being relabelled.
+    pub format_version: u8,
+}
+
+impl BlockHeader {
+    /// The format version this build writes. Use when constructing a header for
+    /// a new block so the intent ("current") is explicit at the call site.
+    pub const fn current_version() -> u8 {
+        FORMAT_VERSION
+    }
+
+    /// True iff this block uses the v3 layout (declared columns authoritative).
+    ///
+    /// No writer emits v3 yet, so this is `false` for every block on disk today;
+    /// it exists so the decode paths can branch on the block rather than on a
+    /// caller-supplied assumption.
+    pub fn is_v3(&self) -> bool {
+        self.format_version == FORMAT_VERSION_V3
+    }
 }
 
 impl BlockHeader {
@@ -156,7 +202,9 @@ impl BlockHeader {
     pub fn to_bytes(self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
         buf[0..4].copy_from_slice(&BLOCK_MAGIC);
-        buf[4] = FORMAT_VERSION;
+        // Serialize the header's OWN version, not a constant: a header parsed
+        // from a v3 block must not be silently relabelled v2 on re-serialize.
+        buf[4] = self.format_version;
         buf[5] = self.block_mode as u8;
         buf[6] = self.compression as u8;
         buf[7] = self.flags;
@@ -181,11 +229,20 @@ impl BlockHeader {
         if buf[0..4] != BLOCK_MAGIC {
             bail!("invalid block magic: {:02x?}", &buf[0..4]);
         }
-        if buf[4] != FORMAT_VERSION {
-            bail!("unsupported block format version {}", buf[4]);
+        // Mixed-read (mandate #8): dispatch on the version byte instead of
+        // equality-rejecting anything that is not the version THIS build writes.
+        // The error names what is supported so an operator can tell "too old"
+        // from "written by a newer peer" without reading the source.
+        let format_version = buf[4];
+        if !SUPPORTED_FORMAT_VERSIONS.contains(&format_version) {
+            bail!(
+                "unsupported block format version {format_version}: this build decodes \
+                 {SUPPORTED_FORMAT_VERSIONS:?}"
+            );
         }
 
         Ok(Self {
+            format_version,
             block_mode: BlockMode::from_u8(buf[5])?,
             compression: BlockCompression::from_u8(buf[6])?,
             flags: buf[7],
@@ -236,9 +293,92 @@ pub fn fnv1a_hash(s: &str) -> u64 {
 mod tests {
     use super::*;
 
+    /// Build header bytes carrying an arbitrary on-disk version byte.
+    fn header_bytes_with_version(version: u8) -> [u8; HEADER_SIZE] {
+        let mut h = BlockHeader {
+            format_version: BlockHeader::current_version(),
+            block_mode: BlockMode::Pax,
+            compression: BlockCompression::None,
+            flags: 0,
+            column_count: 1,
+            row_count: 1,
+            block_size: HEADER_SIZE as u32,
+            checksum: 0,
+            collection_id_hash: 0,
+            schema_fingerprint: 0,
+            min_timestamp_ns: 0,
+            max_timestamp_ns: 0,
+            tenant_id_hash: 0,
+        };
+        h.format_version = version;
+        h.to_bytes()
+    }
+
+    /// TD-USUB-6: the reader must **dispatch** on the version byte, not
+    /// equality-reject it. Before this, `from_bytes` failed anything that was not
+    /// exactly `FORMAT_VERSION`, so a v3 block could never be read — making the
+    /// mixed-read rule this module's own doc states impossible to honour.
+    #[test]
+    fn v3_header_is_accepted_and_its_version_retained() {
+        let parsed = BlockHeader::from_bytes(&header_bytes_with_version(FORMAT_VERSION_V3))
+            .expect("a v3 block must be decodable, not rejected outright");
+        assert_eq!(parsed.format_version, FORMAT_VERSION_V3);
+        assert!(
+            parsed.is_v3(),
+            "decode paths must be able to branch on this"
+        );
+    }
+
+    /// v2 stays the default and is not mistaken for v3.
+    #[test]
+    fn v2_header_round_trips_as_v2() {
+        let parsed = BlockHeader::from_bytes(&header_bytes_with_version(FORMAT_VERSION))
+            .expect("v2 must keep decoding");
+        assert_eq!(parsed.format_version, FORMAT_VERSION);
+        assert!(!parsed.is_v3());
+    }
+
+    /// A header parsed from disk must re-serialize with ITS OWN version, not be
+    /// silently relabelled as whatever this build writes. `to_bytes` previously
+    /// stamped the `FORMAT_VERSION` constant unconditionally, which would rewrite
+    /// a v3 block's header as v2 on any read-modify-write path.
+    #[test]
+    fn to_bytes_preserves_the_parsed_version_rather_than_relabelling() {
+        let v3 = BlockHeader::from_bytes(&header_bytes_with_version(FORMAT_VERSION_V3)).unwrap();
+        assert_eq!(
+            v3.to_bytes()[4],
+            FORMAT_VERSION_V3,
+            "re-serializing a v3 header must not downgrade the version byte"
+        );
+    }
+
+    /// Unknown versions still fail closed, and the error names what IS supported
+    /// so "too old" is distinguishable from "written by a newer peer".
+    #[test]
+    fn unknown_versions_fail_closed_with_an_actionable_message() {
+        for bad in [0u8, 1, 4, 255] {
+            let err = BlockHeader::from_bytes(&header_bytes_with_version(bad))
+                .expect_err("unknown version must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&bad.to_string()) && msg.contains("unsupported block format version"),
+                "error must name the offending version, got: {msg}"
+            );
+        }
+    }
+
+    /// The dispatch table must not drift from the versions the constants name.
+    #[test]
+    fn supported_versions_match_the_named_constants() {
+        assert!(SUPPORTED_FORMAT_VERSIONS.contains(&FORMAT_VERSION));
+        assert!(SUPPORTED_FORMAT_VERSIONS.contains(&FORMAT_VERSION_V3));
+        assert_eq!(BlockHeader::current_version(), FORMAT_VERSION);
+    }
+
     #[test]
     fn header_round_trip() {
         let h = BlockHeader {
+            format_version: BlockHeader::current_version(),
             block_mode: BlockMode::Pax,
             compression: BlockCompression::Lz4,
             flags: flags::HAS_VECTOR | flags::HAS_MVCC,
@@ -268,6 +408,7 @@ mod tests {
         // A well-formed v1 header (correct magic, version byte = 1) must be
         // rejected outright — v2 is a clean break with no migration path.
         let mut bytes = BlockHeader {
+            format_version: BlockHeader::current_version(),
             block_mode: BlockMode::Pax,
             compression: BlockCompression::None,
             flags: 0,
@@ -295,6 +436,7 @@ mod tests {
         // The current build stamps FORMAT_VERSION = 2; a round-trip must hold.
         assert_eq!(FORMAT_VERSION, 2);
         let h = BlockHeader {
+            format_version: BlockHeader::current_version(),
             block_mode: BlockMode::Pax,
             compression: BlockCompression::Zstd,
             flags: flags::HAS_VECTOR,
@@ -316,6 +458,7 @@ mod tests {
     #[test]
     fn time_overlap() {
         let h = BlockHeader {
+            format_version: BlockHeader::current_version(),
             min_timestamp_ns: 100,
             max_timestamp_ns: 200,
             block_mode: BlockMode::Pax,

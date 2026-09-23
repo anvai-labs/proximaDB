@@ -813,6 +813,7 @@ impl PaxBlockWriter {
             f
         };
         let header = BlockHeader {
+            format_version: BlockHeader::current_version(),
             block_mode: mode,
             compression: self.compression,
             flags: block_flags,
