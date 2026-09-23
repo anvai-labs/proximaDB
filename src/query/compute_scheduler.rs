@@ -290,8 +290,12 @@ pub struct QueryShape {
     pub cardinality: CardinalityClass,
     /// Bucketed partition/row-group fan-out (§5.2 Phase-1). `Unknown` default.
     pub partition_fanout: PartitionFanout,
-    /// TD-OLAP-1 slice 2: tables backed by PAX segments (not Parquet). When
-    /// true + `pax_reader_enabled()`, routes to DataFusion via PaxSplitReader.
+    /// TD-OLAP-1 slice 2: tables backed by PAX segments (not Parquet).
+    ///
+    /// Observed and carried on the shape, but it does NOT select a route today:
+    /// TD-USUB-9 removed the arm that stamped `DataFusionLocal` for it, because
+    /// dispatch requires `parquet_backed` and Volcano actually served. The real
+    /// slice-2 dispatch wiring will consume this field again.
     pub pax_backed: bool,
     /// TD-USUB-2: every referenced table can be registered with the DataFusion
     /// destination as a native (non-Parquet) relational table, so the full ANSI SQL
@@ -395,23 +399,6 @@ impl VectorRouteDecision {
             self.reason
         )
     }
-}
-
-/// TD-OLAP-1 slice 2: PAX-native OLAP scan gate (inline — not imported from
-/// `pax_adapter` so compute_scheduler compiles without `datafusion-integration`).
-///
-/// WARNING (TD-PAXRG-1 closeout): enabling this gate today changes only
-/// DECISION STAMPING — dispatch still requires `parquet_backed`, so Volcano
-/// serves while the cost model attributes Volcano's measured costs to
-/// DataFusion cells. Do not default-ON until the slice-2 dispatch wiring
-/// (see the TD-OLAP-1 slice-2 design record) lands.
-fn pax_reader_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PROXIMADB_DF_PAX_READER")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
 }
 
 /// What produced a [`SelectRouteDecision`] — a `route_decisions_total` metric
@@ -756,18 +743,20 @@ impl ComputeScheduler {
             // OLAP shape on native storage — Volcano serves it from WAL+RecordStorage
             // until the relational base tier is Parquet/Iceberg (course-correction §6 P3).
             (true, false) => {
-                // TD-OLAP-1 slice 2: PAX-backed analytical → DataFusion via
-                // PaxSplitReader (flag-gated, default OFF per ADR-052).
-                if shape.pax_backed && pax_reader_enabled() {
-                    SelectRouteDecision {
-                        backend: ComputeBackend::DataFusionLocal,
-                        workload_profile: CatalogWorkloadProfile::Olap,
-                        reason: "OLAP shape on PAX-backed table(s) — DataFusion via PaxSplitReader"
-                            .to_string(),
-                        reasons: Vec::new(),
-                        source: RouteSource::Static,
-                    }
-                } else if shape.native_registerable {
+                // TD-USUB-9 (route-stamp integrity): there used to be an arm here
+                // stamping `DataFusionLocal` when `pax_backed && pax_reader_enabled()`.
+                // It was REMOVED because it stamped a route that never ran:
+                // dispatch requires `parquet_backed`, so Volcano served the query
+                // while the cost model recorded Volcano's measured latency and I/O
+                // against DataFusion cells — poisoning exactly the evidence ADR-052's
+                // observe→ingest→act sequence depends on, and doing so silently.
+                //
+                // Removing it changes no execution (Volcano served before and after);
+                // it only makes the stamp true. The PAX reader itself stays gated and
+                // available for the real slice-2 dispatch wiring, which will add an
+                // arm here once DataFusion genuinely executes this shape — the bar the
+                // `native_registerable` arm below already meets.
+                if shape.native_registerable {
                     // TD-USUB-2: the tables are registerable with DataFusion directly,
                     // so the full ANSI surface (CTE / window / join / subquery) is
                     // reachable without a manual MATERIALIZE. DataFusion genuinely
@@ -1123,7 +1112,11 @@ fn seed_static_route_reasons(decision: &mut SelectRouteDecision, shape: QuerySha
 
     // Trust — the external Parquet/PAX route trusts the catalog base-snapshot
     // statistics (ADR-058 D5); native storage is synchronous with no trust gate.
-    if shape.parquet_backed || (shape.pax_backed && pax_reader_enabled()) {
+    // TD-USUB-9: the PAX clause was dropped with the route arm above. A
+    // PAX-backed table that is not parquet-backed is served by Volcano from
+    // WAL+RecordStorage, which is synchronous and has no trust gate — claiming it
+    // trusts object-store base-snapshot statistics described a route that never ran.
+    if shape.parquet_backed {
         decision.push_reason(
             RouteAxis::Trust,
             "trusts object-store catalog base-snapshot statistics (ADR-058 D5)",
@@ -2004,6 +1997,43 @@ mod tests {
         );
         assert_eq!(d.backend, ComputeBackend::Native);
         assert_eq!(d.source, RouteSource::OverrideExploit);
+    }
+
+    /// TD-USUB-9 route-stamp integrity: a PAX-backed (not Parquet-backed) OLAP
+    /// shape must stamp the backend that ACTUALLY serves it.
+    ///
+    /// Dispatch requires `parquet_backed`, so Volcano serves this shape. The old
+    /// `pax_reader_enabled()` arm stamped `DataFusionLocal` anyway, which meant
+    /// the cost model recorded Volcano's measured latency and I/O against
+    /// DataFusion cells — silently corrupting the evidence ADR-052's
+    /// observe→ingest→act sequence is built on. The env gate is deliberately not
+    /// consulted here any more, so this holds with it set or unset.
+    #[test]
+    fn pax_backed_olap_stamps_the_backend_that_actually_serves() {
+        let shape = QueryShape {
+            engages_relational: true,
+            parquet_backed: false,
+            pax_backed: true,
+            operation_class: OperationClass::ScalarAggregate,
+            ..Default::default()
+        };
+        let decision = ComputeScheduler::new().route_select(shape);
+        assert_eq!(
+            decision.backend,
+            ComputeBackend::Native,
+            "PAX-backed-but-not-parquet-backed OLAP is served by Volcano, so it must \
+             not be stamped as DataFusion — that is what poisons the cost model"
+        );
+
+        // The Trust axis must not claim object-store base-snapshot trust either:
+        // this route reads WAL+RecordStorage synchronously.
+        assert!(
+            !decision
+                .reasons
+                .iter()
+                .any(|r| r.detail.contains("base-snapshot statistics")),
+            "a Volcano-served route must not claim object-store snapshot trust"
+        );
     }
 
     #[test]

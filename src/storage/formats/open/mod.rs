@@ -25,7 +25,7 @@
 //! | Format | Status | Features |
 //! |--------|--------|----------|
 //! | **Delta Lake** | ✓ Implemented | ACID, Time Travel, Z-ordering |
-//! | **Iceberg** | ✓ Implemented | Schema Evolution, Partition Pruning |
+//! | **Iceberg** | Not in this module | Published by the warehouse path via `ObjectStoreBridge::publish_iceberg_table` |
 //! | **Hudi** | Planned | Upserts, Incremental Queries |
 //! | **LanceDB** | Planned | Vector-native, IVF+PQ |
 //!
@@ -51,29 +51,30 @@
 //! ## Usage
 //!
 //! ```rust,ignore
-//! use proximadb::storage::formats::open::{DeltaLakeFormat, IcebergFormat};
+//! use proximadb::storage::formats::open::DeltaLakeFormat;
 //! use proximadb::storage::formats::{OpenTableFormat, ReadContext};
 //!
 //! // Delta Lake
 //! let delta = DeltaLakeFormat::new("/path/to/delta/table").await?;
 //! let snapshot = delta.get_current_snapshot("/path/to/delta/table").await?;
 //! let batches = delta.read_snapshot(&snapshot, &ReadContext::default()).await?;
-//!
-//! // Iceberg
-//! let iceberg = IcebergFormat::new("s3://bucket/warehouse", "db.table").await?;
-//! let snapshot = iceberg.get_current_snapshot("db.table").await?;
-//! let batches = iceberg.read_snapshot(&snapshot, &ReadContext::default()).await?;
 //! ```
+//!
+//! Iceberg is NOT served from here. The warehouse path publishes Iceberg
+//! metadata through `ObjectStoreBridge::publish_iceberg_table`; the unused
+//! parallel connector that used to live in this module was deleted by TD-USUB-9.
 
 // Delta Lake connector
 pub mod delta;
 
-// Apache Iceberg connector
-pub mod iceberg;
+// TD-USUB-9: the Apache Iceberg connector module was DELETED. It was 1507 lines
+// with zero non-doc references anywhere in the workspace — a parallel, unused
+// implementation of a seam the warehouse path already serves through
+// `ObjectStoreBridge::publish_iceberg_table`. Two implementations of one
+// external contract is how they drift; the unused one is the one to remove.
 
 // Re-exports
 pub use delta::{DeltaLakeConfig, DeltaLakeFormat};
-pub use iceberg::{IcebergConfig, IcebergFormat};
 
 // ============================================================================
 // Common Types
