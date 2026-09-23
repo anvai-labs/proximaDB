@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 4.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 4. **Slice 0 landed 2026-09-23** — manifest-driven file selection, the prerequisite without which the filed plan returns rows from multiple generations (see BLOCKER below). Slices 1–3 remain open.
 | Priority | MEDIUM — a correctness-adjacent scaling limit, and a hard prerequisite for any automated publication policy.
 | Component | `src/services/dml/mod.rs` (`materialize_table_to_parquet`), `crates/storage/proximadb-iceberg-engine/src/manifest.rs`
 | Relates to | ADR-094 (Decision 1 rationale), ADR-062 (fresh-name + atomic manifest advance), TD-USUB-4 (additive layouts), TD-USUB-9
@@ -85,3 +85,78 @@ by list order: an accident rather than a decision.
 * Concurrency test exercising `commit_fenced` under two racing publishers.
 * If an automated policy is later enabled: publication lag measured against its declared SLO,
   and the read-side delta-merge cost attributed correctly in the cost model (TD-USUB-9).
+
+== BLOCKER found 2026-09-23: the parquet read path globs, it does not read a manifest
+
+**"How to apply" step 2 — "fresh-name + atomic manifest advance, the mechanism ADR-062
+already specifies" — would produce WRONG ANSWERS as written.** That mechanism assumes readers
+select data files from the manifest. On the live path they do not.
+
+`ObjectStoreParquetTable::open_bridge_base`
+(`src/datafusion/engine_adapters/object_store_parquet_reader.rs`) lists the location and takes
+**every** object whose name ends in `.parquet` (immediate children, falling back to `data/`).
+There is no manifest lookup anywhere in that path — no snapshot id, no file list, nothing.
+
+Today that is correct *by accident of the very thing this TD wants to change*: publication
+writes exactly ONE object at a FIXED name (`{prefix}/data/part-0.parquet`) and overwrites it,
+so "every parquet object present" and "the current snapshot" are the same set.
+
+Both halves of the plan break that identity:
+
+* **Fresh-name publication** accumulates objects. The glob would union every historical
+  generation — a query would see rows from several snapshots at once.
+* **Multi-object output** breaks on re-publish: a later publication with fewer parts leaves
+  the earlier `part-0000N` behind, and the glob unions the stale tail with the new set.
+
+Neither failure is loud. Both return a plausible row set that is simply wrong, which is the
+class mandate #1 exists to prevent — and note this is *more* dangerous than the single-object
+overwrite it would replace.
+
+=== Consequent prerequisite (new slice 0)
+
+**Make the parquet read path select data files from the snapshot/manifest, falling back to the
+glob when none is present (mixed-read-safe).** Only then can publication stop overwriting a
+fixed name.
+
+The manifest already exists on the write side: `publish_iceberg_table` emits Iceberg metadata
+listing the data files. The reader simply ignores it. This also makes TD-USUB-9's new
+`proximadb_warehouse_iceberg_publish_failures_total` counter **load-bearing** rather than
+merely informational: once reads are manifest-driven, a failed publish is no longer an
+interop-only concern, so the fallback path and the alert both matter.
+
+Revised order: **slice 0** (manifest-driven file selection + glob fallback) → slice 1
+(multi-object/streaming write) → slice 2 (incremental delta + atomic advance) → slice 3
+(automated policy, default-OFF, with the publication-lag SLO).
+
+Doing this TD in its filed order would ship a multi-generation read bug.
+
+=== Slice 0 as landed (2026-09-23)
+
+`ObjectStoreParquetTable::open_bridge_base` now tries `manifest_selected_files` first and
+falls back to directory listing. Selection reads the snapshot via the bridge's existing
+`latest_metadata_version` + `read_iceberg_snapshot`, which already returned the snapshot's
+data-file keys — the reader simply never called them.
+
+The bridge must be rooted at the **table base**, not the data directory: publication writes
+parquet to `{base}/data/` and metadata to the SIBLING `{base}/metadata/`, so the manifest is
+unreachable from the data dir. `table_base_of` derives the base only from a `…/data`
+location, which is also what keeps external parquet directories (no manifest, no such shape)
+on the listing path.
+
+**Behaviour is unchanged today, by construction.** Publication still writes one object at a
+fixed name, so the manifest lists exactly what listing would find. The fallback covers every
+case where the manifest cannot be used — non-published layout, no metadata yet, unreadable or
+empty snapshot — which is what makes this mixed-read-safe rather than a flag day. The value is
+that fresh-name and multi-object publication become *expressible*: slices 1–2 can now change
+what is written without the reader silently unioning generations.
+
+**Evidence:** `manifest_selection_excludes_a_parquet_not_in_the_snapshot` publishes a real
+snapshot while only `part-0.parquet` exists, then adds an unreferenced `part-9-stale.parquet`
+and asserts the table opens with 2 splits, not 4 — listing would have unioned it.
+`without_a_manifest_selection_falls_back_to_listing` pins the fallback (4 splits).
+`table_base_is_derived_only_from_a_data_location` pins the shape guard.
+
+**Interaction with TD-USUB-9:** this makes
+`proximadb_warehouse_iceberg_publish_failures_total` load-bearing. A failed publish now means
+a stale-or-absent manifest, and reads either fall back to listing (absent) or serve the prior
+snapshot (stale) — so the counter USUB-9 added is the signal that the two have diverged.
