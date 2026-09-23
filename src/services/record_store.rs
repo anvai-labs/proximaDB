@@ -170,8 +170,16 @@ pub trait TableWalAppender: Send + Sync {
 /// Physical writer route selected from xCatalog table metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableRecordStoreRoute {
-    /// Modern analytics target: Parquet files managed by Iceberg over Object Storage.
-    ParquetIcebergStorage,
+    /// The general relational/HTAP/OLAP route.
+    ///
+    /// TD-USUB-9 renamed this from `ParquetIcebergStorage`, which asserted a
+    /// behaviour that does not happen: the slot is a plain
+    /// `Arc<dyn TableRecordStore>`, and the pgwire wiring fills it with the
+    /// **canonical WAL store** — no Parquet is written on INSERT, and no Iceberg
+    /// manifest is involved. Parquet/Iceberg publication is a separate, explicit
+    /// `ALTER TABLE … MATERIALIZE` step. The route selects a *destination slot*,
+    /// not a physical format, so the name now says only that.
+    RelationalStorage,
     /// Specialized target: PAX block format for high-performance Vector Search / ANN.
     PaxVectorStorage,
     /// Temporary compatibility route through the old vector operations facade.
@@ -193,7 +201,7 @@ impl TableRecordStoreRoute {
             (_, CatalogStorageSpecialization::LsmWriteOptimized) => Self::LegacyVectorCompatibility,
             _ => {
                 // Default for relational, HTAP, and OLAP workloads
-                Self::ParquetIcebergStorage
+                Self::RelationalStorage
             }
         }
     }
@@ -1105,7 +1113,7 @@ impl CatalogRoutingTableRecordStore {
 
     fn store_for_schema(&self, schema: &CatalogTableSchema) -> &Arc<dyn TableRecordStore> {
         match TableRecordStoreRoute::for_schema(schema) {
-            TableRecordStoreRoute::ParquetIcebergStorage => &self.iceberg_store,
+            TableRecordStoreRoute::RelationalStorage => &self.iceberg_store,
             TableRecordStoreRoute::PaxVectorStorage => &self.vector_store,
             TableRecordStoreRoute::LegacyVectorCompatibility => &self.legacy_vector_store,
         }
@@ -2803,8 +2811,8 @@ mod tests {
                 .with_storage_specialization(spec);
             assert_eq!(
                 TableRecordStoreRoute::for_schema(&schema),
-                TableRecordStoreRoute::ParquetIcebergStorage,
-                "{label} must route to ParquetIcebergStorage"
+                TableRecordStoreRoute::RelationalStorage,
+                "{label} must route to RelationalStorage"
             );
         }
 

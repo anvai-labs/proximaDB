@@ -86,6 +86,29 @@ use crate::storage::trait_components::path_resolver::DrPathBuilder;
 use proximadb_catalog::TableIdentifier;
 use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
 
+/// Count of Iceberg snapshot publishes that failed during `ALTER TABLE …
+/// MATERIALIZE` (TD-USUB-9).
+///
+/// This exists so an interop publish failure is **alertable** rather than living
+/// only in a log line. The publish is deliberately non-fatal — the Parquet data
+/// and catalog layout are correct without it — so a counter is the signal that
+/// tells an operator the Iceberg manifests have drifted from the published data.
+///
+/// Registered lazily and tolerantly, exactly like the relational memtable gauge:
+/// observability must never take down a write path, so a construction error
+/// yields `None` and a duplicate registration leaves a working-but-unexported
+/// counter. No `.expect()` — this is `src/` production code (mandate #4).
+static ICEBERG_PUBLISH_FAILURES: std::sync::LazyLock<Option<prometheus::IntCounter>> =
+    std::sync::LazyLock::new(|| {
+        let counter = prometheus::IntCounter::new(
+            "proximadb_warehouse_iceberg_publish_failures_total",
+            "Iceberg snapshot publishes that failed during warehouse materialization",
+        )
+        .ok()?;
+        let _ = prometheus::register(Box::new(counter.clone()));
+        Some(counter)
+    });
+
 /// Placeholder tenant used by warehouse materialization when no `TenantContext`
 /// reaches it. This path does NOT yet enforce tenant isolation (see the note in
 /// [`DmlService::materialize_table_to_parquet`]); the placeholder is named and
@@ -2195,10 +2218,33 @@ impl DmlService {
             )
             .await
         {
-            tracing::warn!(
+            // TD-USUB-9: this failure used to exist ONLY as a `warn!` line, so a
+            // MATERIALIZE that returned success could leave the Iceberg manifest
+            // absent or stale with nothing to alert on — an external reader
+            // (Spark/Trino) would see no table while ProximaDB reported OK.
+            //
+            // It is deliberately still NOT fatal, and that is the right call: the
+            // Parquet data IS published and the catalog layout IS correct, so
+            // ProximaDB-side reads are complete. Failing the whole statement would
+            // turn a transient interop write error into a failed publish whose
+            // O(table) rewrite the user must repeat, on top of state already
+            // committed. The catalog also does not claim Iceberg — the layout is
+            // `parquet-snapshot` / `CatalogPhysicalFormat::Parquet` — so nothing
+            // advertises a manifest that isn't there.
+            //
+            // What was wrong was the SILENCE. Make it countable so it can be
+            // alerted on, and log at error level so it is not lost in warn noise.
+            if let Some(counter) = ICEBERG_PUBLISH_FAILURES.as_ref() {
+                counter.inc();
+            }
+            tracing::error!(
                 target: "proximadb::warehouse::iceberg",
                 table = %table_name,
-                "Iceberg snapshot publish failed (non-fatal, interop only): {e}"
+                location = %location,
+                "Iceberg snapshot publish FAILED — parquet data and catalog layout are \
+                 published and ProximaDB reads are correct, but the Iceberg manifest at \
+                 this location is now absent or stale, so external Iceberg readers will \
+                 not see this materialization: {e}"
             );
         }
 

@@ -156,9 +156,6 @@ pub use open::{
     DeltaLakeConfig,
     // Delta Lake
     DeltaLakeFormat,
-    IcebergConfig,
-    // Iceberg
-    IcebergFormat,
     // Common types
     StorageOptions,
     TableMetadata,
