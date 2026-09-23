@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 3. **Evolves legacy TD-162a-2** (see Reconciliation).
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 3. **Evolves legacy TD-162a-2** (see Reconciliation). **Slice 1 landed 2026-09-22** — block-header version dispatch, the precondition for any v3 (see Slicing). The residual-tail semantics remain open and are blocked on a newly found prerequisite: the block must become self-describing about its shredded keys.
 | Priority | MEDIUM — every shredded value is currently written twice; and typed columns cannot be trusted for correctness, only for pruning.
 | Component | `crates/storage/proximadb-block-format/src/writer.rs`, `.../stripe.rs`, `.../reader.rs`
 | Relates to | ADR-094 (spec §2.1), ADR-055 (P-Shred), ADR-033 / ADR-034 (which rank this work's scan value < 2×), Iceberg v3 Variant shredding
@@ -71,3 +71,65 @@ be re-argued as a scan-throughput win.
   `BENCHMARK_EVIDENCE.toml`.
 * Mixed-read test: a v2 segment and a v3 segment in the same collection both read correctly.
 * Recall ratchet (recall@10 ≥ 0.93) stays green.
+
+== Slicing (2026-09-22) — two prerequisites found while starting the work
+
+=== Slice 1 (LANDED): the block header could not express v3 at all
+
+"How to apply" step 4 says the change "requires the PAX v3 version byte". That byte could not
+have worked as written, for two reasons found in `header.rs`:
+
+. **`from_bytes` equality-rejected** anything that was not exactly `FORMAT_VERSION`
+  (`if buf[4] != FORMAT_VERSION { bail!(...) }`). A v3 block would have been refused outright
+  — the precise flag-day the module's own doc comment forbids ("any future `v3` MUST be
+  mixed-read-safe — readers dispatch on the byte and keep decoding v2").
+. **`BlockHeader` discarded the version.** Even had v3 been accepted, the struct carried no
+  `format_version` field, so no decode path could branch on it. The information was validated
+  and thrown away.
+
+Also latent: `to_bytes` stamped the `FORMAT_VERSION` constant unconditionally, so any
+read-modify-write of a v3 header would have silently **relabelled it v2**.
+
+Slice 1 fixes all three — `SUPPORTED_FORMAT_VERSIONS` dispatch, a retained `format_version`
+field with `is_v3()`, and `to_bytes` serializing the header's own version. It introduces **no
+v3 semantics and no writer emits v3**, so it cannot change any byte on disk or any behaviour;
+it only makes v3 expressible. Pinned by five tests including unknown-version fail-closed and
+the no-relabel property. The recall@10 harness stays green (90/90 in the crate).
+
+=== Slice 2 (OPEN, newly blocked): the block is not self-describing about shredded keys
+
+**This is the finding that matters, and it changes the shape of the remaining work.**
+
+Under today's duplicated form, the msgpack `PROPS` tail is complete, so the typed stripes are
+advisory and the reader can ignore them. `FlatRow::into_record` takes the promoted
+user-column keys from the **caller's schema, positionally** — and that is harmless precisely
+because nothing depends on it: a wrong or stale key list costs nothing when the tail already
+has every value.
+
+Making declared columns authoritative removes that safety net. The value then lives **only**
+in the typed stripe, and the only thing naming that stripe is a caller-supplied, positional
+key list. A key list that drifts from what was written — reordered, truncated, or evolved —
+would **silently drop props**, with no checksum or structural error to catch it.
+
+The TD's own losslessness gate names the exact scenario that breaks it: *"props whose declared
+type changed via schema evolution"*. Schema evolution is precisely when the caller's key list
+and the block's stripes disagree.
+
+**Therefore: before the tail can become a residual, the block must record its own shred
+directory** — the `(col_id, prop_key)` pairs actually written — so reconstruction is driven by
+the block, not by what a caller believes the schema to be. That directory is additive and can
+land in v2 blocks harmlessly (a new stripe/footer section), which also means it can be written
+and verified *before* any v3 block exists.
+
+Revised order for the remaining work:
+
+. **Slice 2a** — self-describing shred directory in the block; written in v2, ignored by
+  existing readers, verified by a round-trip that reconstructs props using ONLY the block's
+  own directory and a deliberately wrong caller key list.
+. **Slice 2b** — v3 writer: residual tail + authoritative stripes, stamping `FORMAT_VERSION_V3`,
+  default-OFF; v3 reader merging stripes + residual via the directory.
+. **Slice 2c** — write-amplification measurement (bytes/row v2 vs v3) into
+  `BENCHMARK_EVIDENCE.toml`, plus the mixed-read test (a v2 and a v3 segment in one
+  collection) and the recall ratchet.
+
+Doing 2b without 2a would ship a data-loss hazard whose trigger is routine schema evolution.
