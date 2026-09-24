@@ -470,6 +470,7 @@ impl DuckDBTableScan {
             },
             statistics: SplitStatistics::default(),
             locality: crate::storage::formats::SplitLocality::default(),
+            object_size: None,
         }];
 
         Ok(DuckDBInitData::new(splits))
@@ -921,6 +922,7 @@ mod tests {
                 },
                 statistics: SplitStatistics::default(),
                 locality: crate::storage::formats::SplitLocality::default(),
+                object_size: None,
             },
             FileSplit {
                 split_id: "s1".to_string(),
@@ -933,6 +935,7 @@ mod tests {
                 },
                 statistics: SplitStatistics::default(),
                 locality: crate::storage::formats::SplitLocality::default(),
+                object_size: None,
             },
         ];
 
@@ -955,6 +958,7 @@ mod tests {
             },
             statistics: SplitStatistics::default(),
             locality: crate::storage::formats::SplitLocality::default(),
+            object_size: None,
         }];
 
         let state = DuckDBGlobalState::new("test".to_string(), schema, splits, 4);

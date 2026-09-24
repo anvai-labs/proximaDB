@@ -365,6 +365,8 @@ async fn discover_native_pax_segments(
         .iter()
         .filter(|e| e.name.ends_with(".pax"))
         .map(|e| {
+            // TD-USUB-8: carry the object size the listing already returned, so
+            // a reader need not pay a `HEAD` to rediscover it.
             crate::storage::formats::FileSplit::new_block(
                 format!("{base_path}/{}", e.name),
                 0,
@@ -372,6 +374,7 @@ async fn discover_native_pax_segments(
                 e.metadata.size,
                 0,
             )
+            .with_object_size(e.metadata.size)
         })
         .collect()
 }
