@@ -35,7 +35,7 @@ proximadb-hardware-caps.workspace = true
 proximadb-runtime-common.workspace = true
 proximadb-compression.workspace = true
 # Optional GPU/Metal support (Apple Silicon). Gated behind the `gpu`/`metal` features.
-metal = { version = "0.27", optional = true }
+metal = { version = "0.33", optional = true }
 
 [dev-dependencies]
 proximadb-config.workspace = true
