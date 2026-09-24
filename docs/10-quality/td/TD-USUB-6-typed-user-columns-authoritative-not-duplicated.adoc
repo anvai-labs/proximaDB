@@ -319,9 +319,19 @@ failing.
 
 === Remaining
 
-* **Measure write-amplification per path** into `BENCHMARK_EVIDENCE.toml` before any default
-  flip — and per ADR-094's narrowing, measure the relational and vector arms separately, since
-  only the relational arm declares exact types.
+* **Write-amplification measured 2026-09-24** — `pax_residual_tail_write_amplification` in the
+  evidence ledger, artifact
+  `docs/_internal/status/PAX_RESIDUAL_TAIL_WRITE_AMPLIFICATION_2026_09_24.adoc`.
+  **Relational: 41.2% smaller blocks** (310.97 → 182.97 bytes/row over 2,000 rows).
+  **Vector/SST: 0.0%, by construction** — and the bench *asserts* that rather than assuming it,
+  because an arm with no exact declared types must never drop anything from its tail.
++
+The measurement also caught a real bug: the first run reported **0.1%**, because
+`residual_tail_enabled()` reads the gate through a process-wide `OnceLock`, so toggling the env
+var inside one process measured the same mode twice. The unit tests had missed it by setting the
+private field directly, exercising the mechanism but never the configuration path. Fixed with
+`PaxBlockWriter::with_residual_tail(bool)`. Same shape as the TD-USUB-9 route stamp: the
+configured thing and the effective thing diverging with no signal.
 * Decide whether the block directory and the segment-level `shred_field_map` (TD-FPRUNE-1 P2)
   converge.
 

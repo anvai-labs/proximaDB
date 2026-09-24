@@ -452,6 +452,19 @@ impl PaxBlockWriter {
         )
     }
 
+    /// Set the residual-tail mode explicitly, overriding the process env gate.
+    ///
+    /// The gate ([`RESIDUAL_TAIL_ENV`]) is read through a `OnceLock`, i.e. ONCE
+    /// per process — which is correct for a server that reads configuration at
+    /// startup, but makes the flag untestable and unmeasurable from a single
+    /// process that wants to compare both modes. The write-amplification reporter
+    /// needs exactly that comparison, and without this builder it silently
+    /// measured the first-initialised value twice.
+    pub fn with_residual_tail(mut self, residual: bool) -> Self {
+        self.residual_tail = residual;
+        self
+    }
+
     /// Declare the shred columns with their exact types where known (TD-USUB-6).
     pub fn with_shred_columns(mut self, spec: Vec<ShredColumn>) -> Self {
         self.user_col_buffers = vec![Vec::new(); spec.len()];

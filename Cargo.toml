@@ -1117,6 +1117,13 @@ name = "engine_performance_reporter"
 harness = false
 path = "benches/engine_performance_reporter.rs"
 
+# TD-USUB-6 2b: deterministic byte-count reporter for the residual PROPS tail.
+# Not criterion — the quantity is exact, not sampled.
+[[bench]]
+name = "pax_residual_tail_write_amplification"
+harness = false
+path = "benches/pax_residual_tail_write_amplification.rs"
+
 # Release build profile optimized for production
 [profile.release-server]
 inherits = "release"
