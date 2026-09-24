@@ -51,6 +51,23 @@ pub struct FileSplit {
     pub statistics: SplitStatistics,
     /// Locality hints for scheduling
     pub locality: SplitLocality,
+    /// Total byte size of the OBJECT this split lives in, when the planner
+    /// already knows it (TD-USUB-8).
+    ///
+    /// Deliberately separate from [`Self::length`], which means different things
+    /// per producer: the PAX segment locators set it to the whole-file size
+    /// (their splits are whole-file), while the SST planner sets it to
+    /// `file.block_size` per block. Reinterpreting `length` as the object size
+    /// would therefore make a footer-tail computation read the wrong bytes on the
+    /// SST path — garbage or a spurious error, not a clean failure.
+    ///
+    /// Object-storage readers need the size before they can locate a trailing
+    /// footer, and today they pay a `HEAD` for it even when the planner obtained
+    /// it for free from `list()`. Carrying it here removes one of the four
+    /// dependent round trips in the cold-read chain, which is the DEPTH term
+    /// ADR-033 ranks dominant. `None` ⇒ the reader falls back to the `HEAD`.
+    #[serde(default)]
+    pub object_size: Option<u64>,
 }
 
 /// Type of split - varies by storage engine
@@ -194,10 +211,18 @@ impl FileSplit {
             },
             statistics: SplitStatistics::default(),
             locality: SplitLocality::default(),
+            object_size: None,
         }
     }
 
     /// Create a new block-based split (for SST engine)
+    /// Record the size of the object this split lives in (TD-USUB-8), so an
+    /// object-storage reader can locate the trailing footer without a `HEAD`.
+    pub fn with_object_size(mut self, object_size: u64) -> Self {
+        self.object_size = Some(object_size);
+        self
+    }
+
     pub fn new_block(
         file_path: String,
         block_id: u32,
@@ -220,6 +245,7 @@ impl FileSplit {
                 ..Default::default()
             },
             locality: SplitLocality::default(),
+            object_size: None,
         }
     }
 
@@ -246,6 +272,7 @@ impl FileSplit {
                 ..Default::default()
             },
             locality: SplitLocality::default(),
+            object_size: None,
         }
     }
 
@@ -278,6 +305,7 @@ impl FileSplit {
                 ..Default::default()
             },
             locality: SplitLocality::default(),
+            object_size: None,
         }
     }
 
@@ -305,6 +333,7 @@ impl FileSplit {
                 ..Default::default()
             },
             locality: SplitLocality::default(),
+            object_size: None,
         }
     }
 
@@ -795,6 +824,7 @@ mod tests {
             },
             statistics: SplitStatistics::default(),
             locality: SplitLocality::default(),
+            object_size: None,
         };
         assert!((zorder.split_cost().decode_complexity - 1.3).abs() < 0.01);
 
@@ -812,6 +842,7 @@ mod tests {
                 storage_tier: StorageTier::Archive,
                 cache_status: CacheStatus::Unknown,
             },
+            object_size: None,
         };
         let cost = byte_range.split_cost();
         assert_eq!(cost.io_bytes, 20);

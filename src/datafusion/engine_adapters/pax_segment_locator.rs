@@ -47,7 +47,13 @@ pub async fn discover_pax_segments(
         // One split per segment; PaxSplitReader ignores offset/length and reads
         // the whole file via PaxSegmentScanner. record_count unknown without the
         // trailer (slice 2+).
-        splits.push(FileSplit::new_block(file_path, 0, 0, size, 0));
+        //
+        // TD-USUB-8: `list()` already gave us the object size, so record it
+        // EXPLICITLY. Without it the reader pays a `HEAD` to re-fetch the same
+        // number before it can locate the trailing footer — one of the four
+        // dependent round trips in the cold-read chain, for information we are
+        // holding right here.
+        splits.push(FileSplit::new_block(file_path, 0, 0, size, 0).with_object_size(size));
     }
     Ok(splits)
 }
@@ -67,6 +73,47 @@ mod tests {
             updated_at_ns: 1,
             ..Default::default()
         }
+    }
+
+    /// TD-USUB-8: the locator already learns each object's size from `list()`,
+    /// so it must RECORD it — otherwise the reader pays a `HEAD` to rediscover a
+    /// number the planner was handed, and that HEAD is the first of four
+    /// dependent round trips in the cold-read chain (the DEPTH term ADR-033
+    /// ranks dominant).
+    ///
+    /// Asserted against the real file size, not merely "is Some", so a future
+    /// change that records the wrong number fails here rather than making the
+    /// reader compute a footer offset from a bogus length.
+    #[tokio::test]
+    async fn splits_carry_the_object_size_so_readers_need_no_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = format!("{}", tmp.path().display());
+        write_pax_segment(
+            &tmp.path().join("seg0.pax"),
+            &[rec()],
+            "col",
+            0,
+            VectorQuant::Auto,
+            None,
+            None,
+        )
+        .unwrap();
+        let on_disk = std::fs::metadata(tmp.path().join("seg0.pax"))
+            .unwrap()
+            .len();
+
+        let fs = Arc::new(FilesystemFactory::create_default().await.unwrap());
+        let splits = discover_pax_segments(&base, &fs).await.unwrap();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(
+            splits[0].object_size,
+            Some(on_disk),
+            "the object size from list() must be recorded exactly"
+        );
+        // It must be the OBJECT size specifically — `length` is producer-defined
+        // (the SST planner puts a per-block size there), so the two fields are
+        // not interchangeable even where they happen to agree.
+        assert_eq!(splits[0].object_size, Some(splits[0].length));
     }
 
     #[tokio::test]

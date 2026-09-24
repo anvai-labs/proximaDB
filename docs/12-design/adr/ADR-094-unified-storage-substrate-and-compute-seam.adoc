@@ -228,9 +228,24 @@ which matters because DEPTH is the term this ADR optimises for. Details, includi
 `FileSplit.length` cannot be substituted for the object size, are in TD-USUB-8.
 ====
 
-Promote ADR-045 **Layer B** — RowDirectory, ColumnMeta statistics, blooms, SegmentIndex,
-deletion vector, all already classified *rebuildable serving metadata* — into xCatalog, so
-planning becomes one catalog query and the cold chain collapses to **1 GET**. This is the
+Promote ADR-045 **Layer B** — ColumnMeta statistics, blooms, SegmentIndex, deletion vector,
+all already classified *rebuildable serving metadata* — into xCatalog, so planning becomes one
+catalog query and the cold chain collapses to **1 GET**.
+
+[NOTE]
+====
+**Corrected 2026-09-24 (TD-USUB-8): the `RowDirectory` is NOT promotable and has been removed
+from this list.** It is `Vec<RowEntry>` at 32 bytes **per row** (`row_dir.rs`), so promoting it
+would grow xCatalog with *row count* — roughly 32 GB for a billion-row table. xCatalog is a
+control-plane store; that is a data-plane index and it stays in the object.
+
+The decision is unaffected: what lets the planner skip the footer and metadata hops is the
+*stripe extents and zone stats* (`SegmentIndex` + `ColumnMeta`). The `RowDirectory` serves
+point lookups **within** a block, after that block's bytes are already fetched.
+
+What changes is the sizing argument a review should be given: catalog growth is
+**O(segments × columns)**, not O(rows).
+==== This is the
 DuckLake insight applied at the layer where ProximaDB already owns a catalog.
 
 **The object retains a self-describing footer copy.** It must stay standalone-readable for

@@ -214,9 +214,18 @@ impl PaxSplitReader {
         out_schema: &SchemaRef,
     ) -> DFResult<Option<Vec<RecordBatch>>> {
         let path = &split.file_path;
-        let len = match self.filesystem_factory.metadata(path).await {
-            Ok(m) => m.size,
-            Err(_) => return Ok(None), // no cheap size → fall back
+        // TD-USUB-8: prefer the object size the PLANNER already knows. The
+        // segment locators get it free from `list()`, so the `HEAD` below is a
+        // dependent round trip spent rediscovering a number we were handed —
+        // and it is the first of the four in the cold-read chain, which nothing
+        // else can start without. `None` ⇒ fall back to the HEAD (external or
+        // hand-built splits that never carried a size).
+        let len = match split.object_size {
+            Some(size) => size,
+            None => match self.filesystem_factory.metadata(path).await {
+                Ok(m) => m.size,
+                Err(_) => return Ok(None), // no cheap size → fall back
+            },
         };
         if len < SEGMENT_INDEX_TRAILER_MIN {
             return Ok(None);
