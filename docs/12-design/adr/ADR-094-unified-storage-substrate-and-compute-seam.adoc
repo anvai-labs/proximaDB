@@ -208,11 +208,25 @@ have preserved the mis-route under `--no-default-features`.
 
 == Decision 4 — Catalog-resident serving metadata, with an in-object copy
 
-A cold PAX read today is a **3-deep dependent GET chain** — 32-byte footer tail →
-metadata ranges (column footer + vector params + row-group index) → surviving stripes
+A cold PAX read today is a deep dependent GET chain — footer tail → metadata ranges (column
+footer + vector params + row-group index) → surviving stripes
 (`crates/storage/proximadb-block-format/src/ranged.rs`, read-order doc comment). That is
 exactly the DEPTH term ADR-033 ranks as dominant
 (`DEPTH ≫ WIDTH ≫ BYTES ≫ CPU`).
+
+[NOTE]
+====
+**Corrected 2026-09-24 (TD-USUB-8): the chain is FOUR round trips, not the three originally
+written here.** `PaxSplitReader::load_ranged` begins with
+`filesystem_factory.metadata(path)` — a **HEAD for the object size** — before the header
+prefix, the footer, and the stripes. On object storage that HEAD is a full round trip, and
+nothing else can start without it.
+
+So the collapse this decision proposes is **4 → 1**, not 3 → 1: the case is stronger than
+written. But a baseline that counts only ranged reads under-reports it by a full round trip,
+which matters because DEPTH is the term this ADR optimises for. Details, including why
+`FileSplit.length` cannot be substituted for the object size, are in TD-USUB-8.
+====
 
 Promote ADR-045 **Layer B** — RowDirectory, ColumnMeta statistics, blooms, SegmentIndex,
 deletion vector, all already classified *rebuildable serving metadata* — into xCatalog, so

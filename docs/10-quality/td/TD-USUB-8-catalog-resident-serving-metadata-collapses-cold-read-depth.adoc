@@ -79,3 +79,53 @@ rebuildable by definition.
   rebuild Layer B from the object and verify byte-equality with the catalog copy.
 * Divergence handling tested: a deliberately stale catalog entry must not produce wrong
   results.
+== Depth re-measured 2026-09-24: the cold chain is FOUR round trips, not three
+
+ADR-094 Decision 4 and this TD both describe the cold PAX read as a "3-deep dependent GET
+chain". Verified against the code, it is **four**, and the uncounted one is a `HEAD`.
+
+`PaxSplitReader::load_ranged` (`src/datafusion/engine_adapters/pax_adapter.rs`) does:
+
+. `filesystem_factory.metadata(path)` — **a HEAD for the object size**. On object storage this
+  is a full round trip, and nothing else can start without it.
+. `read_range(path, 0, SEG_HEADER_PREFIX_LEN)` — the header prefix.
+. `read_range(path, h.footer_off, h.footer_len)` — the footer, at an offset only step 2 reveals.
+. the surviving stripes, at ranges only step 3 reveals.
+
+Each depends on the previous, which is what makes depth the cost rather than bytes. The
+`ranged.rs` module doc states the same order and likewise begins at "`head`/size", so the
+omission is in the *design docs'* count, not in the code.
+
+**Why this matters beyond bookkeeping.** ADR-033 ranks `DEPTH ≫ WIDTH ≫ BYTES ≫ CPU`, and
+ADR-094 Decision 4 justifies catalog-resident Layer B by collapsing 3 → 1. The true
+improvement is **4 → 1**, so the case is stronger than written — but any measurement that
+counted only ranged reads would under-report the baseline by a full round trip and make the
+improvement look smaller than it is.
+
+=== A shortcut that does NOT work, verified
+
+The obvious fix is to drop the HEAD and take the object size from the split. **It is wrong.**
+`FileSplit.length` is the *split's* byte length, not the object's: the SST planner sets
+`length = file.block_size` per block (`sst_adapter.rs`). Using it as the object size would make
+`footer_tail_range` compute from the wrong length and read the wrong bytes — garbage or a
+spurious error, not a clean failure.
+
+Removing that round trip therefore requires the object size to be carried **explicitly**, which
+is precisely this TD's proposal: put it in the catalog alongside the rest of Layer B.
+
+=== Consequent cheapest first slice
+
+**Carry the object size in catalog/split metadata and skip the HEAD.** It is the smallest of
+the four round trips to remove, needs no format change, and is independently useful: every
+other Layer-B promotion still has to start by knowing where the object ends.
+
+Sequence: (0) object size in catalog/split → HEAD removed, 4 → 3; (1) footer/Layer-B promotion
+→ 3 → 1; (2) in-object self-describing copy retained for DR/BYOB (ADR-090), which ADR-094
+Decision 4 already requires.
+
+=== Measurement note
+
+Any baseline recorded for this work must count the HEAD. `io_trace`'s `range_gets` counts
+ranged reads only, so a trace-based number needs the metadata call counted separately (or a
+counting filesystem wrapper, as `segment_format.rs`'s tests already use) — otherwise the
+baseline reads as 3 and the improvement is understated.
