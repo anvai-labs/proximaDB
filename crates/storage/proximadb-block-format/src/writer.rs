@@ -280,6 +280,13 @@ pub struct PaxBlockWriter {
     /// from the tail and ignores `USER_BASE+` columns), so this is additive and
     /// mixed-read-safe with no format-version bump.
     shred_spec: Vec<ShredColumn>,
+    /// TD-USUB-6 2b: drop losslessly-shreddable values from the msgpack tail.
+    /// Default OFF — with it off the tail stays complete and output is
+    /// byte-for-byte today's.
+    residual_tail: bool,
+    /// Set once any row actually had a value removed from its tail, which is
+    /// what makes the block v3: readers MUST reconstruct from the stripes.
+    tail_is_residual: bool,
     /// One buffer per `shred_spec` entry: the CLONED prop value per row (never
     /// removed from `props` — the tail must remain complete).
     user_col_buffers: Vec<Vec<Option<proximadb_data_model::ProximaValue>>>,
@@ -336,6 +343,8 @@ impl PaxBlockWriter {
             edge_weight: Vec::new(),
             embeddings: vec![Vec::new(); embedding_count],
             shred_spec: Vec::new(),
+            residual_tail: residual_tail_enabled(),
+            tail_is_residual: false,
             user_col_buffers: Vec::new(),
             tenant_id_hash_set: 0,
             min_ts: i64::MAX,
@@ -485,7 +494,38 @@ impl PaxBlockWriter {
 
     /// Buffer one `ProximaRecord` for inclusion in the next `flush()`.
     pub fn add_record(&mut self, record: &ProximaRecord) -> Result<()> {
-        let flat = FlatRow::from_record(record)?;
+        // TD-USUB-6 2b: with residual mode on, a prop whose typed stripe can give
+        // it back EXACTLY is dropped from the msgpack tail — that removal is the
+        // write-amplification win. Anything the stripe cannot reproduce
+        // identically stays, so losslessness holds by construction.
+        let residual_keys: Vec<&str> = if self.residual_tail {
+            self.shred_spec
+                .iter()
+                .filter_map(|c| {
+                    let t = c.declared_type.as_ref()?;
+                    match record.props.get(&c.key) {
+                        Some(proximadb_records::ProximaTreeNode::Value(v))
+                            if shreds_losslessly(v, t) =>
+                        {
+                            Some(c.key.as_str())
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let flat = if residual_keys.is_empty() {
+            FlatRow::from_record(record)?
+        } else {
+            FlatRow::from_record_with_residual(record, &residual_keys)?
+        };
+        if !residual_keys.is_empty() {
+            // The tail is now a residual, so the block can only be read by a
+            // reader that reconstructs from the stripes. Mark it.
+            self.tail_is_residual = true;
+        }
 
         // Update block-level stats
         let ts = flat.created_at_ns;
@@ -771,7 +811,11 @@ impl PaxBlockWriter {
             // reader ignores these on reconstruction (mixed-read-safe). Empty spec ⇒
             // this loop is a no-op ⇒ byte-for-byte today's output.
             for (i, col) in self.shred_spec.iter().enumerate() {
-                stripes.push(self.build_shred_stripe(col.column_id, &self.user_col_buffers[i])?);
+                stripes.push(self.build_shred_stripe(
+                    col.column_id,
+                    &self.user_col_buffers[i],
+                    col.declared_type.as_ref(),
+                )?);
             }
         }
 
@@ -952,7 +996,13 @@ impl PaxBlockWriter {
             f
         };
         let header = BlockHeader {
-            format_version: BlockHeader::current_version(),
+            format_version: if self.tail_is_residual {
+                // A residual tail cannot be read by a v2 reader (it would return
+                // records missing the shredded props), so the block declares v3.
+                crate::header::FORMAT_VERSION_V3
+            } else {
+                BlockHeader::current_version()
+            },
             block_mode: mode,
             compression: self.compression,
             flags: block_flags,
@@ -1397,8 +1447,15 @@ impl PaxBlockWriter {
         &self,
         id: i32,
         vals: &[Option<proximadb_data_model::ProximaValue>],
+        declared: Option<&proximadb_data_model::ProximaType>,
     ) -> Result<ColumnStripe> {
-        match vals.iter().flatten().next().map(shred_class) {
+        // TD-USUB-6: a DECLARED type fixes the physical class up front. Only an
+        // undeclared column still infers it from the first non-null value — the
+        // behaviour that made the class depend on row order.
+        let class = declared
+            .and_then(declared_shred_class)
+            .or_else(|| vals.iter().flatten().next().map(shred_class));
+        match class {
             Some(ShredClass::Int) => {
                 let col: Vec<Option<i64>> = vals
                     .iter()
@@ -1578,12 +1635,35 @@ impl PaxBlockWriter {
     }
 }
 
-/// Physical type class chosen for a shredded user-column (P-Shred), inferred from
-/// the first non-null `ProximaValue`.
-enum ShredClass {
+/// Physical type class chosen for a shredded user-column (P-Shred). Derived from
+/// the EXACT declared type when the column has one (TD-USUB-6), and otherwise
+/// inferred from the first non-null `ProximaValue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShredClass {
     Int,
     Float,
     Str,
+}
+
+/// Crate-visible alias so the record reconstruction path can name the class.
+pub(crate) use ShredClass as ShredClassPub;
+
+/// Crate-visible wrapper over [`declared_shred_class`].
+pub(crate) fn declared_shred_class_pub(
+    t: &proximadb_data_model::ProximaType,
+) -> Option<ShredClass> {
+    declared_shred_class(t)
+}
+
+/// Crate-visible wrapper over [`reconstruct_declared`].
+pub(crate) fn reconstruct_declared_pub(
+    class: ShredClass,
+    i: Option<i64>,
+    f: Option<f64>,
+    s: Option<String>,
+    t: &proximadb_data_model::ProximaType,
+) -> Option<proximadb_data_model::ProximaValue> {
+    reconstruct_declared(class, i, f, s, t)
 }
 
 /// Classify a `ProximaValue` into the shred physical type. Integer-like and temporal
@@ -1609,6 +1689,155 @@ fn shred_class(v: &proximadb_data_model::ProximaValue) -> ShredClass {
         PV::Float16(_) | PV::Float32(_) | PV::Float64(_) => ShredClass::Float,
         _ => ShredClass::Str,
     }
+}
+
+/// Gate for the residual tail (TD-USUB-6 2b). Unset ⇒ OFF, so the msgpack
+/// `PROPS` tail stays complete and block bytes are unchanged.
+pub const RESIDUAL_TAIL_ENV: &str = "PROXIMADB_PAX_RESIDUAL_TAIL";
+
+fn residual_tail_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(RESIDUAL_TAIL_ENV)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Physical stripe class implied by an EXACT declared type (TD-USUB-6 2b).
+///
+/// For a typed column this replaces first-value inference entirely: the class is
+/// a property of the schema, not of whichever row happened to be non-null first.
+/// That is what makes the per-row residual decision below answerable at
+/// `add_record` time rather than only after every row is buffered.
+///
+/// `None` for types no physical class represents (Array/Map/Struct/Binary/…) —
+/// those are never shredded authoritatively and stay in the tail.
+fn declared_shred_class(t: &proximadb_data_model::ProximaType) -> Option<ShredClass> {
+    use proximadb_data_model::ProximaType as PT;
+    match t {
+        PT::Boolean
+        | PT::Int8
+        | PT::Int16
+        | PT::Int32
+        | PT::Int64
+        | PT::UInt8
+        | PT::UInt16
+        | PT::UInt32
+        | PT::UInt64
+        | PT::Date
+        | PT::Time(_)
+        | PT::Timestamp(_)
+        | PT::TimestampTz(_) => Some(ShredClass::Int),
+        PT::Float16 | PT::Float32 | PT::Float64 => Some(ShredClass::Float),
+        PT::String | PT::Symbol => Some(ShredClass::Str),
+        _ => None,
+    }
+}
+
+/// Rebuild the declared variant from the physical i64 a typed stripe stores.
+///
+/// This is the inverse the residual tail depends on: a stripe holds i64, so
+/// `Int32` and `Timestamp(Micros)` are indistinguishable in it — only the
+/// declared type says which to rebuild. Returns `None` when the physical value
+/// does not fit the declared type (e.g. an i64 too large for `Int32`), which the
+/// caller treats as "not losslessly shreddable, keep it in the tail".
+fn i64_to_declared(
+    x: i64,
+    t: &proximadb_data_model::ProximaType,
+) -> Option<proximadb_data_model::ProximaValue> {
+    use proximadb_data_model::ProximaType as PT;
+    use proximadb_data_model::ProximaValue as PV;
+    Some(match t {
+        PT::Boolean => match x {
+            0 => PV::Boolean(false),
+            1 => PV::Boolean(true),
+            _ => return None,
+        },
+        PT::Int8 => PV::Int8(i8::try_from(x).ok()?),
+        PT::Int16 => PV::Int16(i16::try_from(x).ok()?),
+        PT::Int32 => PV::Int32(i32::try_from(x).ok()?),
+        PT::Int64 => PV::Int64(x),
+        PT::UInt8 => PV::UInt8(u8::try_from(x).ok()?),
+        PT::UInt16 => PV::UInt16(u16::try_from(x).ok()?),
+        PT::UInt32 => PV::UInt32(u32::try_from(x).ok()?),
+        PT::UInt64 => PV::UInt64(u64::try_from(x).ok()?),
+        PT::Date => PV::Date(i32::try_from(x).ok()?),
+        PT::Time(u) => PV::Time(x, *u),
+        PT::Timestamp(u) => PV::Timestamp(x, *u),
+        PT::TimestampTz(u) => PV::TimestampTz(x, *u),
+        _ => return None,
+    })
+}
+
+/// Rebuild the declared variant from the physical f64 a typed stripe stores.
+fn f64_to_declared(
+    x: f64,
+    t: &proximadb_data_model::ProximaType,
+) -> Option<proximadb_data_model::ProximaValue> {
+    use proximadb_data_model::ProximaType as PT;
+    use proximadb_data_model::ProximaValue as PV;
+    Some(match t {
+        PT::Float16 => PV::Float16(x as f32),
+        PT::Float32 => PV::Float32(x as f32),
+        PT::Float64 => PV::Float64(x),
+        _ => return None,
+    })
+}
+
+/// Rebuild the declared variant from the physical string a typed stripe stores.
+fn str_to_declared(
+    x: String,
+    t: &proximadb_data_model::ProximaType,
+) -> Option<proximadb_data_model::ProximaValue> {
+    use proximadb_data_model::ProximaType as PT;
+    use proximadb_data_model::ProximaValue as PV;
+    Some(match t {
+        PT::String => PV::String(x),
+        PT::Symbol => PV::Symbol(x),
+        _ => return None,
+    })
+}
+
+/// Reconstruct a declared value from what the stripe physically stored.
+pub(crate) fn reconstruct_declared(
+    class: ShredClass,
+    i: Option<i64>,
+    f: Option<f64>,
+    s: Option<String>,
+    t: &proximadb_data_model::ProximaType,
+) -> Option<proximadb_data_model::ProximaValue> {
+    match class {
+        ShredClass::Int => i64_to_declared(i?, t),
+        ShredClass::Float => f64_to_declared(f?, t),
+        ShredClass::Str => str_to_declared(s?, t),
+    }
+}
+
+/// True iff the typed stripe stores `v` such that reconstruction under `t`
+/// returns `v` **exactly** — same variant, same payload.
+///
+/// This is the rule the residual tail is built on (TD-USUB-6): a value is
+/// dropped from the msgpack tail ONLY when the stripe can give it back
+/// identically. Anything else — a variant that does not match the declared type,
+/// a value that does not fit it, a type no physical class represents — stays in
+/// the tail. Losslessness is then a property of the encoding rather than a
+/// requirement on the data, so heterogeneous prop keys degrade instead of
+/// failing the write (which is what the filed "non-conformance is a write error"
+/// rule would have done to a schemaless props tree).
+fn shreds_losslessly(
+    v: &proximadb_data_model::ProximaValue,
+    t: &proximadb_data_model::ProximaType,
+) -> bool {
+    let Some(class) = declared_shred_class(t) else {
+        return false;
+    };
+    let rebuilt = match class {
+        ShredClass::Int => pv_to_i64(v).and_then(|x| i64_to_declared(x, t)),
+        ShredClass::Float => pv_to_f64(v).and_then(|x| f64_to_declared(x, t)),
+        ShredClass::Str => pv_to_str(v).and_then(|x| str_to_declared(x, t)),
+    };
+    rebuilt.as_ref() == Some(v)
 }
 
 fn pv_to_i64(v: &proximadb_data_model::ProximaValue) -> Option<i64> {
@@ -2516,6 +2745,139 @@ mod tests {
         assert_eq!(dir.len(), 1);
         assert_eq!(dir[0].key, "status");
         assert_eq!(dir[0].declared_type, None);
+    }
+
+    /// **The losslessness ratchet (TD-USUB-6 2b).** With the residual tail ON, a
+    /// record must round-trip EXACTLY — same variants, same payloads — even
+    /// though the shredded values no longer live in the msgpack tail.
+    ///
+    /// Covers the three cases that matter:
+    /// * an exactly-typed value that IS dropped from the tail and rebuilt from
+    ///   its stripe (`Int32` must come back `Int32`, not `Int64`);
+    /// * a value whose variant does NOT match its declared type, which must stay
+    ///   in the tail rather than be silently coerced;
+    /// * an untyped column, which can never be authoritative and keeps its tail.
+    #[test]
+    fn residual_tail_round_trips_every_prop_exactly() {
+        use crate::reader::PaxBlockReader;
+        use proximadb_data_model::{ProximaType as PT, ProximaValue as PV};
+        use proximadb_records::ProximaTreeNode as Node;
+
+        let mut rec = ProximaRecord {
+            oid: "r1".into(),
+            ..Default::default()
+        };
+        // Exactly typed → droppable from the tail.
+        rec.props.insert("age".into(), Node::Value(PV::Int32(41)));
+        rec.props
+            .insert("score".into(), Node::Value(PV::Float32(0.5)));
+        rec.props
+            .insert("name".into(), Node::Value(PV::String("ada".into())));
+        // Declared Int32 but holds a String → NOT losslessly shreddable.
+        rec.props
+            .insert("mixed".into(), Node::Value(PV::String("not-an-int".into())));
+        // Untyped column → never authoritative.
+        rec.props
+            .insert("tag".into(), Node::Value(PV::String("x".into())));
+        let original = rec.props.clone();
+
+        let mut w = PaxBlockWriter::new(BlockMode::Pax, BlockCompression::None, "c", 0, 0)
+            .with_shred_columns(vec![
+                ShredColumn::typed("age", col_id::USER_BASE, PT::Int32),
+                ShredColumn::typed("score", col_id::USER_BASE + 1, PT::Float32),
+                ShredColumn::typed("name", col_id::USER_BASE + 2, PT::String),
+                ShredColumn::typed("mixed", col_id::USER_BASE + 3, PT::Int32),
+                ShredColumn::untyped("tag", col_id::USER_BASE + 4),
+            ]);
+        w.residual_tail = true; // gate forced on for the test
+        w.add_record(&rec).unwrap();
+        let block = w.flush().unwrap();
+
+        let reader = PaxBlockReader::open(&block).unwrap();
+        assert!(
+            reader.header().is_v3(),
+            "a block whose tail became a residual must declare v3"
+        );
+
+        let flat = FlatRow::from_block_reader(&reader).unwrap().remove(0);
+        let back = flat.into_record(&[], &[], None).unwrap();
+        assert_eq!(
+            back.props, original,
+            "every prop must round-trip exactly, including the variant"
+        );
+        // Spell out the one that motivated the whole design.
+        assert!(
+            matches!(back.props.get("age"), Some(Node::Value(PV::Int32(41)))),
+            "Int32 must not come back as Int64"
+        );
+    }
+
+    /// The residual actually SHRINKS the tail — the write-amplification win this
+    /// TD is justified on. Same record, gate off vs on.
+    #[test]
+    fn residual_tail_is_smaller_than_the_complete_tail() {
+        use proximadb_data_model::{ProximaType as PT, ProximaValue as PV};
+        use proximadb_records::ProximaTreeNode as Node;
+
+        let build = |residual: bool| {
+            let mut rec = ProximaRecord {
+                oid: "r1".into(),
+                ..Default::default()
+            };
+            rec.props
+                .insert("name".into(), Node::Value(PV::String("a".repeat(256))));
+            let mut w = PaxBlockWriter::new(BlockMode::Pax, BlockCompression::None, "c", 0, 0)
+                .with_shred_columns(vec![ShredColumn::typed(
+                    "name",
+                    col_id::USER_BASE,
+                    PT::String,
+                )]);
+            w.residual_tail = residual;
+            w.add_record(&rec).unwrap();
+            w.flush().unwrap().len()
+        };
+
+        let complete = build(false);
+        let residual = build(true);
+        assert!(
+            residual < complete,
+            "residual tail must be smaller: {residual} !< {complete}"
+        );
+    }
+
+    /// Gate OFF (the shipped default) keeps the tail complete and the block v2 —
+    /// enabling nothing changes nothing.
+    #[test]
+    fn residual_gate_off_keeps_a_complete_v2_tail() {
+        use crate::reader::PaxBlockReader;
+        use proximadb_data_model::{ProximaType as PT, ProximaValue as PV};
+        use proximadb_records::ProximaTreeNode as Node;
+
+        let mut rec = ProximaRecord {
+            oid: "r1".into(),
+            ..Default::default()
+        };
+        rec.props.insert("age".into(), Node::Value(PV::Int32(7)));
+        let original = rec.props.clone();
+
+        let mut w = PaxBlockWriter::new(BlockMode::Pax, BlockCompression::None, "c", 0, 0)
+            .with_shred_columns(vec![ShredColumn::typed(
+                "age",
+                col_id::USER_BASE,
+                PT::Int32,
+            )]);
+        w.residual_tail = false;
+        w.add_record(&rec).unwrap();
+        let block = w.flush().unwrap();
+
+        let reader = PaxBlockReader::open(&block).unwrap();
+        assert_eq!(
+            reader.header().format_version,
+            crate::FORMAT_VERSION,
+            "gate off ⇒ still v2"
+        );
+        let flat = FlatRow::from_block_reader(&reader).unwrap().remove(0);
+        assert_eq!(flat.into_record(&[], &[], None).unwrap().props, original);
     }
 
     /// A block written with NO shred spec carries no directory, and asking for one
