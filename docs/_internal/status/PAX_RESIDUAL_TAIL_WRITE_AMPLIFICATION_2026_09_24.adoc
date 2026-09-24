@@ -1,0 +1,83 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= PAX residual `PROPS` tail — write-amplification measurement (TD-USUB-6 2b)
+:toc:
+:status-as-of: 2026-09-24
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Date (UTC) | 2026-09-24
+| Version | proximadb 0.3.0 @ `37f9bf617`
+| Bench | `benches/pax_residual_tail_write_amplification.rs`
+| Command | `cargo bench --bench pax_residual_tail_write_amplification`
+| Hardware | AMD Ryzen 9 7950X (16 cores), Linux 6.18 WSL2. **Irrelevant to the result** — the quantity is a byte count, not a timing, and is reproducible to the byte on any machine.
+|===
+
+== What was measured
+
+TD-USUB-6 is justified on removing a **double write**: before slice 2b, every shredded prop
+was stored twice — once in its typed stripe, once in the msgpack `PROPS` tail, which the
+writer's own comment described as "a DUPLICATED pruning/projection index". The residual tail
+drops the tail copy wherever the typed stripe reproduces the value *exactly*.
+
+Fixture: 2,000 rows, four shredded scalar props (`status` String, `quantity` Int32,
+`unit_price` Float64, `customer` String) plus one undeclared prop (`note`) that must remain in
+the tail in every configuration.
+
+== Result
+
+[cols="1,1,1,1,1", options="header"]
+|===
+| Path | Gate | Block bytes | Bytes/row | Reduction
+| Relational | off | 621,942 | 310.97 | —
+| Relational | **on** | **365,942** | **182.97** | **41.2%**
+| Vector/SST | off | 621,418 | 310.71 | —
+| Vector/SST | on  | 621,418 | 310.71 | 0.0%
+|===
+
+**Relational: 256,000 bytes saved over 2,000 rows — 128 bytes/row, 41.2% of the block.**
+
+**Vector/SST: exactly zero, by construction.** That arm declares only the coarse v1
+`FilterableDataType` (no integer width, no `TimeUnit`), so no column carries an exact
+`ProximaType`, so nothing may be dropped from its tail. The bench *asserts* this equality
+rather than assuming it: if that arm ever shrank, something would be discarding values it
+cannot reconstruct — the silent-loss failure this TD exists to prevent.
+
+Reporting a single blended figure across both arms would overstate the win, which is why the
+measurement is split by path (ADR-094 narrowing, recorded in TD-USUB-6).
+
+== A bug this measurement caught
+
+The first run of this bench reported **0.1%**, not 41.2%.
+
+`residual_tail_enabled()` reads the `PROXIMADB_PAX_RESIDUAL_TAIL` gate through a `OnceLock` —
+once per **process**. The reporter toggled the environment variable between configurations
+inside a single process, so the first call pinned the value and every later call saw the
+cached one: it measured the same mode four times and produced a plausible-looking 0.1%
+difference.
+
+Two things made that dangerous rather than merely wrong:
+
+* **A plausible wrong number is worse than no number.** 0.1% reads as a real, disappointing
+  result. It could have killed the feature on false evidence, or been copied into a claim.
+* **The unit tests did not catch it.** They set the private field directly
+  (`w.residual_tail = true`), bypassing the gate — proving the *mechanism* worked while
+  leaving the *configuration path* unexercised.
+
+Fixed by `PaxBlockWriter::with_residual_tail(bool)`, an explicit builder with the env gate as
+the default; the bench now sets the mode directly and documents why it must not use the
+environment variable.
+
+This is the same shape as the route-stamp defect closed in TD-USUB-9: the configured thing and
+the effective thing diverging with no signal.
+
+== Scope of the claim
+
+* Measures **bytes written**, not read latency or throughput. No timing claim is made.
+* Measures the **relational shredding shape**. A table with more or wider shredded props saves
+  proportionally more; one with none saves nothing.
+* The result does **not** authorise flipping the gate. Two preconditions remain, recorded in
+  TD-USUB-6: the raw `props` blob projection in `document_pax_provider.rs` must reconstruct
+  (it currently returns the residual verbatim), and the flip needs its own recall/round-trip
+  gating on real corpora.

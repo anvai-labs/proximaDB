@@ -30,6 +30,21 @@ header_status = "ran the benches 2026-06-16 (docs/_internal/status/BENCH_RUN_202
 # ---------------------------------------------------------------------------
 
 [[claims]]
+id = "pax_residual_tail_write_amplification"
+claim = "Enabling the PAX residual PROPS tail (TD-USUB-6 slice 2b) cut block size on the RELATIONAL shredding path by 41.2% — 621,942 to 365,942 bytes over 2,000 rows, i.e. 310.97 to 182.97 bytes/row (256,000 bytes, 128 bytes/row saved) — by dropping each shredded prop from the msgpack tail wherever its typed stripe reproduces the value exactly. On the VECTOR/SST path the reduction is exactly 0.0% by construction, because that path declares only the coarse v1 FilterableDataType and so carries no exact ProximaType; the bench asserts that equality rather than assuming it. Byte counts only — no latency or throughput claim."
+metric = "block bytes and bytes/row, residual gate off vs on, measured separately per shredding path"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-USUB-6-typed-user-columns-authoritative-not-duplicated.adoc",
+]
+bench_source = "benches/pax_residual_tail_write_amplification.rs"
+bench_command = "cargo bench --bench pax_residual_tail_write_amplification"
+artifact = "docs/_internal/status/PAX_RESIDUAL_TAIL_WRITE_AMPLIFICATION_2026_09_24.adoc"
+hardware = "AMD Ryzen 9 7950X (16 cores), Linux 6.18 WSL2. Hardware is irrelevant to this result: the quantity is a deterministic byte count, reproducible to the byte on any machine."
+date = "2026-09-24"
+version = "proximadb 0.3.0 @ 37f9bf617"
+
+[[claims]]
 id = "hybrid_candidate_recall_selector_nfc_dev"
 claim = "On NFCorpus development, the complete canonical-BM25-100 plus exact-BGE-100 source union raised candidate-pool recall from dense Recall@100 0.347232 to union Recall@<=200 0.373375 (+7.53%; paired 95% interval +0.021154 to +0.031727), but global pinned-MiniLM selection regressed final Recall@100 to 0.313560 (-9.70%; interval -0.045557 to -0.022022) and NDCG@100 to 0.301350 (-6.49%; interval -0.031913 to -0.010064). Candidate generation passes; this selector fails; held-out remained sealed."
 metric = "candidate-pool and final source-aware Recall/NDCG + paired cross-depth bootstrap + candidate/window/token work + maximum pair tokens"
