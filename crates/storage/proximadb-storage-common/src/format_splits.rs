@@ -842,6 +842,7 @@ mod tests {
                 storage_tier: StorageTier::Archive,
                 cache_status: CacheStatus::Unknown,
             },
+            object_size: None,
         };
         let cost = byte_range.split_cost();
         assert_eq!(cost.io_bytes, 20);
