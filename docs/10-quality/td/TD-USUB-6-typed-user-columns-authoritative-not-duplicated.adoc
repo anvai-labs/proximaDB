@@ -354,3 +354,22 @@ shredded columns themselves remain correct and full-record reads remain correct.
 flipping, either the raw-blob projection must reconstruct (merge the typed stripes back in), or
 it must be documented that `props` is a residual and callers must read the typed columns. The
 first is the honest fix; the second silently changes a column's meaning.
+
+==== CLOSED 2026-09-24 — the projection now reconstructs
+
+`collect_flushed_rows` reinstates shredded props into the decoded `ProximaTree` from the typed
+columns the batch already carries, under the SAME tail-wins rule as `FlatRow::into_record`: a
+key still present in the tail is one the stripe could not reproduce, so its lossy stripe value
+must never overwrite it. Using one rule in both reconstruction paths is what stops them
+drifting.
+
+Pinned by `residual_tail_props_projection_still_returns_the_whole_document`, which drives a
+real residual-tail segment through **SQL** (`SELECT id, props`) rather than asserting at the
+block layer, and checks both the reconstructed prop and an undeclared one that stays in the
+tail — so it distinguishes "tail present" from "tail complete".
+
+**Verified non-vacuous:** with only the merge loop disabled the test fails with
+`document d0 lost its shredded prop under the residual tail: {"note":"n0"}` — the document
+returns as valid JSON with the field simply gone, which is exactly the silent loss at issue.
+
+Remaining before a flip: recall/round-trip gating on real corpora.
