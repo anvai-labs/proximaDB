@@ -163,3 +163,38 @@ interchangeable in general. Root lib suite 6434/6434.
 **Remaining for this TD:** promoting Layer B itself (footer/RowDirectory/stats/blooms) into
 xCatalog, which is the 3 → 1 collapse, with the in-object self-describing copy retained for DR
 and BYOB (ADR-090) as ADR-094 Decision 4 requires.
+
+=== Not all of Layer B is promotable — the RowDirectory is per-ROW
+
+ADR-094 Decision 4 and this TD both say to promote "ADR-045 **Layer B** — RowDirectory,
+ColumnMeta stats, blooms, SegmentIndex, deletion vector — into xCatalog". That list mixes two
+very different granularities, and one of them cannot go.
+
+`RowDirectory` is `Vec<RowEntry>` with `ROW_ENTRY_SIZE = 32` (`row_dir.rs`): **one 32-byte
+entry per row**. Promoting it would make the catalog grow with *row count* rather than segment
+count — of the order of 32 GB for a billion-row table. xCatalog is a control-plane store; that
+is a data-plane index and it must stay in the object.
+
+The correct split:
+
+[cols="1,2,1", options="header"]
+|===
+| Structure | Granularity | Promote?
+| `ColumnMeta` stats (min/max, null_count, distinct_hint) | per segment × column | **yes**
+| Bloom filters | per segment × column | yes, by reference (size-bounded)
+| `BlockHeader` zone summaries | per block | yes
+| `SegmentIndex` / `BlockFooter` extents | per segment | **yes — this is the one that collapses the chain**
+| Deletion vector (`PDV1`) | per segment, bounded by deletes | by reference
+| **`RowDirectory`** | **per ROW** | **NO — stays in the object**
+|===
+
+**This does not weaken the decision.** The chain is footer → metadata ranges → stripes, and
+what the planner needs in order to skip the first two hops is the *stripe extents and zone
+stats* — `SegmentIndex` + `ColumnMeta`. The `RowDirectory` only serves point lookups *within* a
+block, which happen after that block's bytes have been fetched, so leaving it in the object
+costs the read path nothing. The 3 → 1 collapse (4 → 1 counting the `HEAD`, now removed by
+slice 0) still holds.
+
+What it does change is the **sizing argument**: catalog growth is
+`O(segments × columns)`, not `O(rows)`. That is the number any design review should be given,
+and the decision's own wording currently implies the latter.
