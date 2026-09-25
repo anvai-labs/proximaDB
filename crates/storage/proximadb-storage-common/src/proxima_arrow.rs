@@ -539,6 +539,110 @@ fn proxima_value_to_data_type(v: &ProximaValue) -> Option<ProximaType> {
     })
 }
 
+/// One prop key that appears with two irreconcilable types across records
+/// (TD-USCHEMA-1). Carries enough to act on: which key, which types, and the
+/// record that diverged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDivergence {
+    pub key: String,
+    /// Type locked in by the first record that supplied a concrete value.
+    pub first: ProximaType,
+    /// Conflicting type seen later.
+    pub conflicting: ProximaType,
+    /// `oid` of the record that diverged, for locating it.
+    pub oid: String,
+}
+
+/// Every prop key whose inferred type is NOT consistent across `records`.
+///
+/// [`infer_proxima_schema`] is a **union schema** in the sense of U-Schema
+/// (arXiv:2105.06494 §2.3): it collapses the structural variations of a
+/// schemaless collection into one column set. That collapse is defined to be
+/// lossy, and the paper's union rule 3 says a feature appearing with the same
+/// name but a different type must be kept as *two* features. Our inference
+/// instead locks the type to the first record that supplies a value, after
+/// which `build_column` coerces every non-conforming value to `append_null()`.
+///
+/// Whether that loses data depends entirely on whether the caller keeps a
+/// complete msgpack `PROPS` tail beside the typed columns:
+///
+/// * the PAX spill path does, so a NULL column cell costs nothing — the value
+///   is still recoverable (the same property TD-USUB-6's residual rule relies on);
+/// * the schema-less Parquet export does **not**. There the column IS the data,
+///   so the value is gone and the file is a well-formed Parquet that silently
+///   lacks it.
+///
+/// Callers on a path with no tail must check this and refuse to write.
+pub fn detect_type_divergence(records: &[ProximaRecord]) -> Vec<TypeDivergence> {
+    let mut locked: HashMap<String, ProximaType> = HashMap::new();
+    let mut out = Vec::new();
+    for r in records {
+        for (key, node) in &r.props {
+            let ProximaTreeNode::Value(v) = node else {
+                continue;
+            };
+            let Some(dt) = proxima_value_to_data_type(v) else {
+                continue;
+            };
+            match locked.get(key) {
+                None => {
+                    locked.insert(key.clone(), dt);
+                }
+                Some(first) if *first != dt => {
+                    // Report once per (key, conflicting type) so a large batch
+                    // does not produce one entry per row.
+                    let dup = out
+                        .iter()
+                        .any(|d: &TypeDivergence| d.key == *key && d.conflicting == dt);
+                    if !dup {
+                        out.push(TypeDivergence {
+                            key: key.clone(),
+                            first: first.clone(),
+                            conflicting: dt,
+                            oid: r.oid.clone(),
+                        });
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    out
+}
+
+/// Like [`infer_proxima_schema`], but **fails closed** when a prop key appears
+/// with irreconcilable types (TD-USCHEMA-1).
+///
+/// Use this on any path where the typed columns are the only copy of the data.
+/// The error names the key, both types, and a diverging record, because "some
+/// value somewhere was dropped" is not actionable.
+pub fn infer_proxima_schema_strict(
+    records: &[ProximaRecord],
+) -> Result<ProximaSchema, StorageError> {
+    let divergences = detect_type_divergence(records);
+    if !divergences.is_empty() {
+        let detail = divergences
+            .iter()
+            .map(|d| {
+                format!(
+                    "'{}' is {:?} but record '{}' has {:?}",
+                    d.key, d.first, d.oid, d.conflicting
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(StorageError::Serialization(format!(
+            "proxima_arrow: refusing a schema-less write that would silently drop values — \
+             {} prop key(s) appear with conflicting types across records: {detail}. \
+             This path has no msgpack PROPS tail, so a non-conforming value would be \
+             written as NULL and lost. Supply an explicit schema, or split the batch so \
+             each key has one type.",
+            divergences.len()
+        )));
+    }
+    Ok(infer_proxima_schema(records))
+}
+
 /// Best-effort [`ProximaSchema`] inference from a batch of records — for schema-less write
 /// paths such as `ObjectStoreBridge::write_records_to_parquet`, which take only `&[ProximaRecord]`
 /// (the records are self-describing).
@@ -970,6 +1074,109 @@ mod tests {
             msg.contains(SYS_COL_VALID_TO_NS) && msg.contains("collides"),
             "error must name the colliding column, got: {msg}"
         );
+    }
+
+    // --- TD-USCHEMA-1: structural variation across records ------------------
+
+    /// The defect this closes, stated as a test: a prop key with two types
+    /// loses one of them through the union schema, because `build_column`
+    /// coerces non-conforming values to NULL.
+    ///
+    /// This is U-Schema's union rule 3 (arXiv:2105.06494 §2.3) — such a feature
+    /// should be kept as TWO features, not silently resolved in favour of
+    /// whichever record happened to be first. Pinned so the loss is visible and
+    /// cannot be mistaken for correct behaviour.
+    #[test]
+    fn union_schema_drops_the_divergent_value_documented_not_endorsed() {
+        let a = record_with_props("a", vec![("v", ProximaValue::Int64(7))]);
+        let b = record_with_props("b", vec![("v", ProximaValue::String("hello".into()))]);
+        let recs = vec![a, b];
+
+        let schema = infer_proxima_schema(&recs);
+        let batch = proxima_records_to_record_batch(&recs, &schema).expect("encode");
+        let back = record_batch_to_proxima_records(&batch);
+
+        assert!(
+            matches!(
+                back[0].props.get("v"),
+                Some(ProximaTreeNode::Value(ProximaValue::Int64(7)))
+            ),
+            "the first-seen type survives"
+        );
+        assert_eq!(
+            back[1].props.get("v"),
+            None,
+            "the divergent value is LOST by the union schema — the reason \
+             infer_proxima_schema_strict exists for tail-less paths"
+        );
+    }
+
+    /// Divergence is detected, reported once per (key, conflicting type), and
+    /// carries enough to act on.
+    #[test]
+    fn detect_type_divergence_reports_key_types_and_record() {
+        let recs = vec![
+            record_with_props("a", vec![("v", ProximaValue::Int64(7))]),
+            record_with_props("b", vec![("v", ProximaValue::String("x".into()))]),
+            record_with_props("c", vec![("v", ProximaValue::String("y".into()))]),
+        ];
+        let d = detect_type_divergence(&recs);
+        assert_eq!(
+            d.len(),
+            1,
+            "one entry per (key, conflicting type), not per row"
+        );
+        assert_eq!(d[0].key, "v");
+        assert_eq!(d[0].first, ProximaType::Int64);
+        assert_eq!(d[0].conflicting, ProximaType::String);
+        assert_eq!(d[0].oid, "b", "names the first record that diverged");
+    }
+
+    /// A homogeneous batch — the overwhelmingly common case — is unaffected.
+    #[test]
+    fn strict_inference_accepts_consistent_records() {
+        let recs = vec![
+            record_with_props("a", vec![("v", ProximaValue::Int64(1))]),
+            record_with_props("b", vec![("v", ProximaValue::Int64(2))]),
+        ];
+        assert!(detect_type_divergence(&recs).is_empty());
+        let strict = infer_proxima_schema_strict(&recs).expect("consistent batch must pass");
+        let lenient = infer_proxima_schema(&recs);
+        assert_eq!(
+            strict.columns.len(),
+            lenient.columns.len(),
+            "strict inference must not change the schema it produces"
+        );
+    }
+
+    /// The tail-less path fails CLOSED, and the error is actionable: it names
+    /// the key, both types, and a diverging record.
+    #[test]
+    fn strict_inference_fails_closed_with_an_actionable_message() {
+        let recs = vec![
+            record_with_props("a", vec![("v", ProximaValue::Int64(7))]),
+            record_with_props("b", vec![("v", ProximaValue::String("hello".into()))]),
+        ];
+        let err = infer_proxima_schema_strict(&recs)
+            .expect_err("a divergent batch must be refused on a tail-less path");
+        let msg = err.to_string();
+        for needle in ["'v'", "Int64", "String", "'b'"] {
+            assert!(msg.contains(needle), "error must name {needle}; got: {msg}");
+        }
+    }
+
+    /// A key that is merely ABSENT from some records is not divergence — that is
+    /// ordinary optionality (U-Schema's `optional` feature flag), and must not
+    /// block a write.
+    #[test]
+    fn absent_is_not_divergent() {
+        let recs = vec![
+            record_with_props("a", vec![("v", ProximaValue::Int64(1))]),
+            record_with_props("b", vec![]),
+            record_with_props("c", vec![("v", ProximaValue::Int64(3))]),
+        ];
+        assert!(detect_type_divergence(&recs).is_empty());
+        assert!(infer_proxima_schema_strict(&recs).is_ok());
     }
 
     #[test]
