@@ -74,9 +74,8 @@ the larger change and should not gate the first.
 . **Implement union rule 3** in `infer_proxima_schema`: a key seen with two irreconcilable
   types yields two columns (`v`, `v_2`) rather than one, both nullable. This preserves the data
   and matches the paper's canonical union semantics.
-. **Implement rules 1–2** by tracking presence counts during inference: a key present in every
-  record becomes `nullable: false`. Besides fidelity, that is real information for the
-  planner — a NOT NULL column needs no null mask and prunes differently.
+. **Rules 1–2 do NOT belong on this code path — attempted 2026-09-25 and reverted.** See
+  "Why per-batch nullability inference is a category error" below.
 . **Record variation statistics.** U-Schema's `StructuralVariation` carries `count`,
   `firstTimestamp`, `lastTimestamp`. ProximaDB currently decides which props to shred from a
   *static* `filterable_columns` list (`resolve_flush_shred_spec`). Variation counts would let
@@ -139,3 +138,38 @@ path that loses nothing.
 
 Root lib suite 6434/6434; `cargo check --workspace --all-targets`; crate suites 684/684;
 clippy `-D warnings`; fmt.
+
+== Why per-batch nullability inference is a category error (attempted, reverted 2026-09-25)
+
+The original "how to apply" proposed implementing U-Schema union rules 1–2 in
+`infer_proxima_schema`: count presence, and mark a key found in every record `nullable: false`.
+It was implemented, it worked, and it was **reverted**. Recording why, because the idea is
+appealing and will occur to the next reader.
+
+**The scope of `optional` is an entity type; the scope of this function is one write batch.**
+In U-Schema, `optional` describes a feature across *all structural variations of a schema
+type* — a property of the collection. `infer_proxima_schema` sees only the records handed to
+one `write_records_to_parquet` call. A batch is not the entity type, and "present in every
+record of this batch" is not "present in every object of this collection".
+
+Writing that inference into the file's Parquet schema asserts something true of the **file**
+that a reader will reasonably generalise to the **column**. With single-object publication that
+is merely imprecise. Under TD-USUB-10's multi-object direction it becomes actively harmful:
+part-0 could declare `k` NOT NULL and part-1 declare it nullable, for the same logical column.
+Lenient readers widen to nullable; strict ones object; either way the table's schema now depends
+on which files you looked at.
+
+An existing test, `infer_schema_unions_props_and_appends_vector`, asserts
+`by_name.values().all(|c| c.nullable)`. It is **not** encoding a defect — it pins the correct
+invariant for a per-batch inference, and the function's doc states the rule deliberately
+("Every column is nullable (a key absent from some record is a null there)").
+
+**Where rules 1–2 do belong:** the catalog's entity-type schema, where the scope matches — a
+`CatalogTableSchema` column can legitimately be NOT NULL because it constrains every object of
+the type, and the constraint is declared rather than inferred from a sample. Any future work
+should put presence/optionality there, and leave per-batch file inference maximally permissive.
+
+**A safety note for whoever tries anyway:** Arrow *rejects* a null in a non-nullable field, so
+a presence check even slightly looser than `build_column`'s extraction converts a silent null
+into a failed write. Whatever computes nullability must be provably no more permissive than the
+encoder that fills the column.
