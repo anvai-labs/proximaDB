@@ -198,3 +198,63 @@ slice 0) still holds.
 What it does change is the **sizing argument**: catalog growth is
 `O(segments × columns)`, not `O(rows)`. That is the number any design review should be given,
 and the decision's own wording currently implies the latter.
+
+== Two findings that reshape the remaining work (2026-09-26)
+
+=== 1. The instrumentation under-reports depth by TWO operations, not one
+
+`RangedSegmentReader::open` is documented as "(HEAD for size, suffix GET to locate the
+index)", and `open_inner` confirms it: `vector_segment_size` (a **HEAD**) → index-locate suffix
+GET → footer/metadata ranged reads → surviving stripes.
+
+`RangedSegmentSnapshot::range_gets` — the natural counter to reach for — states outright that
+it *"excludes the one-time index-locate suffix read performed before the reader is
+constructed"*, and it never sees the HEAD either.
+
+So a baseline built on `range_gets` understates the chain by **two** round trips. The earlier
+note in this TD said one; it is two. Any measurement for this work must count the HEAD and the
+index-locate read explicitly, or the improvement will be reported as smaller than it is.
+
+=== 2. The caches already exist — and one caller uses them
+
+`FooterCache` and `SegmentIndexCache` exist, and `RangedSegmentReader::open_with_cache` already
+collapses the chain: "a cached segment index skips the tail suffix GET, and cached per-block
+layouts skip the footer/metadata ranged reads."
+
+**Exactly one caller uses it:** `src/services/record_store.rs` (the vector record-store read
+path). `PaxSplitReader::load_ranged` — the DataFusion lane, and the path slice 0 just
+optimised — does not use `RangedSegmentReader` at all. It issues its own
+`metadata` → header-prefix → footer → stripes sequence through `filesystem_factory`, with **no
+footer or index cache**, re-paying the full chain on every read.
+
+This is the same shape as slice 0, where the object size was already known and thrown away: the
+mechanism exists and is not wired.
+
+==== Consequent re-ordering
+
+**Before** building catalog-resident Layer B — a new per-segment catalog entity, a write path,
+a planner read path, a rebuild path, and an invalidation story — wire the **existing** caches
+into the DataFusion lane. It is a fraction of the work and attacks the same dominant term.
+
+That also sharpens what the catalog promotion is actually *for*. It is not "collapse a chain
+that nothing collapses today". With caches wired, the remaining gaps are the ones a per-process
+cache cannot close:
+
+* **cold start** — a fresh process pays full depth until the cache warms;
+* **sharing** — every node warms its own cache independently;
+* **planning** — a read-side cache accelerates a decided plan; it cannot let the *planner*
+  prune before choosing one, which is what "catalog-resident" buys.
+
+Those are real and worth the architecture, but they are a smaller, sharper claim than 4 → 1,
+and the sizing argument (`O(segments × columns)`, per the RowDirectory correction above) should
+be made against *that* claim.
+
+==== Revised sequence
+
+. **Slice 0 (landed)** — object size in `FileSplit`; HEAD removed. 4 → 3.
+. **Slice 1 (new, cheap)** — wire `FooterCache`/`SegmentIndexCache` into `PaxSplitReader`.
+  Closes the warm-path gap with existing machinery.
+. **Slice 2** — measure cold vs warm depth with the HEAD and index-locate read counted, and
+  record the baseline in `BENCHMARK_EVIDENCE.toml`.
+. **Slice 3** — catalog-resident Layer B, justified on cold-start, cross-node sharing, and
+  planner-time pruning rather than on a depth number a cache already achieves.
