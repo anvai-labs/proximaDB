@@ -11,7 +11,7 @@ Agent runtimes that only support the singular root filename may read
 `AGENT.md`; it is a short compatibility alias for this `AGENTS.md` index and the
 model-specific guides above.
 
-**Filing a TD or ADR:** follow the canonical, collision-free convention in `docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc` (one file per entry; prefer a topic-scoped id like `TD-CAT-1`; never reuse a number already on `develop`; the `td-adr-unique` CI guard backstops). That in-repo doc is the single source of truth — these per-agent rule files only point to it, so concurrent sessions/machines never drift.
+**Filing a TD or ADR:** follow the canonical, collision-free convention in `docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc` (one file per entry; prefer a topic-scoped id like `TD-CAT-1`; never reuse a number already on `develop`; the `td-adr-unique` CI guard backstops). **Implementing one: verify its load-bearing premises against current source FIRST** — does what it cites still exist, does the mechanism it says to *build* already exist (grep it, count callers: zero or one is the common case), is the quantity it cites still true — and **correct the document in the same PR when a premise is wrong**, including the parent ADR. That in-repo doc is the single source of truth — these per-agent rule files only point to it, so concurrent sessions/machines never drift.
 
 ## Mandatory Worktree Workflow
 
