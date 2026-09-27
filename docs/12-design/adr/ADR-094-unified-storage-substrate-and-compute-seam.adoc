@@ -228,6 +228,25 @@ which matters because DEPTH is the term this ADR optimises for. Details, includi
 `FileSplit.length` cannot be substituted for the object size, are in TD-USUB-8.
 ====
 
+[NOTE]
+====
+**Superseded in part 2026-09-27 (TD-USUB-8 slices 0–2, measured): most of that collapse has
+already been delivered without catalog-resident metadata.**
+
+Slice 0 removed the HEAD by carrying the object size the planner already had from `list()`
+(4 → 3). Slice 1 wired the pre-existing `SegmentIndexCache` into `load_ranged`. Slice 2
+**measured** the result: index-acquisition round trips **3 → 0 on a warm read**, ratcheted at
+`cold - warm == 3`
+(`docs/_internal/status/PAX_DATAFUSION_READ_DEPTH_2026_09_27.adoc`; ledger claim
+`pax_datafusion_read_depth_index_acquisition`).
+
+So the text above overstates what remains. **"4 → 1" is no longer the case for this decision**:
+a read-side cache already collapses the warm path. What Layer-B promotion still buys is the
+**cold** path — a cache is per-process and every node warms independently — plus cross-node
+sharing and planner-time pruning, which a read-side cache structurally cannot provide. That
+narrower claim is what slice 3 must be argued and sized against.
+====
+
 Promote ADR-045 **Layer B** — ColumnMeta statistics, blooms, SegmentIndex, deletion vector,
 all already classified *rebuildable serving metadata* — into xCatalog, so planning becomes one
 catalog query and the cold chain collapses to **1 GET**.
@@ -245,8 +264,9 @@ point lookups **within** a block, after that block's bytes are already fetched.
 
 What changes is the sizing argument a review should be given: catalog growth is
 **O(segments × columns)**, not O(rows).
-==== This is the
-DuckLake insight applied at the layer where ProximaDB already owns a catalog.
+====
+
+This is the DuckLake insight applied at the layer where ProximaDB already owns a catalog.
 
 **The object retains a self-describing footer copy.** It must stay standalone-readable for
 disaster recovery, external tools, and BYOB buckets (ADR-090), where the customer owns the

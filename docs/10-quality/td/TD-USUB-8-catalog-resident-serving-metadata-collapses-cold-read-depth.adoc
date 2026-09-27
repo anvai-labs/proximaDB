@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 3. **Slice 0 landed 2026-09-24** — the object size is carried in `FileSplit`, removing the `HEAD` from the cold-read chain (4 → 3). Layer-B promotion (3 → 1) remains open.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 3. **Slices 0–2 landed.** Slice 0 (2026-09-24) carries the object size in `FileSplit`, removing the `HEAD` (4 → 3). Slice 1 (2026-09-27) wires the existing `SegmentIndexCache` into the DataFusion lane. Slice 2 (2026-09-27) **measures** it: index-acquisition round trips 3 → 0 on a warm read (`range_gets` 203 → 200), ratcheted at `cold - warm == 3`. Slice 3 (catalog-resident Layer B) remains open, and must now be argued on cold start / cross-node sharing / planner-time pruning rather than on a depth number a cache already delivers.
 | Priority | MEDIUM-HIGH — targets DEPTH, the term ADR-033's cost spine ranks highest (`DEPTH ≫ WIDTH ≫ BYTES ≫ CPU`).
 | Component | `crates/storage/proximadb-block-format/src/ranged.rs`, `crates/control/proximadb-catalog/`, `src/storage/engines/sst/`
 | Relates to | ADR-094 (Decision 4, spec §3), ADR-045 (Layer A/B split — this promotes Layer B only), ADR-034 (read-path GET depth), ADR-062 (D1 one-object atomicity), ADR-090 (BYOB)
@@ -41,7 +41,9 @@ metadata*, so **nothing authoritative moves**.
 Cold read becomes: **catalog query (ms, no S3 round-trip) → fetch surviving slabs**.
 
 [.text-center]
-**Dependent GET depth 3 → 1.**
+**Dependent GET depth 3 → 1.** (As originally filed. Superseded — slices 0–2 have since
+delivered most of this on the *warm* path with a read-side cache and no catalog change; see the
+Status row and "Slice 2 as landed".)
 
 This is the DuckLake insight — metadata as queryable rows rather than files-in-bucket,
 collapsing the `metadata.json → manifest list → manifest → data` chain — applied at the
@@ -73,13 +75,26 @@ rebuildable by definition.
 == Evidence gate (mandate #6)
 
 * **Cold-read dependent-GET depth measured 3 → 1** via `io_trace` `range_gets` on a genuinely
-  cold cache — the headline claim, and the one that justifies the work.
+  cold cache — the headline claim as originally filed. **Superseded:** slice 2 measured
+  3 → 0 on the *warm* path from a read-side cache alone, so this is no longer the claim that
+  justifies the work. Slice 3 must be gated on the *cold*-path and cross-node numbers instead
+  (Status row; "Slice 2 as landed").
 * Catalog growth (bytes and write rate) per 1 TB of segments recorded.
 * **Catalog-unavailable recovery exercised**: read a segment with the catalog offline, then
   rebuild Layer B from the object and verify byte-equality with the catalog copy.
 * Divergence handling tested: a deliberately stale catalog entry must not produce wrong
   results.
+
 == Depth re-measured 2026-09-24: the cold chain is FOUR round trips, not three
+
+[NOTE]
+====
+**Read the rest of this document as a chronological record, not as current state.** The sections
+below were written across slices 0–2 and the earlier ones argue a "4 → 1" collapse that slices
+0–2 have since largely delivered *without* catalog-resident metadata. The Status row above and
+"Slice 2 as landed" carry the current, narrower claim. Nothing below is deleted — how the number
+moved is the useful part — but slice 3 must be sized against the later sections.
+====
 
 ADR-094 Decision 4 and this TD both describe the cold PAX read as a "3-deep dependent GET
 chain". Verified against the code, it is **four**, and the uncounted one is a `HEAD`.
@@ -295,3 +310,57 @@ props projection, where the assertion had to run through SQL rather than the blo
 **Evidence:** `warm_read_skips_the_index_fetch` (warm `range_gets` strictly < cold) and
 `cached_index_returns_identical_rows` (a cached index must not change results). Root lib suite
 6436/6436.
+
+=== Slice 2 as landed (2026-09-27) — the depth is measured, and the number is a ratchet
+
+Artifact: `docs/_internal/status/PAX_DATAFUSION_READ_DEPTH_2026_09_27.adoc`. Ledger claim:
+`pax_datafusion_read_depth_index_acquisition` (**measured**).
+
+[cols="1,1,1", options="header"]
+|===
+| | `range_gets` | Index acquisition (dependent)
+| Cold read | 203 | **3**
+| Warm read | 200 | **0**
+|===
+
+**The claim is: index-acquisition round trips on the critical path 3 → 0.** For this v2 fixture
+the 3 are the header-prefix read plus two tail-probe iterations; they are strictly serial and
+nothing can be fetched until they finish. The residual 200 are per-surviving-block stripe
+fetches, which depend on the index but **not on each other** — WIDTH, addressed by range
+coalescing, not depth.
+
+`warm_read_skips_the_index_fetch` was tightened from `warm < cold` to `cold - warm == 3`, so a
+regression in the acquisition path fails rather than degrading quietly. ADR-033 ranks depth the
+dominant term; if the path legitimately changes, **re-derive** the constant from the call sites
+rather than adjusting it to whatever the run produced.
+
+==== Two things this measurement is deliberately not
+
+**Not a percentage.** 3 of 203 is ~1.5%, and quoting that would mislead in both directions: it
+understates the latency effect (the 3 are serial, the 200 parallelisable) and the ratio is an
+artifact of this fixture's 200 blocks — a 10-block segment shows 3 of 13 for the identical
+saving. Depth is the quantity; total request count is not.
+
+**Not a generalisation about `range_gets`.** It happens to be a *complete* depth count on this
+lane — but the reason is that **no operation on the lane is a HEAD once `object_size` is
+present**, not that the call sites are few. `load_ranged`'s own body has four (the `metadata`
+HEAD, now a fallback per slice 0, plus three `read_range` calls); it then delegates to
+`load_ranged_with_index`, which issues the per-block footer/metadata reads and the batched
+stripe fetch. All of those are `read_range`/`read_ranges` and therefore counted. Skipping the
+HEAD in slice 0 is what closed the gap — and a split arriving without `object_size` reopens it.
+That property does **not** hold elsewhere: `RangedSegmentReader` still pays a HEAD
+(`vector_segment_size`), and its own `SegmentReadStats` doc states it *"excludes the one-time
+index-locate suffix read"* — so **that struct** cannot attribute depth, and any measurement
+taken from it must count those operations explicitly.
+
+Note this is a statement about `SegmentReadStats`, **not** about what reaches `io_trace` on that
+lane. An earlier draft of TD-USUB-12 claimed those reads were unmetered; they are not — the
+object-store recorder hook counts them, and the reader's manual forward then double-counts the
+body reads. TD-USUB-12 carries the correction and the reachability analysis.
+
+==== What this leaves for slice 3
+
+A cache is per-process and every node warms independently, so a cold process still pays the 3.
+That — cold start, cross-node sharing, and planner-time pruning a read-side cache cannot
+provide — is the surviving case for catalog-resident Layer B, and it is the claim slice 3 must
+be argued against. Not "4 → 1", which a cache has now largely delivered on the warm path.

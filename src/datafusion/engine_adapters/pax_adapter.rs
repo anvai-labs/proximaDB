@@ -981,18 +981,17 @@ mod tests {
         (split, file_len)
     }
 
-    /// The P-Pushdown gate (TD-DOC-PUSHDOWN-1): a selective predicate makes the
-    /// ranged reader fetch only surviving blocks — `bytes_read < whole segment`
-    /// with `range_gets > 0` — AND returns EXACTLY the rows the whole-file path
-    /// would (block-level pruning parity).
-    /// TD-USUB-8 slice 1: the second read of an immutable segment must not
-    /// re-fetch its index.
+    /// TD-USUB-8 slices 1–2: the second read of an immutable segment must not
+    /// re-fetch its index, and the saving is a fixed DEPTH ratchet.
     ///
     /// `FooterCache`/`SegmentIndexCache` and `open_with_cache` already existed,
     /// but only `record_store.rs` used them — this lane rebuilt the index from
-    /// the object on every read. The assertion is on `range_gets`, which counts
-    /// the ranged reads this path actually issues, so a warm read must issue
-    /// strictly fewer than a cold one.
+    /// the object on every read.
+    ///
+    /// The assertion is `cold - warm == 3`, not `warm < cold`: the gap IS the
+    /// index-acquisition cost, and those reads are strictly dependent, so a
+    /// comparison against a moving target would not catch a regression. See
+    /// `docs/_internal/status/PAX_DATAFUSION_READ_DEPTH_2026_09_27.adoc`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn warm_read_skips_the_index_fetch() {
         // 8 MiB pool, 4 MiB per-tenant ceiling — ample for one segment index.
@@ -1027,9 +1026,35 @@ mod tests {
         })
         .await;
 
-        assert!(
-            warm < cold,
-            "a warm read must skip the index fetch: warm={warm} cold={cold}"
+        // TD-USUB-8 slice 2 — DEPTH RATCHET, printed for the evidence artifact.
+        //
+        // Read the difference, not the totals. The warm/cold gap is the
+        // index-acquisition cost, and those reads are STRICTLY DEPENDENT: the
+        // header prefix must return before the probe can start, and each probe
+        // iteration before the next. Nothing can be fetched until they finish, so
+        // they sit on the critical path and set latency.
+        //
+        // The remaining reads are per-surviving-block stripe fetches. They depend
+        // on the index but not on each other, so they are a WIDTH concern
+        // (addressed by range coalescing), not depth. Reporting the saving as a
+        // percentage of total requests would measure the wrong thing — ADR-033
+        // ranks DEPTH above WIDTH for exactly this reason.
+        // `saturating_sub`, not `-`: both are u64, and a regression that made a
+        // warm read COSTLIER than a cold one would panic with "attempt to
+        // subtract with overflow" before printing — losing exactly the
+        // diagnostic a future reader needs. Saturating to 0 still fails the
+        // assertion, but fails it legibly.
+        let index_acquisition = cold.saturating_sub(warm);
+        println!(
+            "DEPTH cold_range_gets={cold} warm_range_gets={warm} index_acquisition={index_acquisition}"
+        );
+        assert_eq!(
+            index_acquisition, 3,
+            "index acquisition should cost exactly 3 dependent reads for this v2 \
+             fixture (header prefix + 2 probe iterations), and a warm read should \
+             pay none of them. A change here means the index-acquisition path \
+             changed — re-derive it rather than adjusting the number: this is the \
+             DEPTH term ADR-033 ranks dominant. cold={cold} warm={warm}"
         );
     }
 
@@ -1074,6 +1099,10 @@ mod tests {
         );
     }
 
+    /// The P-Pushdown gate (TD-DOC-PUSHDOWN-1): a selective predicate makes the
+    /// ranged reader fetch only surviving blocks — `bytes_read < whole segment`
+    /// with `range_gets > 0` — AND returns EXACTLY the rows the whole-file path
+    /// would (block-level pruning parity).
     #[tokio::test]
     async fn ranged_read_prunes_blocks_off_the_wire() {
         let tmp = tempfile::tempdir().expect("tempdir");
