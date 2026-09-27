@@ -258,3 +258,40 @@ be made against *that* claim.
   record the baseline in `BENCHMARK_EVIDENCE.toml`.
 . **Slice 3** — catalog-resident Layer B, justified on cold-start, cross-node sharing, and
   planner-time pruning rather than on a depth number a cache already achieves.
+
+=== Slice 1 as landed (2026-09-27) — the DataFusion lane uses the existing cache
+
+`PaxSplitReader::load_ranged` now consults the global `SegmentIndexCache` before acquiring a
+segment index, and populates it on a miss. A warm read skips the index acquisition entirely —
+the v4 header-prefix + footer reads, or the legacy PAXZ tail probe.
+
+Nothing new was built: the cache, the key type (`CacheKey`/`CacheKind::SegmentIndex`) and the
+stored type (`SegmentIndex`) all already existed and served exactly one caller. This is the
+same shape as slice 0, where the object size was already known and discarded.
+
+**Keyed on path alone, deliberately.** A PAX segment is immutable once written — flush and
+compaction emit fresh names rather than overwriting — so a path never denotes different bytes.
+(The tenant is already in the path via `DrPathBuilder`; the tenant component of the cache key
+is for the cache's own per-tenant fair-share accounting, not for isolation.)
+
+**Inert when the caches are not initialised.** `segment_index_cache()` returns `None` before
+`init_segment_caches`, and every use is behind `if let Some(..)`, so embedded and test
+configurations behave exactly as before.
+
+==== A gap the test caught, worth recording
+
+The first implementation populated the cache **only on the v4 coalesced branch**. The legacy
+PAXZ tail-probe path — which every pre-v4 segment takes, and which the test fixture produces —
+never inserted, so warm and cold reads were identical (`range_gets` 203 vs 203).
+
+That path is the *more* expensive one to repeat: the probe grows ×4 on a short suffix, so a
+miss can cost several dependent reads rather than one. Both paths now populate the cache.
+
+The reason this surfaced is that the test asserts the **observable effect** (`range_gets` warm
+< cold) rather than the mechanism. A test asserting "the cache contains the key" after a v4
+read would have passed while the common path stayed uncached — the same lesson as TD-USUB-6's
+props projection, where the assertion had to run through SQL rather than the block layer.
+
+**Evidence:** `warm_read_skips_the_index_fetch` (warm `range_gets` strictly < cold) and
+`cached_index_returns_identical_rows` (a cached index must not change results). Root lib suite
+6436/6436.

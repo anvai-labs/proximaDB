@@ -4726,6 +4726,16 @@ pub fn segment_cache_tenant_stats() -> Vec<proximadb_cache::TenantCacheStat> {
         .unwrap_or_default()
 }
 
+/// The global segment-index cache, if initialised (TD-USUB-8 slice 1).
+///
+/// Exposed so the DataFusion PAX lane can skip its index reads too — it built
+/// its own read sequence and never used `RangedSegmentReader::open_with_cache`,
+/// so the cache existed but served exactly one caller.
+pub fn segment_index_cache()
+-> Option<Arc<proximadb_storage_common::ranged_segment::SegmentIndexCache>> {
+    segment_caches().1
+}
+
 fn segment_caches() -> (
     Option<Arc<proximadb_storage_common::ranged_segment::FooterCache>>,
     Option<Arc<proximadb_storage_common::ranged_segment::SegmentIndexCache>>,
