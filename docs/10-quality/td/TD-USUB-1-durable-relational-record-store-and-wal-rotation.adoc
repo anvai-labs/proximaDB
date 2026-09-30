@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Open:** wiring 2a into the production partition factory, slice 2b (WAL truncation), slice 2c (compaction).
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **Open:** (i) segment deletion on DROP, (ii) catalog registration of segments, (iii) wire the two production call sites, (iv) slice 2b (WAL truncation), (v) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -173,6 +173,94 @@ no caller changes. Precedent to mirror: `src/graph/cold_segment_store.rs:399`.
 
 Ship default-OFF behind an env gate registered in `ENV_GATE_REGISTRY` (the guard rejects
 unregistered vars), so the existing WAL-only path remains the default until the gate flips.
+
+== Slice 2a wiring as landed (2026-09-27) — and a correction to this TD's ordering
+
+The factory prerequisite above is now implemented: `storage_factory` takes
+`(tenant_id, collection)`, which [`partition`] already had in hand and discarded. `new_spilling`
+builds a `SpillRecordStorage` per partition, so slice 2a's store is no longer unreferenced code.
+
+**Default-OFF means the legacy TYPE, not a disabled new one.** With
+`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` unset, `new_spilling` builds a
+`MemtableRecordStorage` — exactly what `new_partitioned` builds — rather than a spill store
+configured never to flush. A spill store with `flush_threshold: None` would *behave* like the
+memtable while running different read-merge code on every production read. Mandate #8 asks for
+the legacy path when the marker is absent, and "the same type" is the only version of that
+claim which cannot drift.
+
+=== The shared-mode probe had to go, not just move
+
+`drop_table_records` detected shared-storage mode by **calling the factory** and comparing the
+product to a stored partition with `Arc::ptr_eq`. That worked only because every factory was
+side-effect-free. A factory that builds a durable store performs I/O and claims an object path,
+so probing it would construct a partition store on every `DROP TABLE` purely to discard it.
+Replaced with a `shared_storage` flag recorded at construction — which is also simply the truth,
+since only `new` produces that shape.
+
+=== Correction: catalog registration must come BEFORE production wiring, not after
+
+This TD's "How to apply" lists catalog registration as step 2 and truncation as step 3, and the
+slice-2a notes list catalog registration as a 2b precondition. Both understate it: **the derived
+segment path is not reconstructible at recovery at all.**
+
+`replay_wal_entries` — the only thing that repopulates a partition after a restart — reaches
+`partition()` carrying just the WAL entry's `tenant_id` and `collection_id`, and
+`CanonicalWalEntry` has **no namespace field**. A `DrPathBuilder` prefix needs the namespace
+(`object_store_write_base_path` takes it from `TenantContext`), so recovery cannot re-derive
+where a partition's segments were written. Two further movers compound it:
+
+* the partition key's collection component is **gate-dependent** — `memtable_partition_keys`
+  returns the stable object id under `PROXIMADB_WAL_OBJECT_ID_KEY` and the table name otherwise,
+  so flipping an unrelated gate moves the derived path;
+* during an oid cutover a single table has **two** partition keys (primary + legacy), hence two
+  derived paths.
+
+This is harmless in 2a precisely because segments are tracked in memory and never read after a
+restart — the WAL is authoritative and replay rebuilds everything. It is fatal the moment
+truncation lands: truncation may only reference a segment whose location is recorded somewhere
+recovery can read, and a path derived from mutable, gate-dependent, namespace-less identity is
+not that.
+
+**So the order is: catalog registration of segments (TD-USUB-4 additive layouts) → then 2b
+truncation.** Registration is not an implementation detail of truncation; it is what makes a
+segment addressable at all. Recorded here rather than discovered during 2b.
+
+=== Two further preconditions found by reviewing the wiring
+
+**DROP TABLE orphans every flushed segment, and `PURGE` does not purge.** `SpillRecordStorage`
+has no delete path at all — no `filesystem.delete`, no purge method — and `drop_table_records`
+clears only in-RAM state (`drop_partition_state`). Once the gate is on and the production sites
+are wired, `DROP TABLE … PURGE` would drop the catalog entry and the partition map entry while
+every `spill-*.parquet` object stays in the bucket forever, with nothing referencing it. That is
+unbounded KSU billing against the tenant and a data-deletion gap under a statement whose whole
+contract is deletion. It belongs with registration: **the catalog reference is what makes the
+objects findable for deletion**, so neither can ship without the other.
+
+**A deterministic base path needs a per-instance nonce in the segment name.** The counter
+(`next_segment`) is unique only within one store instance, and this PR made `base_path` a pure
+function of `(tenant, collection)`. A second store at the same path — after a restart, or after
+`drop_partition_state` evicts the partition and the next access rebuilds it — restarts at 0 and
+re-issues `spill-0000000000`; `FileSystem::write` with `options: None` takes the overwrite
+branch and clobbers the earlier object **silently**. Fixed here by putting a per-instance UUID in
+the name and committing through `write_if_absent`, so a collision fails loudly instead of
+destroying a segment. Worth recording because the fresh-name property was *vacuously* true while
+the store had no callers: **wiring is what turned a correct-looking comment into a false one.**
+
+**`FileOptions::overwrite` is not the way to get fail-closed writes, and a first attempt at this
+fix used it.** Only `LocalFileSystem::write` consults that flag; `aws_s3`, `azure_blob` and
+`gcs_store` ignore it and issue an unconditional PUT. A unit test on the local backend passes
+either way, so the gap is invisible in CI — the guarantee would have been absent precisely on the
+cloud deployments it exists for. The codebase's designated primitive is `write_if_absent`: a real
+conditional create (`PutMode::Create` on S3, `create_new(true)` locally) whose trait contract
+forbids emulating it with a racy exists-then-write, and whose default impl errors rather than
+silently downgrading.
+
+Checked rather than assumed: **no other live call site has this hole today.** The two remaining
+`overwrite: false` occurrences in the storage layer are both inert — the SST flush path
+(`engines/sst/flush/mod.rs`) already commits through `write_if_absent`, and RAPTOR
+(`engines/raptor/engine.rs`) stores the options in a field nothing reads. So this is a **latent
+hazard to avoid reusing**, not a live defect elsewhere: `FileOptions { overwrite: false }` on a
+plain `write` looks like a safety property and is one only on the local backend.
 
 == Evidence gate (mandate #6)
 

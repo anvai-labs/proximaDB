@@ -84,7 +84,11 @@ pub const SPILL_MAX_RESIDENT_ENV: &str = "PROXIMADB_RELATIONAL_SPILL_MAX_RESIDEN
 ///
 /// A zero or unparsable value reads as unset rather than "flush on every write" —
 /// a typo must not turn every insert into an object write.
-fn configured_flush_threshold() -> Option<usize> {
+///
+/// Read at every partition construction rather than cached in a `OnceLock`: the
+/// gate must be observable per store, and a process-lifetime cache is what made
+/// the TD-USUB-6 residual-tail benchmark measure the same mode twice.
+pub(crate) fn configured_flush_threshold() -> Option<usize> {
     std::env::var(SPILL_MAX_RESIDENT_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -108,9 +112,23 @@ pub struct SpillRecordStorage {
     /// Directory under which this partition's segments are written. Callers build
     /// it with `DrPathBuilder`; this store never constructs a raw path itself.
     base_path: String,
-    /// Monotonic segment counter, so segment names are fresh-by-construction and
-    /// a write never overwrites a live object (ADR-062 fresh-name discipline).
+    /// Monotonic segment counter — unique **within one store instance**.
     next_segment: AtomicU64,
+    /// Per-instance nonce, unique **across** instances sharing a `base_path`.
+    ///
+    /// The counter alone is not enough for ADR-062's fresh-name discipline once
+    /// `base_path` is derived deterministically from `(tenant, collection)`, as
+    /// the partition factory now derives it. A second store at the same path —
+    /// after a process restart, or after `drop_partition_state` evicts the
+    /// partition and the next access rebuilds it — restarts its counter at 0 and
+    /// would re-issue `spill-0000000000`. `FileSystem::write` with `options:
+    /// None` takes the overwrite branch, so that clobbers the earlier object
+    /// **silently**.
+    ///
+    /// The nonce makes names fresh by construction across instances; `flush`
+    /// additionally writes with `overwrite: false` so that if this reasoning is
+    /// ever wrong the write FAILS rather than destroying a segment (mandate #1).
+    instance: String,
 }
 
 impl SpillRecordStorage {
@@ -136,6 +154,7 @@ impl SpillRecordStorage {
             filesystem,
             base_path: base_path.into(),
             next_segment: AtomicU64::new(0),
+            instance: uuid::Uuid::new_v4().simple().to_string(),
         }
     }
 
@@ -184,14 +203,56 @@ impl SpillRecordStorage {
         let bytes = record_batches_to_parquet_bytes(&[batch], file_schema, None)
             .context("spill: encode Arrow batch to parquet bytes")?;
 
+        // `instance` before `seq`: the counter is unique only within one store,
+        // and `base_path` is now derived deterministically from the partition
+        // identity, so two stores at the same path would otherwise both emit
+        // `spill-0000000000`. See the `instance` field.
         let seq = self.next_segment.fetch_add(1, Ordering::SeqCst);
         let path = format!(
-            "{}/spill-{seq:010}.parquet",
-            self.base_path.trim_end_matches('/')
+            "{}/spill-{}-{seq:010}.parquet",
+            self.base_path.trim_end_matches('/'),
+            self.instance
         );
 
+        // `create_dirs`: a local-filesystem backend creates the parent only when
+        // asked (`local.rs` gates it on this flag), and a partition's base path
+        // is fresh by construction — nothing has created
+        // `…/{tenant}/{collection}/` before the first flush. Object-store
+        // backends ignore it: keys are flat (ADR-036).
+        //
+        // Not caught until this store was wired behind the partition factory:
+        // its own tests hand it a `tempdir()` that already exists, so they
+        // exercised the flush MECHANISM while never exercising the path a real
+        // caller supplies.
+        //
+        // `write_if_absent`, NOT `write` with `overwrite: false`. A segment is
+        // immutable and the name above is fresh by construction — so a collision
+        // is a bug, and it must fail loudly rather than destroy a durable segment
+        // (mandate #1: fail closed, never silently wrong).
+        //
+        // `FileOptions::overwrite` would NOT deliver that: only the local backend
+        // consults it. `aws_s3`/`azure_blob`/`gcs_store` all ignore it in `write`
+        // and issue an unconditional PUT, so on exactly the deployments that
+        // matter the "fail loudly" guarantee would be absent while the code
+        // claimed it. `write_if_absent` is this codebase's designated commit
+        // primitive — a real conditional create (`PutMode::Create` on S3,
+        // `create_new(true)` locally), whose trait doc requires implementations
+        // "must not emulate it with a racy exists-then-write", and whose default
+        // impl errors rather than silently downgrading.
+        //
+        // This CANNOT wedge a retry, so do not "fix" it back to `write`: `seq` is
+        // taken by `fetch_add` ABOVE, so a failed flush consumes its number and
+        // the next attempt uses a new one. A name is never reused. The cost is
+        // that a write which failed *after* the object landed leaves an orphan —
+        // inherent to ADR-062 fresh-name discipline, and strictly better than
+        // overwriting a live segment.
+        let options = crate::storage::persistence::filesystem::FileOptions {
+            create_dirs: true,
+            overwrite: false,
+            ..Default::default()
+        };
         self.filesystem
-            .write(&path, &bytes, None)
+            .write_if_absent(&path, &bytes, Some(options))
             .await
             .map_err(|e| anyhow::anyhow!("spill: write segment '{path}' failed: {e}"))?;
 
@@ -415,6 +476,98 @@ mod tests {
         assert_eq!(s.segment_count(), 0);
         assert_eq!(s.resident_len(), 50);
         assert_eq!(s.scan_records(usize::MAX).await?.len(), 50);
+        Ok(())
+    }
+
+    /// TWO stores at the SAME base path must not destroy each other's segments.
+    ///
+    /// This is the shape the partition factory now creates: `base_path` is a pure
+    /// function of `(tenant, collection)`, so a restart — or a
+    /// `drop_partition_state` eviction followed by the next access — builds a
+    /// second store over the first one's objects with its counter back at 0.
+    /// Without the per-instance nonce both would emit `spill-0000000000`, and
+    /// `write` with `options: None` overwrites silently: the first store's
+    /// durable rows would be gone with no error anywhere.
+    ///
+    /// Asserts the observable property (both stores' segments survive and stay
+    /// readable), not the file-naming scheme, so a different uniqueness strategy
+    /// still passes.
+    #[tokio::test]
+    async fn two_stores_sharing_a_base_path_do_not_overwrite_segments() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            LocalFileSystem::new(LocalConfig::default())
+                .await
+                .expect("local filesystem"),
+        );
+
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), shared.clone(), Some(2));
+        for i in 0..4 {
+            first
+                .upsert_record(record(&format!("a{i}"), "open"))
+                .await?;
+        }
+        assert!(first.segment_count() > 0, "first store must have flushed");
+        let first_rows = first.scan_records(usize::MAX).await?.len();
+
+        // A SECOND store over the same path, counter back at 0.
+        let second = SpillRecordStorage::with_flush_threshold(fs, shared, Some(2));
+        for i in 0..4 {
+            second
+                .upsert_record(record(&format!("b{i}"), "open"))
+                .await?;
+        }
+        assert!(second.segment_count() > 0, "second store must have flushed");
+
+        // The first store's rows must still be readable: its segments were not
+        // clobbered by the second store's writes.
+        assert_eq!(
+            first.scan_records(usize::MAX).await?.len(),
+            first_rows,
+            "the second store overwrote the first store's segments"
+        );
+        Ok(())
+    }
+
+    /// A partition's base path does NOT exist before its first flush, and a
+    /// local-filesystem backend will not create it on write.
+    ///
+    /// Every other test here uses `store()`, which hands over a `tempdir()` the
+    /// harness already created — so they exercise the flush mechanism while
+    /// never exercising the path a real caller supplies. This one points the
+    /// store at a nested path that does not exist, which is what the partition
+    /// factory produces (`…/{tenant}/{collection}`), and is the shape that
+    /// failed when slice 2a was first wired behind it.
+    #[tokio::test]
+    async fn flush_creates_a_base_path_that_does_not_exist_yet() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = format!(
+            "{}/tenant-a/orders",
+            dir.path().to_string_lossy().trim_end_matches('/')
+        );
+        std::mem::forget(dir);
+        assert!(
+            !std::path::Path::new(&nested).exists(),
+            "precondition: the partition path must NOT exist yet"
+        );
+
+        let fs = LocalFileSystem::new(LocalConfig::default())
+            .await
+            .expect("local filesystem");
+        let s = SpillRecordStorage::with_flush_threshold(Arc::new(fs), nested, Some(2));
+
+        for i in 0..6 {
+            s.upsert_record(record(&format!("o{i}"), "open")).await?;
+        }
+
+        assert!(s.segment_count() > 0, "the store must have flushed");
+        assert_eq!(
+            s.scan_records(usize::MAX).await?.len(),
+            6,
+            "every row must survive a flush into a freshly created directory"
+        );
         Ok(())
     }
 
