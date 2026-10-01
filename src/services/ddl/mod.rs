@@ -19,9 +19,37 @@ use proximadb_catalog::{
     SchemaChange,
 };
 use proximadb_data_model::ProximaType;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::catalog::CatalogManager;
+
+/// Count of `DROP TABLE`s whose record-tier purge failed, leaving durable objects
+/// behind with no catalog entry referencing them.
+///
+/// This exists because the purge is **structurally** best-effort: the catalog drop
+/// commits first, so by the time a purge failure is known the table is already
+/// gone and nothing will ever retry it. The objects are then unreachable — they
+/// bill the tenant and they are not deleted, under a statement whose contract is
+/// deletion. A log line alone cannot carry that; a counter can be alerted on.
+///
+/// Mirrors the Iceberg-publish-failure counter (TD-USUB-9), including its
+/// lazy-and-tolerant registration: observability must never take down a DDL path,
+/// so a construction error yields `None` and a duplicate registration leaves a
+/// working-but-unexported counter. No `.expect()` — this is `src/` (mandate #4).
+///
+/// **This counter is a smoke alarm, not a fix.** Guaranteed cleanup needs an
+/// orphan reaper that can find these objects without a catalog entry; see
+/// TD-USUB-1.
+static RECORD_PURGE_FAILURES: std::sync::LazyLock<Option<prometheus::IntCounter>> =
+    std::sync::LazyLock::new(|| {
+        let counter = prometheus::IntCounter::new(
+            "proximadb_record_tier_purge_failures_total",
+            "DROP TABLE record-tier purges that failed, orphaning durable objects",
+        )
+        .ok()?;
+        let _ = prometheus::register(Box::new(counter.clone()));
+        Some(counter)
+    });
 
 /// DDL Statement types
 #[derive(Debug, Clone)]
@@ -1021,6 +1049,19 @@ impl DdlService {
         // TD-CONV-2: purge the record tier so a table recreated with the same
         // name starts empty. Best-effort — the catalog drop already committed;
         // stores without drop support warn (trait default).
+        //
+        // TD-USUB-1: this purge now also DELETES a spilled partition's durable
+        // objects, which changes what a failure here costs. It is no longer only
+        // "a recreated table may see dropped rows" — it is objects left in the
+        // bucket that nothing references, billing the tenant, after a statement
+        // that reported success.
+        //
+        // Still not fatal, and deliberately so: the catalog drop above has already
+        // committed, so returning an error would report failure for a table that
+        // IS gone and send the client into a retry that finds nothing. What the
+        // failure must not be is invisible — hence `error!` plus a counter an
+        // operator can alert on (the TD-USUB-9 pattern). Guaranteed cleanup needs
+        // an orphan reaper, which is recorded on TD-USUB-1 rather than faked here.
         if let (Some(record_store), Some(schema)) = (&self.record_store, dropped_schema.as_ref())
             && let Err(e) = record_store
                 .drop_table_records(
@@ -1031,10 +1072,15 @@ impl DdlService {
                 )
                 .await
         {
-            warn!(
+            if let Some(counter) = RECORD_PURGE_FAILURES.as_ref() {
+                counter.inc();
+            }
+            error!(
                 table = %table_name,
                 error = %e,
-                "record-tier purge after DROP TABLE failed; a recreated table may see dropped rows"
+                "record-tier purge after DROP TABLE failed: a recreated table may see dropped rows, \
+                 and any spilled segment objects are now orphaned (no catalog entry references \
+                 them, so nothing will retry this)"
             );
         }
 

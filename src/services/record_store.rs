@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
@@ -2111,6 +2111,45 @@ impl TableRecordStore for DirectWalTableRecordStore {
         self.wal_appender
             .append_operations(operations, tenant_id)
             .await?;
+
+        // Delete the partition's durable objects BEFORE releasing the in-memory
+        // handle, and surface a failure rather than logging it.
+        //
+        // Order matters: `drop_partition_state` removes the map entry, and for a
+        // store that owns objects that is NOT deletion — it is losing the handle
+        // to data that stays in the bucket. Purging first means a failure leaves
+        // the partition addressable, so a retried DROP can finish the job.
+        //
+        // A no-op for the in-memory default (nothing to own). The purge is
+        // idempotent, so a partition created on demand here purely to be dropped
+        // is harmless.
+        //
+        // The error is returned, but do NOT read that as "a failed purge fails the
+        // DROP": the caller cannot make it fatal. `DropTable::execute` commits the
+        // CATALOG drop before calling this, so by the time a purge failure is
+        // known the table is already gone — failing the statement would report
+        // failure for a table that really is dropped. It therefore records the
+        // failure loudly (`error!` + `proximadb_record_tier_purge_failures_total`)
+        // and continues. Returning the error here is still right: it is the
+        // caller's decision to make, and the context travels with it.
+        //
+        // The consequence is that a purge failure orphans objects permanently
+        // (nothing references them afterwards, so nothing retries). That gap needs
+        // an orphan reaper and is the first Open item on TD-USUB-1 — it is not
+        // closed by this change.
+        //
+        // `partitions_for` already drops a legacy partition that is the same `Arc`
+        // as the primary, so a shared-storage store is not purged twice.
+        let (primary_partition, legacy_partition) =
+            self.partitions_for(&tenant_scope, table_schema);
+        for partition in std::iter::once(primary_partition).chain(legacy_partition) {
+            partition.purge_durable_objects().await.with_context(|| {
+                format!(
+                    "dropping table '{}': purging durable objects for partition '{collection_id}'",
+                    table_schema.name
+                )
+            })?;
+        }
 
         self.drop_partition_state(&tenant_scope, &collection_id);
         if let Some(legacy) = &legacy_key {
