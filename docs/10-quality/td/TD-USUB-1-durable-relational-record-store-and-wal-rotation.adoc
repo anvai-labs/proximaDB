@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **Open:** (i) an **orphan reaper** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone (see "What purge-on-DROP does NOT cover"), (ii) catalog registration of segments — for 2b truncation, *not* for deletion, (iii) wire the two production call sites, (iv) slice 2b (WAL truncation), (v) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with (iii)** — see "Design decided"; (ii) catalog registration of segments — for 2b truncation, *not* for deletion, (iii) wire the two production call sites, (iv) slice 2b (WAL truncation), (v) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -271,10 +271,79 @@ without new machinery, because the catalog drop commits *first*:
   permanently. Making replay purge is not obviously safe either: replaying a stale drop marker
   could delete objects belonging to a table since recreated under the same name.
 
-Both roads lead to the same missing piece: **a reaper that can find spill objects without a
-catalog entry.** It is tractable precisely because `base_path` is derived from
-`(tenant, collection)` — a sweep can enumerate prefixes under a tenant and delete those with no
-live table. Recorded here as its own item rather than implied by "deletion works".
+Both roads lead to the same missing piece: **a way to finish a deletion whose catalog entry is
+already gone.**
+
+==== Design decided 2026-10-02 — a POSITIVE-EVIDENCE obligation, not a sweep for absence
+
+An earlier draft of this section proposed "a sweep can enumerate prefixes under a tenant and
+delete those with no live table". **Do not build that.** It deletes on *inferred absence*: a
+catalog that is briefly unreadable, a listing that races a `CREATE`, or an entry that has not yet
+replicated all read as "no live table", and the reaper then destroys live data. A deletion path
+must fail closed (mandate #1); absence-inference is fail-open by construction.
+
+The correct shape is the one this repo already uses for the identical problem. **TD-COMPACT-13**
+(`src/storage/engines/sst/retirement_ledger.rs`) records a compaction's failed deletes as a durable
+*obligation* in a per-collection sidecar (`retire-pending.json`) beside the segments, tracks them in
+a process-global set the read path filters against, and exposes a gauge so un-drained obligations
+are visible rather than silent. Nothing is deleted because it *looks* unreferenced; it is deleted
+because something recorded the intent to delete it.
+
+**Prefer widening that module to writing a second one (mandate #12).** Exactly one thing blocks
+direct reuse: it is **local-disk coupled** — `sidecar_path` / `load_ledger` / `write_ledger` use
+`std::fs::read`/`write`/`rename` over `&Path`, while the relational spill path goes through
+`Arc<dyn FileSystem>` and must work on S3/Azure. Visibility is **not** a barrier, despite looking
+like one: those functions are `pub(crate)`, and in this monolith `pub(crate)` is crate-wide —
+`src/services/` and `src/storage/` are the same root `proximadb` crate, so `record_spill.rs` can
+call them today. So the cheapest honest path is to give the ledger a `&dyn FileSystem` and reuse
+it; a parallel implementation should be the fallback, not the plan.
+
+So: **on purge failure, write an obligation marker under the partition prefix, and drain markers
+later.** The drain acts only on prefixes carrying a marker — positive evidence — never on a prefix
+that merely lacks a catalog entry.
+
+[IMPORTANT]
+====
+**The marker MUST record the exact object paths, and the drain MUST delete only those paths —
+never re-list the prefix.** This is not an implementation detail; it is the whole safety argument,
+and an earlier draft of this section omitted it and was therefore unsafe.
+
+The partition prefix is derived from `(tenant, collection)`, so a table dropped and **recreated
+under the same name writes to the same prefix**. A drain that found a marker and then re-listed the
+prefix for `spill-*.parquet` would delete the *new* table's segments. Recording exact paths is what
+makes that impossible, because the per-instance nonce added with the 2a wiring gives every segment
+a name unique to the store instance that wrote it (`spill-{instance}-{seq:010}.parquet`) — so the
+recorded names cannot match anything a later instance writes.
+
+Note the precedent already gets this right: `PendingRetirement` records `inputs: Vec<String>`, an
+explicit path list, not a directory to re-scan. Follow it literally.
+
+The nonce is therefore load-bearing for two independent properties: it prevents a second store
+instance from silently overwriting the first's segments (the reason it was added, #1945), and it
+makes a stale deletion obligation safe to complete. Neither is stated at the field itself; both
+depend on it.
+====
+
+The purge already has the exact list in hand at the moment of failure — it listed the prefix to
+build the delete set — so recording it costs nothing extra.
+
+**Why not put the obligation in the canonical WAL** (extend `RecordPartitionDrop` with the paths):
+it would work, and it *would* be mixed-read-safe — canonical entries are encoded with
+`rmp_serde::to_vec_named` (`src/services/canonical_wal.rs`), so field-name-keyed maps plus
+`#[serde(default)]` tolerate old and new readers in both directions. It is rejected on blast
+radius: `wal_entry.rs` carries **no `#[serde(default)]` field today**, so this would be the first
+format evolution of the most safety-critical structure in the system, for a gap that is still
+latent. A prefix-local marker needs no format change and is self-describing to anyone reading the
+bucket directly.
+
+==== Sequencing: build this WITH production wiring, not ahead of it
+
+The gap cannot be reached today — `new_spilling` has no production caller, so no deployment can
+orphan a spill object. Building marker + drain now would be machinery exercised only by its own
+tests, and the part that actually needs validating — does a drain reliably finish an interrupted
+DROP against a real object store? — is not testable until something real writes segments.
+**Open item (i) is therefore gated with (iii), not ahead of it**, and
+`proximadb_record_tier_purge_failures_total` is what keeps the gap visible meanwhile.
 
 **A deterministic base path needs a per-instance nonce in the segment name.** The counter
 (`next_segment`) is unique only within one store instance, and this PR made `base_path` a pure
