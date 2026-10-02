@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **Open:** (i) segment deletion on DROP, (ii) catalog registration of segments, (iii) wire the two production call sites, (iv) slice 2b (WAL truncation), (v) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **Open:** (i) an **orphan reaper** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone (see "What purge-on-DROP does NOT cover"), (ii) catalog registration of segments — for 2b truncation, *not* for deletion, (iii) wire the two production call sites, (iv) slice 2b (WAL truncation), (v) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -233,8 +233,48 @@ clears only in-RAM state (`drop_partition_state`). Once the gate is on and the p
 are wired, `DROP TABLE … PURGE` would drop the catalog entry and the partition map entry while
 every `spill-*.parquet` object stays in the bucket forever, with nothing referencing it. That is
 unbounded KSU billing against the tenant and a data-deletion gap under a statement whose whole
-contract is deletion. It belongs with registration: **the catalog reference is what makes the
-objects findable for deletion**, so neither can ship without the other.
+contract is deletion.
+
+[NOTE]
+====
+**Fixed 2026-09-30 — and the sentence that stood here was wrong.** It said "the catalog reference
+is what makes the objects findable for deletion, so neither can ship without the other."
+
+Deletion needs no catalog. `base_path` is derived deterministically from `(tenant, collection)` —
+which is exactly what the slice-2a wiring established — so the **prefix is** the reference.
+`purge_durable_objects` lists it and deletes the `spill-*.parquet` objects it finds.
+
+Listing the prefix is also strictly better than any tracked list would have been: it reclaims
+segments written by *earlier* store instances at the same prefix — the orphans a restart or a
+`drop_partition_state` eviction leaves behind, which neither this instance's in-memory list nor a
+catalog row written by a previous process would surface.
+
+Catalog registration remains a precondition for **2b truncation** (which must reference a segment
+whose location recovery can read, per ADR-094's rule). It was never a precondition for deletion.
+Coupling the two would have held a real data-deletion fix behind unrelated work.
+====
+
+==== What purge-on-DROP does NOT cover — an orphan reaper is still needed
+
+Deletion on the **success path** is now correct. Deletion under **failure** is not, and cannot be
+without new machinery, because the catalog drop commits *first*:
+
+* `DropTable::execute` drops the catalog entry, *then* purges the record tier. By the time a purge
+  failure is known the table is gone, so **nothing will ever retry it** — the objects have no
+  catalog entry naming them. Returning an error would report failure for a table that really is
+  dropped and send the client into a retry that finds nothing, so the failure is instead made
+  loud and alertable (`error!` + `proximadb_record_tier_purge_failures_total`, the TD-USUB-9
+  pattern). A counter is a smoke alarm, not a fix.
+* **WAL replay of `RecordPartitionDrop` does not purge**, only `drop_partition_state`. The marker
+  is appended before the purge precisely so a crash replays the drop — which is right for
+  *correctness* (no resurrected rows) but means a crash in that window orphans the objects
+  permanently. Making replay purge is not obviously safe either: replaying a stale drop marker
+  could delete objects belonging to a table since recreated under the same name.
+
+Both roads lead to the same missing piece: **a reaper that can find spill objects without a
+catalog entry.** It is tractable precisely because `base_path` is derived from
+`(tenant, collection)` — a sweep can enumerate prefixes under a tenant and delete those with no
+live table. Recorded here as its own item rather than implied by "deletion works".
 
 **A deterministic base path needs a per-instance nonce in the segment name.** The counter
 (`next_segment`) is unique only within one store instance, and this PR made `base_path` a pure

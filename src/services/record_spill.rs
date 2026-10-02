@@ -383,6 +383,107 @@ impl RecordStore for SpillRecordStorage {
         }
         Ok(false)
     }
+
+    /// Delete every spill segment under this partition's prefix.
+    ///
+    /// Deletes by **listing the prefix**, not by walking the in-memory
+    /// `segments` list, and that difference is the point: `base_path` is derived
+    /// deterministically from `(tenant, collection)`, so the prefix also holds
+    /// segments written by *earlier* store instances at the same path — a prior
+    /// process, or an instance discarded by `drop_partition_state`. Those are
+    /// invisible to this instance's list and would survive a DROP forever.
+    ///
+    /// A missing prefix is success, not failure: a partition that never flushed
+    /// has nothing to delete, and a re-drop must not error (the contract requires
+    /// idempotence). Every other I/O error propagates — reporting success for a
+    /// failed delete would leave data the tenant cannot reach or remove.
+    async fn purge_durable_objects(&self) -> RecordStoreResult<()> {
+        let prefix = self.base_path.trim_end_matches('/').to_string();
+        let entries = match self.filesystem.list(&prefix).await {
+            Ok(entries) => entries,
+            // Nothing was ever written under this prefix — a partition that never
+            // flushed has nothing to delete, and the contract requires idempotence.
+            //
+            // BOTH arms are needed. The local backend surfaces a missing directory
+            // as `Io(ErrorKind::NotFound)` from `read_dir`, not as the typed
+            // `NotFound` variant — matching only the latter would make DROP TABLE
+            // fail outright for any table that never spilled.
+            Err(err) if is_absent(&err) => {
+                // Clear BOTH, exactly as the success path does. Harmless today
+                // because `drop_table_records` releases the whole store right
+                // after — but an orphan reaper calling purge standalone would
+                // otherwise leave a store whose segments are gone while its
+                // tombstones survive, and the two arms must not diverge.
+                self.segments.write().clear();
+                self.tombstones.clear();
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "spill: list segment prefix '{prefix}' for purge failed: {err}"
+                ));
+            }
+        };
+
+        for entry in entries {
+            if entry.metadata.is_directory || !is_spill_segment(&entry.name) {
+                continue;
+            }
+            self.filesystem.delete(&entry.url).await.map_err(|err| {
+                anyhow::anyhow!(
+                    "spill: delete segment '{}' during purge failed: {err}",
+                    entry.url
+                )
+            })?;
+        }
+
+        // Only after the objects are gone: a crash midway leaves the remaining
+        // objects still listed under the prefix, so a retry finds and removes
+        // them.
+        self.segments.write().clear();
+        self.tombstones.clear();
+        Ok(())
+    }
+}
+
+/// `true` when a `list` error means "this path does not exist" rather than a real
+/// failure.
+///
+/// How each backend reports a missing prefix, checked rather than assumed:
+///
+/// * **local** — `Io(ErrorKind::NotFound)`, straight out of `read_dir`. This is
+///   the case that matters: without it, an ordinary DROP of a table that never
+///   spilled would fail.
+/// * **S3 / Azure / GCS** — no error at all. They stream a listing and yield
+///   `Ok(vec![])` for a prefix with no keys, so this predicate is never consulted
+///   (flat keyspace: there is no directory to be missing).
+/// * **HDFS** — `Network("HDFS list error: 404 …")`. Deliberately **not** matched:
+///   classifying it would mean string-matching a status code out of a message,
+///   and for a *deletion* path the conservative failure is the right one. Treating
+///   an unrecognised list error as absence would silently skip deleting objects
+///   that are really there. The cost is that DROP of a never-spilled table on HDFS
+///   reports a purge failure; HDFS is not in `SUPPORTED_SURFACE.adoc` and the
+///   filesystem factory never constructs it, so nothing reaches this today.
+///
+/// Erring toward "real failure" is the safe direction here: a false *absence*
+/// loses data silently, a false *failure* is loud and recorded.
+fn is_absent(err: &proximadb_storage_filesystem_types::FilesystemError) -> bool {
+    use proximadb_storage_filesystem_types::FilesystemError;
+    match err {
+        FilesystemError::NotFound(_) => true,
+        FilesystemError::Io(io) => io.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+/// `true` for an object this store wrote — `spill-{instance}-{seq}.parquet`.
+///
+/// Matched by prefix and extension rather than by parsing the name, and
+/// deliberately narrow: the prefix belongs to this partition, but refusing to
+/// delete anything that does not look like our own output means a path
+/// misconfiguration cannot turn a DROP into a delete of someone else's objects.
+fn is_spill_segment(name: &str) -> bool {
+    name.starts_with("spill-") && name.ends_with(".parquet")
 }
 
 #[async_trait]
@@ -448,6 +549,122 @@ mod tests {
             .await
             .expect("local filesystem");
         SpillRecordStorage::with_flush_threshold(Arc::new(fs), base, threshold)
+    }
+
+    /// Count segment objects directly on disk, independent of what the store
+    /// believes it has — the only way to tell deletion from forgetting.
+    fn segment_files_on_disk(base: &str) -> usize {
+        std::fs::read_dir(base)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| is_spill_segment(&e.file_name().to_string_lossy()))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// DROP must DELETE the objects, not merely forget them.
+    ///
+    /// Asserted on the filesystem rather than through `segment_count()`: clearing
+    /// the in-memory list is exactly the bug this guards against, so a test that
+    /// trusted the store's own bookkeeping would pass while every object survived.
+    #[tokio::test]
+    async fn purge_deletes_the_objects_not_just_the_bookkeeping() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            LocalFileSystem::new(LocalConfig::default())
+                .await
+                .expect("local filesystem"),
+        );
+        let s = SpillRecordStorage::with_flush_threshold(fs, base.clone(), Some(2));
+
+        for i in 0..6 {
+            s.upsert_record(record(&format!("o{i}"), "open")).await?;
+        }
+        let before = segment_files_on_disk(&base);
+        assert!(before > 0, "precondition: the store must have flushed");
+
+        s.purge_durable_objects().await?;
+
+        assert_eq!(
+            segment_files_on_disk(&base),
+            0,
+            "purge must delete every segment object (had {before})"
+        );
+        assert_eq!(
+            s.segment_count(),
+            0,
+            "purge must also clear the tracked list"
+        );
+        Ok(())
+    }
+
+    /// Purge must reclaim segments written by an EARLIER store instance at the
+    /// same prefix — the orphans a restart or a `drop_partition_state` eviction
+    /// leaves behind, which the current instance never knew about.
+    ///
+    /// This is why purge lists the prefix instead of walking `self.segments`.
+    #[tokio::test]
+    async fn purge_reclaims_orphans_from_a_previous_instance() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            LocalFileSystem::new(LocalConfig::default())
+                .await
+                .expect("local filesystem"),
+        );
+
+        // Instance 1 flushes, then goes away without purging (restart / eviction).
+        {
+            let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), Some(2));
+            for i in 0..4 {
+                first
+                    .upsert_record(record(&format!("a{i}"), "open"))
+                    .await?;
+            }
+            assert!(first.segment_count() > 0, "precondition: first flushed");
+        }
+        let orphans = segment_files_on_disk(&base);
+        assert!(orphans > 0, "precondition: orphaned objects exist");
+
+        // Instance 2 at the same prefix has an EMPTY segment list.
+        let second = SpillRecordStorage::with_flush_threshold(fs, base.clone(), Some(2));
+        assert_eq!(
+            second.segment_count(),
+            0,
+            "precondition: the new instance knows nothing of the orphans"
+        );
+
+        second.purge_durable_objects().await?;
+
+        assert_eq!(
+            segment_files_on_disk(&base),
+            0,
+            "purge must delete orphans it never tracked (had {orphans})"
+        );
+        Ok(())
+    }
+
+    /// Purge is idempotent: a partition that never flushed, and a re-drop, are
+    /// both success. The contract says so, and `drop_table_records` now propagates
+    /// errors — so a spurious failure here would make DROP TABLE fail outright.
+    #[tokio::test]
+    async fn purge_is_idempotent_and_tolerates_a_missing_prefix() -> Result<()> {
+        let s = store(Some(2)).await;
+        // Never flushed: the prefix may not even exist.
+        s.purge_durable_objects().await?;
+        s.purge_durable_objects().await?;
+
+        for i in 0..4 {
+            s.upsert_record(record(&format!("o{i}"), "open")).await?;
+        }
+        s.purge_durable_objects().await?;
+        s.purge_durable_objects().await?;
+        Ok(())
     }
 
     fn record(oid: &str, status: &str) -> ProximaRecord {

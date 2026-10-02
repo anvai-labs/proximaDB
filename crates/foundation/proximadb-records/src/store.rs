@@ -216,6 +216,24 @@ pub trait RecordStore: Send + Sync {
     async fn flush(&self) -> RecordStoreResult<()> {
         Ok(())
     }
+
+    /// Permanently delete the durable objects this store owns, for a DROP of the
+    /// partition it backs. The default is a no-op: an in-memory store owns no
+    /// objects, so releasing its handle already is complete deletion.
+    ///
+    /// A store that writes objects MUST override this, because releasing the
+    /// in-memory handle does **not** delete them. Without it a `DROP TABLE`
+    /// leaves every written object in the bucket with nothing referencing it —
+    /// billable storage the tenant can neither see nor reach, under a statement
+    /// whose whole contract is deletion.
+    ///
+    /// Must be **idempotent** (re-dropping, or dropping a partition that never
+    /// wrote anything, is not an error) and must **propagate real I/O failures**
+    /// rather than reporting success — silently failing here leaves undeletable
+    /// data.
+    async fn purge_durable_objects(&self) -> RecordStoreResult<()> {
+        Ok(())
+    }
 }
 
 /// Optional scan contract for stores that can expose canonical record ranges.
