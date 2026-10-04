@@ -104,6 +104,21 @@ pub struct SpillRecordStorage {
     /// Oids deleted after having been flushed. Suppresses the segment copy on
     /// read; cleared for an oid that is re-inserted.
     tombstones: DashSet<String>,
+    /// `oid → durable WAL LSN` for rows still RESIDENT, i.e. not yet in a
+    /// segment. The minimum over this map is the lowest LSN the WAL must retain
+    /// on this partition's account (TD-USUB-1, slice 2b prerequisite).
+    ///
+    /// Kept beside the memtable rather than on `ProximaRecord` so the central
+    /// record type is untouched and the LSN never has to survive the Parquet
+    /// round trip — once a row is in a segment it is durable there, and its LSN
+    /// stops constraining truncation, which is exactly when this entry is
+    /// dropped.
+    ///
+    /// Populated only through [`RecordStore::upsert_record_at_lsn`]. A write
+    /// arriving via plain `upsert_record` contributes **no** entry — which is
+    /// why `min_unflushed_lsn` refuses to answer when any resident row is
+    /// untracked, rather than returning a minimum that silently excludes it.
+    resident_lsns: DashMap<String, u64>,
     /// Flushed segment paths, oldest first. Later entries shadow earlier ones.
     segments: parking_lot::RwLock<Vec<String>>,
     /// Resident-row count after which a write triggers a flush. `None` ⇒ never.
@@ -149,6 +164,7 @@ impl SpillRecordStorage {
         Self {
             memtable: DashMap::new(),
             tombstones: DashSet::new(),
+            resident_lsns: DashMap::new(),
             segments: parking_lot::RwLock::new(Vec::new()),
             flush_threshold,
             filesystem,
@@ -262,6 +278,10 @@ impl SpillRecordStorage {
         self.segments.write().push(path.clone());
         for record in &records {
             self.memtable.remove(&record.oid);
+            // The row is durable in the segment now, so its WAL entry no longer
+            // constrains truncation. Dropping the association here is what makes
+            // `min_unflushed_lsn` advance.
+            self.resident_lsns.remove(&record.oid);
         }
         Ok(Some(path))
     }
@@ -321,6 +341,72 @@ impl RecordStore for SpillRecordStorage {
         Ok(record)
     }
 
+    async fn upsert_record_at_lsn(
+        &self,
+        record: ProximaRecord,
+        lsn: u64,
+    ) -> RecordStoreResult<ProximaRecord> {
+        // Record the association BEFORE the write, so a flush triggered by this
+        // very insert already sees it and can evict it. Doing it afterwards
+        // would leave a flushed oid tracked as resident, pinning the WAL at an
+        // LSN that is in fact already durable in a segment.
+        self.resident_lsns.insert(record.oid.clone(), lsn);
+        self.upsert_record(record).await
+    }
+
+    /// Minimum LSN among resident (unflushed) rows.
+    ///
+    /// **Fails closed when any resident row is untracked.** A row written through
+    /// plain `upsert_record` has no LSN association, so a minimum computed over
+    /// the tracked set alone would silently exclude it — and a caller truncating
+    /// below that minimum would discard the only durable copy of that row. When
+    /// the counts disagree this therefore returns an error rather than a number:
+    /// the consumer's correct response is to not truncate.
+    ///
+    /// `Ok(None)` means genuinely nothing resident, i.e. no constraint.
+    async fn min_unflushed_lsn(&self) -> RecordStoreResult<Option<u64>> {
+        // An in-memory tombstone is NEVER durable, so the WAL entry that
+        // recreates it can never be safely discarded — and a tombstone is not
+        // cleared by `flush()` (it must keep suppressing the segment copy until
+        // compaction removes that segment; only a re-insert or a purge clears
+        // it). Reporting a minimum here would be actively wrong:
+        //
+        //   row inserted @10 -> flushed (association dropped)
+        //   row deleted  @20 -> tombstone in memory only, nothing resident
+        //   -> a minimum over resident rows says "no constraint"
+        //   -> truncation discards @20
+        //   -> restart: replay never sees the delete, the segment still holds the
+        //      row live, and the DELETED ROW RESURRECTS (mandate #16a).
+        //
+        // TD-USUB-1 already names persisting tombstones as a hard precondition
+        // on 2b. Until that lands, any tombstone makes the question unanswerable.
+        if !self.tombstones.is_empty() {
+            return Err(anyhow::anyhow!(
+                "spill: cannot compute a safe truncation point — {} in-memory tombstone(s) \
+                 exist, and a tombstone is not durable in any segment, so the WAL entries that \
+                 reconstruct them must be retained. Persisting tombstones into the segment is a \
+                 precondition on slice 2b (TD-USUB-1). Do not truncate.",
+                self.tombstones.len()
+            ));
+        }
+        let resident = self.memtable.len();
+        if resident == 0 {
+            return Ok(None);
+        }
+        let tracked = self.resident_lsns.len();
+        if tracked < resident {
+            return Err(anyhow::anyhow!(
+                "spill: cannot compute a safe truncation point — {} resident row(s) but only {} \
+                 carry a WAL LSN. Rows written through `upsert_record` instead of \
+                 `upsert_record_at_lsn` are untracked, and a minimum over the tracked subset \
+                 would exclude them. Do not truncate.",
+                resident,
+                tracked
+            ));
+        }
+        Ok(self.resident_lsns.iter().map(|e| *e.value()).min())
+    }
+
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>> {
         if self.tombstones.contains(&key.oid) {
             return Ok(None);
@@ -361,6 +447,12 @@ impl RecordStore for SpillRecordStorage {
         if has_segments {
             self.tombstones.insert(key.oid.clone());
         }
+        // A deleted row is no longer resident, so its INSERT's LSN stops
+        // constraining truncation. The DELETE's own LSN is a separate matter: if
+        // the row had been flushed, the tombstone above is the only in-memory
+        // evidence of the deletion and `min_unflushed_lsn` fails closed on it —
+        // dropping this association does NOT release that obligation.
+        self.resident_lsns.remove(&key.oid);
 
         // Report truthfully whether a live row went away. The segment read is
         // paid ONLY when the answer is not already known from the memtable.
@@ -651,6 +743,141 @@ mod tests {
 
     /// Purge is idempotent: a partition that never flushed, and a re-drop, are
     /// both success. The contract says so, and `drop_table_records` now propagates
+    /// The minimum is over RESIDENT rows only, and it ADVANCES as rows flush.
+    ///
+    /// This is the quantity ADR-094's truncation rule needs. Asserted as a
+    /// minimum over an unordered set rather than a prefix, because that is what
+    /// a `DashMap` keyed by oid can honestly report.
+    #[tokio::test]
+    async fn min_unflushed_lsn_tracks_resident_rows_and_advances_on_flush() -> Result<()> {
+        let s = store(Some(3)).await;
+        assert_eq!(s.min_unflushed_lsn().await?, None, "nothing resident");
+
+        // LSNs deliberately out of insertion order: the answer must be the
+        // minimum, not the first or last seen.
+        s.upsert_record_at_lsn(record("o1", "open"), 70).await?;
+        s.upsert_record_at_lsn(record("o2", "open"), 50).await?;
+        assert_eq!(s.min_unflushed_lsn().await?, Some(50));
+
+        // Third insert crosses the threshold -> flush -> all three become durable
+        // in a segment, so none of their LSNs constrains the WAL any more.
+        s.upsert_record_at_lsn(record("o3", "open"), 90).await?;
+        assert!(s.segment_count() > 0, "precondition: flushed");
+        assert_eq!(
+            s.min_unflushed_lsn().await?,
+            None,
+            "flushed rows must stop pinning the WAL"
+        );
+
+        // A later write re-establishes a constraint at its own LSN.
+        s.upsert_record_at_lsn(record("o4", "open"), 120).await?;
+        assert_eq!(s.min_unflushed_lsn().await?, Some(120));
+        Ok(())
+    }
+
+    /// The minimum is NOT the high-water mark — the distinction the TD's warning
+    /// is about.
+    ///
+    /// A high-water scheme would stamp the segment with the largest LSN it had
+    /// seen and let the WAL truncate below it, discarding the entry for a row
+    /// that is still only resident. Here row `keep` sits at a LOWER LSN than an
+    /// already-flushed row, so a high-water answer (90) and the correct answer
+    /// (40) differ — and truncating at 90 would lose `keep`.
+    #[tokio::test]
+    async fn min_unflushed_lsn_is_not_the_high_water_mark() -> Result<()> {
+        let s = store(Some(2)).await;
+        s.upsert_record_at_lsn(record("a", "open"), 80).await?;
+        s.upsert_record_at_lsn(record("b", "open"), 90).await?;
+        assert!(s.segment_count() > 0, "precondition: a and b flushed");
+
+        // Resident, and OLDER than everything already durable.
+        s.upsert_record_at_lsn(record("keep", "open"), 40).await?;
+
+        assert_eq!(
+            s.min_unflushed_lsn().await?,
+            Some(40),
+            "the answer must be the resident minimum, not the 90 a high-water \
+             scheme would report"
+        );
+        Ok(())
+    }
+
+    /// An untracked resident row makes the question unanswerable, and that must
+    /// FAIL rather than return a minimum that excludes it (mandate #1).
+    ///
+    /// A row inserted through plain `upsert_record` carries no LSN. Reporting
+    /// `Some(60)` here would invite a caller to truncate past the untracked
+    /// row's WAL entry — the only durable copy of it.
+    #[tokio::test]
+    async fn min_unflushed_lsn_fails_closed_when_a_resident_row_is_untracked() -> Result<()> {
+        let s = store(None).await;
+        s.upsert_record_at_lsn(record("tracked", "open"), 60)
+            .await?;
+        s.upsert_record(record("untracked", "open")).await?;
+
+        let err = s
+            .min_unflushed_lsn()
+            .await
+            .expect_err("an untracked resident row must not yield a minimum");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Do not truncate"),
+            "the error must tell the caller what to do, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// An in-memory tombstone must make the truncation point UNANSWERABLE.
+    ///
+    /// This is the resurrection path (mandate #16a), and the reason a minimum
+    /// over resident rows alone is not enough: the row is durable in a segment,
+    /// so nothing is resident and a naive answer is "no constraint" — but the
+    /// only durable evidence of the DELETE is its WAL entry. Truncating past it
+    /// brings the row back on restart.
+    #[tokio::test]
+    async fn min_unflushed_lsn_fails_closed_while_a_tombstone_is_memory_only() -> Result<()> {
+        let s = store(Some(2)).await;
+        s.upsert_record_at_lsn(record("x", "open"), 10).await?;
+        s.upsert_record_at_lsn(record("y", "open"), 11).await?;
+        assert!(s.segment_count() > 0, "precondition: flushed to a segment");
+        assert_eq!(
+            s.min_unflushed_lsn().await?,
+            None,
+            "precondition: nothing resident once flushed"
+        );
+
+        // Delete a FLUSHED row: suppressed by an in-memory tombstone only.
+        s.delete_record(&RecordKey::new("x".to_string())).await?;
+
+        let err = s
+            .min_unflushed_lsn()
+            .await
+            .expect_err("a memory-only tombstone must not yield a minimum");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tombstone") && msg.contains("Do not truncate"),
+            "the error must name the cause and the action, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// Deleting a resident row releases its LSN — it is no longer durable-pending.
+    #[tokio::test]
+    async fn delete_releases_the_lsn_constraint() -> Result<()> {
+        let s = store(None).await;
+        s.upsert_record_at_lsn(record("gone", "open"), 30).await?;
+        s.upsert_record_at_lsn(record("stays", "open"), 55).await?;
+        assert_eq!(s.min_unflushed_lsn().await?, Some(30));
+
+        s.delete_record(&RecordKey::new("gone".to_string())).await?;
+        assert_eq!(
+            s.min_unflushed_lsn().await?,
+            Some(55),
+            "a deleted row must stop pinning the WAL"
+        );
+        Ok(())
+    }
+
     /// errors — so a spurious failure here would make DROP TABLE fail outright.
     #[tokio::test]
     async fn purge_is_idempotent_and_tolerates_a_missing_prefix() -> Result<()> {
