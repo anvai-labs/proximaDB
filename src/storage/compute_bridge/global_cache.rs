@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::{debug, info};
 
-use crate::compute::quantization::quantization_engine::{Codebook, CodebookStore};
+use proximadb_quantization_kernel::quantization_engine::{Codebook, CodebookStore};
 use crate::storage::cache::orchestrator::{CacheType, CrossCacheOrchestrator};
 use proximadb_kernel::hash::XxHash64;
 

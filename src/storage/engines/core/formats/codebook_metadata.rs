@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::compute::quantization::{
-    global_cache::{GlobalQuantizationCache, QuantizationCacheKey},
-    quantization_engine::{Codebook, CodebookData, QuantizationLevel, UnifiedQuantizationEngine},
-    storage_engine::StorageQuantizationEngine,
+use crate::storage::compute_bridge::global_cache::{GlobalQuantizationCache, QuantizationCacheKey};
+use proximadb_quantization_kernel::quantization_engine::{
+    Codebook, CodebookData, QuantizationLevel, UnifiedQuantizationEngine,
 };
+use proximadb_quantization_kernel::storage_engine::StorageQuantizationEngine;
 
 /// Codebook metadata stored at file level
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -13,10 +13,8 @@
 // `crate::compute::quantization::*` paths.
 pub use proximadb_quantization_kernel::*;
 
-// Storage↔compute glue (Q2) kept at this path for unchanged consumers (storage engines
-// import `crate::compute::quantization::{global_cache, selection}`).
-pub use crate::storage::compute_bridge::{global_cache, selection};
-pub use global_cache::{GlobalQuantizationCache, QuantizationCacheKey};
-pub use selection::{
-    QuantizationSelectionReason, QuantizationSelector, RecommendedQuantizationLevel,
-};
+// Storage↔compute glue (Q2: global_cache, selection) is NOT re-exported here —
+// its consumers (the storage engines) import `crate::storage::compute_bridge::*`
+// directly (ADR-094 import unification). The kernel re-export above stays: 38+
+// files use the flattened `crate::compute::quantization::quantization_engine::*`
+// paths.

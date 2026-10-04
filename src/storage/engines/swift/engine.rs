@@ -794,7 +794,7 @@ impl SwiftEngine {
     /// Check if we should use persistent quantization for this operation
     /// Returns true for collection-based operations with quantization enabled
     pub fn should_use_persistent_quantization(&self, params: &FlushParameters) -> bool {
-        crate::compute::quantization::QuantizationSelector::should_use_persistent_quantization(
+        crate::storage::compute_bridge::selection::QuantizationSelector::should_use_persistent_quantization(
             params, "SWIFT",
         )
     }
