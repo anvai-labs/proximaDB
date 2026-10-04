@@ -2,6 +2,8 @@
 
 pub mod adaptive_engine;
 pub mod analyzer;
+#[cfg(feature = "axis")]
+pub mod advisor_observations;
 pub mod ann_advisor;
 pub mod hmgi_param_advisor;
 pub mod hnsw_param_advisor;

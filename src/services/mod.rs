@@ -168,7 +168,9 @@
 //! - Cache hit rates
 
 #[cfg(feature = "axis")]
-pub mod advisor_observations;
+/// ADR-094 placement fix: relocated to `index::axis::management` (its advisor
+/// siblings). Shim kept for the single fully-qualified consumer; remove next release.
+pub use crate::index::axis::management::advisor_observations;
 pub mod agent_checkpoint;
 pub mod agent_memory;
 pub mod audit_sink;
