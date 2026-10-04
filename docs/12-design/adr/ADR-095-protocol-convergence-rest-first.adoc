@@ -1,0 +1,121 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= ADR-095: Protocol convergence sequencing — REST-first completion criteria as the gRPC-perf gate
+:toc: left
+:toclevels: 3
+:icons: font
+:last-updated: 2026-10-03
+
+[cols="1,3"]
+|===
+| Field | Value
+| Status | Accepted
+| Date | 2026-10-03
+| Extends | ADR-014 (two-shape vector boundary), ADR-015 (port impl location), ADR-016 (PortUserContext), ADR-072 (one contract surface, many implementations)
+| Amends | `ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` (status refresh), `ROOT_CRATE_DECOMPOSITION_NETWORK_COUPLING_REVIEW_2026_07_10.adoc` (execution addendum)
+| Tracked-by | TD-104 (handler convergence), CONNECTIVITY_AND_MODALITY_COMPLETION_TRACKER_2026_07_21.adoc (surface-parity items)
+|===
+
+== Context
+
+REST `/api/v2` is already the sole canonical REST surface and gRPC v1 is removed
+from serving (`SUPPORTED_SURFACE.adoc`, 2026-09-11). The port layer
+(`crates/platform/proximadb-runtime`: `ApiHandlersPort`, `UnifiedHandlers`,
+`RecordOpsPort`, modality ports) is the designed shared seam, and both REST and
+gRPC v2 already dispatch through the same Arcs for collections/records.
+However, convergence has stalled structurally:
+
+* **Two drifting REST trees.** Root `src/network/rest/` (211 `.route()`
+  registrations across v2 + canonical + specialty routers) coexists with the
+  port-backed twins in `crates/platform/proximadb-api/src/rest/` (66 routes;
+  graph, document, observability, multimodal_query, hybrid, analytics, catalog,
+  entities, v2/agentic). Same endpoint families, separate state types
+  (`AnalyticsApiState` vs `AnalyticsRestState`) and duplicated serde DTOs.
+* **Concrete reaches from handlers.** 24 files under `src/network/` import
+  `crate::storage`. Worst case: `src/network/rest/canonical/handlers.rs`
+  (3,986 LOC) holds `Arc<crate::storage::document::DocumentService>`,
+  `Arc<crate::storage::engines::eventlog::EventLogEngine>`, and constructs
+  `FullTextIndex` / `ProximaEntityStore` directly.
+* **Parity gaps** (per `SUPPORTED_SURFACE.adoc` + surface audit): gRPC-only
+  write semantics (`UpsertRecords`/`UpdateRecords`; REST `/records/batch` is
+  insert-only), gRPC-only schema lifecycle (`EvolveSchema`, `ListSchemas`;
+  REST has GET/PUT per collection), and an unpromoted diagnostics route.
+* **Two error envelopes** (`src/errors/mod.rs::ApiError` vs
+  `crates/platform/proximadb-api/src/rest/errors.rs::RestError`) that must not
+  drift further while the trees coexist.
+* **Stale contract tests** (`tests/rest_grpc_parity_test.rs`,
+  `tests/api_consistency_test.rs`, `tests/api_consistency_comprehensive.rs`)
+  drive removed v1 gRPC clients and inflate the root test-binary link unit.
+
+Separately, the owner directive is: complete REST first; treat gRPC as the
+performance option afterward.
+
+== Decision
+
+1. **REST-tree convergence continues the decomposition program** under the
+   existing port doctrine — root REST v2 routers move to
+   `crates/platform/proximadb-api/src/rest/v2/` behind a port-only state type
+   (`V2RestState`); `canonical/handlers.rs` is *retired* per TD-104 (thin
+   mount list remains in `src/network/rest/server.rs`). Operator/commercial
+   specialty routers (pinning, affinity, primary-pod, mlflow,
+   iceberg_rest_catalog, abac_admin, rank, aql, nl, memory, websocket, health,
+   enterprise catalogs) remain root-resident per the ADR-084 open-core
+   boundary, each with a documented disposition.
+2. **One error envelope.** A foundation crate
+   (`crates/foundation/proximadb-api-error`, no tonic dep per
+   `CRATE_DISALLOWED_DEPS`) unifies `ApiError`/`RestError`; both old paths
+   become re-export shims; the wire envelope `{error:{type,message,code}}` and
+   per-variant HTTP statuses are reproduced exactly.
+3. **REST-first completion checklist** (all must hold before gRPC performance
+   work unlocks — the *gRPC-perf gate*):
+   .. Single REST tree: zero production routes defined in `src/network/rest/`
+      except the documented root-resident operator/commercial mounts; zero
+      `crate::{storage,services,graph}::` imports under `src/network/rest/v2/`.
+   .. Write parity: REST record-batch semantics ≡ gRPC v2
+      `UpsertRecords`/`UpdateRecords`, asserted by one parity test.
+   .. Schema lifecycle parity: REST `EvolveSchema` + `ListSchemas` equivalents.
+   .. One error envelope in `crates/foundation/proximadb-api-error`.
+   .. Route census snapshot (`tests/route_census.rs`) identical across the
+      convergence PRs; committed `docs/openapi/proximadb-openapi.yaml`
+      bit-identical (or deliberately grown, reviewed).
+   .. Fresh parity suite (`tests/api_v2_parity_test.rs`: REST in-process +
+      v2 `ProximaRecordServiceClient`) replaces the v1-based suites; zero test
+      targets referencing removed v1 gRPC clients.
+   .. `_diagnostics/collections/{id}/route-health` promoted to
+      `/api/v2/collections/{id}/route-health` with a one-release 308 alias.
+4. **gRPC v2 interim disposition**: services stay in root
+   (`src/network/grpc/v2/`) until Slice E/F extract the stores they reach
+   into. Until the gate opens, gRPC code may only *shrink toward*
+   `proximadb-runtime` ports; registration remains in
+   `src/network/multi_server.rs` canonical helpers. End-state home:
+   `crates/platform/proximadb-api/src/grpc/v2/` (already hosts `agentic`).
+5. **Storage-stream continuation is unaffected and parallel**: Slice D
+   completion (`IndexPort`, engine/compaction injection, D-quant) is
+   file-disjoint from the network stream and proceeds per
+   `ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc`.
+
+== Baselines (committed 2026-10-03; later PRs ratchet from these)
+
+[cols="3,2,2"]
+|===
+| Metric | Baseline | Method
+| Route census, root `src/network/rest/` | 182 `.route(` registrations (grep, `--include=*.rs`) | `grep -rc '\.route(' src/network/rest/`
+| Route census, `crates/platform/proximadb-api/src/rest/` | 66 | same
+| `src/network → crate::storage` files | 24 | `grep -rl 'crate::storage' src/network/`
+| `check-layering.sh` storage-up-edges ceiling | 197 (down from 271 at Slice D start) | `scripts/check-layering.sh:13`
+| v1-proto usage | src 1,889 / crates 367 / clients 49 / tests 376 references | `scripts/check_v1_proto_usage.py`
+|===
+
+== Consequences
+
+* The REST surface becomes single-tree and port-clean, making the OpenAPI
+  drift gate the *only* wire-contract authority for REST.
+* gRPC performance/streaming investment (bidi transport tuning, `SearchStream`
+  optimizations) is explicitly sequenced behind a measurable REST-complete
+  checklist — no parallel protocol feature drift during convergence.
+* `canonical/handlers.rs` (3,986 LOC) leaves the root unit, contributing to
+  the decomposition build-economics goal.
+* The stale v1-based parity suites are deleted; contract coverage moves to the
+  fresh v2 parity suite, which must land in the same phase as the deletions.
+* Specialty routers' root residency is a *documented temporary disposition*,
+  revisited at the enterprise-crate split (ADR-084), not an endorsement.

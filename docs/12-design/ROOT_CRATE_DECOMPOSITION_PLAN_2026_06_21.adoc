@@ -223,3 +223,21 @@ worktrees by edge class:
 * `index` edges: design `IndexPort` facade or pre-extract leaked AXIS types; high review cost.
 * `compute` edges: separate pure kernel redirects from quantization/runtime policy ports; highest
   compile-payoff because it dominates the remaining count.
+
+== Status addendum (2026-10-03)
+
+Slice D is substantially executed: the `--storage-up-edges` ratchet stands at
+**197** (down from the 271 recorded above), with D0/D1 landed (PRs #370/#377/
+#379/#386) and `CollectionMetadataPort`/`StorageEventLogPort` living in
+`crates/storage/proximadb-storage-ports`. Remaining: `IndexPort` definition +
+engine/compaction injection (D2 remainder/D3/D4) and D-quant
+(`StorageQuantizationEnginePort`).
+
+In parallel — and file-disjoint from the storage stream — the **network stream**
+has started under link:adr/ADR-094-protocol-convergence-rest-first.adoc[ADR-094]
+(REST-first completion criteria as the gRPC-perf gate): root REST v2 routers
+converge onto the port-backed `crates/platform/proximadb-api` routers,
+`canonical/handlers.rs` retires per TD-104, and the one error envelope lands in
+`crates/foundation/proximadb-api-error`. The two streams share only the
+`check-layering.sh` ceiling; each lowering lands in the PR that removes the
+edges.

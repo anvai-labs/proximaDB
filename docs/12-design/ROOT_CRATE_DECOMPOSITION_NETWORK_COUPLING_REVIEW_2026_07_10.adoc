@@ -182,3 +182,25 @@ WHERE sn.file='src/network/postgres/protocol.rs' AND dn.file<>sn.file
   AND e.type IN ('CALLS','IMPLEMENTS','COMPOSITION','IMPORTS','INHERITS')
 GROUP BY dn.file ORDER BY 2 DESC;
 ----
+
+== Execution addendum (2026-10-03)
+
+Execution has started under link:adr/ADR-094-protocol-convergence-rest-first.adoc[ADR-094],
+per this review's recommended sequence:
+
+* Finding 2 (shared_services thinning): first cut scheduled as PR-5.1 (per-family
+  constructor extraction, wiring only) after the REST tree converges.
+* Finding 3 (protocol/Flight reach via concretes): handler-side port-ification is
+  PR-3.1; every required port already exists in `proximadb-runtime`.
+* Finding 4 (`rest/v1/handlers.rs` retirement): executing as PR-3.5 — the file
+  (`canonical/handlers.rs`, 3,986 LOC) is deleted, with `create_router` reduced
+  to a thin mount list in `src/network/rest/server.rs`. Retire, don't decompose,
+  as advised.
+* Finding 6 (duplication): PR-3.4 converges the twin routers (analytics,
+  multimodal_query, document) and deletes the unmounted `canonical/hybrid.rs`.
+* Stale v1-based parity suites are deleted in PR-4.3 with a fresh v2 parity suite
+  replacing them.
+
+Baseline metrics are committed in ADR-094 (route census 182/66; 24
+`src/network → crate::storage` files; storage-up-edges ceiling 197; v1-proto
+usage src 1,889 / crates 367 / clients 49 / tests 376).
