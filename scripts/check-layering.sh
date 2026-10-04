@@ -15,3 +15,7 @@ python3 scripts/check_workspace_boundaries.py --storage-up-edges --max-storage-u
 # ADR-094: REST v2 root-import ratchet (handlers destined for
 # crates/platform/proximadb-api must not gain root-internal imports).
 bash "$(dirname "$0")/check_v2_root_imports.sh"
+
+# ADR-094: crates→root import ratchet (extracted crates must not re-reach the
+# monolith; the embedded-binding composition files are the sanctioned ceiling).
+bash "$(dirname "$0")/check_crates_root_imports.sh"
