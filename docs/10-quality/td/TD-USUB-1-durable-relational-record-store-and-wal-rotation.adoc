@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with "wire the two production call sites"** below — see "Design decided"; (ii) **plumb the WAL LSN to the partition store** — it is returned by `append_operations` and discarded today, and without it 2b's truncation point cannot be computed safely (see "Slice 2b is not gated on catalog registration"), (iii) **track the unflushed minimum LSN per partition** — a single high-water watermark is unsafe by construction, so this is what makes a correct truncation point expressible at all (see the warning under "Slice 2b is not gated on catalog registration"), (iv) catalog registration of segments — needed for 2b truncation, *not* for deletion, and the LAST of 2b's prerequisites rather than the first, (v) wire the two production call sites, (vi) slice 2b (WAL truncation), (vii) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **LSN plumbing + unflushed-minimum tracking landed 2026-10-03** — `RecordStore` gained defaulted `upsert_record_at_lsn` / `min_unflushed_lsn` (11 implementors untouched); `write_mutations` now binds the `append_operations` result it used to discard and passes each record its durable LSN positionally (length-guarded); `SpillRecordStorage` tracks `oid → lsn` for resident rows and **fails closed** if any resident row is untracked. Nothing truncates yet, so this cannot lose data — it makes the safe truncation point *computable*. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with "wire the two production call sites"** below — see "Design decided"; (ii) **TD-USUB-13** — a delete concurrent with a flush resurrects the row (pre-existing in 2a, needs no truncation to fire, and blocks 2b because it makes a segment unfaithful); its fix must resolve the tombstone-vs-truncation tension below, (iii) **persist tombstones into the segment** — an in-memory tombstone is the only durable evidence of a post-flush delete, so `min_unflushed_lsn` fails closed while any exists; truncation cannot progress until they are durable, (iv) catalog registration of segments — needed for 2b truncation, *not* for deletion, and the LAST of 2b's prerequisites rather than the first, (v) wire the two production call sites, (vi) slice 2b (WAL truncation), (vii) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -434,10 +434,34 @@ not a property it can report.
 
 === What 2b actually requires, in order
 
-. **Plumb the LSN to the store.** The append site has it; the `RecordStore` write API does not take
-  it. Either widen the API or carry it on the record. This is the real first step, and it is
-  independent of the catalog.
+. **Plumb the LSN to the store.** ✅ **Landed 2026-10-03.** `RecordStore` gained a *defaulted*
+  `upsert_record_at_lsn` rather than a widened `upsert_record` — there are 11 implementors (graph,
+  document, cedar, the test doubles) with no interest in relational WAL retention, so a signature change was the
+  wrong instrument. `write_mutations` binds the `append_operations` result it used to discard;
+  index *i* of those entries is the LSN for `storage_actions[i]`, which holds because the two are
+  pushed in lockstep and the appender returns entries in input order **after `sync_data()`** (so a
+  bound LSN is durable by construction). A length mismatch **disables** association rather than
+  guessing a mapping, because a wrong LSN here becomes a wrong truncation point later.
 . **Track the unflushed minimum** per partition, so a safe truncation point exists at all.
+  ✅ **Landed 2026-10-03.** `SpillRecordStorage` keeps `oid → lsn` for *resident* rows only, beside
+  the memtable rather than on `ProximaRecord` — so the central record type is untouched and the LSN
+  never has to survive the Parquet round trip (a flushed row is durable in its segment and stops
+  constraining the WAL, which is exactly when the association is dropped). `min_unflushed_lsn`
+  **fails closed**: if any resident row is untracked (written via plain `upsert_record`) it returns
+  an error telling the caller not to truncate, rather than a minimum that silently excludes that
+  row. Pinned by `min_unflushed_lsn_is_not_the_high_water_mark`, where a resident row at LSN 40
+  sits behind flushed rows at 80/90 — so the correct answer and a high-water answer differ, and
+  truncating at the high-water would lose it.
+. **Persist tombstones into the segment.** Found 2026-10-03 while implementing the minimum, and
+  it is a *correctness* prerequisite, not a nicety. A tombstone is in-memory only and is **not**
+  cleared by `flush()` — it must keep suppressing the segment copy until compaction removes that
+  segment, so only a re-insert or a purge clears it. The sole durable evidence of a post-flush
+  delete is therefore its WAL entry. A minimum computed over resident *rows* reports "no
+  constraint" in that state, and truncating past it resurrects the deleted row on restart
+  (mandate #16a). `min_unflushed_lsn` consequently **fails closed while any tombstone exists**,
+  which means truncation cannot make progress at all until tombstones are durable. This TD's
+  slice-2a notes already listed tombstone persistence as a hard 2b precondition; it is now also
+  enforced in code rather than only written down.
 . **Register segments in the catalog** — still needed, because truncation may only reference a
   segment whose location recovery can read (the reason recorded under "Correction" above). But it
   is the *last* prerequisite, not the first.
