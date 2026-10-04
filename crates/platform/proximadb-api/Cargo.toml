@@ -16,6 +16,7 @@ async-trait.workspace = true
 axum.workspace = true
 chrono = "0.4"
 hyper.workspace = true
+proximadb-api-error = { path = "../../foundation/proximadb-api-error" }
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
 proximadb-proto = { path = "../../foundation/proximadb-proto" }

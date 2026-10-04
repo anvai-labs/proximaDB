@@ -24,6 +24,7 @@ members = [
     "apps/proximadb-server",
     ".",
     "clients/rust",
+    "crates/foundation/proximadb-api-error",
     "crates/foundation/proximadb-cache",
     "crates/foundation/proximadb-compression-types",
     "crates/foundation/proximadb-concurrent",
@@ -237,6 +238,7 @@ proximadb-clustering-kernel = { path = "crates/foundation/proximadb-clustering-k
 proximadb-concurrent = { path = "crates/foundation/proximadb-concurrent" }
 proximadb-memory-pool = { path = "crates/foundation/proximadb-memory-pool" }
 proximadb-kernel = { path = "crates/foundation/proximadb-kernel" }
+proximadb-api-error = { path = "crates/foundation/proximadb-api-error" }
 proximadb-interner = { path = "crates/foundation/proximadb-interner" }
 proximadb-bloom = { path = "crates/foundation/proximadb-bloom" }
 proximadb-search-types = { path = "crates/foundation/proximadb-search-types" }
@@ -717,6 +719,7 @@ toml = "0.8"
 anyhow = "1.0"
 thiserror = "2.0"
 proximadb-kernel = { path = "crates/foundation/proximadb-kernel" }
+proximadb-api-error = { path = "crates/foundation/proximadb-api-error" }
 proximadb-interner = { path = "crates/foundation/proximadb-interner" }
 proximadb-bloom = { path = "crates/foundation/proximadb-bloom" }
 proximadb-search-types = { path = "crates/foundation/proximadb-search-types" }

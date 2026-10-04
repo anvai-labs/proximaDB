@@ -7133,6 +7133,7 @@ dependencies = [
  "proximadb-abac",
  "proximadb-admin-ui",
  "proximadb-api",
+ "proximadb-api-error",
  "proximadb-arrow-block-index",
  "proximadb-audit",
  "proximadb-automl",
@@ -7365,6 +7366,7 @@ dependencies = [
  "futures",
  "hyper 1.11.1",
  "prost-types",
+ "proximadb-api-error",
  "proximadb-data-model",
  "proximadb-kernel",
  "proximadb-proto",
@@ -7384,6 +7386,19 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "proximadb-api-error"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "proximadb-kernel",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -8614,6 +8629,7 @@ dependencies = [
 name = "proximadb-query-capability"
 version = "0.2.0"
 dependencies = [
+ "proximadb-api-error",
  "serde",
 ]
 

@@ -1332,7 +1332,7 @@ pub async fn insert_records(
             // NOTE: the batch path folds WAL-lane rejections into Ok(success=false)
             // (#951), so this arm sees backpressure only on Err-propagating inserts;
             // end-to-end 429 for the batch path is the TD-WAL-1 S4 residual.
-            Err(ApiError::from_write_error("Insert failed", e))
+            Err(crate::errors::api_error_from_write_error("Insert failed", e))
         }
     }
 }

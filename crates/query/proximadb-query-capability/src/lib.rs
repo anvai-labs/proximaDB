@@ -704,3 +704,50 @@ mod tests {
         assert!(none.is_empty());
     }
 }
+
+/// Convert to the unified wire error envelope (ADR-094). Lives next to the
+/// type's definition because orphan rules require the `From` source to be
+/// local once `ApiError` moved to the foundation tier.
+impl From<CapabilityCheckError> for proximadb_api_error::ApiError {
+    fn from(err: CapabilityCheckError) -> Self {
+        use proximadb_api_error::ApiError;
+        match err {
+            CapabilityCheckError::UnsupportedCapability {
+                capability,
+                available_alternatives,
+            } => {
+                let msg = if available_alternatives.is_empty() {
+                    format!(
+                        "The requested capability '{}' is not supported by the selected storage engine.",
+                        capability
+                    )
+                } else {
+                    format!(
+                        "The requested capability '{}' is not supported. Available alternatives: {}",
+                        capability,
+                        available_alternatives.join(", ")
+                    )
+                };
+                ApiError::UnsupportedCapability(msg)
+            }
+            CapabilityCheckError::MultipleUnsupportedCapabilities {
+                missing_capabilities,
+                available_alternatives,
+            } => {
+                let msg = if available_alternatives.is_empty() {
+                    format!(
+                        "Multiple capabilities are not supported: {}. Please check the storage engine capabilities.",
+                        missing_capabilities.join(", ")
+                    )
+                } else {
+                    format!(
+                        "Multiple capabilities are not supported: {}. Available alternatives: {}",
+                        missing_capabilities.join(", "),
+                        available_alternatives.join(", ")
+                    )
+                };
+                ApiError::UnsupportedCapability(msg)
+            }
+        }
+    }
+}

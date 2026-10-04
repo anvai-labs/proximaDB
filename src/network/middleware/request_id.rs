@@ -106,7 +106,7 @@ pub async fn request_id_middleware(mut request: axum::extract::Request, next: Ne
     // envelopes (`RestError`/`AgenticApiError::into_response`) carry the SAME
     // id we advertise in the `X-Request-ID` response header below — no handler
     // signature changes required.
-    let mut response = proximadb_api::rest::errors::REQUEST_ID
+    let mut response = proximadb_api_error::REQUEST_ID
         .scope(request_id.0.clone(), next.run(request))
         .await;
 

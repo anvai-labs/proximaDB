@@ -14,4 +14,5 @@ name = "proximadb_query_capability"
 path = "src/lib.rs"
 
 [dependencies]
+proximadb-api-error = { path = "../../foundation/proximadb-api-error" }
 serde.workspace = true
