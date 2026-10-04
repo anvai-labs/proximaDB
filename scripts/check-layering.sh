@@ -11,3 +11,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 python3 scripts/check_workspace_boundaries.py --strict
 python3 scripts/check_workspace_boundaries.py --storage-up-edges --max-storage-up-edges 197
+
+# ADR-094: REST v2 root-import ratchet (handlers destined for
+# crates/platform/proximadb-api must not gain root-internal imports).
+bash "$(dirname "$0")/check_v2_root_imports.sh"

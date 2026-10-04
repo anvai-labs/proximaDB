@@ -534,3 +534,6 @@ clients/python/src/proximadb_sdk/_generated/**/__pycache__/
 **/s3:/
 **/gs:/
 **/gcs:/
+
+# ADR-094 route-census snapshot (wire-surface instrument)
+!docs/diagnostics/route-census-baseline.txt
