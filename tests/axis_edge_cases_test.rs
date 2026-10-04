@@ -17,7 +17,6 @@ fn test_engines() -> Vec<&'static str> {
     let mut engines = vec!["sst", "helix", "nova"];
     if cfg!(feature = "experimental-engines") {
         engines.push("swift");
-        engines.push("raptor");
     }
     engines
 }

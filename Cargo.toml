@@ -122,8 +122,6 @@ members = [
     "crates/modalities/proximadb-rank-profile",
     "crates/modalities/proximadb-rank-onnx",
     "crates/storage/proximadb-engine-core",
-    "crates/storage/proximadb-raptor-common",
-    "crates/storage/proximadb-raptor-engine",
     "crates/storage/proximadb-storage-common",
     "crates/storage/proximadb-storage-ports",
     "crates/storage/proximadb-cks-local",
@@ -773,8 +771,6 @@ moka = { version = "0.12", features = ["future"] }
 # Provides direct buffer access to numpy arrays without Python .tolist() conversion
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
-proximadb-raptor-common = { version = "0.2.0", path = "crates/storage/proximadb-raptor-common" }
-proximadb-raptor-engine = { version = "0.2.0", path = "crates/storage/proximadb-raptor-engine" }
 proximadb-engine-core = { version = "0.2.0", path = "crates/storage/proximadb-engine-core" }
 proximadb-mongodb-parser = { version = "0.2.0", path = "crates/binding/proximadb-mongodb-parser" }
 
@@ -843,10 +839,11 @@ axis = []
 mlflow-ui = ["dep:include_dir", "dep:mime_guess"]
 # Optional surfaces; keep off by default to minimize binary size and public API surface
 tenant_access = []
-# Experimental storage engines (RAPTOR, SWIFT); disabled by default to prevent
+# Experimental storage engines (SWIFT; RAPTOR was deleted 2026-10-04 —
+# ADR-093-family stage-3); disabled by default to prevent
 # server panics from unimplemented code paths. Enable for development/testing only.
-# RAPTOR fundamentally uses AXIS clustering, so this implies `axis`.
-experimental-engines = ["proximadb-raptor-engine/experimental-engines", "axis"]
+# SWIFT-dependent engines imply `axis`.
+experimental-engines = ["axis"]
 # Experimental transactional Ledger modality (ADR-071 / TD-LEDGER-1): the durable atomic-CAS
 # KV + TTL-lease OLTP surface. Off by default; enables the durable backend + its gRPC service.
 experimental-ledger = ["dep:proximadb-ledger", "proximadb-ledger/durable"]

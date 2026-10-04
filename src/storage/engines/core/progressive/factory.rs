@@ -105,11 +105,8 @@ impl ProgressivePipelineFactory {
             #[cfg(not(feature = "experimental-engines"))]
             ProgressiveEngineType::SWIFT => ProgressiveSearchCoordinator::new(),
             ProgressiveEngineType::NOVA => self.create_nova_pipeline(stages, hamming_threshold),
-            #[cfg(feature = "experimental-engines")]
-            ProgressiveEngineType::RAPTOR => self.create_raptor_pipeline(stages, hamming_threshold),
-            // RAPTOR requires `experimental-engines`; unreachable without it, so
-            // return an empty pipeline to keep the match exhaustive.
-            #[cfg(not(feature = "experimental-engines"))]
+            // RAPTOR stage-3 deleted (ADR-093 family): the engine implementation is
+            // gone; the variant remains for wire compat and yields an empty pipeline.
             ProgressiveEngineType::RAPTOR => ProgressiveSearchCoordinator::new(),
         }
     }
@@ -282,37 +279,6 @@ impl ProgressivePipelineFactory {
         coordinator
     }
 
-    #[cfg(feature = "experimental-engines")]
-    fn create_raptor_pipeline(
-        &self,
-        stages: &[PipelineStage],
-        hamming_threshold: f32,
-    ) -> ProgressiveSearchCoordinator {
-        use crate::storage::engines::raptor::progressive_stages::*;
-
-        let mut coordinator = ProgressiveSearchCoordinator::new();
-
-        for stage in stages {
-            let boxed_stage: Box<dyn ProgressiveSearchStage> = match stage {
-                PipelineStage::Binary => Box::new(RaptorBinaryStage::new(
-                    hamming_threshold,
-                    self.quantization_engine.clone(),
-                )),
-                PipelineStage::INT8 => {
-                    Box::new(RaptorInt8Stage::new(self.distance_compute.clone()))
-                }
-                PipelineStage::FP32 => {
-                    Box::new(RaptorFp32Stage::new(self.distance_compute.clone()))
-                }
-                PipelineStage::FP16 | PipelineStage::PQ4 | PipelineStage::PQ8 => {
-                    Box::new(RaptorFp32Stage::new(self.distance_compute.clone()))
-                }
-            };
-            coordinator = coordinator.add_stage(boxed_stage);
-        }
-
-        coordinator
-    }
 }
 
 #[cfg(test)]

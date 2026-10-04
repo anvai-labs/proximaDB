@@ -174,3 +174,30 @@ verified empty persisted-VIPER inventory after migration):**
   not a structural one).
 * **Retire all of VIPER/NOVA/HELIX now** — rejected: ADR-026's census says
   the blast radius is large; one engine at a time, evidence first.
+
+== Amendment (2026-10-04): RAPTOR stage-3 executed under this ADR's pattern
+
+The ADR's scope note ("SWIFT/RAPTOR remain `experimental-engines`-gated dead
+code, a separate future cleanup") is executed for RAPTOR. Its baseline was
+already stage-2-equivalent (compile-gated off by default, factory bail on
+default builds, zero production configs, deprecated 2026-04-03), so stage 3
+collapsed to the deletion:
+
+- Removed: `src/storage/engines/raptor/` (7.7K), `crates/storage/
+  proximadb-raptor-engine` (11.4K), `crates/storage/proximadb-raptor-common`
+  (2.5K; audited — external consumers were raptor-only), the four factory
+  dispatch arms + `create_raptor{,_async}` constructors (now CHRONO-style
+  bails), the feature-gated progressive-search pipeline
+  (`create_raptor_pipeline` + RAPTOR stage arm), the
+  `RaptorFormatAdapter`/`create_raptor_adapter` surface, the
+  `StorageEngineType::RAPTOR` extractor arm (SST fallback), and
+  `tests/raptor_recall_test.rs`. `experimental-engines` now = `axis` only
+  (SWIFT remains gated).
+- Kept for wire compat: `StorageEngineType::Raptor` proto variant,
+  `StorageEngine::Raptor` / `FormatType::Raptor` enum variants and their
+  match arms (hybrid strategy → SST fallback with a warn).
+- Fixed: `EXPERIMENTAL_ENGINES_STATUS.md` migration guide no longer
+  recommends the (itself deprecated) VIPER.
+- Removed ~21.6K LOC from the root build unit (decomposition
+  build-economics goal) and the repo's highest fan-out file
+  (`raptor/engine.rs`, fan-out 65 — codegraph audit 2026-10-04).

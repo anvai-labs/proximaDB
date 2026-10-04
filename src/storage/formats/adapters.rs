@@ -564,10 +564,6 @@ pub type NovaFormatAdapter = InternalFormatAdapter<crate::storage::engines::nova
 pub type SwiftFormatAdapter = InternalFormatAdapter<crate::storage::engines::swift::SwiftEngine>;
 
 /// Type alias for RAPTOR format adapter
-#[cfg(feature = "experimental-engines")]
-#[allow(deprecated)]
-pub type RaptorFormatAdapter = InternalFormatAdapter<crate::storage::engines::raptor::RaptorEngine>;
-
 // ============================================================================
 // Factory Functions
 // ============================================================================
@@ -610,13 +606,6 @@ pub fn create_swift_adapter(
 }
 
 /// Create a RAPTOR format adapter from an existing engine
-#[cfg(feature = "experimental-engines")]
-#[allow(deprecated)]
-pub fn create_raptor_adapter(
-    engine: Arc<crate::storage::engines::raptor::RaptorEngine>,
-) -> RaptorFormatAdapter {
-    InternalFormatAdapter::new(engine)
-}
 
 // ============================================================================
 // Tests

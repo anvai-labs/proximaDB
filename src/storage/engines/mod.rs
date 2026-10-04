@@ -36,7 +36,6 @@
 //!   - `viper/`: Columnar Parquet for analytics
 //!   - `nova/`: Hybrid quantized columnar engine
 //!   - `swift/`: High-speed hierarchical blocks
-//!   - `raptor/`: Matrix-optimized with adaptive PXK
 //!
 //! ## Engine Selection Guide
 //!
@@ -104,8 +103,6 @@ pub mod impls; // Deprecated: Moving engines directly to engines/ level
 pub mod nova; // Phase 1: Moved from impls/nova/
 // RAPTOR fundamentally uses AXIS clustering; gated by `experimental-engines`
 // (which implies `axis`). Not compiled for PAX-exact-scan builds.
-#[cfg(feature = "experimental-engines")]
-pub mod raptor; // Phase 1: Moved from impls/raptor/
 pub mod sst; // Phase 1: Moved from impls/sst/
 // SWIFT: deprecated, slated for removal at v1.0 (TD-152). Gated exactly like
 // RAPTOR — dead weight in every default build before this (compiled,
@@ -142,7 +139,6 @@ pub use helix::HelixEngine;
 pub use nova::NovaEngine; // Phase 1: Moved from impls/
 #[cfg(feature = "experimental-engines")]
 #[allow(deprecated)]
-pub use raptor::RaptorEngine; // Phase 1: Moved from impls/
 #[allow(deprecated)]
 pub use sst::SstEngine; // Phase 1: Moved from impls/
 #[cfg(feature = "experimental-engines")]

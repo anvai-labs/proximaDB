@@ -181,3 +181,14 @@ If you want to help complete these engines:
 *Last Updated: 2026-04-03*
 *Status: Under Evaluation*
 *For questions: https://github.com/vijaysingh1992/proximadb/issues*
+
+## Update 2026-10-04 (ADR-094 program)
+
+RAPTOR executed ADR-093-style **stage-3 deletion**: `src/storage/engines/raptor/`,
+`crates/storage/proximadb-raptor-engine`, `crates/storage/proximadb-raptor-common`,
+the four factory dispatch arms/constructors, and `tests/raptor_recall_test.rs` are
+removed (~21.6K LOC). The `StorageEngineType::Raptor` proto variant and the
+`StorageEngine::Raptor`/`FormatType::Raptor` enum variants remain for wire compat
+(stage-2 rule); factory construction now always errors with a migrate hint, and
+hybrid-strategy collections fall back to SST. The migration target above is
+corrected accordingly (VIPER is itself deprecated — ADR-093).

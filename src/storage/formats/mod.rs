@@ -181,7 +181,6 @@ pub use adapters::{
 pub use adapters::{SwiftFormatAdapter, create_swift_adapter};
 // RAPTOR adapters are `experimental-engines`-gated (RAPTOR needs AXIS clustering).
 #[cfg(feature = "experimental-engines")]
-pub use adapters::{RaptorFormatAdapter, create_raptor_adapter};
 
 // ============================================================================
 // Module-Level Tests

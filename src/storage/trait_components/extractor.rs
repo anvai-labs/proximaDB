@@ -399,13 +399,8 @@ impl ExtractionFactory {
             StorageEngineType::NOVA => {
                 Arc::new(crate::storage::engines::nova::extraction::NovaExtractor::new(filesystem))
             }
-            #[cfg(feature = "experimental-engines")]
-            StorageEngineType::RAPTOR => Arc::new(
-                crate::storage::engines::raptor::extraction::RaptorExtractor::new(filesystem),
-            ),
-            // RAPTOR requires `experimental-engines`; unreachable on a build without
-            // it, so fall back to the SST extractor to keep the match exhaustive.
-            #[cfg(not(feature = "experimental-engines"))]
+            // RAPTOR stage-3 deleted (ADR-093 family): fall back to the SST
+            // extractor; the variant remains for wire compat.
             StorageEngineType::RAPTOR => Arc::new(
                 crate::storage::engines::sst::extraction::SstExtractor::new(filesystem),
             ),

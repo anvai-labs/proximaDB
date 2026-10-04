@@ -7227,8 +7227,6 @@ dependencies = [
  "proximadb-rank-features",
  "proximadb-rank-onnx",
  "proximadb-rank-profile",
- "proximadb-raptor-common",
- "proximadb-raptor-engine",
  "proximadb-record-buffer-pool",
  "proximadb-records",
  "proximadb-relational-algebra",
@@ -8749,53 +8747,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "toml 0.8.23",
- "tracing",
-]
-
-[[package]]
-name = "proximadb-raptor-common"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "proximadb-bloom",
- "proximadb-codec",
- "proximadb-compression",
- "proximadb-compression-types",
- "proximadb-data-model",
- "proximadb-hardware-caps",
- "proximadb-proto",
- "serde",
-]
-
-[[package]]
-name = "proximadb-raptor-engine"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "arrow-array 59.3.0",
- "arrow-ipc",
- "arrow-schema 59.3.0",
- "async-trait",
- "base64 0.22.1",
- "bincode",
- "chrono",
- "dashmap",
- "prost",
- "proximadb-bloom",
- "proximadb-codec",
- "proximadb-compression",
- "proximadb-distance-kernel",
- "proximadb-hardware-caps",
- "proximadb-kernel",
- "proximadb-proto",
- "proximadb-raptor-common",
- "proximadb-runtime-common",
- "proximadb-search-types",
- "proximadb-storage-filesystem-types",
- "proximadb-storage-ports",
- "serde",
- "serde_json",
- "tokio",
  "tracing",
 ]
 

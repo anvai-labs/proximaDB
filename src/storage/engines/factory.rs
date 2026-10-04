@@ -116,7 +116,7 @@ use proximadb_query_capability::CapabilityRegistry;
 
 use super::{nova::NovaEngine, sst::SstEngine, viper::ViperEngine};
 #[cfg(feature = "experimental-engines")]
-use super::{raptor::RaptorEngine, swift::SwiftEngine};
+use super::swift::SwiftEngine;
 
 /// Global capability registry for storage engine capabilities
 ///
@@ -202,20 +202,10 @@ impl StorageEngineFactory {
                 }
             }
             ProtoStorageEngine::Nova => Self::create_nova(),
-            ProtoStorageEngine::Raptor => {
-                #[cfg(feature = "experimental-engines")]
-                {
-                    Self::create_raptor()
-                }
-                #[cfg(not(feature = "experimental-engines"))]
-                {
-                    anyhow::bail!(
-                        "RAPTOR engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
-                         To enable: cargo build --features experimental-engines"
-                    )
-                }
-            }
+            ProtoStorageEngine::Raptor => anyhow::bail!(
+                "RAPTOR engine has been removed (stage-3 deletion). \
+                 Use SST, HELIX, or NOVA instead — VIPER is also deprecated (ADR-093)."
+            ),
             ProtoStorageEngine::Tst => Self::create_tst(),
             ProtoStorageEngine::Cedar => Self::create_cedar(),
             ProtoStorageEngine::Chrono => anyhow::bail!(
@@ -266,20 +256,10 @@ impl StorageEngineFactory {
                 }
             }
             ProtoStorageEngine::Nova => Self::create_nova_async().await,
-            ProtoStorageEngine::Raptor => {
-                #[cfg(feature = "experimental-engines")]
-                {
-                    Self::create_raptor_async().await
-                }
-                #[cfg(not(feature = "experimental-engines"))]
-                {
-                    anyhow::bail!(
-                        "RAPTOR engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
-                         To enable: cargo build --features experimental-engines"
-                    )
-                }
-            }
+            ProtoStorageEngine::Raptor => anyhow::bail!(
+                "RAPTOR engine has been removed (stage-3 deletion). \
+                 Use SST, HELIX, or NOVA instead — VIPER is also deprecated (ADR-093)."
+            ),
             ProtoStorageEngine::Tst => Self::create_tst_async().await,
             ProtoStorageEngine::Cedar => Self::create_cedar_async().await,
             ProtoStorageEngine::Chrono => anyhow::bail!(
@@ -322,21 +302,11 @@ impl StorageEngineFactory {
         match strategy {
             StorageEngineStrategy::Viper => Self::create_viper(),
             StorageEngineStrategy::Sst => Self::create_sst(),
+            // RAPTOR (which served hybrid strategy) is deleted (stage-3); hybrid
+            // collections fall back to the supported default SST engine.
             StorageEngineStrategy::Hybrid => {
-                #[cfg(feature = "experimental-engines")]
-                {
-                    // RAPTOR uses hybrid strategy (row-aligned with columnar benefits)
-                    info!("Creating RAPTOR engine for hybrid strategy");
-                    Self::create_raptor()
-                }
-                #[cfg(not(feature = "experimental-engines"))]
-                {
-                    anyhow::bail!(
-                        "RAPTOR engine (hybrid strategy) is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
-                         To enable: cargo build --features experimental-engines"
-                    )
-                }
+                warn!("Hybrid strategy: RAPTOR deleted; using SST (supported default)");
+                Self::create_sst()
             }
             StorageEngineStrategy::Swift => {
                 #[cfg(feature = "experimental-engines")]
@@ -357,21 +327,10 @@ impl StorageEngineFactory {
                 info!("Creating NOVA engine");
                 Self::create_nova()
             }
-            StorageEngineStrategy::Raptor => {
-                #[cfg(feature = "experimental-engines")]
-                {
-                    info!("Creating RAPTOR engine");
-                    Self::create_raptor()
-                }
-                #[cfg(not(feature = "experimental-engines"))]
-                {
-                    anyhow::bail!(
-                        "RAPTOR engine is experimental and disabled in default builds. \
-                         Use SST, VIPER, HELIX, or NOVA instead. \
-                         To enable: cargo build --features experimental-engines"
-                    )
-                }
-            }
+            StorageEngineStrategy::Raptor => anyhow::bail!(
+                "RAPTOR engine has been removed (stage-3 deletion). \
+                 Use SST, HELIX, or NOVA instead — VIPER is also deprecated (ADR-093)."
+            ),
             StorageEngineStrategy::Helix => {
                 info!("Creating HELIX engine");
                 Self::create_helix()
@@ -621,26 +580,6 @@ impl StorageEngineFactory {
     /// Note: Requires async initialization with collection metadata.
     ///
     /// **Requires `experimental-engines` feature flag.**
-    #[cfg(feature = "experimental-engines")]
-    #[allow(deprecated)]
-    pub fn create_raptor() -> Result<Arc<dyn UnifiedStorageFormat>> {
-        warn!("RAPTOR engine is experimental and not production-ready");
-        let engine = Self::block_on_with_persistent_runtime(async { RaptorEngine::new().await })?;
-        Ok(Arc::new(engine))
-    }
-
-    /// Async version for use within async contexts (e.g., tests)
-    ///
-    /// **Requires `experimental-engines` feature flag.**
-    #[cfg(feature = "experimental-engines")]
-    #[allow(deprecated)]
-    pub async fn create_raptor_async() -> Result<Arc<dyn UnifiedStorageFormat>> {
-        warn!("RAPTOR engine is experimental and not production-ready");
-        info!("Creating RAPTOR storage engine");
-        let engine = RaptorEngine::new().await?;
-        Ok(Arc::new(engine))
-    }
-
     /// Create a storage engine with metrics integration
     pub fn create_with_metrics(
         engine_type: ProtoStorageEngine,
