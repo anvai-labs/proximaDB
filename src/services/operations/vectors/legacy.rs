@@ -6868,6 +6868,31 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
 
         Ok(matching)
     }
+
+    /// Resolve a user-facing collection identifier to its canonical object id.
+    /// Delegates to the inherent resolver (ADR-094 recall-tune port support).
+    async fn resolve_collection_object_id(
+        &self,
+        collection_id: &str,
+    ) -> anyhow::Result<proximadb_kernel::stable_id::CollectionObjectId> {
+        self.resolve_collection_object_id(collection_id).await
+    }
+
+    /// List every visibility-filtered record (WAL memtable + flushed storage)
+    /// for the recall-tune read. Mirrors the `record_ids_matching_filter`
+    /// tenant pattern: `tenant_id: Option<&str>` in, `TenantContext` built
+    /// internally.
+    async fn list_records_for_recall_tune(
+        &self,
+        internal_collection_id: &str,
+        tenant_id: Option<&str>,
+    ) -> anyhow::Result<Vec<proximadb_records::ProximaRecord>> {
+        let tenant_ctx = tenant_id
+            .filter(|t| !t.is_empty())
+            .map(crate::storage::tenant::context::TenantContext::for_tenant_id);
+        self.list_all_records_with_tenant_context(internal_collection_id, tenant_ctx.as_ref())
+            .await
+    }
 }
 
 // ─── P4: ANN advisor observation hook ───────────────────────────

@@ -9,12 +9,13 @@
 # This ratchet pins the TOTAL count at its committed ceiling: CI fails if it
 # rises. Lower the ceiling in the same PR that removes imports.
 #
-# Baseline (2026-10-03): 52 across 12 files.
+# Baseline (2026-10-03): 52 across 12 files. After PR-3.1b (graphs.rs port
+# rewrite): 51.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CEILING="${V2_ROOT_IMPORTS_CEILING:-52}"
+CEILING="${V2_ROOT_IMPORTS_CEILING:-51}"
 DIR="src/network/rest/v2"
 
 count=$(grep -rh "^use crate::" "$DIR"/*.rs 2>/dev/null | wc -l | tr -d ' ')

@@ -163,6 +163,12 @@ pub struct AppState {
     /// Constructed once at boot from the vector + graph services (mirrors the
     /// TD-104 S5 extraction pattern) instead of per-request in each handler.
     pub fusion_service: Arc<crate::services::fusion_service::FusionService>,
+    /// ADR-094: fusion retrieval seam (port object over `fusion_service`) —
+    /// v2 handlers call this instead of the concrete service.
+    pub fusion_port: Arc<dyn proximadb_runtime::FusionSearchPort>,
+    /// ADR-094: vector ops port (same `Arc` as `vector_operations_service`,
+    /// re-typed) — v2 handlers call this instead of the concrete service.
+    pub vector_ops_port: Arc<dyn proximadb_runtime::VectorOpsPort>,
     /// Observability service, extracted at boot (TD-104 S5). Feeds the
     /// observability AQL source; same `Arc` as the root handler.
     pub observability_service: Arc<crate::observability::ObservabilityService>,
@@ -368,6 +374,12 @@ impl AppState {
                 graph_operations_service.clone(),
                 fulltext_indexes.clone(),
             ));
+        // ADR-094: the fusion + vector-ops seams as port objects — v2 handlers
+        // read these instead of the concrete services.
+        let fusion_port: std::sync::Arc<dyn proximadb_runtime::FusionSearchPort> =
+            fusion_service.clone();
+        let vector_ops_port: std::sync::Arc<dyn proximadb_runtime::VectorOpsPort> =
+            vector_operations_service.clone();
         Self {
             api_handlers,
             graph_execution_service,
@@ -378,6 +390,8 @@ impl AppState {
             graph_collection_service,
             record_ops,
             fusion_service,
+            fusion_port,
+            vector_ops_port,
             observability_service,
             event_log,
             security_coordinator,

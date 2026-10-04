@@ -258,6 +258,30 @@ pub trait VectorOpsPort: Send + Sync {
     ) -> Result<HashSet<String>> {
         Ok(HashSet::new())
     }
+
+    /// Resolve a user-facing collection identifier to its canonical object id
+    /// (recall-tune/diagnostics support). Fail-closed default: only the
+    /// production impl resolves real ids.
+    async fn resolve_collection_object_id(
+        &self,
+        _collection_id: &str,
+    ) -> Result<proximadb_kernel::stable_id::CollectionObjectId> {
+        Err(anyhow::anyhow!(
+            "collection object-id resolution is not implemented by this runtime port"
+        ))
+    }
+
+    /// List every visibility-filtered record (WAL memtable + flushed storage)
+    /// for recall-tune reads. Fail-closed default.
+    async fn list_records_for_recall_tune(
+        &self,
+        _internal_collection_id: &str,
+        _tenant_id: Option<&str>,
+    ) -> Result<Vec<proximadb_records::ProximaRecord>> {
+        Err(anyhow::anyhow!(
+            "recall-tune record listing is not implemented by this runtime port"
+        ))
+    }
 }
 
 // ── Query facade ──────────────────────────────────────────────────────────────

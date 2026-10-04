@@ -21,10 +21,15 @@ pub mod port;
 pub mod proto_defaults;
 pub mod record_ops_port;
 pub mod record_route_port;
+pub mod fusion_search_port;
 pub mod record_search_port;
 pub mod resources;
 pub mod rich_record;
 pub mod rich_search;
+pub use fusion_search_port::{
+    DocumentFusionSpec, FusionOidKey, FusionRoutePolicy, FusionSearchPort, FusionSearchResult,
+    GraphFusionRequest, GraphGrain,
+};
 pub mod security_port;
 pub mod service_ports;
 pub mod streaming_port;

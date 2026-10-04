@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use proximadb_graph::record::{GraphEdgeKey, GraphNodeKey};
 use proximadb_records::{ProximaRecord, RecordKey};
 
@@ -297,61 +298,6 @@ impl DocumentExpander {
 
 /// How source record `oid`s map to the fusion key (what the [`Fuser`] merges by).
 ///
-/// Co-indexed collections (graph fusion) share one canonical oid space, so keying is identity.
-/// Entities keep their vectors under an *auxiliary* oid and their graph nodes under the canonical
-/// oid; [`FusionOidKey::EntityNode`] reduces both to the entity `node_id` so the vector and graph
-/// sources co-rank (TD-142 / TD-146 scope B — graph-augmented entity fusion).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FusionOidKey {
-    /// Vector + graph share the canonical oid `graph/{graph_id}/node/{node_id}`. Identity keying.
-    #[default]
-    Canonical,
-    /// Entity keying: vector oids are `{node_id}/{model_id}`, graph oids are
-    /// `graph/{graph_id}/node/{node_id}`. Both normalize to the entity `node_id`.
-    EntityNode,
-}
-
-impl FusionOidKey {
-    /// Fusion key for a source oid (the value the Fuser merges by).
-    pub(crate) fn fusion_key(&self, oid: &str) -> String {
-        match self {
-            Self::Canonical => oid.to_string(),
-            Self::EntityNode => entity_node_id_from_oid(oid).to_string(),
-        }
-    }
-
-    /// Graph `node_id` to seed traversal, recovered from a vector-hit oid.
-    pub(crate) fn seed_node_id(&self, graph_id: &str, hit_id: &str) -> String {
-        match self {
-            // Co-indexed: the hit id is the canonical oid; strip the prefix.
-            Self::Canonical => {
-                let prefix = format!("graph/{graph_id}/node/");
-                hit_id
-                    .strip_prefix(&prefix)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| hit_id.to_string())
-            }
-            // Entity: the hit id is the auxiliary `{node_id}/{model_id}`; drop the model suffix.
-            Self::EntityNode => entity_node_id_from_oid(hit_id).to_string(),
-        }
-    }
-}
-
-/// Recover the entity `node_id` from either oid form: the canonical graph oid
-/// `graph/{graph_id}/node/{node_id}` or the auxiliary vector oid `{node_id}/{model_id}`.
-/// (`entity_node_id` itself contains no `/`, so stripping the last path segment of the auxiliary
-/// form or the `graph/…/node/` prefix of the canonical form both yield the bare `node_id`.)
-fn entity_node_id_from_oid(oid: &str) -> &str {
-    if let Some(rest) = oid.strip_prefix("graph/")
-        && let Some((_gid, node_id)) = rest.split_once("/node/")
-    {
-        return node_id;
-    }
-    oid.rsplit_once('/')
-        .map(|(node_id, _)| node_id)
-        .unwrap_or(oid)
-}
-
 /// Recover the graph `node_id`(s) to seed traversal from the vector hits, bounded by `max_seeds`
 /// (D8 — conservative expansion). Keying follows [`FusionOidKey`].
 pub(crate) fn seed_node_ids(
@@ -384,35 +330,10 @@ pub(crate) fn normalize_source_keys(
     src
 }
 
-/// Whether graph expansion contributes node candidates, edge (relationship) candidates, or both.
-/// Edge-grain carries more relational signal (HELIOS: +6–12% over node-grain); node-grain is the
-/// default sweet spot (D8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GraphGrain {
-    #[default]
-    Nodes,
-    Edges,
-    Both,
-}
-
-/// Optional document-modality contribution to a fusion query (TD-138). When present, the shared
-/// [`FusionService`] runs BM25/full-text search over the collection's in-memory index (via
-/// [`DocumentExpander`]) and emits an `oid`-keyed [`SourceId::Document`] source that merges with the
-/// vector + graph sources by shared `oid`. Absent ⇒ no document contribution (the default, preserving
-/// plain vector+graph fusion). The expander fails closed on a missing/poisoned index, so fusion
-/// proceeds on the other modalities rather than erroring (D5/D6).
-#[derive(Debug, Clone)]
-pub struct DocumentFusionSpec {
-    /// The BM25/full-text query. Its presence is what enables the document source.
-    pub text_query: String,
-    /// Collection whose full-text index to search. `None` ⇒ the vector collection (documents
-    /// co-indexed with the vectors share the record `oid`, so they merge by `oid`).
-    pub collection: Option<String>,
-    /// Document modality weight (mirrors `vector_weight` / `graph_weight`).
-    pub weight: f32,
-    /// Top-k documents to take from the index. `None` ⇒ reuse the query `limit`.
-    pub k: Option<usize>,
-}
+// ADR-094: the fusion DTOs are runtime-owned (FusionSearchPort seam); the
+// service re-exports them so `crate::services::fusion_service::*` paths keep
+// working for the four construction sites.
+pub use proximadb_runtime::fusion_search_port::{DocumentFusionSpec, FusionOidKey, GraphGrain};
 
 /// Parameters for one graph-modality fusion query.
 #[derive(Debug, Clone)]
@@ -803,6 +724,45 @@ fn truncate_source_to_budget(source: &mut SourceCandidates, budget: usize) {
     pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     for (oid, score) in pairs.into_iter().take(budget) {
         source.scores.insert(oid, score);
+    }
+}
+
+/// ADR-094: the fusion retrieval seam, exposed as a runtime port so REST/gRPC
+/// handlers stop constructing `GraphFusionParams` themselves. Identity travels
+/// via `PortIdentity` (tenant/principal/stable-id map 1:1 onto the params).
+#[async_trait]
+impl proximadb_runtime::FusionSearchPort for FusionService {
+    async fn fusion_search(
+        &self,
+        request: proximadb_runtime::GraphFusionRequest,
+        identity: proximadb_runtime::PortIdentity<'_>,
+    ) -> Result<proximadb_runtime::FusionSearchResult> {
+        let params = GraphFusionParams {
+            graph_id: request.graph_id,
+            vector_collection: request.vector_collection,
+            query_vector: request.query_vector,
+            max_depth: request.max_depth,
+            edge_types: request.edge_types,
+            max_seeds: request.max_seeds,
+            limit: request.limit,
+            vector_weight: request.vector_weight,
+            graph_weight: request.graph_weight,
+            grain: request.grain,
+            principal: identity.subject.map(str::to_string),
+            route_policy: request
+                .route_policy
+                .map(|p| crate::core::search::fusion_route::RoutePolicy {
+                    min_weight_fraction: p.min_weight_fraction,
+                    total_budget: p.total_budget,
+                }),
+            policy: request.policy,
+            oid_key: request.oid_key,
+            document: request.document,
+            tenant: identity.tenant_id.map(str::to_string),
+            tenant_stable_id: identity.tenant_stable_id,
+        };
+        let (items, stats, labels) = self.graph_fusion_search_with_labels(params).await?;
+        Ok(proximadb_runtime::FusionSearchResult { items, stats, labels })
     }
 }
 

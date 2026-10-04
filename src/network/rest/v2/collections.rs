@@ -3295,14 +3295,15 @@ pub async fn post_collection_recluster_v2(
 
         // (2) Read every record. Resolves the user-facing name to the
         // canonical internal id (same as the discovery recluster pass).
-        let vector_ops = &state.vector_operations_service;
-        let internal_id = vector_ops
+        let internal_id = state
+            .vector_ops_port
             .resolve_collection_object_id(&collection_id)
             .await
             .map_err(|e| ApiError::NotFound(e.to_string()))?
             .to_string();
-        let records = vector_ops
-            .list_all_records_with_tenant_context(internal_id.as_str(), None)
+        let records = state
+            .vector_ops_port
+            .list_records_for_recall_tune(internal_id.as_str(), None)
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to list records: {}", e)))?;
 

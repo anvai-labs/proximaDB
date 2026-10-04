@@ -8962,6 +8962,7 @@ dependencies = [
  "futures",
  "num_cpus",
  "proximadb-config",
+ "proximadb-cross-modal-fusion",
  "proximadb-data-model",
  "proximadb-distance-types",
  "proximadb-graph-query",

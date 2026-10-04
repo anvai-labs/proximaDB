@@ -145,3 +145,15 @@ methods the sites call expose root types:
 Sequence: foundation type moves → `VectorOpsPort`/`FusionSearchPort` growth →
 site port-ification → ratchet 52 → 0 → Phase 3.2 file moves. Each step keeps
 `check-layering.sh` and the route census green.
+
+Executed (2026-10-04): `CollectionObjectId` was already kernel-resident;
+`TenantContext` already lives in `proximadb-storage-tenant` (a legal
+downward dep for the port impl, and the established `tenant_id: Option<&str>`
+port pattern avoids it at the seam anyway). `VectorOpsPort` grew
+`resolve_collection_object_id` + `list_records_for_recall_tune` (fail-closed
+defaults); `FusionSearchPort` landed with runtime-owned request/result DTOs
+(`fusion_search_port.rs`) and a root impl on `FusionService`. graphs.rs
+fusion-search + collections.rs recall-tune now go through the ports; the
+entities.rs orchestrator site stays concrete until the Phase 3.3 move
+(relocates `entity_orchestrator` types with the file). Ratchet 52 → 51;
+route census identical.

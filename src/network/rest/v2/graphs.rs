@@ -1,7 +1,8 @@
 //! REST v2 graph fusion endpoints — the graph instance of the cross-modal fusion seam on a transport.
 //!
 //! `POST /api/v2/graphs/{graph_id}/fusion-search` runs vector ANN seed → k-hop graph expand →
-//! calibrated fuse-by-`oid`, via [`crate::services::fusion_service::FusionService`]. See
+//! calibrated fuse-by-`oid`, via the [`proximadb_runtime::FusionSearchPort`] seam
+//! (`FusionService` impl). See
 //! `docs/12-design/CROSS_MODAL_FUSION_SEAM_2026_06_22.adoc` (TD-137).
 
 use axum::{
@@ -11,15 +12,16 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use proximadb_runtime::{FusionRoutePolicy, GraphFusionRequest, PortIdentity};
+
 use crate::core::search::cross_modal_fusion::{FusionPolicy, FusionStats};
-use crate::core::search::fusion_route::RoutePolicy;
 use crate::errors::{ApiError, ApiResult};
 use crate::network::middleware::tenant::TenantContext;
 use crate::network::rest::canonical::handlers::AppState;
 use crate::network::rest::openapi::ErrorResponse;
 use crate::security::rbac_service::UnifiedUserContext;
 use crate::services::fusion_service::{
-    DocumentFusionSpec, FusionOidKey, GraphFusionParams, GraphGrain,
+    DocumentFusionSpec, FusionOidKey, GraphGrain,
 };
 
 fn default_limit() -> usize {
@@ -165,16 +167,21 @@ pub async fn fusion_search_v2(
         policy.consensus_beta = beta;
     }
 
-    // Use the shared fusion port constructed once at boot (AppState::fusion_service),
-    // per the search-surface contract — one retrieval engine, no per-handler construction.
-    let service = state.fusion_service.clone();
-    let params = GraphFusionParams {
-        graph_id,
+    // ADR-094: call the shared fusion seam through the runtime port (constructed
+    // once at boot as `AppState::fusion_port`) — one retrieval engine, no
+    // per-handler construction. Identity travels via `PortIdentity`.
+    let subject = user_context.as_ref().map(|ctx| ctx.user_id.as_str());
+    let identity = PortIdentity {
+        subject,
         // Structural tenant boundary — scopes both fusion legs (TD-ENTITY-TENANT-1).
-        tenant: Some(tenant.tenant_id.clone()),
+        tenant_id: Some(tenant.tenant_id.as_str()),
         // FA-2 PR-D3: stable tenant id for ABAC per-record enforcement (binding
         // filter key). `None` ⇒ structural isolation only.
         tenant_stable_id: tenant.tenant_stable_id,
+        ..Default::default()
+    };
+    let request = GraphFusionRequest {
+        graph_id: graph_id.clone(),
         vector_collection: request.vector_collection,
         query_vector: request.query_vector,
         max_depth: request.max_depth,
@@ -188,17 +195,16 @@ pub async fn fusion_search_v2(
             Some("both") => GraphGrain::Both,
             _ => GraphGrain::Nodes,
         },
-        principal: user_context.as_ref().map(|ctx| ctx.user_id.clone()),
         route_policy: match (request.min_weight_fraction, request.total_budget) {
-            (Some(frac), Some(budget)) => Some(RoutePolicy {
+            (Some(frac), Some(budget)) => Some(FusionRoutePolicy {
                 min_weight_fraction: frac,
                 total_budget: budget,
             }),
-            (Some(frac), None) => Some(RoutePolicy {
+            (Some(frac), None) => Some(FusionRoutePolicy {
                 min_weight_fraction: frac,
                 total_budget: usize::MAX,
             }),
-            (None, Some(budget)) => Some(RoutePolicy {
+            (None, Some(budget)) => Some(FusionRoutePolicy {
                 min_weight_fraction: 0.0,
                 total_budget: budget,
             }),
@@ -220,10 +226,12 @@ pub async fn fusion_search_v2(
             }),
     };
 
-    let (items, stats, node_labels) = service
-        .graph_fusion_search_with_labels(params)
+    let result = state
+        .fusion_port
+        .fusion_search(request, identity)
         .await
         .map_err(|error| ApiError::Internal(format!("fusion search failed: {error}")))?;
+    let (items, stats, node_labels) = (result.items, result.stats, result.labels);
 
     Ok(Json(FusionSearchResponse {
         results: items

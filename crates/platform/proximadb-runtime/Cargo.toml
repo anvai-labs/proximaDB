@@ -29,6 +29,7 @@ chrono.workspace = true
 proximadb-graph-query = { path = "../../query/proximadb-graph-query" }
 proximadb-vector-query = { path = "../../query/proximadb-vector-query" }
 proximadb-hardware = { path = "../../foundation/proximadb-hardware" }
+proximadb-cross-modal-fusion = { path = "../../horizontal/proximadb-cross-modal-fusion" }
 proximadb-kernel = { path = "../../foundation/proximadb-kernel" }
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
 proximadb-records = { path = "../../foundation/proximadb-records" }
