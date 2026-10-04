@@ -119,3 +119,29 @@ performance option afterward.
   fresh v2 parity suite, which must land in the same phase as the deletions.
 * Specialty routers' root residency is a *documented temporary disposition*,
   revisited at the enterprise-crate split (ADR-084), not an endorsement.
+
+== PR-3.1b prerequisites discovered (2026-10-04)
+
+Port-ifying the six remaining concrete v2 reads requires foundation-tier type
+moves FIRST — `proximadb-runtime` ports must stay monolith-independent, and the
+methods the sites call expose root types:
+
+* `collections.rs` recall-tune → `VectorOperationsService::
+  resolve_collection_object_id` returns `crate::core::stable_id::
+  CollectionObjectId`; `list_all_records_with_tenant_context` takes
+  `crate::storage::tenant::context::TenantContext`. Both types move to
+  foundation (stable-id → `proximadb-kernel` or a new `proximadb-stable-id`;
+  tenant context → `proximadb-tenant`) before `VectorOpsPort` grows the two
+  methods.
+* `graphs.rs` fusion-search → handler builds `GraphFusionParams` +
+  `RoutePolicy`/`FusionPolicy`/`GraphGrain` (root `crate::core::search::*`).
+  `FusionSearchPort` needs those params types in a foundation crate (or the
+  port re-exports `proximadb-query` contracts if they already sit in a clean
+  crate).
+* `entities.rs` orchestrator → `EntityOrchestrator::new` takes four concrete
+  Arcs; a port-based constructor (or an `EntityOpsPort`) is the follow-up after
+  the fusion/tenant types land.
+
+Sequence: foundation type moves → `VectorOpsPort`/`FusionSearchPort` growth →
+site port-ification → ratchet 52 → 0 → Phase 3.2 file moves. Each step keeps
+`check-layering.sh` and the route census green.
