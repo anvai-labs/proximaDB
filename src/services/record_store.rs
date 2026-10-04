@@ -1902,6 +1902,13 @@ impl DirectWalTableRecordStore {
         let mut summary = proximadb_records::RecordRecoverySummary::default();
         for entry in entries {
             let tenant_id = entry.tenant_id.clone().unwrap_or_default();
+            // The replayed entry carries its own LSN, and it is the SAME LSN the
+            // live write path recorded. Passing it keeps a spill-backed partition
+            // able to compute a truncation point after a restart — replay through
+            // plain `upsert_record` would leave every recovered row resident but
+            // untracked, so `min_unflushed_lsn` would fail closed forever and 2b
+            // could never make progress on a restarted node.
+            let lsn = entry.sequence_number;
             match entry.operation {
                 CanonicalOperation::RecordUpsert {
                     collection_id,
@@ -1909,7 +1916,7 @@ impl DirectWalTableRecordStore {
                     ..
                 } => {
                     self.partition(&tenant_id, &collection_id)
-                        .upsert_record(*record)
+                        .upsert_record_at_lsn(*record, lsn)
                         .await?;
                     summary.upserts_replayed += 1;
                 }
@@ -2326,9 +2333,31 @@ impl TableRecordStore for DirectWalTableRecordStore {
         }
 
         let tenant_id = tenant_context.map(|tenant| tenant.tenant_id.clone());
-        self.wal_appender
+        // Bind the result: each entry's `sequence_number` is the durable WAL LSN
+        // of the corresponding operation, and until TD-USUB-1's 2b work it was
+        // discarded here. `operations` and `storage_actions` are pushed in
+        // lockstep below, and `append_operations` returns its entries in input
+        // order (built by `map`/`collect` over the input, after `sync_data`), so
+        // index i of this vec is the LSN for `storage_actions[i]`.
+        let wal_entries = self
+            .wal_appender
             .append_operations(operations, tenant_id)
             .await?;
+        // Defensive, not decorative: a future appender that reorders or coalesces
+        // would make the positional mapping silently wrong — and a wrong LSN here
+        // becomes a wrong truncation point later, i.e. data loss. Mismatched
+        // lengths therefore disable LSN tracking rather than guess.
+        let lsns: Option<Vec<u64>> = if wal_entries.len() == storage_actions.len() {
+            Some(wal_entries.iter().map(|e| e.sequence_number).collect())
+        } else {
+            tracing::warn!(
+                entries = wal_entries.len(),
+                actions = storage_actions.len(),
+                "WAL entry count does not match storage actions; skipping LSN association \
+                 (truncation will fail closed rather than use a guessed mapping)"
+            );
+            None
+        };
 
         // TD-110 Slice C: maintain the UNIQUE/PK index incrementally — but only
         // once it has been built (first `check_unique_conflict`). Until then the
@@ -2346,14 +2375,23 @@ impl TableRecordStore for DirectWalTableRecordStore {
         let maintain_any = maintain_index || maintain_secondary;
 
         let mut record_ids = Vec::with_capacity(storage_actions.len());
-        for (kind, record) in storage_actions {
+        for (idx, (kind, record)) in storage_actions.into_iter().enumerate() {
+            // `None` when the positional mapping could not be trusted (above), in
+            // which case the store gets no LSN and reports "cannot truncate"
+            // rather than a minimum derived from a partial set.
+            let lsn = lsns.as_ref().and_then(|v| v.get(idx).copied());
             let key = RecordKey::from(&record);
             match kind {
                 TableRecordMutationKind::Insert
                 | TableRecordMutationKind::Upsert
                 | TableRecordMutationKind::Update => {
                     if maintain_any {
-                        let written = partition.upsert_record(record.clone()).await?;
+                        let written = match lsn {
+                            Some(lsn) => {
+                                partition.upsert_record_at_lsn(record.clone(), lsn).await?
+                            }
+                            None => partition.upsert_record(record.clone()).await?,
+                        };
                         record_ids.push(written.oid);
                         if maintain_index
                             && let Some(index) = self.unique_index.write().get_mut(&index_key)
@@ -2366,7 +2404,10 @@ impl TableRecordStore for DirectWalTableRecordStore {
                             index.upsert(&record);
                         }
                     } else {
-                        let written = partition.upsert_record(record).await?;
+                        let written = match lsn {
+                            Some(lsn) => partition.upsert_record_at_lsn(record, lsn).await?,
+                            None => partition.upsert_record(record).await?,
+                        };
                         record_ids.push(written.oid);
                     }
                     // ADR-031 O3 migrate-on-write: drain any pre-flip copy from the
