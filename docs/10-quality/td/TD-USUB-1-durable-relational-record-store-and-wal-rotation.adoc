@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with (iii)** — see "Design decided"; (ii) catalog registration of segments — for 2b truncation, *not* for deletion, (iii) wire the two production call sites, (iv) slice 2b (WAL truncation), (v) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with "wire the two production call sites"** below — see "Design decided"; (ii) **plumb the WAL LSN to the partition store** — it is returned by `append_operations` and discarded today, and without it 2b's truncation point cannot be computed safely (see "Slice 2b is not gated on catalog registration"), (iii) **track the unflushed minimum LSN per partition** — a single high-water watermark is unsafe by construction, so this is what makes a correct truncation point expressible at all (see the warning under "Slice 2b is not gated on catalog registration"), (iv) catalog registration of segments — needed for 2b truncation, *not* for deletion, and the LAST of 2b's prerequisites rather than the first, (v) wire the two production call sites, (vi) slice 2b (WAL truncation), (vii) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -107,7 +107,8 @@ riskiest element (WAL truncation) is the one that can lose data. So:
 * **Slice 2b — WAL truncation**, under ADR-094's rule (truncate only below the minimum LSN
   durably committed in a catalog-referenced segment), plus the crash-recovery evidence gate.
   This is what makes the bound survive restart, and it is legal only once 2a proves the
-  segment is readable.
+  segment is readable. **Its real prerequisites are not what this TD said — see
+  "Slice 2b is not gated on catalog registration".**
 * **Slice 2c — background compaction.**
 
 A further prerequisite for 2a: `storage_factory` is `Fn() -> Arc<dyn RecordStorage>`
@@ -342,7 +343,7 @@ The gap cannot be reached today — `new_spilling` has no production caller, so 
 orphan a spill object. Building marker + drain now would be machinery exercised only by its own
 tests, and the part that actually needs validating — does a drain reliably finish an interrupted
 DROP against a real object store? — is not testable until something real writes segments.
-**Open item (i) is therefore gated with (iii), not ahead of it**, and
+**The deletion-obligation item is therefore gated with "wire the two production call sites", not ahead of it** (named rather than numbered: the Open list has been renumbered twice, and a numeral cross-reference silently went stale each time), and
 `proximadb_record_tier_purge_failures_total` is what keeps the gap visible meanwhile.
 
 **A deterministic base path needs a per-instance nonce in the segment name.** The counter
@@ -370,6 +371,81 @@ Checked rather than assumed: **no other live call site has this hole today.** Th
 (`engines/raptor/engine.rs`) stores the options in a field nothing reads. So this is a **latent
 hazard to avoid reusing**, not a live defect elsewhere: `FileOptions { overwrite: false }` on a
 plain `write` looks like a safety property and is one only on the local backend.
+
+== Slice 2b is not gated on catalog registration — found 2026-10-02
+
+This TD has said twice that catalog registration of segments is what gates 2b truncation. That is
+wrong, or at least badly incomplete: **registration records where a segment is, but truncation
+needs to know which WAL range it covers, and that information does not exist anywhere today.**
+
+=== Finding 1 — the LSN is produced and thrown away
+
+`ProximaRecord` has **no LSN field**, and the `proximadb-records` crate has no LSN concept at all
+(checked: no `lsn` / `sequence_number` anywhere in it). So a flushed segment cannot record "every
+record in here was durably committed at or below LSN X" — the exact quantity ADR-094's rule needs.
+
+The LSN is not unavailable, it is **discarded**. `TableWalAppender::append_operations` returns
+`Vec<CanonicalWalEntry>`, and `CanonicalWalEntry.sequence_number` is the LSN — but the write path
+calls it as `self.wal_appender.append_operations(operations, tenant_id).await?;` with **no
+binding** (`record_store.rs`, the `write_mutations` path), so every LSN is dropped on the floor
+before the records reach the partition store. This is the same shape as the object size in
+TD-USUB-8 slice 0 and the partition identity in 2a: *the value was already in hand.*
+
+=== Finding 2 — a "WAL high-water at flush time" watermark would be UNSAFE
+
+The tempting cheap fix is to skip per-record LSNs and have `flush()` stamp the segment with the
+WAL high-water mark observed at flush time. **That loses data.** The WAL append and the memtable
+insert are two separate, non-atomic steps: `append_operations(...).await?` completes, and only
+then does the loop call `partition.upsert_record(record)`. So a record whose append has committed
+but whose insert has not yet happened when `flush()` takes its snapshot is **counted under the
+high-water mark while present in no segment.** Truncating below that mark discards the only
+durable copy.
+
+[WARNING]
+====
+**This needs no concurrency whatsoever — one ordinary multi-row statement is enough.**
+
+`write_mutations` appends the **entire batch** in a single `append_operations` call, which assigns a
+sequence number to every operation and bumps the per-collection high-water *before returning*. Only
+then does a second loop insert the records one at a time. And `flush()` is triggered from inside
+`upsert_record` the moment `memtable.len() >= flush_threshold`.
+
+So on a single-task `INSERT` of N rows, if row 0 crosses the threshold, `flush()` fires mid-loop and
+its snapshot **excludes rows 1..N** — whose LSNs are already committed, and already at or below
+anything a high-water scheme would stamp on that segment. Concurrent writers widen the window; they
+are not required to open it.
+
+An earlier draft of this section implied the hazard needed a race. It does not, and the difference
+matters: a race is something a reviewer may discount as unlikely, whereas this would fire on the
+first multi-row insert that straddles the flush threshold.
+
+**To be exact about what is and is not broken today: nothing.** This is a hazard of a design that
+has *not been built*. It requires all four of — the watermark truncation scheme (does not exist),
+the spill store rather than the default memtable, its gate set, and `new_spilling` wired to
+production (it is not). No deployment can hit this. The point of recording it is that every one of
+those four becomes true in the course of finishing 2b, and at that moment the shortcut looks
+correct and is not.
+====
+
+The safe quantity is therefore the **minimum LSN among records not yet in a durable segment**,
+which cannot be derived from a single watermark and does need per-record LSN tracking. Note the
+memtable is a `DashMap` keyed by oid, not an LSN-ordered structure, so "flushed up to LSN N" is
+not a property it can report.
+
+=== What 2b actually requires, in order
+
+. **Plumb the LSN to the store.** The append site has it; the `RecordStore` write API does not take
+  it. Either widen the API or carry it on the record. This is the real first step, and it is
+  independent of the catalog.
+. **Track the unflushed minimum** per partition, so a safe truncation point exists at all.
+. **Register segments in the catalog** — still needed, because truncation may only reference a
+  segment whose location recovery can read (the reason recorded under "Correction" above). But it
+  is the *last* prerequisite, not the first.
+. Then truncation, behind the crash-recovery evidence gate below.
+
+**Had 2b been built to this TD's previous ordering** — register segments, then truncate — the
+result would have been a truncation point derived from a watermark that is unsafe by construction,
+i.e. silent data loss on recovery. Recorded here rather than discovered then.
 
 == Evidence gate (mandate #6)
 
