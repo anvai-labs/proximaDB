@@ -52,7 +52,7 @@ pub mod graphs;
 pub mod model_registry;
 pub mod query;
 pub mod records;
-pub mod schema;
+pub use proximadb_api::rest::v2::schema; // ADR-094: moved to platform/api
 pub mod sql;
 pub mod timeseries;
 
@@ -322,4 +322,17 @@ pub async fn capabilities() -> axum::Json<serde_json::Value> {
             "request_id_header": "X-Request-ID"
         }
     }))
+}
+
+
+// ADR-094: sub-state extraction for the converged (platform/api) v2 handlers —
+// the root router keeps `AppState` while moved handlers take `State<RestAppState>`.
+impl axum::extract::FromRef<crate::network::rest::canonical::handlers::AppState>
+    for proximadb_api::rest::state::RestAppState
+{
+    fn from_ref(
+        input: &crate::network::rest::canonical::handlers::AppState,
+    ) -> Self {
+        Self::new(input.api_handlers.clone())
+    }
 }

@@ -824,6 +824,7 @@ pub async fn tenant_middleware(
             req.extensions_mut()
                 .insert(proximadb_api::rest::TenantContext {
                     tenant_id: context.tenant_id.clone(),
+                    tenant_stable_id: context.tenant_stable_id,
                 });
             // ADR-087 (TD-ABAC-8): the ONE foundation identity, visible to every
             // crate. api-crate handlers consume this; the tenant-only api
@@ -848,6 +849,7 @@ pub async fn tenant_middleware(
                 req.extensions_mut()
                     .insert(proximadb_api::rest::TenantContext {
                         tenant_id: default_ctx.tenant_id.clone(),
+                        tenant_stable_id: default_ctx.tenant_stable_id,
                     });
                 req.extensions_mut()
                     .insert(proximadb_tenant::ResolvedRequestIdentity::from(

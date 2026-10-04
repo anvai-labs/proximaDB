@@ -15,18 +15,29 @@ use proximadb_runtime::ApiHandlersPort;
 #[derive(Debug, Clone)]
 pub struct TenantContext {
     pub tenant_id: String,
+    /// FA-2 PR-D3: the ABAC binding-filter key, populated by the root tenant
+    /// middleware at injection time. `None` on unauthenticated/test paths.
+    pub tenant_stable_id: Option<u64>,
 }
 
 impl TenantContext {
     pub fn new(tenant_id: impl Into<String>) -> Self {
         Self {
             tenant_id: tenant_id.into(),
+            tenant_stable_id: None,
         }
     }
 
     /// Convenience for tests and middleware that need a default tenant.
     pub fn default_tenant() -> Self {
         Self::new("default")
+    }
+
+    /// Set the ABAC stable tenant id (root middleware injects this from the
+    /// resolved identity).
+    pub fn with_tenant_stable_id(mut self, id: u64) -> Self {
+        self.tenant_stable_id = Some(id);
+        self
     }
 }
 

@@ -199,6 +199,7 @@ needless_range_loop = "allow"
 
 [workspace.dependencies]
 anyhow = "1.0"
+utoipa = { version = "5", features = ["axum_extras", "preserve_order", "yaml"] }
 # R-5b.1.3 workaround: an auto-refactor commit added
 # crates/query/proximadb-relational-frontend referencing
 # `sqlparser = { workspace = true }` without first declaring the
@@ -415,7 +416,7 @@ sandhi-core = "0.2"
 # is generated from the handler code (see src/network/rest/openapi.rs) with a CI
 # drift gate, rather than hand-maintained. Derives are zero runtime cost; the
 # aggregated document is only materialized by the generator/test path.
-utoipa = { version = "5", features = ["axum_extras", "preserve_order", "yaml"] }
+utoipa.workspace = true
 # YAML (de)serialization for the OpenAPI generator: parse the checked-in
 # supplement fragment and render the merged document to canonical YAML.
 serde_yaml = "0.9"

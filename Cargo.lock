@@ -7383,6 +7383,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 

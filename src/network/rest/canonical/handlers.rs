@@ -2016,6 +2016,7 @@ pub fn create_router(state: AppState) -> axum::Router {
     );
     let default_api_tenant = proximadb_api::rest::TenantContext {
         tenant_id: "default".to_string(),
+        tenant_stable_id: None,
     };
     let router = router
         .with_state(state)

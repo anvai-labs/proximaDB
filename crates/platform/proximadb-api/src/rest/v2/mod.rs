@@ -3,6 +3,7 @@
 //! Version 2 REST request/response contracts for multimodal and agentic APIs.
 
 pub mod agentic;
+pub mod schema;
 
 pub use agentic::{
     AgentCheckpointRequest, AgentCheckpointResponse, AgentEventAppendRequest,

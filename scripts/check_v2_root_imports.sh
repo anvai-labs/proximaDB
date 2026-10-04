@@ -10,12 +10,12 @@
 # rises. Lower the ceiling in the same PR that removes imports.
 #
 # Baseline (2026-10-03): 52 across 12 files. After PR-3.1b (graphs.rs port
-# rewrite): 51.
+# rewrite): 51. After PR-3.2a (schema.rs moved to proximadb-api): 48.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CEILING="${V2_ROOT_IMPORTS_CEILING:-51}"
+CEILING="${V2_ROOT_IMPORTS_CEILING:-48}"
 DIR="src/network/rest/v2"
 
 count=$(grep -rh "^use crate::" "$DIR"/*.rs 2>/dev/null | wc -l | tr -d ' ')

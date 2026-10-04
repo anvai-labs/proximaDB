@@ -8,6 +8,32 @@
 
 pub use proximadb_api_error::{current_request_id, ApiError as RestError, REQUEST_ID};
 
+/// whenever the request passed through the request-id middleware; quote it in
+/// bug reports.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct ErrorResponse {
+    pub error: ErrorBody,
+}
+
+/// Inner body of [`ErrorResponse`].
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct ErrorBody {
+    /// Stable machine-readable error code (snake_case).
+    #[schema(example = "collection_not_found")]
+    pub r#type: String,
+    pub message: String,
+    /// HTTP status code.
+    pub code: i32,
+    /// Correlation id (matches the X-Request-ID header).
+    pub request_id: Option<String>,
+    /// Optional structured context (e.g. migration hints).
+    #[schema(value_type = Option<Object>)]
+    pub details: Option<serde_json::Value>,
+}
+
+
 /// Result alias for REST handler functions.
 pub type RestResult<T> = Result<T, RestError>;
 

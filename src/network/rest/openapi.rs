@@ -52,35 +52,11 @@ use utoipa::OpenApi;
 use crate::network::rest::v2::{
     collections, documents, entities, graphs, model_registry, query, records, schema, sql,
 };
+pub use proximadb_api::rest::errors::{ErrorBody, ErrorResponse};
 
 /// Canonical ProximaDB error envelope (`{ error: { type, message, code } }`).
 ///
 /// `request_id` (also returned in the `X-Request-ID` response header) is present
-/// whenever the request passed through the request-id middleware; quote it in
-/// bug reports.
-#[derive(utoipa::ToSchema)]
-#[allow(dead_code)]
-pub struct ErrorResponse {
-    pub error: ErrorBody,
-}
-
-/// Inner body of [`ErrorResponse`].
-#[derive(utoipa::ToSchema)]
-#[allow(dead_code)]
-pub struct ErrorBody {
-    /// Stable machine-readable error code (snake_case).
-    #[schema(example = "collection_not_found")]
-    pub r#type: String,
-    pub message: String,
-    /// HTTP status code.
-    pub code: i32,
-    /// Correlation id (matches the X-Request-ID header).
-    pub request_id: Option<String>,
-    /// Optional structured context (e.g. migration hints).
-    #[schema(value_type = Option<Object>)]
-    pub details: Option<Value>,
-}
-
 /// Query facade result. Implementations return records, total_count, metrics,
 /// plan, or diagnostics depending on language and endpoint, so the body is a
 /// free-form JSON object.

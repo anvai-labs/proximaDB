@@ -1,3 +1,10 @@
+//! REST API v2 — collection schema lifecycle (`GET`/`PUT /api/v2/collections/{id}/schema`).
+//!
+//! Moved from the root `src/network/rest/v2/schema.rs` under the ADR-094
+//! REST-tree convergence: port-only state (`RestAppState`), foundation error
+//! envelope, and the collection-schema wire DTOs co-located here (single
+//! source of truth shared with the root collections router via re-export).
+
 /*
  * Copyright 2025 ProximaDB
  *
@@ -40,16 +47,213 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
-use crate::errors::{ApiError, ApiResult};
-use crate::network::middleware::tenant::TenantContext;
-use crate::network::rest::canonical::handlers::AppState;
+use crate::rest::errors::{RestError as ApiError, RestResult as ApiResult};
+use crate::rest::TenantContext;
+use crate::rest::state::RestAppState;
 use proximadb_data_model::ProximaType;
 use proximadb_runtime::{
     CollectionSchemaColumn, CollectionSchemaEnforcement, CollectionSchemaMetadata,
     CollectionSchemaUpdate, CollectionTextStorage,
 };
 
-use super::collections::{ColumnDefinition, SchemaDefinition, parse_rest_data_type};
+
+/// Defines the typed columns and enforcement rules for ProximaRecord support.
+#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
+pub struct SchemaDefinition {
+    /// Column definitions
+    pub columns: Vec<RestColumnDefinition>,
+    /// Schema enforcement mode
+    ///
+    /// - "strict": All columns must match schema exactly
+    /// - "flexible": Schema on read, no validation at insert
+    /// - "hybrid": Core columns enforced, additional fields allowed (default)
+    pub enforcement: Option<String>,
+    /// Allow additional fields not defined in schema
+    ///
+    /// Only applies in "hybrid" mode.
+    /// Default: true
+    pub allow_additional_fields: Option<bool>,
+}
+
+/// Backwards-compat alias for [`RestColumnDefinition`].
+pub type ColumnDefinition = RestColumnDefinition;
+
+/// Column definition for schema
+#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
+pub struct RestColumnDefinition {
+    /// Column name
+    pub name: String,
+    /// Data type
+    ///
+    /// Supported types:
+    /// - "text": Variable-length UTF-8 text
+    /// - "text_large": Large text with sidecar storage
+    /// - "integer": 64-bit signed integer
+    /// - "float": 64-bit floating point
+    /// - "decimal": 128-bit decimal (precision, scale)
+    /// - "boolean": True/false
+    /// - "timestamp": Microseconds since epoch
+    /// - "timestamp_tz": Timestamp with timezone
+    /// - "date": Days since epoch
+    /// - "time": Microseconds since midnight
+    /// - "uuid": RFC 4122 UUID
+    /// - "binary": Raw bytes
+    /// - "json": Validated JSON
+    /// - "array_text", "array_integer", "array_float", "array_boolean"
+    /// - "map_string_string", "map_string_any"
+    /// - "geo_point": Latitude/longitude point
+    /// - "vector": Fixed-dimension vector (specify dimension)
+    pub data_type: String,
+    /// Whether null values are allowed
+    ///
+    /// Default: true
+    pub nullable: Option<bool>,
+    /// Create secondary index for this column
+    ///
+    /// Improves query performance for equality/range filters.
+    /// Default: false
+    pub indexed: Option<bool>,
+    /// Enable filtering on this column
+    ///
+    /// When true, the column can be used in WHERE clauses.
+    /// Default: true for indexed columns, false otherwise
+    pub filterable: Option<bool>,
+    /// Maximum length for TEXT/BINARY columns
+    ///
+    /// Default: no limit
+    pub max_length: Option<u32>,
+    /// Precision for DECIMAL type (1-38)
+    pub precision: Option<u8>,
+    /// Scale for DECIMAL type (0-precision)
+    pub scale: Option<u8>,
+    /// Dimension for VECTOR type
+    pub vector_dimension: Option<u32>,
+}
+
+/// Parse a v2 REST column definition's `data_type` string into the canonical
+/// [`proximadb_data_model::ProximaType`] (ADR-024 Step 5).
+///
+/// This is the SINGLE source for the type vocabulary the v2 collection API
+/// accepts: the accepted set is exactly what maps to a `ProximaType`, rather than
+/// a separate hardcoded allowlist. Type-specific validation (decimal
+/// precision/scale, vector dimension) is performed here so the REST surface and
+/// the catalog/storage layers share one type authority.
+pub fn parse_rest_data_type(
+    column: &RestColumnDefinition,
+) -> Result<proximadb_data_model::ProximaType, ApiError> {
+    use proximadb_data_model::{ProximaType, TimeUnit, VectorElement};
+    let ty = match column.data_type.as_str() {
+        "text" | "text_large" => ProximaType::String,
+        "int8" => ProximaType::Int8,
+        "int16" => ProximaType::Int16,
+        "int32" => ProximaType::Int32,
+        "integer" => ProximaType::Int64,
+        "uint8" => ProximaType::UInt8,
+        "uint16" => ProximaType::UInt16,
+        "uint32" => ProximaType::UInt32,
+        "uint64" => ProximaType::UInt64,
+        "float32" => ProximaType::Float32,
+        "float" => ProximaType::Float64,
+        "decimal" => {
+            let precision = column.precision.ok_or_else(|| {
+                ApiError::InvalidArgument(format!(
+                    "Column '{}' with type 'decimal' requires precision",
+                    column.name
+                ))
+            })?;
+            let scale = column.scale.ok_or_else(|| {
+                ApiError::InvalidArgument(format!(
+                    "Column '{}' with type 'decimal' requires scale",
+                    column.name
+                ))
+            })?;
+            if precision == 0 || precision > 38 {
+                return Err(ApiError::InvalidArgument(format!(
+                    "Column '{}': decimal precision must be between 1 and 38",
+                    column.name
+                )));
+            }
+            if scale > precision {
+                return Err(ApiError::InvalidArgument(format!(
+                    "Column '{}': decimal scale cannot exceed precision",
+                    column.name
+                )));
+            }
+            ProximaType::Decimal { precision, scale }
+        }
+        "boolean" => ProximaType::Boolean,
+        "timestamp" => ProximaType::Timestamp(TimeUnit::Nanosecond),
+        "timestamp_tz" => ProximaType::TimestampTz(TimeUnit::Nanosecond),
+        "date" => ProximaType::Date,
+        "time" => ProximaType::Time(TimeUnit::Nanosecond),
+        "duration" => ProximaType::Duration(TimeUnit::Nanosecond),
+        "interval" => ProximaType::Interval(TimeUnit::Nanosecond),
+        "uuid" => ProximaType::Uuid,
+        "ulid" => ProximaType::ULID,
+        "binary" | "binary_large" => ProximaType::Binary,
+        "json" => ProximaType::Json,
+        "jsonb" => ProximaType::Jsonb,
+        "symbol" => ProximaType::Symbol,
+        "array_text" => ProximaType::Array(Box::new(ProximaType::String)),
+        "array_integer" => ProximaType::Array(Box::new(ProximaType::Int64)),
+        "array_float" => ProximaType::Array(Box::new(ProximaType::Float64)),
+        "array_boolean" => ProximaType::Array(Box::new(ProximaType::Boolean)),
+        "array_uuid" => ProximaType::Array(Box::new(ProximaType::Uuid)),
+        "array_any" => ProximaType::Array(Box::new(ProximaType::Json)),
+        "map_string_string" => ProximaType::Map {
+            key: Box::new(ProximaType::String),
+            value: Box::new(ProximaType::String),
+        },
+        "map_string_any" => ProximaType::Map {
+            key: Box::new(ProximaType::String),
+            value: Box::new(ProximaType::Json),
+        },
+        "map_string_integer" => ProximaType::Map {
+            key: Box::new(ProximaType::String),
+            value: Box::new(ProximaType::Int64),
+        },
+        "map_string_float" => ProximaType::Map {
+            key: Box::new(ProximaType::String),
+            value: Box::new(ProximaType::Float64),
+        },
+        "struct" => ProximaType::Struct { fields: Vec::new() },
+        "geo_point" => ProximaType::Point,
+        "geo_polygon" => ProximaType::GeographyPoint,
+        "vector" => {
+            let dim = column.vector_dimension.ok_or_else(|| {
+                ApiError::InvalidArgument(format!(
+                    "Column '{}' with type 'vector' requires vector_dimension",
+                    column.name
+                ))
+            })? as usize;
+            ProximaType::DenseVector {
+                element: VectorElement::Float32,
+                dim,
+            }
+        }
+        "sparse_vector" => ProximaType::SparseVector {
+            element: VectorElement::Float32,
+        },
+        "binary_vector" => {
+            let dim = column.vector_dimension.ok_or_else(|| {
+                ApiError::InvalidArgument(format!(
+                    "Column '{}' with type 'binary_vector' requires vector_dimension",
+                    column.name
+                ))
+            })? as usize;
+            ProximaType::BinaryVector { dim }
+        }
+        other => {
+            return Err(ApiError::InvalidArgument(format!(
+                "Invalid data type '{}' for column '{}'",
+                other, column.name
+            )));
+        }
+    };
+    Ok(ty)
+}
+
+
 
 /// Schema response with metadata
 #[derive(Debug, Serialize, ToSchema)]
@@ -97,13 +301,13 @@ pub struct SchemaResponse {
     ),
     responses(
         (status = 200, description = "Collection schema.", body = SchemaResponse),
-        (status = 404, description = "Resource not found.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 404, description = "Resource not found.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn get_schema(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
 ) -> ApiResult<Json<SchemaResponse>> {
     debug!("V2 API: Getting schema for collection '{}'", collection_id);
 
@@ -114,7 +318,7 @@ pub async fn get_schema(
     }
 
     let metadata = state
-        .api_handlers
+        .handlers
         .get_collection_schema_metadata(&collection_id, Some(&tenant.tenant_id))
         .await
         .map_err(|e| {
@@ -269,13 +473,13 @@ pub struct SchemaChange {
     request_body = UpdateSchemaRequest,
     responses(
         (status = 200, description = "Schema updated.", body = UpdateSchemaResponse),
-        (status = 400, description = "Invalid request.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 400, description = "Invalid request.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn update_schema(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
     Json(request): Json<UpdateSchemaRequest>,
 ) -> ApiResult<Json<UpdateSchemaResponse>> {
     info!("V2 API: Updating schema for collection '{}'", collection_id);
@@ -318,7 +522,7 @@ pub async fn update_schema(
     }
 
     let existing_metadata = state
-        .api_handlers
+        .handlers
         .get_collection_schema_metadata(&collection_id, Some(&tenant.tenant_id))
         .await
         .map_err(|e| {
@@ -479,7 +683,7 @@ pub async fn update_schema(
     )?;
 
     state
-        .api_handlers
+        .handlers
         .update_collection_schema_metadata(&collection_id, update, Some(&tenant.tenant_id))
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to update collection schema: {}", e)))?;
@@ -655,7 +859,7 @@ fn rest_data_type_from_proxima(
 
 /// Map a REST schema-enforcement string to the proto `SchemaEnforcement`
 /// discriminant (1=strict, 2=flexible, 3=hybrid; default hybrid).
-pub(crate) fn enforcement_value(enforcement: Option<&str>) -> i32 {
+pub fn enforcement_value(enforcement: Option<&str>) -> i32 {
     match enforcement {
         Some("strict") => 1,
         Some("flexible") => 2,
@@ -668,8 +872,8 @@ pub(crate) fn enforcement_value(enforcement: Option<&str>) -> i32 {
 /// supports_range)` pair, or `None` for text / structured / array types that are
 /// not metadata-filterable scalar columns (text → `text_columns`). Inverse:
 /// [`filterable_type_to_rest`].
-pub(crate) fn rest_scalar_filterable_type(data_type: &str) -> Option<(i32, bool)> {
-    use crate::proto::proximadb_v1::FilterableDataType as F;
+pub fn rest_scalar_filterable_type(data_type: &str) -> Option<(i32, bool)> {
+    use proximadb_proto::proximadb_v1::FilterableDataType as F;
     let (ty, supports_range) = match data_type {
         "integer" => (F::FilterableInteger, true),
         "float" => (F::FilterableFloat, true),
@@ -687,8 +891,8 @@ pub(crate) fn rest_scalar_filterable_type(data_type: &str) -> Option<(i32, bool)
 
 /// Inverse of [`rest_scalar_filterable_type`]: a `FilterableDataType`
 /// discriminant back to its REST `data_type` label (for the GET schema view).
-pub(crate) fn filterable_type_to_rest(v: i32) -> &'static str {
-    use crate::proto::proximadb_v1::FilterableDataType as F;
+pub fn filterable_type_to_rest(v: i32) -> &'static str {
+    use proximadb_proto::proximadb_v1::FilterableDataType as F;
     match F::try_from(v) {
         Ok(F::FilterableInteger) => "integer",
         Ok(F::FilterableFloat) => "float",
@@ -711,8 +915,8 @@ pub(crate) fn filterable_type_to_rest(v: i32) -> &'static str {
 ///
 /// Shared by the create-collection and update-schema paths so both persist the
 /// same shape (the inverse of [`build_existing_schema`]).
-pub(crate) fn apply_schema_definition(
-    config: &mut crate::proto::proximadb_v1::CollectionConfig,
+pub fn apply_schema_definition(
+    config: &mut proximadb_proto::proximadb_v1::CollectionConfig,
     schema: &SchemaDefinition,
     schema_id: String,
     schema_version: String,
@@ -737,20 +941,20 @@ pub(crate) fn apply_schema_definition(
     // indexed_fields reflects them. Gap A: filterable short `text` joins them as
     // `FilterableString` (equality-only; hashes are unordered so `supports_range`
     // is false).
-    let filterable_columns: Vec<crate::proto::proximadb_v1::FilterableColumnSpec> = schema
+    let filterable_columns: Vec<proximadb_proto::proximadb_v1::FilterableColumnSpec> = schema
         .columns
         .iter()
         .filter(|c| c.filterable != Some(false))
         .filter_map(|c| {
             let (data_type, supports_range) = if c.data_type == "text" {
                 (
-                    crate::proto::proximadb_v1::FilterableDataType::FilterableString as i32,
+                    proximadb_proto::proximadb_v1::FilterableDataType::FilterableString as i32,
                     false,
                 )
             } else {
                 rest_scalar_filterable_type(&c.data_type)?
             };
-            Some(crate::proto::proximadb_v1::FilterableColumnSpec {
+            Some(proximadb_proto::proximadb_v1::FilterableColumnSpec {
                 name: c.name.clone(),
                 data_type,
                 indexed: c.indexed.unwrap_or(false),
@@ -760,11 +964,11 @@ pub(crate) fn apply_schema_definition(
         })
         .collect();
 
-    let text_storage_configs: Vec<crate::proto::proximadb_v1::TextStorageConfig> = schema
+    let text_storage_configs: Vec<proximadb_proto::proximadb_v1::TextStorageConfig> = schema
         .columns
         .iter()
         .filter(|c| c.data_type == "text_large")
-        .map(|c| crate::proto::proximadb_v1::TextStorageConfig {
+        .map(|c| proximadb_proto::proximadb_v1::TextStorageConfig {
             column_name: c.name.clone(),
             strategy: 1, // TextStorage::Chunked
             inline_threshold: 4096,
@@ -774,7 +978,7 @@ pub(crate) fn apply_schema_definition(
         })
         .collect();
 
-    config.record_schema = Some(crate::proto::proximadb_v1::RecordSchemaConfig {
+    config.record_schema = Some(proximadb_proto::proximadb_v1::RecordSchemaConfig {
         schema_id,
         schema_version,
         enforcement: enforcement_value(schema.enforcement.as_deref()),
@@ -788,8 +992,8 @@ pub(crate) fn apply_schema_definition(
 }
 
 /// Build existing schema from collection config
-pub(crate) fn build_existing_schema(
-    config: &crate::proto::proximadb_v1::CollectionConfig,
+pub fn build_existing_schema(
+    config: &proximadb_proto::proximadb_v1::CollectionConfig,
 ) -> Option<SchemaDefinition> {
     // If ProximaRecord is not enabled or no schema config, return None
     if !config.enable_proxima_record.unwrap_or(false) && config.record_schema.is_none() {
@@ -1257,7 +1461,7 @@ mod tests {
 
     #[test]
     fn test_build_existing_schema_no_proxima_record() {
-        let config = crate::proto::proximadb_v1::CollectionConfig {
+        let config = proximadb_proto::proximadb_v1::CollectionConfig {
             enable_proxima_record: Some(false),
             record_schema: None,
             ..Default::default()
@@ -1268,7 +1472,7 @@ mod tests {
 
     #[test]
     fn test_build_existing_schema_with_text_columns() {
-        let config = crate::proto::proximadb_v1::CollectionConfig {
+        let config = proximadb_proto::proximadb_v1::CollectionConfig {
             enable_proxima_record: Some(true),
             text_columns: vec!["title".to_string(), "body".to_string()],
             record_schema: None,
@@ -1285,7 +1489,7 @@ mod tests {
 
     #[test]
     fn apply_schema_definition_populates_typed_filterable_columns() {
-        use crate::proto::proximadb_v1::FilterableDataType as F;
+        use proximadb_proto::proximadb_v1::FilterableDataType as F;
         let schema = SchemaDefinition {
             columns: vec![
                 // TD-FPRUNE-1 Gap A: filterable short `text` (partition/lang-style
@@ -1330,7 +1534,7 @@ mod tests {
             enforcement: Some("strict".to_string()),
             allow_additional_fields: Some(false),
         };
-        let mut config = crate::proto::proximadb_v1::CollectionConfig::default();
+        let mut config = proximadb_proto::proximadb_v1::CollectionConfig::default();
         apply_schema_definition(&mut config, &schema, "s".to_string(), "1.0.0".to_string());
 
         // text_large + non-filterable text → text_columns (not shredded).
@@ -1370,7 +1574,7 @@ mod tests {
 
     #[test]
     fn build_existing_schema_round_trips_filterable_scalar_columns() {
-        use crate::proto::proximadb_v1::{FilterableColumnSpec, FilterableDataType as F};
+        use proximadb_proto::proximadb_v1::{FilterableColumnSpec, FilterableDataType as F};
 
         let schema = SchemaDefinition {
             columns: vec![
@@ -1396,7 +1600,7 @@ mod tests {
             enforcement: Some("hybrid".to_string()),
             allow_additional_fields: Some(true),
         };
-        let mut config = crate::proto::proximadb_v1::CollectionConfig::default();
+        let mut config = proximadb_proto::proximadb_v1::CollectionConfig::default();
         apply_schema_definition(
             &mut config,
             &schema,
@@ -1422,7 +1626,7 @@ mod tests {
         assert!(names_and_types.contains(&("price", "float", Some(true), Some(true))));
         assert!(names_and_types.contains(&("created_on", "date", Some(false), Some(true))));
 
-        let mut legacy_config = crate::proto::proximadb_v1::CollectionConfig {
+        let mut legacy_config = proximadb_proto::proximadb_v1::CollectionConfig {
             enable_proxima_record: Some(true),
             filterable_columns: vec![FilterableColumnSpec {
                 name: "score".to_string(),
@@ -1433,7 +1637,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        legacy_config.record_schema = Some(crate::proto::proximadb_v1::RecordSchemaConfig {
+        legacy_config.record_schema = Some(proximadb_proto::proximadb_v1::RecordSchemaConfig {
             schema_id: "legacy".to_string(),
             schema_version: "1.0.0".to_string(),
             enforcement: 3,
@@ -1466,9 +1670,9 @@ mod tests {
 
     #[test]
     fn test_build_existing_schema_with_record_schema_enforcement() {
-        let config = crate::proto::proximadb_v1::CollectionConfig {
+        let config = proximadb_proto::proximadb_v1::CollectionConfig {
             enable_proxima_record: Some(true),
-            record_schema: Some(crate::proto::proximadb_v1::RecordSchemaConfig {
+            record_schema: Some(proximadb_proto::proximadb_v1::RecordSchemaConfig {
                 schema_id: "s1".to_string(),
                 schema_version: "1.0.0".to_string(),
                 enforcement: 1, // strict
@@ -1488,9 +1692,9 @@ mod tests {
     fn test_build_existing_schema_enforcement_mapping() {
         // Test all enforcement values
         for (value, expected) in [(1, "strict"), (2, "flexible"), (3, "hybrid"), (0, "hybrid")] {
-            let config = crate::proto::proximadb_v1::CollectionConfig {
+            let config = proximadb_proto::proximadb_v1::CollectionConfig {
                 enable_proxima_record: Some(true),
-                record_schema: Some(crate::proto::proximadb_v1::RecordSchemaConfig {
+                record_schema: Some(proximadb_proto::proximadb_v1::RecordSchemaConfig {
                     enforcement: value,
                     auto_evolve: true,
                     ..Default::default()
@@ -1509,10 +1713,10 @@ mod tests {
 
     #[test]
     fn test_build_existing_schema_text_storage_configs() {
-        let config = crate::proto::proximadb_v1::CollectionConfig {
+        let config = proximadb_proto::proximadb_v1::CollectionConfig {
             enable_proxima_record: Some(true),
             text_columns: vec!["summary".to_string()],
-            text_storage_configs: vec![crate::proto::proximadb_v1::TextStorageConfig {
+            text_storage_configs: vec![proximadb_proto::proximadb_v1::TextStorageConfig {
                 column_name: "full_text".to_string(),
                 chunk_size: 1024,
                 ..Default::default()
@@ -1536,10 +1740,10 @@ mod tests {
     fn test_build_existing_schema_deduplicates_columns() {
         // If a column appears in both text_columns and text_storage_configs,
         // it should not be duplicated
-        let config = crate::proto::proximadb_v1::CollectionConfig {
+        let config = proximadb_proto::proximadb_v1::CollectionConfig {
             enable_proxima_record: Some(true),
             text_columns: vec!["content".to_string()],
-            text_storage_configs: vec![crate::proto::proximadb_v1::TextStorageConfig {
+            text_storage_configs: vec![proximadb_proto::proximadb_v1::TextStorageConfig {
                 column_name: "content".to_string(),
                 chunk_size: 512,
                 ..Default::default()
