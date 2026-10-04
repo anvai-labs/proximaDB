@@ -1,0 +1,102 @@
+= Codegraph coupling & cohesion diagnostics — 2026-10-04
+:toc: left
+
+Victor codegraph (Victor v0.10.0, CCG) over the full workspace: 3,704 files
+indexed → 67,574 file-level code edges (CALLS / IMPORTS / IMPLEMENTS /
+INHERITS / COMPOSITION; statement nodes excluded; name-resolution heuristics
+apply — read as relative indicators, not exact counts).
+
+Evidence file: `codegraph-edges-2026-10-04.tsv` (source-file, target-file,
+edge-type). Regenerate: `victor index graph index -p . --ccg` →
+`victor index graph export -p . -f json -o /tmp/g.json` → extract triples.
+
+== Top coupling hotspots (fan-out: unique external callees)
+
+[cols="1,3,1"]
+|===
+| fan-out | file | module
+| 65 | src/storage/engines/raptor/engine.rs | engines (experimental, ADR-093 adjacent)
+| 55 | src/query/execution/native_engine.rs | query (ADR-054 native cutover)
+| 50 | src/storage/engines/sst/tests/cross_format_interop_benchmark.rs | engines test
+| 48 | src/storage/formats/open/iceberg.rs | storage formats
+| 47 | src/storage/formats/open/delta.rs | storage formats
+| 44 | src/network/arrow_ipc/file_export.rs | network (Arrow Flight)
+| 43 | src/storage/engines/tst/mod.rs | engines
+| 42 | crates/horizontal/proximadb-codec/src/simd/simd.rs | horizontal codec
+| 40 | src/storage/persistence/write_ahead_log/disk_manager.rs | WAL
+| 38 | src/core/search/integrated_search_optimization.rs | src/core (un-extracted common)
+|===
+
+== Top blast radius (fan-in: unique external callers)
+
+[cols="1,3,1"]
+|===
+| fan-in | file | note
+| 564 | src/services/advisor_observations.rs | *not in any decomposition slice* — biggest hidden hub; split or scope-rename
+| 271 | src/proto/mod.rs | re-export hub; thins naturally as v1 usage ratchets down
+| 270 | src/storage/compute_bridge/global_cache.rs | hidden compute-bridge hub
+| 257 | crates/storage/proximadb-raptor-common/src/lib.rs | raptor-adjacent
+| 253 | crates/modalities/proximadb-rank-core/src/arena.rs | rank arena
+| 253 | src/storage/cache/backend/memory_tier.rs | cache backend
+| 188 | src/storage/persistence/mod.rs | WAL persistence hub
+| 164 | crates/foundation/proximadb-records/src/lib.rs | foundation (expected wide)
+|===
+
+== Cross-module coupling matrix (top edges)
+
+* `src/storage/engines → src/storage` 639 · `src/storage → src/services` 209 ·
+  `src/storage/engines → src/services` 185 (Slice D/E: engines still wired to
+  services layer — port inversion pending, matches ADR-094 Phase 2)
+* `crates/horizontal/proximadb-codec → src/storage` 182 — *horizontal crate
+  calling the root monolith*: upward edge; block-format's codec pull is the
+  same family (PR-1.3 deferred)
+* `src/storage/engines → clients` 379 and `src/storage → clients` 199 —
+  inversion-smell edges (likely name-resolution artifacts + shared test
+  helpers); audit before treating as real
+* `src/network` cohesion **1%** (7 internal / 644 out) — confirms the pure-
+  facade doctrine; nothing to extract, everything to thin
+
+== Cohesion ranking (modules ≥200 edges)
+
+[cols="2,1,1,1"]
+|===
+| module | internal | cross-out | cohesion
+| src/network | 7 | 644 | 1% (pure facade — correct)
+| crates/storage/proximadb-storage-common | 22 | 386 | 5% (mini-god-crate)
+| src/metrics | 15 | 209 | 7%
+| src/core | 69 | 386 | 15% (un-extracted common)
+| crates/platform/proximadb-runtime | 36 | 169 | 18% (port crate — thin by design)
+| src/services | 90 | 374 | 19%
+| src/graph | 53 | 192 | 22%
+| src/observability | 97 | 322 | 23%
+| crates/control/proximadb-metrics | 47 | 159 | 23%
+| src/index | 162 | 486 | 25%
+| src/query | 298 | 719 | 29%
+| src/storage | 646 | 1,374 | 32%
+| src/storage/engines | 1,874 | 3,244 | 37%
+| src/datafusion | 183 | 182 | 50%
+| crates/horizontal/proximadb-codec | 469 | 461 | 50%
+|===
+
+== How to address (multimodal / database / large-codebase practice)
+
+. *Hidden hubs first*: `advisor_observations.rs` (fan-in 564, absent from every
+  slice) and `compute_bridge/global_cache.rs` (270) are higher-leverage than
+  any named slice — audit, split, or convert to ports before Phase 3 moves.
+. *Multimodal*: the fusion surface is already single-port-shaped
+  (`FusionService` consumed by graphs/hybrid/entities) — formalize it as
+  `FusionSearchPort` in `proximadb-runtime` (ADR-094 PR-3.1b) so multimodal
+  stops reaching concrete services, and move the fusion params types
+  (`crate::core::search::{cross_modal_fusion, fusion_route}`) to a query
+  contract crate.
+. *Database core*: `src/storage/engines → src/services` (185 edges) is the
+  exact Slice-D remainder — finishing `IndexPort` + engine injection converts
+  the largest cross-layer fan in the codebase.
+. *Extreme-engineering ratchets*: adopt the storage-up-edges pattern for
+  per-FILE fan-out ceilings (top table above gives the starting ceilings),
+  wire `check_v2_root_imports.sh`-style count ratchets for the low-cohesion
+  hubs (`src/core`, `src/services`), and add a periodic codegraph export +
+  coupling-diff to CI so regressions in this table become visible PR-over-PR.
+. *Engine thinning*: raptor (fan-out 65, experimental, ADR-093-family) —
+  isolate behind its feature gate and schedule retirement review; do not let
+  the highest-coupled file in the repo be an experimental engine.
