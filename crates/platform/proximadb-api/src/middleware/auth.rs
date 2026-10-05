@@ -64,3 +64,4 @@ mod tests {
         assert!(!middleware.config.enable_api_key);
     }
 }
+

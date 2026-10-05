@@ -26,6 +26,7 @@ pub mod record_search_port;
 pub mod resources;
 pub mod rich_record;
 pub mod rich_search;
+pub use write_routing_port::{RecallProbePort, WriteRoutingDecision, WriteRoutingPort};
 pub use fusion_search_port::{
     DocumentFusionSpec, FusionOidKey, FusionRoutePolicy, FusionSearchPort, FusionSearchResult,
     GraphFusionRequest, GraphGrain,
@@ -33,6 +34,7 @@ pub use fusion_search_port::{
 pub mod security_port;
 pub mod service_ports;
 pub mod streaming_port;
+pub mod write_routing_port;
 pub mod unified_query_port;
 
 // Re-exports

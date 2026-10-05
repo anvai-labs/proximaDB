@@ -974,6 +974,67 @@ impl proximadb_runtime::RecordOpsPort for RecordOpsService {
         )
         .await
     }
+
+    // ── ADR-094: the REST v2 handler surface (records.rs consumers). The
+    // inherent methods win method resolution over the trait methods, so these
+    // are pure delegations, not recursion. ──
+
+    async fn handle_record_batch_for_tenant(
+        &self,
+        request: RichRecordBatchRequest,
+        tenant_id: Option<&str>,
+    ) -> Result<BatchOperationResult> {
+        RecordOpsService::handle_record_batch_for_tenant(self, request, tenant_id).await
+    }
+
+    async fn handle_record_delete_batch_for_tenant(
+        &self,
+        request: RichRecordDeleteBatchRequest,
+        tenant_id: Option<&str>,
+    ) -> Result<BatchOperationResult> {
+        RecordOpsService::handle_record_delete_batch_for_tenant(self, request, tenant_id).await
+    }
+
+    async fn handle_record_get_for_tenant(
+        &self,
+        request: RichRecordGetRequest,
+        identity: proximadb_runtime::PortIdentity<'_>,
+    ) -> Result<RichRecordGetResponse> {
+        RecordOpsService::handle_record_get_for_tenant(self, request, identity).await
+    }
+
+    async fn handle_record_scan_paginated_for_tenant(
+        &self,
+        collection_id: &str,
+        cursor: Option<&ScanCursor>,
+        limit: usize,
+        include_vector: bool,
+        include_props: bool,
+        tenant_id: Option<&str>,
+        filter: Option<&FilterExpression>,
+        now_ns: i64,
+    ) -> Result<(Vec<proximadb_records::ProximaRecord>, Option<ScanCursor>)> {
+        RecordOpsService::handle_record_scan_paginated_for_tenant(
+            self,
+            collection_id,
+            cursor,
+            limit,
+            include_vector,
+            include_props,
+            tenant_id,
+            filter,
+            now_ns,
+        )
+        .await
+    }
+
+    async fn handle_record_search_for_tenant(
+        &self,
+        request: RichSearchRequest,
+        identity: proximadb_runtime::PortIdentity<'_>,
+    ) -> Result<RichSearchResponse> {
+        RecordOpsService::handle_record_search_for_tenant(self, request, identity).await
+    }
 }
 
 // TD-FLIGHT-1: canonical v2 search read port. The Arrow Flight search surfaces

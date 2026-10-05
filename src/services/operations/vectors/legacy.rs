@@ -255,77 +255,7 @@ pub type RichRecordGetResponse = Option<RichSearchResult>;
 pub(crate) fn rich_filters_to_filter_expression(
     filters: &[RichFilterCondition],
 ) -> Option<FilterExpression> {
-    use crate::core::search::ComparisonOperator;
-
-    let mut conditions: Vec<FilterExpression> = Vec::new();
-    for filter in filters {
-        let field = filter.field.clone();
-        match filter.operator {
-            RichFilterOperator::Between => {
-                conditions.push(FilterExpression::Comparison {
-                    field: field.clone(),
-                    operator: ComparisonOperator::GreaterThanOrEqual,
-                    value: proxima_value_to_filter_literal(&filter.value),
-                });
-                if let Some(upper) = &filter.value_upper {
-                    conditions.push(FilterExpression::Comparison {
-                        field,
-                        operator: ComparisonOperator::LessThanOrEqual,
-                        value: proxima_value_to_filter_literal(upper),
-                    });
-                }
-            }
-            RichFilterOperator::In | RichFilterOperator::NotIn => {
-                let values = if filter.value_list.is_empty() {
-                    match &filter.value {
-                        proximadb_data_model::ProximaValue::Array(values) => values.clone(),
-                        value => vec![value.clone()],
-                    }
-                } else {
-                    filter.value_list.clone()
-                };
-                let array = serde_json::Value::Array(
-                    values.iter().map(proxima_value_to_filter_literal).collect(),
-                );
-                conditions.push(FilterExpression::Comparison {
-                    field,
-                    operator: if matches!(filter.operator, RichFilterOperator::In) {
-                        ComparisonOperator::In
-                    } else {
-                        ComparisonOperator::NotIn
-                    },
-                    value: array,
-                });
-            }
-            operator => {
-                let operator = match operator {
-                    RichFilterOperator::Eq => ComparisonOperator::Equals,
-                    RichFilterOperator::Ne => ComparisonOperator::NotEquals,
-                    RichFilterOperator::Gt => ComparisonOperator::GreaterThan,
-                    RichFilterOperator::Gte => ComparisonOperator::GreaterThanOrEqual,
-                    RichFilterOperator::Lt => ComparisonOperator::LessThan,
-                    RichFilterOperator::Lte => ComparisonOperator::LessThanOrEqual,
-                    RichFilterOperator::Contains => ComparisonOperator::Contains,
-                    RichFilterOperator::StartsWith => ComparisonOperator::StartsWith,
-                    RichFilterOperator::EndsWith => ComparisonOperator::EndsWith,
-                    RichFilterOperator::Between
-                    | RichFilterOperator::In
-                    | RichFilterOperator::NotIn => unreachable!("handled above"),
-                };
-                conditions.push(FilterExpression::Comparison {
-                    field,
-                    operator,
-                    value: proxima_value_to_filter_literal(&filter.value),
-                });
-            }
-        }
-    }
-
-    match conditions.len() {
-        0 => None,
-        1 => conditions.into_iter().next(),
-        _ => Some(FilterExpression::And(conditions)),
-    }
+    proximadb_runtime::rich_search::rich_filters_to_filter_expression(filters)
 }
 
 /// Thin alias to the centralized

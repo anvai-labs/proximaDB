@@ -786,7 +786,7 @@ impl ProximaFlightService {
             capability: resolved
                 .user_context
                 .as_ref()
-                .and_then(DataPlaneCapability::from_user_context),
+                .and_then(crate::network::auth::middleware::data_plane_capability_from_user_context),
         })
     }
 

@@ -20,6 +20,7 @@ use crate::network::auth::{
     AuthError, AuthResult, AuthService, Permission, PermissionContext, ResourceType,
 };
 use crate::network::tls::ClientCertificateInfo;
+pub use proximadb_runtime::service_ports::DataPlaneCapability;
 use crate::security::{AuthenticationData, SecurityCoordinator, UnifiedUserContext};
 use axum::{
     extract::{Request, State},
@@ -30,6 +31,39 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// ADR-094: free function (the struct moved to `proximadb-runtime`; an
+/// inherent method on it cannot be declared here once it left the crate).
+pub fn data_plane_capability_from_user_context(
+    user_context: &UnifiedUserContext,
+) -> Option<DataPlaneCapability> {
+    let capability_type = user_context.metadata.get("capability_type")?.clone();
+    Some(DataPlaneCapability {
+        capability_type,
+        collection: user_context.metadata.get("collection").cloned(),
+        operation: user_context.metadata.get("operation").cloned(),
+        protocol: user_context.metadata.get("protocol").cloned(),
+        mode: user_context.metadata.get("mode").cloned(),
+        scopes: user_context
+            .metadata
+            .get("scopes")
+            .map(|scopes| {
+                scopes
+                    .split_whitespace()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        max_records: user_context
+            .metadata
+            .get("max_records")
+            .and_then(|value| value.parse::<u64>().ok()),
+        max_bytes: user_context
+            .metadata
+            .get("max_bytes")
+            .and_then(|value| value.parse::<u64>().ok()),
+    })
+}
 
 /// Authentication middleware state
 pub struct AuthMiddlewareState {
@@ -53,64 +87,7 @@ pub struct AuthErrorResponse {
 /// This keeps ProximaDB generic: an external control plane can issue scoped
 /// route tokens, while ProximaDB only validates transport, collection,
 /// operation, byte, and record limits from additive JWT claims.
-#[derive(Debug, Clone)]
-pub struct DataPlaneCapability {
-    pub capability_type: String,
-    pub collection: Option<String>,
-    pub operation: Option<String>,
-    pub protocol: Option<String>,
-    pub mode: Option<String>,
-    pub scopes: Vec<String>,
-    pub max_records: Option<u64>,
-    pub max_bytes: Option<u64>,
-}
 
-impl DataPlaneCapability {
-    pub fn from_user_context(user_context: &UnifiedUserContext) -> Option<Self> {
-        let capability_type = user_context.metadata.get("capability_type")?.clone();
-        Some(Self {
-            capability_type,
-            collection: user_context.metadata.get("collection").cloned(),
-            operation: user_context.metadata.get("operation").cloned(),
-            protocol: user_context.metadata.get("protocol").cloned(),
-            mode: user_context.metadata.get("mode").cloned(),
-            scopes: user_context
-                .metadata
-                .get("scopes")
-                .map(|scopes| {
-                    scopes
-                        .split_whitespace()
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-            max_records: user_context
-                .metadata
-                .get("max_records")
-                .and_then(|value| value.parse::<u64>().ok()),
-            max_bytes: user_context
-                .metadata
-                .get("max_bytes")
-                .and_then(|value| value.parse::<u64>().ok()),
-        })
-    }
-
-    pub fn ensure_record_count(&self, count: usize) -> Result<(), String> {
-        if let Some(max_records) = self.max_records
-            && count as u64 > max_records
-        {
-            return Err(format!(
-                "Request has {} records, exceeding capability limit {}",
-                count, max_records
-            ));
-        }
-        Ok(())
-    }
-
-    fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|candidate| candidate == scope)
-    }
-}
 
 /// Unified auth middleware using SecurityCoordinator
 pub async fn auth_middleware_unified(
@@ -141,7 +118,7 @@ pub async fn auth_middleware_unified(
             )
         })?;
 
-    if let Some(capability) = DataPlaneCapability::from_user_context(&user_context) {
+    if let Some(capability) = data_plane_capability_from_user_context(&user_context) {
         validate_rest_data_plane_capability(&capability, &request)?;
         request.extensions_mut().insert(capability);
     }
@@ -1512,3 +1489,4 @@ mod tests {
         }
     }
 }
+

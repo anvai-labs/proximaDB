@@ -25,6 +25,7 @@ proximadb-query = { path = "../../query/proximadb-query" }
 proximadb-query-filter = { path = "../../query/proximadb-query-filter" }
 proximadb-records = { path = "../../foundation/proximadb-records" }
 proximadb-runtime = { path = "../proximadb-runtime" }
+proximadb-write-intent = { path = "../../horizontal/proximadb-write-intent" }
 prost-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

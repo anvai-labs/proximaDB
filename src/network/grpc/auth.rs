@@ -218,7 +218,7 @@ pub async fn authenticate_http_request<B>(
         .await
         .map_err(|error| Status::unauthenticated(format!("authentication failed: {error}")))?;
 
-    let capability = DataPlaneCapability::from_user_context(&user_context);
+    let capability = crate::network::auth::middleware::data_plane_capability_from_user_context(&user_context);
     if let Some(capability) = capability.as_ref() {
         validate_capability_for_grpc_path(capability, path)?;
         validate_tenant_metadata(&user_context, request.headers())?;
@@ -934,7 +934,7 @@ mod tests {
             ]),
         };
         let capability =
-            DataPlaneCapability::from_user_context(&user_context).expect("capability should parse");
+            crate::network::auth::middleware::data_plane_capability_from_user_context(&user_context).expect("capability should parse");
 
         validate_data_plane_capability(&capability, "ingest", "example_knowledge", 2, Some(100))
             .expect("matching request should pass");

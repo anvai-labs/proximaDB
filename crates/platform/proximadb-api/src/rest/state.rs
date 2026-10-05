@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use proximadb_runtime::ApiHandlersPort;
+use proximadb_runtime::{ApiHandlersPort, RecallProbePort, WriteRoutingPort};
 
 /// Tenant context extracted from request headers/JWT and injected as an Axum Extension.
 ///
@@ -49,11 +49,32 @@ impl TenantContext {
 pub struct RestAppState {
     /// Primary API port — collection, vector, hybrid, and SQL operations.
     pub handlers: Arc<dyn ApiHandlersPort>,
+    /// Primary-pod write-routing gate. `None` ⇒ single-node: writes allowed
+    /// unconditionally (ADR-084 — the registry is a multi-node affordance).
+    pub write_routing: Option<Arc<dyn WriteRoutingPort>>,
+    /// Recall-probe gate (experimental AXIS diagnostics). `None` ⇒ closed.
+    pub recall_probe: Option<Arc<dyn RecallProbePort>>,
 }
 
 impl RestAppState {
     pub fn new(handlers: Arc<dyn ApiHandlersPort>) -> Self {
-        Self { handlers }
+        Self {
+            handlers,
+            write_routing: None,
+            recall_probe: None,
+        }
+    }
+
+    /// Wire the primary-pod write-routing gate (multi-node deployments).
+    pub fn with_write_routing(mut self, gate: Arc<dyn WriteRoutingPort>) -> Self {
+        self.write_routing = Some(gate);
+        self
+    }
+
+    /// Wire the recall-probe gate (experimental AXIS diagnostics).
+    pub fn with_recall_probe(mut self, gate: Arc<dyn RecallProbePort>) -> Self {
+        self.recall_probe = Some(gate);
+        self
     }
 }
 

@@ -332,3 +332,62 @@ pub trait QueryAdapterPort: Send + Sync {
         identity: PortIdentity<'_>,
     ) -> Result<SqlExecutionResult>;
 }
+
+// ============================================================================
+// Data-plane capability (auth contract)
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct DataPlaneCapability {
+    pub capability_type: String,
+    pub collection: Option<String>,
+    pub operation: Option<String>,
+    pub protocol: Option<String>,
+    pub mode: Option<String>,
+    pub scopes: Vec<String>,
+    pub max_records: Option<u64>,
+    pub max_bytes: Option<u64>,
+}
+
+impl DataPlaneCapability {
+    /// Build from a metadata map (ADR-094: the root middleware adapts its
+    /// `UnifiedUserContext` to this call — the struct lives here so every
+    /// transport shares one capability type).
+    pub fn from_metadata(metadata: &std::collections::HashMap<String, String>) -> Option<Self> {
+        let capability_type = metadata.get("capability_type")?.clone();
+        Some(Self {
+            capability_type,
+            collection: metadata.get("collection").cloned(),
+            operation: metadata.get("operation").cloned(),
+            protocol: metadata.get("protocol").cloned(),
+            mode: metadata.get("mode").cloned(),
+            scopes: metadata
+                .get("scopes")
+                .map(|scopes| {
+                    scopes
+                        .split_whitespace()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            max_records: metadata.get("max_records").and_then(|value| value.parse::<u64>().ok()),
+            max_bytes: metadata.get("max_bytes").and_then(|value| value.parse::<u64>().ok()),
+        })
+    }
+
+    pub fn ensure_record_count(&self, count: usize) -> Result<(), String> {
+        if let Some(max_records) = self.max_records
+            && count as u64 > max_records
+        {
+            return Err(format!(
+                "Request has {} records, exceeding capability limit {}",
+                count, max_records
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|candidate| candidate == scope)
+    }
+}

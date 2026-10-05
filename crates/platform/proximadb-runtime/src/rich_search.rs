@@ -11,7 +11,9 @@
 use std::collections::HashMap;
 
 use proximadb_data_model::ProximaValue;
+use proximadb_filter_expression::FilterExpression;
 use proximadb_search_types::PredicateShortfall;
+use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
 
 /// Canonical rich search request for v2 and internal callers.
 #[derive(Debug, Clone)]
@@ -74,3 +76,83 @@ pub enum RichFilterOperator {
     StartsWith,
     EndsWith,
 }
+
+/// Lower rich filter conditions to the canonical [`FilterExpression`] — the
+/// single lowering shared by v2 REST handlers and internal callers (ADR-094:
+/// moved here so the converged handlers are root-independent).
+pub fn rich_filters_to_filter_expression(
+    filters: &[RichFilterCondition],
+) -> Option<FilterExpression> {
+    use proximadb_filter_expression::ComparisonOperator;
+
+    let mut conditions: Vec<FilterExpression> = Vec::new();
+    for filter in filters {
+        let field = filter.field.clone();
+        match filter.operator {
+            RichFilterOperator::Between => {
+                conditions.push(FilterExpression::Comparison {
+                    field: field.clone(),
+                    operator: ComparisonOperator::GreaterThanOrEqual,
+                    value: proxima_value_to_filter_literal(&filter.value),
+                });
+                if let Some(upper) = &filter.value_upper {
+                    conditions.push(FilterExpression::Comparison {
+                        field,
+                        operator: ComparisonOperator::LessThanOrEqual,
+                        value: proxima_value_to_filter_literal(upper),
+                    });
+                }
+            }
+            RichFilterOperator::In | RichFilterOperator::NotIn => {
+                let values = if filter.value_list.is_empty() {
+                    match &filter.value {
+                        proximadb_data_model::ProximaValue::Array(values) => values.clone(),
+                        value => vec![value.clone()],
+                    }
+                } else {
+                    filter.value_list.clone()
+                };
+                let array = serde_json::Value::Array(
+                    values.iter().map(proxima_value_to_filter_literal).collect(),
+                );
+                conditions.push(FilterExpression::Comparison {
+                    field,
+                    operator: if matches!(filter.operator, RichFilterOperator::In) {
+                        ComparisonOperator::In
+                    } else {
+                        ComparisonOperator::NotIn
+                    },
+                    value: array,
+                });
+            }
+            operator => {
+                let operator = match operator {
+                    RichFilterOperator::Eq => ComparisonOperator::Equals,
+                    RichFilterOperator::Ne => ComparisonOperator::NotEquals,
+                    RichFilterOperator::Gt => ComparisonOperator::GreaterThan,
+                    RichFilterOperator::Gte => ComparisonOperator::GreaterThanOrEqual,
+                    RichFilterOperator::Lt => ComparisonOperator::LessThan,
+                    RichFilterOperator::Lte => ComparisonOperator::LessThanOrEqual,
+                    RichFilterOperator::Contains => ComparisonOperator::Contains,
+                    RichFilterOperator::StartsWith => ComparisonOperator::StartsWith,
+                    RichFilterOperator::EndsWith => ComparisonOperator::EndsWith,
+                    RichFilterOperator::Between
+                    | RichFilterOperator::In
+                    | RichFilterOperator::NotIn => unreachable!("handled above"),
+                };
+                conditions.push(FilterExpression::Comparison {
+                    field,
+                    operator,
+                    value: proxima_value_to_filter_literal(&filter.value),
+                });
+            }
+        }
+    }
+
+    match conditions.len() {
+        0 => None,
+        1 => conditions.into_iter().next(),
+        _ => Some(FilterExpression::And(conditions)),
+    }
+}
+
