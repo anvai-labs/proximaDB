@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use proximadb_runtime::{ApiHandlersPort, RecallProbePort, WriteRoutingPort};
+use proximadb_runtime::{
+    ApiHandlersPort, RecallProbePort, UnifiedQueryPort, WriteRoutingPort,
+};
 
 /// Tenant context extracted from request headers/JWT and injected as an Axum Extension.
 ///
@@ -54,6 +56,9 @@ pub struct RestAppState {
     pub write_routing: Option<Arc<dyn WriteRoutingPort>>,
     /// Recall-probe gate (experimental AXIS diagnostics). `None` ⇒ closed.
     pub recall_probe: Option<Arc<dyn RecallProbePort>>,
+    /// Unified multimodal query port (optional during the feature-flag
+    /// transition; wired by the root builder when the facade is enabled).
+    pub unified_query_port: Option<Arc<dyn UnifiedQueryPort>>,
 }
 
 impl RestAppState {
@@ -62,7 +67,18 @@ impl RestAppState {
             handlers,
             write_routing: None,
             recall_probe: None,
+            unified_query_port: None,
         }
+    }
+
+    /// Wire the unified multimodal query port (root builder; `None` keeps the
+    /// feature-flag transition default — unified query routes degrade).
+    pub fn with_unified_query_port(
+        mut self,
+        port: Option<Arc<dyn UnifiedQueryPort>>,
+    ) -> Self {
+        self.unified_query_port = port;
+        self
     }
 
     /// Wire the primary-pod write-routing gate (multi-node deployments).

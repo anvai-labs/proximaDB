@@ -4696,3 +4696,18 @@ mod td_rel_lower_order_by {
         );
     }
 }
+
+use anyhow::anyhow;
+
+pub fn validate_single_statement(sql: &str) -> std::result::Result<(), anyhow::Error> {
+    let statements = Parser::parse_sql(&GenericDialect, sql)
+        .map_err(|error| anyhow!("SQL parsing failed: {error}"))?;
+    match statements.len() {
+        1 => Ok(()),
+        0 => Err(anyhow!("No SQL statement found")),
+        count => Err(anyhow!(
+            "Exactly one SQL statement is required, found {count}"
+        )),
+    }
+}
+

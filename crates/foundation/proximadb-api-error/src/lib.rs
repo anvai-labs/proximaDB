@@ -289,6 +289,18 @@ impl IntoResponse for ApiError {
     }
 }
 
+
+/// Walk an error chain looking for the foundation `ApiError::LockConflict`
+/// variant (DML write-lock). Returns the conflict message so transport layers
+/// can map it (HTTP 409 / gRPC ABORTED / SQLSTATE 55P03) without each
+/// reimplementing the chain walk.
+pub fn extract_lock_conflict(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(|cause| match cause.downcast_ref::<ApiError>() {
+        Some(ApiError::LockConflict(msg)) => Some(msg.clone()),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

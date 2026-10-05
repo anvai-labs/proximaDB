@@ -1,3 +1,5 @@
+//! REST API v2 — query surface. Moved from the root v2 tree under ADR-094.
+
 //! OpenAPI-facing v2 query endpoints for AQL/UQL.
 //!
 //! These handlers are protocol facades only. They validate the REST contract and
@@ -11,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 use utoipa::ToSchema;
 
-use crate::errors::{ApiError, ApiResult};
-use crate::network::rest::canonical::handlers::AppState;
+use crate::rest::errors::{RestError as ApiError, RestResult as ApiResult};
+use crate::rest::state::RestAppState;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -78,12 +80,12 @@ fn json_to_proxima_values(params: Option<Vec<serde_json::Value>>) -> Option<Vec<
     summary = "Execute AQL or UQL through the shared query facade.",
     request_body = QueryRequest,
     responses(
-        (status = 200, description = "Query result.", body = crate::network::rest::openapi::QueryResponse),
-        (status = 400, description = "Invalid request.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 200, description = "Query result.", body = crate::rest::errors::QueryResponse),
+        (status = 400, description = "Invalid request.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn execute_query(
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
     Json(request): Json<QueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_query(request.language, &request.query)?;
@@ -130,12 +132,12 @@ pub async fn execute_query(
     summary = "Explain an AQL or UQL query through the shared query facade.",
     request_body = ExplainQueryRequest,
     responses(
-        (status = 200, description = "Query plan and lowering details.", body = crate::network::rest::openapi::QueryResponse),
-        (status = 400, description = "Invalid request.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 200, description = "Query plan and lowering details.", body = crate::rest::errors::QueryResponse),
+        (status = 400, description = "Invalid request.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn explain_query(
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
     Json(request): Json<ExplainQueryRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_query(request.language, &request.query)?;

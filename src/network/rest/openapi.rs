@@ -53,17 +53,12 @@ use crate::network::rest::v2::{
     collections, documents, entities, graphs, model_registry, query, records, schema, sql,
 };
 pub use proximadb_api::rest::errors::{ErrorBody, ErrorResponse};
+pub use proximadb_api::rest::errors::QueryResponse;
 
 /// Canonical ProximaDB error envelope (`{ error: { type, message, code } }`).
 ///
 /// `request_id` (also returned in the `X-Request-ID` response header) is present
-/// Query facade result. Implementations return records, total_count, metrics,
-/// plan, or diagnostics depending on language and endpoint, so the body is a
-/// free-form JSON object.
-#[derive(utoipa::ToSchema)]
-#[allow(dead_code)]
-#[schema(value_type = Object)]
-pub struct QueryResponse(pub Value);
+
 
 /// Aggregated OpenAPI document for the spec-from-code core surface.
 ///

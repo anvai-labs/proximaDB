@@ -36,17 +36,7 @@ use crate::query::ast::{
 /// the shared frontend parser prevents REST/gRPC adapters from growing their
 /// own quote/semicolon splitters while still allowing every statement kind the
 /// execution authority may handle (SELECT, DDL, DML, EXPLAIN, extensions).
-pub fn validate_single_statement(sql: &str) -> Result<()> {
-    let statements = Parser::parse_sql(&GenericDialect, sql)
-        .map_err(|error| anyhow!("SQL parsing failed: {error}"))?;
-    match statements.len() {
-        1 => Ok(()),
-        0 => Err(anyhow!("No SQL statement found")),
-        count => Err(anyhow!(
-            "Exactly one SQL statement is required, found {count}"
-        )),
-    }
-}
+pub use proximadb_relational_frontend::validate_single_statement;
 
 /// Detect an `EXPLAIN [ANALYZE] <inner>` wrapper.
 ///

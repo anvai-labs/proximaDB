@@ -34,6 +34,16 @@ pub struct ErrorBody {
 }
 
 
+/// Query facade result. Implementations return records, total_count, metrics,
+/// plan, or diagnostics depending on language and endpoint, so the body is a
+/// free-form JSON object.
+/// Query facade result. Implementations return records, total_count, metrics,
+/// plan, or diagnostics depending on language and endpoint, so the body is a
+/// free-form JSON object.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct QueryResponse(pub serde_json::Value);
+
 /// Result alias for REST handler functions.
 pub type RestResult<T> = Result<T, RestError>;
 

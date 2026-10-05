@@ -11,11 +11,12 @@
 #
 # Baseline (2026-10-03): 52 across 12 files. After PR-3.1b (graphs.rs port
 # rewrite): 51. After PR-3.2a (schema.rs moved to proximadb-api): 48.
+# After PR-3.3a (query.rs + sql.rs moved): 44.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CEILING="${V2_ROOT_IMPORTS_CEILING:-48}"
+CEILING="${V2_ROOT_IMPORTS_CEILING:-44}"
 DIR="src/network/rest/v2"
 
 count=$(grep -rh "^use crate::" "$DIR"/*.rs 2>/dev/null | wc -l | tr -d ' ')

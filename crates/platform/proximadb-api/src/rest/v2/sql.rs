@@ -1,3 +1,5 @@
+//! REST API v2 — sql surface. Moved from the root v2 tree under ADR-094.
+
 //! Canonical SQL-over-REST transport adapter.
 //!
 //! This module owns no SQL parser, planner, catalog, or executor. It validates
@@ -14,8 +16,8 @@ use tracing::{error, info};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::errors::{ApiError, ApiResult};
-use crate::network::rest::canonical::handlers::AppState;
+use crate::rest::errors::{RestError as ApiError, RestResult as ApiResult};
+use crate::rest::state::RestAppState;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
@@ -90,7 +92,7 @@ fn validate_request(request: &SqlRequest) -> ApiResult<u64> {
             "SQL query exceeds the {MAX_QUERY_BYTES}-byte limit"
         )));
     }
-    crate::query::sql_frontend::validate_single_statement(&request.query)
+    proximadb_relational_frontend::validate_single_statement(&request.query)
         .map_err(|error| ApiError::InvalidArgument(error.to_string()))?;
 
     let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
@@ -103,11 +105,7 @@ fn validate_request(request: &SqlRequest) -> ApiResult<u64> {
 }
 
 fn map_execution_error(error: anyhow::Error) -> ApiError {
-    if let Some((resource, holder)) = crate::errors::extract_dml_lock_conflict(&error) {
-        let message = match holder {
-            Some(holder) => format!("resource {resource} is held by {holder}"),
-            None => format!("resource {resource} is locked"),
-        };
+    if let Some(message) = proximadb_api_error::extract_lock_conflict(&error) {
         ApiError::LockConflict(message)
     } else {
         ApiError::Internal(format!("SQL execution failed: {error}"))
@@ -128,14 +126,14 @@ fn map_execution_error(error: anyhow::Error) -> ApiError {
     request_body = SqlRequest,
     responses(
         (status = 200, description = "SQL result or write count.", body = SqlResponse),
-        (status = 400, description = "Invalid SQL request.", body = crate::network::rest::openapi::ErrorResponse),
-        (status = 408, description = "Query deadline exceeded.", body = crate::network::rest::openapi::ErrorResponse),
-        (status = 409, description = "Write lock conflict.", body = crate::network::rest::openapi::ErrorResponse),
-        (status = 500, description = "SQL execution failure.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 400, description = "Invalid SQL request.", body = crate::rest::errors::ErrorResponse),
+        (status = 408, description = "Query deadline exceeded.", body = crate::rest::errors::ErrorResponse),
+        (status = 409, description = "Write lock conflict.", body = crate::rest::errors::ErrorResponse),
+        (status = 500, description = "SQL execution failure.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn execute_sql(
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
     Extension(identity): Extension<proximadb_tenant::ResolvedRequestIdentity>,
     Json(request): Json<SqlRequest>,
 ) -> ApiResult<Json<SqlResponse>> {
@@ -148,7 +146,7 @@ pub async fn execute_sql(
         "executing canonical REST SQL request"
     );
 
-    let execution = state.api_handlers.execute_sql(
+    let execution = state.handlers.execute_sql(
         request.query,
         None,
         request.collection,

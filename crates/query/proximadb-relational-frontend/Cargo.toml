@@ -14,6 +14,7 @@ name = "proximadb_relational_frontend"
 path = "src/lib.rs"
 
 [dependencies]
+anyhow.workspace = true
 proximadb-data-model = { workspace = true }
 proximadb-relational-types = { workspace = true }
 proximadb-relational-algebra = { workspace = true }

@@ -50,10 +50,10 @@ pub mod entities;
 pub mod external_collection;
 pub mod graphs;
 pub mod model_registry;
-pub mod query;
+pub use proximadb_api::rest::v2::query; // ADR-094
 pub mod records;
 pub use proximadb_api::rest::v2::schema; // ADR-094: moved to platform/api
-pub mod sql;
+pub use proximadb_api::rest::v2::sql; // ADR-094
 pub mod timeseries;
 
 pub use collections::*;
@@ -334,5 +334,6 @@ impl axum::extract::FromRef<crate::network::rest::canonical::handlers::AppState>
         input: &crate::network::rest::canonical::handlers::AppState,
     ) -> Self {
         Self::new(input.api_handlers.clone())
+            .with_unified_query_port(input.unified_query_port.clone())
     }
 }

@@ -7371,6 +7371,7 @@ dependencies = [
  "proximadb-query",
  "proximadb-query-filter",
  "proximadb-records",
+ "proximadb-relational-frontend",
  "proximadb-runtime",
  "proximadb-tenant",
  "proximadb-write-intent",
@@ -8837,6 +8838,7 @@ dependencies = [
 name = "proximadb-relational-frontend"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "proximadb-data-model",
  "proximadb-functions",
  "proximadb-relational-algebra",
