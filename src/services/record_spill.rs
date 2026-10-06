@@ -155,23 +155,42 @@ pub struct SpillRecordStorage {
     /// Directory under which this partition's segments are written. Callers build
     /// it with `DrPathBuilder`; this store never constructs a raw path itself.
     base_path: String,
-    /// Monotonic segment counter — unique **within one store instance**.
+    /// Monotonic segment counter, **resumed from durable state** by
+    /// [`Self::ensure_discovered`] before the first flush.
+    ///
+    /// Resumption is what keeps names fresh across instances that share a
+    /// `base_path` **sequentially** — a process restart, or a
+    /// `drop_partition_state` eviction whose next access rebuilds the partition
+    /// after the old store is gone. A store that started this counter at 0
+    /// regardless would re-issue a live segment's name.
+    ///
+    /// It does NOT make names fresh across instances that are **concurrently
+    /// live**, and that case is reachable: `drop_partition_state` only removes
+    /// the map entry, so a caller still holding the old `Arc` keeps writing
+    /// while the next access builds a second store over the same prefix.
+    /// Discovery runs once per store, so both can resume to the same number and
+    /// both issue it. There the guarantee is `write_if_absent`, which fails the
+    /// loser's flush rather than letting it destroy a segment — a lost write
+    /// surfaced as an error, not silent corruption (mandate #1). The removed
+    /// per-instance UUID nonce was collision-free in that case; this is a
+    /// deliberate trade of concurrent-writer tolerance for a segment set whose
+    /// ORDER is recoverable from a listing, which the nonce made impossible and
+    /// on which all three read paths depend. Single-writer-per-partition is the
+    /// design (one store per `(tenant, collection)` per process, one process per
+    /// WAL), so the traded-away case is already outside it.
+    ///
+    /// This replaces the per-instance UUID nonce that previously bought the same
+    /// freshness: a nonce makes names unique but leaves them **unordered**,
+    /// because a lexicographic sort of `spill-{uuid}-{seq}` sorts on the random
+    /// nonce. All three read paths depend on segment order (newest wins), so a
+    /// nonce-named set cannot be recovered from a listing — only its membership
+    /// can. A resumed, zero-padded counter delivers freshness *and* order, which
+    /// is why `src/graph/cold_segment_store.rs` — the precedent TD-USUB-1
+    /// names — uses one.
     next_segment: AtomicU64,
-    /// Per-instance nonce, unique **across** instances sharing a `base_path`.
-    ///
-    /// The counter alone is not enough for ADR-062's fresh-name discipline once
-    /// `base_path` is derived deterministically from `(tenant, collection)`, as
-    /// the partition factory now derives it. A second store at the same path —
-    /// after a process restart, or after `drop_partition_state` evicts the
-    /// partition and the next access rebuilds it — restarts its counter at 0 and
-    /// would re-issue `spill-0000000000`. `FileSystem::write` with `options:
-    /// None` takes the overwrite branch, so that clobbers the earlier object
-    /// **silently**.
-    ///
-    /// The nonce makes names fresh by construction across instances; `flush`
-    /// additionally writes with `overwrite: false` so that if this reasoning is
-    /// ever wrong the write FAILS rather than destroying a segment (mandate #1).
-    instance: String,
+    /// Guards [`Self::ensure_discovered`] so the listing runs at most once per
+    /// store, and so concurrent first-touches cannot both populate `segments`.
+    discovered: tokio::sync::OnceCell<()>,
 }
 
 impl SpillRecordStorage {
@@ -199,7 +218,7 @@ impl SpillRecordStorage {
             filesystem,
             base_path: base_path.into(),
             next_segment: AtomicU64::new(0),
-            instance: uuid::Uuid::new_v4().simple().to_string(),
+            discovered: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -209,7 +228,12 @@ impl SpillRecordStorage {
         self.memtable.len()
     }
 
-    /// Number of durable segments written so far.
+    /// Number of durable segments this store knows about.
+    ///
+    /// Sync, so it cannot itself discover: before any path that calls
+    /// `ensure_discovered` has run, this reports only what THIS instance
+    /// flushed, not what the prefix holds. Callers that need the durable count
+    /// should touch a read path first.
     pub fn segment_count(&self) -> usize {
         self.segments.read().len()
     }
@@ -219,12 +243,279 @@ impl SpillRecordStorage {
         self.flush_threshold
     }
 
+    /// Candidate segment objects for this partition, as paths under this
+    /// store's own prefix.
+    ///
+    /// These are CANDIDATES, not a verified set: a listing can propose an object
+    /// that is not ours (see below), and the guarantee is about where a returned
+    /// path can point, not about whether something lives there.
+    ///
+    /// The one place that interprets a listing, shared by discovery and purge so
+    /// the rule lives once (mandate #12).
+    ///
+    /// # Why a listing cannot simply be trusted
+    ///
+    /// Only the local backend — and HDFS, whose `LISTSTATUS` is also
+    /// directory-scoped, though the factory never constructs it — lists a
+    /// *directory* (`read_dir`, non-recursive). A directory-scoped backend is
+    /// the safe case; the hazard below is the prefix-scoped ones.
+    /// The object stores list by key prefix and **recursively**, and GCS passes
+    /// the prefix through raw with no trailing delimiter
+    /// (`ListObjectsRequest { prefix }`). So a partition at `…/order` would also
+    /// see `…/orders/…` — a different table's objects, whose basenames parse as
+    /// perfectly good segment names.
+    ///
+    /// # The two properties that make this safe
+    ///
+    /// **1. Correctness comes from canonical reconstruction, not from the
+    /// listing.** A returned path is always under `{base_path}/`, and for a
+    /// parseable name it is exactly `{base_path}/{spill_segment_name(seq)}`,
+    /// rebuilt from the sequence rather than from the listing. (The legacy arm
+    /// is the one exception: a name with no sequence has only its basename to
+    /// identify it, so that is re-rooted under our prefix instead. `entry.name`
+    /// is a bare basename on every backend, so it cannot contain a `/` and
+    /// cannot escape the prefix — the *where* guarantee holds for both arms,
+    /// which is what the rest of this argument needs.) So
+    /// a candidate that is not in fact ours cannot name another table's object:
+    /// it names a path under OUR prefix, which either holds our segment or holds
+    /// nothing. Reading it then fails loudly with not-found; purge deletes only
+    /// paths under our own prefix and tolerates absence. The failure mode is an
+    /// error, never a wrong answer (mandate #1), and that is what round 1's
+    /// `entry.url`-deleting purge got wrong: it deleted the *listing's* path.
+    ///
+    /// **2. Availability comes from scoping the listing.** `list` is called with
+    /// a trailing delimiter, which is what keeps GCS's raw prefix from matching a
+    /// sibling table. Without it, a sibling's segment at a sequence we lack
+    /// becomes a canonical path that does not exist, and every read of this
+    /// partition fails — correct, but useless. The delimiter is a no-op
+    /// elsewhere, though for a reason worth stating precisely: `ObjPath::from`
+    /// splits on `/` and drops empty segments (`Path::from("a/b/") == "a/b"`),
+    /// so our delimiter is DISCARDED before it reaches S3/Azure — those two are
+    /// scoped because `object_store` re-appends a delimiter itself when listing
+    /// a prefix. That is upstream behaviour this repo does not pin, so if it
+    /// ever changed, S3/Azure would acquire the sibling-prefix availability
+    /// problem and no test here would catch it (the local-backend double cannot
+    /// model it). GCS keeps our delimiter verbatim, which is the backend this
+    /// call is for. `read_dir` ignores it.
+    ///
+    /// Note what is deliberately NOT done: membership is not decided by
+    /// comparing the listing's location against `base_path`. Those two strings
+    /// come from different places — `base_path` is whatever the caller passed,
+    /// `DirEntry::url` is reconstructed by the backend — and they disagree in
+    /// real configurations (a bare-relative `base_path`, the shape
+    /// `DrPathBuilder` emits, against a `root_dir`-anchored local filesystem;
+    /// S3/Azure percent-encoding characters `DrPathBuilder::validate_id` permits
+    /// in an identifier). A mismatch would have skipped **our own** segments,
+    /// which is silent loss.
+    ///
+    /// Nor is membership probed with `exists`, which is unreliable in BOTH
+    /// directions. False negative: every backend collapses a transport failure
+    /// into `Ok(false)` (`aws_s3`/`azure_blob`/`gcs_store` are
+    /// `Ok(head(..).is_ok())`, and `std::path::Path::exists` is false on
+    /// `EACCES`/`EIO` too), so one throttled HEAD would read as "not ours" — and
+    /// because discovery is a `OnceCell`, that answer would stick for the
+    /// store's lifetime. False positive: `UnifiedCachingFilesystem::exists`
+    /// returns `Ok(true)` on any metadata-cache hit, and `put_negative` inserts
+    /// an ordinary entry, so a path confirmed ABSENT reads back as PRESENT for
+    /// the next 60s. An oracle that errs both ways cannot decide membership.
+    async fn list_partition_objects(&self) -> Result<Vec<PartitionObject>> {
+        let prefix = self.base_path.trim_end_matches('/').to_string();
+        // Trailing delimiter: see property 2 above.
+        let entries = match self.filesystem.list(&format!("{prefix}/")).await {
+            Ok(entries) => entries,
+            // A partition that never flushed has no prefix at all: the common
+            // case, not an error. BOTH `is_absent` arms are needed — the local
+            // backend reports a missing directory as `Io(ErrorKind::NotFound)`
+            // from `read_dir`, not the typed `NotFound` variant.
+            Err(err) if is_absent(&err) => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "spill: list segment prefix '{prefix}' failed: {err}"
+                ));
+            }
+        };
+
+        let mut objects: Vec<PartitionObject> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in entries {
+            if entry.metadata.is_directory {
+                continue;
+            }
+            // Basename only. A recursive listing reports whole keys, and `name`
+            // is already `key.rsplit('/').next()` on the object stores.
+            let name = entry.name.rsplit('/').next().unwrap_or(&entry.name);
+            if !is_spill_segment(name) {
+                // A wrapper filesystem that rewrites names on write but not on
+                // `list` would otherwise make every segment invisible here.
+                // Silent loss plus a permanently failing flush — refuse instead.
+                if is_mangled_spill_segment(name) {
+                    return Err(anyhow::anyhow!(
+                        "spill: segment '{name}' under '{prefix}' carries an extra extension, so \
+                         a filesystem wrapper is rewriting object names without un-mangling \
+                         `list` (see TD-ENCFS-1); refusing to serve this partition rather than \
+                         report it empty"
+                    ));
+                }
+                continue;
+            }
+            let seq = parse_spill_seq(name);
+            let path = match seq {
+                Some(seq) => format!("{prefix}/{}", spill_segment_name(seq)),
+                // A legacy name carries no sequence to rebuild from, so its
+                // basename is the only locator. Still re-rooted under OUR
+                // prefix, so the guarantee above holds; only purge consumes it.
+                None => format!("{prefix}/{name}"),
+            };
+            // A paginated listing can repeat a key, and two candidates can map
+            // to one canonical path.
+            //
+            // This is a COST guard, not a correctness one, and mutation testing
+            // is what established the difference: removing it changes no
+            // observable behaviour, because `ensure_discovered` independently
+            // refuses a path already in `segments` and purge tolerates a
+            // second delete of the same object as absent. What it buys is
+            // avoiding the duplicate work before those backstops see it.
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            objects.push(PartitionObject { path, seq });
+        }
+        Ok(objects)
+    }
+
+    /// Populate `segments` from durable state and resume `next_segment` past it,
+    /// so a store built over a prefix an earlier instance wrote serves that
+    /// instance's rows instead of ignoring them — and never reuses a name.
+    ///
+    /// Runs at most once per store, lazily. It must precede the FIRST path whose
+    /// answer depends on the segment list, not merely the first read:
+    /// `delete_record` decides whether to record a tombstone from
+    /// `!segments.is_empty()`, so a delete that ran before discovery would skip
+    /// the tombstone and a later discovery would then expose the flushed copy —
+    /// a resurrection. Hence the call at the head of every such path.
+    ///
+    /// **Order comes from the names, not from a durable list.** Each name
+    /// carries its sequence, and discovery sorts on the parsed value. That is
+    /// deliberate: a segment written but not yet recorded anywhere is still
+    /// found, and still ordered correctly. A design that took order from a
+    /// catalog-side list instead would make the window between "object landed"
+    /// and "list updated" a silent-data-loss window once the WAL is truncated
+    /// (slice 2b).
+    ///
+    /// Scope: this recovers segments under a prefix the caller already knows.
+    /// It does NOT let recovery *find* that prefix — WAL replay carries no
+    /// namespace, so the prefix itself still has to come from the catalog. See
+    /// `DirectTableRecordWriter::new_spilling` and TD-USUB-1.
+    ///
+    /// **Never call this while holding `flush_guard`**: it acquires the guard
+    /// itself, so a caller that already held it would wait on the `OnceCell`
+    /// while the initializer waits on the guard — a permanent hang. Every caller
+    /// is correct today (`flush` and `delete_record` discover *before* taking
+    /// it; `purge_durable_objects` never discovers), and after the first success
+    /// the cell short-circuits without touching the guard, so the window is the
+    /// first call only. `tokio::sync::Mutex` exposes no ownership query, so
+    /// neither a `debug_assert` nor a type-state can enforce this — hence prose.
+    ///
+    /// Why the guard is taken at all: `purge_durable_objects` CLEARS `segments`
+    /// under it, so a discovery whose listing ran before a concurrent purge
+    /// would otherwise publish paths the purge had already deleted. It is NOT
+    /// needed against `flush` — `flush` is the only other writer of `segments`
+    /// and it discovers first, so the list is provably empty inside the
+    /// initializer. An earlier version of this comment gave the flush race as
+    /// the reason, which was wrong.
+    async fn ensure_discovered(&self) -> Result<()> {
+        self.discovered
+            .get_or_try_init(|| async {
+                // Exclusive with `purge_durable_objects`, which CLEARS
+                // `segments` under this same guard. Without it a discovery whose
+                // listing ran before a concurrent purge could publish paths the
+                // purge has already deleted, after the purge emptied the list.
+                //
+                // NOT needed against `flush`: `flush` is the only writer of
+                // `segments` and it discovers first, so `segments` is provably
+                // empty whenever this closure runs. An earlier version of this
+                // comment claimed the flush race as the reason, which was wrong
+                // — the guard is load-bearing, for purge.
+                let _exclusive = self.flush_guard.lock().await;
+                let objects = self.list_partition_objects().await?;
+
+                let mut found: Vec<(u64, String)> = Vec::with_capacity(objects.len());
+                for object in objects {
+                    // Segment-shaped but unparseable: FAIL, do not skip
+                    // (mandate #1). Skipping would drop a durable segment out of
+                    // the merge silently — rows held only in that segment would
+                    // read as absent, and a DELETE of such a row would record no
+                    // tombstone. Without a sequence this store cannot establish
+                    // the order its read paths require, so it refuses to serve
+                    // rather than serve a subset. `purge_durable_objects` still
+                    // reclaims the object, so a DROP is the way out.
+                    let Some(seq) = object.seq else {
+                        return Err(anyhow::anyhow!(
+                            "spill: segment '{}' has an unrecognized name; refusing to serve \
+                             this partition from a segment set whose order cannot be \
+                             established",
+                            object.path
+                        ));
+                    };
+                    found.push((seq, object.path));
+                }
+
+                found.sort_by_key(|(seq, _)| *seq);
+                // `checked_add`, not `seq + 1`: the sequence comes from a
+                // FILENAME, so `spill-ffffffffffffffff.parquet` — a corrupt or
+                // hostile object under the prefix — would otherwise overflow.
+                // That panics in debug (mandate #4) and WRAPS in release, and a
+                // wrap resumes at 0, straight onto live segment names (mandate
+                // #1). Exhaustion is an explicit refusal instead.
+                let resume = match found.last() {
+                    Some((seq, _)) => match seq.checked_add(1) {
+                        Some(next) => next,
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "spill: segment sequence space exhausted under '{}' (highest \
+                                 segment is {seq}); refusing to serve rather than reuse a live \
+                                 segment name",
+                                self.base_path.trim_end_matches('/')
+                            ));
+                        }
+                    },
+                    None => 0,
+                };
+
+                {
+                    let mut segments = self.segments.write();
+                    for (_, path) in found {
+                        // Defense-in-depth, not a guard against an observed
+                        // case: `flush` is the only other writer of `segments`
+                        // and it discovers first, so this list is provably empty
+                        // here. Kept because a duplicate entry would silently
+                        // double the reads a segment costs, at the price of one
+                        // short linear scan run once per store.
+                        if !segments.contains(&path) {
+                            segments.push(path);
+                        }
+                    }
+                }
+                // `fetch_max`, not `store`: defense-in-depth, so a counter that
+                // somehow already advanced past `resume` is never rewound onto a
+                // name it already used.
+                self.next_segment.fetch_max(resume, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .map(|_| ())
+    }
+
     /// Write every resident row to a fresh durable segment and clear the
     /// memtable. A no-op when nothing is resident.
     ///
     /// Tombstones are deliberately **retained** across a flush: they suppress
     /// copies in *older* segments, which this flush does not rewrite.
     pub async fn flush(&self) -> Result<Option<String>> {
+        // BEFORE the guard: `ensure_discovered` takes it. Also before the
+        // `fetch_add` below, which is what makes this flush's name fresh with
+        // respect to an earlier instance's segments.
+        self.ensure_discovered().await?;
         // Held for the WHOLE publish — snapshot, write, push, evict — so no
         // delete can observe the pre-push segment list for a row this flush is
         // about to make durable (TD-USUB-13). See `flush_guard`.
@@ -252,15 +543,15 @@ impl SpillRecordStorage {
         let bytes = record_batches_to_parquet_bytes(&[batch], file_schema, None)
             .context("spill: encode Arrow batch to parquet bytes")?;
 
-        // `instance` before `seq`: the counter is unique only within one store,
-        // and `base_path` is now derived deterministically from the partition
-        // identity, so two stores at the same path would otherwise both emit
-        // `spill-0000000000`. See the `instance` field.
+        // `next_segment` was resumed past every durable segment by
+        // `ensure_discovered` at the top of this method, so this number is fresh
+        // with respect to objects an earlier instance wrote at the same path —
+        // not merely fresh within this process. See the `next_segment` field.
         let seq = self.next_segment.fetch_add(1, Ordering::SeqCst);
         let path = format!(
-            "{}/spill-{}-{seq:010}.parquet",
+            "{}/{}",
             self.base_path.trim_end_matches('/'),
-            self.instance
+            spill_segment_name(seq)
         );
 
         // `create_dirs`: a local-filesystem backend creates the parent only when
@@ -339,6 +630,7 @@ impl SpillRecordStorage {
     /// scan. Bounding that is compaction plus a per-segment oid index — slice 2c.
     /// It is acceptable here only because the path is default-OFF.
     async fn merged_records(&self) -> Result<Vec<ProximaRecord>> {
+        self.ensure_discovered().await?;
         let paths = self.segments.read().clone();
         let mut merged: std::collections::HashMap<String, ProximaRecord> =
             std::collections::HashMap::new();
@@ -405,6 +697,12 @@ impl RecordStore for SpillRecordStorage {
 
     /// Minimum LSN among resident (unflushed) rows.
     ///
+    /// Deliberately does NOT call `ensure_discovered`, and must not: it reads
+    /// only `resident_lsns` and `tombstones`, both in memory, and discovery adds
+    /// to neither — it adds *flushed* segments, whose rows are by definition no
+    /// longer resident and no longer constrain truncation. Adding the call would
+    /// be harmless but misleading about what this answer depends on.
+    ///
     /// **Fails closed when any resident row is untracked.** A row written through
     /// plain `upsert_record` has no LSN association, so a minimum computed over
     /// the tracked set alone would silently exclude it — and a caller truncating
@@ -457,15 +755,26 @@ impl RecordStore for SpillRecordStorage {
     }
 
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>> {
+        self.ensure_discovered().await?;
         if self.tombstones.contains(&key.oid) {
             return Ok(None);
         }
-        if let Some(record) = self.memtable.get(&key.oid) {
-            return Ok(Some(record.value().clone()));
+        let now_ns = now_ns();
+        if let Some(entry) = self.memtable.get(&key.oid) {
+            // The MEMTABLE is a read boundary too (mandate #16a). #1952 applied
+            // the predicate to the segment arms and this commit added the third
+            // one in `delete_record`; both left the resident copies unfiltered,
+            // so a row written already-dead and never flushed read back live.
+            // The memtable is strictly newer than any segment, so a dead
+            // resident copy means the row is dead — return None rather than
+            // falling through to a stale segment copy.
+            let record = entry.value().clone();
+            return Ok((!record.is_dead(now_ns)).then_some(record));
         }
         // Newest segment first: a later flush shadows an earlier copy.
+        // `now_ns` is taken once above and reused, so the memtable and segment
+        // arms judge liveness against the same instant.
         let paths = self.segments.read().clone();
-        let now_ns = now_ns();
         for path in paths.iter().rev() {
             if let Some(found) = self
                 .read_segment(path)
@@ -486,13 +795,21 @@ impl RecordStore for SpillRecordStorage {
     }
 
     async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool> {
+        // One instant for both liveness decisions below (the resident copy and
+        // the segment probe), so they cannot disagree about the same row — the
+        // same property `get_record` states for its two arms.
+        let now_ns = now_ns();
+        // BEFORE the guarded block below, for two reasons: `ensure_discovered`
+        // takes the same guard, and the `has_segments` decision it guards is
+        // only correct once discovery has run.
+        self.ensure_discovered().await?;
         // Exclusive with `flush` (TD-USUB-13): `has_segments` below and the
         // tombstone insert must not straddle a flush's `segments.push`, or a row
         // that flush is mid-way through making durable gets no tombstone and
         // comes back live. Scoped so the guard is released before the segment
         // READS at the end of this method — those are idempotent and need no
         // exclusion.
-        let (was_resident, has_segments) = {
+        let (was_resident, resident_was_dead, has_segments) = {
             let _exclusive = self.flush_guard.lock().await;
 
             // Already suppressed: nothing live to remove, so report false even
@@ -502,7 +819,19 @@ impl RecordStore for SpillRecordStorage {
                 return Ok(false);
             }
 
-            let was_resident = self.memtable.remove(&key.oid).is_some();
+            // Remove unconditionally, and distinguish THREE states rather than
+            // two: absent, resident-and-live, resident-and-dead.
+            //
+            // Collapsing the last two into one `false` was a real defect: a dead
+            // resident copy then fell through to the segment probe below, where a
+            // stale LIVE copy of the same oid reported that this DELETE removed a
+            // row — while `get_record` and `merged_records`, on identical state,
+            // both report the row absent. Mandate #16a names affected-row counts.
+            let removed = self.memtable.remove(&key.oid);
+            let resident_was_dead = removed
+                .as_ref()
+                .is_some_and(|(_, record)| record.is_dead(now_ns));
+            let was_resident = removed.is_some() && !resident_was_dead;
             let has_segments = !self.segments.read().is_empty();
 
             // A row already written to an immutable segment cannot be removed,
@@ -522,7 +851,7 @@ impl RecordStore for SpillRecordStorage {
             // that obligation.
             self.resident_lsns.remove(&key.oid);
 
-            (was_resident, has_segments)
+            (was_resident, resident_was_dead, has_segments)
         };
 
         // Report truthfully whether a live row went away. The segment read is
@@ -530,18 +859,39 @@ impl RecordStore for SpillRecordStorage {
         if was_resident {
             return Ok(true);
         }
+        // The memtable is strictly newer than any segment, so a dead resident
+        // copy means the row is dead: do not consult the segments, exactly as
+        // `get_record` does not. The tombstone inserted above is what keeps the
+        // older live segment copy suppressed, so returning here cannot resurrect
+        // it.
+        if resident_was_dead {
+            return Ok(false);
+        }
         if !has_segments {
             return Ok(false);
         }
         let paths = self.segments.read().clone();
         for path in paths.iter().rev() {
-            if self
+            // Newest segment first, and the FIRST hit is authoritative — the
+            // same rule `get_record` states and `merged_records` implements. A
+            // dead hit means the row is gone; it does NOT mean an older segment
+            // should be consulted for a live copy.
+            //
+            // Getting this wrong is subtle, and an earlier version of this
+            // commit did: it filtered dead rows *within* each segment and then
+            // CONTINUED to an older one, so a row dead in the newest segment and
+            // live in an older one reported that this DELETE removed it — while
+            // `get_record` and `merged_records`, on identical state, both
+            // reported it absent. Filtering per-segment answers "does this
+            // segment hold a live copy", which is the wrong question; the right
+            // one is "what does the newest segment holding this oid say".
+            if let Some(found) = self
                 .read_segment(path)
                 .await?
-                .iter()
-                .any(|r| r.oid == key.oid)
+                .into_iter()
+                .find(|r| r.oid == key.oid)
             {
-                return Ok(true);
+                return Ok(!found.is_dead(now_ns));
             }
         }
         Ok(false)
@@ -567,48 +917,42 @@ impl RecordStore for SpillRecordStorage {
         // an object the purge was supposed to remove — orphaned, with the
         // partition about to be dropped and nothing left to reference it.
         let _exclusive = self.flush_guard.lock().await;
-        let prefix = self.base_path.trim_end_matches('/').to_string();
-        let entries = match self.filesystem.list(&prefix).await {
-            Ok(entries) => entries,
-            // Nothing was ever written under this prefix — a partition that never
-            // flushed has nothing to delete, and the contract requires idempotence.
-            //
-            // BOTH arms are needed. The local backend surfaces a missing directory
-            // as `Io(ErrorKind::NotFound)` from `read_dir`, not as the typed
-            // `NotFound` variant — matching only the latter would make DROP TABLE
-            // fail outright for any table that never spilled.
-            Err(err) if is_absent(&err) => {
-                // Clear BOTH, exactly as the success path does. Harmless today
-                // because `drop_table_records` releases the whole store right
-                // after — but an orphan reaper calling purge standalone would
-                // otherwise leave a store whose segments are gone while its
-                // tombstones survive, and the two arms must not diverge.
-                self.segments.write().clear();
-                self.tombstones.clear();
-                return Ok(());
-            }
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "spill: list segment prefix '{prefix}' for purge failed: {err}"
-                ));
-            }
-        };
 
-        for entry in entries {
-            if entry.metadata.is_directory || !is_spill_segment(&entry.name) {
-                continue;
+        // Shared with discovery, which is what makes this safe on the object
+        // stores: a listing is by key prefix and recursive there, and GCS passes
+        // the prefix through raw, so dropping table `order` would otherwise
+        // delete table `orders`' segments — round 1's defect was deleting the
+        // LISTING's path. `list_partition_objects` returns paths rebuilt
+        // canonically under our own prefix, so a candidate that is not ours
+        // names a path that holds nothing and the delete below tolerates its
+        // absence. See that method.
+        let objects = self.list_partition_objects().await?;
+
+        for object in &objects {
+            match self.filesystem.delete(&object.path).await {
+                Ok(()) => {}
+                // Already gone: either a retry of a partially-completed purge,
+                // or a candidate the listing proposed that was never ours (a
+                // sibling prefix bled in by a raw-prefix LIST — the canonical
+                // path under OUR prefix simply holds nothing). Deleting nothing
+                // is the correct outcome in both cases, and the contract
+                // requires idempotence, so this must not fail the DROP.
+                Err(err) if is_absent(&err) => {}
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "spill: delete segment '{}' during purge failed: {err}",
+                        object.path
+                    ));
+                }
             }
-            self.filesystem.delete(&entry.url).await.map_err(|err| {
-                anyhow::anyhow!(
-                    "spill: delete segment '{}' during purge failed: {err}",
-                    entry.url
-                )
-            })?;
         }
 
         // Only after the objects are gone: a crash midway leaves the remaining
         // objects still listed under the prefix, so a retry finds and removes
-        // them.
+        // them. An empty prefix takes this path too (the contract requires
+        // idempotence), and BOTH pieces of state are cleared on every path so an
+        // orphan reaper calling purge standalone cannot leave a store whose
+        // segments are gone while its tombstones survive.
         self.segments.write().clear();
         self.tombstones.clear();
         Ok(())
@@ -653,14 +997,131 @@ fn is_absent(err: &proximadb_storage_filesystem_types::FilesystemError) -> bool 
     }
 }
 
-/// `true` for an object this store wrote — `spill-{instance}-{seq}.parquet`.
+/// One candidate segment object for a partition, as a path under that
+/// partition's prefix.
+///
+/// The PATH is always directly under the prefix; the listing entry that proposed
+/// it need not have been — a recursive listing can report an object nested
+/// deeper, and its basename is indistinguishable from one of ours. That is safe
+/// by construction rather than by filtering: see `list_partition_objects`. `seq` is `None` for a spill-shaped name carrying no parseable
+/// sequence (e.g. the superseded nonce scheme).
+struct PartitionObject {
+    /// Canonical path, built the way `flush` builds it — never a listing-derived
+    /// string.
+    path: String,
+    seq: Option<u64>,
+}
+
+/// Filename prefix and extension of a spill segment.
+const SPILL_PREFIX: &str = "spill-";
+const SPILL_SUFFIX: &str = ".parquet";
+
+/// Width of the hex sequence in a segment name: fixed, so a lexicographic sort
+/// of segment names equals their numeric order (`spill-10` after `spill-9`).
+///
+/// Note what this does and does not buy TODAY. Discovery sorts numerically on
+/// the parsed sequence, so current ordering does not depend on the padding; what
+/// the fixed width is load-bearing for is `parse_spill_seq`, which REJECTS any
+/// other width, so an unpadded name becomes a hard error rather than a
+/// mis-ordered segment. The padding is kept because it makes that rejection
+/// meaningful and keeps the names correct for any future consumer that orders a
+/// listing directly, which is cheap insurance — not because anything sorts
+/// lexicographically now.
+const SPILL_SEQ_HEX_WIDTH: usize = 16;
+
+/// Name of the segment carrying sequence `seq`.
+fn spill_segment_name(seq: u64) -> String {
+    format!(
+        "{SPILL_PREFIX}{seq:0width$x}{SPILL_SUFFIX}",
+        width = SPILL_SEQ_HEX_WIDTH
+    )
+}
+
+/// Sequence encoded in a segment's name, or `None` if the name is not one this
+/// store could have written.
+///
+/// Strict where [`is_spill_segment`] is permissive, and the asymmetry is
+/// deliberate — see that function. A caller that needs ORDER (discovery) must
+/// treat `None` on a segment-shaped name as an error rather than skipping it;
+/// a caller that needs only RECLAMATION (purge) is right to be permissive.
+fn parse_spill_seq(name: &str) -> Option<u64> {
+    let name = name.rsplit('/').next()?;
+    let hex = name
+        .strip_prefix(SPILL_PREFIX)?
+        .strip_suffix(SPILL_SUFFIX)?;
+    // Reject any other width: accepting a short name would admit a sequence
+    // whose lexicographic order disagrees with its numeric order, which is the
+    // one property the name exists to carry.
+    if hex.len() != SPILL_SEQ_HEX_WIDTH {
+        return None;
+    }
+    // Require the ALLOWED class, do not enumerate disallowed ones. An earlier
+    // version rejected uppercase and stopped there, which did NOT deliver the
+    // injectivity it claimed: `from_str_radix` also accepts a leading `+`, so
+    // `spill-+00000000000000f.parquet` parsed to 15 — sixteen bytes, no
+    // uppercase, both checks passed — exactly as
+    // `spill-000000000000000f.parquet` does. Two objects claiming one sequence,
+    // and a set holding both has no defined order. Worse for the ordering
+    // property, `+` is 0x2B and sorts BEFORE `0` (0x30), so such a name sorts
+    // ahead of sequence 0 while carrying 15.
+    //
+    // `spill_segment_name` emits exactly `[0-9a-f]`, so that is the whole
+    // alphabet a name this store wrote can use; anything else is not ours.
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// `true` for a name that is a spill segment with one extra extension appended —
+/// the shape a non-transparent wrapper filesystem produces.
+///
+/// `EncryptedFilesystem` appends its `encrypted_extension` (default `.enc`) to
+/// every `read`/`write`/`write_if_absent`/`delete`/`exists` path, but its `list`
+/// is a bare passthrough that does NOT un-mangle what it returns. So a segment
+/// written as `spill-{seq}.parquet` is listed as `spill-{seq}.parquet.enc`.
+///
+/// Without this detector that name is simply not spill-shaped, and the
+/// consequences are silent: discovery finds nothing, so every flushed row reads
+/// as absent and `delete_record` records no tombstone; `resume` restarts at 0,
+/// so the next flush collides with the underlying object and `write_if_absent`
+/// fails permanently; and purge reclaims nothing while reporting success. The
+/// wrapper is the layer at fault (TD-ENCFS-1), so this store refuses to serve
+/// rather than pretend the partition is empty.
+///
+/// Scope, stated so it is not mistaken for general: this detects ONE extra
+/// dot-separated extension, which is the only reachable shape today
+/// (`maybe_wrap_with_encryption` uses `EncryptedFilesystem::new`, i.e. the
+/// hardcoded `.enc`). A two-dot extension (`.enc.v2`) or a dotless one (`enc`)
+/// would evade it and restore the silent empty-partition failure.
+/// `with_extension` has no callers, so neither is reachable — but this is
+/// brittle to a one-line configuration change, which is a further reason the
+/// fix belongs in the wrapper (TD-ENCFS-1), not here.
+fn is_mangled_spill_segment(name: &str) -> bool {
+    if !name.starts_with(SPILL_PREFIX) {
+        return false;
+    }
+    match name.rfind('.') {
+        Some(dot) => is_spill_segment(&name[..dot]),
+        None => false,
+    }
+}
+
+/// `true` for an object this store wrote — `spill-{seq}.parquet`.
 ///
 /// Matched by prefix and extension rather than by parsing the name, and
 /// deliberately narrow: the prefix belongs to this partition, but refusing to
 /// delete anything that does not look like our own output means a path
 /// misconfiguration cannot turn a DROP into a delete of someone else's objects.
+///
+/// Deliberately PERMISSIVE relative to [`parse_spill_seq`]: purge must reclaim
+/// every object this store could have written, including one left by an older
+/// naming scheme, or a DROP leaks it forever.
 fn is_spill_segment(name: &str) -> bool {
-    name.starts_with("spill-") && name.ends_with(".parquet")
+    name.starts_with(SPILL_PREFIX) && name.ends_with(SPILL_SUFFIX)
 }
 
 #[async_trait]
@@ -826,8 +1287,6 @@ mod tests {
         Ok(())
     }
 
-    /// Purge is idempotent: a partition that never flushed, and a re-drop, are
-    /// both success. The contract says so, and `drop_table_records` now propagates
     /// The minimum is over RESIDENT rows only, and it ADVANCES as rows flush.
     ///
     /// This is the quantity ADR-094's truncation rule needs. Asserted as a
@@ -963,6 +1422,8 @@ mod tests {
         Ok(())
     }
 
+    /// Purge is idempotent: a partition that never flushed, and a re-drop, are
+    /// both success. The contract says so, and `drop_table_records` propagates
     /// errors — so a spurious failure here would make DROP TABLE fail outright.
     #[tokio::test]
     async fn purge_is_idempotent_and_tolerates_a_missing_prefix() -> Result<()> {
@@ -1249,6 +1710,137 @@ mod tests {
         }
     }
 
+    /// A filesystem that reproduces the OBJECT-STORE listing contract on top of
+    /// the local backend, so the hazard it creates is testable without GCS.
+    ///
+    /// Local `list` is `read_dir`: directory-scoped and non-recursive, so it can
+    /// never return a foreign object. The object stores list by KEY PREFIX and
+    /// recursively, and GCS passes the prefix through raw with no trailing
+    /// delimiter — so a partition at `…/order` also sees `…/orders/…`. This
+    /// double injects exactly those entries, shaped the way the real backends
+    /// shape them: `name` is a bare basename (`key.rsplit('/').next()`) and
+    /// `url` is the full location.
+    #[derive(Debug)]
+    struct ListInjectFs {
+        inner: LocalFileSystem,
+        /// Entries returned ONLY when the listed path lacks a trailing
+        /// delimiter — modelling GCS's raw prefix, where `…/order` also matches
+        /// `…/orders/…`. Scoping the listing is what makes these disappear, so a
+        /// test that relies on them is testing that we scope.
+        inject_unscoped: Vec<proximadb_storage_filesystem_types::DirEntry>,
+        /// Entries returned regardless — modelling a RECURSIVE listing, which
+        /// returns keys nested below the prefix even when correctly scoped.
+        inject_always: Vec<proximadb_storage_filesystem_types::DirEntry>,
+    }
+
+    impl ListInjectFs {
+        fn entry(url: &str) -> proximadb_storage_filesystem_types::DirEntry {
+            proximadb_storage_filesystem_types::DirEntry {
+                name: url.rsplit('/').next().unwrap_or(url).to_string(),
+                url: url.to_string(),
+                metadata: proximadb_storage_filesystem_types::FsFileMetadata::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl FileSystem for ListInjectFs {
+        async fn list(
+            &self,
+            path: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            Vec<proximadb_storage_filesystem_types::DirEntry>,
+        > {
+            let mut entries = self.inner.list(path).await?;
+            entries.extend(self.inject_always.iter().cloned());
+            if !path.ends_with('/') {
+                entries.extend(self.inject_unscoped.iter().cloned());
+            }
+            Ok(entries)
+        }
+        async fn write_if_absent(
+            &self,
+            path: &str,
+            data: &[u8],
+            options: Option<proximadb_storage_filesystem_types::FileOptions>,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.write_if_absent(path, data, options).await
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+            self.inner.read(path).await
+        }
+        async fn write(
+            &self,
+            path: &str,
+            data: &[u8],
+            options: Option<proximadb_storage_filesystem_types::FileOptions>,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.write(path, data, options).await
+        }
+        async fn append(
+            &self,
+            path: &str,
+            data: &[u8],
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.append(path, data).await
+        }
+        async fn delete(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.delete(path).await
+        }
+        async fn exists(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn metadata(
+            &self,
+            path: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            proximadb_storage_filesystem_types::FsFileMetadata,
+        > {
+            self.inner.metadata(path).await
+        }
+        async fn create_dir(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.create_dir(path).await
+        }
+        async fn create_dir_all(
+            &self,
+            path: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.create_dir_all(path).await
+        }
+        async fn copy(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn move_file(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.move_file(from, to).await
+        }
+        fn filesystem_type(&self) -> &'static str {
+            self.inner.filesystem_type()
+        }
+        async fn sync(&self) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.sync().await
+        }
+        async fn open_file(
+            &self,
+            path: &str,
+            create: bool,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            Box<dyn proximadb_storage_filesystem_types::FilesystemFile>,
+        > {
+            self.inner.open_file(path, create).await
+        }
+    }
+
     fn record(oid: &str, status: &str) -> ProximaRecord {
         let mut r = ProximaRecord {
             oid: oid.to_string(),
@@ -1284,9 +1876,13 @@ mod tests {
     /// function of `(tenant, collection)`, so a restart — or a
     /// `drop_partition_state` eviction followed by the next access — builds a
     /// second store over the first one's objects with its counter back at 0.
-    /// Without the per-instance nonce both would emit `spill-0000000000`, and
-    /// `write` with `options: None` overwrites silently: the first store's
-    /// durable rows would be gone with no error anywhere.
+    /// A store that did not resume its counter would re-issue sequence 0, and
+    /// the first store's durable rows would be gone — silently, if the write
+    /// were an unconditional overwrite. Two things now prevent that: the resumed
+    /// counter makes the name fresh, and `write_if_absent` fails loudly if that
+    /// reasoning is ever wrong. (This doc previously described the superseded
+    /// `spill-{uuid}-{seq:010}` naming and a `write` with `options: None`;
+    /// neither exists any more.)
     ///
     /// Asserts the observable property (both stores' segments survive and stay
     /// readable), not the file-naming scheme, so a different uniqueness strategy
@@ -1565,5 +2161,979 @@ mod tests {
         assert_eq!(configured_flush_threshold(), Some(256));
         unsafe { std::env::remove_var(SPILL_MAX_RESIDENT_ENV) };
         assert_eq!(configured_flush_threshold(), None);
+    }
+    /// Pins the NAME FORMAT: a lexicographic sort of segment names equals their
+    /// numeric order.
+    ///
+    /// Note what this does not claim. Discovery sorts numerically on the parsed
+    /// sequence, so today's ordering does not depend on the padding — an earlier
+    /// version of this comment said it did, which was false of the shipped code.
+    /// The fixed width is load-bearing for `parse_spill_seq`, which rejects any
+    /// other width, and this test keeps the names correct for any future
+    /// consumer that orders a listing directly. It fails if
+    /// `spill_segment_name` stops padding.
+    #[test]
+    fn segment_names_sort_in_sequence_order() {
+        let seqs: Vec<u64> = (0..40).chain([255, 256, 4095, 4096, u64::MAX]).collect();
+        let names: Vec<String> = seqs.iter().map(|q| spill_segment_name(*q)).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, names,
+            "lexicographic order of segment names must equal sequence order"
+        );
+    }
+
+    /// `parse_spill_seq` is the strict counterpart of the permissive
+    /// `is_spill_segment`, and the asymmetry is the point: purge must reclaim the
+    /// legacy nonce-shaped name, while discovery must refuse to assign it an
+    /// order it does not carry.
+    #[test]
+    fn segment_names_round_trip_and_reject_non_canonical() {
+        for seq in [0u64, 1, 9, 10, 16, 255, 4096, u64::MAX] {
+            let name = spill_segment_name(seq);
+            assert_eq!(parse_spill_seq(&name), Some(seq), "{name} must round-trip");
+            assert!(
+                is_spill_segment(&name),
+                "{name} must match the purge filter"
+            );
+            assert_eq!(
+                parse_spill_seq(&format!("tenant/coll/{name}")),
+                Some(seq),
+                "a full path must parse by its final component"
+            );
+        }
+
+        for bad in [
+            "spill-9.parquet",                 // unpadded
+            "spill-000000000000000.parquet",   // 15 digits
+            "spill-00000000000000000.parquet", // 17 digits
+            "spill-.parquet",                  // no sequence
+            "spill-zzzzzzzzzzzzzzzz.parquet",  // not hex
+            "other-0000000000000001.parquet",  // not our prefix
+            "spill-0000000000000001.txt",      // not our extension
+            "spill-00000000000000FF.parquet",  // uppercase: not injective
+            "spill-00000000000000Ff.parquet",  // mixed case
+            // `from_str_radix` accepts a leading sign, so a name outside the
+            // `[0-9a-f]` alphabet could claim a sequence another name already
+            // owns. `+` also sorts BEFORE `0`, so it breaks the ordering
+            // property too. An earlier guard rejected uppercase and stopped
+            // there, which did not deliver the injectivity it claimed.
+            "spill-+00000000000000f.parquet", // leading plus: parses to 15
+            "spill-+000000000000000.parquet", // leading plus: parses to 0
+            "spill--00000000000000f.parquet", // leading minus
+            "spill- 00000000000000f.parquet", // leading space
+            "spill-0x0000000000000f.parquet", // radix prefix
+            "spill-0000000000000_0f.parquet", // underscore separator
+        ] {
+            assert_eq!(parse_spill_seq(bad), None, "{bad} must not parse");
+        }
+
+        // The property those rejections exist for: no two accepted names may
+        // claim one sequence. Checked directly, because an earlier guard
+        // satisfied its own tests while failing this.
+        for seq in [0u64, 15, 255, 4096, u64::MAX] {
+            let canonical = spill_segment_name(seq);
+            for candidate in [
+                format!("spill-+{:015x}.parquet", seq),
+                format!("spill-{:015X}.parquet", seq),
+                format!("spill-{:016X}.parquet", seq),
+            ] {
+                if candidate == canonical {
+                    continue;
+                }
+                assert_ne!(
+                    parse_spill_seq(&candidate),
+                    Some(seq),
+                    "{candidate} must not claim the sequence {canonical} owns"
+                );
+            }
+        }
+
+        // The legacy nonce shape: still reclaimable by purge, never orderable.
+        let legacy = "spill-deadbeefcafe-0000000001.parquet";
+        assert!(
+            is_spill_segment(legacy),
+            "purge must still reclaim a legacy-named segment or DROP leaks it"
+        );
+        assert_eq!(
+            parse_spill_seq(legacy),
+            None,
+            "a nonce-named segment carries no recoverable order"
+        );
+    }
+
+    /// Build a filesystem over a fresh leaked tempdir, returning both.
+    async fn fs_and_base() -> (Arc<dyn FileSystem>, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = LocalFileSystem::new(LocalConfig::default())
+            .await
+            .expect("local filesystem");
+        (Arc::new(fs) as Arc<dyn FileSystem>, base)
+    }
+
+    fn status_is(record: &ProximaRecord, expected: &str) -> bool {
+        matches!(
+            record.props.get("status"),
+            Some(ProximaTreeNode::Value(proximadb_data_model::ProximaValue::String(v)))
+                if v == expected
+        )
+    }
+
+    /// A store built over a prefix an earlier instance wrote serves that
+    /// instance's rows, and resolves a key to the value in the NEWEST segment.
+    ///
+    /// Asserting the newest value — not merely the row count — is what makes
+    /// this a test of recovered ORDER rather than recovered membership. Reverse
+    /// the sort and the row count still passes while `k` reads `old`.
+    #[tokio::test]
+    async fn discovery_recovers_segment_set_and_order() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        first.upsert_record(record("k", "old")).await?;
+        first.upsert_record(record("p", "keep")).await?;
+        first.flush().await?;
+        first.upsert_record(record("k", "new")).await?;
+        first.flush().await?;
+        assert_eq!(first.segment_count(), 2, "two segments are needed to order");
+        drop(first);
+
+        // A second instance with nothing in memory: everything it serves came
+        // from discovery.
+        let second = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let got = second
+            .get_record(&RecordKey::new("k".to_string()))
+            .await?
+            .expect("a flushed row must be visible to a new instance");
+        assert!(
+            status_is(&got, "new"),
+            "get_record must resolve to the newest segment's value"
+        );
+
+        let all = second.scan_records(usize::MAX).await?;
+        assert_eq!(all.len(), 2, "the merge must dedup `k` across segments");
+        let merged_k = all
+            .iter()
+            .find(|r| r.oid == "k")
+            .expect("`k` must survive the merge");
+        assert!(
+            status_is(merged_k, "new"),
+            "the merge must take the newest segment's value for `k`"
+        );
+        Ok(())
+    }
+
+    /// Discovery resumes `next_segment` past every durable segment, so a second
+    /// instance's first flush cannot reuse a live name.
+    ///
+    /// This is the guarantee the removed per-instance UUID nonce used to buy.
+    /// Break the resume and this fails either way: `write_if_absent` rejects the
+    /// duplicate name (loud), or — if that backstop were also removed — the
+    /// first instance's rows vanish from the third instance's merge (silent).
+    #[tokio::test]
+    async fn discovery_resumes_the_sequence_across_instances() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        first.upsert_record(record("a0", "open")).await?;
+        first.upsert_record(record("a1", "open")).await?;
+        first.flush().await?;
+        drop(first);
+
+        let second = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        second.upsert_record(record("b0", "open")).await?;
+        second.flush().await?;
+        assert_eq!(
+            second.segment_count(),
+            2,
+            "the second instance must have discovered the first's segment \
+             alongside its own"
+        );
+        drop(second);
+
+        let third = SpillRecordStorage::with_flush_threshold(fs, base.clone(), None);
+        let all = third.scan_records(usize::MAX).await?;
+        let mut oids: Vec<String> = all.into_iter().map(|r| r.oid).collect();
+        oids.sort();
+        assert_eq!(
+            oids,
+            vec!["a0".to_string(), "a1".to_string(), "b0".to_string()],
+            "no instance's segment may be clobbered by a later one"
+        );
+        assert_eq!(
+            segment_files_on_disk(&base),
+            2,
+            "two distinct objects must exist on disk"
+        );
+        Ok(())
+    }
+
+    /// A segment-shaped object whose name carries no sequence must make the
+    /// partition FAIL rather than serve the rest of the set.
+    ///
+    /// Skipping it would be silently wrong twice over: rows held only in that
+    /// segment read as absent, and `delete_record` would see a shorter segment
+    /// list and could skip a tombstone it needs. Order cannot be established
+    /// over a set with an unplaceable member, so the store refuses to serve.
+    #[tokio::test]
+    async fn discovery_fails_closed_on_an_unrecognized_segment_name() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        first.upsert_record(record("k", "old")).await?;
+        first.flush().await?;
+        drop(first);
+
+        // An object under our prefix that `is_spill_segment` claims but
+        // `parse_spill_seq` cannot place — e.g. one written by the superseded
+        // nonce scheme.
+        std::fs::write(
+            format!(
+                "{}/spill-deadbeefcafe-0000000001.parquet",
+                base.trim_end_matches('/')
+            ),
+            b"not a parquet file",
+        )
+        .expect("write unparseable segment");
+
+        let second = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let err = second
+            .scan_records(usize::MAX)
+            .await
+            .expect_err("an unplaceable segment must fail the read, not be skipped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unrecognized name"),
+            "the error must name the cause; got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// The resurrection guard for the `delete_record` call site.
+    ///
+    /// `delete_record` decides whether to record a tombstone from
+    /// `!segments.is_empty()`. A delete that is a new instance's FIRST operation
+    /// would, without discovery ahead of it, see an empty segment list, skip the
+    /// tombstone, and then a later read would discover the flushed copy and
+    /// serve the deleted row. Remove `ensure_discovered` from `delete_record`
+    /// and this test fails.
+    #[tokio::test]
+    async fn a_delete_as_the_first_touch_still_suppresses_a_flushed_row() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        first.upsert_record(record("k", "old")).await?;
+        first.upsert_record(record("p", "keep")).await?;
+        first.flush().await?;
+        drop(first);
+
+        let second = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        // FIRST operation on this instance is the delete — nothing has read, so
+        // nothing else could have populated the segment list.
+        //
+        // The return value is checked LAST, deliberately. Asserting it here
+        // would short-circuit the run on a weaker symptom ("reported it removed
+        // nothing") and the test would never reach the claim it is named for.
+        let reported_removal = second
+            .delete_record(&RecordKey::new("k".to_string()))
+            .await?;
+
+        assert!(
+            second
+                .get_record(&RecordKey::new("k".to_string()))
+                .await?
+                .is_none(),
+            "the deleted row must not come back from the segment"
+        );
+        let survivors: Vec<String> = second
+            .scan_records(usize::MAX)
+            .await?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        assert_eq!(
+            survivors,
+            vec!["p".to_string()],
+            "only the untouched row may survive the merge"
+        );
+        assert!(
+            reported_removal,
+            "deleting a flushed row must also report that it removed something"
+        );
+        Ok(())
+    }
+    /// A sequence read from a FILENAME must not overflow when resumed.
+    ///
+    /// `spill-ffffffffffffffff.parquet` is a well-formed name carrying
+    /// `u64::MAX`, so a naive `seq + 1` panics in debug and WRAPS in release —
+    /// and a wrap resumes at 0, straight onto live segment names. Exhaustion is
+    /// an explicit refusal instead (mandates #1 and #4).
+    #[tokio::test]
+    async fn discovery_refuses_an_exhausted_sequence_rather_than_overflowing() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        std::fs::write(
+            format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                spill_segment_name(u64::MAX)
+            ),
+            b"not a parquet file",
+        )
+        .expect("write max-sequence segment");
+
+        let store = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let err = store
+            .scan_records(usize::MAX)
+            .await
+            .expect_err("an exhausted sequence must refuse, not overflow or wrap");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sequence space exhausted"),
+            "the error must name the cause; got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// Build `{tmp}/order` (ours) and `{tmp}/orders` (a sibling table), with one
+    /// real segment object in each, plus a filesystem whose `list` injects the
+    /// sibling the way a recursive/raw-prefix object-store LIST would.
+    async fn bleeding_pair() -> (Arc<ListInjectFs>, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let ours = format!("{root}/order");
+        let sibling = format!("{root}/orders");
+        std::fs::create_dir_all(&ours).expect("mkdir ours");
+        std::fs::create_dir_all(&sibling).expect("mkdir sibling");
+        // The sibling's object has a PERFECTLY VALID segment name — that is the
+        // whole point: its basename is indistinguishable from one of ours.
+        //
+        // Sequence 5, NOT 0: our own first flush takes 0, and an implementation
+        // that decided membership from the basename would then produce the same
+        // canonical path for both and dedup the sibling away, so these tests
+        // would pass while the defect was present. A distinct sequence makes the
+        // adoption observable.
+        let sibling_object = format!("{sibling}/{}", spill_segment_name(5));
+        std::fs::write(&sibling_object, b"sibling table's segment").expect("write sibling");
+        let inner = LocalFileSystem::new(LocalConfig::default())
+            .await
+            .expect("local filesystem");
+        let fs = Arc::new(ListInjectFs {
+            inner,
+            inject_unscoped: vec![ListInjectFs::entry(&format!("file://{sibling_object}"))],
+            inject_always: Vec::new(),
+        });
+        (fs, ours, sibling_object)
+    }
+
+    /// A sibling prefix's objects must be IGNORED, not adopted.
+    ///
+    /// The object stores list by key prefix and recursively, and GCS passes the
+    /// prefix through raw, so a partition at `…/order` also sees `…/orders/…`.
+    /// Deciding membership from the basename would re-root another table's
+    /// object under our prefix: every read of `order` would then fail on a key
+    /// that does not exist, and `delete_record` would see a spurious
+    /// `has_segments` and tombstone a never-flushed row — which pins
+    /// `min_unflushed_lsn` fail-closed forever.
+    #[tokio::test]
+    async fn discovery_ignores_objects_from_a_sibling_prefix() -> Result<()> {
+        let (fs, ours, _sibling) = bleeding_pair().await;
+
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), ours.clone(), None);
+        first.upsert_record(record("k", "ours")).await?;
+        first.flush().await?;
+        drop(first);
+
+        let second = SpillRecordStorage::with_flush_threshold(fs, ours, None);
+        let all = second.scan_records(usize::MAX).await?;
+        assert_eq!(
+            all.len(),
+            1,
+            "only this partition's own segment may be discovered"
+        );
+        assert_eq!(all[0].oid, "k");
+        assert_eq!(
+            second.segment_count(),
+            1,
+            "the sibling table's object must not enter the segment list"
+        );
+        Ok(())
+    }
+
+    /// Purge must reclaim a LEGACY-named segment — the flag day's escape hatch.
+    ///
+    /// The rename to `spill-{seq:016x}` ships with no migration: a partition
+    /// holding `spill-{uuid}-{seq}` objects refuses every read, because the
+    /// order of such a set cannot be established. That is tolerable ONLY because
+    /// a DROP reclaims them, which is why `is_spill_segment` stays permissive
+    /// (prefix+suffix) where `parse_spill_seq` is strict. Tighten
+    /// `is_spill_segment` to agree with `parse_spill_seq` and those objects leak
+    /// forever — so this test is what makes that asymmetry load-bearing rather
+    /// than incidental.
+    ///
+    /// Claimed in `ENV_GATE_REGISTRY` and in TD-USUB-1; untested until now.
+    #[tokio::test]
+    async fn purge_reclaims_a_legacy_named_segment() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let legacy = format!(
+            "{}/spill-deadbeefcafe-0000000001.parquet",
+            base.trim_end_matches('/')
+        );
+        std::fs::write(&legacy, b"a segment written under the previous naming")
+            .expect("write legacy segment");
+
+        let store = SpillRecordStorage::with_flush_threshold(fs, base.clone(), None);
+        // Captured, not asserted yet: reads must refuse while the object is
+        // there (the flag day), but asserting it HERE would short-circuit the
+        // run on that symptom and the test would never reach the escape hatch
+        // it exists to pin. Checked last.
+        let read_refused = store.scan_records(usize::MAX).await.is_err();
+
+        store.purge_durable_objects().await?;
+
+        assert!(
+            !std::path::Path::new(&legacy).exists(),
+            "purge must reclaim the legacy-named segment, or a DROP leaks it forever"
+        );
+        assert_eq!(segment_files_on_disk(&base), 0);
+        assert!(
+            read_refused,
+            "a legacy-named segment must also make reads refuse"
+        );
+        Ok(())
+    }
+
+    /// A RESIDENT row that is already dead must not read back live, and
+    /// deleting it must report no removal.
+    ///
+    /// The memtable is a read boundary like the segments are (mandate #16a).
+    /// #1952 filtered the two segment arms and this commit added the third in
+    /// `delete_record`'s probe — all three only ever see FLUSHED copies. The
+    /// resident copies were left unfiltered, and
+    /// `a_dead_record_from_a_segment_does_not_read_back_live` cannot catch it
+    /// because it flushes first. With the threshold unset nothing flushes, so
+    /// this exercises the memtable alone.
+    #[tokio::test]
+    async fn a_dead_resident_record_is_neither_read_nor_counted_as_deleted() -> Result<()> {
+        let s = store(None).await;
+        let mut dead = record("gone", "open");
+        dead.valid_to_ns = Some(0);
+        s.upsert_record(dead).await?;
+        s.upsert_record(record("live", "open")).await?;
+        assert_eq!(s.segment_count(), 0, "precondition: nothing flushed");
+        assert_eq!(s.resident_len(), 2, "precondition: both rows resident");
+
+        assert!(
+            s.get_record(&RecordKey::new("gone".to_string()))
+                .await?
+                .is_none(),
+            "a dead resident row must not read back live"
+        );
+        assert!(
+            s.get_record(&RecordKey::new("live".to_string()))
+                .await?
+                .is_some(),
+            "and a live resident row must still be served"
+        );
+        assert_eq!(
+            s.scan_records(usize::MAX).await?.len(),
+            1,
+            "the scan already filtered it; get_record must agree"
+        );
+        assert!(
+            !s.delete_record(&RecordKey::new("gone".to_string())).await?,
+            "deleting an already-dead resident row must report no removal"
+        );
+        Ok(())
+    }
+
+    /// A DEAD resident copy over a LIVE segment copy: every surface must agree
+    /// the row is gone, including `delete_record`'s return value.
+    ///
+    /// This is the state the resident filter was added for and did not cover.
+    /// `was_resident` collapsed "absent" and "resident but dead" into one
+    /// `false`, so the dead copy fell through to the segment probe, found the
+    /// stale LIVE copy, and reported that the DELETE removed a row — while
+    /// `get_record` and `merged_records`, on the same state, both reported it
+    /// absent. Neither earlier test could reach it:
+    /// `a_dead_resident_record_is_neither_read_nor_counted_as_deleted` never
+    /// flushes (so it exits on `!has_segments`), and
+    /// `deleting_an_already_dead_segment_row_reports_no_removal` puts the dead
+    /// copy in the SEGMENT with nothing resident.
+    #[tokio::test]
+    async fn a_dead_resident_copy_shadows_a_live_segment_copy_on_every_surface() -> Result<()> {
+        let s = store(Some(2)).await;
+        // Flush a LIVE `k` into a segment.
+        s.upsert_record(record("k", "live-in-segment")).await?;
+        s.upsert_record(record("filler", "open")).await?;
+        assert!(
+            s.segment_count() > 0,
+            "precondition: `k` is flushed and live"
+        );
+        assert_eq!(s.resident_len(), 0, "precondition: nothing resident");
+
+        // Now a DEAD resident copy of the same oid.
+        let mut dead = record("k", "dead-resident");
+        dead.valid_to_ns = Some(0);
+        s.upsert_record(dead).await?;
+
+        let key = RecordKey::new("k".to_string());
+        assert!(
+            s.get_record(&key).await?.is_none(),
+            "get_record must not serve the stale live segment copy"
+        );
+        assert!(
+            !s.scan_records(usize::MAX)
+                .await?
+                .iter()
+                .any(|r| r.oid == "k"),
+            "the scan must agree the row is gone"
+        );
+        assert!(
+            !s.delete_record(&key).await?,
+            "delete_record must agree too — not re-count the row from the segment"
+        );
+
+        // AFTER the delete, too. Without this the test cannot distinguish a
+        // correct early return from one that skipped the tombstone: moving the
+        // `tombstones.insert` below `resident_was_dead`'s return would resurrect
+        // the live segment copy here, and every other assertion would still
+        // pass.
+        assert!(
+            s.get_record(&key).await?.is_none(),
+            "the live segment copy must stay suppressed after the delete"
+        );
+        assert!(
+            !s.scan_records(usize::MAX)
+                .await?
+                .iter()
+                .any(|r| r.oid == "k"),
+            "and must not reappear in a scan"
+        );
+        Ok(())
+    }
+
+    /// A row DEAD in the newest segment and LIVE in an older one is gone, on
+    /// every surface including `delete_record`'s count.
+    ///
+    /// Newest-segment-first is only authoritative if the FIRST hit decides. An
+    /// earlier version of this commit filtered dead rows within each segment and
+    /// then continued to an older one, so this state made `delete_record` report
+    /// a removal while `get_record` and `merged_records` reported the row
+    /// absent — the same cross-surface disagreement, one layer out from the
+    /// resident case above.
+    #[tokio::test]
+    async fn a_row_dead_in_the_newest_segment_is_gone_despite_a_live_older_copy() -> Result<()> {
+        let s = store(None).await;
+        s.upsert_record(record("x", "live")).await?;
+        s.upsert_record(record("keep", "live")).await?;
+        s.flush().await?; // segment 0: x LIVE
+        let mut dead = record("x", "expired");
+        dead.valid_to_ns = Some(0);
+        s.upsert_record(dead).await?;
+        s.flush().await?; // segment 1 (newest): x DEAD
+        assert_eq!(s.segment_count(), 2, "precondition: two segments hold `x`");
+        assert_eq!(s.resident_len(), 0, "precondition: nothing resident");
+
+        let key = RecordKey::new("x".to_string());
+        assert!(
+            s.get_record(&key).await?.is_none(),
+            "the newest segment's dead copy is authoritative"
+        );
+        assert!(
+            !s.scan_records(usize::MAX)
+                .await?
+                .iter()
+                .any(|r| r.oid == "x"),
+            "the merge must agree"
+        );
+        assert!(
+            !s.delete_record(&key).await?,
+            "delete_record must not consult an OLDER segment for a live copy"
+        );
+        Ok(())
+    }
+
+    /// Two listing entries proposing ONE canonical path must collapse to one
+    /// segment, not two reads of the same object.
+    ///
+    /// A paginated listing can repeat a key, and a foreign object whose basename
+    /// matches one of ours maps to the path our own segment already occupies.
+    /// The other sibling/nested tests deliberately pick sequences 5 and 7 to
+    /// AVOID collapsing, so none of them reaches this state.
+    ///
+    /// Pins the OBSERVABLE property, and deliberately does not claim to isolate
+    /// one mechanism: TWO independent layers deliver it — the `seen` set in
+    /// `list_partition_objects` and `ensure_discovered`'s refusal of a path
+    /// already in `segments` — so removing either alone leaves this passing.
+    /// Mutation testing is what established that, and the `seen` comment now
+    /// says it is a cost guard rather than a correctness one.
+    #[tokio::test]
+    async fn two_entries_proposing_one_canonical_path_collapse_to_one_segment() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        // Flush with a PLAIN filesystem first. The double injects on every
+        // listing, so injecting before the flush would have the first store
+        // adopt a sequence-0 path that does not exist yet and flush to 1
+        // instead — the duplicate must name a REAL object to model a repeated
+        // listing page.
+        let plain = Arc::new(
+            LocalFileSystem::new(LocalConfig::default())
+                .await
+                .expect("local filesystem"),
+        ) as Arc<dyn FileSystem>;
+        let first = SpillRecordStorage::with_flush_threshold(plain, base.clone(), None);
+        first.upsert_record(record("k", "ours")).await?;
+        let written = first
+            .flush()
+            .await?
+            .expect("the flush must publish a segment");
+        drop(first);
+        assert!(
+            written.ends_with(&spill_segment_name(0)),
+            "precondition: the flush took sequence 0, got {written}"
+        );
+
+        let inner = LocalFileSystem::new(LocalConfig::default())
+            .await
+            .expect("local filesystem");
+        let fs = Arc::new(ListInjectFs {
+            inner,
+            inject_unscoped: Vec::new(),
+            // The same real object, reported a second time.
+            inject_always: vec![ListInjectFs::entry(&format!("file://{written}"))],
+        });
+
+        let second = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let all = second.scan_records(usize::MAX).await?;
+        assert_eq!(all.len(), 1, "the row must appear once, not twice");
+        assert_eq!(
+            second.segment_count(),
+            1,
+            "one object must yield one segment entry, however often it is listed"
+        );
+        Ok(())
+    }
+
+    /// A wrapper filesystem that renames objects on write but not on `list`
+    /// must make the partition REFUSE, not look empty.
+    ///
+    /// `EncryptedFilesystem` appends its `encrypted_extension` (default `.enc`)
+    /// to every read/write/delete/exists path while its `list` passes names
+    /// through unchanged, so a segment written as `spill-{seq}.parquet` is
+    /// listed as `spill-{seq}.parquet.enc` (TD-ENCFS-1). Without the detector
+    /// that name is simply not spill-shaped and the consequences are all
+    /// silent: discovery finds nothing, so flushed rows read as absent and
+    /// `delete_record` records no tombstone; `resume` restarts at 0 so the next
+    /// flush collides with the underlying object forever; purge reclaims
+    /// nothing while reporting success.
+    #[tokio::test]
+    async fn a_wrapper_mangled_segment_name_refuses_rather_than_reading_empty() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        // Exactly what the encryption wrapper's `list` would report.
+        let mangled = format!(
+            "{}/{}.enc",
+            base.trim_end_matches('/'),
+            spill_segment_name(3)
+        );
+        std::fs::write(&mangled, b"an encrypted segment").expect("write mangled segment");
+        let inner = LocalFileSystem::new(LocalConfig::default())
+            .await
+            .expect("local filesystem");
+        let fs = Arc::new(ListInjectFs {
+            inner,
+            inject_unscoped: Vec::new(),
+            inject_always: Vec::new(),
+        });
+
+        let store = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let err = store.scan_records(usize::MAX).await.expect_err(
+            "a mangled segment name must refuse the read, not report an empty partition",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rewriting object names"),
+            "the error must name the cause; got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// Canonical reconstruction alone must protect a foreign object, with no
+    /// help from listing scope.
+    ///
+    /// The sibling tests cannot show this: scoping and canonical reconstruction
+    /// are independent protections and either one suffices, so neither mutation
+    /// alone makes them fail. Here the foreign entry is injected into even a
+    /// correctly SCOPED listing — the conservative assumption that a backend may
+    /// report a key we did not expect — so the only thing standing between purge
+    /// and another table's object is that the path it deletes is rebuilt under
+    /// OUR prefix.
+    ///
+    /// Mutate the path source to the listing's own url and this fails.
+    #[tokio::test]
+    async fn purge_never_deletes_a_path_outside_its_own_prefix() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let ours = format!("{root}/order");
+        let foreign_dir = format!("{root}/orders");
+        std::fs::create_dir_all(&ours).expect("mkdir ours");
+        std::fs::create_dir_all(&foreign_dir).expect("mkdir foreign");
+        // Sequence 5, distinct from our own flush at 0, so it cannot be deduped.
+        let foreign = format!("{foreign_dir}/{}", spill_segment_name(5));
+        std::fs::write(&foreign, b"another table's segment").expect("write foreign");
+        let inner = LocalFileSystem::new(LocalConfig::default())
+            .await
+            .expect("local filesystem");
+        let fs = Arc::new(ListInjectFs {
+            inner,
+            inject_unscoped: Vec::new(),
+            // Returned even for a scoped listing.
+            inject_always: vec![ListInjectFs::entry(&format!("file://{foreign}"))],
+        });
+
+        let store = SpillRecordStorage::with_flush_threshold(fs, ours.clone(), None);
+        store.upsert_record(record("k", "ours")).await?;
+        store.flush().await?;
+        assert_eq!(segment_files_on_disk(&ours), 1);
+
+        store.purge_durable_objects().await?;
+
+        assert!(
+            std::path::Path::new(&foreign).exists(),
+            "purge deleted a path OUTSIDE its own prefix: {foreign}"
+        );
+        assert_eq!(
+            segment_files_on_disk(&ours),
+            0,
+            "and must still delete its own segment"
+        );
+        Ok(())
+    }
+
+    /// Purge must not delete a sibling prefix's objects.
+    ///
+    /// Same listing hazard as above, with the worse consequence: on GCS,
+    /// dropping table `order` would DELETE table `orders`' segments. Asserts
+    /// the sibling's bytes survive, not merely that purge reported success.
+    #[tokio::test]
+    async fn purge_only_deletes_objects_under_its_own_prefix() -> Result<()> {
+        let (fs, ours, sibling_object) = bleeding_pair().await;
+
+        let store = SpillRecordStorage::with_flush_threshold(fs, ours.clone(), None);
+        store.upsert_record(record("k", "ours")).await?;
+        store.flush().await?;
+        assert_eq!(segment_files_on_disk(&ours), 1);
+
+        store.purge_durable_objects().await?;
+
+        assert_eq!(
+            segment_files_on_disk(&ours),
+            0,
+            "purge must delete this partition's own segments"
+        );
+        assert!(
+            std::path::Path::new(&sibling_object).exists(),
+            "purge deleted ANOTHER table's segment: {sibling_object}"
+        );
+        Ok(())
+    }
+
+    /// Deleting a row whose only segment copy is already DEAD must report that
+    /// it removed nothing.
+    ///
+    /// `delete_record`'s segment probe is the THIRD segment-read boundary, and
+    /// #1952 applied the canonical dead-record predicate at the other two
+    /// (`merged_records`, `get_record`) while missing this one. Without the
+    /// filter the probe counts a tombstoned/expired row as present and DELETE
+    /// reports a wrong affected-row count — a count/stats surface mandate #16a
+    /// names explicitly.
+    #[tokio::test]
+    async fn deleting_an_already_dead_segment_row_reports_no_removal() -> Result<()> {
+        let s = store(Some(2)).await;
+        let mut dead = record("gone", "open");
+        dead.valid_to_ns = Some(0);
+        s.upsert_record(dead).await?;
+        s.upsert_record(record("other", "open")).await?;
+        assert!(s.segment_count() > 0, "precondition: flushed to a segment");
+        assert_eq!(s.resident_len(), 0, "precondition: nothing resident");
+
+        assert!(
+            !s.delete_record(&RecordKey::new("gone".to_string())).await?,
+            "an already-dead segment row must not be reported as removed"
+        );
+        Ok(())
+    }
+
+    /// A spill-named object nested BELOW the prefix fails the read LOUDLY.
+    ///
+    /// A recursive listing returns it even when correctly scoped, and its
+    /// basename is indistinguishable from one of ours — so it is proposed as a
+    /// candidate. What keeps that safe is canonical reconstruction: the path
+    /// built from its sequence points under OUR prefix, where nothing lives, so
+    /// the read fails with not-found instead of serving a foreign object's
+    /// bytes. Wrong-and-loud, never wrong-and-silent (mandate #1).
+    ///
+    /// Nothing writes nested spill names today; this pins the failure DIRECTION
+    /// if anything ever does.
+    #[tokio::test]
+    async fn a_nested_spill_named_object_fails_the_read_rather_than_being_served() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let nested_dir = format!("{base}/sub");
+        std::fs::create_dir_all(&nested_dir).expect("mkdir nested");
+        // Sequence 7, distinct from our own flush, so it cannot be deduped away.
+        let nested = format!("{nested_dir}/{}", spill_segment_name(7));
+        std::fs::write(&nested, b"not ours").expect("write nested");
+        let inner = LocalFileSystem::new(LocalConfig::default())
+            .await
+            .expect("local filesystem");
+        let fs = Arc::new(ListInjectFs {
+            inner,
+            inject_unscoped: Vec::new(),
+            // Returned even for a scoped listing: that is what "recursive" means.
+            inject_always: vec![ListInjectFs::entry(&format!("file://{nested}"))],
+        });
+
+        let store = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        store.upsert_record(record("k", "ours")).await?;
+        store.flush().await?;
+
+        let err = store
+            .scan_records(usize::MAX)
+            .await
+            .expect_err("an adopted foreign candidate must fail the read, not be served");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read segment") || msg.contains("decode segment"),
+            "the failure must be a read of OUR canonical path, not a decode of \
+             the foreign object; got: {msg}"
+        );
+        assert!(
+            std::path::Path::new(&nested).exists(),
+            "and the foreign object is never touched"
+        );
+        Ok(())
+    }
+
+    /// OUR OWN segments must be found when the listing spells their location
+    /// differently from the `base_path` we were given.
+    ///
+    /// This is the regression test for the dangerous direction. `base_path` is a
+    /// caller string; `DirEntry::url` is reconstructed by the backend, and they
+    /// disagree in real configurations — notably a bare-relative `base_path`
+    /// (the shape `DrPathBuilder` emits) against a `root_dir`-anchored local
+    /// filesystem, which reports an absolute `file://…` url because `local.rs`
+    /// takes its relative branch only for a path literally starting `./`.
+    ///
+    /// An implementation that decided membership by comparing those two strings
+    /// would skip every one of our segments and return Ok: reads would report
+    /// flushed rows as absent, `delete_record` would record no tombstone, and
+    /// purge would delete nothing and report success. Silent loss, with no
+    /// fail-closed arm firing — which is why membership is not decided by
+    /// comparing those two strings at all. A candidate's path is rebuilt
+    /// canonically instead, so a spelling difference cannot hide our own
+    /// segments.
+    #[tokio::test]
+    async fn discovery_finds_our_segments_when_the_listing_spells_them_differently() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        let inner = LocalFileSystem::new(LocalConfig {
+            root_dir: Some(root.clone()),
+            ..LocalConfig::default()
+        })
+        .await
+        .expect("local filesystem with a root_dir");
+        let fs = Arc::new(inner) as Arc<dyn FileSystem>;
+
+        // Bare-relative, no leading `./` — the shape `DrPathBuilder` emits.
+        let base = "data/tenant-a/ns1/orders".to_string();
+
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        first.upsert_record(record("k", "old")).await?;
+        first.flush().await?;
+        first.upsert_record(record("k", "new")).await?;
+        first.flush().await?;
+        drop(first);
+
+        let second = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        assert_eq!(
+            second.segment_count(),
+            0,
+            "nothing discovered before the first read"
+        );
+        let got = second
+            .get_record(&RecordKey::new("k".to_string()))
+            .await?
+            .expect("our own flushed row must be discovered despite the url spelling");
+        assert!(
+            status_is(&got, "new"),
+            "and must resolve to the newest segment"
+        );
+        assert_eq!(second.segment_count(), 2, "both our segments must be found");
+
+        // Purge must find them too — the same membership rule decides both.
+        second.purge_durable_objects().await?;
+        let on_disk = root.join(&base);
+        assert_eq!(
+            segment_files_on_disk(&on_disk.to_string_lossy()),
+            0,
+            "purge must delete our segments, not silently report success"
+        );
+        Ok(())
+    }
+
+    /// Discovery changes what an ORPHANED segment costs, and this pins the
+    /// premise that makes it so.
+    ///
+    /// The partition prefix is a pure function of `(tenant, collection)`, and
+    /// with `PROXIMADB_WAL_OBJECT_ID_KEY` default-OFF the collection key is the
+    /// bare table NAME — so a table dropped and recreated under the same name
+    /// reuses its predecessor's prefix. DROP purges the prefix first
+    /// (`purge_durable_objects`), so this is reachable only when that purge
+    /// failed or crashed part-way: TD-USUB-1's open deletion-obligation item.
+    ///
+    /// Before discovery that window cost wasted storage. With discovery, a
+    /// surviving object is found and SERVED — a dropped table's rows appearing
+    /// in a recreated one. The mechanism is not wrong; its precondition is.
+    /// Hence the obligation marker + drain is a correctness prerequisite for
+    /// enabling the spill gate, not hygiene to be done later.
+    ///
+    /// Asserts the premise (a second store over the same prefix serves what the
+    /// first left) rather than asserting resurrection as desired behaviour.
+    #[tokio::test]
+    async fn an_unpurged_prefix_is_served_to_the_next_store_at_that_path() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+
+        let dropped = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        dropped.upsert_record(record("leftover", "old")).await?;
+        dropped.flush().await?;
+        // NOTE: no `purge_durable_objects` — standing in for a purge that failed
+        // or a crash before it ran. The live DROP path does call it.
+        drop(dropped);
+        assert_eq!(
+            segment_files_on_disk(&base),
+            1,
+            "the orphaned object must still be on disk for this to mean anything"
+        );
+
+        let recreated = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let served = recreated.scan_records(usize::MAX).await?;
+        assert_eq!(
+            served.len(),
+            1,
+            "discovery serves whatever the prefix holds — which is why the \
+             prefix must be empty before it is reused (TD-USUB-1 open item: \
+             deletion-obligation marker + drain)"
+        );
+        Ok(())
     }
 }

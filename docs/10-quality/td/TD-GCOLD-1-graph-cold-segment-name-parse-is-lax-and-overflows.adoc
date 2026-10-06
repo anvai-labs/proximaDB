@@ -1,0 +1,80 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GCOLD-1: Graph cold-segment name parsing is lax and its sequence resume overflows
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-06, found while adopting this module as the precedent for TD-USUB-1's spill-segment discovery. The equivalent defects were fixed in the spill store in the same PR; these two remain here.
+| Priority | **LOW.** Both require an object whose NAME is anomalous under the partition prefix, which nothing in the system writes — so neither is reachable from normal operation. Recorded because the names are attacker- or corruption-influenced inputs, and because this module is cited as the pattern to copy.
+| Component | `src/graph/cold_segment_store.rs` (`parse_seg_seq`, the two resume sites)
+| Relates to | TD-USUB-1 (spill-segment discovery, which copied this module's design), mandates #1 and #4
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`cold_segment_store.rs` solves durable segment discovery the way TD-USUB-1 now does: a
+zero-padded hex sequence in the name (`seg-{seq:016x}.gcseg`), recovered by `parse_seg_seq` and
+resumed past the highest value found, "so new segments never clobber existing ones". The design is
+right — it is why TD-USUB-1 adopted it. Two details of the implementation are not.
+
+=== 1. `seq + 1` overflows on a filename-controlled value (mandate #4, then #1)
+
+`cold_segment_store.rs:247` and `:305`:
+
+[source,rust]
+----
+max_seq = max_seq.max(seq + 1);
+----
+
+`seq` comes from the object's NAME. `seg-ffffffffffffffff.gcseg` is well-formed and parses to
+`u64::MAX`, so `seq + 1` **panics in debug** — forbidden in production code by mandate #4 — and
+**wraps to 0 in release**, which is worse: the store then resumes at 0 and re-issues names that
+live segments already hold. Unlike the spill store, this writer does not use a conditional create,
+so a wrap would silently overwrite.
+
+Fix: `checked_add`, refusing explicitly on exhaustion rather than panicking or wrapping.
+
+=== 2. `parse_seg_seq` accepts names the writer never emits (mandate #1)
+
+`cold_segment_store.rs:536-540`:
+
+[source,rust]
+----
+fn parse_seg_seq(path: &str) -> Option<u64> {
+    let name = path.rsplit('/').next()?;
+    let hex = name.strip_prefix("seg-")?.strip_suffix(".gcseg")?;
+    u64::from_str_radix(hex, 16).ok()
+}
+----
+
+Two gaps, both of which break the single property the name exists to carry — that a lexicographic
+sort of a listing equals sequence order:
+
+* **No width check.** `seg-9.gcseg` parses to 9, and `seg-10.gcseg` sorts *before* it. The writer
+  always pads to 16, so any other width is not a name this store wrote.
+* **No case check.** `from_str_radix` accepts either case, so `seg-00000000000000ff.gcseg` and
+  `seg-00000000000000FF.gcseg` are two distinct objects claiming one sequence — a set holding both
+  has no defined order.
+
+Fix: reject any width but 16 and any uppercase digit, mirroring
+`parse_spill_seq` in `src/services/record_spill.rs`.
+
+== Why this is filed rather than fixed
+
+Out of scope for the PR that found it (different modality, different module, and that PR already
+carries the relational substrate change plus a data-destruction fix in purge). Neither defect is
+reachable without an anomalous object name, so the cost of deferring is bounded. The reason to fix
+it at all is that this module is the *reference* implementation other code is told to copy — the
+spill store copied it and had to correct both on the way in.
+
+== How to apply
+
+1. `checked_add` at both resume sites, with an explicit error on exhaustion.
+2. Width + case rejection in `parse_seg_seq`.
+3. Unit tests mirroring the spill store's: name round-trip, rejection table (short, long, uppercase,
+   mixed, wrong prefix, wrong extension), lexicographic-equals-numeric order across a range that
+   includes `0x9`/`0x10` and `0xff`/`0x100`, and a refusal on `seg-ffffffffffffffff.gcseg`.
+4. Mutation-test each guard: unpadded names must break the order assertion, and the overflow test
+   must fail without `checked_add`.
