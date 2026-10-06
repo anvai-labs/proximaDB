@@ -5,11 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-10-04, found by adversarial review while verifying TD-USUB-1's LSN plumbing. **Pre-existing** in slice 2a (`SpillRecordStorage`), not introduced by the LSN work. **Latent:** `new_spilling` has no production caller, so no deployment can reach it today.
+| Status | **FIXED 2026-10-05.** Filed 2026-10-04, found by adversarial review while verifying TD-USUB-1's LSN plumbing; pre-existing in slice 2a, not introduced by the LSN work. Fixed by serializing `flush` against `delete_record` and `purge_durable_objects` on one `tokio::sync::Mutex` — option 3 below, chosen over the finer-grained alternative for the reason recorded there. Pinned by `delete_during_a_flush_does_not_resurrect_the_row`, **mutation-tested**: removing the guard reproduces the resurrection (`deleted row resurrected via get_record from the segment flush published`).
 | Priority | **HIGH once the spill path is wired** — it is a silent wrong answer (mandate #1) of the resurrection class (mandate #16a), and it needs no WAL truncation to fire. Until wiring it is unreachable, which is the only reason this is not a live incident.
 | Component | `src/services/record_spill.rs` (`flush`, `delete_record`)
 | Relates to | TD-USUB-1 (slice 2a introduced the flush path; its 2b safety argument depends on reads never resurrecting), TD-USUB-11 (tombstone round-trip), mandate #16a
-| Blocked by | Nothing. **Blocks slice 2b** — see "Why this blocks 2b".
+| Blocked by | Nothing. **No longer blocks slice 2b** as of the fix above; the remaining 2b prerequisites are on TD-USUB-1.
 |===
 
 == The race
@@ -75,6 +75,19 @@ in rough order of preference:
 . **Serialize flush against delete** on a per-partition lock. Simplest and most obviously correct,
   and the one to prefer unless the contention is shown to matter — the flush holds it across an
   object write, which is exactly the kind of thing to measure rather than assume (mandate #6).
+  **✅ This is what landed**, for a reason beyond simplicity: option 2 admits a tombstone for a row
+  whose flush then *fails*, and under TD-USUB-1's rule a spurious tombstone pins WAL truncation
+  **forever** (`min_unflushed_lsn` fails closed on any tombstone). Serializing introduces no such
+  state. The spill path still has no production caller, so the contention it costs is currently
+  zero — measure before trading correctness obviousness for it.
++
+`purge_durable_objects` takes the same guard, which this TD originally did not mention: it lists
+the prefix and deletes what it finds, so a concurrent flush could publish a segment *after* the
+listing and leave an object the purge was meant to remove — orphaned, with the partition about to
+be dropped and nothing left to reference it.
++
+The guard is `tokio::sync::Mutex`, not `parking_lot`: the critical section spans an `await` on the
+object write, and a blocking mutex held across an await stalls the runtime thread.
 
 Whichever is chosen, the tombstone-vs-truncation tension above has to be resolved in the same
 change, most likely by making tombstones durable (already TD-USUB-1's own open item) so that
