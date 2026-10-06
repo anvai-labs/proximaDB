@@ -121,6 +121,34 @@ pub struct SpillRecordStorage {
     resident_lsns: DashMap<String, u64>,
     /// Flushed segment paths, oldest first. Later entries shadow earlier ones.
     segments: parking_lot::RwLock<Vec<String>>,
+    /// Serializes `flush` against any other structural mutation of the
+    /// segment set — today `delete_record` and `purge_durable_objects`.
+    ///
+    /// **Why a lock held across object I/O (TD-USUB-13).** `flush` publishes in
+    /// three steps that were not atomic: snapshot the memtable, write the
+    /// object, then push the path to `segments`. `delete_record` decides whether
+    /// to record a tombstone from `!segments.is_empty()`. A delete landing
+    /// between the snapshot and the push therefore saw an empty segment list on
+    /// a partition's first flush, recorded **no tombstone**, and reported
+    /// success — while flush went on to write that row into the segment from its
+    /// pre-delete snapshot. The row came back live, with no WAL truncation
+    /// involved (mandate #16a).
+    ///
+    /// `tokio::sync::Mutex`, not `parking_lot`: the critical section spans an
+    /// `await` on the object write, and a blocking mutex held across an await
+    /// stalls the whole runtime thread.
+    ///
+    /// **Not the cheapest possible fix, chosen deliberately.** TD-USUB-13 lists
+    /// a finer-grained alternative (publish the in-flight oid set under a short
+    /// lock, release before the I/O, and have `delete_record` consult it). That
+    /// avoids holding anything across the write, but it admits a tombstone for a
+    /// row whose flush then *fails* — and a spurious tombstone now pins WAL
+    /// truncation forever, because `min_unflushed_lsn` fails closed on any
+    /// tombstone. Serializing is obviously correct and introduces no such state;
+    /// the spill path has no production caller yet, so the contention it costs is
+    /// currently zero and should be *measured* before trading correctness
+    /// obviousness for it (mandate #6).
+    flush_guard: tokio::sync::Mutex<()>,
     /// Resident-row count after which a write triggers a flush. `None` ⇒ never.
     flush_threshold: Option<usize>,
     filesystem: Arc<dyn FileSystem>,
@@ -166,6 +194,7 @@ impl SpillRecordStorage {
             tombstones: DashSet::new(),
             resident_lsns: DashMap::new(),
             segments: parking_lot::RwLock::new(Vec::new()),
+            flush_guard: tokio::sync::Mutex::new(()),
             flush_threshold,
             filesystem,
             base_path: base_path.into(),
@@ -196,6 +225,10 @@ impl SpillRecordStorage {
     /// Tombstones are deliberately **retained** across a flush: they suppress
     /// copies in *older* segments, which this flush does not rewrite.
     pub async fn flush(&self) -> Result<Option<String>> {
+        // Held for the WHOLE publish — snapshot, write, push, evict — so no
+        // delete can observe the pre-push segment list for a row this flush is
+        // about to make durable (TD-USUB-13). See `flush_guard`.
+        let _publish = self.flush_guard.lock().await;
         let records: Vec<ProximaRecord> = self
             .memtable
             .iter()
@@ -430,29 +463,44 @@ impl RecordStore for SpillRecordStorage {
     }
 
     async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool> {
-        // Already suppressed: nothing live to remove, so report false even if a
-        // stale segment copy still exists on disk.
-        if self.tombstones.contains(&key.oid) {
-            self.memtable.remove(&key.oid);
-            return Ok(false);
-        }
+        // Exclusive with `flush` (TD-USUB-13): `has_segments` below and the
+        // tombstone insert must not straddle a flush's `segments.push`, or a row
+        // that flush is mid-way through making durable gets no tombstone and
+        // comes back live. Scoped so the guard is released before the segment
+        // READS at the end of this method — those are idempotent and need no
+        // exclusion.
+        let (was_resident, has_segments) = {
+            let _exclusive = self.flush_guard.lock().await;
 
-        let was_resident = self.memtable.remove(&key.oid).is_some();
-        let has_segments = !self.segments.read().is_empty();
+            // Already suppressed: nothing live to remove, so report false even
+            // if a stale segment copy still exists on disk.
+            if self.tombstones.contains(&key.oid) {
+                self.memtable.remove(&key.oid);
+                return Ok(false);
+            }
 
-        // A row already written to an immutable segment cannot be removed, so it
-        // is suppressed instead. The tombstone is recorded whenever segments
-        // exist — a redundant tombstone is harmless, a missing one resurrects
-        // the row.
-        if has_segments {
-            self.tombstones.insert(key.oid.clone());
-        }
-        // A deleted row is no longer resident, so its INSERT's LSN stops
-        // constraining truncation. The DELETE's own LSN is a separate matter: if
-        // the row had been flushed, the tombstone above is the only in-memory
-        // evidence of the deletion and `min_unflushed_lsn` fails closed on it —
-        // dropping this association does NOT release that obligation.
-        self.resident_lsns.remove(&key.oid);
+            let was_resident = self.memtable.remove(&key.oid).is_some();
+            let has_segments = !self.segments.read().is_empty();
+
+            // A row already written to an immutable segment cannot be removed,
+            // so it is suppressed instead. Inside the guard with the
+            // `has_segments` read: deciding and acting on that decision as one
+            // step is what makes the reasoning local, rather than depending on
+            // the separate argument that flush's snapshot could no longer
+            // contain this oid.
+            if has_segments {
+                self.tombstones.insert(key.oid.clone());
+            }
+            // A deleted row is no longer resident, so its INSERT's LSN stops
+            // constraining truncation. The DELETE's own LSN is a separate
+            // matter: if the row had been flushed, the tombstone above is the
+            // only in-memory evidence of the deletion and `min_unflushed_lsn`
+            // fails closed on it — dropping this association does NOT release
+            // that obligation.
+            self.resident_lsns.remove(&key.oid);
+
+            (was_resident, has_segments)
+        };
 
         // Report truthfully whether a live row went away. The segment read is
         // paid ONLY when the answer is not already known from the memtable.
@@ -490,6 +538,12 @@ impl RecordStore for SpillRecordStorage {
     /// idempotence). Every other I/O error propagates — reporting success for a
     /// failed delete would leave data the tenant cannot reach or remove.
     async fn purge_durable_objects(&self) -> RecordStoreResult<()> {
+        // Exclusive with `flush` for the same reason as `delete_record`
+        // (TD-USUB-13): purge lists the prefix and deletes what it finds, so a
+        // concurrent flush could publish a segment *after* the listing and leave
+        // an object the purge was supposed to remove — orphaned, with the
+        // partition about to be dropped and nothing left to reference it.
+        let _exclusive = self.flush_guard.lock().await;
         let prefix = self.base_path.trim_end_matches('/').to_string();
         let entries = match self.filesystem.list(&prefix).await {
             Ok(entries) => entries,
@@ -892,6 +946,227 @@ mod tests {
         s.purge_durable_objects().await?;
         s.purge_durable_objects().await?;
         Ok(())
+    }
+
+    /// TD-USUB-13: a delete that lands mid-flush must not resurrect the row.
+    ///
+    /// Sequence, made deterministic by `BarrierFs`:
+    ///
+    ///   1. two rows cross the flush threshold, so `flush()` runs and parks
+    ///      inside the object write — AFTER snapshotting the memtable, BEFORE
+    ///      pushing to `segments`;
+    ///   2. a delete for one of those rows runs in that window;
+    ///   3. the write is released and the flush completes, publishing a segment
+    ///      built from the PRE-delete snapshot.
+    ///
+    /// Without serialization the delete saw an empty segment list, recorded no
+    /// tombstone, and reported success — and the row came back live from the
+    /// segment flush then published. No WAL truncation involved (mandate #16a).
+    ///
+    /// Asserts the OBSERVABLE property — the row is gone from both `get_record`
+    /// and a scan — not the presence of a tombstone, so a different fix (an
+    /// in-flight oid set, say) still satisfies it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_during_a_flush_does_not_resurrect_the_row() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let fs = Arc::new(BarrierFs {
+            inner: LocalFileSystem::new(LocalConfig::default())
+                .await
+                .expect("local filesystem"),
+            reached: reached.clone(),
+            release: release.clone(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+
+        // Threshold 2: the second insert triggers the flush that parks.
+        let store = Arc::new(SpillRecordStorage::with_flush_threshold(fs, base, Some(2)));
+
+        let writer = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store.upsert_record(record("keep", "open")).await?;
+                // This one crosses the threshold and parks inside the write.
+                store.upsert_record(record("victim", "open")).await?;
+                Ok::<(), anyhow::Error>(())
+            })
+        };
+
+        // Wait until the flush is genuinely parked mid-write.
+        reached.notified().await;
+
+        // The delete MUST be a separate task. Awaiting it here would deadlock
+        // once the fix is in: `delete_record` blocks on the same guard the
+        // parked `flush` holds, so this task would never reach the release
+        // below. That deadlock is the fix working — "a delete during a flush"
+        // is exactly what serialization makes impossible — so the test has to
+        // let the delete queue rather than wait for it.
+        let deleter = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .delete_record(&RecordKey::new("victim".to_string()))
+                    .await
+            })
+        };
+
+        // Give an UNSERIALIZED delete the chance to slip into the window. With
+        // the fix it is parked on the guard and this elapses; without the fix it
+        // completes here, inside the flush, which is the defect being pinned.
+        // Either way the assertions below are the same, so this bounds nothing
+        // but how long the window stays open.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        release.notify_one();
+        writer.await.expect("writer task").expect("writer result");
+        let deleted = deleter.await.expect("deleter task")?;
+        assert!(deleted, "the delete must report that a live row went away");
+
+        // The row must be gone by every read path.
+        assert!(
+            store
+                .get_record(&RecordKey::new("victim".to_string()))
+                .await?
+                .is_none(),
+            "deleted row resurrected via get_record from the segment flush published"
+        );
+        let scanned = store.scan_records(usize::MAX).await?;
+        assert!(
+            !scanned.iter().any(|r| r.oid == "victim"),
+            "deleted row resurrected in a scan: {:?}",
+            scanned.iter().map(|r| &r.oid).collect::<Vec<_>>()
+        );
+        assert!(
+            scanned.iter().any(|r| r.oid == "keep"),
+            "the surviving row must still be readable"
+        );
+        Ok(())
+    }
+
+    /// A filesystem that pauses inside `write_if_absent` until released.
+    ///
+    /// This is the only way to open TD-USUB-13's window deterministically: the
+    /// race needs a delete to land between `flush`'s memtable snapshot and its
+    /// `segments.push`, and the gap between them is exactly one object write.
+    /// Timing-based attempts (a "slow enough" real write) would be flaky, and a
+    /// test-only hook in the production path would be worse.
+    ///
+    /// Deliberately local and lock-free of process-global state: no env arming
+    /// and no `OnceLock`, because a process-lifetime gate is what made the
+    /// TD-USUB-6 benchmark measure the same mode twice. The barrier is passed in
+    /// by `Arc`, so each test owns its own.
+    #[derive(Debug)]
+    struct BarrierFs {
+        inner: LocalFileSystem,
+        /// Signalled by the FS when a write has arrived and is parked.
+        reached: Arc<tokio::sync::Notify>,
+        /// Awaited by the FS; signalled by the test to let the write proceed.
+        release: Arc<tokio::sync::Notify>,
+        /// Only the FIRST write parks; later ones pass through, so `flush`'s
+        /// eviction and any follow-up work cannot deadlock.
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl FileSystem for BarrierFs {
+        async fn write_if_absent(
+            &self,
+            path: &str,
+            data: &[u8],
+            options: Option<proximadb_storage_filesystem_types::FileOptions>,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.write_if_absent(path, data, options).await
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+            self.inner.read(path).await
+        }
+        async fn write(
+            &self,
+            path: &str,
+            data: &[u8],
+            options: Option<proximadb_storage_filesystem_types::FileOptions>,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.write(path, data, options).await
+        }
+        async fn append(
+            &self,
+            path: &str,
+            data: &[u8],
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.append(path, data).await
+        }
+        async fn delete(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.delete(path).await
+        }
+        async fn exists(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn metadata(
+            &self,
+            path: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            proximadb_storage_filesystem_types::FsFileMetadata,
+        > {
+            self.inner.metadata(path).await
+        }
+        async fn list(
+            &self,
+            path: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            Vec<proximadb_storage_filesystem_types::DirEntry>,
+        > {
+            self.inner.list(path).await
+        }
+        async fn create_dir(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.create_dir(path).await
+        }
+        async fn create_dir_all(
+            &self,
+            path: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.create_dir_all(path).await
+        }
+        async fn copy(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn move_file(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.move_file(from, to).await
+        }
+        fn filesystem_type(&self) -> &'static str {
+            self.inner.filesystem_type()
+        }
+        async fn sync(&self) -> proximadb_storage_filesystem_types::FsResult<()> {
+            self.inner.sync().await
+        }
+        async fn open_file(
+            &self,
+            path: &str,
+            create: bool,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            Box<dyn proximadb_storage_filesystem_types::FilesystemFile>,
+        > {
+            self.inner.open_file(path, create).await
+        }
     }
 
     fn record(oid: &str, status: &str) -> ProximaRecord {
