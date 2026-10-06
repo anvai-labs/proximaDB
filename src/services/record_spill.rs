@@ -354,7 +354,23 @@ impl SpillRecordStorage {
         for oid in self.tombstones.iter() {
             merged.remove(oid.key());
         }
-        Ok(merged.into_values().collect())
+        // Mandate #16a: apply the canonical dead-record predicate at this read
+        // boundary. `ProximaRecord::is_dead` covers both the `Some(0)` tombstone
+        // and a TTL-expired `valid_to_ns`.
+        //
+        // A no-op on today's relational path, and deliberately added anyway. The
+        // store's own suppression is an IN-MEMORY set, so it protects only rows
+        // this process deleted; it says nothing about a record that arrives from
+        // a segment already carrying `valid_to_ns`. The predicate is idempotent
+        // and the mandate explicitly encourages the overlap, so the cost of
+        // having it is one comparison per row and the cost of lacking it is a
+        // resurrected row (TD-USUB-11's failure mode) the first time anything
+        // writes a dead record here.
+        let now_ns = now_ns();
+        Ok(merged
+            .into_values()
+            .filter(|r| !r.is_dead(now_ns))
+            .collect())
     }
 }
 
@@ -449,6 +465,7 @@ impl RecordStore for SpillRecordStorage {
         }
         // Newest segment first: a later flush shadows an earlier copy.
         let paths = self.segments.read().clone();
+        let now_ns = now_ns();
         for path in paths.iter().rev() {
             if let Some(found) = self
                 .read_segment(path)
@@ -456,6 +473,12 @@ impl RecordStore for SpillRecordStorage {
                 .into_iter()
                 .find(|r| r.oid == key.oid)
             {
+                // Mandate #16a here too. Newest segment first, so the first hit
+                // is authoritative: a dead hit means the row is GONE, not that an
+                // older segment should be consulted for a live copy.
+                if found.is_dead(now_ns) {
+                    return Ok(None);
+                }
                 return Ok(Some(found));
             }
         }
@@ -590,6 +613,14 @@ impl RecordStore for SpillRecordStorage {
         self.tombstones.clear();
         Ok(())
     }
+}
+
+/// Wall clock in nanoseconds, for the canonical dead-record predicate.
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 /// `true` when a `list` error means "this path does not exist" rather than a real
@@ -945,6 +976,55 @@ mod tests {
         }
         s.purge_durable_objects().await?;
         s.purge_durable_objects().await?;
+        Ok(())
+    }
+
+    /// Mandate #16a: a record that arrives from a segment already carrying a
+    /// tombstone `valid_to_ns` must NOT read back as live.
+    ///
+    /// The store's own suppression is an in-memory set, so it only covers rows
+    /// this process deleted. This drives the other way in: a record that is
+    /// already dead when it is written, so nothing is in `tombstones` and only
+    /// the canonical predicate can catch it. That is the shape a durable
+    /// tombstone will take once segments are discoverable (TD-USUB-1), and the
+    /// shape a TTL'd row would take today on any path that sets `valid_to_ns`.
+    ///
+    /// Asserted through BOTH read surfaces, because they filter independently.
+    #[tokio::test]
+    async fn a_dead_record_from_a_segment_does_not_read_back_live() -> Result<()> {
+        let s = store(Some(2)).await;
+
+        // `live` is an ordinary row; `gone` is already a tombstone when written.
+        s.upsert_record(record("live", "open")).await?;
+        let mut dead = record("gone", "open");
+        dead.valid_to_ns = Some(0);
+        s.upsert_record(dead).await?;
+
+        // Threshold 2 ⇒ both were flushed into a segment, and the in-memory
+        // tombstone set is empty because nothing was deleted through this store.
+        assert!(s.segment_count() > 0, "precondition: flushed to a segment");
+        assert_eq!(
+            s.resident_len(),
+            0,
+            "precondition: nothing resident, so reads come from the segment"
+        );
+
+        assert!(
+            s.get_record(&RecordKey::new("gone".to_string()))
+                .await?
+                .is_none(),
+            "a dead record from a segment must not be returned by get_record"
+        );
+        let scanned = s.scan_records(usize::MAX).await?;
+        assert!(
+            !scanned.iter().any(|r| r.oid == "gone"),
+            "a dead record from a segment must not appear in a scan: {:?}",
+            scanned.iter().map(|r| &r.oid).collect::<Vec<_>>()
+        );
+        assert!(
+            scanned.iter().any(|r| r.oid == "live"),
+            "the live row must still be readable"
+        );
         Ok(())
     }
 
