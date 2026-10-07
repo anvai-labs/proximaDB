@@ -1081,7 +1081,8 @@ fn parse_spill_seq(name: &str) -> Option<u64> {
 ///
 /// `EncryptedFilesystem` appends its `encrypted_extension` (default `.enc`) to
 /// every `read`/`write`/`write_if_absent`/`delete`/`exists` path, but its `list`
-/// is a bare passthrough that does NOT un-mangle what it returns. So a segment
+/// WAS a bare passthrough that did not un-mangle what it returned (fixed in
+/// `fc6fefe32`; see the note below). So a segment
 /// written as `spill-{seq}.parquet` is listed as `spill-{seq}.parquet.enc`.
 ///
 /// Without this detector that name is simply not spill-shaped, and the
@@ -1091,6 +1092,12 @@ fn parse_spill_seq(name: &str) -> Option<u64> {
 /// fails permanently; and purge reclaims nothing while reporting success. The
 /// wrapper is the layer at fault (TD-ENCFS-1), so this store refuses to serve
 /// rather than pretend the partition is empty.
+///
+/// **That wrapper was fixed in `fc6fefe32`, so this detector is now redundant
+/// defence-in-depth rather than a live mitigation.** It is kept deliberately: it
+/// would still trip on a future wrapper that renames objects on write without
+/// un-mangling `list`, which is a silent-emptiness failure this store cannot
+/// otherwise distinguish from a genuinely empty partition.
 ///
 /// Scope, stated so it is not mistaken for general: this detects ONE extra
 /// dot-separated extension, which is the only reachable shape today

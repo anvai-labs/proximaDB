@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-10-06, found by adversarial review of TD-USUB-1's segment discovery — the first code to depend on a listing round-tripping back to a readable path.
+| Status | **RESOLVED 2026-10-07** by `fc6fefe32` (#1954): `EncryptedFilesystem::list` now reports logical names, stripping `encrypted_extension` from `name`/`url`/`metadata.path` for files (directories are never mangled, since `create_dir` passes paths through). Pinned by five tests in that crate, which previously had none — including one that proves the round-trip by recording which path `exists` probes, and one that reproduces the WAL-manifest filter directly. Filed 2026-10-06, found by adversarial review of TD-USUB-1's segment discovery — the first code to depend on a listing round-tripping back to a readable path. NOTE: this TD shipped in #1953 marked Open because its fix landed in a separate PR that merged first; the status was stale on arrival and is corrected here.
 | Priority | **HIGH when filesystem encryption is configured**, which is a supported deployment (`FilesystemFactory::maybe_wrap_with_encryption` wraps every filesystem it hands out whenever `global_options.encryption` names an env var). Unreachable with encryption unconfigured.
 | Component | `crates/storage/proximadb-storage-encryption/src/filesystem.rs` (`actual_path`, `list`)
 | Relates to | TD-USUB-1 (segment discovery, which fails closed on the symptom), mandate #1
@@ -43,21 +43,42 @@ TD-USUB-1's spill-segment discovery identifies its objects by name
   restart fails, permanently**;
 * `purge_durable_objects` deletes nothing and returns `Ok(())`, so DROP leaks every segment.
 
-== Interim mitigation already in place
+== The mitigation that preceded the fix, now redundant
 
-The spill store does not attempt to compensate; it **fails closed**. `is_mangled_spill_segment`
-detects a spill name carrying one extra extension and refuses to serve the partition rather than
-report it empty, naming this TD in the error
-(`a_wrapper_mangled_segment_name_refuses_rather_than_reading_empty`). That converts silent data
-loss into a loud refusal; it does not make the spill store work under encryption.
+Before `fc6fefe32` the spill store did not attempt to compensate; it **failed closed**.
+`is_mangled_spill_segment` detects a spill name carrying one extra extension and refuses to serve
+the partition rather than report it empty, naming this TD in the error
+(`a_wrapper_mangled_segment_name_refuses_rather_than_reading_empty`). That converted silent data
+loss into a loud refusal; it did not make the spill store work under encryption.
 
-== How to apply
+With the wrapper transparent, that detector is **redundant defence-in-depth rather than a live
+mitigation**, and it is deliberately kept: it would still trip on a future wrapper that renames
+objects on write without un-mangling `list`, and on the two shapes this one's fix does not cover
+(a two-dot extension such as `.enc.v2`, or a dotless one), both reachable only through
+`with_extension`, which has no callers.
 
-1. Make `list` transparent: strip `encrypted_extension` from each returned entry's `name` and
-   `url` when present, so a listing round-trips through `read`/`delete`.
-2. Audit the wrapper's other passthrough methods for the same leak (`metadata`, `read_range`, and
-   any directory-walking helper) — the bug class is "forgot that `actual_path` applies here too".
-3. Add tests to that crate, which currently has **none** in `filesystem.rs`: a write→list→read
-   round-trip asserting the listed name is the caller's name, and a delete-by-listed-name.
-4. Once transparent, relax the spill store's detector to a plain skip, or keep it as a guard
-   against future wrappers and note that it should no longer fire.
+== What was done
+
+1. `list` made transparent — strips `encrypted_extension` from each entry's `name`, `url` and
+   `metadata.path`, for files only (`create_dir`/`create_dir_all` pass paths through, so a
+   directory name never carries the extension and is not ours to rewrite).
+2. **The other passthrough methods were audited and are already correct**, which is worth recording
+   because "forgot that `actual_path` applies here too" was the expected bug class and it is not
+   present: `read`/`read_range`/`read_ranges` route through `read_encrypted`; `write`,
+   `write_if_absent`, `write_atomic`, `append`, `sync_file`, `delete`, `exists`, `copy` and
+   `move_file` all route through `actual_path`; `metadata` both uses `actual_path` AND rewrites the
+   returned `metadata.path` back to the logical name; `open_file` always errors and `get_mmap`
+   always returns `Ok(None)`, so neither has path semantics. The default `remove_dir_all`, the one
+   trait method that consumes `list`, now hands `delete` a logical url, which mangles correctly.
+3. Five tests added to a file that had none, including a round-trip proven by recording which path
+   `exists` probes, and one that reproduces the WAL-manifest extension filter directly.
+4. The spill store's `is_mangled_spill_segment` is **kept** rather than relaxed, now documented as
+   redundant defence-in-depth — see the section above for why.
+
+== Residual, deliberately not fixed
+
+The wrapper marks encrypted files by extension, so a file genuinely named `x.enc` that is NOT
+encrypted is indistinguishable from an encrypted `x`. That ambiguity is inherent to extension
+marking and predates this work. Likewise the detector in the spill store catches only ONE extra
+dot-extension, so `.enc.v2` or a dotless `enc` would evade it — both reachable only through
+`EncryptedFilesystem::with_extension`, which has no callers in the repo.

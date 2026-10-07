@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-10-06, found while adopting this module as the precedent for TD-USUB-1's spill-segment discovery. The equivalent defects were fixed in the spill store in the same PR; these two remain here.
+| Status | **RESOLVED 2026-10-07.** `parse_seg_seq` now requires width 16 and the `[0-9a-f]` alphabet, and both resume sites use `checked_add` with an explicit refusal. Pinned by `seg_name_maps_to_exactly_one_sequence_and_sorts_by_it` (asserts the injectivity and ordering PROPERTIES, and mutation-kills the full removal plus all four half-fixes, including the uppercase-only one) and `index_load_refuses_an_exhausted_sequence_rather_than_overflowing`. Filed 2026-10-06, found while adopting this module as the precedent for TD-USUB-1's spill-segment discovery; the equivalent defects were fixed in the spill store in that PR.
 | Priority | **LOW.** Both require an object whose NAME is anomalous under the partition prefix, which nothing in the system writes — so neither is reachable from normal operation. Recorded because the names are attacker- or corruption-influenced inputs, and because this module is cited as the pattern to copy.
 | Component | `src/graph/cold_segment_store.rs` (`parse_seg_seq`, the two resume sites)
 | Relates to | TD-USUB-1 (spill-segment discovery, which copied this module's design), mandates #1 and #4
