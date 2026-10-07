@@ -5,9 +5,9 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **RESOLVED 2026-10-07.** `parse_seg_seq` now requires width 16 and the `[0-9a-f]` alphabet, and both resume sites use `checked_add` with an explicit refusal. Pinned by `seg_name_maps_to_exactly_one_sequence_and_sorts_by_it` (asserts the injectivity and ordering PROPERTIES, and mutation-kills the full removal plus all four half-fixes, including the uppercase-only one) and `index_load_refuses_an_exhausted_sequence_rather_than_overflowing`. Filed 2026-10-06, found while adopting this module as the precedent for TD-USUB-1's spill-segment discovery; the equivalent defects were fixed in the spill store in that PR.
+| Status | **RESOLVED 2026-10-07.** `parse_seg_seq` requires width 16 and the `[0-9a-f]` alphabet; the two resume sites AND the write site all refuse on exhaustion (`checked_add` at resume, `fetch_update` + requeue-on-refusal at the write, since `fetch_add` on an `AtomicU64` is not covered by `overflow-checks` and wraps in both profiles); and the same overflow class in `merge_segment_directory` (`TRAILER + dir_len`, both `offset + len` ranges) is checked. Pinned by `seg_name_maps_to_exactly_one_sequence_and_sorts_by_it` (asserts the injectivity and ordering PROPERTIES; mutation-kills the full removal and every half-fix tried, including uppercase-only), `index_load_refuses_an_exhausted_sequence_rather_than_overflowing`, and `write_refuses_at_sequence_exhaustion_and_requeues_the_batch`. Filed 2026-10-06, found while adopting this module as the precedent for TD-USUB-1's spill-segment discovery.
 | Priority | **LOW.** Both require an object whose NAME is anomalous under the partition prefix, which nothing in the system writes — so neither is reachable from normal operation. Recorded because the names are attacker- or corruption-influenced inputs, and because this module is cited as the pattern to copy.
-| Component | `src/graph/cold_segment_store.rs` (`parse_seg_seq`, the two resume sites)
+| Component | `src/graph/cold_segment_store.rs` (`parse_seg_seq`, the two resume sites, the write site in `write_segment`, and `merge_segment_directory`'s trailer/directory arithmetic)
 | Relates to | TD-USUB-1 (spill-segment discovery, which copied this module's design), mandates #1 and #4
 | Blocked by | Nothing.
 |===
@@ -61,20 +61,35 @@ sort of a listing equals sequence order:
 Fix: reject any width but 16 and any uppercase digit, mirroring
 `parse_spill_seq` in `src/services/record_spill.rs`.
 
-== Why this is filed rather than fixed
+== What was done
 
-Out of scope for the PR that found it (different modality, different module, and that PR already
-carries the relational substrate change plus a data-destruction fix in purge). Neither defect is
-reachable without an anomalous object name, so the cost of deferring is bounded. The reason to fix
-it at all is that this module is the *reference* implementation other code is told to copy — the
-spill store copied it and had to correct both on the way in.
+1. **`parse_seg_seq` requires the ALLOWED alphabet**, not the absence of a class someone thought
+   of: width exactly 16 and every byte in `[0-9a-f]`. The recipe this TD originally carried —
+   "reject any width but 16 and any uppercase digit" — was **insufficient**, because
+   `from_str_radix` also accepts a leading `+`, so `seg-+0000000000000ff.gcseg` still claimed the
+   sequence `seg-00000000000000ff.gcseg` owns, and `+` (0x2B) sorts ahead of `0` (0x30). That
+   half-fix shipped once in `parse_spill_seq` and had to be corrected; the original wording of this
+   section would have reproduced it. Recorded because TD-GCOLD-2 directs a future reader back here
+   to extract a shared helper.
+2. **Both resume sites use `checked_add`** with an explicit refusal, AND so does the write site.
+   Refusing only at resume was off by one: `fetch_add` on an `AtomicU64` is not covered by
+   `overflow-checks`, so it wraps silently in *both* profiles — a name carrying `u64::MAX - 1`
+   resumed to `MAX` without refusing, and two writes later the counter wrapped to 0 and re-issued
+   `seg-0000000000000000.gcseg`. The write site now uses `fetch_update` and requeues the pending
+   batch on refusal, so the class is closed at the point of consumption.
+3. **Tests assert the properties, not a rejection list:**
+   `seg_name_maps_to_exactly_one_sequence_and_sorts_by_it` (injectivity and
+   lexicographic-equals-numeric; mutation-kills the full removal and every half-fix tried, including
+   uppercase-only) and `index_load_refuses_an_exhausted_sequence_rather_than_overflowing`.
+4. **The same overflow class in `merge_segment_directory`** — `TRAILER + dir_len` and both
+   `offset + len` ranges, all derived from the segment's own trailer/directory — was folded in. In
+   release that sum wrapped, which made the truncation guard *pass* and issued a reversed
+   `get_range`.
 
-== How to apply
+== Residual
 
-1. `checked_add` at both resume sites, with an explicit error on exhaustion.
-2. Width + case rejection in `parse_seg_seq`.
-3. Unit tests mirroring the spill store's: name round-trip, rejection table (short, long, uppercase,
-   mixed, wrong prefix, wrong extension), lexicographic-equals-numeric order across a range that
-   includes `0x9`/`0x10` and `0xff`/`0x100`, and a refusal on `seg-ffffffffffffffff.gcseg`.
-4. Mutation-test each guard: unpadded names must break the order assertion, and the overflow test
-   must fail without `checked_add`.
+The heal-from-tails resume site is not directly tested: the loop calls `merge_segment_directory`
+first, so a max-named object with a garbage body fails on the trailer before reaching the resume.
+Reaching it needs a hand-built valid segment body. The construct is byte-identical to the covered
+sidecar site.
+

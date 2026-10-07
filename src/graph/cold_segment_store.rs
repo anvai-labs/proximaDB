@@ -138,7 +138,41 @@ impl ColdGraphSegmentStore {
         if pending.is_empty() {
             return Ok(());
         }
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        // `fetch_update`, not `fetch_add`. Atomics are NOT covered by
+        // `overflow-checks`, so `fetch_add` wraps silently in debug as well as
+        // release — which left the resume-site refusals off by one against their
+        // own stated invariant: a name carrying `u64::MAX - 1` resumes to
+        // `u64::MAX` without refusing, the next write consumes `MAX`, the
+        // counter wraps to 0, and the write after that re-issues
+        // `seg-0000000000000000.gcseg` and silently overwrites a live segment
+        // (`put_with_tier` is an unconditional PUT). Refusing at the point of
+        // CONSUMPTION closes the class; refusing only at resume cannot.
+        //
+        // `fetch_update` returns the PREVIOUS value on success, matching
+        // `fetch_add`'s contract, and leaves the counter untouched on refusal.
+        //
+        // Note it refuses once the counter REACHES `u64::MAX`, so that sequence
+        // is never issued — the closure must be able to produce the next value,
+        // and a counter that cannot advance has no way to represent
+        // "MAX consumed" without a second flag. Burning one sequence out of
+        // 2^64 to make a wrap structurally impossible is the right trade.
+        let seq = match self
+            .seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                cur.checked_add(1)
+            }) {
+            Ok(previous) => previous,
+            Err(current) => {
+                // Requeue, as every other failure path in this function does:
+                // the records were `mem::take`-n out of the buffer by the
+                // caller, so dropping them here would lose buffered writes.
+                self.requeue(pending)?;
+                return Err(anyhow::anyhow!(
+                    "cold segment store: segment sequence space exhausted (counter at \
+                     {current}); refusing to write rather than wrap onto a live segment name"
+                ));
+            }
+        };
         // Deterministic, collision-free key; not time-based (offline-build constraint).
         let seg_path = format!("{SEG_PREFIX}/seg-{seq:016x}.gcseg");
 
@@ -801,6 +835,58 @@ mod tests {
         assert_eq!(
             got[2].as_ref().map(|r| r.oid.as_str()),
             Some("graph/g/node/c")
+        );
+    }
+
+    /// The WRITE site must refuse at exhaustion too, and requeue the batch.
+    ///
+    /// Refusing only at the resume sites was off by one: `fetch_add` on an
+    /// `AtomicU64` is not covered by `overflow-checks`, so it wraps silently in
+    /// BOTH profiles. A name carrying `u64::MAX - 1` resumes to `u64::MAX`
+    /// without tripping the resume refusal, the next write consumes `MAX`, the
+    /// counter wraps to 0, and the write after that re-issues
+    /// `seg-0000000000000000.gcseg` over a live segment.
+    ///
+    /// Also asserts the records are REQUEUED rather than dropped — every other
+    /// failure path in `write_segment` does that, because the caller has already
+    /// `mem::take`-n them out of the buffer.
+    #[tokio::test]
+    async fn write_refuses_at_sequence_exhaustion_and_requeues_the_batch() {
+        let backing = ProximaObjectStore::from_url("memory://").expect("mem");
+        let store = ColdGraphSegmentStore::new(backing, ObjectAccessTier::Cool);
+
+        // Parked one below the ceiling: that write succeeds and leaves the
+        // counter at `u64::MAX`, after which the next must refuse rather than
+        // wrap. (Sequence `u64::MAX` is deliberately never issued — see the
+        // `fetch_update` note at the write site.)
+        store.seq.store(u64::MAX - 1, Ordering::Relaxed);
+        store
+            .upsert_record(record("graph/g/node/a"))
+            .await
+            .expect("upsert");
+        store
+            .flush()
+            .await
+            .expect("the write at MAX-1 is still legal");
+
+        store
+            .upsert_record(record("graph/g/node/b"))
+            .await
+            .expect("upsert");
+        let err = store
+            .flush()
+            .await
+            .expect_err("the write after exhaustion must refuse, not wrap to 0");
+        assert!(
+            err.to_string().contains("sequence space exhausted"),
+            "the error must name the cause; got: {err}"
+        );
+
+        // The refused batch is back in the buffer, not lost.
+        assert_eq!(
+            store.lock_buffer().expect("buffer").records.len(),
+            1,
+            "a refused write must requeue its records"
         );
     }
 
