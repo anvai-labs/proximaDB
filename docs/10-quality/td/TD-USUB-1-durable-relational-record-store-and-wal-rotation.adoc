@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **LSN plumbing + unflushed-minimum tracking landed 2026-10-03** — `RecordStore` gained defaulted `upsert_record_at_lsn` / `min_unflushed_lsn` (11 implementors untouched); `write_mutations` now binds the `append_operations` result it used to discard and passes each record its durable LSN positionally (length-guarded); `SpillRecordStorage` tracks `oid → lsn` for resident rows and **fails closed** if any resident row is untracked. Nothing truncates yet, so this cannot lose data — it makes the safe truncation point *computable*. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **TD-USUB-13 FIXED 2026-10-05** — the flush/delete resurrection race is closed (flush serialized against delete and purge), so it no longer blocks 2b. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with "wire the two production call sites"** below — see "Design decided"; (ii) **catalog registration of segments** — this must come FIRST: nothing rediscovers a segment, so no durable artefact in one is recoverable until the catalog records where it is (see "Tombstone persistence is gated on segment DISCOVERY") — an in-memory tombstone is the only durable evidence of a post-flush delete, so `min_unflushed_lsn` fails closed while any exists; truncation cannot progress until they are durable, (iii) **persist tombstones into the segment** — unobservable and unsafe to act on before (ii), (iv) wire the two production call sites, (v) slice 2b (WAL truncation), (vi) slice 2c (compaction). **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **LSN plumbing + unflushed-minimum tracking landed 2026-10-03** — `RecordStore` gained defaulted `upsert_record_at_lsn` / `min_unflushed_lsn` (11 implementors untouched); `write_mutations` now binds the `append_operations` result it used to discard and passes each record its durable LSN positionally (length-guarded); `SpillRecordStorage` tracks `oid → lsn` for resident rows and **fails closed** if any resident row is untracked. Nothing truncates yet, so this cannot lose data — it makes the safe truncation point *computable*. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **TD-USUB-13 FIXED 2026-10-05** — the flush/delete resurrection race is closed (flush serialized against delete and purge), so it no longer blocks 2b. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with "wire the two production call sites"** below — see "Design decided"; (ii) **catalog registration of the segment PREFIX** — narrowed by the discovery work below: the segment *set and its order* are now recovered from the object names by listing, so what the catalog still owes is only *where* to list, which WAL replay cannot reconstruct (`CanonicalWalEntry` carries no namespace); (iii) **persist tombstones into the segment** — now genuinely unblocked by discovery, and still the gate on truncation, because an in-memory tombstone is the only evidence of a post-flush delete and `min_unflushed_lsn` fails closed while any exists, (iv) wire the two production call sites, (v) slice 2b (WAL truncation), (vi) slice 2c (compaction). **Segment discovery landed 2026-10-06** — segments are named `spill-{seq:016x}.parquet` (zero-padded hex, so a lexicographic sort of a listing *is* chronological order) with the sequence resumed past durable state, replacing the per-instance UUID nonce that bought uniqueness at the cost of recoverable order; `ensure_discovered` rebuilds the segment list in order at the head of every path that depends on it, and **fails closed** on a segment-shaped name it cannot place rather than silently serving a subset. **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -506,6 +506,389 @@ it was **mutation-tested to confirm it is not decorative**: with the filters rem
 written already-dead is returned live by `get_record`. That is the guard which makes
 segment-resident tombstones safe whenever discovery lands, and it is the one piece of this slice
 that does not depend on it.
+
+== Segment discovery as landed (2026-10-06) — and what registration still owes
+
+Discovery is now implemented, and splitting it from catalog registration was forced by a finding:
+**the two halves of "find my segments" are different durable facts with different owners.**
+
+[cols="1,3"]
+|===
+| Fact | Who must supply it, and why
+
+| *Where* — the prefix a partition's segments live under
+| **The catalog.** WAL replay reaches `DirectTableRecordWriter::partition` carrying only the
+  entry's `tenant_id` and `collection_id`; `CanonicalWalEntry` has no namespace field, so a
+  `DrPathBuilder` prefix is **not reconstructible at recovery**. Still open.
+
+| *What, and in what order* — the segment set and its sequence
+| **The object names.** Recovered by listing the prefix and sorting. Landed here.
+|===
+
+Taking order from the names rather than from a catalog-side list is the load-bearing choice, and
+it is a safety argument, not a convenience one: the window between "object landed" and "list
+updated" is unavoidable (two writes, no transaction across them). If order lived in the list, a
+segment written but not yet registered would be **invisible** — harmless today, and silent data
+loss the moment 2b truncates the WAL that still holds its rows. With order intrinsic to the name,
+such a segment is found anyway, and found *in the right place*. The catalog then supplies only the
+prefix, which is a single durable fact per partition rather than a list that must stay in step
+with every flush.
+
+=== The finding: the nonce that fixed overwrite blocked order
+
+Slice 2a's wiring (2026-09-27) named segments `spill-{uuid}-{seq:010}.parquet`. The UUID was added
+for a real defect — once `base_path` became a pure function of `(tenant, collection)`, a second
+instance restarted its counter at 0 and silently clobbered the first's segment. The nonce fixed
+that. But it made the segment set **unorderable from a listing**, because a lexicographic sort of
+`spill-{uuid}-…` sorts on the random nonce.
+
+Order is load-bearing in all three read paths — `merged_records` inserts oldest→newest so the
+later copy wins, while `get_record` and `delete_record` both walk `paths.iter().rev()` newest-first
+— and it was correct only because `flush()` recorded it in RAM as it went. So the naming bought
+uniqueness at the cost of the one property discovery needs.
+
+`src/graph/cold_segment_store.rs` — the precedent this TD has named since it was filed — already
+solved both at once: `seg-{seq:016x}.gcseg`, a zero-padded hex sequence **resumed** past the
+highest name found on open. Padded hex makes lexicographic order equal numeric order; resumption
+makes the name fresh across instances. Mandate #12: the primitive existed and was cited, and the
+nonce was a parallel solution to half the problem. Segments are now
+`spill-{seq:016x}.parquet` and the nonce is gone.
+
+=== What landed
+
+* `spill_segment_name` / `parse_spill_seq`, with the hex width fixed at 16 and **any other width
+  rejected** — a short name would admit a sequence whose lexicographic order disagrees with its
+  numeric order, which is the only property the name exists to carry.
+* `ensure_discovered`, a once-per-store async listing that populates `segments` in sequence order
+  and resumes `next_segment` with `fetch_max`. Called at the head of `flush`, `merged_records`,
+  `get_record` and `delete_record`; it acquires `flush_guard` itself, so a listing cannot straddle
+  a publish (the TD-USUB-13 shape), which is why no call site may hold that guard when calling it.
+* **Fail-closed on an unplaceable segment.** `is_spill_segment` (prefix+suffix) stays deliberately
+  *permissive* so purge reclaims every object this store could have written, including a
+  legacy-named one — otherwise DROP leaks it forever. `parse_spill_seq` is *strict*. Discovery
+  treats a segment-shaped name it cannot place as an **error**, never a skip: skipping is wrong
+  twice over, because rows held only in that segment would read as absent, and `delete_record`
+  would see a shorter segment list and could skip a tombstone it needs.
+
+=== The resurrection this closes, and the one it does not
+
+`delete_record` decides whether to record a tombstone from `!segments.is_empty()`. Adding
+discovery *without* putting it ahead of that decision would have created a new resurrection: a
+delete issued as a new instance's first operation sees an empty list, skips the tombstone, and a
+later read then discovers the flushed copy and serves the deleted row. The call site at the head
+of `delete_record` is what prevents it, and
+`a_delete_as_the_first_touch_still_suppresses_a_flushed_row` fails if that call is removed.
+
+Note what discovery does **not** yet change: tombstones are still in-memory only, so a restart
+still loses them, and `min_unflushed_lsn` still fails closed while any exists. Discovery is what
+makes persisting them *mean* something — it does not persist them. That remains the next item,
+now genuinely unblocked.
+
+=== A listing is not scoped to your prefix — and purge was already acting as if it were
+
+Found by adversarial review of the discovery change, and it turned out to name a
+pre-existing data-destruction bug in the purge that landed 2026-09-30.
+
+Discovery's first cut decided membership from `DirEntry::name` and re-rooted it under the
+partition prefix. That is sound for the local backend and unsound for every object store:
+
+[cols="1,1,2"]
+|===
+| Backend | `list` scope | `name` / `url`
+
+| local (`local.rs`)
+| a DIRECTORY, non-recursive (`read_dir`)
+| basename / `file://{abs}`
+
+| S3, Azure, GCS
+| a KEY PREFIX, **recursive**
+| basename (`key.rsplit('/').next()`) / full key (`s3://…`, `az://…`, `gs://…`)
+|===
+
+GCS additionally passes the prefix through **raw**, with no trailing delimiter
+(`ListObjectsRequest { prefix }`), and the caller strips the trailing `/`. So for a partition at
+`…/order`, a GCS listing also returns `…/orders/…` — a *different table's* objects, whose
+basenames parse as perfectly good segment names. Two consequences:
+
+* **Discovery** adopted another table's object under its own prefix: every read of `order` then
+  fails on a key that does not exist, and `delete_record` sees a spurious `has_segments` and
+  tombstones a never-flushed row — which pins `min_unflushed_lsn` fail-closed permanently and
+  blocks 2b.
+* **Purge** (`purge_durable_objects`, landed 2026-09-30) filters on `name` and deletes
+  `entry.url`. On GCS, dropping table `order` therefore **deletes table `orders`' segments.**
+  That is data destruction, and it is reachable with the `gcp` feature plus the spill gate on.
+
+Both are the same defect, so the fix is one primitive, `list_partition_objects`, consumed by
+discovery and purge alike (mandate #12).
+
+**The first version of that primitive was itself wrong, in the dangerous direction**, and a second
+review round caught it. It decided membership by comparing the full `DirEntry::url`
+(scheme-stripped) against the prefix. Those two strings come from different places: `base_path` is
+whatever the caller passed, while `url` is reconstructed by the backend. They disagree in real
+configurations:
+
+* **Local, bare-relative `base_path` + `root_dir`.** `local.rs` takes its relative-url branch only
+  when the caller's path literally starts `./` or `file://./`. `DrPathBuilder::root_prefix()` emits
+  a *bare* relative `data/{tenant}/{ns}/{coll}/`, so with a `root_dir` set the listing reports an
+  absolute `file://{root}/data/…` while the prefix is `data/…`.
+* **S3/Azure percent-encoding.** `ObjPath` encodes `~ % # [ ] { } ^ ` " < > | * ?`, every one of
+  which `DrPathBuilder::validate_id` permits in an identifier. For a table named `a~b` the write
+  key and the listed location agree (`…/a%7Eb/…`) while the prefix does not.
+
+A mismatch took the "not ours" branch and **skipped our own segments**: reads report flushed rows
+absent, `delete_record` records no tombstone, and purge deletes nothing and returns `Ok(())` —
+silent loss with no fail-closed arm firing, since nothing is unparseable and nothing is nested.
+Only the next flush fails, on `write_if_absent` reusing sequence 0.
+
+So membership is no longer a string comparison at all. **A listing proposes candidate sequences;
+each candidate is confirmed by the existence of the canonical path this store would itself read,
+write and delete** — `{base_path}/{spill_segment_name(seq)}`. Every operation resolves that string
+through one resolver per backend (`LocalFileSystem::resolve_path`; `parse` on the object stores),
+so "this path exists" and "we can read it" are the same question, independent of how a listing
+spells things. A url that already matches canonically is a zero-round-trip fast path; the cost
+otherwise is one existence check per spill-shaped candidate, paid once per store.
+
+This also removed the `saw_nested` fail-closed arm rather than weakening it. That arm could not
+fire on the local backend at all (a non-recursive `read_dir` never reports a nested object, only
+its directory), and under existence-based membership there is no unplaceable-but-ours case: every
+object this store could have written is at exactly one path. A nested object is simply not at that
+path, so it is neither served nor deleted — same outcome as before for purge, and now honestly
+described.
+
+Tested with a filesystem double that reproduces the object-store listing contract on the local
+backend (`ListInjectFs`): `discovery_ignores_objects_from_a_sibling_prefix`,
+`purge_only_deletes_objects_under_its_own_prefix` (asserts the sibling's *bytes* survive, not that
+purge returned Ok), and `discovery_ignores_an_object_nested_below_the_prefix`. The sibling's object
+deliberately carries a *different* sequence from our own first flush — with the same one, a
+basename-based implementation produces the same canonical path for both and dedups the sibling
+away, so the tests would pass while the defect was present.
+
+The dangerous direction has its own regression test,
+`discovery_finds_our_segments_when_the_listing_spells_them_differently`, which runs a
+bare-relative `base_path` against a `root_dir`-anchored local filesystem — the exact shape above —
+and asserts that both our segments are discovered, that the newest value wins, and that purge
+deletes them. Mutation-tested against the superseded url-comparison membership, which fails it
+("our own flushed row must be discovered despite the url spelling").
+
+Two further corrections from the same round:
+
+* **The zero-padding claim was false of the shipped code.** Comments said a lexicographic sort of
+  the names is what gives chronological order, "the property all three read paths depend on".
+  Discovery sorts *numerically* on the parsed sequence; nothing sorts names. What the fixed width
+  is actually load-bearing for is `parse_spill_seq`, which rejects any other width — so an
+  unpadded name is a hard error rather than a mis-ordered segment. The padding is kept (it makes
+  that rejection meaningful, and keeps names correct for any future listing-order consumer) with
+  the claim corrected.
+* **`delete_record`'s segment probe was a third read boundary with no `is_dead` filter**
+  (mandate #16a). #1952 applied the canonical predicate at `merged_records` and `get_record` and
+  missed this one, so deleting a row whose only segment copy is already dead reported that it
+  removed something — a wrong affected-row count, which the mandate names among the surfaces the
+  predicate must cover. Fixed, with `deleting_an_already_dead_segment_row_reports_no_removal`
+  pinning it (mutation-tested).
+
+=== The naming change is a flag day, and that is a deliberate pre-GA choice
+
+Mandate #8 wants a format change mixed-read-safe with the reader defaulting to legacy when the
+marker is absent. This change does the opposite on purpose: `is_spill_segment` still *matches* the
+slice-2a name `spill-{uuid}-{seq:010}.parquet`, but `parse_spill_seq` rejects it and discovery
+turns that into a hard error, so a partition that flushed under the previous naming becomes
+unreadable and unwritable on every path.
+
+Accepted because the gate is default-OFF, has no production caller, and the previous naming existed
+for nine days (2026-09-27 to 2026-10-06) — so no deployment can hold such objects, and the pre-GA
+directive is replace-in-place. The escape hatch is that purge stays permissive: a DROP reclaims the
+legacy objects, which is why `is_spill_segment` must NOT be tightened to match `parse_spill_seq`.
+Recorded here and in `ENV_GATE_REGISTRY` because an undisclosed flag day is the actual mandate-#8
+violation; the flag day itself is a judgement call.
+
+=== Two residual costs and one residual resurrection, stated rather than implied
+
+Recorded because an earlier draft of this section claimed the failed-purge case was the *only*
+remaining resurrection, which is not true.
+
+* **Concurrently-live instances (outside the single-writer design).** `drop_partition_state` only
+  removes the map entry, so a caller still holding the old `Arc` keeps writing while the next
+  access builds a second store over the same prefix. Discovery runs once per store, so a stale
+  store's flush that lands *after* the new store's listing is invisible to it: a `delete_record`
+  for a row living only in that segment records no tombstone and returns `false`, and a third
+  instance then discovers the segment and serves the deleted row. Pre-discovery the same race lost
+  the row instead. Neither is acceptable, and neither is in scope: one store per
+  `(tenant, collection)` per process and one process per WAL is the design, and the fix if that
+  ever changes is a lease, not a nonce — a nonce makes names unique while destroying the ORDER all
+  three read paths depend on, which is the trade this change deliberately reversed.
+* **A LIST on first touch of every partition.** Discovery adds one round-trip before the first
+  read, write or delete a partition serves — and on an object store that LIST is *recursive* over
+  the whole collection prefix, so it paginates at 1000 keys and returns the WAL/PAX/index subtrees
+  too (all correctly skipped, but paid for), plus one existence check per spill-shaped candidate
+  whose url does not match canonically. Under the co-design mandate round-trips are the
+  dominant cost term, so this is the change's real cost, and it is not yet in the query-scoped
+  I/O trace. It is paid once per store, not per query.
+* **A partially-written orphan becomes a permanent read failure.** `flush`'s comment concedes only
+  storage cost for an object that landed before the write failed. On the local backend
+  `write_if_absent` creates the file and *then* writes it, so a mid-write ENOSPC/EIO leaves a
+  truncated object under a canonical name. Before discovery that object was invisible (the segment
+  list was RAM-only); now it is adopted and decoded on every read. Truncation routes to the legacy
+  reader (Parquet needs `PAR1` at both ends), so the outcome is a decode error — the partition is
+  unreadable until a DROP, not corrupted. S3/Azure are immune (`PutMode::Create` is atomic).
+* **Discovery widens the window in which tombstones are minted.** `delete_record` inserts a
+  tombstone whenever `segments` is non-empty, and `tombstones` is unbounded, not counted toward
+  `flush_threshold`, and cleared only by a re-insert or a purge. Before discovery a fresh instance
+  had no segments until it flushed, so its early deletes minted none; now the first delete can.
+  That is the intended resurrection fix, but it means a DELETE-heavy workload grows the heap by a
+  vector the module's "bounds resident memory within a process run" claim does not cover. Pre-existing
+  in shape, amplified here, and worth bounding before the gate is enabled.
+* **A permanent discovery error re-LISTs per request.** `OnceCell::get_or_try_init` does not cache
+  failures — correct for a transient LIST error, since the next call retries. But for a permanent
+  one (an unplaceable name, a nested object, an exhausted sequence) every read, write and delete
+  pays a LIST and then fails, and does so while holding `flush_guard`, so the partition
+  serializes on a failing LIST. Fail-closed is the right outcome; the cost of *staying* closed is
+  unbounded. Bounding it (cache the permanent classes, keep retrying the transient ones) is
+  deferred, and the escape hatch is a DROP.
+
+Also noted in passing, pre-existing and not introduced here: `SpillRecordStorage` never overrides
+`RecordStore::flush`, whose default is a no-op documented as something a buffered store "MUST
+override". The spill store's `flush` is an *inherent* method with a different signature, so
+`RecordStore::flush()` through `Arc<dyn RecordStorage>` does nothing. Not a data-loss path today
+(the WAL replays every resident row), but the "flush always discovers first" reasoning above
+covers only the inherent method.
+
+=== The deadlock invariant is enforced by prose, deliberately
+
+`ensure_discovered` acquires `flush_guard` inside the `OnceCell` initializer, so a caller that
+invoked it *while already holding* that guard would deadlock permanently — the holder awaits the
+cell while the initializer awaits the guard. Every call site is correct today (verified by tracing
+all three holders: `flush` and `delete_record` discover before taking it, `purge_durable_objects`
+never discovers), and after the first success the cell short-circuits without touching the guard
+at all, so the window is the first call only.
+
+There is no cheap structural guard: `tokio::sync::Mutex` exposes no ownership query, so neither a
+`debug_assert` nor a type-state can detect the violation. The alternative — dropping the guard —
+is not available, because purge CLEARS `segments` under it and a discovery whose listing straddled
+a purge would republish deleted paths. So the invariant stays a comment, and this records why that
+is a choice rather than an oversight.
+
+=== Round 5: a guard that passed its own tests while failing the property it existed for
+
+The strict `parse_spill_seq` was added to make the name→sequence map injective, and it did not.
+`u64::from_str_radix` **accepts a leading `+`**, so `spill-+00000000000000f.parquet` parsed to 15
+— sixteen bytes, no uppercase, both checks satisfied — exactly as
+`spill-000000000000000f.parquet` does. Two objects claiming one sequence, which is the precise
+condition the guard's own comment named. And `+` is `0x2B`, sorting *before* `0` (`0x30`), so such
+a name also sorts ahead of sequence 0 while carrying 15, falsifying the ordering property the
+fixed width exists to preserve.
+
+The error has a name worth keeping: **the guard enumerated a disallowed class instead of requiring
+the allowed one.** "Reject uppercase" is a guess about what else `from_str_radix` tolerates;
+"every byte is in `[0-9a-f]`" is the alphabet `spill_segment_name` actually emits. The fix
+requires the alphabet. The test now asserts the **property** — that no two accepted names claim
+one sequence — rather than only enumerating rejections, because the previous guard passed a
+rejection table that happened not to contain the input that broke it.
+
+Found by *executing* `from_str_radix`, not by reading it. That is the same lesson as the one
+already recorded for greps: a claim about a primitive's behaviour is verified by running it.
+
+=== Round 5: the dead-record predicate was missing from the RESIDENT arms too
+
+Mandate #16a was applied to the segment arms by #1952 and to `delete_record`'s segment probe
+earlier in this change — all three of which only ever see *flushed* copies. The **memtable** arms
+of `get_record` and `delete_record` had no filter, so with the gate's threshold unset (nothing
+ever flushes) a row written already-dead read back **live**, and deleting it reported an affected
+row. Neither existing dead-record test could catch it: both flush first, by construction.
+
+Now filtered, with `a_dead_resident_record_is_neither_read_nor_counted_as_deleted` keeping
+everything resident, and `now_ns` taken once per `get_record` so the memtable and segment arms
+judge liveness against the same instant. Recorded because the same defect class has now been
+found at three different layers of this one module — the general form is "the predicate was
+applied where the author was looking, not at every boundary".
+
+=== Round 5: three more claims-versus-code defects, and one pre-existing orphaned doc
+
+* A test doc still asserted "membership is existence of the canonical path", the rule rejected one
+  round earlier — sitting on the regression test for the very rule under dispute.
+* `list_partition_objects`'s headline said it returns "every segment object this store wrote … as
+  canonical paths in sequence-bearing form" and that a path is "always
+  `{base_path}/{spill_segment_name(seq)}` … never from the listing's own strings". Both are false
+  of the legacy arm, which re-roots the listing's basename because a name with no sequence has
+  nothing else to identify it. The *where* guarantee — the one the safety argument actually needs
+  — holds for both arms, and is now what the doc claims.
+* "The delimiter is a no-op elsewhere" is literally true and misleading: `ObjPath::from` discards
+  it, so S3/Azure are scoped only because **`object_store` re-appends a delimiter itself** when
+  listing a prefix. That is upstream behaviour this repo does not pin, and the local-backend test
+  double cannot model it — so if it changed, those two backends would acquire the sibling-prefix
+  availability problem with no test failing here. Now stated.
+* A third doc block in this file was found split across two tests (pre-existing), with the first
+  half landing mid-sentence on an unrelated test. Reattached.
+
+=== Round 6: three states collapsed into two, and a guard that guards nothing
+
+**The defect.** `delete_record`'s resident filter, added one round earlier, was defeated by its own
+fall-through. `was_resident` yielded `false` for *absent* **and** for *resident-but-dead*, so a dead
+resident copy fell through to the segment probe, found a stale **live** copy of the same oid, and
+reported that the DELETE removed a row — while `get_record` and `merged_records`, on identical
+state, both report the row absent. The comment introduced with that filter asserted the opposite.
+
+Neither test of that filter could reach the state: one never flushes (so it exits on
+`!has_segments`), the other puts the dead copy *in the segment* with nothing resident. The missing
+case was dead-resident **over** live-segment, now pinned by
+`a_dead_resident_copy_shadows_a_live_segment_copy_on_every_surface` (mutation-tested: collapsing
+the states back fails it with "delete_record must agree too — not re-count the row from the
+segment"). `delete_record` also now takes ONE `now_ns` for both arms, the consistency property the
+file already claimed for `get_record`.
+
+Not reachable through SQL today: the relational DELETE routes to `delete_record`, never to an
+upsert of a dead record, and no production caller reads the returned bool. It is reachable through
+the `RecordStore` API the tests use, which is the premise mandate #16a argues from.
+
+**A guard that turned out not to be one.** Mutation testing showed the `seen` dedup in
+`list_partition_objects` is a **cost** guard, not a correctness guard: removing it changes nothing
+observable, because `ensure_discovered` independently refuses a path already in `segments` and
+purge tolerates a repeat delete as absent. The test asserting it was corrected to pin the
+*observable* property and to say that two independent layers deliver it. Recorded because the
+original comment ("a duplicate would silently double the reads") read as though it guarded an
+observed case, and because this is the second claim this programme has corrected about *why*
+something is safe rather than *whether* it is.
+
+**What round 6 confirmed sound**, by brute force rather than reading: the membership rule and the
+name primitive. 1536 single-byte mutants across all 16 hex positions were accepted only when
+byte-identical to the canonical name, so name→sequence is a bijection over the accepted language;
+lexicographic order equals numeric order; no path serves or deletes a foreign object; no path
+silently skips one of our own. That part has now survived two consecutive rounds unbroken, having
+been wrong three times.
+
+Three further doc corrections: `PartitionObject` claimed its objects were found "directly under"
+the prefix, which the file's own nested-object test contradicts (the PATH is directly under it; the
+listing entry need not have been); "only the local backend lists a *directory*" omitted HDFS's
+`LISTSTATUS`; and a pre-existing test doc still described the removed `spill-{uuid}-{seq:010}`
+naming and a `write` with `options: None`.
+
+=== Discovery reclassifies the deletion-obligation item as a CORRECTNESS gate
+
+Discovery introduces no new gap, but it changes what an existing one costs, and that moves an
+item's priority rather than its content.
+
+The partition prefix is a pure function of `(tenant, collection)`, and with
+`PROXIMADB_WAL_OBJECT_ID_KEY` default-OFF the collection key is the bare table **name**. So a
+table dropped and recreated under the same name reuses its predecessor's prefix — the same
+property that forced the obligation marker to record *exact paths* rather than a prefix
+(2026-10-02). DROP purges the prefix before releasing the partition, so a surviving object
+requires that purge to have **failed or crashed part-way** — precisely the window open item (i)
+exists to close. Note also that WAL replay's `DropTable` arm calls only `drop_partition_state`,
+never purge, and its comment asserts "a table recreated post-drop starts empty".
+
+Before discovery, an object surviving that window cost **wasted storage**. With discovery it is
+found and **served**: a dropped table's rows surface in a recreated one. So:
+
+* The **deletion-obligation marker + drain is a correctness prerequisite for enabling the spill
+  gate**, not hygiene deferrable behind it. The Open list keeps it first for that reason now,
+  rather than only because it was discovered first.
+* `an_unpurged_prefix_is_served_to_the_next_store_at_that_path` pins the premise (a second store
+  over a non-empty prefix serves what the first left) rather than asserting resurrection as
+  intended behaviour, so the hazard is a failing precondition on the record and not a hypothetical.
+
+This is reachable only through an already-known gap, in a subsystem that is default-OFF and still
+has no production caller — but it is the reason discovery alone does not license turning the gate
+on. The honest sequencing is: obligation drain → enable. Discovery is what makes a durable
+artefact *mean* something; the drain is what makes the prefix *trustworthy*.
 
 == Evidence gate (mandate #6)
 
