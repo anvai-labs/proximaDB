@@ -244,7 +244,21 @@ impl ColdGraphSegmentStore {
                 let mut max_seq: u64 = 0;
                 for (oid, loc) in snapshot {
                     if let Some(seq) = parse_seg_seq(&loc.segment) {
-                        max_seq = max_seq.max(seq + 1);
+                        // `checked_add`: `seq` comes from a NAME, so
+                        // `seg-ffffffffffffffff.gcseg` would otherwise panic in
+                        // debug and WRAP in release — and a wrap resumes at 0,
+                        // where the next `put_with_tier` (an unconditional PUT,
+                        // with no conditional-create backstop) silently
+                        // overwrites a live segment.
+                        let Some(next) = seq.checked_add(1) else {
+                            return Err(anyhow::anyhow!(
+                                "cold segment store: segment sequence space exhausted \
+                                 ('{}' carries the maximum); refusing to resume rather \
+                                 than reuse a live segment name",
+                                loc.segment
+                            ));
+                        };
+                        max_seq = max_seq.max(next);
                     }
                     self.index.insert(oid, loc);
                 }
@@ -302,7 +316,17 @@ impl ColdGraphSegmentStore {
         let mut max_seq = covered_through;
         for (seq, path) in &uncovered {
             self.merge_segment_directory(path).await?;
-            max_seq = max_seq.max(seq + 1);
+            // See the `checked_add` note in the index-snapshot path: the
+            // sequence is name-derived, and a wrap would resume onto a live name
+            // that an unconditional PUT then overwrites.
+            let Some(next) = seq.checked_add(1) else {
+                return Err(anyhow::anyhow!(
+                    "cold segment store: segment sequence space exhausted ('{path}' \
+                     carries the maximum); refusing to resume rather than reuse a live \
+                     segment name"
+                ));
+            };
+            max_seq = max_seq.max(next);
         }
         self.seq.store(max_seq, Ordering::Relaxed);
         tracing::info!(
@@ -338,12 +362,26 @@ impl ColdGraphSegmentStore {
             u64::from_le_bytes(tail[0..8].try_into().map_err(|_| {
                 anyhow::anyhow!("cold segment store: segment `{path}` bad dir_len")
             })?);
-        if size < TRAILER + dir_len {
+        // `checked_add`/`checked_sub`, because `dir_len` is read from the
+        // SEGMENT'S OWN TRAILER — the same untrusted input this module's
+        // sequence handling now guards. `TRAILER + dir_len` wraps in release
+        // (`overflow-checks` is off there, on in dev/test), and a wrap makes the
+        // truncation guard *pass*: for `size = 1000`, `dir_len = 0xFFFF…F5` the
+        // sum wraps small, `dir_start` wraps to 995, and the range below becomes
+        // `995..984` — reversed — instead of the refusal this guard exists to
+        // produce. Debug builds would panic instead (mandate #4).
+        let Some(dir_end) = TRAILER.checked_add(dir_len) else {
+            return Err(anyhow::anyhow!(
+                "cold segment store: segment `{path}` declares a directory length that \
+                 overflows ({dir_len}); refusing to trust the trailer"
+            ));
+        };
+        if size < dir_end {
             return Err(anyhow::anyhow!(
                 "cold segment store: segment `{path}` directory is truncated"
             ));
         }
-        let dir_start = size - TRAILER - dir_len;
+        let dir_start = size - dir_end;
         let dir_bytes = self
             .store
             .get_range(path, dir_start..(size - TRAILER))
@@ -438,7 +476,18 @@ impl RecordStore for ColdGraphSegmentStore {
         }
         // 2. Segment index → ranged GET of just this record's bytes.
         if let Some(loc) = self.index.get(&key.oid) {
-            let range = loc.offset..(loc.offset + loc.len);
+            // `loc.offset`/`loc.len` are bincode-decoded from the segment
+            // directory, i.e. untrusted for the same reason as `dir_len` above.
+            let Some(end) = loc.offset.checked_add(loc.len) else {
+                return Err(anyhow::anyhow!(
+                    "cold segment store: record location in `{}` overflows \
+                     (offset {} + len {})",
+                    loc.segment,
+                    loc.offset,
+                    loc.len
+                ));
+            };
+            let range = loc.offset..end;
             let bytes = self
                 .store
                 .get_range(&ObjectPath::from(loc.segment.clone()), range)
@@ -475,10 +524,26 @@ impl RecordStore for ColdGraphSegmentStore {
             }
         }
         for (segment, items) in by_segment {
+            // Same untrusted input as the single-record path: `offset`/`len`
+            // come from the segment directory, so the sum is checked. Collected
+            // through a `Result` rather than a plain `map` so one corrupt entry
+            // refuses the batch instead of wrapping into a reversed range.
             let ranges: Vec<std::ops::Range<u64>> = items
                 .iter()
-                .map(|(_, loc)| loc.offset..(loc.offset + loc.len))
-                .collect();
+                .map(|(_, loc)| {
+                    loc.offset
+                        .checked_add(loc.len)
+                        .map(|end| loc.offset..end)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "cold segment store: record location in `{segment}` overflows \
+                             (offset {} + len {})",
+                                loc.offset,
+                                loc.len
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let bufs = self
                 .store
                 .get_ranges(&ObjectPath::from(segment.clone()), &ranges)
@@ -532,15 +597,111 @@ impl RecordStore for ColdGraphSegmentStore {
     }
 }
 
-/// Parse the `seq` out of a `graph-cold-seg/seg-{seq:016x}.gcseg` path.
+/// Width of the hex sequence in a segment name, fixed so a lexicographic sort of
+/// names equals their numeric order.
+const SEG_SEQ_HEX_WIDTH: usize = 16;
+
+/// Sequence encoded in a segment's name, or `None` if the name is not one this
+/// store could have written.
+///
+/// Strict on purpose. The writer emits exactly `seg-{seq:016x}.gcseg`, so
+/// sixteen LOWERCASE hex digits is the whole language; anything else is not ours
+/// and must not be assigned a sequence.
+///
+/// Two gaps this closes, both of which broke the one property the name exists to
+/// carry — that a name maps to exactly one sequence, and that sorting names
+/// equals sorting sequences:
+///
+/// * **No width check.** `seg-9.gcseg` parsed to 9 while sorting *after*
+///   `seg-10.gcseg`.
+/// * **No alphabet check.** `from_str_radix` accepts either case AND a leading
+///   `+`, so `seg-00000000000000FF.gcseg` and `seg-+0000000000000ff.gcseg` each
+///   claimed the sequence `seg-00000000000000ff.gcseg` owns. Note the shape of
+///   the fix: it requires the ALLOWED alphabet rather than rejecting classes
+///   someone happened to think of — "reject uppercase" would still have
+///   admitted `+`, and `+` is 0x2B, sorting ahead of `0`.
 fn parse_seg_seq(path: &str) -> Option<u64> {
     let name = path.rsplit('/').next()?;
     let hex = name.strip_prefix("seg-")?.strip_suffix(".gcseg")?;
+    if hex.len() != SEG_SEQ_HEX_WIDTH {
+        return None;
+    }
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
     u64::from_str_radix(hex, 16).ok()
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The name format must carry its sequence unambiguously, and sorting names
+    /// must equal sorting sequences.
+    ///
+    /// Asserts the PROPERTY, not just a table of rejections: the previous guard
+    /// (none at all) and a half-guard that merely rejected uppercase would both
+    /// pass a rejection list that happened to omit the input which breaks them.
+    #[test]
+    fn seg_name_maps_to_exactly_one_sequence_and_sorts_by_it() {
+        // Round-trip over a range plus the boundaries.
+        for seq in [0u64, 1, 9, 10, 15, 16, 255, 256, 4095, 4096, u64::MAX] {
+            let name = format!("seg-{seq:016x}.gcseg");
+            assert_eq!(parse_seg_seq(&name), Some(seq), "{name} must round-trip");
+            assert_eq!(
+                parse_seg_seq(&format!("{SEG_PREFIX}/{name}")),
+                Some(seq),
+                "a full path must parse by its final component"
+            );
+        }
+
+        // Injectivity: no name outside the canonical rendering may claim a
+        // sequence that a canonical name owns.
+        for seq in [0u64, 15, 255, 4096, u64::MAX] {
+            let canonical = format!("seg-{seq:016x}.gcseg");
+            for candidate in [
+                format!("seg-+{seq:015x}.gcseg"),
+                format!("seg-{seq:015X}.gcseg"),
+                format!("seg-{seq:016X}.gcseg"),
+                format!("seg-{seq:x}.gcseg"),
+            ] {
+                if candidate == canonical {
+                    continue;
+                }
+                assert_ne!(
+                    parse_seg_seq(&candidate),
+                    Some(seq),
+                    "{candidate} must not claim the sequence {canonical} owns"
+                );
+            }
+        }
+
+        // Lexicographic order equals numeric order.
+        let names: Vec<String> = (0..600u64).map(|q| format!("seg-{q:016x}.gcseg")).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(sorted, names, "name order must equal sequence order");
+
+        // Shapes that are not ours.
+        for bad in [
+            "seg-9.gcseg",                  // unpadded
+            "seg-000000000000000.gcseg",    // 15 digits
+            "seg-00000000000000000.gcseg",  // 17 digits
+            "seg-.gcseg",                   // no sequence
+            "seg-00000000000000FF.gcseg",   // uppercase
+            "seg-+0000000000000ff.gcseg",   // leading plus: parses via from_str_radix
+            "seg--0000000000000ff.gcseg",   // leading minus
+            "seg- 0000000000000ff.gcseg",   // leading space
+            "seg-0x00000000000000.gcseg",   // radix prefix
+            "seg-zzzzzzzzzzzzzzzz.gcseg",   // not hex
+            "other-0000000000000001.gcseg", // not our prefix
+            "seg-0000000000000001.sst",     // not our extension
+        ] {
+            assert_eq!(parse_seg_seq(bad), None, "{bad} must not parse");
+        }
+    }
     use super::*;
 
     fn mem_store() -> ColdGraphSegmentStore {
@@ -640,6 +801,53 @@ mod tests {
         assert_eq!(
             got[2].as_ref().map(|r| r.oid.as_str()),
             Some("graph/g/node/c")
+        );
+    }
+
+    /// A sequence read from a NAME must not be incremented blindly.
+    ///
+    /// `seg-ffffffffffffffff.gcseg` is a well-formed name carrying `u64::MAX`,
+    /// so `seq + 1` panicked in debug (mandate #4) and WRAPPED in release — and
+    /// a wrap resumes at 0, where the next segment write silently overwrites a
+    /// live object, because this store writes with `put_with_tier` (an
+    /// unconditional PUT) and not `put_if_absent`.
+    ///
+    /// Site 1 (the sidecar load) is reachable with no I/O beyond one planted
+    /// index entry, which is why this exercises that path: the heal-from-tails
+    /// site would need a VALID segment body under the max name, so it fails on
+    /// the trailer before reaching the resume.
+    #[tokio::test]
+    async fn index_load_refuses_an_exhausted_sequence_rather_than_overflowing() {
+        let backing = ProximaObjectStore::from_url("memory://").expect("mem");
+
+        // A sidecar whose only entry points at the maximum-sequence name.
+        let snapshot: Vec<(String, RecordLoc)> = vec![(
+            "graph/g/node/a".to_string(),
+            RecordLoc {
+                segment: format!("{SEG_PREFIX}/seg-{:016x}.gcseg", u64::MAX),
+                offset: 0,
+                len: 1,
+            },
+        )];
+        let bytes = bincode::serialize(&snapshot).expect("encode sidecar");
+        backing
+            .put_with_tier(
+                &ObjectPath::from(INDEX_KEY),
+                Bytes::from(bytes),
+                ObjectAccessTier::Cool,
+            )
+            .await
+            .expect("plant sidecar");
+
+        let store = ColdGraphSegmentStore::new(backing, ObjectAccessTier::Cool);
+        let err = store
+            .load_index()
+            .await
+            .expect_err("an exhausted sequence must refuse, not overflow or wrap");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sequence space exhausted"),
+            "the error must name the cause; got: {msg}"
         );
     }
 
