@@ -86,6 +86,13 @@ the cargo ecosystem's `ignore` list with
 `update-types: ["version-update:semver-major"]`. They stop being reopened weekly,
 and the upgrades live in this TD instead.
 
+Three of the four are `0.x` crates, which still counts as major: Dependabot treats a
+change in the **leftmost non-zero** component as `semver-major`, so `0.32 -> 0.35`,
+`0.21 -> 0.41` and `0.27 -> 0.33` are all major, matching cargo's own semver. That is
+corroborated empirically rather than assumed — all four were opened as individual PRs
+*outside* the `cargo-minor-patch` group, while the 62 in-range crates of #1958 went
+into it.
+
 Scoped to the four named crates rather than `dependency-name: "*"` deliberately:
 a blanket major-ignore would also mask a major bump we *do* want to see. The
 accepted cost is that a new 0.x major elsewhere will rot the same way — close it
