@@ -33,9 +33,32 @@ N=20 000, 200 queries, `IVF_K=64`:
 Σfetch_rounds=200`. Better recall, **−33% round trips**, −7.2% bytes — a strict
 win, no trade.
 
-(The baseline arm shows mild run-to-run variance — an earlier run of the same
-configuration measured 0.9860 / 6 338 539. The probe arm was byte-identical
-across runs. Neither is ledgered; see "How to apply".)
+=== Measurement hygiene: the figures move with L0 segment count
+
+Three consecutive runs of the identical command agree closely — the probe arm is
+**byte-identical** (2 range GETs, 5 861 939 bytes, recall 0.9905 in all three)
+and the baseline varies by ~0.2% in bytes (6 326 526 / 6 316 695 / 6 316 552) and
+by one recall sample (0.9860 / 0.9884 / 0.9884).
+
+A fourth run of the *same command* gave wildly different numbers: baseline 5
+GETs / 1 596 718 bytes, probe 4 GETs / 840 467 bytes. The cause is visible in the
+GET trace. The three stable runs read one L0 segment plus its L1
+(`L0_20261008T234633`, `L1_20261008T234633`); the outlier read **two** L0
+segments (`L0_20261008T234423` and `L0_20261008T234424`) plus an L1. Segment names
+carry second granularity, so a write that straddles a wall-clock second boundary
+emits an extra L0, which changes the compaction input, the resulting L1 layout,
+and therefore the read plan — fewer, larger ranged GETs become more, smaller
+ones.
+
+So **no figure from this harness is comparable unless the L0 segment count is
+reported alongside it.** That is a precondition for the work below, not a footnote:
+a before/after comparison that silently differs in segment count measures the
+boundary, not the change. It also makes the "multiple segments after compaction"
+hypothesis below concrete rather than speculative — segment count demonstrably
+moves the I/O by 4x here.
+
+None of these numbers is ledgered in `BENCHMARK_EVIDENCE.toml`; they are
+workstation observations recorded to direct the work, not to claim performance.
 
 N=100 000, 1000 queries, same `IVF_K=64` (the test's **default** N):
 
@@ -53,17 +76,44 @@ false by 57 110 bytes/query.
 
 == The finding
 
-**The probe's pruning is fine; its engagement collapses.** The prune ratio is
-*identical* at both scales — 3 200 / 12 800 cells at N=20k and 272 / 1 088 at
-N=100k, i.e. **25% probed, 75% pruned in both cases**. So corpus size does not
-degrade the probe's selectivity at all; it only changes how often the probe runs.
-The 983 non-engaging queries take the armed-but-missed **whole-Region-A
-fallback**, which is the GET budget the probe exists to avoid, and 1.7%
-engagement cannot pay for its own footer work — which is why bytes go *up*.
+**What actually changes is how often the probe runs.** 200 of 200 queries record
+a probe at N=20k; 17 of 1000 at N=100k. The rest take the armed-but-missed
+**whole-Region-A fallback**, which is the GET budget the probe exists to avoid,
+and engagement that thin cannot pay for its own footer work — which is why bytes
+go *up* at 100k.
 
-That the selectivity is constant while the outcome inverts is the whole finding:
-any fix aimed at `nprobe`, `IVF_K` or the read budget is aimed at the wrong
-quantity.
+=== Correction: the "constant prune ratio" is not a measurement
+
+An earlier revision of this TD made the 25%-probed-at-both-scales figure its
+headline — "corpus size does not degrade the probe's selectivity" — and derived
+from it that "any fix aimed at `nprobe`, `IVF_K` or the read budget is aimed at
+the wrong quantity". **Both are wrong, and the ratio is forced by configuration
+rather than measured.**
+
+Per engaged query, `cells_total` is `k_c`, and the test pins `PROXIMADB_IVF_K=64`
+(12 800/200 = 64; 1 088/17 = 64). `cells_probed` is `coarse_probe_nprobe(64)`,
+and the test sets no `PROXIMADB_PAX_READ_COARSE_NPROBE`, so it falls to
+`geometric_nprobe(64, defaults)` = `ceil(sqrt(64) × 2.0)` = **16**
+(`default_nprobe_multiplier() = 2.0`, `nprobe_max = 0` = uncapped) — confirmed
+3 200/200 = 16 and 272/17 = 16.
+
+16/64 = 25% at *every* corpus size, by construction. Two data points of a
+constant carry no information about selectivity, and the derived directive is
+backwards: `nprobe` and `IVF_K` are precisely the two quantities that set the
+ratio. The earlier revision even contradicted itself, listing `IVF_K=64` giving
+~1 560 rows/cell as a leading candidate cause one section later.
+
+=== The signal that WAS in the data and went unanalysed
+
+`Σfetch_rounds` per engaged query **doubled**: 200/200 = 1 at N=20k, 34/17 = 2 at
+N=100k. That is a depth regression in the dimension ADR-033 ranks dominant, and
+it contradicts "only engagement changes" — among the queries that *do* engage,
+each now costs twice the round trips. It is the one number here that is measured
+rather than configured, and it should be the first thing the work below explains.
+
+`probed_rows` — the third field of `record_probe_trace`'s 4-tuple, and the only
+one that could carry real selectivity information — is not reported by the
+harness at all. Print it before drawing any further conclusion about pruning.
 
 So the knee is not in `nprobe` and not in the budget. It is in whether the probe
 engages at all, and that is the quantity to instrument before tuning anything —
@@ -91,16 +141,27 @@ unengaged probe measures nothing; neither does one over an untrained index.
 
 == How to apply
 
-. **Split the miss reason first**, before changing any policy. Replace `.ok()`
-  with a branch that records an error distinctly from a decline (the durable
-  surface already carries a `whole_region_fallback` flag — it needs a sibling
-  for "probe errored"). Without this every hypothesis below is unfalsifiable.
-. Then attribute the 983: re-run at N=100k with the split in place and report the
-  error/decline split. Candidate causes, in the order they are cheap to test —
-  `IVF_K=64` giving ~1 560 rows/cell at 100k vs ~310 at 20k (so a probe that must
-  touch most cells to reach top-k); multiple segments after compaction where only
-  some carry a trained A0 directory; a footer-plan cache miss making the probe
-  decline rather than pay an extra GET.
+. **Split the miss reason first**, before changing any policy. `segment_format.rs`
+  calls `coarse_probe_survivors(...).await.ok().flatten()`, collapsing ~15
+  descriptive `Err` paths and 8 `return Ok(None)` declines into one "no probe",
+  and `record_ivf_probe_durable(0,0,0,0,true)` fires for both. Nothing else
+  distinguishes them: the only `warn!` on that path is an unrelated non-fatal
+  footer-overlap case, and there is no error counter. Record the error distinctly
+  from the decline — AND record WHICH decline, since the eight reasons are also
+  mutually indistinguishable, so splitting `Err` alone will not attribute the
+  983. Until then every hypothesis below is unfalsifiable.
+. **Report `probed_rows` and per-query `fetch_rounds`.** The harness prints
+  neither per query. `fetch_rounds` already shows the doubling above and is the
+  one measured signal here; `probed_rows` is the only field that can speak to
+  selectivity at all.
+. Then attribute the 983, with candidates ordered by cost to test: multiple
+  segments after compaction where only some carry a trained A0 directory (which
+  would also explain the doubled `fetch_rounds`, and makes the per-segment-read
+  nature of `probe_trace` load-bearing); a footer-plan cache miss making the
+  probe decline rather than pay an extra GET; and `k_c`/`nprobe` sizing —
+  `IVF_K=64` gives ~1 560 rows/cell at 100k against ~310 at 20k, so a probe that
+  must touch most cells to reach top-k. That last one is a genuine candidate, NOT
+  excluded by the 25% figure — see the correction above.
 . **Do not relax the byte ratchet to make the test green.** `bytes_probe <
   bytes_base` is the correct contract: a probe that reads more bytes than the
   scan it replaces has no reason to exist. The test being red at the default N is

@@ -281,6 +281,24 @@ fn next_object_id() -> String {
 
 fn collection(id: &str, base_location: String) -> Collection {
     Collection {
+        // NOTE: this is the collection NAME, not a decimal catalog object id, and
+        // that is a KNOWN DEFECT tracked by TD-SIFTCOMPACT-1 — deliberately not
+        // fixed here.
+        //
+        // Compaction is armed by default for untagged collections (`AppendBulk`
+        // is the default storage profile), and the flush/compaction-admission
+        // boundaries are fail-closed on a non-decimal id, so every flush past
+        // the L0 threshold fails admission — logged at `warn!` and then
+        // swallowed, because a compaction failure never fails the flush. These
+        // ratchets have therefore been measuring an L0-only, uncompacted layout.
+        //
+        // Minting an id here is a ONE-LINE change that these tests do not
+        // survive: measured at N=100 000, compaction then runs and the very
+        // first query fails `assert_single_vector_access` — the ratchets encode
+        // a single-physical-access assumption that a compacted layout breaks.
+        // Fixing it therefore means deciding what these ratchets should measure
+        // and re-baselining their published numbers, which is TD-SIFTCOMPACT-1's
+        // job, not this change's.
         id: id.to_string(),
         config: Some(CollectionConfig {
             name: id.to_string(),
@@ -1918,19 +1936,23 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         measured_base > 0 && measured_probe > 0,
         "no queries measured"
     );
-    // A non-empty trace is NOT evidence that the probe is doing its job: measured
-    // at the default N=100_000 it engages on 17 of 1000 queries (1.7%) and
-    // `!is_empty()` certifies that happily. The remaining 983 take the
-    // whole-Region-A fallback — the GET budget the probe exists to avoid — so a
-    // presence check would let a probe that is effectively off pass as engaged.
-    // Assert a proportion instead. See TD-IVF2ENGAGE-1 for why this currently
-    // fails at N=100_000 while passing at N=20_000.
+    // A non-empty trace is NOT evidence that the probe is doing its job: at the
+    // default N=100_000 it records 17 entries against 1000 measured queries and
+    // `!is_empty()` certifies that happily, while the rest take the
+    // whole-Region-A fallback the probe exists to avoid. Assert a proportion.
+    //
+    // Denominator is `measured_probe`, not `qcount`: `measure()` skips a query
+    // that returned no hits, so against `qcount` a search regression that
+    // emptied half the results would fail HERE with a false engagement
+    // diagnosis, masking the real defect.
+    //
+    // CAVEAT, and why this is a floor rather than a ratio: entries are pushed
+    // per SEGMENT READ, not per query, so with multiple v3 segments the count is
+    // not a query count in either direction. Read it as "the probe ran at least
+    // this often". Attributing the misses needs the per-query split that the
+    // swallowed `Err` currently prevents — TD-IVF2ENGAGE-1.
     let engaged = probe_trace.len();
-    let engagement_floor = (qcount + 1) / 2; // > 50% of measured queries
-    assert!(
-        engaged >= engagement_floor,
-        "coarse probe engaged on only {engaged}/{qcount} queries (floor {engagement_floor});          the rest fell back to the whole-Region-A scan — see TD-IVF2ENGAGE-1"
-    );
+    let engagement_floor = (measured_probe + 1) / 2; // >= 50% of MEASURED queries
     assert!(
         recall_probe >= recall_base - recall_drop,
         "probe recall@{TOP_K} = {recall_probe:.4} dropped > {recall_drop} vs baseline {recall_base:.4}"
@@ -1938,6 +1960,15 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
     assert!(
         bytes_probe < bytes_base,
         "probe bytes/q = {bytes_probe} must read fewer than baseline {bytes_base}"
+    );
+    // LAST on purpose. Asserted before the two ratchets above, this masked the
+    // byte-ratchet failure that is the actual finding: the run died on
+    // engagement and never reported what the probe cost in bytes.
+    assert!(
+        engaged >= engagement_floor,
+        "coarse probe recorded only {engaged} probe(s) against {measured_probe} \
+         measured queries (floor {engagement_floor}); the rest fell back to the \
+         whole-Region-A scan — see TD-IVF2ENGAGE-1"
     );
     unsafe {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
