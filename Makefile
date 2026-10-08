@@ -462,7 +462,7 @@ integration-full: build-release
 	@echo "Stopping server..."
 	pkill -f proximadb-server || true
 
-# Cloud object-store emulator tier validation (TD-168/TD-173): Azurite/MinIO/fake-gcs
+# Cloud object-store emulator tier validation (TD-168/TD-173): Azurite/LocalStack/fake-gcs
 # via Docker. The exact path the qa-gate CI job runs (single source of truth).
 # Requires docker + aws/az CLIs + curl.
 cloud-emulator-test:

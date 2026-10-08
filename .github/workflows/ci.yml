@@ -1820,7 +1820,7 @@ jobs:
   # path: the same put_with_tier_* validation that runs at develop→qa now also runs
   # on the introducing feat→develop PR. Path-gated (skipped otherwise) and in
   # ci-success.needs so it gates when it runs (skipped ⇒ pass). Requires Docker
-  # (Azurite/MinIO/fake-gcs), preinstalled on ubuntu-latest.
+  # (Azurite/LocalStack/fake-gcs), preinstalled on ubuntu-latest.
   object-store-emulator-tests:
     name: Object-store Cool tier (emulators)
     runs-on: ubuntu-24.04

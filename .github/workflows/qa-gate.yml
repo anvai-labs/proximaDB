@@ -258,7 +258,7 @@ jobs:
         run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --nocapture
 
   # Validate the object-store access-tier cost lever (TD-168/TD-173) against REAL
-  # cloud APIs via emulators — Azurite (Azure), MinIO (S3), fake-gcs (GCP) — the
+  # cloud APIs via emulators — Azurite (Azure), LocalStack (S3), fake-gcs (GCP) — the
   # "develop→qa upfront validation" for the cold-payload tier. The default CI only
   # exercises put_with_tier on memory:// (where the tier degrades to a plain put),
   # so a native-class mapping regression that a real cloud API would 4xx is
@@ -310,7 +310,7 @@ jobs:
         run: bash scripts/run_cloud_emulator_tests.sh --qa
 
   cloud-emulator-object-store:
-    name: Cloud object-store emulators (Azurite/MinIO/fake-gcs)
+    name: Cloud object-store emulators (Azurite/LocalStack/fake-gcs)
     runs-on: ubuntu-latest
     # The --all scope compiles the full main crate under CARGO_BUILD_JOBS=2 (see
     # scripts/run_cloud_emulator_tests.sh) — a middle ground that stays off the 16GB
