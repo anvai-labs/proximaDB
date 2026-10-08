@@ -620,3 +620,16 @@ tdd-precommit:
 	@$(MAKE) clippy
 	@$(MAKE) test-tdd-unit
 	@echo "✅ All TDD pre-commit checks passed!"
+
+# ── Documentation site (mkdocs + Material) ────────────────────────────────────
+# `docs-build` is what CI gates on: --strict so a broken link or a page missing
+# from the nav fails here rather than shipping a wrong site.
+.PHONY: docs-install docs-serve docs-build
+docs-install:
+	pip install -r requirements-docs.txt
+
+docs-serve: ## Serve the user-facing docs site locally on :8000
+	mkdocs serve
+
+docs-build: ## Build the docs site, failing on broken links (CI gate)
+	mkdocs build --strict

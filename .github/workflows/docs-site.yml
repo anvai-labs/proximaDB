@@ -1,0 +1,92 @@
+# User-facing documentation site (mkdocs + Material).
+#
+# Two jobs, matching the feat -> develop -> qa -> main promotion flow:
+#   * `build`  — runs on every docs-touching PR and on develop. `--strict`, so a
+#     broken link or a page missing from the nav FAILS rather than shipping a
+#     silently wrong site. This is the gate.
+#   * `deploy` — publishes to GitHub Pages from `main` only, so the public site
+#     tracks the released branch rather than in-flight work.
+#
+# Path-filtered on purpose: CI runners are a shared finite resource, and a docs
+# site rebuild has no bearing on a Rust-only change.
+name: Docs Site
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.txt'
+      - '.github/workflows/docs-site.yml'
+  push:
+    branches: [develop, main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.txt'
+      - '.github/workflows/docs-site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-site-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build docs (strict)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+      - name: Install pinned docs toolchain
+        run: pip install -r requirements-docs.txt
+      - name: Build (strict)
+        # --strict turns nav/link warnings into failures. If this breaks on a
+        # link into docs/12-design or docs/10-quality, the fix is NOT to relax
+        # strict: those trees are excluded by design (see mkdocs.yml), so link
+        # to a published page or drop the link.
+        run: mkdocs build --strict
+      - name: Upload site artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: site/
+          retention-days: 7
+
+  deploy:
+    name: Deploy to GitHub Pages
+    # `main` only — the published site follows the released branch.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+      - run: pip install -r requirements-docs.txt
+      - run: mkdocs build --strict
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+      - id: deployment
+        uses: actions/deploy-pages@v4

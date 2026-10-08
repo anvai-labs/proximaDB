@@ -1,0 +1,103 @@
+# ProximaDB user-facing documentation site.
+#
+# SCOPE IS DELIBERATE. The repo holds 977 doc files, but 541 of them live in
+# `docs/10-quality` and `docs/12-design` — TDs, ADRs and design records written
+# for engineers working in this repo, not for users. Publishing those would make
+# the site a changelog of internal debt. This site covers the user-facing tree
+# only: 00-product, 01-quick-start, 02-guides, 03-api-reference, 04-operations,
+# 05-concepts, 11-usecases.
+#
+# FORMAT CAVEAT (TD-DOCSITE-1): the corpus is ~85% AsciiDoc (829 .adoc vs
+# 148 .md) and mkdocs is Markdown-native. The nav below lists the Markdown pages
+# that render today; the 33 user-facing .adoc files are tracked for conversion.
+# `asciidoctor` is NOT a build dependency — rather than bolt on a fragile
+# plugin, the user-facing .adoc files get converted to Markdown incrementally.
+site_name: ProximaDB
+site_description: Cloud-native vector and graph database for RAG and knowledge graphs
+repo_url: https://github.com/anvai-labs/proximaDB
+edit_uri: edit/develop/
+docs_dir: docs
+
+# Everything that is NOT the user-facing site. mkdocs walks the whole docs_dir,
+# so without this it pulls in 541 internal TD/ADR files plus the archive — and
+# strict mode then fails on their stale cross-links, which is noise from pages
+# that were never meant to be published. `*.adoc` is excluded wholesale because
+# mkdocs cannot render AsciiDoc at all (TD-DOCSITE-1 tracks converting the
+# user-facing ones).
+exclude_docs: |
+  _archive/
+  _internal/
+  06-internals/
+  09-roadmap/
+  10-quality/
+  12-design/
+  agent-rules/
+  architecture-diagrams/
+  openapi/
+  *.adoc
+  README.md
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  # Mermaid via superfences rather than the mermaid2 plugin: the diagrams in
+  # these pages are ```mermaid fences, and Material renders them natively this
+  # way with no extra runtime dependency.
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Quick Start:
+      - Overview: 01-quick-start/index.md
+      - Install: 01-quick-start/install.md
+      - First Query: 01-quick-start/first-query.md
+      - Architecture Basics: 01-quick-start/architecture-basics.md
+  - Guides:
+      - Overview: 02-guides/index.md
+      - Vector Search: 02-guides/vector-search.md
+      - Vector Index Selection & Benchmarking: 02-guides/vector-index-selection-and-benchmarking.md
+      - Multi-Model Joins: 02-guides/multi-model-joins.md
+      - API Surface & Performance: 02-guides/api-surface-performance-guide.md
+      - Platform Packages: 02-guides/platform-packages.md
+  - Concepts:
+      - Overview: 05-concepts/index.md
+      - Quantization: 05-concepts/quantization.md
+      - Query Planner: 05-concepts/query-planner.md
+      - Unified WAL: 05-concepts/unified-wal.md
+  - API Reference: 03-api-reference/index.md
+  - Operations:
+      - Overview: 04-operations/index.md
+      - "Release: v0.2.1 macOS": 04-operations/release/v0.2.1-macos-support.md
