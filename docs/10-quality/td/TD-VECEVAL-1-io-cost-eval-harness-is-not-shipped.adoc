@@ -1,0 +1,80 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-VECEVAL-1: The recall+I/O-cost harness is a repo test, so users cannot evaluate on their own data
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-08 while documenting PAX-IVF vs AXIS-IVF selection; the guide can tell users what to measure but not give them a tool they can run.
+| Priority | **MEDIUM.** No defect; a packaging gap that blocks the "evaluate before you adopt" motion and keeps our own cost evidence un-reproducible outside the repo.
+| Component | `tests/sift_pax_recall_ratchet_test.rs`, `apps/proximadb-ann-bench`, `docs/02-guides/vector-index-selection-and-benchmarking.md`
+| Relates to | ADR-033 (cost spine), TD-087 / TD-088 (cold-path + point-read cost), TD-SEARCH-3 (Azure budget evidence), mandate #6 (measure, don't assert)
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+The instrument that measures what actually matters on object storage — **recall@k
+AND GETs/query AND bytes/query in the same run** — exists and works, but lives in
+`tests/sift_pax_recall_ratchet_test.rs`. Consequences:
+
+* A user cannot run it. It needs the repo, the toolchain, `--features io-trace`,
+  and `cargo test`; it is not in any released artifact.
+* It is `#[test]`-shaped, so it reports via `--nocapture` prose rather than a
+  machine-readable artifact a user could diff across configurations.
+* The shipped benchmark binary, `apps/proximadb-ann-bench`, is the *classic*
+  ann-benchmarks shape — recall vs QPS across algorithms on standardized
+  datasets. It does **not** report the I/O-cost dimension, which is the term our
+  own cost spine ranks first (DEPTH ≫ WIDTH ≫ BYTES ≫ CPU).
+
+So we publish a guide telling users the decision rests on GETs/query, and ship no
+tool that prints GETs/query.
+
+== What is already right (do not rebuild it)
+
+* **Dataset contract is already user-generic:** plain-binary TEXMEX
+  `.fvecs`/`.ivecs`, parsed with std only (no HDF5 dependency), and when ground
+  truth is absent or a subset is inserted it computes a **brute-force oracle over
+  the inserted rows**. So arbitrary customer corpora already work.
+* **The measurement is implemented:** per-query GET / ranged-GET / bytes /
+  compute-ms, via `PROXIMADB_COUNT_FS_IO` + the `CountingFileSystem` seam and the
+  `io_trace` records, plus recall against the oracle, plus a bytes/query budget
+  assertion.
+* **Cloud budgets are reachable** through `PROXIMADB_OBJECT_STORE_URL`, which is
+  how the 4 MiB-vs-8 MiB budget difference was measured.
+
+== How to apply
+
+1. **Add a subcommand to the existing `proximadb-ann-bench`** (do not create a
+   third benchmark vehicle) — e.g. `proximadb-ann-bench io-cost` — that reuses
+   the test's `.fvecs`/`.ivecs` parser, brute-force oracle, and counter
+   snapshotting. Extract those three into a small lib module both callers share,
+   rather than copying them.
+2. **Emit a machine-readable artifact** (JSON/CSV: `corpus_n`, `dim`, `top_k`,
+   `nprobe`, `budget_target_bytes`, `recall_at_k`, `gets_per_query`,
+   `bytes_per_query`, `bytes_per_get`) so a user can sweep and diff. Prose
+   `eprintln!` is why our own numbers are hard to compare run-to-run.
+3. **Keep the ratchet test as the gate.** It should call the same shared module,
+   so the thing CI gates on and the thing users run cannot drift apart — the
+   failure mode this TD family keeps hitting.
+4. Document the subcommand in
+   `docs/02-guides/vector-index-selection-and-benchmarking.md`, replacing that
+   guide's `cargo test` instructions once the binary exists.
+
+== Adjacent defect found while filing this
+
+`sift_ivf2_coarse_probe_recall_ratchet` **fails a precondition** and cannot run:
+
+[source]
+----
+compaction admission requires a catalog-resolved collection object id for
+"sift_ivf2_gate": flush collection_id must be a decimal catalog object id,
+got "sift_ivf2_gate": invalid digit found in string
+----
+
+It passes a collection *name* where a decimal catalog object id is now required.
+Because the test is `#[ignore]`d, CI never runs it, so the drift was invisible —
+the same ungated-rot pattern as the stale `rg_layout` "default OFF" comments. The
+clustered arm must be exercised through `sift_ivf2_probe_release_bakeoff_eval`
+until it is fixed. Worth folding into item 3: a gate that cannot run is not a
+gate.

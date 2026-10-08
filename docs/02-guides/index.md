@@ -36,6 +36,7 @@ flowchart TB
 | Guide | Description | Time |
 |-------|-------------|------|
 | [Vector Search](./vector-search.md) | Semantic search, filtering, hybrid search | 15 min |
+| [Vector Index Selection & Benchmarking](./vector-index-selection-and-benchmarking.md) | PAX IVF vs AXIS IVF, I/O budgets, measuring recall + GETs on your own dataset | 20 min |
 | [Multi-Model Joins](./multi-model-joins.md) | Cross-model SQL queries | 20 min |
 
 ## Data Model Guides
