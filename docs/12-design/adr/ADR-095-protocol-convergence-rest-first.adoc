@@ -157,3 +157,61 @@ fusion-search + collections.rs recall-tune now go through the ports; the
 entities.rs orchestrator site stays concrete until the Phase 3.3 move
 (relocates `entity_orchestrator` types with the file). Ratchet 52 → 51;
 route census identical.
+
+== Execution status (2026-10-07) — branch `decomp/rest-first-modularization`
+
+Landed (14 commits, rebased on develop @ 97c033394, pushed to origin):
+
+* PR-0.1 — this ADR + committed baselines (route census 237, v2-import
+  ratchet, crates→root ratchet at 7, storage-up-edges ceiling 197).
+* PR-1.1 — unified error envelope: foundation `proximadb-api-error` (tonic
+  mapping included — orphan rules force it into the enum's own crate).
+* PR-3.1a — route census instrument (`scripts/route_census.py`, snapshot at
+  `docs/diagnostics/route-census-baseline.txt`) + v2 root-import ratchet
+  (`scripts/check_v2_root_imports.sh`, wired into check-layering.sh).
+* PR-3.1b — `FusionSearchPort` + `VectorOpsPort` growth + `WriteRoutingPort`/
+  `RecallProbePort`; FusionSearch/RecallTune sites dispatch through ports;
+  full `RecordOpsPort` impl (8 methods, previously unimplemented).
+* PR-3.1c/d — advisor_observations relocated to AXIS management; quant
+  facade re-exports dropped (import unification).
+* PR-3.2a — **schema.rs moved** to `crates/platform/proximadb-api/src/rest/
+  v2/` (first v2 file across; RestAppState + root FromRef sub-state pattern
+  proven; route census identical).
+* PR-3.3a — **query.rs + sql.rs moved**; DML lock-conflict 409 mapping now
+  rides the foundation envelope (root QueryFacadeAdapter promotes
+  `ProximaDBError::DmlLockConflict` → `ApiError::LockConflict` in the chain;
+  foundation `extract_lock_conflict` detects it). `UnifiedQueryPort` threaded
+  through RestAppState. `validate_single_statement` moved to
+  proximadb-relational-frontend.
+* PR-R1 — **RAPTOR stage-3 deletion** (~21.6K LOC; ADR-093 amendment;
+  hybrid strategy → SST fallback; proto/enum variants kept for wire compat).
+* PR-R2 — crates→root import ratchet (ceiling 7, embedded-binding only).
+
+Current ratchet: v2 root-imports **44** (from 52). Route census identical
+throughout. api-crate tests 76 → 112 (moved suites). Both feature configs
+compile; layering green against develop @ 97c033394.
+
+== Remaining sequence (in order)
+
+1. **PR-3.3b** — timeseries + model_registry families (needs
+   `TimeseriesPort`/`ModelRegistryService` field on RestAppState; the catalog
+   dep is layer-legal platform→control).
+2. **PR-3.3c** — graphs (needs the authenticated-identity extension type
+   resolved: `UnifiedUserContext` is root-crate; use the injected
+   `ResolvedRequestIdentity`), documents (needs the Arrow-Flight ingest
+   reference port-ified), external_collection (needs records.rs wire types
+   relocated), discovery (needs `DiscoveryService` port).
+3. **records.rs + collections.rs** stay root-resident until the Phase-5
+   catalog-singleton extractions (`CorpusVersionRegistry`, `PlanCache`,
+   tenant-tier fail-safe, federated optimizer) — documented blockers.
+4. **PR-3.4/3.5** — twin-router dedup; retire `canonical/handlers.rs`.
+5. **Phase 4** — write/schema parity PRs, test refresh, REST-complete
+   checklist → gRPC-perf gate opens.
+6. **Phase 2 (storage stream, parallel)** — Slice D remainder: `IndexPort`,
+   engine/compaction injection (ceiling 197 → lower), D-quant.
+7. **Phase 5** — gRPC disposition + Slice E handoff.
+
+Tool note: the Victor codegraph's method resolution is short-name-based (no
+receiver-type scoping) — it inflated two phantom hubs (fan-in 564/270 vs real
+2/8, via `fn now`/`fn new` collisions). Fan-in numbers from it need
+import-based verification before acting; file the fix upstream.
