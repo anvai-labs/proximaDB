@@ -21,23 +21,37 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    # Without this, Dependabot rewrites Cargo.lock to a version the Cargo.toml
-    # requirement does not permit and leaves the manifest alone, so the PR is
-    # born unbuildable: CI's `--locked` build dies with "cannot update the lock
-    # file ... because --locked was passed" in `Detect Changes`, before anything
-    # compiles. That is what happened to #1910 (metal 0.27 -> 0.33), #1911
-    # (nalgebra 0.32 -> 0.35), #1912 (pgwire 0.21 -> 0.41) and #1913
-    # (google-cloud-storage 0.15 -> 1.16): four PRs that sat open for three
-    # weeks having never once been compiled. See TD-DEPS-2.
+    # Dependabot cannot open a buildable PR for a cargo SEMVER-MAJOR bump, so the
+    # four below are suppressed rather than reopened weekly. It rewrites
+    # Cargo.lock to a version the Cargo.toml requirement does not permit and
+    # leaves the manifest alone, so CI's `--locked` build dies in `Detect
+    # Changes` with "cannot update the lock file ... because --locked was passed"
+    # before anything compiles. #1910, #1911, #1912 and #1913 sat open for three
+    # weeks that way, never once compiled.
     #
-    # `increase-if-necessary` rather than `increase`: it touches Cargo.toml only
-    # when the new version falls outside the declared range, so in-range patch
-    # bumps keep the manifest quiet while out-of-range ones become coherent and
-    # therefore compile-testable. Note this makes such PRs *buildable*, not
-    # *correct* — a 0.x minor bump is still a breaking API change, so expect it
-    # to fail on real compile errors. That failure is the point: it is signal
-    # about the upgrade instead of a lockfile technicality.
-    versioning-strategy: increase-if-necessary
+    # `versioning-strategy` is NOT the fix here: for the cargo ecosystem
+    # Dependabot's validator accepts only `lockfile-only` and `auto`, and
+    # rejects both `increase` and `increase-if-necessary` with
+    #   The property '#/updates/0/versioning-strategy' value "increase" did not
+    #   match one of the following values: lockfile-only, auto
+    # even though the options reference lists them as supported. Setting one
+    # makes this whole file invalid, which stops every update — strictly worse
+    # than the problem. Do not add it back.
+    #
+    # Scoped to these four crates rather than `dependency-name: "*"` on purpose:
+    # a blanket major-ignore would also mask a major bump we DO want to see. The
+    # cost is that a new 0.x major elsewhere will rot the same way; close it and
+    # add it here with a TD entry. The upgrades themselves, each with its gate,
+    # are in TD-DEPS-2.
+    ignore:
+      - dependency-name: "pgwire"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "google-cloud-storage"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "nalgebra"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "metal"
+        update-types: ["version-update:semver-major"]
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]

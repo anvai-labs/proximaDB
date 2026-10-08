@@ -55,17 +55,44 @@ reports as **1 fail / 4 pass / 58 skipping**. A glance at that reads like a most
 green PR with one flaky job, not like a PR that never compiled. The 58 skips are
 the entire test suite.
 
+== The config remedy that does NOT exist
+
+The obvious fix is `versioning-strategy`, so Dependabot raises the `Cargo.toml`
+requirement alongside the lock. **For the cargo ecosystem it is unavailable.**
+Dependabot's validator accepts only `lockfile-only` and `auto`, and rejects both
+`increase` and `increase-if-necessary`:
+
+[source]
+----
+The property '#/updates/0/versioning-strategy' value "increase" did not match
+one of the following values: lockfile-only, auto
+----
+
+The published options reference lists `increase-if-necessary` as supported for
+cargo, so this is a documentation/validator discrepancy, and several projects
+have hit it. It matters more than a normal unsupported option would: an invalid
+`dependabot.yml` is rejected **as a whole**, so setting it would silently stop
+*every* dependency update in the repo — strictly worse than the bug it was meant
+to fix. The comment in `.github/dependabot.yml` says not to add it back.
+
+Consequence: **Dependabot cannot produce a buildable cargo semver-major PR at
+all.** A major bump needs a manifest edit, and the only strategies cargo accepts
+leave the manifest alone. This is categorical, not a per-crate accident.
+
 == Fix, part 1 (done here)
 
-`versioning-strategy: increase-if-necessary` on the cargo ecosystem in
-`.github/dependabot.yml`. Dependabot then raises the `Cargo.toml` requirement
-whenever the new version falls outside the declared range, so the PR is at least
-*coherent*, while in-range patch bumps keep the manifest quiet.
+Since every such PR is unmergeable by construction, the four crates are added to
+the cargo ecosystem's `ignore` list with
+`update-types: ["version-update:semver-major"]`. They stop being reopened weekly,
+and the upgrades live in this TD instead.
 
-This makes such PRs **buildable, not correct.** A `0.x` minor bump is a breaking
-API change in cargo's semver, so expect real compile errors — which is the point:
-signal about the upgrade rather than a lockfile technicality. The grouped
-`cargo-minor-patch` PR (e.g. #1958) is unaffected; it was already coherent.
+Scoped to the four named crates rather than `dependency-name: "*"` deliberately:
+a blanket major-ignore would also mask a major bump we *do* want to see. The
+accepted cost is that a new 0.x major elsewhere will rot the same way — close it
+and add it here with an entry below.
+
+This changes nothing about the grouped `cargo-minor-patch` PR (e.g. #1958), which
+was already coherent because in-range bumps need no manifest change.
 
 == Fix, part 2 (the actual upgrades — not done)
 
@@ -97,9 +124,9 @@ Each needs deliberate work and its own evidence. Ordered by value:
 
 Closed, not merged — they cannot build, and leaving them open each week adds
 runner cycles against mandate #7 while hiding real signal behind
-`1 fail / 58 skipping`. The upgrades live here instead. When Dependabot reopens
-them under the corrected strategy they will be compile-testable, and can be taken
-one at a time against the gates above.
+`1 fail / 58 skipping`. With the `ignore` entries they will not be reopened, so
+this TD is now the only record of the upgrades; each must be driven by hand
+against the gate named above.
 
 == How to apply
 
