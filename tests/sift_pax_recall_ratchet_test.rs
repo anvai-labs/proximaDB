@@ -260,6 +260,25 @@ fn vid(i: u32) -> String {
     format!("v{i}")
 }
 
+/// Mint a catalog-style decimal collection object id (ADR-075:
+/// `CollectionObjectId = u64`).
+///
+/// The SST flush and compaction-admission paths are fail-closed on a decimal id
+/// (`FlushParams::get_collection_object_id` /
+/// `CompactionParams::get_collection_object_id`, in
+/// `crates/storage/proximadb-storage-traits/src/types.rs`), so a bare-engine
+/// test that drives either must supply one — the human name belongs in
+/// `CollectionConfig.name`. Do NOT hash the name here: that boundary's own doc
+/// comment warns it would create "a second, collision-prone identity domain that
+/// cannot be joined reliably with catalog, MVCC, deletion-vector, or compaction
+/// state". Mirrors the production catalog's monotonic mint without standing up
+/// the catalog, as `tests/sst_ivf2_compaction_route_proof_test.rs` already does.
+fn next_object_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
 fn collection(id: &str, base_location: String) -> Collection {
     Collection {
         id: id.to_string(),
@@ -1770,7 +1789,7 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
 
     let temp_dir = TempDir::new().unwrap();
     let collection = Collection {
-        id: "sift_ivf2_gate".to_string(),
+        id: next_object_id(),
         config: Some(CollectionConfig {
             name: "sift_ivf2_gate".to_string(),
             dimension: DIMENSION as u32,
@@ -1899,9 +1918,18 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         measured_base > 0 && measured_probe > 0,
         "no queries measured"
     );
+    // A non-empty trace is NOT evidence that the probe is doing its job: measured
+    // at the default N=100_000 it engages on 17 of 1000 queries (1.7%) and
+    // `!is_empty()` certifies that happily. The remaining 983 take the
+    // whole-Region-A fallback — the GET budget the probe exists to avoid — so a
+    // presence check would let a probe that is effectively off pass as engaged.
+    // Assert a proportion instead. See TD-IVF2ENGAGE-1 for why this currently
+    // fails at N=100_000 while passing at N=20_000.
+    let engaged = probe_trace.len();
+    let engagement_floor = (qcount + 1) / 2; // > 50% of measured queries
     assert!(
-        !probe_trace.is_empty(),
-        "PROXIMADB_PAX_READ_COARSE_PROBE=1 must engage the coarse probe on the v3 segment"
+        engaged >= engagement_floor,
+        "coarse probe engaged on only {engaged}/{qcount} queries (floor {engagement_floor});          the rest fell back to the whole-Region-A scan — see TD-IVF2ENGAGE-1"
     );
     assert!(
         recall_probe >= recall_base - recall_drop,

@@ -1,0 +1,110 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-IVF2ENGAGE-1: the IVF2 coarse probe engages on 1.7% of queries at N=100k, and the byte ratchet fails
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-08, the first time this eval could be run (see TD-VECEVAL-1).
+| Severity | Medium — no incorrect results; the probe silently stops paying for itself at scale, and two guards were too weak to notice.
+| Component | `src/storage/engines/sst/segment_format.rs` (coarse probe arm/fallback), `tests/sift_pax_recall_ratchet_test.rs::sift_ivf2_coarse_probe_recall_ratchet`
+| Evidence | Measured below on SIFT1M subsets, workstation, `--release --features io-trace`
+| Related | TD-RDSTRAT-8 (the probe), TD-VECEVAL-1 (why this was unrunnable), ADR-033 (DEPTH ≫ BYTES ordering)
+|===
+
+== What was measured
+
+`sift_ivf2_coarse_probe_recall_ratchet` could not run at all until the catalog
+object-id fix in this change — it failed the flush/compaction-admission
+precondition, and because it is `#[ignore]`d CI never surfaced that. Run for the
+first time, it reports a result that **inverts with corpus size**.
+
+N=20 000, 200 queries, `IVF_K=64`:
+
+[cols="1,1,1,1", options="header"]
+|===
+| Arm | recall@10 | range GETs/q | bytes/q
+
+| probe OFF | 0.9884 | 3 | 6 316 695
+| probe ON  | 0.9905 | 2 | 5 861 939
+|===
+
+`probes_recorded=200/200`, `Σcells_total=12800 Σcells_probed=3200
+Σfetch_rounds=200`. Better recall, **−33% round trips**, −7.2% bytes — a strict
+win, no trade.
+
+(The baseline arm shows mild run-to-run variance — an earlier run of the same
+configuration measured 0.9860 / 6 338 539. The probe arm was byte-identical
+across runs. Neither is ledgered; see "How to apply".)
+
+N=100 000, 1000 queries, same `IVF_K=64` (the test's **default** N):
+
+[cols="1,1,1,1", options="header"]
+|===
+| Arm | recall@10 | range GETs/q | bytes/q
+
+| probe OFF | 0.9830 | 2 | 26 916 094
+| probe ON  | 0.9839 | 2 | 26 973 204
+|===
+
+`probes_recorded=17/1000`, `Σcells_total=1088 Σcells_probed=272
+Σfetch_rounds=34`. The byte ratchet **fails**: `bytes_probe < bytes_base` is
+false by 57 110 bytes/query.
+
+== The finding
+
+**The probe's pruning is fine; its engagement collapses.** The prune ratio is
+*identical* at both scales — 3 200 / 12 800 cells at N=20k and 272 / 1 088 at
+N=100k, i.e. **25% probed, 75% pruned in both cases**. So corpus size does not
+degrade the probe's selectivity at all; it only changes how often the probe runs.
+The 983 non-engaging queries take the armed-but-missed **whole-Region-A
+fallback**, which is the GET budget the probe exists to avoid, and 1.7%
+engagement cannot pay for its own footer work — which is why bytes go *up*.
+
+That the selectivity is constant while the outcome inverts is the whole finding:
+any fix aimed at `nprobe`, `IVF_K` or the read budget is aimed at the wrong
+quantity.
+
+So the knee is not in `nprobe` and not in the budget. It is in whether the probe
+engages at all, and that is the quantity to instrument before tuning anything —
+"trace before you tune" (the co-design mandate) applied to the probe itself.
+
+NOTE: this also explains an earlier vacuous sweep. Varying
+`PROXIMADB_PAX_READ_COARSE_NPROBE` across 32/16/8/4 and fully-off produced
+byte-identical results (53.97 GETs, 25 297 445 bytes in every arm) because the
+segments were not clustered, so nothing was probing. A knob sweep over an
+unengaged probe measures nothing; neither does one over an untrained index.
+
+== Two guards that were too weak to catch it
+
+1. **`assert!(!probe_trace.is_empty(), "... must engage the coarse probe ...")`**
+   is satisfied by 17/1000. A presence check certifies a probe that is
+   effectively off. Replaced in this change by a **proportion** floor (>50% of
+   measured queries), which is what the assertion's own message always claimed
+   to check.
+2. **The probe's error path is swallowed.** `segment_format.rs` calls
+   `coarse_probe_survivors(...).await.ok().flatten()`, so `Err` and
+   `Ok(None)` both become "no probe" and take the same fallback. From the
+   recorded metrics — `record_ivf_probe_durable(0, 0, 0, 0, true)` for every miss
+   — a probe that *failed* is indistinguishable from one that legitimately
+   *declined*. Until that is split, the 983 misses cannot be attributed.
+
+== How to apply
+
+. **Split the miss reason first**, before changing any policy. Replace `.ok()`
+  with a branch that records an error distinctly from a decline (the durable
+  surface already carries a `whole_region_fallback` flag — it needs a sibling
+  for "probe errored"). Without this every hypothesis below is unfalsifiable.
+. Then attribute the 983: re-run at N=100k with the split in place and report the
+  error/decline split. Candidate causes, in the order they are cheap to test —
+  `IVF_K=64` giving ~1 560 rows/cell at 100k vs ~310 at 20k (so a probe that must
+  touch most cells to reach top-k); multiple segments after compaction where only
+  some carry a trained A0 directory; a footer-plan cache miss making the probe
+  decline rather than pay an extra GET.
+. **Do not relax the byte ratchet to make the test green.** `bytes_probe <
+  bytes_base` is the correct contract: a probe that reads more bytes than the
+  scan it replaces has no reason to exist. The test being red at the default N is
+  the honest state, and it is `#[ignore]`d so no CI tier is affected.
+. Re-measure at 20k/100k/333k/1M once engagement holds, and only then sweep
+  `nprobe`. Record in `BENCHMARK_EVIDENCE.toml` per mandate #6 — the numbers above
+  are workstation-only and deliberately not ledgered as `measured`.
