@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # the import package stays `proximadb_sdk`). The native in-process engine ships
 # separately as `proximadb_embedded` — install via the `embedded` extra below.
 name = "proximadb"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python client SDK for ProximaDB - Cloud-native vector database engineered for AI-first applications"
 authors = [
     {name = "Vijaykumar Singh", email = "vijay@anvaiops.com"}

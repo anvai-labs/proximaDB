@@ -7049,7 +7049,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -8998,7 +8998,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-sdk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "httpmock",
