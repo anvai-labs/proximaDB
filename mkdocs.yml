@@ -9,7 +9,8 @@
 #
 # FORMAT CAVEAT (TD-DOCSITE-1): the corpus is ~85% AsciiDoc (829 .adoc vs
 # 148 .md) and mkdocs is Markdown-native. The nav below lists the Markdown pages
-# that render today; the 33 user-facing .adoc files are tracked for conversion.
+# that render today; the 39 user-facing .adoc files are tracked for conversion
+# (frozen by scripts/check_docs_site_coverage.py, see TD-DOCSITE-1).
 # `asciidoctor` is NOT a build dependency — rather than bolt on a fragile
 # plugin, the user-facing .adoc files get converted to Markdown incrementally.
 site_name: ProximaDB
@@ -33,9 +34,30 @@ exclude_docs: |
   12-design/
   agent-rules/
   architecture-diagrams/
+  11-usecases/
   openapi/
   *.adoc
   README.md
+
+# `--strict` only escalates WARNINGs, and mkdocs ships link/nav checks at INFO by
+# default — so without this block a strict build happily publishes broken links
+# and silently unpublished pages. Raise them so CI fails instead.
+#
+# NOT coverable here: a link to a file matched by `exclude_docs` is reported at
+# INFO unconditionally, with no validation category to raise (verified against
+# mkdocs 1.6.1 by setting every category to `warn`). That is the dominant case
+# for us — the excluded `*.adoc` corpus — so it is enforced out-of-band by
+# `scripts/check_docs_site_coverage.py`. See TD-DOCSITE-1.
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
 
 theme:
   name: material

@@ -622,8 +622,11 @@ tdd-precommit:
 	@echo "✅ All TDD pre-commit checks passed!"
 
 # ── Documentation site (mkdocs + Material) ────────────────────────────────────
-# `docs-build` is what CI gates on: --strict so a broken link or a page missing
-# from the nav fails here rather than shipping a wrong site.
+# `docs-build` is what CI gates on. Note that `--strict` alone is NOT a gate: it
+# only escalates WARNINGs, and mkdocs ships link/nav checks at INFO — the
+# `validation:` block in mkdocs.yml is what makes a broken link or a page missing
+# from the nav fail. The one case mkdocs cannot express at all (a link to an
+# excluded file) is checked by scripts/check_docs_site_coverage.py.
 .PHONY: docs-install docs-serve docs-build
 docs-install:
 	pip install -r requirements-docs.txt
@@ -632,4 +635,5 @@ docs-serve: ## Serve the user-facing docs site locally on :8000
 	mkdocs serve
 
 docs-build: ## Build the docs site, failing on broken links (CI gate)
+	python3 scripts/check_docs_site_coverage.py
 	mkdocs build --strict

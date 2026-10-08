@@ -17,6 +17,7 @@ on:
       - 'docs/**'
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
+      - 'scripts/check_docs_site_coverage.py'
       - '.github/workflows/docs-site.yml'
   push:
     branches: [develop, main]
@@ -24,6 +25,7 @@ on:
       - 'docs/**'
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
+      - 'scripts/check_docs_site_coverage.py'
       - '.github/workflows/docs-site.yml'
   workflow_dispatch:
 
@@ -48,9 +50,15 @@ jobs:
           cache-dependency-path: requirements-docs.txt
       - name: Install pinned docs toolchain
         run: pip install -r requirements-docs.txt
+      - name: Guard — no user-facing page silently unpublished
+        # Needs no toolchain: mkdocs cannot report this at all (a link to an
+        # excluded file is an unraisable INFO), so it is checked out-of-band.
+        run: python3 scripts/check_docs_site_coverage.py
       - name: Build (strict)
-        # --strict turns nav/link warnings into failures. If this breaks on a
-        # link into docs/12-design or docs/10-quality, the fix is NOT to relax
+        # --strict only escalates WARNINGs, and mkdocs ships link/nav checks at
+        # INFO; the `validation:` block in mkdocs.yml raises them, which is what
+        # makes this step a gate rather than a formality. If it breaks on a link
+        # into docs/12-design or docs/10-quality, the fix is NOT to relax
         # strict: those trees are excluded by design (see mkdocs.yml), so link
         # to a published page or drop the link.
         run: mkdocs build --strict

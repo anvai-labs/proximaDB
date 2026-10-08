@@ -65,7 +65,7 @@ flowchart TB
 ## New Here?
 
 Start with:
-1. [Quick Start](../01-quick-start/) - Get running in 5 minutes
+1. [Quick Start](../01-quick-start/index.md) - Get running in 5 minutes
 2. [Vector Search](./vector-search.md) - Most common use case
 3. [Multi-Model Joins](./multi-model-joins.md) - What makes ProximaDB unique
 
@@ -92,4 +92,4 @@ Start with:
 
 ---
 
-*Looking for API docs?* See [API Reference](../03-api-reference/)
+*Looking for API docs?* See [API Reference](../03-api-reference/index.md)

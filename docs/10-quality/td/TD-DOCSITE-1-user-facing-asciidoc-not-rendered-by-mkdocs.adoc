@@ -1,13 +1,13 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-DOCSITE-1: 33 user-facing AsciiDoc pages are absent from the mkdocs site because mkdocs cannot render AsciiDoc
+= TD-DOCSITE-1: 39 user-facing AsciiDoc pages are absent from the mkdocs site because mkdocs cannot render AsciiDoc
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
 | Status | **Open.** Filed 2026-10-08 when the mkdocs pipeline was introduced; the site ships with the Markdown pages and excludes `*.adoc` wholesale.
 | Priority | **MEDIUM.** The site is coherent and strict-clean today, but a user following `05-concepts/index.md` hits links to pages that are not published. Content exists; it is unreachable from the site.
-| Component | `mkdocs.yml` (`exclude_docs`), `docs/00-product`, `docs/02-guides`, `docs/03-api-reference`, `docs/04-operations`, `docs/05-concepts`, `docs/11-usecases`
+| Component | `mkdocs.yml` (`exclude_docs`, `validation`), `scripts/check_docs_site_coverage.py`, `docs/.site-coverage-baseline.json`, `docs/00-product`, `docs/02-guides`, `docs/03-api-reference`, `docs/04-operations`, `docs/05-concepts`
 | Relates to | TD-VECEVAL-1 (the guide that prompted the site), mandate #12 (don't bolt on a fragile duplicate)
 | Blocked by | Nothing. Needs a decision on conversion vs a second renderer.
 |===
@@ -39,7 +39,7 @@ Per-directory, the split matters because it separates "must publish" from
 
 So the site's exclusion of `10-quality`/`12-design`/`_archive` is **correct and
 deliberate** (publishing a 541-file internal debt register would make the site a
-changelog of our own TODOs). The genuine gap is the **33 user-facing `.adoc`
+changelog of our own TODOs). The genuine gap is the **39 user-facing `.adoc`
 files** in the publish-yes rows.
 
 Consequence today: `mkdocs build --strict` passes, but with INFO lines such as
@@ -50,32 +50,62 @@ link to nothing.
 == Why `*.adoc` is excluded wholesale rather than plugged in
 
 Rejected: an AsciiDoc plugin for mkdocs. The maintained options are thin, and
-adding a second renderer to make 33 files work would put a fragile dependency in
+adding a second renderer to make 39 files work would put a fragile dependency in
 the publish path for every page (mandate #12 — do not bolt on a duplicate of a
 tool we would then own).
 
 Rejected for now: switching the site to **Antora** (AsciiDoc-native, versioned,
 the natural fit for an 85%-AsciiDoc corpus). It is the better theoretical fit,
 but it would discard the mkdocs/Material pipeline that now builds strict-clean in
-0.5 s, and the *user-facing* subset is only 33 files — small enough to convert.
+0.5 s, and the *user-facing* subset is only 39 files — small enough to convert.
 
 == How to apply
 
-1. **Convert the 33 user-facing `.adoc` files to Markdown**, directory by
-   directory, smallest first (`01-quick-start` has 1, `11-usecases` 2, `00-product`
-   4). Add each to the `nav` in the same commit that converts it, so the page is
-   reachable the moment it renders.
-2. **Fix the dangling links as you go** — `05-concepts/index.md` and
-   `05-concepts/quantization.md`/`unified-wal.md` link to `storage-engines.adoc`,
-   `configuration.adoc` and `SUPPORTED_SURFACE.adoc`. These are the reader-visible
-   breakage; prioritise the targets they point at.
-3. **Then tighten the gate**: once the publish-yes directories hold no `.adoc`,
-   narrow `exclude_docs` from `*.adoc` to the internal directories only, so a NEW
-   user-facing `.adoc` fails the build instead of being silently unpublished.
-   That step is what converts this from a cleanup into a guard.
-4. Leave `10-quality` / `12-design` / `06-internals` / `09-roadmap` / `_archive`
-   in AsciiDoc and excluded. They are not the product's documentation, and the
-   TD/ADR convention (`HOW_TO_FILE_TD_AND_ADR.adoc`) depends on AsciiDoc.
+The gate is already in place, so this TD is a conversion backlog rather than an
+open hole. `scripts/check_docs_site_coverage.py` freezes the set of unpublished
+AsciiDoc pages in `docs/.site-coverage-baseline.json`: a NEW user-facing `.adoc`
+fails CI, and converting one fails until its stale baseline entry is removed. The
+list can therefore only shrink.
 
-Item 3 is the one that matters long-term: until the exclusion is narrowed, the
-failure mode is silent — a new user-facing AsciiDoc page simply never appears.
+1. **Convert the 39 user-facing `.adoc` files to Markdown**, directory by
+   directory, smallest first (`01-quick-start` has 1, `00-product` 4). Add each to
+   the `nav` *and* drop its baseline entry in the same commit that converts it, so
+   the page is reachable the moment it renders and the count stays truthful.
+2. **Fix the dangling links as you go.** There are **52** links from published
+   pages into the excluded `.adoc` set (counted from the `mkdocs build` log);
+   `05-concepts/index.md` and `05-concepts/quantization.md`/`unified-wal.md` point
+   at `storage-engines.adoc`, `configuration.adoc` and `SUPPORTED_SURFACE.adoc`.
+   These are the reader-visible breakage, so prioritise the targets they point at.
+3. Leave `10-quality` / `12-design` / `06-internals` / `09-roadmap` / `11-usecases`
+   / `_archive` in AsciiDoc and excluded. They are not the product's documentation,
+   and the TD/ADR convention (`HOW_TO_FILE_TD_AND_ADR.adoc`) depends on AsciiDoc.
+
+== Rejected: narrowing `exclude_docs` as the gate
+
+An earlier draft of this TD proposed that once the publish-yes directories hold no
+`.adoc`, narrowing `exclude_docs` from `*.adoc` to the internal directories would
+make a new user-facing `.adoc` fail the build. **Measured against mkdocs 1.6.1,
+that is false in both halves**, which is why the out-of-band guard exists:
+
+* Dropping `*.adoc` from `exclude_docs` builds **clean** — `--strict` exits 0 with
+  zero warnings. mkdocs only treats `.md` as pages, so a `.adoc` is never a page
+  whose absence from `nav` could be reported.
+* Worse, all 39 files are then **copied into `site/` as raw unrendered AsciiDoc**
+  (`site/00-product/PRD.adoc` verified present), so the public site would serve
+  markup as source text.
+
+Relatedly, a link *to* an excluded file is reported at `INFO`
+**unconditionally** — setting every `validation:` category to `warn` leaves those
+52 messages at INFO while surfacing only 13 other findings. So mkdocs cannot gate
+this class at all, in any configuration.
+
+== Watch item: MkDocs 2.0
+
+`mkdocs-material` 9.7.7 emits an upstream notice on every build that MkDocs 2.0
+removes the plugin system, rewrites theming, offers **no migration path**, and is
+currently unlicensed. Our pipeline deliberately uses no third-party plugins
+(mermaid rides on `pymdownx.superfences`), which limits the exposure, but the
+toolchain is pinned in `requirements-docs.txt` for exactly this reason — do not
+chase a 2.0 bump. If upstream makes 1.x untenable, revisit Antora, whose fit for
+an 85%-AsciiDoc corpus was the runner-up here and would absorb this backlog
+instead of working through it.

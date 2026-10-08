@@ -1,0 +1,11 @@
+# Pinned toolchain for the MkDocs documentation site (docs/).
+#
+# Pinned so `mkdocs build --strict` is reproducible: a transitive bump in
+# Markdown or pymdown-extensions changes rendering, and --strict turns a
+# rendering change into a build failure. Bump deliberately, in a PR, with the
+# strict build green.
+#
+# Install:  make docs-install      Serve: make docs-serve      Build: make docs-build
+mkdocs==1.6.1
+mkdocs-material==9.7.7
+pymdown-extensions==11.0.2
