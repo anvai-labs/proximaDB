@@ -1,0 +1,114 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DEPS-2: four breaking Rust dependency upgrades are deferred, and Dependabot cannot open a buildable PR for any of them
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-08 while triaging the Dependabot backlog.
+| Severity | Medium — no user-visible defect, but the upgrades include a protocol crate and a cloud SDK, and the PRs were never once compiled.
+| Component | `.github/dependabot.yml`, root `Cargo.toml`, `crates/horizontal/proximadb-codec/Cargo.toml`, `src/network/postgres/`, `crates/storage/proximadb-object-store`
+| Evidence | CI job `Detect Changes` on #1911, run 35212260852: `error: cannot update the lock file … because --locked was passed to prevent this`
+| Related | TD-DEPS-1 (bincode 2.x), mandate #7 (CI cost), mandate #9 (security governance)
+|===
+
+== What happened
+
+Four Dependabot PRs sat open from 2026-09-17 to 2026-10-08 — three weeks — and
+**none of them was ever compiled**. Each failed in `Detect Changes`, the first
+path-filter job, before any build step ran:
+
+[source]
+----
+error: cannot update the lock file /home/runner/work/proximaDB/proximaDB/Cargo.lock
+       because --locked was passed to prevent this
+----
+
+The cause is a split between the lockfile and the manifests. Dependabot rewrote
+`Cargo.lock` to a version the `Cargo.toml` requirement does not permit, and left
+the requirement alone. Verified on each PR head:
+
+[cols="1,2,2,2", options="header"]
+|===
+| PR | Crate | `Cargo.toml` requirement | `Cargo.lock` version
+
+| #1911 | `nalgebra` | `"0.32"` | `0.35.0`
+| #1912 | `pgwire` | `"0.21"` | `0.41.0`
+| #1913 | `google-cloud-storage` | `"0.15"` | `1.16.0`
+| #1910 | `metal` | `"0.27"` (root) | `0.33` (codec crate only)
+|===
+
+`^0.32` does not admit `0.35.0`, so `cargo --locked` refuses to proceed and
+cargo without `--locked` would silently re-resolve back to `0.32`, making the PR
+a no-op. Either way the upgrade cannot land.
+
+#1910 fails the same way for a different reason: it bumped
+`crates/horizontal/proximadb-codec/Cargo.toml` to `0.33` but not the root
+`Cargo.toml`, which still declares `0.27`. Since the root's `metal` feature wires
+`["dep:metal", "proximadb-codec/metal"]`, a successful resolution there would have
+compiled two incompatible `metal` versions into one feature.
+
+== Why it went unnoticed for three weeks
+
+`Detect Changes` is the path-filter job every other job depends on, so its failure
+reports as **1 fail / 4 pass / 58 skipping**. A glance at that reads like a mostly
+green PR with one flaky job, not like a PR that never compiled. The 58 skips are
+the entire test suite.
+
+== Fix, part 1 (done here)
+
+`versioning-strategy: increase-if-necessary` on the cargo ecosystem in
+`.github/dependabot.yml`. Dependabot then raises the `Cargo.toml` requirement
+whenever the new version falls outside the declared range, so the PR is at least
+*coherent*, while in-range patch bumps keep the manifest quiet.
+
+This makes such PRs **buildable, not correct.** A `0.x` minor bump is a breaking
+API change in cargo's semver, so expect real compile errors — which is the point:
+signal about the upgrade rather than a lockfile technicality. The grouped
+`cargo-minor-patch` PR (e.g. #1958) is unaffected; it was already coherent.
+
+== Fix, part 2 (the actual upgrades — not done)
+
+Each needs deliberate work and its own evidence. Ordered by value:
+
+. **`pgwire` 0.21 → 0.41.** The highest-value and highest-risk item: 20 minor
+  versions of the crate carrying our PostgreSQL wire protocol, against a deep
+  integration (`src/network/postgres/`, incl. the extended-query path in
+  `protocol.rs` and SELECT lowering in `relational_pipeline.rs`). Gate on the
+  **TPC-H (22) and TPC-DS (16) pgwire conformance ratchets** — they only go up,
+  so they are exactly the right instrument for a wire-protocol upgrade. Do this
+  one alone, in its own PR.
+. **`google-cloud-storage` 0.15 → 1.16.** A major bump of a cloud SDK behind the
+  `gcp` feature. Blast radius is the GCS backend in
+  `crates/storage/proximadb-object-store`; gate on the cloud-emulator lane
+  (`scripts/run_cloud_emulator_tests.sh`, fake-gcs-server) plus the GCS
+  cold-store paths. Check whether the 1.0 API changes the request shape in ways
+  that affect per-object access tier (ADR-036) or ranged reads.
+. **`nalgebra` 0.32 → 0.35.** Used for PCA eigendecomposition with
+  `serde-serialize` for model persistence, so the upgrade must be checked for
+  **serialized-model compatibility**, not just compilation: a persisted PCA model
+  written by 0.32 must still load, or the change needs the mixed-read-safe
+  treatment mandate #8 requires.
+. **`metal` 0.27 → 0.33.** Must bump **both** manifests in one commit. Lowest
+  priority: it is optional, macOS-ARM64-only, and cannot be validated on this
+  Linux CI, so it is a blind bump either way.
+
+== Disposition of the four PRs
+
+Closed, not merged — they cannot build, and leaving them open each week adds
+runner cycles against mandate #7 while hiding real signal behind
+`1 fail / 58 skipping`. The upgrades live here instead. When Dependabot reopens
+them under the corrected strategy they will be compile-testable, and can be taken
+one at a time against the gates above.
+
+== How to apply
+
+. Take **one** crate per PR. These are breaking upgrades; batching them makes a
+  failure impossible to attribute, which is the one case where mandate #7's
+  "batch related work" does not apply.
+. Bump the `Cargo.toml` requirement **and** `Cargo.lock` together, every manifest
+  that declares the crate (`grep -rn '^<crate>' --include=Cargo.toml .`).
+. Name the gate in the PR before changing code: conformance ratchet for `pgwire`,
+  emulator lane for `google-cloud-storage`, serialized-model load test for
+  `nalgebra`.
+. Verify the **server binary** builds, not just `--lib` (mandate #11).

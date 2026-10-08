@@ -21,6 +21,23 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Without this, Dependabot rewrites Cargo.lock to a version the Cargo.toml
+    # requirement does not permit and leaves the manifest alone, so the PR is
+    # born unbuildable: CI's `--locked` build dies with "cannot update the lock
+    # file ... because --locked was passed" in `Detect Changes`, before anything
+    # compiles. That is what happened to #1910 (metal 0.27 -> 0.33), #1911
+    # (nalgebra 0.32 -> 0.35), #1912 (pgwire 0.21 -> 0.41) and #1913
+    # (google-cloud-storage 0.15 -> 1.16): four PRs that sat open for three
+    # weeks having never once been compiled. See TD-DEPS-2.
+    #
+    # `increase-if-necessary` rather than `increase`: it touches Cargo.toml only
+    # when the new version falls outside the declared range, so in-range patch
+    # bumps keep the manifest quiet while out-of-range ones become coherent and
+    # therefore compile-testable. Note this makes such PRs *buildable*, not
+    # *correct* — a 0.x minor bump is still a breaking API change, so expect it
+    # to fail on real compile errors. That failure is the point: it is signal
+    # about the upgrade instead of a lockfile technicality.
+    versioning-strategy: increase-if-necessary
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
