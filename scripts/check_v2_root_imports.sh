@@ -12,6 +12,7 @@
 # Baseline (2026-10-03): 52 across 12 files. After PR-3.1b (graphs.rs port
 # rewrite): 51. After PR-3.2a (schema.rs moved to proximadb-api): 48.
 # After PR-3.3a (query.rs + sql.rs moved): 44.
+# After PR-3.3b (timeseries.rs + model_registry.rs moved): 38.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

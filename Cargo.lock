@@ -7365,6 +7365,7 @@ dependencies = [
  "hyper 1.11.1",
  "prost-types",
  "proximadb-api-error",
+ "proximadb-catalog",
  "proximadb-data-model",
  "proximadb-kernel",
  "proximadb-proto",

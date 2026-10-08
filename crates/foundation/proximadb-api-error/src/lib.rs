@@ -160,6 +160,18 @@ impl IntoApiError for serde_json::Error {
     }
 }
 
+impl From<String> for ApiError {
+    fn from(msg: String) -> Self {
+        ApiError::Internal(msg)
+    }
+}
+
+impl From<&str> for ApiError {
+    fn from(msg: &str) -> Self {
+        ApiError::Internal(msg.to_string())
+    }
+}
+
 /// Convert `proximadb_kernel::error::ProtocolError` to ApiError for unified
 /// error handling (kernel is a foundation-tier peer, so this From lives here).
 impl From<proximadb_kernel::error::ProtocolError> for ApiError {

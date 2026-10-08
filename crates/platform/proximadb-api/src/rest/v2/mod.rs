@@ -4,6 +4,7 @@
 
 pub mod agentic;
 pub mod query;
+pub mod model_registry;
 pub mod schema;
 pub mod sql;
 pub mod timeseries;

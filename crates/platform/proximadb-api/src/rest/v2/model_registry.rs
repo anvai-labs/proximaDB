@@ -1,3 +1,5 @@
+//! REST API v2 — model-registry surface. Moved from the root v2 tree under ADR-094.
+
 //! Native REST facade for the tenant-scoped xCatalog embedding-model registry.
 //!
 //! The handlers own HTTP extraction and error mapping only. Lifecycle rules,
@@ -18,9 +20,9 @@ use proximadb_catalog::model_registry_service::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::errors::{ApiError, ApiResult};
-use crate::network::middleware::tenant::TenantContext;
-use crate::network::rest::canonical::handlers::AppState;
+use crate::rest::errors::{RestError as ApiError, RestResult as ApiResult};
+use crate::rest::TenantContext;
+use crate::rest::state::RestAppState;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateModelRegistryRequest {
@@ -119,17 +121,16 @@ fn service_error(error: ModelRegistryServiceError) -> ApiError {
     request_body = CreateModelRegistryRequest,
     responses(
         (status = 200, description = "Created model registry.", body = ModelRegistryRecordResponse),
-        (status = 400, description = "Invalid registry name.", body = crate::network::rest::openapi::ErrorResponse),
-        (status = 409, description = "Registry already exists.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 400, description = "Invalid registry name.", body = crate::rest::errors::ErrorResponse),
+        (status = 409, description = "Registry already exists.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn create_model_registry(
     Extension(tenant): Extension<TenantContext>,
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
     Json(request): Json<CreateModelRegistryRequest>,
 ) -> ApiResult<Json<ModelRegistryRecordResponse>> {
-    state
-        .model_registry_service
+    state.model_registry()?
         .create_registry(&tenant.tenant_id, &request.name)
         .await
         .map(ModelRegistryRecordResponse::from)
@@ -148,10 +149,9 @@ pub async fn create_model_registry(
 )]
 pub async fn list_model_registries(
     Extension(tenant): Extension<TenantContext>,
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
 ) -> ApiResult<Json<ListModelRegistriesResponse>> {
-    let registries = state
-        .model_registry_service
+    let registries = state.model_registry()?
         .list_registries(&tenant.tenant_id)
         .await
         .map_err(service_error)?
@@ -169,16 +169,15 @@ pub async fn list_model_registries(
     params(("name" = String, Path, description = "Tenant-local registry name.")),
     responses(
         (status = 200, description = "Model registry.", body = ModelRegistryRecordResponse),
-        (status = 404, description = "Registry not found.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 404, description = "Registry not found.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn get_model_registry(
     Path(name): Path<String>,
     Extension(tenant): Extension<TenantContext>,
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
 ) -> ApiResult<Json<ModelRegistryRecordResponse>> {
-    state
-        .model_registry_service
+    state.model_registry()?
         .get_registry(&tenant.tenant_id, &name)
         .await
         .map(ModelRegistryRecordResponse::from)
@@ -195,19 +194,18 @@ pub async fn get_model_registry(
     request_body = ApplyModelRegistryMutationRequest,
     responses(
         (status = 200, description = "Updated registry.", body = ModelRegistryRecordResponse),
-        (status = 400, description = "Invalid lifecycle command.", body = crate::network::rest::openapi::ErrorResponse),
-        (status = 404, description = "Registry not found.", body = crate::network::rest::openapi::ErrorResponse),
-        (status = 409, description = "Revision conflict.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 400, description = "Invalid lifecycle command.", body = crate::rest::errors::ErrorResponse),
+        (status = 404, description = "Registry not found.", body = crate::rest::errors::ErrorResponse),
+        (status = 409, description = "Revision conflict.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn apply_model_registry_mutation(
     Path(name): Path<String>,
     Extension(tenant): Extension<TenantContext>,
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
     Json(request): Json<ApplyModelRegistryMutationRequest>,
 ) -> ApiResult<Json<ModelRegistryRecordResponse>> {
-    state
-        .model_registry_service
+    state.model_registry()?
         .apply_mutation(
             &tenant.tenant_id,
             &name,
@@ -229,22 +227,21 @@ pub async fn apply_model_registry_mutation(
     request_body = ResolveModelAliasRequest,
     responses(
         (status = 200, description = "Immutable version and digest binding.", body = ResolvedModelBindingResponse),
-        (status = 400, description = "Alias, dimension, runtime, or approval policy rejected.", body = crate::network::rest::openapi::ErrorResponse),
-        (status = 404, description = "Registry not found.", body = crate::network::rest::openapi::ErrorResponse),
+        (status = 400, description = "Alias, dimension, runtime, or approval policy rejected.", body = crate::rest::errors::ErrorResponse),
+        (status = 404, description = "Registry not found.", body = crate::rest::errors::ErrorResponse),
     ),
 )]
 pub async fn resolve_model_alias(
     Path(name): Path<String>,
     Extension(tenant): Extension<TenantContext>,
-    State(state): State<AppState>,
+    State(state): State<RestAppState>,
     Json(request): Json<ResolveModelAliasRequest>,
 ) -> ApiResult<Json<ResolvedModelBindingResponse>> {
     let policy = CatalogModelUsePolicy {
         runtime: request.runtime,
         require_approved: request.require_approved,
     };
-    let resolved = state
-        .model_registry_service
+    let resolved = state.model_registry()?
         .resolve_alias_binding(
             &tenant.tenant_id,
             &name,

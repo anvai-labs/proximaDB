@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use proximadb_catalog::model_registry_service::CatalogModelRegistryService;
+
 use proximadb_runtime::{
     ApiHandlersPort, RecallProbePort, UnifiedQueryPort, WriteRoutingPort,
 };
@@ -59,6 +61,10 @@ pub struct RestAppState {
     /// Unified multimodal query port (optional during the feature-flag
     /// transition; wired by the root builder when the facade is enabled).
     pub unified_query_port: Option<Arc<dyn UnifiedQueryPort>>,
+    /// Tenant-scoped model-registry lifecycle authority (control tier;
+    /// platform->control is a downward dep — ADR-094 PR-3.3b). `None` before
+    /// the root builder wires it (and in port-only test states).
+    pub model_registry_service: Option<Arc<CatalogModelRegistryService>>,
 }
 
 impl RestAppState {
@@ -68,7 +74,26 @@ impl RestAppState {
             write_routing: None,
             recall_probe: None,
             unified_query_port: None,
+            model_registry_service: None,
         }
+    }
+
+    /// Wire the model-registry authority (root builder passes the live one).
+    pub fn with_model_registry_service(
+        mut self,
+        svc: Arc<CatalogModelRegistryService>,
+    ) -> Self {
+        self.model_registry_service = Some(svc);
+        self
+    }
+
+    /// Fail-closed accessor for the model-registry authority.
+    pub fn model_registry(
+        &self,
+    ) -> Result<Arc<CatalogModelRegistryService>, String> {
+        self.model_registry_service.clone().ok_or_else(|| {
+            "model registry service is not available".to_string()
+        })
     }
 
     /// Wire the unified multimodal query port (root builder; `None` keeps the
