@@ -691,7 +691,7 @@ mod tests {
     //
     // The memory-degrade unit test cannot catch a native-class mapping regression
     // (an invalid storage-class string a real cloud API would 4xx). These run the
-    // tier path against emulators — Azurite (Azure), MinIO (S3), fake-gcs (GCP) —
+    // tier path against emulators — Azurite (Azure), LocalStack (S3), fake-gcs (GCP) —
     // so the `x-ms-access-tier` / `x-amz-storage-class` / `x-goog-storage-class`
     // header is exercised end-to-end. Azure + S3 go through the PRODUCTION
     // `store_for_url` + forwarded-env path (highest fidelity); GCS uses the builder
@@ -738,49 +738,46 @@ mod tests {
         // Cool-tier proof object_store cannot surface. The emulator is ephemeral.
     }
 
-    /// AWS S3 (MinIO) via the production `from_url` + env path. Default MinIO
-    /// *rejects* `x-amz-storage-class: STANDARD_IA` (InvalidStorageClass) unless
-    /// object tiering/ILM is configured — impractical for a CI emulator — so this
-    /// best-effort-skips on that rejection (real AWS S3 accepts it; the header
-    /// mapping is unit-tested via `native_tier`). It still hard-fails on a
-    /// non-storage-class error. Set by CI: `AWS_ENDPOINT`, `AWS_ALLOW_HTTP=true`,
-    /// `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false`, `AWS_ACCESS_KEY_ID/SECRET/REGION`.
+    /// AWS S3 emulator via the production `from_url` + env path.
+    ///
+    /// Emulator-agnostic on purpose. The named emulator has changed twice
+    /// (MinIO on Docker Hub, then MinIO on Quay, now LocalStack — TD-CI-6), and
+    /// what this test actually pins is the production path, not a vendor: open
+    /// via `from_url`, `put_with_tier(Cool)`, round-trip the bytes.
+    ///
+    /// STRICT, as of the LocalStack migration (TD-CI-6). It used to
+    /// best-effort-skip `InvalidStorageClass`, because default MinIO rejected
+    /// `x-amz-storage-class: STANDARD_IA` without object tiering/ILM configured.
+    /// LocalStack 4.0.3 both accepts it and PERSISTS it (verified: `head-object`
+    /// returns `STANDARD_IA`), so that skip arm is now unreachable-by-design —
+    /// and leaving it in would mean a future emulator that silently ignores the
+    /// header prints "skip" and the tier gate stays green, which is exactly the
+    /// vacuity this job exists to prevent. Set by CI: `AWS_ENDPOINT`,
+    /// `AWS_ALLOW_HTTP=true`, `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false`,
+    /// `AWS_ACCESS_KEY_ID/SECRET/REGION`.
     #[cfg(feature = "aws")]
     #[tokio::test]
-    #[ignore = "needs MinIO/S3 — set AWS_ENDPOINT with the emulator running"]
-    async fn put_with_tier_accepted_by_minio() {
+    #[ignore = "needs an S3 emulator — set AWS_ENDPOINT with it running"]
+    async fn put_with_tier_accepted_by_s3_emulator() {
         if std::env::var("AWS_ENDPOINT").is_err() && std::env::var("AWS_ENDPOINT_URL").is_err() {
-            eprintln!("skip: set AWS_ENDPOINT to the MinIO/S3 emulator");
+            eprintln!("skip: set AWS_ENDPOINT to the S3 emulator");
             return;
         }
         let os = ProximaObjectStore::from_url("s3://proximadb-test/cold/probe-s3.bin")
             .or_else(|_| ProximaObjectStore::from_url("s3://proximadb-test"))
-            .expect("open MinIO/S3 store via from_url");
+            .expect("open the S3 emulator store via from_url");
         assert_eq!(os.backend(), ObjectBackendKind::S3);
         let p = Path::from("cold/probe-s3.bin");
-        // Best-effort: skip on the emulator's STANDARD_IA rejection (mirrors the
-        // GCS pattern); fail on other errors. The header mapping itself is
-        // unit-tested (`native_tier(ObjectAccessTier::Cool) == "STANDARD_IA"`).
-        match os
-            .put_with_tier(&p, Bytes::from_static(b"cool-s3"), ObjectAccessTier::Cool)
+        os.put_with_tier(&p, Bytes::from_static(b"cool-s3"), ObjectAccessTier::Cool)
             .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                let msg = format!("{e:?}");
-                if msg.contains("InvalidStorageClass") {
-                    eprintln!(
-                        "skip (best-effort): MinIO emulator rejected STANDARD_IA \
-                         (InvalidStorageClass) — real AWS S3 accepts it; the \
-                         put_with_tier mapping is unit-tested separately. err: {msg}"
-                    );
-                    return;
-                }
-                panic!("MinIO/S3 put_with_tier failed (non-storage-class error): {msg}");
-            }
-        }
+            .expect("the S3 emulator must ACCEPT a tiered PUT (see the doc above)");
         assert_eq!(&os.get(&p).await.expect("get")[..], b"cool-s3");
-        let _ = os.delete(&p).await;
+        // NOTE: intentionally NOT deleted — the harness reads this object's
+        // resident StorageClass back out-of-band (`head-object --query
+        // StorageClass`) to prove the tier was APPLIED and not just accepted,
+        // which `object_store` 0.13 cannot surface on read. Same deliberate
+        // choice as the Azurite probe above; deleting it here makes that
+        // read-back silently unverifiable.
     }
 
     /// GCP (fake-gcs-server) via the builder (`object_store` has no emulator env key
