@@ -46,6 +46,19 @@ extract_version_from_file() {
     package_json)
       grep '"version"' "$file" | head -1 | sed 's/.*: *"\(.*\)".*/\1/'
       ;;
+    # `cargo` takes the FIRST `^version = ` line, which is [package]. The
+    # [workspace.package] version is further down the file and was therefore
+    # invisible to this gate — the reason a "0.4.0" release shipped 150 crates
+    # (and the server binary) still reporting 0.2.0.
+    cargo_workspace)
+      awk '/^\[workspace\.package\]/{f=1; next} f && /^version = /{match($0, /"[^"]*"/); print substr($0, RSTART+1, RLENGTH-2); exit}' "$file"
+      ;;
+    # A package-lock.json records the package's own version TWICE: top-level and
+    # packages[""]. `package_json` above only sees the first, so the second could
+    # drift unnoticed — which is half of what `set` writes.
+    package_lock_own)
+      python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"][""]["version"])' "$file" 2>/dev/null
+      ;;
     *)
       echo ""
       ;;
@@ -69,6 +82,7 @@ cmd_check() {
   # Define files to check: file_path:type
   declare -a files=(
     "Cargo.toml:cargo"
+    "Cargo.toml:cargo_workspace"
     "pyproject.toml:pyproject"
     "clients/python/pyproject.toml:pyproject"
     # NOT clients/python-embedded/pyproject.toml: it carries no version by
@@ -93,7 +107,9 @@ cmd_check() {
     # `package_json` extractor reads the FIRST "version" key, which in a lockfile
     # is the package's own, so it works unchanged here.
     "ui/package-lock.json:package_json"
+    "ui/package-lock.json:package_lock_own"
     "clients/nodejs-embedded/package-lock.json:package_json"
+    "clients/nodejs-embedded/package-lock.json:package_lock_own"
   )
 
   for entry in "${files[@]}"; do
@@ -135,134 +151,163 @@ cmd_set() {
   echo ""
 
   # Use perl for cross-platform compatibility (supports -i)
-  if command -v perl >/dev/null 2>&1; then
-    # 1. Cargo.toml (root, first occurrence only)
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/ if 1..m/^version = / && /^version = /' "$REPO_ROOT/Cargo.toml"
-    echo "  [SET]  Cargo.toml -> $version"
+  # perl and python3 are REQUIRED, checked before any write.
+  #
+  # There used to be a `sed` fallback here. It was a second, divergent
+  # implementation of the same substitutions: it still patched
+  # clients/python-embedded/pyproject.toml (which has no version), never touched
+  # the npm lockfiles, and finished by printing "[SET] All files updated" — a
+  # blanket false success, the very category of defect this script was being
+  # fixed for. #1675 recorded the same lesson about two configs with one
+  # correct. Requiring the tools is strictly safer than maintaining a path
+  # nobody exercises; perl ships with macOS and every CI image we use.
+  local missing=""
+  command -v perl >/dev/null 2>&1 || missing="$missing perl"
+  command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+  if [ -n "$missing" ]; then
+    echo "Error: version-sync.sh set requires:$missing" >&2
+    echo "       Nothing was modified." >&2
+    exit 1
+  fi
 
-    # 2. pyproject.toml (root)
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/pyproject.toml"
-    echo "  [SET]  pyproject.toml -> $version"
+  # Pre-flight the npm lockfiles BEFORE writing anything, so a malformed lockfile
+  # aborts with the tree untouched rather than half-bumped.
+  local lock
+  for lock in "ui/package-lock.json" "clients/nodejs-embedded/package-lock.json"; do
+    [ -f "$REPO_ROOT/$lock" ] || continue
+    python3 - "$REPO_ROOT/$lock" <<'PYEOF' || exit 1
+import json
+import sys
 
-    # 3. clients/python/pyproject.toml
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
-    echo "  [SET]  clients/python/pyproject.toml -> $version"
+path = sys.argv[1]
+try:
+    with open(path) as fh:
+        doc = json.load(fh)
+except (OSError, json.JSONDecodeError) as exc:
+    sys.exit(f"{path}: not readable as JSON ({exc})")
+if "version" not in doc:
+    sys.exit(f'{path}: no top-level "version" key')
+if "version" not in doc.get("packages", {}).get("", {}):
+    sys.exit(f'{path}: no packages[""]["version"] key (lockfileVersion 1?)')
+PYEOF
+  done
 
-    # (no clients/python-embedded/pyproject.toml step — see the note in
-    # check_versions(): that file has no version field, so the substitution
-    # matched nothing while the echo claimed success.)
+  # 1. Cargo.toml [package] version (root, first occurrence only)
+  perl -i -pe 's/^version = ".*"/version = "'"$version"'"/ if 1..m/^version = / && /^version = /' "$REPO_ROOT/Cargo.toml"
+  echo "  [SET]  Cargo.toml [package] -> $version"
 
-    # 4. clients/python/src/proximadb_sdk/__init__.py
-    perl -i -pe 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python/src/proximadb_sdk/__init__.py"
-    echo "  [SET]  clients/python/src/proximadb_sdk/__init__.py -> $version"
+  # 2. Cargo.toml [workspace.package] version — this is what the OTHER 150
+  #    workspace crates inherit via `version.workspace = true`, including
+  #    apps/proximadb-server (whose startup banner and runtime-state report
+  #    env!("CARGO_PKG_VERSION")) and the proximadb-embedded binding (which sets
+  #    the Python package's __version__). Missing it meant a "0.4.0" release
+  #    whose server said 0.2.0 while its own /health said 0.4.0.
+  perl -i -0pe 's/(\[workspace\.package\]\s*\nversion = )".*"/${1}"'"$version"'"/' "$REPO_ROOT/Cargo.toml"
+  echo "  [SET]  Cargo.toml [workspace.package] -> $version"
 
-    # 5. clients/python-embedded/src/proximadb_embedded/__init__.py
-    perl -i -pe 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/src/proximadb_embedded/__init__.py"
-    echo "  [SET]  clients/python-embedded/src/proximadb_embedded/__init__.py -> $version"
+  # 3. Intra-workspace path dependencies carry an explicit version requirement,
+  #    which must track [workspace.package] or resolution fails with
+  #    "failed to select a version for the requirement".
+  perl -i -pe 's/version = "\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?", path =/version = "'"$version"'", path =/g' "$REPO_ROOT/Cargo.toml"
+  echo "  [SET]  Cargo.toml intra-workspace path deps -> $version"
 
-    # 6. clients/rust/Cargo.toml (first occurrence only)
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/ if 1..m/^version = / && /^version = /' "$REPO_ROOT/clients/rust/Cargo.toml"
-    echo "  [SET]  clients/rust/Cargo.toml -> $version"
+  # 4. pyproject.toml (root) — this is the canonical proximadb_embedded wheel.
+  perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/pyproject.toml"
+  echo "  [SET]  pyproject.toml -> $version"
 
-    # 7+8. deploy/helm/proximadb/Chart.yaml
-    perl -i -pe 's/^version: .*/version: '"$version"'/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
-    perl -i -pe 's/^appVersion: .*/appVersion: "'"$version"'"/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
-    echo "  [SET]  deploy/helm/proximadb/Chart.yaml -> $version"
+  # 5. clients/python/pyproject.toml, including the self-referential `embedded`
+  #    extra: its own upper bound would otherwise exclude the wheel this release
+  #    builds, making `pip install 'proximadb[embedded]'` unsatisfiable.
+  perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
+  perl -i -pe 's/"proximadb_embedded>=[\d.]+,<[\d.]+"/"proximadb_embedded>='"$version"',<'"$(echo "$version" | awk -F. '{print $1"."$2+1".0"}')"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
+  echo "  [SET]  clients/python/pyproject.toml (+ embedded extra) -> $version"
 
-    # 9. ui/package.json (first version field)
-    perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if $. <= 10 && /"version"/' "$REPO_ROOT/ui/package.json"
-    echo "  [SET]  ui/package.json -> $version"
+  # (no clients/python-embedded/pyproject.toml step — see the note in
+  # check_versions(): that file has no version field, so the substitution
+  # matched nothing while the echo claimed success.)
 
-    # 10. the npm lockfiles' own version fields.
-    #
-    # A blunt substitution is WRONG here: ui/package-lock.json contains four
-    # `"version": "0.3.0"` lines, two of which belong to dependencies that happen
-    # to share the release version (@standard-schema/utils at the time of
-    # writing). Only the two that precede the first "node_modules/" key are the
-    # package's own, so bound the edit to those.
-    if command -v python3 >/dev/null 2>&1; then
-      for lock in "ui/package-lock.json" "clients/nodejs-embedded/package-lock.json"; do
-        [ -f "$REPO_ROOT/$lock" ] || continue
-        python3 - "$REPO_ROOT/$lock" "$version" <<'PYEOF'
+  # 6. clients/python/src/proximadb_sdk/__init__.py
+  perl -i -pe 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python/src/proximadb_sdk/__init__.py"
+  echo "  [SET]  clients/python/src/proximadb_sdk/__init__.py -> $version"
+
+  # 7. clients/python-embedded/src/proximadb_embedded/__init__.py
+  perl -i -pe 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/src/proximadb_embedded/__init__.py"
+  echo "  [SET]  clients/python-embedded/src/proximadb_embedded/__init__.py -> $version"
+
+  # 8. clients/rust/Cargo.toml (first occurrence only)
+  perl -i -pe 's/^version = ".*"/version = "'"$version"'"/ if 1..m/^version = / && /^version = /' "$REPO_ROOT/clients/rust/Cargo.toml"
+  echo "  [SET]  clients/rust/Cargo.toml -> $version"
+
+  # 9+10. deploy/helm/proximadb/Chart.yaml
+  perl -i -pe 's/^version: .*/version: '"$version"'/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
+  perl -i -pe 's/^appVersion: .*/appVersion: "'"$version"'"/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
+  echo "  [SET]  deploy/helm/proximadb/Chart.yaml -> $version"
+
+  # 11. ui/package.json (first version field)
+  perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if 1..m/"version":/ && /"version":/' "$REPO_ROOT/ui/package.json"
+  echo "  [SET]  ui/package.json -> $version"
+
+  # 12. clients/nodejs-embedded/package.json (first version field)
+  perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if 1..m/"version":/ && /"version":/' "$REPO_ROOT/clients/nodejs-embedded/package.json"
+  echo "  [SET]  clients/nodejs-embedded/package.json -> $version"
+
+  # 13. The npm lockfiles' own version fields, LAST so an abort here cannot skip
+  #     a package.json above. Identified STRUCTURALLY (doc["version"] and
+  #     doc["packages"][""]["version"]), not positionally: a positional "first
+  #     two version lines before node_modules/" walk silently corrupted a
+  #     dependency pin on a lockfileVersion-1 lockfile (no `packages` object, no
+  #     node_modules/ key) and reported success. Pre-flighted above.
+  for lock in "ui/package-lock.json" "clients/nodejs-embedded/package-lock.json"; do
+    [ -f "$REPO_ROOT/$lock" ] || continue
+    python3 - "$REPO_ROOT/$lock" "$version" <<'PYEOF' || exit 1
+import json
 import re
 import sys
 
 path, version = sys.argv[1], sys.argv[2]
 with open(path) as fh:
+    doc = json.load(fh)
+old_top = doc["version"]
+old_own = doc["packages"][""]["version"]
+
+# Edit by line so indentation and key order survive byte-for-byte, but take the
+# TARGETS from the parsed document rather than from position.
+with open(path) as fh:
     lines = fh.readlines()
 
-patched = 0
+done_top = done_own = False
 for i, line in enumerate(lines):
     if '"node_modules/' in line:
         break
-    new, n = re.subn(r'("version":\s*")[^"]*(")', r'\g<1>' + version + r'\g<2>', line)
-    if n:
-        lines[i] = new
-        patched += 1
-    if patched == 2:
-        break
+    if not done_top and re.fullmatch(
+        r'\s*"version":\s*"' + re.escape(old_top) + r'",?\s*', line
+    ):
+        lines[i] = line.replace(f'"{old_top}"', f'"{version}"', 1)
+        done_top = True
+        continue
+    if done_top and not done_own and re.fullmatch(
+        r'\s*"version":\s*"' + re.escape(old_own) + r'",?\s*', line
+    ):
+        lines[i] = line.replace(f'"{old_own}"', f'"{version}"', 1)
+        done_own = True
 
-if patched != 2:
-    sys.exit(f"{path}: expected 2 own-version fields before the first "
-             f"node_modules entry, patched {patched}")
+if not (done_top and done_own):
+    sys.exit(f"{path}: could not locate both own-version lines "
+             f"(top={done_top}, packages[''] ={done_own}) — not modified")
 
 with open(path, "w") as fh:
     fh.writelines(lines)
+
+# Re-read and assert the structural result, so a line edit that landed in the
+# wrong place cannot pass.
+with open(path) as fh:
+    after = json.load(fh)
+if after["version"] != version or after["packages"][""]["version"] != version:
+    sys.exit(f"{path}: post-write check failed")
 PYEOF
-        echo "  [SET]  $lock -> $version"
-      done
-    else
-      echo "  [WARN] python3 not found — package-lock.json versions NOT updated;"
-      echo "         'npm ci' will fail until they match package.json."
-    fi
+    echo "  [SET]  $lock -> $version"
+  done
 
-    # 11. clients/nodejs-embedded/package.json (first version field)
-    perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if $. <= 10 && /"version"/' "$REPO_ROOT/clients/nodejs-embedded/package.json"
-    echo "  [SET]  clients/nodejs-embedded/package.json -> $version"
-  else
-    # Fallback: use gsed if available (macOS coreutils)
-    if command -v gsed >/dev/null 2>&1; then
-      local SED="gsed"
-    else
-      local SED="sed"
-    fi
-
-    # Note: This fallback may not work on all systems due to -i incompatibilities
-    echo "  [WARN] perl not found, using sed (may fail on macOS)"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/Cargo.toml"
-    rm -f "$REPO_ROOT/Cargo.toml.bak"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/pyproject.toml"
-    rm -f "$REPO_ROOT/pyproject.toml.bak"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
-    rm -f "$REPO_ROOT/clients/python/pyproject.toml.bak"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/pyproject.toml"
-    rm -f "$REPO_ROOT/clients/python-embedded/pyproject.toml.bak"
-
-    $SED -i.bak 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python/src/proximadb_sdk/__init__.py"
-    rm -f "$REPO_ROOT/clients/python/src/proximadb_sdk/__init__.py.bak"
-
-    $SED -i.bak 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/src/proximadb_embedded/__init__.py"
-    rm -f "$REPO_ROOT/clients/python-embedded/src/proximadb_embedded/__init__.py.bak"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/rust/Cargo.toml"
-    rm -f "$REPO_ROOT/clients/rust/Cargo.toml.bak"
-
-    $SED -i.bak 's/^version: .*/version: '"$version"'/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
-    $SED -i.bak 's/^appVersion: .*/appVersion: "'"$version"'"/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
-    rm -f "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml.bak"
-
-    $SED -i.bak 's/"version": ".*"/"version": "'"$version"'"/' "$REPO_ROOT/ui/package.json"
-    rm -f "$REPO_ROOT/ui/package.json.bak"
-
-    $SED -i.bak 's/"version": ".*"/"version": "'"$version"'"/' "$REPO_ROOT/clients/nodejs-embedded/package.json"
-    rm -f "$REPO_ROOT/clients/nodejs-embedded/package.json.bak"
-
-    echo "  [SET]  All files updated (using sed fallback)"
-  fi
 
   echo ""
   echo "Done. Run 'bash scripts/version-sync.sh check' to verify."

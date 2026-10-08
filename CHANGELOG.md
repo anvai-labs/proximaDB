@@ -2,6 +2,67 @@
 
 All notable changes to ProximaDB will be documented in this file.
 
+## [0.4.0] - unreleased
+
+Storage-substrate release (415 commits since 0.3.0). Headline: ADR-094 unified the three
+divergent storage substrates behind one compute seam, and the I/O-cost work that followed made
+round-trip count — not bytes, not CPU — the term the engine measures and the operator can tune.
+Full notes: `docs/release-notes/v0.4.0.md`.
+
+### Storage substrate (ADR-094)
+- Durable relational spill store with read-merge, bounded memtable, segment discovery with
+  order-recoverable names, purge-on-DROP, and spill tombstone persistence (TD-USUB-1).
+- Native relational tables register with DataFusion, closing the capability cliff with no format
+  change (TD-USUB-2); publication is additive rather than clobbering (TD-USUB-4).
+- One `RecordReader` seam + Parquet `PAR1` detect arm (TD-USUB-5).
+- Typed shredded columns with a residual PROPS tail — measured 41.2% smaller relational blocks
+  (TD-USUB-6).
+- Faithful canonical-record round trip for Parquet Layer A; Parquet had been dropping
+  `valid_to_ns`, which resurrected tombstoned records (TD-USUB-11).
+- Catalog-resident serving metadata: cold-read GET depth 3 -> 0, measured and ratcheted (TD-USUB-8).
+
+### I/O cost and read geometry
+- Operator-configurable per-location `io_budget` ranged-GET geometry (TD-IOBUDGET-1).
+- Bounded-concurrent `read_ranges` with `fetch_rounds`/`max_inflight` metrics (TD-RDSTRAT-12).
+- Footer-resident pruning: self-describing footer field map, footer block stats, tag-aware
+  two-level compaction layout default-ON per collection with a kill-switch (TD-FPRUNE-1).
+
+### SQL / pgwire
+- Real transaction control — `BEGIN`/`COMMIT`/`ROLLBACK` per ADR-018 P2.D (TD-076).
+- SCRAM-SHA-256 authentication (TD-PGWIRE-AUTH-1).
+- Identifier case-folding: unquoted folds, quoted stays case-exact (TD-OLAP-18).
+- TPC-H/TPC-DS anchored accuracy ratchets (TD-182 P1).
+
+### MLOps
+- MLflow-compatible tracking, registry and artifacts over the existing substrate, with a
+  tracked-S3 artifact backend behind an `ArtifactBackend` seam and a vendored UI at `/mlflow-ui`.
+  Default OFF (TD-MLOPS-1..4).
+
+### Security & governance
+- Generic OIDC provider with multi-IdP portability; legacy SSO removed (TD-SSO-1).
+- API-key gateway roles (TD-TENANT-1 follow-up); subject-parameterized row predicates
+  (ADR-090 L2.1); trust-gated tier entitlement (ADR-0053 W8/W9); REST request limiter,
+  default-off (TD-RATE-1).
+- v1 residue removed — sunset middleware deleted, Flight alias honoring removed
+  (TD-V1SUNSET-1).
+
+### SDK & spec surface
+- TD-SPECRAT-1 took the generated OpenAPI surface from 42 to 94 paths, exposing the ABAC control
+  plane, collections-admin, graph, time-series, rank search, CRUD and unified query to every
+  generated SDK. Node SDK published to npm as `@anvailabs/proximadb-client`.
+
+### Deprecations
+- VIPER engine deprecated (ADR-093); Hive proto arm retired (TD-CAT-8); `OltpCatalog` gated
+  behind the `oltp-catalog` feature (TD-CAT-7.4).
+
+### Known gaps
+- The vector I/O-cost harness is a repo integration test, not a shipped tool (TD-VECEVAL-1).
+- 30 user-facing AsciiDoc pages do not render on the docs site (TD-DOCSITE-1).
+- Four breaking dependency upgrades deferred with named gates, incl. pgwire 0.21 -> 0.41
+  (TD-DEPS-2).
+- The published OpenAPI contract still reports `info.version: 0.2.0`; it is hardcoded rather than
+  derived from the crate version.
+
 ## [0.3.0] - 2026-08-05
 
 Major feature release (802 commits since 0.2.2). Headlines: a Postgres-wire query surface for
