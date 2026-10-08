@@ -18,7 +18,6 @@ use uuid::Uuid;
 
 use crate::errors::{ApiError, ApiResult};
 use crate::network::middleware::tenant::TenantContext;
-use crate::network::rest::canonical::analytics::{self, AnalyticsApiState};
 use crate::network::rest::canonical::aql::{self, AqlApiState};
 use crate::network::rest::canonical::nl::{self, NlApiState};
 use crate::network::rest::health;
@@ -1882,10 +1881,15 @@ pub fn create_router(state: AppState) -> axum::Router {
     // landed in commit 6a73ead7f. The module at `src/network/rest/canonical/hybrid.rs`
     // remains in-tree for reference but is no longer mounted.
 
-    // Read-only collection analytics (Entanglement Index, etc.) — TD-043 sub-2
+    // Read-only collection analytics (Entanglement Index, etc.) — TD-043 sub-2.
+    // ADR-094: the router moved to proximadb-api and reads records through the
+    // RecordOpsPort (tenant-scoped) instead of the concrete vector service.
     let analytics_router = {
-        let analytics_state = AnalyticsApiState::new(Some(state.vector_operations_service.clone()));
-        analytics::create_router().with_state(analytics_state)
+        use proximadb_api::rest::canonical::analytics::{AnalyticsRestState, create_analytics_router};
+        let analytics_state = AnalyticsRestState {
+            record_ops: state.record_ops.clone(),
+        };
+        create_analytics_router().with_state(analytics_state)
     };
     router = router.nest("/api/v2/analytics", analytics_router);
     info!("✅ Analytics API endpoints enabled at /api/v2/analytics");

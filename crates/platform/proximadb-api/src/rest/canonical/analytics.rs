@@ -11,7 +11,14 @@ use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
 };
+use std::sync::Arc;
+
+use proximadb_records::{EmbeddingValues, tree_get};
+use proximadb_runtime::RecordOpsPort;
 use serde::{Deserialize, Serialize};
+
+use crate::rest::TenantContext;
+use axum::extract::Extension;
 use tracing::debug;
 
 use crate::rest::errors::{RestError, RestResult};
@@ -24,7 +31,11 @@ use crate::rest::errors::{RestError, RestResult};
 /// requires a `VectorOpsPort` which is not yet wired in — that endpoint
 /// returns `NotImplemented`.
 #[derive(Clone)]
-pub struct AnalyticsRestState;
+pub struct AnalyticsRestState {
+    /// Record scan authority — the collection-EI handler reads the tenant's
+    /// records through the port (ADR-094).
+    pub record_ops: Arc<dyn RecordOpsPort>,
+}
 
 // ── Legacy stub types kept for re-export compatibility ────────────────────────
 
@@ -74,10 +85,12 @@ pub struct EntanglementRequest {
     pub chunks: Vec<ChunkInput>,
 }
 
-/// Query params for collection-level EI (deferred endpoint).
+/// Query params for collection-level EI.
 #[derive(Debug, Deserialize)]
 pub struct CollectionEiParams {
-    pub topic_field: Option<String>,
+    /// Field in record metadata to use as the topic label.
+    pub topic_field: String,
+    /// Maximum number of records to analyze (default: 1000).
     pub limit: Option<usize>,
 }
 
@@ -127,15 +140,68 @@ async fn compute_entanglement(
     Ok(Json(report))
 }
 
-/// Collection-level EI requires `VectorOpsPort` which is not yet wired.
+/// Collection-level EI: scan the tenant's records through the record-ops port.
 async fn get_collection_entanglement(
-    State(_): State<AnalyticsRestState>,
-    Path(_collection_id): Path<String>,
-    Query(_params): Query<CollectionEiParams>,
+    State(state): State<AnalyticsRestState>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(collection_id): Path<String>,
+    Query(params): Query<CollectionEiParams>,
 ) -> RestResult<Json<EntanglementResponse>> {
-    Err(RestError::NotImplemented(
-        "Collection-level entanglement requires VectorOpsPort — not yet wired.".to_string(),
-    ))
+    let limit = params.limit.unwrap_or(1000);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let (records, _cursor) = state
+        .record_ops
+        .handle_record_scan_paginated_for_tenant(
+            &collection_id,
+            None,
+            limit,
+            true,  // include_vector - EI needs the embeddings
+            true,  // include_props  - EI needs the topic field
+            Some(&tenant.tenant_id),
+            None,
+            now_ns,
+        )
+        .await
+        .map_err(|e| RestError::Internal(format!("record scan failed: {e}")))?;
+
+    let chunks: Vec<ChunkInput> = records
+        .into_iter()
+        .filter_map(|r| {
+            // Topic: a string/symbol property under the caller-chosen field.
+            let topic = match tree_get(&r.props, &params.topic_field) {
+                Some(proximadb_data_model::ProximaValue::String(s))
+                | Some(proximadb_data_model::ProximaValue::Symbol(s)) => s.clone(),
+                _ => return None,
+            };
+            // Embedding: the first fp32-representable cell set. Quantized cells
+            // are skipped (EI needs full precision to be meaningful).
+            let embedding = r.embeddings.iter().find_map(|cell| match &cell.values {
+                EmbeddingValues::Fp32(v) => Some(v.clone()),
+                _ => None,
+            })?;
+            let chunk_id = if r.oid.is_empty() {
+                r.local_id.unwrap_or_default()
+            } else {
+                r.oid
+            };
+            Some(ChunkInput { chunk_id, topic, embedding })
+        })
+        .collect();
+
+    if chunks.is_empty() {
+        return Err(RestError::InvalidArgument(format!(
+            "No records in collection '{}' have a string field '{}'",
+            collection_id, params.topic_field
+        )));
+    }
+
+    let report = entanglement_index(&chunks)
+        .map_err(|e| RestError::InvalidArgument(e.to_string()))?;
+    Ok(Json(report))
 }
 
 // ── Entanglement Index — inline pure-math implementation ─────────────────────
