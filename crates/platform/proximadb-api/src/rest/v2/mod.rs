@@ -6,6 +6,7 @@ pub mod agentic;
 pub mod query;
 pub mod schema;
 pub mod sql;
+pub mod timeseries;
 
 pub use agentic::{
     AgentCheckpointRequest, AgentCheckpointResponse, AgentEventAppendRequest,

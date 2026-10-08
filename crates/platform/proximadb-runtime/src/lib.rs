@@ -26,6 +26,7 @@ pub mod record_search_port;
 pub mod resources;
 pub mod rich_record;
 pub mod rich_search;
+pub use timeseries_port::{TimeseriesOpsPort, TsCollectionConfig, TsPoint, TsValueColumn, install_timeseries_port, timeseries_port};
 pub use write_routing_port::{RecallProbePort, WriteRoutingDecision, WriteRoutingPort};
 pub use fusion_search_port::{
     DocumentFusionSpec, FusionOidKey, FusionRoutePolicy, FusionSearchPort, FusionSearchResult,
@@ -34,6 +35,7 @@ pub use fusion_search_port::{
 pub mod security_port;
 pub mod service_ports;
 pub mod streaming_port;
+pub mod timeseries_port;
 pub mod write_routing_port;
 pub mod unified_query_port;
 

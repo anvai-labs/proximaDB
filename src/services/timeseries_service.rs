@@ -29,7 +29,10 @@ pub fn init_timeseries_service(base_path: PathBuf) -> Result<()> {
         return Ok(());
     }
     let service = Arc::new(TimeSeriesService::new(base_path)?);
-    let _ = TIMESERIES_SERVICE.set(service);
+    let _ = TIMESERIES_SERVICE.set(service.clone());
+    // ADR-094: expose the same instance through the runtime port so the
+    // converged (platform/api) v2 handlers can reach it without root types.
+    proximadb_runtime::timeseries_port::install_timeseries_port(service);
     Ok(())
 }
 
@@ -38,43 +41,8 @@ pub fn timeseries_service() -> Option<Arc<TimeSeriesService>> {
     TIMESERIES_SERVICE.get().cloned()
 }
 
-/// A value column in a time-series collection (mirrors the SDK `ValueColumn`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TsValueColumn {
-    pub name: String,
-    #[serde(default)]
-    pub unit: Option<String>,
-    #[serde(default)]
-    pub aggregation: Option<String>,
-}
 
-/// Time-series collection config (mirrors the SDK `TimeSeriesCollectionConfig`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TsCollectionConfig {
-    pub name: String,
-    #[serde(default = "default_timestamp_column")]
-    pub timestamp_column: String,
-    #[serde(default)]
-    pub value_columns: Vec<TsValueColumn>,
-    #[serde(default)]
-    pub tag_columns: Vec<String>,
-    #[serde(default)]
-    pub retention_ms: Option<i64>,
-}
-
-fn default_timestamp_column() -> String {
-    "timestamp".to_string()
-}
-
-/// A single time-series point: epoch-millis timestamp + named numeric values + string tags.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TsPoint {
-    pub timestamp: i64,
-    #[serde(default)]
-    pub values: HashMap<String, f64>,
-    #[serde(default)]
-    pub tags: HashMap<String, String>,
-}
+pub use proximadb_runtime::timeseries_port::{TsCollectionConfig, TsPoint, TsValueColumn};
 
 /// Multiplexes a `TimeSeriesEngine` PER TENANT — each rooted at `<base_path>/<tenant>` — so
 /// tenants are isolated STRUCTURALLY by physical storage path, not by folding the tenant into the
@@ -492,5 +460,61 @@ mod tests {
                 .is_err(),
             "separator in tenant rejected"
         );
+    }
+}
+
+#[async_trait::async_trait]
+impl proximadb_runtime::TimeseriesOpsPort for TimeSeriesService {
+    async fn create_collection(&self, tenant: &str, config: TsCollectionConfig) -> anyhow::Result<()> {
+        TimeSeriesService::create_collection(self, tenant, config).await
+    }
+
+    async fn list_collections(&self, tenant: &str) -> Vec<TsCollectionConfig> {
+        TimeSeriesService::list_collections(self, tenant).await
+    }
+
+    async fn delete_collection(&self, tenant: &str, name: &str) -> bool {
+        TimeSeriesService::delete_collection(self, tenant, name).await
+    }
+
+    async fn ingest(
+        &self,
+        tenant: &str,
+        collection_id: &str,
+        points: Vec<TsPoint>,
+    ) -> anyhow::Result<usize> {
+        TimeSeriesService::ingest(self, tenant, collection_id, points).await
+    }
+
+    async fn query(
+        &self,
+        tenant: &str,
+        collection_id: &str,
+        start_time: i64,
+        end_time: i64,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<TsPoint>> {
+        TimeSeriesService::query(self, tenant, collection_id, start_time, end_time, limit).await
+    }
+
+    async fn aggregate(
+        &self,
+        tenant: &str,
+        collection_id: &str,
+        start_time: i64,
+        end_time: i64,
+        aggregation: &str,
+        bucket_ms: i64,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        TimeSeriesService::aggregate(
+            self,
+            tenant,
+            collection_id,
+            start_time,
+            end_time,
+            aggregation,
+            bucket_ms,
+        )
+        .await
     }
 }

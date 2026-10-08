@@ -1,3 +1,5 @@
+//! REST API v2 — time-series surface. Moved from the root v2 tree under ADR-094.
+
 // Copyright (C) 2025 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 //! v2 REST time-series surface (TD-TS-1).
@@ -6,7 +8,7 @@
 //! (`clients/python/src/proximadb_sdk/adapters/rest_adapter.py`):
 //! `POST /api/v2/timeseries/collections` (create), `.../{c}/ingest`, `.../{c}/query`,
 //! `.../{c}/aggregate`, `GET /api/v2/timeseries/collections` (list),
-//! `DELETE .../{c}` (delete). Backed by the process-global [`TimeSeriesService`] over
+//! `DELETE .../{c}` (delete). Backed by the process-global timeseries service (via the ADR-094 port) over
 //! the native TST engine — never the stubbed vector-shaped trait methods. Tenant
 //! isolation is structural: the request tenant selects a per-tenant engine in the
 //! service (physically separate storage), and the collection name stays tenant-clean.
@@ -16,15 +18,15 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::errors::{ApiError, ApiResult};
-use crate::network::middleware::tenant::TenantContext;
-use crate::services::timeseries_service::{
-    TimeSeriesService, TsCollectionConfig, TsPoint, timeseries_service,
-};
+use proximadb_runtime::timeseries_port::{TimeseriesOpsPort, TsCollectionConfig, TsPoint, timeseries_port};
 
-fn service() -> ApiResult<Arc<TimeSeriesService>> {
-    timeseries_service()
-        .ok_or_else(|| ApiError::Internal("timeseries service is not available".to_string()))
+use crate::rest::errors::{RestError as ApiError, RestResult as ApiResult};
+use crate::rest::TenantContext;
+
+fn service() -> ApiResult<Arc<dyn TimeseriesOpsPort>> {
+    timeseries_port().ok_or_else(|| {
+        ApiError::Internal("timeseries service is not available".to_string())
+    })
 }
 
 #[derive(Debug, Deserialize)]

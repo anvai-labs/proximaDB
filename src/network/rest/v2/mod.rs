@@ -54,7 +54,7 @@ pub use proximadb_api::rest::v2::query; // ADR-094
 pub mod records;
 pub use proximadb_api::rest::v2::schema; // ADR-094: moved to platform/api
 pub use proximadb_api::rest::v2::sql; // ADR-094
-pub mod timeseries;
+pub use proximadb_api::rest::v2::timeseries; // ADR-094
 
 pub use collections::*;
 pub use query::*;
