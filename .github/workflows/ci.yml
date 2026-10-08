@@ -103,6 +103,7 @@ jobs:
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
       docs: ${{ steps.filter.outputs.docs }}
+      td_citations: ${{ steps.filter.outputs.td_citations }}
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
       v1_proto_usage: ${{ steps.filter.outputs.v1_proto_usage }}
@@ -214,6 +215,19 @@ jobs:
               - 'docs/**'
               - '*.adoc'
               - '*.md'
+            # Separate from `docs` on purpose: three other jobs are gated on
+            # `docs`, and widening it would silently change their triggers too.
+            # This one exists because a TD citation is invalidated by a RENAME in
+            # the Rust sources, not by a doc edit -- so a guard that only runs on
+            # doc changes never sees the change that breaks it, and fires later
+            # on an unrelated docs-only PR, blaming the wrong author.
+            td_citations:
+              - 'docs/10-quality/td/**'
+              - 'scripts/check_td_cited_tests.py'
+              - 'src/**'
+              - 'crates/**'
+              - 'apps/**'
+              - 'tests/**'
             proto:
               - 'proto/**'
             panic_policy:
@@ -1392,7 +1406,7 @@ jobs:
     name: Docs Validation
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.docs == 'true'
+    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -1408,6 +1422,14 @@ jobs:
         run: python3 scripts/check_design_status_index.py
       - name: Check resolved TD status/body consistency
         run: python3 scripts/check_td_status_consistency.py
+      # A TD that names a test which no longer exists sends the next engineer
+      # looking for evidence that is not there. On #1957 one TD cited a renamed
+      # test three times across six review rounds, each caught only by someone
+      # reading carefully. Narrowly scoped so it stays quiet: Tests sections
+      # only, snake_case identifiers only, and lines marking a name as
+      # historical are skipped.
+      - name: Check TD-cited test names resolve
+        run: python3 scripts/check_td_cited_tests.py
       - name: Check documentation links
         run: |
           echo "Checking for broken links in documentation..."
