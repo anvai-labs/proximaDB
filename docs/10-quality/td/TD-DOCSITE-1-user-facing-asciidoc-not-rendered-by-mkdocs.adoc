@@ -1,6 +1,6 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-DOCSITE-1: 39 user-facing AsciiDoc pages are absent from the mkdocs site because mkdocs cannot render AsciiDoc
+= TD-DOCSITE-1: 30 user-facing AsciiDoc pages are absent from the mkdocs site because mkdocs cannot render AsciiDoc
 
 [cols="1,3", options="header"]
 |===
@@ -14,8 +14,14 @@
 
 == The finding
 
-The documentation corpus is **~85% AsciiDoc**: measured 829 `.adoc` against 148
-`.md`. mkdocs is Markdown-native and cannot render AsciiDoc.
+The documentation corpus is **overwhelmingly AsciiDoc** — roughly six `.adoc` for
+every `.md`. mkdocs is Markdown-native and cannot render AsciiDoc.
+
+Exact totals are deliberately not quoted here: they move with almost every PR, so
+a number in this document is stale debt (an earlier revision of this TD carried
+four counts that were all wrong within weeks). The per-directory table below is
+indicative; the **only** count that is maintained is the guard's, in
+`docs/.site-coverage-baseline.json`, because CI fails when it drifts.
 
 Per-directory, the split matters because it separates "must publish" from
 "internal engineering record":
@@ -24,23 +30,46 @@ Per-directory, the split matters because it separates "must publish" from
 |===
 | Directory | .adoc | .md | Publish?
 
-| `00-product` | 4 | 0 | yes
 | `01-quick-start` | 1 | 4 | yes
-| `02-guides` | 7 | 5 | yes
+| `02-guides` | 7 | 6 | yes
 | `03-api-reference` | 6 | 1 | yes
 | `04-operations` | 7 | 2 | yes
 | `05-concepts` | 6 | 4 | yes
-| `11-usecases` | 2 | 2 | yes
+| `release-notes` | 2 | 0 | yes
+| `docs/` root | 1 | 2 | yes — `SUPPORTED_SURFACE.adoc`
+| `00-product` | 4 | 0 | no — PRD/VISION/scorecards, internal product material
+| `rfcs` | 3 | 0 | no — RFC drafts and templates
+| `11-usecases` | 2 | 2 | no — dated internal design drafts
 | `06-internals` | 17 | 8 | no — engineer-facing
 | `09-roadmap` | 4 | 0 | no
-| `10-quality` | 346 | 8 | no — TD/debt register
-| `12-design` | 178 | 8 | no — ADRs / design records
+| `10-quality` | — | — | no — TD/debt register (the bulk of the corpus)
+| `12-design` | — | — | no — ADRs / design records (ditto)
 |===
 
 So the site's exclusion of `10-quality`/`12-design`/`_archive` is **correct and
-deliberate** (publishing a 541-file internal debt register would make the site a
-changelog of our own TODOs). The genuine gap is the **39 user-facing `.adoc`
-files** in the publish-yes rows.
+deliberate**: publishing the internal debt register would make the product's docs
+site a changelog of our own TODOs. The genuine gap is the **30 user-facing
+`.adoc` files** in the publish-yes rows — which is exactly what the guard's
+baseline holds, so the two cannot disagree.
+
+`00-product` and `rfcs` were initially treated as publish-yes and are not. Neither
+holds a single `.md` or a `nav` entry, so nothing in them could reach the site
+anyway, and their content — PRD, VISION, COMPETITIVE_LANDSCAPE, the MVP
+scorecards — is internal product material. `00-product` also held the one
+non-Markdown leak worth naming: see "The second failure mode" below.
+
+== The second failure mode: raw non-Markdown files served publicly
+
+mkdocs copies **any** non-excluded, non-Markdown file into `site/` verbatim. That
+is correct for images, which real pages reference, and wrong for everything else.
+`docs/00-product/MVP_TRUST_CORRIDOR.toml` — an internal MVP scorecard carrying
+`graduation_gate` and per-tier claims — was being served at
+`<site>/00-product/MVP_TRUST_CORRIDOR.toml`.
+
+Neither `--strict` nor an `.adoc`-only check can see this class, so the guard now
+covers it: anything under a published directory whose extension is neither
+Markdown nor a known asset type is a finding. Verified by mutation — a `.toml`
+dropped into `docs/02-guides` fails the guard.
 
 Consequence today: `mkdocs build --strict` passes, but with INFO lines such as
 `'05-concepts/index.md' contains a link to 'SUPPORTED_SURFACE.adoc' which is
@@ -50,35 +79,52 @@ link to nothing.
 == Why `*.adoc` is excluded wholesale rather than plugged in
 
 Rejected: an AsciiDoc plugin for mkdocs. The maintained options are thin, and
-adding a second renderer to make 39 files work would put a fragile dependency in
+adding a second renderer to make 30 files work would put a fragile dependency in
 the publish path for every page (mandate #12 — do not bolt on a duplicate of a
 tool we would then own).
 
 Rejected for now: switching the site to **Antora** (AsciiDoc-native, versioned,
 the natural fit for an 85%-AsciiDoc corpus). It is the better theoretical fit,
 but it would discard the mkdocs/Material pipeline that now builds strict-clean in
-0.5 s, and the *user-facing* subset is only 39 files — small enough to convert.
+0.5 s, and the *user-facing* subset is only 30 files — small enough to convert.
 
 == How to apply
 
 The gate is already in place, so this TD is a conversion backlog rather than an
-open hole. `scripts/check_docs_site_coverage.py` freezes the set of unpublished
+open hole.
+
+One honest limit: "the list can only shrink" is enforced by *review*, not by the
+guard. The guard compares the tree against the baseline, so adding a line to the
+baseline makes a new violation pass. What it does guarantee is that the addition
+is **visible** — it cannot happen silently, which was the original failure mode.
+Any baseline is editable by whoever edits the baseline; the point is that doing
+so is a reviewable diff rather than an absence. `scripts/check_docs_site_coverage.py` freezes the set of unpublished
 AsciiDoc pages in `docs/.site-coverage-baseline.json`: a NEW user-facing `.adoc`
 fails CI, and converting one fails until its stale baseline entry is removed. The
 list can therefore only shrink.
 
-1. **Convert the 39 user-facing `.adoc` files to Markdown**, directory by
-   directory, smallest first (`01-quick-start` has 1, `00-product` 4). Add each to
-   the `nav` *and* drop its baseline entry in the same commit that converts it, so
-   the page is reachable the moment it renders and the count stays truthful.
-2. **Fix the dangling links as you go.** There are **52** links from published
-   pages into the excluded `.adoc` set (counted from the `mkdocs build` log);
+1. **Convert the 30 user-facing `.adoc` files to Markdown**, directory by
+   directory, smallest first (`docs/` root and `01-quick-start` have 1 each,
+   `release-notes` 2). Add each to the `nav` *and* drop its baseline entry in the
+   same commit that converts it, so the page is reachable the moment it renders
+   and the count stays truthful.
+2. **Fix the dangling links as you go.** The `mkdocs build` log reports **52**
+   links from published pages to excluded files — 51 to `.adoc` and one to
+   `_archive/README.md`, so "all 52 are AsciiDoc" would be wrong.
    `05-concepts/index.md` and `05-concepts/quantization.md`/`unified-wal.md` point
-   at `storage-engines.adoc`, `configuration.adoc` and `SUPPORTED_SURFACE.adoc`.
-   These are the reader-visible breakage, so prioritise the targets they point at.
-3. Leave `10-quality` / `12-design` / `06-internals` / `09-roadmap` / `11-usecases`
-   / `_archive` in AsciiDoc and excluded. They are not the product's documentation,
-   and the TD/ADR convention (`HOW_TO_FILE_TD_AND_ADR.adoc`) depends on AsciiDoc.
+   at `storage-engines.adoc`, `configuration.adoc` and `SUPPORTED_SURFACE.adoc`;
+   those are the reader-visible breakage, so prioritise the targets they point at.
++
+   Converting all 30 will **not** drive this to zero: some of the 52 target
+   `12-design/*` and `_archive/*`, which stay excluded permanently. Those links
+   are wrong in a different way — a published page should not link into an
+   internal tree at all — and the fix is to rewrite or drop the link, not to
+   publish the target. See how `05-concepts/index.md` now points at the GitHub
+   tree for `06-internals`.
+3. Leave `10-quality` / `12-design` / `06-internals` / `09-roadmap` /
+   `11-usecases` / `00-product` / `rfcs` / `_archive` in AsciiDoc and excluded.
+   They are not the product's documentation, and the TD/ADR convention
+   (`HOW_TO_FILE_TD_AND_ADR.adoc`) depends on AsciiDoc.
 
 == Rejected: narrowing `exclude_docs` as the gate
 
@@ -90,7 +136,7 @@ that is false in both halves**, which is why the out-of-band guard exists:
 * Dropping `*.adoc` from `exclude_docs` builds **clean** — `--strict` exits 0 with
   zero warnings. mkdocs only treats `.md` as pages, so a `.adoc` is never a page
   whose absence from `nav` could be reported.
-* Worse, all 39 files are then **copied into `site/` as raw unrendered AsciiDoc**
+* Worse, all 30 files are then **copied into `site/` as raw unrendered AsciiDoc**
   (`site/00-product/PRD.adoc` verified present), so the public site would serve
   markup as source text.
 

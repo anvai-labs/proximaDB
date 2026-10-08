@@ -1,16 +1,20 @@
 # ProximaDB user-facing documentation site.
 #
-# SCOPE IS DELIBERATE. The repo holds 977 doc files, but 541 of them live in
-# `docs/10-quality` and `docs/12-design` — TDs, ADRs and design records written
-# for engineers working in this repo, not for users. Publishing those would make
-# the site a changelog of internal debt. This site covers the user-facing tree
-# only: 00-product, 01-quick-start, 02-guides, 03-api-reference, 04-operations,
-# 05-concepts, 11-usecases.
+# SCOPE IS DELIBERATE. Most of `docs/` is internal: `docs/10-quality` and
+# `docs/12-design` alone hold more than half the corpus as TDs, ADRs and design
+# records written for engineers working in this repo, not for users. Publishing
+# those would make the site a changelog of internal debt. This site covers the
+# user-facing tree only: 01-quick-start, 02-guides, 03-api-reference,
+# 04-operations, 05-concepts, release-notes.
 #
-# FORMAT CAVEAT (TD-DOCSITE-1): the corpus is ~85% AsciiDoc (829 .adoc vs
-# 148 .md) and mkdocs is Markdown-native. The nav below lists the Markdown pages
-# that render today; the 39 user-facing .adoc files are tracked for conversion
-# (frozen by scripts/check_docs_site_coverage.py, see TD-DOCSITE-1).
+# Deliberately no exact file counts here: they change with almost every PR, so a
+# number in this comment is stale debt. The one count that IS maintained is the
+# guard's, in `docs/.site-coverage-baseline.json`, because CI fails when it drifts.
+#
+# FORMAT CAVEAT (TD-DOCSITE-1): the corpus is overwhelmingly AsciiDoc and mkdocs
+# is Markdown-native. The nav below lists the Markdown pages that render today;
+# the user-facing .adoc files are tracked for conversion and frozen by
+# `scripts/check_docs_site_coverage.py`.
 # `asciidoctor` is NOT a build dependency — rather than bolt on a fragile
 # plugin, the user-facing .adoc files get converted to Markdown incrementally.
 site_name: ProximaDB
@@ -20,7 +24,7 @@ edit_uri: edit/develop/
 docs_dir: docs
 
 # Everything that is NOT the user-facing site. mkdocs walks the whole docs_dir,
-# so without this it pulls in 541 internal TD/ADR files plus the archive — and
+# so without this it pulls in every internal TD/ADR file plus the archive — and
 # strict mode then fails on their stale cross-links, which is noise from pages
 # that were never meant to be published. `*.adoc` is excluded wholesale because
 # mkdocs cannot render AsciiDoc at all (TD-DOCSITE-1 tracks converting the
@@ -35,6 +39,22 @@ exclude_docs: |
   agent-rules/
   architecture-diagrams/
   11-usecases/
+  # Internal product material, not user documentation: PRD, VISION,
+  # COMPETITIVE_LANDSCAPE, the MVP scorecards. It also held the one non-Markdown
+  # leak worth naming — mkdocs copies ANY non-excluded, non-.md file into the
+  # site verbatim, so `00-product/MVP_TRUST_CORRIDOR.toml` (tier claims, graduation
+  # gate) was being served publicly. `scripts/check_docs_site_coverage.py` now
+  # guards that whole class, not just .adoc.
+  00-product/
+  # Internal RFC drafts and templates.
+  rfcs/
+  # The site's own entry point is docs/index.md; INDEX.adoc is the repo-tree index.
+  INDEX.adoc
+  # The coverage guard's baseline is build input, not a page.
+  .site-coverage-baseline.json
+  # assets/ itself stays published — the images are referenced by real pages —
+  # but its readme is an asset-directory note, not a user page.
+  assets/readme.adoc
   openapi/
   *.adoc
   README.md

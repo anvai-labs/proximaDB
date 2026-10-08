@@ -1,11 +1,7 @@
 {
-  "_comment": "User-facing AsciiDoc pages that the mkdocs site cannot render, so they publish nowhere. Frozen by scripts/check_docs_site_coverage.py: this list may only shrink, as TD-DOCSITE-1 converts each page to Markdown. Do not add entries without a conversion plan.",
+  "_comment": "Files under a published docs directory that the mkdocs site cannot serve as a page: AsciiDoc (mkdocs renders only Markdown, so these publish nowhere while links to them silently break), and any other non-asset file (copied into site/ as raw source and served publicly). Frozen by scripts/check_docs_site_coverage.py: this list may only shrink, as TD-DOCSITE-1 converts each page to Markdown. Do not add entries without a conversion plan.",
   "_td": "TD-DOCSITE-1",
   "unpublished_asciidoc": [
-    "00-product/COMPETITIVE_LANDSCAPE.adoc",
-    "00-product/MVP_EXECUTION_SCORECARD.adoc",
-    "00-product/PRD.adoc",
-    "00-product/VISION.adoc",
     "01-quick-start/CONTEXT_SERVING_MVP.adoc",
     "02-guides/SYNERGY_SUMMARY.adoc",
     "02-guides/arrow-export-guide.adoc",
@@ -33,13 +29,8 @@
     "05-concepts/hybrid-fusion.adoc",
     "05-concepts/storage-engines.adoc",
     "05-concepts/vision.adoc",
-    "INDEX.adoc",
     "SUPPORTED_SURFACE.adoc",
-    "assets/readme.adoc",
     "release-notes/v0.2.0.adoc",
-    "release-notes/v0.2.2.adoc",
-    "rfcs/0000-template.adoc",
-    "rfcs/0001-transactional-ledger-modality.adoc",
-    "rfcs/0002-foundational-modality-consolidation.adoc"
+    "release-notes/v0.2.2.adoc"
   ]
 }

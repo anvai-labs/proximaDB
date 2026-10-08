@@ -215,6 +215,9 @@ jobs:
               - 'docs/**'
               - '*.adoc'
               - '*.md'
+              # the docs-site config and its coverage guard (TD-DOCSITE-1)
+              - 'mkdocs.yml'
+              - 'scripts/check_docs_site_coverage.py'
             # Separate from `docs` on purpose: three other jobs are gated on
             # `docs`, and widening it would silently change their triggers too.
             # This one exists because a TD citation is invalidated by a RENAME in
@@ -1430,6 +1433,12 @@ jobs:
       # historical are skipped.
       - name: Check TD-cited test names resolve
         run: python3 scripts/check_td_cited_tests.py
+      # Blocking because this job IS in ci-success's needs, unlike the
+      # `Build docs (strict)` job in docs-site.yml — a separate workflow cannot
+      # appear in `needs`, so that one is advisory. Stdlib-only on purpose, so it
+      # costs no toolchain here. TD-DOCSITE-1.
+      - name: Check no user-facing page is silently unpublished
+        run: python3 scripts/check_docs_site_coverage.py
       - name: Check documentation links
         run: |
           echo "Checking for broken links in documentation..."

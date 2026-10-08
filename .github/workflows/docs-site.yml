@@ -1,11 +1,24 @@
 # User-facing documentation site (mkdocs + Material).
 #
 # Two jobs, matching the feat -> develop -> qa -> main promotion flow:
-#   * `build`  — runs on every docs-touching PR and on develop. `--strict`, so a
-#     broken link or a page missing from the nav FAILS rather than shipping a
-#     silently wrong site. This is the gate.
+#   * `build`  — runs on every docs-touching PR and on develop. `--strict` plus
+#     the `validation:` block in mkdocs.yml, so a broken link, a bad anchor or a
+#     page missing from the nav FAILS rather than shipping a silently wrong site.
+#
+#     NOT merge-blocking: `develop` requires only the `CI Success` aggregator,
+#     and a job in a SEPARATE workflow cannot appear in its `needs`. Making this
+#     required means either adding `Docs Site / Build docs (strict)` to branch
+#     protection, or folding the build into `ci.yml`. The cheap part — the
+#     coverage guard, which needs no toolchain — is already blocking: it runs in
+#     ci.yml's `docs-validation`, which IS in `ci-success.needs`.
 #   * `deploy` — publishes to GitHub Pages from `main` only, so the public site
 #     tracks the released branch rather than in-flight work.
+#
+#     PREREQUISITE, not yet done: GitHub Pages must be enabled for this repo with
+#     source "GitHub Actions" (Settings -> Pages). Until then `configure-pages`
+#     fails with "Get Pages site failed", so the first push to `main` after this
+#     merges will show a red Deploy job. That is a one-time repo setting, not a
+#     code change.
 #
 # Path-filtered on purpose: CI runners are a shared finite resource, and a docs
 # site rebuild has no bearing on a Rust-only change.
@@ -19,6 +32,7 @@ on:
       - 'requirements-docs.txt'
       - 'scripts/check_docs_site_coverage.py'
       - '.github/workflows/docs-site.yml'
+      - 'Makefile'
   push:
     branches: [develop, main]
     paths:
@@ -27,6 +41,7 @@ on:
       - 'requirements-docs.txt'
       - 'scripts/check_docs_site_coverage.py'
       - '.github/workflows/docs-site.yml'
+      - 'Makefile'
   workflow_dispatch:
 
 permissions:
@@ -34,7 +49,9 @@ permissions:
 
 concurrency:
   group: docs-site-${{ github.ref }}
-  cancel-in-progress: true
+  # false, not true: this group covers the Pages `deploy` job, and cancelling a
+  # deployment mid-flight can leave the published site in a partial state.
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -57,13 +74,13 @@ jobs:
       - name: Build (strict)
         # --strict only escalates WARNINGs, and mkdocs ships link/nav checks at
         # INFO; the `validation:` block in mkdocs.yml raises them, which is what
-        # makes this step a gate rather than a formality. If it breaks on a link
-        # into docs/12-design or docs/10-quality, the fix is NOT to relax
+        # makes this step meaningful rather than a formality. If it breaks on a
+        # link into docs/12-design or docs/10-quality, the fix is NOT to relax
         # strict: those trees are excluded by design (see mkdocs.yml), so link
         # to a published page or drop the link.
         run: mkdocs build --strict
       - name: Upload site artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docs-site
           path: site/
@@ -84,14 +101,13 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      # Publish exactly the bytes `build` produced. Rebuilding here would mean
+      # the artifact the build job verified is not the artifact that ships.
+      - name: Download the verified site
+        uses: actions/download-artifact@v7
         with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements-docs.txt
-      - run: pip install -r requirements-docs.txt
-      - run: mkdocs build --strict
+          name: docs-site
+          path: site/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -622,11 +622,17 @@ tdd-precommit:
 	@echo "✅ All TDD pre-commit checks passed!"
 
 # ── Documentation site (mkdocs + Material) ────────────────────────────────────
-# `docs-build` is what CI gates on. Note that `--strict` alone is NOT a gate: it
-# only escalates WARNINGs, and mkdocs ships link/nav checks at INFO — the
-# `validation:` block in mkdocs.yml is what makes a broken link or a page missing
-# from the nav fail. The one case mkdocs cannot express at all (a link to an
-# excluded file) is checked by scripts/check_docs_site_coverage.py.
+# These targets mirror what CI runs; CI invokes the two commands inline rather
+# than calling `make`, so keep them in step (the docs-site workflow is
+# path-filtered on this Makefile so a drift here re-runs it).
+#
+# Note that `--strict` alone is NOT a gate: it only escalates WARNINGs, and
+# mkdocs ships link/nav checks at INFO — the `validation:` block in mkdocs.yml is
+# what makes a broken link or a page missing from the nav fail. The class mkdocs
+# cannot express at all (a link to an excluded file; a non-Markdown file served
+# as raw source) is checked by scripts/check_docs_site_coverage.py, which is the
+# merge-blocking half: it runs in ci.yml's `docs-validation`, while the strict
+# build runs in the separate Docs Site workflow and is advisory.
 .PHONY: docs-install docs-serve docs-build
 docs-install:
 	pip install -r requirements-docs.txt
@@ -634,6 +640,6 @@ docs-install:
 docs-serve: ## Serve the user-facing docs site locally on :8000
 	mkdocs serve
 
-docs-build: ## Build the docs site, failing on broken links (CI gate)
+docs-build: ## Build the docs site, failing on broken links
 	python3 scripts/check_docs_site_coverage.py
 	mkdocs build --strict

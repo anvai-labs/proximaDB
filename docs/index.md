@@ -1,6 +1,6 @@
 # ProximaDB
 
-**The context database** — vectors, documents, graphs and observability in one system.
+**The context database** — vectors, documents and graphs in one system, queried through standard SQL, gRPC and Arrow Flight. Observability ingestion and query are also built in, at Beta ([support tiers](https://github.com/anvai-labs/proximaDB/blob/main/docs/SUPPORTED_SURFACE.adoc)).
 
 ```mermaid
 %%{init: {"theme": "neutral"}}%%

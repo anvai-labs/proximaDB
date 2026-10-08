@@ -5,20 +5,26 @@
 ```mermaid
 %%{init: {"theme": "neutral"}}%%
 flowchart TB
-  Q[Query vector] --> R{engine_selector}
-  R -->|co-located| P[PAX segment<br/>one object]
-  R -->|separate index| X[AXIS index<br/>.axis files]
+  C[Collection] --> D{"index_configs non-empty<br/>AND enable_axis_indexes<br/>AND axis feature built?"}
+  D -->|no — the default| P[PAX scan path<br/>one object]
+  D -->|yes — opt-in| X["AXIS index<br/>in-memory HNSW/IVF"]
   P --> P1[coarse IVF probe<br/>prune cells]
   P1 --> P2[RaBitQ rank<br/>~1 bit/dim]
   P2 --> P3[SQ8/FP16 rerank]
   P3 --> R1[top-k + payload<br/>same object]
-  X --> X1[IVF/HNSW traversal]
+  X --> X1[IVF/HNSW traversal<br/>in RAM]
   X1 --> X2[fetch payload<br/>second hop]
   X2 --> R2[top-k]
   style P fill:#3498db,color:#fff
   style X fill:#9b59b6,color:#fff
   style P2 fill:#e74c3c,color:#fff
 ```
+
+The choice is made **per collection at create time**, not per query: AXIS serves
+only a collection that declares a non-empty `index_configs`, on a server with
+`storage.optimization.enable_axis_indexes = true`, in a binary built with the
+Cargo `axis` feature. Anything else takes the PAX scan path
+([ADR-070](https://github.com/anvai-labs/proximaDB/blob/main/docs/12-design/adr/ADR-070-axis-not-needed-for-codesign-collections.adoc)).
 
 ---
 
@@ -30,24 +36,30 @@ redundant — they optimise different cost terms.
 | | **PAX IVF** (co-located) | **AXIS IVF** (separate index) |
 |---|---|---|
 | Where vectors live | In the data object, as typed stripes | In the data object |
-| Where the index lives | *No separate index* — IVF coarse directory inside the segment footer | Separate persisted `.axis` files |
+| Where the index lives | *No separate index* — IVF coarse directory inside the segment footer | A separate in-memory HNSW/IVF structure; materialized projection bytes live under `indexes/<projection>/` |
 | Payload fetch | Same object, same GET family | Second hop after the index returns ids |
 | Quantization | RaBitQ (~1 bit/dim) → SQ8/FP16 rerank, in-segment | Index-side (IVF/HNSW/flat) |
 | Filtered search | Metadata stripes co-resident → prune before ranking | Needs a join or post-filter |
-| Default | **On** (PAX + RaBitQ + row-group layout) | Feature `axis`, **on** by default |
+| Default | **This is the default** (PAX + RaBitQ + row-group layout) | **Opt-in.** Needs non-empty `index_configs` *and* `storage.optimization.enable_axis_indexes = true`. The Cargo `axis` feature is in the default set, but that is compile-time *capability*, not activation (ADR-070, Accepted) |
 
-The shapes map onto the industry split: PAX IVF is the "one object, many
-column groups" model; AXIS IVF is the pgvector/LanceDB model where the index is
-a separate artifact beside the data.
+The shapes map onto the industry split: PAX IVF is the "one object, many column
+groups" model; AXIS IVF is the pgvector/LanceDB model where the index is a
+separate artifact from the data. Note the difference from those systems, though:
+AXIS's working structure is held **in RAM**, which is why ADR-070 measures its
+cost as a "redundant second copy in RAM" (8.6 GB for 1M × 768d) rather than as
+extra object-storage traffic. That memory is the price of its latency advantage.
 
 ## When to use which
 
 **Prefer PAX IVF when:**
 
 * **Queries carry predicates.** Metadata lives in the same object as the
-  vectors, so a filtered ANN query prunes before ranking and never pays a join.
-  Measured on SIFT1M-100k with 8 partitions: filtered recall@10 **0.9907** —
-  i.e. filtering did not cost recall.
+  vectors, so a filtered ANN query prunes before ranking rather than paying a
+  join or a post-filter. Note this is a *structural* argument, not a measured
+  one: filtered ANN carries **no recall SLA** today — `SUPPORTED_SURFACE.adoc`
+  lists per-collection filtered-ANN policy as Not supported while ADR-011 is
+  Beta, and its harness (`tests/filtered_ann_recall_bands.rs`) is `#[ignore]`d
+  with floors of 0.30/0.60/0.80. Measure your own workload before relying on it.
 * **You need the payload with the hit.** Vector search returns ids; apps want
   records. Co-location keeps that in the same GET family rather than a second
   round trip.
@@ -64,6 +76,18 @@ a separate artifact beside the data.
 * **The payload is large relative to the vector** and you do *not* want payload
   bytes anywhere near the ranking path.
 
+To actually get AXIS you must do all three of these — any one missing silently
+leaves you on the PAX path, which is the usual reason a reader concludes "I tried
+AXIS and saw no difference":
+
+1. create the collection with a non-empty `index_configs`;
+2. run the server with `storage.optimization.enable_axis_indexes = true`
+   (see `config/cloud-object-store.toml`);
+3. build with the Cargo `axis` feature — it is in the default set, so this one
+   is usually already true.
+
+Budget the RAM: ADR-070 measures 8.6 GB for 1M × 768d vectors.
+
 **A caution that applies to both.** Index choice is secondary to the
 **I/O budget** (below). In our own measurements, moving the storage budget from
 4 MiB to 8 MiB cut GETs/query by 22% at identical recall, while the IVF
@@ -76,7 +100,7 @@ Per-backend defaults (`crates/storage/proximadb-storage-common/src/iops_budget.r
 
 | Backend | min | target | max |
 |---|---|---|---|
-| Azure (`az`/`adls`/`abfs`) | 512 KiB | **4 MiB** | 4 MiB |
+| Azure (`az`/`azure`/`adls`/`abfs`) | 512 KiB | **4 MiB** | 4 MiB |
 | S3 (`s3`/`http(s)`) | 512 KiB | **8 MiB** | 16 MiB |
 | GCS (`gs`/`gcs`) | 512 KiB | **8 MiB** | 16 MiB |
 | Local / MinIO | 256 KiB | 1 MiB | 8 MiB |
@@ -89,20 +113,31 @@ Two things worth knowing:
    source says so explicitly: *"not a Blob billing quantum or a proven SDK range
    limit"* (tracked by TD-SEARCH-3). If you have wire evidence for your account,
    raise it.
-2. **You can override it per location**, which is the supported way to escape a
+2. **`PROXIMADB_DISK_CLASS=hdd` replaces the local profile with the cloud one**
+   (4 MiB target), so a local measurement can silently change profile. Check it
+   before comparing runs.
+3. **You can override it per location**, which is the supported way to escape a
    default you have measured past:
 
 ```toml
 [[storage.storage_locations]]
 url = "az://mycontainer/vectors"
+weight = 1
+tags = ["vectors"]
   [storage.storage_locations.io_budget]
-  min    = 524288      # 512 KiB
-  target = 8388608     # 8 MiB  — override the 4 MiB Azure default
-  max    = 16777216    # 16 MiB
+  target_bytes = 8388608     # 8 MiB — override the 4 MiB Azure default
+  max_bytes    = 16777216    # 16 MiB
+  # min_bytes and disk_class are optional; unset fields keep the profile value.
 ```
 
-Registered at boot and resolved by **longest matching URL prefix**, so you can
-tune one prefix without touching the rest.
+`IoBudgetConfig` is `deny_unknown_fields`, so the `_bytes` suffixes are not
+optional spelling — `min`/`target`/`max` fail at startup with *"unknown field
+`min`, expected one of `disk_class`, `min_bytes`, `target_bytes`, `max_bytes`"*.
+`weight` and `tags` have no serde default either, so a location entry must carry
+them. `config/multi-disk-config.toml` is a working reference.
+
+Registered at boot and resolved by **longest matching URL prefix** (on `/`
+boundaries), so you can tune one prefix without touching the rest.
 
 ## Benchmark it on your own dataset
 
@@ -127,6 +162,16 @@ so your own corpus works without precomputed neighbours.
 
 ### Run it
 
+!!! warning "This needs the repository, not a release"
+
+    The harness is an integration test, so running it today requires a git
+    checkout, the pinned Rust toolchain and `cargo test` — it is **not** in any
+    released artifact, and there is no `proximadb`-CLI equivalent yet.
+    **TD-VECEVAL-1** tracks shipping it as a subcommand of
+    `apps/proximadb-ann-bench` so it can be run against your own data without
+    building the server. Until then, treat this section as instructions for
+    someone working in the repo.
+
 ```bash
 PROXIMADB_SIFT_DATASET_DIR=/path/to/your/vectors \
 PROXIMADB_SIFT_N=100000 \
@@ -138,7 +183,7 @@ PROXIMADB_RECALL_DATASET_REQUIRED=1 \
 
 Add `,aws` to `--features` and set `PROXIMADB_OBJECT_STORE_URL=s3://bucket/prefix`
 (plus `AWS_ENDPOINT`/credentials) to measure under a **cloud** I/O budget rather
-than the local one. Without this you are measuring the 1–4 MiB local profile,
+than the local one. Without this you are measuring the 1 MiB-target local profile,
 which understates the GET savings a cloud budget gives you.
 
 ### Knobs
@@ -160,9 +205,14 @@ which understates the GET savings a cloud budget gives you.
 
 ```
 SIFT PAX cascade recall@10 [rg_layout] = 0.9896 over 1000 queries (N=100000, floor=0.9)
-SIFT paired exact/ANN evidence: ... exact GET/range-GET/bytes/compute-ms per pair=5.00/0.00/74961193/189.47,
-                                    ANN   GET/range-GET/bytes/compute-ms per pair=53.97/53.97/25297445/20.07
+SIFT paired exact/ANN evidence: pairs=30, N=100000, dim=128, ...
+    exact GET/range-GET/bytes/compute-ms per pair=5.00/0.00/74961193/164.57,
+    ANN   GET/range-GET/bytes/compute-ms per pair=53.97/53.97/25297445/25.47
 ```
+
+Note `pairs=30`. Recall is measured over all 1000 queries, but the paired I/O
+and compute figures come from a 30-pair sample at N=100k (100 pairs at N=10k,
+3 at N=1M). Do not read the I/O columns as 1000-query averages.
 
 Four numbers decide a configuration, and you want them **together**:
 
@@ -174,23 +224,36 @@ Four numbers decide a configuration, and you want them **together**:
 
 ## Reference measurements
 
-SIFT1M subset, N=100 000, dim 128, top_k 10, 1000 queries, RaBitQ→SQ8 cascade
-with the row-group layout (the shipped default). Reproduced identically on CI
-and a workstation:
+SIFT1M subset, N=100 000, dim 128, top_k 10, recall over 1000 queries, I/O over
+30 pairs, RaBitQ→SQ8 cascade with the row-group layout.
 
-| Configuration | recall@10 | GETs/query | bytes/query | bytes/GET |
-|---|---|---|---|---|
-| Exact scan (no ANN) | 1.0 by definition | **5.00** | 75.0 MB | 15.0 MB |
-| ANN, local budget (4 MiB) | 0.9896 | 53.97 | 25.3 MB | ~469 KB |
-| **ANN, S3 budget (8 MiB)** | 0.9896 | **42.03** | 26.9 MB | ~639 KB |
-| ANN, filtered (8 partitions) | 0.9907 | — | — | — |
+**Provenance, because it changes how much weight these carry:**
+
+* Rows 1–2 are from the **qa-gate `sift-pax-recall` job**, the last successful
+  run (2026-09-04). They are reproducible in CI.
+* Row 3 is **workstation-only and not in the evidence ledger** — no CI job sets
+  `PROXIMADB_OBJECT_STORE_URL`, so the `s3://` budget arm has never run in CI.
+  Treat it as indicative, and re-measure on your own account before relying on
+  it. (That gap is part of what TD-VECEVAL-1 covers.)
+* The harness forces `PROXIMADB_PAX_F32_TIER=1`, which is **default-OFF**
+  (`ENV_GATE_REGISTRY.adoc`) and changes which stripes a segment emits. So these
+  are *default + one opt-in gate*, not stock defaults — and that gate moves the
+  very bytes/query and bytes/GET columns below.
+
+| Configuration | recall@10 | GETs/query | bytes/query | bytes/GET | Source |
+|---|---|---|---|---|---|
+| Exact scan (no ANN) | 1.0 by definition | **5.00** | 75.0 MB | 15.0 MB | CI |
+| ANN, local profile (1 MiB target) | 0.9896 | 53.97 | 25.3 MB | ~469 KB | CI |
+| **ANN, `s3://` budget (8 MiB target)** | 0.9896 | **42.03** | 26.9 MB | ~639 KB | workstation |
 
 Reading it:
 
-* ANN buys **−66% bytes** and **−85% compute** over an exact scan, but costs
-  **~8–11× more round-trips**. On object storage that trade is the whole
-  decision, and it is why the budget matters more than the knobs.
-* The **8 MiB S3 budget cut GETs 22% for +6% bytes at identical recall** — a
+* ANN buys **−66% bytes** and **−85% compute** over an exact scan (164.57 ms →
+  25.47 ms in that run), but costs **~8–11× more round-trips**. On object storage
+  that trade is the whole decision, and it is why the budget matters more than
+  the knobs.
+* Moving from the **local 1 MiB target to the `s3://` 8 MiB target cut GETs 22%
+  for +6% bytes at identical recall** — a
   straight DEPTH-for-BYTES win, and the clearest single lever we measured.
 * With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
   **81 GETs / 92 ms probed vs 108 GETs / 144 ms unprobed** at recall
@@ -209,7 +272,8 @@ Reading it:
 * `sift_ivf2_coarse_probe_recall_ratchet` currently fails a precondition
   (it passes a collection *name* where a catalog object id is required). It is
   `#[ignore]`d, so CI does not catch the drift. Use
-  `sift_ivf2_probe_release_bakeoff_eval` for the clustered arm until that is
+  `sift_ivf2_probe_release_bakeoff_eval` (which is `#[ignore]`d, so it needs
+  `-- --ignored`) for the clustered arm until that is
   fixed.
 
 ## See also
