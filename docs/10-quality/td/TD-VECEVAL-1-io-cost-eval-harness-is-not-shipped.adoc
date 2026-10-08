@@ -74,7 +74,41 @@ got "sift_ivf2_gate": invalid digit found in string
 
 It passes a collection *name* where a decimal catalog object id is now required.
 Because the test is `#[ignore]`d, CI never runs it, so the drift was invisible —
-the same ungated-rot pattern as the stale `rg_layout` "default OFF" comments. The
+the same ungated-rot pattern as the stale `rg_layout` "default OFF" comments.
+
+Note why the *other* SIFT ratchets in the same file are unaffected: the decimal-id
+requirement is enforced at the **flush/compaction-admission** boundary
+(`FlushParams::get_collection_object_id` and its compaction twin, in
+`crates/storage/proximadb-storage-traits/src/types.rs`), which only this test
+reaches — it is the one that drives v3 through the production compaction trigger.
+The others set `id` to a name too and never hit that boundary, so the pattern
+looks fine by inspection and is not.
+
+**The fix is two lines, and the canonical precedent is already in the repo.**
+`tests/sst_ivf2_compaction_route_proof_test.rs` mints an id for exactly this
+reason:
+
+[source,rust]
+----
+/// The SST flush / compaction-admission path is fail-closed on a decimal id
+/// (`FlushParams::get_collection_object_id`), so a bare-engine test must supply
+/// one — the human name lives in `CollectionConfig.name`.
+fn next_object_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed).to_string()
+}
+----
+
+So `sift_ivf2_coarse_probe_recall_ratchet` needs `id: next_object_id()` with
+`config.name: "sift_ivf2_gate"` — do not hash the name at the storage boundary,
+which `get_collection_object_id`'s own doc comment warns against ("a second,
+collision-prone identity domain that cannot be joined reliably with catalog,
+MVCC, deletion-vector, or compaction state").
+
+Fixing it does not change CI, since the test stays `#[ignore]`d — the value is
+that the clustered-arm eval becomes runnable at all, which is what this TD needs
+in order to ship a harness whose arms are not vacuous. The
 clustered arm must be exercised through `sift_ivf2_probe_release_bakeoff_eval`
 until it is fixed. Worth folding into item 3: a gate that cannot run is not a
 gate.
