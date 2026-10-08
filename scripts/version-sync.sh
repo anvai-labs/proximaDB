@@ -50,8 +50,47 @@ extract_version_from_file() {
     # [workspace.package] version is further down the file and was therefore
     # invisible to this gate — the reason a "0.4.0" release shipped 150 crates
     # (and the server binary) still reporting 0.2.0.
+    # Parsed with tomllib, not a regex. A hand-rolled awk walk failed OPEN on
+    # four valid TOML spellings of the field it exists to watch — `[ workspace.
+    # package ]`, an indented `version`, a single-quoted value, and a DELETED
+    # version line (empty extraction reads as [SKIP], which does not fail) — and
+    # it leaked a later table's version when `[workspace.package]` had none,
+    # because the section flag was never reset at the next header.
     cargo_workspace)
-      awk '/^\[workspace\.package\]/{f=1; next} f && /^version = /{match($0, /"[^"]*"/); print substr($0, RSTART+1, RLENGTH-2); exit}' "$file"
+      python3 -c 'import sys,tomllib
+with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
+v=d.get("workspace",{}).get("package",{}).get("version")
+print(v if v else "<MISSING-workspace.package.version>")' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>"
+      ;;
+    # M2: intra-workspace path dependencies carry an explicit version
+    # requirement that MUST track [workspace.package] — cargo fails with
+    # "failed to select a version for the requirement" otherwise, a hard build
+    # break the release gate was blind to. Reports the first mismatching pin so
+    # the comparison fails with a useful value.
+    cargo_path_dep_pins)
+      python3 -c 'import sys,tomllib
+with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
+pins={}
+for table in ("dependencies","dev-dependencies","build-dependencies"):
+    for name,spec in d.get(table,{}).items():
+        if isinstance(spec,dict) and "path" in spec and "version" in spec:
+            pins[name]=spec["version"]
+vals=set(pins.values())
+if not pins: print("<NO-PATH-DEP-PINS>")
+elif len(vals)==1: print(next(iter(vals)))
+else: print("<MIXED:"+",".join(f"{k}={v}" for k,v in sorted(pins.items()))+">")' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>"
+      ;;
+    # M2: the `embedded` extra pins the wheel this release builds. Its own upper
+    # bound once excluded that wheel, making `pip install proximadb[embedded]`
+    # unsatisfiable. Reports the LOWER bound so a stale pin fails.
+    python_extra_lower_bound)
+      python3 -c 'import re,sys
+s=open(sys.argv[1]).read()
+m=re.search(r"proximadb_embedded>=([0-9][^,\"]*),<", s)
+print(m.group(1) if m else "<NO-EMBEDDED-EXTRA-BOUND>")' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>"
       ;;
     # A package-lock.json records the package's own version TWICE: top-level and
     # packages[""]. `package_json` above only sees the first, so the second could
@@ -110,6 +149,8 @@ cmd_check() {
     "ui/package-lock.json:package_lock_own"
     "clients/nodejs-embedded/package-lock.json:package_json"
     "clients/nodejs-embedded/package-lock.json:package_lock_own"
+    "Cargo.toml:cargo_path_dep_pins"
+    "clients/python/pyproject.toml:python_extra_lower_bound"
   )
 
   for entry in "${files[@]}"; do
@@ -118,7 +159,13 @@ cmd_check() {
 
     actual=$(extract_version_from_file "$REPO_ROOT/$file" "$type")
 
-    if [ -z "$actual" ]; then
+    # A `<...>` sentinel means the extractor ran and found the field missing or
+    # malformed. That is a FAILURE, not a skip: an empty extraction reading as
+    # [SKIP] is how a deleted [workspace.package] version passed this gate.
+    if [ "${actual#<}" != "$actual" ]; then
+      echo "  [FAIL] $file ($type): $actual"
+      ((failed++)) || true
+    elif [ -z "$actual" ]; then
       echo "  [SKIP] $file (file not found or no version extracted)"
     elif [ "$actual" != "$expected" ]; then
       echo "  [FAIL] $file: found $actual, expected $expected"
@@ -189,6 +236,30 @@ if "version" not in doc:
     sys.exit(f'{path}: no top-level "version" key')
 if "version" not in doc.get("packages", {}).get("", {}):
     sys.exit(f'{path}: no packages[""]["version"] key (lockfileVersion 1?)')
+
+# Key existence is not enough: the writer edits by LINE, so each own-version
+# field must also sit alone on a line it can match. Checking only the keys let a
+# minified-but-valid lockfile pass the pre-flight and then fail the writer, which
+# is exactly the half-bumped tree this pre-flight promises to prevent.
+import re
+
+with open(path, newline="") as fh:
+    lines = fh.readlines()
+wanted = [doc["version"], doc["packages"][""]["version"]]
+found = 0
+for line in lines:
+    if '"node_modules/' in line:
+        break
+    if found < len(wanted) and re.fullmatch(
+        r'\s*"version":\s*"' + re.escape(wanted[found]) + r'",?\s*[\r\n]*', line
+    ):
+        found += 1
+if found != 2:
+    sys.exit(
+        f"{path}: the two own-version fields are not on separately matchable lines "
+        f"(matched {found}/2) — this writer edits by line, so it would fail "
+        "mid-run; not modified"
+    )
 PYEOF
   done
 
@@ -219,7 +290,31 @@ PYEOF
   #    extra: its own upper bound would otherwise exclude the wheel this release
   #    builds, making `pip install 'proximadb[embedded]'` unsatisfiable.
   perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
-  perl -i -pe 's/"proximadb_embedded>=[\d.]+,<[\d.]+"/"proximadb_embedded>='"$version"',<'"$(echo "$version" | awk -F. '{print $1"."$2+1".0"}')"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
+  python3 - "$REPO_ROOT/clients/python/pyproject.toml" "$version" <<'PYEOF' || exit 1
+import re
+import sys
+
+path, version = sys.argv[1], sys.argv[2]
+# `[\d.]+` could not match a PRERELEASE lower bound, so once `set 0.4.1-beta.1`
+# wrote ">=0.4.1-beta.1,<0.5.0" no later `set` could repair it: perl matched
+# nothing, wrote nothing, and the caller's echo still claimed success. At 0.5.0
+# that bound excludes the very wheel the release builds — the defect this step
+# exists to prevent, made permanent. Match any bound, and ASSERT the rewrite
+# applied rather than trusting it.
+base = version.split("-", 1)[0]
+major, minor, _ = base.split(".")
+upper = f"{major}.{int(minor) + 1}.0"
+text = open(path).read()
+pattern = r'"proximadb_embedded>=[^,"]+,<[^"]+"'
+replacement = f'"proximadb_embedded>={version},<{upper}"'
+new, n = re.subn(pattern, replacement, text)
+if n != 1:
+    sys.exit(
+        f"{path}: expected exactly 1 proximadb_embedded bound to rewrite, found {n} "
+        "— not modified"
+    )
+open(path, "w").write(new)
+PYEOF
   echo "  [SET]  clients/python/pyproject.toml (+ embedded extra) -> $version"
 
   # (no clients/python-embedded/pyproject.toml step — see the note in
@@ -272,7 +367,10 @@ old_own = doc["packages"][""]["version"]
 
 # Edit by line so indentation and key order survive byte-for-byte, but take the
 # TARGETS from the parsed document rather than from position.
-with open(path) as fh:
+# newline="" on BOTH read and write: text mode would translate CRLF to LF
+# throughout, rewriting every line of a CRLF lockfile and contradicting the
+# byte-faithful intent stated above.
+with open(path, newline="") as fh:
     lines = fh.readlines()
 
 done_top = done_own = False
@@ -280,13 +378,13 @@ for i, line in enumerate(lines):
     if '"node_modules/' in line:
         break
     if not done_top and re.fullmatch(
-        r'\s*"version":\s*"' + re.escape(old_top) + r'",?\s*', line
+        r'\s*"version":\s*"' + re.escape(old_top) + r'",?\s*[\r\n]*', line
     ):
         lines[i] = line.replace(f'"{old_top}"', f'"{version}"', 1)
         done_top = True
         continue
     if done_top and not done_own and re.fullmatch(
-        r'\s*"version":\s*"' + re.escape(old_own) + r'",?\s*', line
+        r'\s*"version":\s*"' + re.escape(old_own) + r'",?\s*[\r\n]*', line
     ):
         lines[i] = line.replace(f'"{old_own}"', f'"{version}"', 1)
         done_own = True
@@ -295,7 +393,7 @@ if not (done_top and done_own):
     sys.exit(f"{path}: could not locate both own-version lines "
              f"(top={done_top}, packages[''] ={done_own}) — not modified")
 
-with open(path, "w") as fh:
+with open(path, "w", newline="") as fh:
     fh.writelines(lines)
 
 # Re-read and assert the structural result, so a line edit that landed in the

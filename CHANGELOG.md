@@ -4,10 +4,11 @@ All notable changes to ProximaDB will be documented in this file.
 
 ## [0.4.0] - unreleased
 
-Storage-substrate release (415 commits since 0.3.0). Headline: ADR-094 unified the three
+Storage-substrate release (416 commits since 0.3.0). Headline: ADR-094 unified the three
 divergent storage substrates behind one compute seam, and the I/O-cost work that followed made
 round-trip count — not bytes, not CPU — the term the engine measures and the operator can tune.
-Full notes: `docs/release-notes/v0.4.0.md`.
+Full notes land with the docs-site PR (they must ship together with their nav
+entry, or the strict build fails on an unpublished page).
 
 ### Storage substrate (ADR-094)
 - Durable relational spill store with read-merge, bounded memtable, segment discovery with
@@ -19,7 +20,12 @@ Full notes: `docs/release-notes/v0.4.0.md`.
   (TD-USUB-6).
 - Faithful canonical-record round trip for Parquet Layer A; Parquet had been dropping
   `valid_to_ns`, which resurrected tombstoned records (TD-USUB-11).
-- Catalog-resident serving metadata: cold-read GET depth 3 -> 0, measured and ratcheted (TD-USUB-8).
+- Index-acquisition round trips 3 -> 0 on a **warm** read (`range_gets` 203 -> 200),
+  measured and ratcheted at `cold - warm == 3` (TD-USUB-8 slices 0-2). The
+  catalog-resident Layer B that would move the **cold** path is still open, and
+  TD-USUB-8 is explicit that it must now be argued on cold start, cross-node
+  sharing and planner-time pruning rather than on a depth number a read-side
+  cache already delivers.
 
 ### I/O cost and read geometry
 - Operator-configurable per-location `io_budget` ranged-GET geometry (TD-IOBUDGET-1).
@@ -41,13 +47,14 @@ Full notes: `docs/release-notes/v0.4.0.md`.
 ### Security & governance
 - Generic OIDC provider with multi-IdP portability; legacy SSO removed (TD-SSO-1).
 - API-key gateway roles (TD-TENANT-1 follow-up); subject-parameterized row predicates
-  (ADR-090 L2.1); trust-gated tier entitlement (ADR-0053 W8/W9); REST request limiter,
+  (ADR-090 L2.1); trust-gated tier entitlement (TD-TENANT-3); REST request limiter,
   default-off (TD-RATE-1).
 - v1 residue removed — sunset middleware deleted, Flight alias honoring removed
   (TD-V1SUNSET-1).
 
 ### SDK & spec surface
-- TD-SPECRAT-1 took the generated OpenAPI surface from 42 to 94 paths, exposing the ABAC control
+- TD-SPECRAT-1 took the generated OpenAPI surface from 35 paths at the v0.3.0 tag
+  to 94, exposing the ABAC control
   plane, collections-admin, graph, time-series, rank search, CRUD and unified query to every
   generated SDK. Node SDK published to npm as `@anvailabs/proximadb-client`.
 
