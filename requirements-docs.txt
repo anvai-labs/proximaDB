@@ -6,8 +6,9 @@
 # deliberately — two clean installs a few weeks apart otherwise resolved 3.10.2
 # and 3.11, which is exactly the drift this file exists to stop.
 #
-# Still floating: Jinja2, backrefs, pathspec, mergedeep and the rest of the
-# transitive set. Pin one here the moment it moves rendering.
+# Still floating, most-rendering-relevant first: Pygments (renders every code
+# fence), mkdocs-material-extensions, Babel, Jinja2, backrefs, pathspec,
+# mergedeep. Pin one here the moment it moves rendering.
 #
 # Bump deliberately, in a PR, with the strict build green.
 # Install:  make docs-install      Serve: make docs-serve      Build: make docs-build

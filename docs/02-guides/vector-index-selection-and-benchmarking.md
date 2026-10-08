@@ -55,11 +55,21 @@ extra object-storage traffic. That memory is the price of its latency advantage.
 
 * **Queries carry predicates.** Metadata lives in the same object as the
   vectors, so a filtered ANN query prunes before ranking rather than paying a
-  join or a post-filter. Note this is a *structural* argument, not a measured
-  one: filtered ANN carries **no recall SLA** today — `SUPPORTED_SURFACE.adoc`
-  lists per-collection filtered-ANN policy as Not supported while ADR-011 is
-  Beta, and its harness (`tests/filtered_ann_recall_bands.rs`) is `#[ignore]`d
-  with floors of 0.30/0.60/0.80. Measure your own workload before relying on it.
+  join or a post-filter. Measured on SIFT1M-100k over 8 partitions: filtered
+  recall@10 **0.9907** against 0.9896 unfiltered — filtering did not cost
+  recall. That comes from `sift_pax_filtered_cascade_recall_ratchet`
+  (`tests/sift_pax_recall_ratchet_test.rs`, not `#[ignore]`d), and the qa-gate
+  `sift-pax-recall` job logs it verbatim:
+  `SIFT FILTERED cascade recall@10 = 0.9907 over 1000 queries (N=100000,
+  floor=0.9, partitions=8)`.
+
+  Two caveats, because the number is better than the contract. The ratchet
+  **floor** is 0.90, not 0.99 — one run above it is not a guarantee. And
+  per-collection filtered-ANN *policy* carries **no recall SLA**:
+  `SUPPORTED_SURFACE.adoc` lists it as Not supported while ADR-011 is Beta, and
+  that separate harness (`tests/filtered_ann_recall_bands.rs`) is `#[ignore]`d
+  with floors of 0.30/0.60/0.80. So: a real measurement of the default policy,
+  not a promise about a configurable one.
 * **You need the payload with the hit.** Vector search returns ids; apps want
   records. Co-location keeps that in the same GET family rather than a second
   round trip.
@@ -90,9 +100,9 @@ Budget the RAM: ADR-070 measures 8.6 GB for 1M × 768d vectors.
 
 **A caution that applies to both.** Index choice is secondary to the
 **I/O budget** (below). In our own measurements, moving the storage budget from
-4 MiB to 8 MiB cut GETs/query by 22% at identical recall, while the IVF
-coalescing and nprobe knobs were *inert* on the un-clustered path. Measure the
-budget first.
+the local **1 MiB** target to the `s3://` **8 MiB** target cut GETs/query by 22%
+at identical recall, while the IVF coalescing and nprobe knobs were *inert* on
+the un-clustered path. Measure the budget first.
 
 ## The I/O budget dominates — and it is tunable
 
@@ -107,7 +117,7 @@ Per-backend defaults (`crates/storage/proximadb-storage-common/src/iops_budget.r
 | Generic cloud | 512 KiB | 4 MiB | 8 MiB |
 | Unknown | 512 KiB | 2 MiB | 8 MiB |
 
-Two things worth knowing:
+Three things worth knowing:
 
 1. **Azure's 4 MiB is a conservative planner policy, not a platform limit.** The
    source says so explicitly: *"not a Blob billing quantum or a proven SDK range
@@ -203,15 +213,19 @@ which understates the GET savings a cloud budget gives you.
 
 ### Reading the output
 
+Verbatim from the qa-gate `sift-pax-recall` job — two long lines, not wrapped:
+
 ```
-SIFT PAX cascade recall@10 [rg_layout] = 0.9896 over 1000 queries (N=100000, floor=0.9)
-SIFT paired exact/ANN evidence: pairs=30, N=100000, dim=128, ...
-    exact GET/range-GET/bytes/compute-ms per pair=5.00/0.00/74961193/164.57,
-    ANN   GET/range-GET/bytes/compute-ms per pair=53.97/53.97/25297445/25.47
+SIFT PAX cascade recall@10 [rg_layout] = 0.9896 over 1000 queries (N=100000, floor=0.9, brute-force-GT rows=396)
+SIFT paired exact/ANN evidence: pairs=30, N=100000, dim=128, top_k=10; exact p50/p95=165042/166467 us, ANN p50/p95=25798/28831 us; exact GET/range-GET/bytes/compute-ms per pair=5.00/0.00/74961193/164.57, ANN GET/range-GET/bytes/compute-ms per pair=53.97/53.97/25297445/25.47
 ```
 
+`brute-force-GT rows=396` means ground truth for 396 of the 1000 queries came
+from the brute-force oracle rather than the provided file — expected when you
+insert a subset.
+
 Note `pairs=30`. Recall is measured over all 1000 queries, but the paired I/O
-and compute figures come from a 30-pair sample at N=100k (100 pairs at N=10k,
+and compute figures come from a 30-pair sample at N=100k (300 pairs at N=10k,
 3 at N=1M). Do not read the I/O columns as 1000-query averages.
 
 Four numbers decide a configuration, and you want them **together**:
@@ -243,8 +257,13 @@ SIFT1M subset, N=100 000, dim 128, top_k 10, recall over 1000 queries, I/O over
 | Configuration | recall@10 | GETs/query | bytes/query | bytes/GET | Source |
 |---|---|---|---|---|---|
 | Exact scan (no ANN) | 1.0 by definition | **5.00** | 75.0 MB | 15.0 MB | CI |
-| ANN, local profile (1 MiB target) | 0.9896 | 53.97 | 25.3 MB | ~469 KB | CI |
+| ANN, no row-group layout (`[baseline]`) | 0.9896 | 70.43 | 97.8 MB | ~1.4 MB | CI |
+| ANN, row-group layout (`[rg_layout]`) | 0.9896 | 53.97 | 25.3 MB | ~469 KB | CI |
 | **ANN, `s3://` budget (8 MiB target)** | 0.9896 | **42.03** | 26.9 MB | ~639 KB | workstation |
+
+Rows 2–4 are the same ANN configuration differing only in layout and budget, and
+rows 2–3 come from **one** qa-gate run (both arms logged in it), so the layout
+comparison is as controlled as this harness gets.
 
 Reading it:
 
@@ -252,9 +271,12 @@ Reading it:
   25.47 ms in that run), but costs **~8–11× more round-trips**. On object storage
   that trade is the whole decision, and it is why the budget matters more than
   the knobs.
+* The **row-group layout alone cuts ANN GETs 70.43 → 53.97 (−23%) and bytes
+  97.8 → 25.3 MB (−74%) at identical recall 0.9896** — the largest single effect
+  in the table, and it is a shipped default rather than a knob.
 * Moving from the **local 1 MiB target to the `s3://` 8 MiB target cut GETs 22%
   for +6% bytes at identical recall** — a
-  straight DEPTH-for-BYTES win, and the clearest single lever we measured.
+  straight DEPTH-for-BYTES win, and the clearest tunable lever we measured.
 * With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
   **81 GETs / 92 ms probed vs 108 GETs / 144 ms unprobed** at recall
   0.9860–0.9870 (ratchet 0.984) — better on every axis. Untrained, nprobe does

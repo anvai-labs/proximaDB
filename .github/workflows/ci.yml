@@ -103,6 +103,7 @@ jobs:
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
       docs: ${{ steps.filter.outputs.docs }}
+      docs_site: ${{ steps.filter.outputs.docs_site }}
       td_citations: ${{ steps.filter.outputs.td_citations }}
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
@@ -215,7 +216,12 @@ jobs:
               - 'docs/**'
               - '*.adoc'
               - '*.md'
-              # the docs-site config and its coverage guard (TD-DOCSITE-1)
+            # Separate from `docs`, for the reason the next comment gives: three
+            # other jobs (docs-authority, risk-coverage, design-status) are gated
+            # on `docs`, so adding mkdocs.yml to it would have changed their
+            # triggers too. TD-DOCSITE-1.
+            docs_site:
+              - 'docs/**'
               - 'mkdocs.yml'
               - 'scripts/check_docs_site_coverage.py'
             # Separate from `docs` on purpose: three other jobs are gated on
@@ -1409,7 +1415,7 @@ jobs:
     name: Docs Validation
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true'
+    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true' || needs.changes.outputs.docs_site == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

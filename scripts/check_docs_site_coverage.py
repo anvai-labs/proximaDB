@@ -36,8 +36,16 @@ from pathlib import Path, PurePosixPath
 REPO = Path(__file__).resolve().parent.parent
 BASELINE = REPO / "docs" / ".site-coverage-baseline.json"
 
-# Files mkdocs renders into pages.
-RENDERABLE = {".md"}
+# Files mkdocs renders into pages. This is mkdocs's OWN tuple
+# (`mkdocs.utils.markdown_extensions`), matched the way mkdocs matches it:
+# `path.endswith(markdown_extensions)`, i.e. CASE-SENSITIVELY.
+#
+# An earlier revision used `{".md"}` compared against `entry.suffix.lower()`.
+# That is wrong in both directions: `.MD` is not a page to mkdocs (so it is
+# copied into site/ as raw source) while `.lower()` classified it as renderable
+# and skipped it — re-opening the exact leak this guard closes — and `.markdown`
+# IS a page to mkdocs while the guard reported it as unservable.
+RENDERABLE = (".markdown", ".mdown", ".mkdn", ".mkd", ".md")
 
 # Files it copies verbatim and SHOULD: a real page can reference them.
 ASSETS = {
@@ -100,25 +108,40 @@ def unpublished(docs: Path, patterns: list[str]) -> list[str]:
     """
     structural = [p for p in patterns if not p.startswith("*.")]
     found = []
-    # rglob does not descend symlinked directories, which would hide a whole
-    # tree, so walk them explicitly.
+    # Walked explicitly rather than with rglob, which does not descend symlinked
+    # directories and so would hide a whole tree.
+    #
+    # Symlinks are FLAGGED, never followed. Following them made the verdict
+    # depend on directory sort order: a link from a published directory into an
+    # excluded one was skipped only when the real directory had already been
+    # visited, so `02-guides/r -> rfcs` passed while `02-guides/p -> 00-product`
+    # failed. Exclusion is evaluated on the logical path, so the two cannot be
+    # reconciled by following. There are no symlinks under docs/ today; if one is
+    # ever wanted, decide its publication explicitly rather than inheriting it
+    # from readdir order.
     stack = [docs]
-    seen: set[Path] = set()
     while stack:
         d = stack.pop()
-        real = d.resolve()
-        if real in seen:
-            continue
-        seen.add(real)
         for entry in sorted(d.iterdir()):
+            rel_entry = PurePosixPath(entry.relative_to(docs).as_posix())
+            if entry.is_symlink():
+                if not is_excluded(rel_entry, structural):
+                    found.append(rel_entry.as_posix())
+                continue
             if entry.is_dir():
-                stack.append(entry)
+                # Skip an excluded directory here rather than per-file, so the
+                # decision cannot depend on traversal order.
+                if not is_excluded(
+                    PurePosixPath(rel_entry.as_posix() + "/x"), structural
+                ):
+                    stack.append(entry)
                 continue
             rel = PurePosixPath(entry.relative_to(docs).as_posix())
             if is_excluded(rel, structural):
                 continue
-            suffix = entry.suffix.lower()
-            if suffix in RENDERABLE or suffix in ASSETS:
+            # Renderability is case-SENSITIVE, matching mkdocs. Asset classification
+            # is not: a `.PNG` is still an image a page may reference.
+            if entry.name.endswith(RENDERABLE) or entry.suffix.lower() in ASSETS:
                 continue
             found.append(rel.as_posix())
     return sorted(found)
@@ -129,6 +152,28 @@ def main() -> int:
     if not docs.is_dir():
         print(f"error: docs_dir {docs} does not exist", file=sys.stderr)
         return 2
+    # `exclude_docs` is gitignore syntax, where a leading `!` RE-INCLUDES a path.
+    # This parser does not implement that, and ignoring it is not safe: a
+    # negation under a directory exclusion silently republishes the file, and the
+    # guard reported OK while mkdocs served it. Fail closed instead of guessing.
+    negations = [p for p in patterns if p.startswith("!")]
+    if negations:
+        print(
+            "error: exclude_docs contains gitignore-style negation(s) this guard "
+            "does not interpret, so it cannot tell what the site publishes:",
+            file=sys.stderr,
+        )
+        for p in negations:
+            print(f"  {p}", file=sys.stderr)
+        print(
+            "\n  Remove the negation and express the intent as an explicit include,\n"
+            "  or teach is_excluded() to honour it. Until then this is fail-closed\n"
+            "  on purpose: a negation under a directory exclusion republishes the\n"
+            "  file while this guard says OK.",
+            file=sys.stderr,
+        )
+        return 2
+
     if not any(p.endswith("/") for p in patterns):
         # A parse failure would silently empty the exclusion set and report every
         # internal file as a violation; fail loudly instead of noisily.

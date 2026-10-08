@@ -137,8 +137,14 @@ that is false in both halves**, which is why the out-of-band guard exists:
   zero warnings. mkdocs only treats `.md` as pages, so a `.adoc` is never a page
   whose absence from `nav` could be reported.
 * Worse, all 30 files are then **copied into `site/` as raw unrendered AsciiDoc**
-  (`site/00-product/PRD.adoc` verified present), so the public site would serve
-  markup as source text.
+  (re-verified on the current config: `site/SUPPORTED_SURFACE.adoc` and
+  `site/04-operations/production-readiness.adoc` both present), so the public
+  site would serve markup as source text.
++
+NOTE: an earlier revision of this TD cited `site/00-product/PRD.adoc` here. That
+artifact was produced before `00-product/` was excluded, and the citation went
+stale without the claim becoming false — the count is still 30 and the behaviour
+is unchanged. Re-run the experiment rather than trusting the example.
 
 Relatedly, a link *to* an excluded file is reported at `INFO`
 **unconditionally** — setting every `validation:` category to `warn` leaves those

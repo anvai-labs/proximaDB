@@ -47,11 +47,13 @@ on:
 permissions:
   contents: read
 
+# Workflow-level: PR builds are cheap and superseded by the next push, so cancel
+# them (mandate #7 — runners are a shared finite resource). The Pages `deploy`
+# job overrides this with its own group below, because cancelling a deployment
+# mid-flight can leave the published site in a partial state.
 concurrency:
   group: docs-site-${{ github.ref }}
-  # false, not true: this group covers the Pages `deploy` job, and cancelling a
-  # deployment mid-flight can leave the published site in a partial state.
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -93,6 +95,11 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Its own group, so the workflow-level cancel above cannot abort a
+    # half-finished Pages deployment.
+    concurrency:
+      group: docs-site-deploy
+      cancel-in-progress: false
     permissions:
       contents: read
       pages: write
