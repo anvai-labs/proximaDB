@@ -350,12 +350,22 @@ jobs:
       - name: Install coverage tools
         run: |
           cargo install cargo-llvm-cov --locked
+          # `cargo llvm-cov nextest` (below) requires the nextest cargo
+          # subcommand — without this install the coverage step dies with
+          # "no such command: nextest" (seen on the r9 promotion, 2026-09-04).
+          cargo install cargo-nextest --locked
 
       - name: Run coverage analysis
         env:
           RUSTFLAGS: "-A warnings"
         run: |
-          cargo llvm-cov --lib --html
+          # nextest executor, not plain `cargo test`: process-per-test is a
+          # documented contract for tests that mutate process-global env
+          # (pax_olap_tests' PROXIMADB_DF_PAX_RANGED, cold-tail inflight
+          # arming, eventlog recovery) — llvm-cov's default cargo-test
+          # execution shares one process and those tests race. cargo-nextest
+          # is installed by the step above.
+          cargo llvm-cov nextest --lib --html
 
       - name: Check coverage thresholds
         run: |
