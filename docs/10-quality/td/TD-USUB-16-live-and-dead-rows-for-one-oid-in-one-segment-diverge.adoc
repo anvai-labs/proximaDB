@@ -1,0 +1,100 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-16: A live and a dead row for one oid in ONE segment make the read surfaces disagree
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **FIXED 2026-10-08** in the commit that introduced it, after the round-5 review showed the original triage understated it. Kept as a record because the triage error is the instructive part.
+| Priority | **Was filed LOW twice, and both triages were wrong.** Round 1 said "needs OS preemption between two adjacent non-`await` statements"; round 4 corrected that (production is multi-thread, so it is plain parallelism, no preemption needed). Round 5 then found the consequence was understated too: it is not only a read-surface inconsistency but a **fail-OPEN for truncation**, which under slice 2b resurrects a client-acknowledged DELETE permanently. Fixed rather than re-filed.
+| Component | `src/services/record_spill.rs` (`flush`'s `written` ordering, `merged_records`, `get_record`, `delete_record`)
+| Relates to | TD-USUB-1 (tombstone persistence), mandate #16a
+| Blocked by | Nothing. (Had it not been fixed here it would have been a gate on slice 2b, alongside TD-USUB-15 and TD-USUB-18 — which is what the round-5 review pointed out: it was the only one of the three not gated, and the only one that resurrects a row.)
+|===
+
+== The finding
+
+`written` is `residents` followed by the synthesised tombstones, with no dedup, and the Arrow
+converter emits one row per input record in input order. So if one oid appears in BOTH the memtable
+snapshot and the tombstone snapshot, the segment holds `live` then `dead` for that oid — and the
+three read surfaces split, because they disagree about which row of a segment wins:
+
+* `merged_records` inserts per row into a map ⇒ **last row wins** ⇒ dead ⇒ filtered ⇒ **absent**.
+* `get_record` uses `.find(...)` ⇒ **first row wins** ⇒ **live**.
+* `delete_record`'s probe uses `.find(...)` ⇒ **live**, and reports a removal.
+
+Reachability: `upsert_record` must execute `tombstones.remove(oid)`, then `delete_record` must run to
+completion (inserting the tombstone) while holding `flush_guard`, then `upsert_record` must execute
+`memtable.insert(oid, v)`. There is no `.await` between those two statements, so it needs genuine
+plain parallelism on a multi-thread runtime — no preemption needed.
+
+Direction, as finally established (the first two attempts both got this wrong):
+
+* **Round 1:** "not a regression in data loss; a regression in *consistency*" — because before
+  tombstone persistence the same race produced a uniform "absent" on all three surfaces: a lost
+  write, but consistent.
+* **Round 5 correction:** that missed the truncation half. Before this change the tombstone stayed
+  in `tombstones` forever (nothing cleared it), so `min_unflushed_lsn` **failed closed** as well as
+  reading absent. After it, the post-commit clear removes a tombstone that is only half-durable, so
+  `min_unflushed_lsn` answers `Ok(None)` — **fail OPEN**. Under slice 2b the DELETE's WAL entry is
+  then discarded and `get_record` serves the live row forever: a client-acknowledged DELETE
+  resurrected permanently, which is mandate #16a, not a consistency nit.
+
+== The fix that landed
+
+`flush` does **not** flush an oid that is both resident and tombstoned — neither row is written,
+nothing is evicted, nothing is cleared:
+
+[source,rust]
+----
+let ambiguous: HashSet<String> = tombstoned.iter()
+    .filter(|oid| resident_oids.contains(oid.as_str())).cloned().collect();
+let evicting:   Vec<ProximaRecord> = residents.iter().filter(|r| !ambiguous.contains(&r.oid)).cloned().collect();
+let persisting: Vec<&String>       = tombstoned.iter().filter(|oid| !ambiguous.contains(*oid)).collect();
+----
+
+The post-commit loops then iterate `evicting` and `persisting`, so **"evicted" implies "written"** by
+construction, and so does "cleared".
+
+=== Why neither side may win, which took two attempts to get right
+
+The authoritative order is the WAL's LSN order, and `tombstones` is a `DashSet<String>` of oids that
+carries **no LSN** — so this store cannot tell which operation came later and must not pretend to.
+
+* This TD's first "how to apply" said the **live row** should win ("it is the newer one in the racing
+  interleaving"). Not sound: it is not knowably the newer one, and the TD itself noted that dropping
+  the tombstone while still clearing it post-commit would lose the delete.
+* The first implementation picked the **tombstone**, reasoning that `get_record` consults
+  `tombstones` before the memtable, so "absent" is already the served answer. The round-6 review
+  showed how that fails, and the mechanism is the instructive part: the post-commit eviction loop
+  iterated `residents`, so suppressing the live row from the object **while still evicting it**
+  destroyed an acknowledged INSERT — and removing its `resident_lsns` entry also removed the
+  `tracked < resident` arm that had been failing closed for it, so slice 2b would have discarded the
+  WAL entry as well. A committed row in no segment, no memtable and no WAL.
+* The read-side argument was the trap. That `get_record` answers "absent" explains why the READ is
+  absent; it does not license destroying the row's only copy and then releasing its WAL entry.
+  A read answer is not a licence to discard state.
+
+So the oid is left alone and keeps `min_unflushed_lsn` refusing (mandate #1). Three things clear
+that state: an `upsert_record` of the same oid (which clears the tombstone, and the following flush
+then persists the row normally), `delete_record`'s already-suppressed branch (which removes a
+resident copy that is itself dead — a resolver the first version of this entry omitted), and
+`purge_durable_objects` on DROP. Replay is the only thing that can decide the ORDER rather than
+merely clear the state, because it applies the WAL in LSN order.
+
+Unflushed state is bounded by one row plus one tombstone per racing oid — but that is a bound on
+MEMORY only. The WAL is NOT bounded: until one of those exits occurs the partition cannot compute a
+truncation point at all, so a healthy idle partition can pin the WAL indefinitely, with no metric
+and only a repeated `warn!`. That is **TD-USUB-19**, filed separately, and it is the reason the
+durable fix is to carry the LSN with the tombstone so this block can resolve the race instead of
+refusing it.
+
+This also removes the inconsistency this TD was filed for, at the source: no segment ever holds a
+live and a dead row for one oid, so the read surfaces cannot disagree about one.
+
+Pinned by `an_oid_both_resident_and_tombstoned_is_not_flushed_and_stays_fail_closed`, which builds
+the state directly (inserting into `memtable` and `tombstones` for one oid) rather than racing for
+it, and asserts: the oid is in the object in neither form, an unambiguous row alongside it still
+persists, the row is still resident, the tombstone is still pending, `min_unflushed_lsn` still
+refuses, and a later write resolves it. Evicting by the raw `residents` or clearing by the raw
+`tombstoned` both fail it.

@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **LSN plumbing + unflushed-minimum tracking landed 2026-10-03** — `RecordStore` gained defaulted `upsert_record_at_lsn` / `min_unflushed_lsn` (11 implementors untouched); `write_mutations` now binds the `append_operations` result it used to discard and passes each record its durable LSN positionally (length-guarded); `SpillRecordStorage` tracks `oid → lsn` for resident rows and **fails closed** if any resident row is untracked. Nothing truncates yet, so this cannot lose data — it makes the safe truncation point *computable*. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **TD-USUB-13 FIXED 2026-10-05** — the flush/delete resurrection race is closed (flush serialized against delete and purge), so it no longer blocks 2b. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with "wire the two production call sites"** below — see "Design decided"; (ii) **catalog registration of the segment PREFIX** — narrowed by the discovery work below: the segment *set and its order* are now recovered from the object names by listing, so what the catalog still owes is only *where* to list, which WAL replay cannot reconstruct (`CanonicalWalEntry` carries no namespace); (iii) **persist tombstones into the segment** — now genuinely unblocked by discovery, and still the gate on truncation, because an in-memory tombstone is the only evidence of a post-flush delete and `min_unflushed_lsn` fails closed while any exists, (iv) wire the two production call sites, (v) slice 2b (WAL truncation), (vi) slice 2c (compaction). **Segment discovery landed 2026-10-06** — segments are named `spill-{seq:016x}.parquet` (zero-padded hex, so a lexicographic sort of a listing *is* chronological order) with the sequence resumed past durable state, replacing the per-instance UUID nonce that bought uniqueness at the cost of recoverable order; `ensure_discovered` rebuilds the segment list in order at the head of every path that depends on it, and **fails closed** on a segment-shaped name it cannot place rather than silently serving a subset. **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. **Slice 1 landed** — observe + bound, no persistence (see "Slicing"). **Slice 2a landed 2026-09-22** — `SpillRecordStorage`: durable Parquet segments, memtable ∪ segments read-merge, tombstones; default-OFF; **no WAL truncation**. **Slice 2a factory prerequisite landed 2026-09-27** — `storage_factory` now carries partition identity and `new_spilling` constructs a `SpillRecordStorage` per partition (default-OFF; gate unset ⇒ the legacy `MemtableRecordStorage` type). **`new_spilling` has no production caller yet:** `multi_server.rs` and `shared_services.rs` still build `new_partitioned`, so setting the spill gate on a server changes nothing today. **LSN plumbing + unflushed-minimum tracking landed 2026-10-03** — `RecordStore` gained defaulted `upsert_record_at_lsn` / `min_unflushed_lsn` (11 implementors untouched); `write_mutations` now binds the `append_operations` result it used to discard and passes each record its durable LSN positionally (length-guarded); `SpillRecordStorage` tracks `oid → lsn` for resident rows and **fails closed** if any resident row is untracked. Nothing truncates yet, so this cannot lose data — it makes the safe truncation point *computable*. **Segment deletion on DROP landed 2026-09-30** — `RecordStore::purge_durable_objects` (default no-op; the spill store deletes by prefix, reclaiming orphans from earlier instances), called from `drop_table_records` before the partition handle is released, propagating failure rather than logging it. **TD-USUB-13 FIXED 2026-10-05** — the flush/delete resurrection race is closed (flush serialized against delete and purge), so it no longer blocks 2b. **Open:** (i) **deletion-obligation marker + drain** — DROP deletes on the success path only; a purge failure or a crash in the marker→purge window orphans objects permanently, because the catalog entry is already gone. **Design decided 2026-10-02** (positive-evidence obligation following TD-COMPACT-13, *not* a sweep for absence) and deliberately **gated with "wire the two production call sites"** below — see "Design decided"; (ii) **catalog registration of the segment PREFIX** — narrowed by the discovery work below: the segment *set and its order* are now recovered from the object names by listing, so what the catalog still owes is only *where* to list, which WAL replay cannot reconstruct (`CanonicalWalEntry` carries no namespace); (iii) wire the two production call sites, (iv) slice 2b (WAL truncation) — now gated on **TD-USUB-15** as well, see below, (v) slice 2c (compaction) — gated on **TD-USUB-17**: a persisted tombstone is `is_dead` but NOT `is_tombstone_at`, which is the predicate compaction drops on, so a compactor following `pax_block.rs` would silently retain every tombstone it meant to reclaim. **Tombstone persistence landed 2026-10-07** — see below; it was the gate on truncation and is no longer open. **Segment discovery landed 2026-10-06** — segments are named `spill-{seq:016x}.parquet` (zero-padded hex, so a lexicographic sort of a listing *is* chronological order) with the sequence resumed past durable state, replacing the per-instance UUID nonce that bought uniqueness at the cost of recoverable order; `ensure_discovered` rebuilds the segment list in order at the head of every path that depends on it, and **fails closed** on a segment-shaped name it cannot place rather than silently serving a subset. **Order corrected:** registration must precede truncation because the derived segment path is not reconstructible at recovery — see "Correction" below.
 | Priority | **HIGH** — this is an operability/durability defect, not a design preference. A long-lived relational table grows the heap and the WAL without bound and never tiers to object storage.
 | Component | `src/services/record_memtable.rs`, `src/services/record_store.rs`, `src/services/canonical_wal.rs`, `src/network/shared_services.rs`
 | Relates to | ADR-094 (Phase 1, defect **a**), ADR-010 (WAL truncation rule added by ADR-094), ADR-045 (Layer A/B), TD-USUB-4
@@ -889,6 +889,332 @@ This is reachable only through an already-known gap, in a subsystem that is defa
 has no production caller — but it is the reason discovery alone does not license turning the gate
 on. The honest sequencing is: obligation drain → enable. Discovery is what makes a durable
 artefact *mean* something; the drain is what makes the prefix *trustworthy*.
+
+== Tombstone persistence as landed (2026-10-07)
+
+The item this TD called the gate on truncation. A post-flush delete's only evidence was an
+in-memory tombstone, so `min_unflushed_lsn` failed closed while any existed and 2b could not
+progress. Tombstones are now written into the segment.
+
+=== What it required, and the one thing it did not
+
+* **A SYNTHESISED record**, built with `ProximaRecord::tombstone` — the primitive already existed,
+  and the first draft hand-rolled `{oid, tenant_id, valid_to_ns}`, which review flagged under
+  mandate #12. `tombstones` is a `DashSet<String>` of oids, and the live copy a tombstone
+  suppresses may exist solely in an older segment, so there is no record to copy.
++
+Using the primitive is what exposed **TD-USUB-17**. It sets `origin: Some("delete")` and
+`method: Some("tombstone")`, and the system-columns round-trip **drops both** — `SYSTEM_COLUMNS`
+carries seven fields and neither is among them. So the persisted record satisfies `is_dead` (every
+read boundary here is correct) but NOT `is_tombstone_at`, which is what compaction drops on. Hence
+the 2c gate above. TD-USUB-11 is the precedent: the same serialization path once dropped
+`valid_to_ns` and resurrected tombstones.
+* **The tenant, plumbed.** The store had no `tenant_id`; `new_spilling`'s factory closure already
+  receives one to derive `base_path`, so it is passed through. Placed as a builder
+  (`with_tenant`) rather than a constructor parameter because every construction site in that
+  module is a test that never persists a tombstone — but the safety is **structural where it
+  matters**: a tombstone is never stamped with an unusable tenant, so an unattributable record
+  cannot enter a tenant-scoped segment. (Round 2 made that refusal fail the whole FLUSH; round 3
+  changed it to persist the residents and retain the tombstones, because failing the flush aborted
+  WAL replay. See the third-round corrections.) (Review caught that checking `is_some` alone
+  was not enough: `matches_tenant` treats an EMPTY `tenant_id` as matching ANY tenant, so a blank
+  stamp is worse than none. The guard filters for non-empty.)
+* **A flush that writes with an empty memtable.** The early return on `records.is_empty()` was
+  what made a durable delete impossible; the guard is now
+  `evicting.is_empty() && persisting.is_empty()` — keyed off what will actually be WRITTEN, so a
+  flush whose every oid is unresolvable publishes nothing and burns no segment name. (It began as
+  `residents.is_empty() && tombstoned.is_empty()`; the sixth round narrowed it.)
+* **Snapshot, then clear only post-commit.** A delete arriving mid-flush must not be cleared by a
+  flush whose object does not contain it (TD-USUB-13's shape).
+* **`min_unflushed_lsn` needed NO change.** Clearing persisted tombstones post-commit makes
+  "present in the set" mean "not yet durable", so its existing fail-closed arm already expressed the
+  right rule, and the mutation that removes the clear reproduces its own pre-existing
+  2b-precondition message.
++
+NOTE: review corrected an over-strong first draft of this claim. The implication holds in the
+direction that matters (durable ⇒ cleared) but **not** as a biconditional: `delete_record` inserts a
+tombstone whenever any segment exists, without checking the oid is in one, so a repeat DELETE of an
+already-durable row re-pins truncation. That is conservative — more WAL retained, never less — and
+is filed as **TD-USUB-14**, which also covers the durable garbage a no-op DELETE now writes.
+
+=== Clearing is only sound because of #1953's round-7 fix
+
+Once a tombstone leaves memory, read-time suppression comes from the persisted record in the
+newest segment. `merged_records` was already fine (oldest→newest, so the tombstone overwrites the
+older live copy before `is_dead` filters it) and so was `get_record` (newest-first, first hit
+authoritative). `delete_record` was **not**: until round 7 its probe filtered dead rows *within* a
+segment and continued to an older one, so it would have found the stale live copy and reported a
+removal.
+
+So persisting tombstones on top of the pre-round-7 probe would have been unsafe. That is the
+**second** time in this TD that a step's safety depended on a property a later step established —
+the first being durable tombstones depending on segment discovery, which reordered this backlog.
+The generalisation worth keeping: when a step's value is "now X is possible", check whether X is
+also *safe* yet.
+
+=== A live-row loss this nearly shipped
+
+The first draft appended the synthesised tombstones to the same `Vec` the post-commit loop uses to
+evict from the memtable. That eviction is sound **only** for rows that came from the memtable. With
+tombstones in the list, an `upsert` of a tombstoned oid landing after the snapshot — it clears the
+tombstone and inserts, and does NOT take `flush_guard` — would have had its fresh row evicted. A
+live row, lost silently.
+
+The evicted list and the written list are now separate, with the reason recorded at
+both sites, and `an_upsert_of_a_tombstoned_oid_after_the_snapshot_is_not_evicted` pins it using the
+existing `BarrierFs` to park a flush mid-write. Recorded because the existing 40 tests all passed
+with the bug present — **none of them exercised a tombstone-persisting flush at all**, so the new
+path was entirely uncovered until these tests existed.
+
+=== What this did NOT close, and why 2b is now gated on it
+
+The residents/written split fixes which KEYS the post-commit loop evicts. It does not make the
+eviction conditional on the VALUE at a key still being the one this flush made durable — and
+`memtable.remove` is unconditional. `upsert_record` does not take `flush_guard`, and the window is
+the whole object-store PUT, so a newer value written during a flush is discarded by it.
+
+Today that is a stale read only: the WAL still holds the newer value and replay restores it. **Once
+slice 2b truncates on `min_unflushed_lsn`, it becomes permanent and silent** — which is why
+**TD-USUB-15 is now a stated prerequisite of 2b**, recorded in the Open list above. The tombstone
+half of this exact hazard is what this change closed; the resident half is the dominant one, because
+its window is a PUT rather than a few instructions.
+
+Also filed from the same review: **TD-USUB-16** — appending tombstones after residents with no
+dedup means one oid can appear live-then-dead in a single segment, and the three read surfaces then
+disagree (`merged_records` takes the last row, `get_record`/`delete_record` the first). Narrow
+(needs preemption between two adjacent non-`await` statements) and a consistency regression rather
+than a data-loss one, since the pre-change behaviour was a uniformly-absent lost write.
+
+=== Tests (every new test, all mutation-tested)
+
+No counts are quoted below, deliberately — the list IS the count. Five separate count errors in
+this TD came from quoting one: four from citing a `cargo nextest --lib <substring>` total as if it
+described a file (it is a substring match: the `record_store` filter runs 43 tests of which only 33
+are in `record_store.rs`, and one of the strays is this slice's own
+`flush_through_the_record_store_trait_makes_the_buffer_durable` from `record_spill.rs`), and a
+fifth from adding to the previous round's total instead of re-measuring. Every new test is named
+here under the file it lives in, so the figure cannot go stale independently of the facts.
+
+In `record_spill.rs`:
+
+* `a_tombstone_only_flush_persists_and_suppresses_across_instances` — the headline: suppression
+  survives a restart, visible only via discovery.
+* `a_persisted_tombstone_round_trips_its_marker_and_tenant` — TD-USUB-11's precedent: Parquet
+  silently dropped `valid_to_ns` there, so a synthesised record's fields are not assumed to
+  survive. Also pins the timestamps, which are slice 2c's retention clock.
+* `a_segment_mixing_props_rows_and_a_tombstone_round_trips_both` — the only test where a propless
+  synthesised tombstone shares a segment with props-carrying rows. Every other tombstone test is
+  tombstone-only, so the schema union was untested; a failure there happens after the snapshot and
+  propagates through `upsert_record`'s `?`, surfacing as "every write to this partition fails".
+* `an_unusable_tenant_refuses_the_tombstone_but_not_the_flush` — covers `None` *and* `Some("")`;
+  asserts the residents still reach durability while the tombstone stays memory-only and
+  `min_unflushed_lsn` keeps refusing.
+* `with_tenant_normalises_an_empty_tenant_to_none` — `matches_tenant` treats an empty `tenant_id`
+  as matching ANY tenant, so a blank stamp is worse than none. This is the ONE home of that
+  normalisation; `flush` deliberately does not repeat it.
+* `flush_through_the_record_store_trait_makes_the_buffer_durable` — the trait override exists at
+  all. (Note: it has no production CALLER yet — see the open items.)
+* `a_failed_write_fails_truncation_closed_until_purge` — TD-USUB-18's fail-closed counter on the
+  error path, asserted by VALUE (`Some(Some(7))`) rather than `is_ok()`, so another refusal arm
+  cannot silently take its place.
+* `a_flush_cancelled_mid_put_fails_truncation_closed` — the same counter on the path an error
+  cannot reach: `BarrierFs` parks the write, the task is aborted strictly inside the PUT window,
+  and the refusal must still hold. This is the test that distinguishes the fix from the defect —
+  the one above passes under BOTH shapes, so the mutation back to "set only on `Err`" survived it.
+* `min_unflushed_lsn_releases_once_the_tombstone_is_durable`.
+* `an_upsert_of_a_tombstoned_oid_after_the_snapshot_is_not_evicted`.
+* `an_oid_both_resident_and_tombstoned_is_not_flushed_and_stays_fail_closed` — TD-USUB-16's state, built
+  directly rather than raced for: the oid appears in the object in NEITHER form, an unambiguous row
+  alongside it still persists, the row stays resident, the tombstone stays pending, truncation still
+  refuses, and a later write to that oid resolves it.
+
+In `record_store.rs`, which is where the PRODUCTION factory is:
+
+* `spilling_partition_persists_a_tombstone_through_the_production_wiring` — drives a
+  tombstone-persisting flush through `new_spilling` itself, and asserts the DURABLE effect
+  (`min_unflushed_lsn == Ok(None)`, by value). The durability assertion is the load-bearing one:
+  "replay succeeded" and "the row is absent" both pass with `.with_tenant(tenant_id)` deleted,
+  because the flush warns rather than failing and the memory-only tombstone still suppresses. See
+  the fifth-round correction.
+* `an_empty_tenant_gets_no_spill_partition` — the untenanted partition must not be spill-backed at
+  all (see the fourth-round correction below).
+
+Every one of these mutations is killed by the list above — verified in the round that introduced
+the guard, not carried forward from an earlier round (a verdict expires when the code it probed
+changes, which is how one of these became vacuous for two rounds):
+
+* keeping the empty-memtable early return;
+* evicting by the written set;
+* omitting the post-commit clear;
+* removing `.with_tenant` from the production factory;
+* dropping `with_tenant`'s `filter(!is_empty)`;
+* removing the whole trait `flush` override;
+* dropping the unresolved-write refusal, and resetting its counter with `store(0)` on success
+  instead of lowering only its own raise;
+* setting that counter only on `Err` (which the cancellation test is what distinguishes);
+* stamping the synthesised tombstone's timestamps `0` instead of `now_ns`;
+* re-introducing the whole-flush `Err` on an unusable tenant;
+* removing the empty-tenant factory guard;
+* writing only the residents into the segment;
+* evicting by the raw `residents` or clearing by the raw `tombstoned` — the pair that made
+  "evicted implies written" false;
+* reverting the all-unresolvable early return to `residents.is_empty() && tombstoned.is_empty()`.
+
+=== Corrections the fifth review round forced
+
+* **The production tenant-wiring mutation was NOT killed, and two documents said it was.** Round 2
+  added `spilling_partition_persists_a_tombstone_through_the_production_wiring` when an unusable
+  tenant made the whole flush return `Err`, and verified by mutation that deleting
+  `.with_tenant(tenant_id)` failed it. Round 3 then changed that response — correctly — to
+  warn-and-drop, which **silently invalidated the evidence**: without the tenant the flush now
+  warns, drops the tombstone from its snapshot, writes the residents and returns `Ok`, while the
+  un-persisted tombstone still suppresses the row from memory. Both of the test's assertions
+  therefore passed with the wiring deleted. Re-running the mutation at round 5 confirmed
+  SURVIVED.
++
+The test now asserts the **durable** effect — `min_unflushed_lsn == Ok(None)`, by value — which is
+`Err` without the tenant because the tombstone is still in memory. Re-verified KILLED.
++
+The transferable lesson: **a mutation verdict expires when the behaviour it probed changes.** It is
+evidence about one version of the code, not a permanent property, and a refactor that improves the
+behaviour can quietly convert a live guard into a vacuous one. Any claim of the form "mutation X is
+killed" has to be re-run in the round that changes X's code path.
+
+* **TD-USUB-16 was mis-triaged twice, and this commit had made it worse rather than neutral.**
+  Filed LOW as "a consistency regression, not data loss". But before tombstone persistence the
+  racing tombstone stayed in the set forever, so `min_unflushed_lsn` **failed closed**; after it,
+  the post-commit clear removes a tombstone that is only half-durable, so it answers `Ok(None)` —
+  **fail open**. Under slice 2b that discards the DELETE's WAL entry and `get_record` serves the
+  live row forever: a client-acknowledged DELETE resurrected permanently. It was also the only one
+  of the three new flush TDs not gated on 2b, and the only one that resurrects a row. Fixed here
+  rather than re-filed — `flush` writes one row per oid with the tombstone winning — and TD-USUB-16
+  now records the fix and both triage errors.
+
+* **The `is_dead` filter's comment described the opposite of the truth, on the headline mechanism.**
+  It said "a no-op on today's relational path, and deliberately added anyway" — accurate before
+  this commit, when nothing wrote a dead record into a relational segment. Now that `flush`
+  persists tombstones and clears the in-memory entry, that predicate is the SOLE suppression for a
+  flushed delete, and the headline test passes because of it. A comment telling the next reader
+  that deleting it costs nothing is worse than no comment.
+
+* **A non-spill partition answers `Ok(None)`, which slice 2b must not read as "safe to truncate".**
+  `MemtableRecordStorage` overrides neither `upsert_record_at_lsn` nor `min_unflushed_lsn`, so it
+  discards every LSN and reports no constraint while its rows exist only in the WAL. That is
+  fail-OPEN, and the round-4 fallback (an empty tenant now gets a memtable) widened the set of
+  partitions that answer that way. **Slice 2b must treat a store with no durable segment path as an
+  unconditional refusal, not as `Ok(None)`** — otherwise "respect every store's answer" is
+  satisfied by a store that has no answer. Recorded here as a 2b prerequisite; the fallback also
+  now logs, since `""` is the normal tenant key for a single-tenant server today and a silent
+  fallback would leave an operator who set the gate with no spill partitions and no signal.
+
+* **The construction-site count, wrong for the fourth time — and twice by its own corrections.**
+  "37 of this module's 38" was stale again; the round-5 correction to "43 of 44" was also wrong, and
+  so was the "all but one" that replaced it. Measured: every site in `record_spill.rs` is a test,
+  and the single production site is in `record_store.rs` — so within the module it is all of them.
+  (Round 7 then found the one real exception, a dead `pub fn new`, now deleted — see the sixth-round
+  section.) The number is gone rather than corrected again: the field doc states the SHAPE, which
+  does not age when a test is added. No running tally of these errors is kept either — that tally
+  went stale twice as well.
+
+=== Corrections the fourth review round forced
+
+* **"Zero liveness cost" was false, and the arm it described had unbounded state.** On an unusable
+  tenant, `flush` cleared only its LOCAL `tombstoned` snapshot — so the post-commit loop
+  (`for oid in &tombstoned`) removed nothing from `self.tombstones`. For an untenanted partition
+  that meant: every post-flush DELETE inserts a tombstone, no flush ever clears one, nothing but a
+  purge shrinks the set, `min_unflushed_lsn` refuses FOREVER, `merged_records` iterates the growing
+  set on every scan, and a `warn!` fires per flush with a monotonically rising count. Unbounded
+  state plus permanently unachievable truncation — strictly worse than the unbounded memtable this
+  slice exists to replace, and exactly the shape this same commit files TD-GCOLD-3 for elsewhere.
++
+Fixed by making the unusable shape **unconstructible** rather than tolerated: `new_spilling`'s
+factory returns a `MemtableRecordStorage` when the tenant is empty. The untenanted partition keeps
+today's behaviour (an unbounded memtable — still this TD's open defect for that case, now recorded
+as such), and the spill store's unusable-tenant arm survives only as defence-in-depth for a
+directly-constructed store. Pinned by `an_empty_tenant_gets_no_spill_partition`.
+
+* **The orphan flag could not see the case that most needs it.** It was set on `write_if_absent`
+  returning `Err` — but a flush future **dropped** mid-PUT (a cancelled request task, a `timeout`
+  wrapper, an aborted `JoinHandle`) returns no error and runs no code after the `await`, so it
+  produced TD-USUB-18's orphan with the mitigation disengaged. The flag now means "a PUT is
+  UNRESOLVED": raised BEFORE the write is issued, lowered only on the success path, so a
+  cancellation leaves it raised by construction.
++
+It is a **counter**, not a bool, and that is load-bearing: clearing a bool on success would discard
+the suspicion raised by an earlier cancelled or failed write, and a later successful flush does not
+reconcile a previous orphan. `saturating_add`/`saturating_sub` via `fetch_update`, not `fetch_add` —
+atomics bypass `overflow-checks`, and a wrap from `MAX` to 0 would silently clear the refusal (the
+same hazard as TD-GCOLD-1's write-site defect).
+
+* **The trait `flush` override has no production caller, so the defect it addresses is still open.**
+  `DirectWalTableRecordStore` has no flush/shutdown/checkpoint method and never iterates
+  `self.partitions` except in `partition()`, `partitions_for()` and `drop_partition_state()`; the
+  only `dyn RecordStore` flush caller in the tree is the graph `flush_wal` path. So graceful
+  shutdown still drops the buffer and `min_unflushed_lsn`'s "flush, then re-ask" is still
+  uncarryable for a relational partition. The override is necessary and correct — dispatch is
+  pinned by a test — but **not sufficient**, and round 3's message presented it as closing the
+  defect. **Slice 2b additionally requires the caller** (`flush_partitions()` wired to shutdown);
+  it is deliberately not added here, because an uncalled method is the #1945 dead-wiring class
+  this TD already learned once.
+
+* **A dead second copy of the tenant predicate.** `flush` re-ran `filter(!is_empty)` on a field
+  whose only two write sites are the constructor's `None` and `with_tenant`'s normalisation, so
+  `Some("")` was already unrepresentable and the filter could never fire — while its comment argued
+  the invariant as though enforced there. Removed; the normalisation has one home (mandate #12).
+
+* **Three more count/name errors, and the fix is structural.** The Tests section cited "6 new" for
+  what was 9, carried a stale "45 pass", attributed four `record_spill.rs` tests to
+  `record_store.rs`, and **cited the pre-rename test name again** — the literal recurrence of
+  round 2's own blocking finding. Filter totals are no longer quoted at all (see the Tests
+  section's preamble): they were the source of every one of these.
+
+* **This commit's edit spliced an unrelated test's doc comment — again, in the other file.** Round 3
+  recorded that lesson for `record_spill.rs` and did not apply it to `record_store.rs`, which the
+  same insertion script edited: six doc lines belonging to
+  `spilling_partition_flushes_and_still_serves_every_row` ("Asserted as the OBSERVABLE effect …
+  Both halves matter") ended up heading the new tombstone test, which asserts neither half, while
+  the original kept one line. Three review rounds read the diff without seeing it, for the reason
+  already written down: `cargo fmt` does not reflow comments, so no gate catches it. Restored.
+
+=== Corrections the third review round forced, which change the slice's claims
+
+* **The trait `flush` was never overridden**, so through the only production seam
+  (`Arc<dyn RecordStorage>`) the trait default returned `Ok(())` and did nothing. The error text in
+  `min_unflushed_lsn` tells the operator to "flush to persist them, then re-ask" — an instruction no
+  caller could carry out. The only path that reached the inherent `flush` was `upsert_record`
+  crossing the resident threshold, i.e. **a delete could only become durable by writing more rows**,
+  so a delete-then-idle partition pinned the WAL forever and graceful shutdown lost the buffer.
+  `ColdGraphSegmentStore` was already the precedent (inherent flush + override + a dyn-dispatch
+  test) and was not followed.
+* **Refusing the flush on an unusable tenant was an outage, not a safeguard.** The production
+  factory derives the tenant from `tenant_key` and the WAL entry's `tenant_id`, both
+  `unwrap_or_default()` — so `""` is a real production input, and it is exactly the value the guard
+  rejected. The `Err` propagates through `upsert_record`'s `?` (every later write to the partition
+  fails, defeating the heap bound this store exists to enforce) and through `replay_wal_entries`
+  (recovery aborts — a restart crash loop). Refusing the *tombstone* is correct; refusing the
+  *flush* is not. Now: the residents are persisted, the tombstone is left in the set so
+  `min_unflushed_lsn` keeps failing closed, and `with_tenant` normalises `""` to
+  `None` so there is one unusable shape rather than two. (Round 3 called this "identical safety,
+  zero liveness cost". The first half holds; the second was wrong — see the fourth-round
+  correction below.)
+* **The `min_unflushed_lsn` safety argument covered only the safe direction.** "Absent from the set
+  while NOT durable" is reachable via an orphan from a write that failed after the object landed —
+  filed as **TD-USUB-18**, mitigated fail-closed here, and **now a gate on slice 2b** alongside
+  TD-USUB-15.
+* **The "`ProximaRecord::tombstone` vs a literal is load-bearing" claim was false as shipped.** The
+  two differ only in `origin`, `method` and the timestamps; `origin`/`method` do not survive the
+  round-trip (TD-USUB-17) and `Default` already stamps both timestamps with `now_ns`, so the
+  persisted artefacts are identical — the mutation to a hand-rolled literal passed every test. Using
+  the primitive is still right (mandate #12, and the in-memory value is correct), but the
+  justification was wrong and is corrected at the call site.
+* **Mandate #8 note.** A spill segment can now contain dead rows, and a tombstone-only flush
+  produces a Parquet file whose schema is the 7 system columns and nothing else. Nothing on disk
+  distinguishes a pre- from a post-change segment; correctness rests on deployment order (the
+  `is_dead` filtering from #1952 and the newest-first rule from #1953 round 7). Acceptable only
+  because the path is default-OFF with no production caller, so no data exists in either form — which
+  is also the cheapest moment to add a marker. The zero-user-column shape is additionally a new
+  constraint on open item (ii): anything that unions schemas across the prefix (e.g. DataFusion)
+  must tolerate it.
 
 == Evidence gate (mandate #6)
 

@@ -1781,12 +1781,48 @@ impl DirectWalTableRecordStore {
             wal_appender,
             Arc::new(move |tenant_id, collection| {
                 match crate::services::record_spill::configured_flush_threshold() {
+                    // An EMPTY tenant is not a spillable partition. `tenant_key`
+                    // and the replay path are both `unwrap_or_default()`, so `""`
+                    // is a real input here — and a spill store that cannot stamp a
+                    // tenant cannot persist a tombstone, so its `tombstones` set
+                    // would grow monotonically (nothing but a purge clears it) and
+                    // `min_unflushed_lsn` would refuse FOREVER. That is a worse
+                    // failure than having no heap bound: unbounded state *plus*
+                    // permanently unachievable truncation.
+                    //
+                    // So the unusable shape is made unconstructible instead of
+                    // tolerated. The untenanted partition keeps today's behaviour
+                    // (an unbounded memtable — the defect TD-USUB-1 exists to fix,
+                    // unchanged for this case and recorded there as an open item).
+                    Some(_) if tenant_id.is_empty() => {
+                        // Say so. The in-store arm at least `warn!`s; a silent
+                        // fallback here would mean an operator who set the spill
+                        // gate to bound the heap gets no spill partitions and no
+                        // signal — and `""` is the NORMAL key for a single-tenant
+                        // server today, not an edge case (pgwire auth is still an
+                        // open item, and the relational pipeline maps an empty
+                        // tenant to `None`).
+                        tracing::warn!(
+                            collection = %collection,
+                            "spill gate is set but this partition has no tenant, so it \
+                             falls back to an unbounded memtable: a spill store cannot \
+                             stamp a tombstone without a tenant. See TD-USUB-1."
+                        );
+                        Arc::new(crate::services::MemtableRecordStorage::new())
+                            as Arc<dyn RecordStorage>
+                    }
                     Some(threshold) => {
-                        Arc::new(crate::services::SpillRecordStorage::with_flush_threshold(
-                            filesystem.clone(),
-                            segment_base(tenant_id, collection),
-                            Some(threshold),
-                        )) as Arc<dyn RecordStorage>
+                        Arc::new(
+                            crate::services::SpillRecordStorage::with_flush_threshold(
+                                filesystem.clone(),
+                                segment_base(tenant_id, collection),
+                                Some(threshold),
+                            )
+                            // Required for a tombstone-only flush to stamp its
+                            // synthesised record; the store refuses to persist a
+                            // tombstone without it.
+                            .with_tenant(tenant_id),
+                        ) as Arc<dyn RecordStorage>
                     }
                     None => Arc::new(crate::services::MemtableRecordStorage::new())
                         as Arc<dyn RecordStorage>,
@@ -4769,6 +4805,214 @@ mod tests {
             "gate unset must write no segments; found entries under {}",
             root.display()
         );
+    }
+
+    /// An EMPTY tenant must NOT get a spill partition, even with the gate on.
+    ///
+    /// `tenant_key` and the replay path are both `unwrap_or_default()`, so `""`
+    /// reaches the factory. A spill store with no tenant cannot persist a
+    /// tombstone, and nothing but a purge clears one — so its `tombstones` set
+    /// would grow monotonically while `min_unflushed_lsn` refused forever.
+    /// Unbounded state plus permanently unachievable truncation is strictly worse
+    /// than the unbounded memtable this slice is trying to replace, so the shape
+    /// is made unconstructible.
+    ///
+    /// Asserted by OBSERVABLE effect: with the gate on and well past the
+    /// threshold, an untenanted partition writes no segment anywhere under the
+    /// root — and still serves its rows.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn an_empty_tenant_gets_no_spill_partition() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::new_spilling(
+            wal,
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+
+        // No tenant context at all — this is what `tenant_key(None)` produces.
+        let partition = store.partition("", "orders");
+        for i in 0..8 {
+            partition
+                .upsert_record(ProximaRecord {
+                    oid: format!("o{i}"),
+                    tenant_id: String::new(),
+                    ..Default::default()
+                })
+                .await
+                .expect("upsert must succeed for an untenanted partition");
+        }
+
+        // Same shape as the gate-unset test above, including `expect` rather
+        // than `unwrap_or(false)`: an unreadable root must FAIL the test, not read
+        // as "wrote nothing" and pass it.
+        let wrote_anything = std::fs::read_dir(&root)
+            .expect("read spill root")
+            .next()
+            .is_some();
+        assert!(
+            !wrote_anything,
+            "an untenanted partition must not spill; found entries under {}",
+            root.display()
+        );
+        assert_eq!(
+            RecordScan::scan_records(partition.as_ref(), 100)
+                .await
+                .expect("scan")
+                .len(),
+            8,
+            "and it must still serve every row"
+        );
+
+        unsafe {
+            std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV);
+        }
+    }
+
+    /// The PRODUCTION wiring of the tenant is exercised, not just the store's own
+    /// unit tests.
+    ///
+    /// Persisting a tombstone refuses without a non-empty tenant, and the only
+    /// thing that satisfies that in production is `.with_tenant(tenant_id)` in
+    /// `new_spilling`'s factory closure. Remove that one call and every
+    /// `record_spill` unit test still passes — they construct the store directly
+    /// — while the first post-flush DELETE would make every subsequent flush
+    /// error, and (because `upsert_record` flushes at the threshold) every
+    /// subsequent upsert with it.
+    ///
+    /// This is the class this module's own comments already name: a wiring line
+    /// whose absence no test notices. So it is asserted THROUGH `new_spilling`.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn spilling_partition_persists_a_tombstone_through_the_production_wiring() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::new_spilling(
+            wal,
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+
+        let upsert = |i: u64| {
+            CanonicalWalEntry::new(
+                i + 1,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: format!("r{i}"),
+                        variation_id: Some("orders".to_string()),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                Some("tenant-a".to_string()),
+            )
+        };
+
+        // Eight upserts at threshold 4 flush at least once, so segments exist and
+        // the DELETE below records a tombstone rather than a plain removal.
+        let mut entries: Vec<CanonicalWalEntry> = (0..8).map(upsert).collect();
+        entries.push(CanonicalWalEntry::new(
+            9,
+            CanonicalOperation::RecordDelete {
+                collection_id: "orders".to_string(),
+                oid: "r0".to_string(),
+                projections: vec![],
+            },
+            Some("tenant-a".to_string()),
+        ));
+        // More upserts, so a flush runs WITH that tombstone pending — the flush
+        // that refuses if the tenant was never plumbed.
+        entries.extend((10..18).map(upsert));
+
+        store
+            .replay_wal_entries(entries)
+            .await
+            .expect("replay must succeed");
+
+        // THE wiring assertion, and it has to be this one.
+        //
+        // Neither "replay succeeded" nor "r0 is absent" distinguishes a plumbed
+        // tenant from an unplumbed one, because `flush` does not fail without a
+        // tenant — it warns, drops the tombstones from its snapshot, writes the
+        // residents and returns Ok, and the un-persisted tombstone still
+        // suppresses `r0` from memory. (Round 2 added this test when the flush DID
+        // return `Err`; round 3 changed that response for good reasons and
+        // silently invalidated the evidence, which went unnoticed for two rounds.)
+        //
+        // What does distinguish them is DURABILITY: with the tenant, the tombstone
+        // reaches the segment and is cleared post-commit, so this is `Ok(None)` —
+        // no constraint, nothing unflushed. Without it the tombstone is still in
+        // memory and this is `Err`. Asserted by VALUE rather than `is_ok()` so a
+        // different refusal arm cannot silently stand in for the right answer.
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(store.partition("tenant-a", "orders").as_ref())
+                .await
+                .ok(),
+            Some(None),
+            "the tombstone must be DURABLE — i.e. the production factory supplied a tenant"
+        );
+
+        // And the deleted row stays gone through the read-merge.
+        let schema = CatalogTableSchema::new("orders");
+        let scanned = store
+            .scan_records(
+                &schema,
+                TableRecordScanRequest {
+                    filter: None,
+                    table_id: "orders".to_string(),
+                    limit: None,
+                    include_vector: false,
+                    include_props: true,
+                },
+                Some(&TenantContext::for_tenant_id("tenant-a")),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+            )
+            .await
+            .expect("scan");
+        assert!(
+            !scanned.iter().any(|r| r.oid == "r0"),
+            "the deleted row must not come back after its tombstone was persisted"
+        );
+
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
     }
 
     /// The wiring proof: with the gate ON, a partition really is spill-backed —
