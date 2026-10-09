@@ -249,7 +249,7 @@ Two further gates appear in the test file and neither belongs in the run above:
   does not need to — it derives GET and byte figures from io_trace snapshots,
   which is why it needs `--features io-trace`.
 
-!!! warning "nprobe is inert in this harness, and no env var fixes that"
+!!! warning "nprobe is inert in the documented run, and no env var fixes that"
 
     `PROXIMADB_PAX_READ_COARSE_NPROBE` probes **Region A0**, and
     **compaction is the only write path that emits A0**: the flush entry point
@@ -368,10 +368,13 @@ Reading it:
 
 * ANN buys **−66% bytes** and **−85% compute** over an exact scan (164.57 ms →
   25.47 ms in that run), but costs **~11× more round-trips** — 53.97/5.00 =
-  10.8×, comparing row 1 to **row 3**, both from the `[rg_layout]` arm. (Row 4's
-  `s3://` budget brings it down to 8.4×, which is where the "~8–11×" range an
-  earlier revision quoted came from; it spans two rows with different
-  provenance, so it is given per-row here instead.) Without the
+  10.8×, comparing row 1 to **row 3**, both from the `[rg_layout]` arm and the
+  same CI run. (An earlier revision quoted "~8–11×", whose lower end was row 4 ÷
+  row 1 = 8.4×. That ratio is deliberately **not** published here: row 4 is a
+  workstation run under the `s3://` 8 MiB budget while row 1 is CI under the local
+  1 MiB budget, and the exact leg was never measured under the s3 budget — so it
+  divides across both provenance and budget, which is the comparison this bullet
+  warns against two sentences on.) Without the
   row-group layout the trade is *worse than nothing* on bytes — the `[baseline]`
   arm's own exact leg was 78.2 MB against its ANN 97.8 MB, so comparing rows 1
   and 2 across arms is not meaningful. On object storage
@@ -403,13 +406,17 @@ Reading it:
   HTTP overhead and is **not** comparable to the local-filesystem latency
   column. Compare GETs and bytes across backends; compare latency only within
   one backend.
-* The clustered/probed arm lives in `sift_ivf2_coarse_probe_recall_ratchet`,
-  which is `#[ignore]`d — so **no CI tier runs it** (both the ci.yml and qa-gate
-  invocations omit `--ignored`), and drift in it surfaces only when someone runs
-  it by hand. **TD-IVF2ENGAGE-1** records what it currently measures, including a
-  retraction worth reading: an earlier "engagement collapses at scale" finding
-  turned out to be an un-awaited background compaction in the harness, not a
-  product effect.
+* The probed arms — `sift_ivf2_coarse_probe_recall_ratchet` and
+  `sift_ivf2_probe_release_bakeoff_eval`, both described under *Knobs* — are
+  `#[ignore]`d, so **no CI tier runs either** (the ci.yml and qa-gate invocations
+  both omit `--ignored`) and drift in them surfaces only when someone runs them
+  by hand. **TD-IVF2ENGAGE-1** records what they currently measure, including a
+  retraction worth reading: an earlier "the probe barely engages" finding (1.7%
+  of queries at N=100k) was an un-awaited background compaction in the harness,
+  not a product effect — re-measured behind a barrier it is 1000/1000. Note what
+  the retraction does **not** cover: that TD was *retitled* around a
+  scale-dependent effect which survived — fetch-round depth growing with corpus
+  size — so not every "at scale" finding there is withdrawn.
 
 ## See also
 
