@@ -1763,6 +1763,25 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
             &std::env::var("PROXIMADB_SIFT_IVF_K").unwrap_or_else(|_| "64".to_string()),
         );
         std::env::set_var("PROXIMADB_TRACE_GETS", "1");
+        // Pin the TD-COMPACT-5 training arm out of the way so only the COUNT arm
+        // can fire. Without this the test fails deterministically at N >= ~333k,
+        // and the failure looks like the opposite of what it is: at that scale
+        // the FIRST flush's segment (n/2 rows) crosses the 32 MB training floor,
+        // so flush #1 enqueues a training compaction that consumes the only L0;
+        // flush #2 then has nothing due, `enqueue_due_compaction` returns
+        // Ok(false), and the assert below reports "must be enqueued by the 2nd
+        // flush (compaction_error: None)" -- a missing enqueue, with no error to
+        // point at. Confirmed by execution: N=333000 fails, and the same run with
+        // PROXIMADB_TRAINING_COMPACTION_MIN_MB raised passes (200/200 probes).
+        //
+        // The quiescence barrier below cannot fix this: it runs AFTER the
+        // compaction_ran assert, so it can neither await nor absorb a
+        // first-flush compaction. Pinning states the intent instead -- this test
+        // is about the count-triggered compaction product -- and it unblocks the
+        // 333k/1M re-measurement the TDs ask for.
+        if std::env::var_os("PROXIMADB_TRAINING_COMPACTION_MIN_MB").is_none() {
+            std::env::set_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB", "1000000");
+        }
     }
 
     let base_path = match dataset_path("sift_base.fvecs") {
@@ -1874,11 +1893,14 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
     // This is the barrier the precedent this test borrows `next_object_id()`
     // from already has (`sst_ivf2_compaction_route_proof_test.rs`, TD-COMPACT-6
     // D1); it was the one piece not carried over. It also closes an edition-2024
-    // soundness hazard: `measure()` calls `std::env::set_var` while a live
-    // compaction worker reads env from other threads (`PROXIMADB_CACHE_ON_WRITE`,
-    // `PROXIMADB_PAX_WRITE_A0_TRAIN`, `PROXIMADB_IVF_K`). Before this PR the
-    // enqueue always failed, so no second thread existed -- minting the object id
-    // activated that hazard, and quiescing before the first `set_var` removes it.
+    // soundness hazard: `measure()` calls `std::env::set_var` while a compaction
+    // worker reads env from other threads (`PROXIMADB_CACHE_ON_WRITE`,
+    // `PROXIMADB_PAX_WRITE_A0_TRAIN`, `PROXIMADB_IVF_K`). To be precise about
+    // why -- an earlier revision of this comment said "no second thread existed"
+    // before this PR, which is wrong: the workers are started unconditionally at
+    // engine construction and always existed. What did not exist was a RUNNING
+    // compaction. Quiescing removes the overlap with compaction's own env reads;
+    // it does not remove the workers, which stay live across both arms.
     match engine.compaction_manager() {
         Some(cm) => {
             let quiet = cm
@@ -1901,7 +1923,7 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         queries: &[Vec<f32>],
         ground_truth: &[std::collections::HashSet<String>],
         probe_on: bool,
-    ) -> (f64, u64, u64, usize, u64) {
+    ) -> (f64, u64, u64, usize, u64, usize, Vec<(u64, u64, u64, u64)>) {
         unsafe {
             if probe_on {
                 std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
@@ -1911,29 +1933,50 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         }
         let _ = proximadb::storage::engines::sst::segment_format::drain_get_trace();
         let _ = proximadb::storage::engines::sst::segment_format::drain_probe_trace();
-        let (recall, measured, snap, _us) = proximadb::observability::io_trace::scope(async {
-            let mut recall_sum = 0.0f64;
-            let mut measured = 0usize;
-            for (qi, query) in queries.iter().enumerate() {
-                let got = search_topk(engine, collection, query.clone()).await;
-                if got.is_empty() {
-                    continue;
+        let (recall, measured, snap, queries_with_probe, probe_rows) =
+            proximadb::observability::io_trace::scope(async {
+                let mut recall_sum = 0.0f64;
+                let mut measured = 0usize;
+                // Per-QUERY engagement, kept alongside the per-segment-read ratio
+                // below. The ratio answers "of the reads that armed, how many
+                // probed", which structurally cannot see a query that never reached
+                // the coalesced path or hit a pre-arm early return -- i.e. it cannot
+                // detect the "engages on a small fraction of queries" shape at all,
+                // except through the degenerate zero case. Draining per query costs
+                // nothing and restores the query-level view.
+                let mut queries_with_probe = 0usize;
+                let mut probe_rows: Vec<(u64, u64, u64, u64)> = Vec::new();
+                for (qi, query) in queries.iter().enumerate() {
+                    let got = search_topk(engine, collection, query.clone()).await;
+                    // Drain per query: the rows still aggregate (they are collected
+                    // into `probe_rows` and returned), and emptiness per drain is
+                    // what makes the per-query count possible.
+                    let rows =
+                        proximadb::storage::engines::sst::segment_format::drain_probe_trace();
+                    let probed_this_query = !rows.is_empty();
+                    probe_rows.extend(rows);
+                    if got.is_empty() {
+                        continue;
+                    }
+                    if probed_this_query {
+                        queries_with_probe += 1;
+                    }
+                    let got_ids: std::collections::HashSet<String> =
+                        got.into_iter().take(TOP_K).collect();
+                    recall_sum +=
+                        got_ids.intersection(&ground_truth[qi]).count() as f64 / TOP_K as f64;
+                    measured += 1;
                 }
-                let got_ids: std::collections::HashSet<String> =
-                    got.into_iter().take(TOP_K).collect();
-                recall_sum += got_ids.intersection(&ground_truth[qi]).count() as f64 / TOP_K as f64;
-                measured += 1;
-            }
-            let recall = if measured > 0 {
-                recall_sum / measured as f64
-            } else {
-                0.0
-            };
-            let snap =
-                proximadb::observability::io_trace::snapshot().expect("io_trace scope active");
-            (recall, measured, snap, Vec::<u64>::new())
-        })
-        .await;
+                let recall = if measured > 0 {
+                    recall_sum / measured as f64
+                } else {
+                    0.0
+                };
+                let snap =
+                    proximadb::observability::io_trace::snapshot().expect("io_trace scope active");
+                (recall, measured, snap, queries_with_probe, probe_rows)
+            })
+            .await;
         let per_q_gets = if measured > 0 {
             snap.range_gets / measured as u64
         } else {
@@ -1956,14 +1999,32 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
             per_q_bytes,
             measured,
             snap.ivf_whole_region_fallback,
+            queries_with_probe,
+            probe_rows,
         )
     }
 
-    let (recall_base, gets_base, bytes_base, measured_base, _fallback_base) =
+    let (recall_base, gets_base, bytes_base, measured_base, fallback_base, qprobe_base, _rows_base) =
         measure(&engine, &collection, &queries, &ground_truth, false).await;
-    let (recall_probe, gets_probe, bytes_probe, measured_probe, fallback_probe) =
-        measure(&engine, &collection, &queries, &ground_truth, true).await;
-    let probe_trace = proximadb::storage::engines::sst::segment_format::drain_probe_trace();
+    let (
+        recall_probe,
+        gets_probe,
+        bytes_probe,
+        measured_probe,
+        fallback_probe,
+        queries_with_probe,
+        probe_trace,
+    ) = measure(&engine, &collection, &queries, &ground_truth, true).await;
+    // With the probe OFF, `coarse_probe_enabled()` is false so `probe_armed`
+    // cannot be true: both counters must be identically zero. Asserting it is the
+    // only thing that checks the two arms really were configured differently --
+    // otherwise a gate that silently stopped toggling would read as a clean pass.
+    assert_eq!(
+        (fallback_base, qprobe_base),
+        (0, 0),
+        "probe-OFF arm recorded probe activity (fallback={fallback_base}, \
+         queries_with_probe={qprobe_base}); the arms were not configured differently"
+    );
 
     eprintln!(
         "=== TD-RDSTRAT-8 IVF2 coarse probe (N={n}, {qcount} queries, top-{TOP_K}, IVF_K from env) ===\n  \
@@ -2005,7 +2066,8 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
     let armed_reads = engaged + fallback_probe;
     eprintln!(
         "  probe engagement: {engaged} probed / {armed_reads} armed segment read(s) \
-         ({fallback_probe} armed-but-whole-region) over {measured_probe} measured queries"
+         ({fallback_probe} armed-but-whole-region); {queries_with_probe} of \
+         {measured_probe} measured queries probed at least once"
     );
 
     // Collect every verdict BEFORE asserting, then fail once with all of them.
@@ -2019,15 +2081,19 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
     let mut failures: Vec<String> = Vec::new();
 
     if armed_reads == 0 {
-        // Distinct from "armed and missed": no segment read had a parsable
-        // Region A0, so no IVF ran at all. The two have opposite fixes (write a
-        // v3 segment vs. investigate the decline path), and the previous single
-        // message asserted the second unconditionally -- "the rest fell back to
-        // the whole-Region-A scan" -- in a run where nothing had fallen back.
+        // Both counters zero. Name the candidates rather than asserting one:
+        // an earlier message said "the rest fell back to the whole-Region-A
+        // scan" in a run where nothing had fallen back, and the replacement
+        // then asserted "no segment read had a parsable Region A0", which is
+        // only one of three states that produce this.
         failures.push(
-            "the coarse probe never ARMED: no segment read had a parsable Region A0, so no \
-             IVF ran (the armed-but-whole-region counter is 0 too). The v3 layout is written \
-             only by compaction -- see TD-IVF2ENGAGE-1"
+            "the coarse probe recorded NOTHING: 0 probes and 0 armed-but-whole-region \
+             reads. Three states produce this and these counters cannot separate them: \
+             (a) no segment read had a parsable Region A0, so the probe never armed -- \
+             the v3 layout is written only by compaction; (b) the coalesced path was \
+             never entered at all (cascade declined, or generic-scan fail-over) -- see \
+             TD-SIFTCOMPACT-1; (c) a pre-arm early return (header parse, stale-size \
+             guard, size floor). See TD-IVF2ENGAGE-1"
                 .to_string(),
         );
     } else {
@@ -2039,6 +2105,20 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
                  armed-but-whole-region fallback the probe exists to avoid -- see TD-IVF2ENGAGE-1"
             ));
         }
+        // And the per-QUERY floor, which the ratio above cannot express. Today
+        // the two agree (2 L0 compact to exactly 1 L1, inputs retired, so armed
+        // reads == measured queries), but they diverge the moment the layout
+        // mixes a trained v3 with an untrained L0, or segment discovery skips
+        // the v3 for most queries: per-query engagement can be arbitrarily low
+        // while the ratio still reads 100%.
+        let query_floor = (measured_probe + 1) / 2;
+        if queries_with_probe < query_floor {
+            failures.push(format!(
+                "only {queries_with_probe} of {measured_probe} measured queries probed at \
+                 least once (floor {query_floor}) -- the per-armed-read ratio can read 100% \
+                 while most queries never reach a trained segment. See TD-IVF2ENGAGE-1"
+            ));
+        }
     }
     if recall_probe < recall_base - recall_drop {
         failures.push(format!(
@@ -2046,6 +2126,15 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
              {recall_base:.4}"
         ));
     }
+    // CONFOUND, disclosed rather than claimed away: the baseline arm runs FIRST
+    // (cold SegmentInvariantsCache, cold page cache on the just-written L1) and
+    // the probe arm second (warm). Nothing is invalidated between them, so part
+    // of this gap is cold-vs-warm. The barrier above makes "the same segment"
+    // true; it does not make "the same cache state" true. Measured signature of
+    // exactly that: the gap narrows from -60% at 100 queries to -30% at 1000 as
+    // a fixed warm-up advantage amortises. Direction and ordering are stable, so
+    // this works as a ratchet -- but no figure from here belongs in
+    // BENCHMARK_EVIDENCE.toml until the arms are run in both orders.
     if bytes_probe >= bytes_base {
         failures.push(format!(
             "probe bytes/q = {bytes_probe} must read fewer than baseline {bytes_base}"
