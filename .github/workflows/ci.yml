@@ -2469,6 +2469,15 @@ jobs:
     # coverage is expensive, so gate it to the main-promotion gate explicitly.
     needs: [changes, rust-test]
     if: needs.changes.outputs.extensive == 'true'
+    # Advisory, and that now means BOTH halves: `continue-on-error` here AND
+    # absent from `ci-success.needs`. Only the first was set, which made the job
+    # a hard gate in practice -- `ci-success`'s final step blocks on
+    # `contains(needs.*.result, 'failure')`, and `continue-on-error` only stops
+    # the WORKFLOW being marked failed, not the aggregator reading the result.
+    # Observed on the v0.4.0 qa->main promotion: coverage ran 83 minutes, was
+    # evicted mid-`Generate Coverage` with no logs uploaded, and blocked the
+    # required check. Compare the advisory job above, which gets the pairing
+    # right: "advisory — never a merge gate (also not in ci-success.needs)".
     continue-on-error: true
     env:
       RUSTC_WRAPPER: sccache
@@ -3127,7 +3136,6 @@ jobs:
       - rust-integration-test-api
       - object-store-emulator-tests
       - object-store-restart-recovery
-      - rust-coverage
       - python-lint
       - python-test
       - sdk-coverage-ratchet
