@@ -287,10 +287,14 @@ fn collection(id: &str, base_location: String) -> Collection {
         // Minting an id is a one-line change these tests do not survive: with a
         // valid id compaction actually runs, and the sibling ratchet then dies on
         // the FIRST query at `assert_single_vector_access` with ZERO recorded
-        // accesses — the PAX coalesced cascade declines on the compacted segment
-        // and the ANN proof is never emitted. That is a product finding, so the
-        // assertion must stay strict; relaxing it would go green while the
-        // engagement loss remained.
+        // accesses — no ANN proof is emitted. "No proof emitted" is the
+        // observation; "the cascade declined on the compacted segment" is one of
+        // four candidate explanations and is NOT established -- TD-SIFTCOMPACT-1
+        // lists them and rates the most likely as a harness artifact (that
+        // experiment had no compaction-quiescence barrier either, the same defect
+        // retracted in TD-IVF2ENGAGE-1). So the assertion stays strict because a
+        // zero-proof query is a real signal either way, not because a product
+        // defect has been demonstrated.
         //
         // What IS fixed here is the silence: `compaction:off` below states that
         // these arms measure an uncompacted layout, instead of achieving it by a
@@ -1923,7 +1927,16 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         queries: &[Vec<f32>],
         ground_truth: &[std::collections::HashSet<String>],
         probe_on: bool,
-    ) -> (f64, u64, u64, usize, u64, usize, Vec<(u64, u64, u64, u64)>) {
+    ) -> (
+        f64,
+        u64,
+        u64,
+        usize,
+        u64,
+        usize,
+        Vec<(u64, u64, u64, u64)>,
+        u64,
+    ) {
         unsafe {
             if probe_on {
                 std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
@@ -2001,11 +2014,30 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
             snap.ivf_whole_region_fallback,
             queries_with_probe,
             probe_rows,
+            // Ungated, unlike `probe_trace`: `record_ivf_probe_durable` is called
+            // on BOTH the engaged and the fallback path with no `trace_on` guard,
+            // while `record_probe_trace` is called only `if trace_on`. Non-zero
+            // cells therefore prove the probe engaged even when the trace vector
+            // is empty, which is the only way to tell "probe worked, tracing off"
+            // from "never armed".
+            snap.ivf_cells_total,
         )
     }
 
-    let (recall_base, gets_base, bytes_base, measured_base, fallback_base, qprobe_base, _rows_base) =
-        measure(&engine, &collection, &queries, &ground_truth, false).await;
+    let (
+        recall_base,
+        gets_base,
+        bytes_base,
+        measured_base,
+        fallback_base,
+        // Unused on purpose: the OFF-arm check below uses `_rows_base`, which
+        // counts probe rows unconditionally, rather than this counter, which is
+        // only incremented after the empty-result `continue` and so cannot see a
+        // baseline query that probed but returned nothing.
+        _qprobe_base,
+        _rows_base,
+        cells_base,
+    ) = measure(&engine, &collection, &queries, &ground_truth, false).await;
     let (
         recall_probe,
         gets_probe,
@@ -2014,17 +2046,19 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         fallback_probe,
         queries_with_probe,
         probe_trace,
+        cells_probe,
     ) = measure(&engine, &collection, &queries, &ground_truth, true).await;
     // With the probe OFF, `coarse_probe_enabled()` is false so `probe_armed`
     // cannot be true: both counters must be identically zero. Asserting it is the
     // only thing that checks the two arms really were configured differently --
     // otherwise a gate that silently stopped toggling would read as a clean pass.
-    assert_eq!(
-        (fallback_base, qprobe_base),
-        (0, 0),
-        "probe-OFF arm recorded probe activity (fallback={fallback_base}, \
-         queries_with_probe={qprobe_base}); the arms were not configured differently"
-    );
+    // Deliberately NOT a bare assert here: an early hard assert would lose every
+    // measured number below, which is the thing the collect-then-report structure
+    // exists to avoid. Folded into `failures` instead (see below). Uses
+    // `_rows_base`, which counts probe rows unconditionally, rather than
+    // `qprobe_base`, which is only incremented after the empty-result `continue`
+    // and so cannot see a baseline query that probed but returned nothing.
+    let off_arm_activity = (fallback_base, _rows_base.len(), cells_base);
 
     eprintln!(
         "=== TD-RDSTRAT-8 IVF2 coarse probe (N={n}, {qcount} queries, top-{TOP_K}, IVF_K from env) ===\n  \
@@ -2048,12 +2082,18 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         measured_base > 0 && measured_probe > 0,
         "no queries measured"
     );
-    // A non-empty trace is NOT evidence that the probe is doing its job: at
-    // N=100_000 with PROXIMADB_SIFT_QUERIES=1000 it records 17 entries against
-    // 1000 measured queries and `!is_empty()` certifies that happily, while the
-    // rest never benefit from the probe at all. (This test's own query default
-    // is `100.min(DEFAULT_QUERIES)` = 100, so the 1000 figure needs the env var.)
-    // Assert a proportion instead.
+    // A non-empty trace is NOT evidence that the probe is doing its job: a
+    // presence check is satisfied by one probe out of any number of queries, so
+    // it certifies a probe that is effectively off. Assert a proportion instead.
+    //
+    // NOTE: an earlier revision of this comment justified the change with
+    // "at N=100_000 with PROXIMADB_SIFT_QUERIES=1000 it records 17 entries
+    // against 1000 measured queries". That measurement is RETRACTED -- it was
+    // taken before the compaction-quiescence barrier above existed, so the arms
+    // raced the compaction. Re-measured behind the barrier, that exact config
+    // records 1000 of 1000 (TD-IVF2ENGAGE-1). The proportion floor is still the
+    // right guard -- a presence check is weak whatever the true engagement is --
+    // but it is not fixing an observed collapse.
     //
     // Both terms are PER SEGMENT READ, which is what makes this a ratio rather
     // than a floor: `probe_trace` is pushed once per segment read that probed,
@@ -2072,13 +2112,29 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
 
     // Collect every verdict BEFORE asserting, then fail once with all of them.
     // Asserting in sequence means the first failure hides the rest, and WHICH
-    // one comes first decides what the reader of a CI failure sees: at this
-    // test's DEFAULT N the probe does not engage at all (0 of 100 measured), and
-    // with the byte ratchet asserted first that surfaced as a 3.3% byte
-    // regression with no engagement number -- the same masking a previous
-    // revision reordered these to remove, pointed the other way. Reporting all
-    // three is the only ordering that is not a guess about which matters.
+    // one comes first decides what the reader of a CI failure sees, and which
+    // failure is "first" is a guess about which one matters. Reporting all three
+    // is the only ordering that makes no such guess.
+    //
+    // NOTE: an earlier revision justified this with "at this test's DEFAULT N
+    // the probe does not engage at all (0 of 100 measured) ... a 3.3% byte
+    // regression". Also RETRACTED, same cause: post-barrier the default config
+    // measures 100 of 100 probed and bytes 60% BELOW baseline, and the test is
+    // green. The collect-then-report structure stands on its own reasoning.
     let mut failures: Vec<String> = Vec::new();
+
+    // The probe-OFF arm must record NOTHING: `coarse_probe_enabled()` is false,
+    // so `probe_armed` cannot be true. Nothing else checks that the two arms were
+    // configured differently, so without this a gate that silently stopped
+    // toggling would read as a clean pass.
+    if off_arm_activity != (0, 0, 0) {
+        failures.push(format!(
+            "the probe-OFF arm recorded probe activity (fallback={}, probe_rows={}, \
+             cells_total={}); the two arms were not configured differently, so every \
+             comparison below is meaningless",
+            off_arm_activity.0, off_arm_activity.1, off_arm_activity.2
+        ));
+    }
 
     if armed_reads == 0 {
         // Both counters zero. Name the candidates rather than asserting one:
@@ -2086,16 +2142,33 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         // scan" in a run where nothing had fallen back, and the replacement
         // then asserted "no segment read had a parsable Region A0", which is
         // only one of three states that produce this.
-        failures.push(
-            "the coarse probe recorded NOTHING: 0 probes and 0 armed-but-whole-region \
-             reads. Three states produce this and these counters cannot separate them: \
-             (a) no segment read had a parsable Region A0, so the probe never armed -- \
-             the v3 layout is written only by compaction; (b) the coalesced path was \
-             never entered at all (cascade declined, or generic-scan fail-over) -- see \
-             TD-SIFTCOMPACT-1; (c) a pre-arm early return (header parse, stale-size \
-             guard, size floor). See TD-IVF2ENGAGE-1"
-                .to_string(),
-        );
+        // `cells_probe` is recorded WITHOUT the `trace_on` guard that
+        // `probe_trace` is behind, so it separates "the probe worked and tracing
+        // was off" from everything else. Without it this branch named three
+        // causes and silently excluded the one the toggle itself could produce.
+        if cells_probe > 0 {
+            failures.push(format!(
+                "the coarse probe DID engage ({cells_probe} cells probed, recorded on the \
+                 ungated durable counter) but `probe_trace` is empty -- so the trace gate, \
+                 not the probe, is off. `record_probe_trace` is called only `if trace_on` \
+                 (PROXIMADB_TRACE_GETS / TRACE_PAX_STAGES) while the durable counters are \
+                 not, so any caller that clears it reads 0% engagement on a working probe"
+            ));
+        } else {
+            failures.push(
+                "the coarse probe recorded NOTHING: 0 probes, 0 armed-but-whole-region \
+                 reads, 0 cells. Four states produce this and these counters cannot \
+                 separate them: (a) no segment read had a parsable Region A0, so the probe \
+                 never armed -- the v3 layout is written only by compaction; (b) the \
+                 coalesced path was never entered at all (cascade declined, or generic-scan \
+                 fail-over) -- see TD-SIFTCOMPACT-1; (c) a pre-arm early return (header \
+                 parse, stale-size guard, size floor); (d) the read gate itself is off, i.e. \
+                 `coarse_probe_enabled()` is false even though this arm set it -- which the \
+                 probe-OFF check above cannot catch, because if BOTH arms are off it \
+                 passes. See TD-IVF2ENGAGE-1"
+                    .to_string(),
+            );
+        }
     } else {
         let engagement_floor = (armed_reads + 1) / 2; // >= 50% of ARMED segment reads
         if engaged < engagement_floor {

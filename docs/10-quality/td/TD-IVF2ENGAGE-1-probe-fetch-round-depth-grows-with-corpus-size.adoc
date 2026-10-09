@@ -92,7 +92,11 @@ turns out to be. They are strengthened in the same change.
    `Ok(None)` both become "no probe" and take the same fallback. From the
    recorded metrics — `record_ivf_probe_durable(0, 0, 0, 0, true)` for every miss
    — a probe that *failed* is indistinguishable from one that legitimately
-   *declined*. Until that is split, the 983 misses cannot be attributed.
+   *declined*. Until that is split, a miss cannot be attributed to a reason.
+   (An earlier revision said "the 983 misses" -- 1000 minus 17, carried over from
+   the retracted measurement. Engagement is 100% at every scale measured and
+   `ivf_whole_region_fallback` is 0, so there are currently no misses to
+   attribute at all; see "How to apply" item 3.)
 
 == How to apply
 
@@ -116,8 +120,9 @@ turns out to be. They are strengthened in the same change.
 . **Then, and only if the growth is a real cost, split the miss reason.**
   `segment_format.rs` calls `coarse_probe_survivors(...).await.ok().flatten()`,
   collapsing ~15 descriptive `Err` paths and **six** `return Ok(None)` declines
-  (`:3044`, `:3061`, `:3066`, `:3078`, `:3127`, `:3148` on HEAD -- an earlier
-  revision of this list was a uniform 46 lines stale) into one "no probe", with
+  (`:3090`, `:3107`, `:3112`, `:3124`, `:3173`, `:3194` on `origin/develop`;
+  `coarse_probe_survivors` starts at `:3067`, and this PR does not touch that
+  file) into one "no probe", with
   `record_ivf_probe_durable(0,0,0,0,true)` firing for both. This was item 1 while
   the engagement collapse was believed real; with engagement measured at 100% at
   every scale there are currently **no misses to attribute**, so it is
