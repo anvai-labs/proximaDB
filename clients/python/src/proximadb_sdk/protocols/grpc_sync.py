@@ -10,6 +10,7 @@ Features:
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC
 from typing import Any
 
 from ..exceptions import ProximaDBError
@@ -1603,7 +1604,7 @@ class ProximaDBSyncGrpcClient:
 
     def _convert_node_from_proto(self, node) -> dict[str, Any]:
         """Convert Node proto to dictionary"""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         return {
             "id": node.id,
@@ -1613,16 +1614,12 @@ class ProximaDBSyncGrpcClient:
                 for k, v in node.properties.items()
             },
             "created_at": (
-                datetime.fromtimestamp(
-                    node.created_at_ms / 1000, tz=timezone.utc
-                ).isoformat()
+                datetime.fromtimestamp(node.created_at_ms / 1000, tz=UTC).isoformat()
                 if node.created_at_ms
                 else None
             ),
             "updated_at": (
-                datetime.fromtimestamp(
-                    node.updated_at_ms / 1000, tz=timezone.utc
-                ).isoformat()
+                datetime.fromtimestamp(node.updated_at_ms / 1000, tz=UTC).isoformat()
                 if node.updated_at_ms
                 else None
             ),
@@ -1630,7 +1627,7 @@ class ProximaDBSyncGrpcClient:
 
     def _convert_edge_from_proto(self, edge) -> dict[str, Any]:
         """Convert Edge proto to dictionary"""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         return {
             "id": edge.id,
@@ -1643,16 +1640,12 @@ class ProximaDBSyncGrpcClient:
             },
             "weight": edge.weight if edge.HasField("weight") else None,
             "created_at": (
-                datetime.fromtimestamp(
-                    edge.created_at_ms / 1000, tz=timezone.utc
-                ).isoformat()
+                datetime.fromtimestamp(edge.created_at_ms / 1000, tz=UTC).isoformat()
                 if edge.created_at_ms
                 else None
             ),
             "updated_at": (
-                datetime.fromtimestamp(
-                    edge.updated_at_ms / 1000, tz=timezone.utc
-                ).isoformat()
+                datetime.fromtimestamp(edge.updated_at_ms / 1000, tz=UTC).isoformat()
                 if edge.updated_at_ms
                 else None
             ),

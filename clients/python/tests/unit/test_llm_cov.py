@@ -6,7 +6,7 @@
 import asyncio
 import sys
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -205,7 +205,7 @@ def test_lookup_miss_no_results():
 
 
 def test_lookup_hit_fresh():
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     result = {
         "vector": [0.1, 0.2],
         "metadata": {
@@ -241,7 +241,7 @@ def test_lookup_hit_fresh():
 
 
 def test_lookup_expired_returns_none():
-    old = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
+    old = (datetime.now(UTC) - timedelta(hours=100)).isoformat()
     result = {"vector": [], "metadata": {"cached_at": old, "answer": "x"}}
     client = FakeClient(search_results=[result])
     c = SemanticCache(SemanticCacheConfig(ttl_hours=1), client)
@@ -673,7 +673,7 @@ def test_rag_query_skip_cache_and_top_k(stub_heavy_deps):
 
 
 def test_rag_query_cache_hit(stub_heavy_deps):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     cache_hit = {
         "vector": [],
         "metadata": {
