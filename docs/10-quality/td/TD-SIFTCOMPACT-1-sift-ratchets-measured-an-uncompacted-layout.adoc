@@ -76,18 +76,33 @@ collapsed:
   threshold 1 regardless of the flush count. So nothing was hidden for it at that
   N and its L0-only layout is the intended one.
 +
-  That exemption is only as good as the env, which matters because it does not
-  hold in the run the figures come from: the qa-gate `sift-pax-recall` job sets
-  `PROXIMADB_SIFT_N=100000` for the whole binary, at which this arm performs five
-  20 000-row flushes and reaches the **count** arm exactly like the two cascade
-  arms. In the run that produced the published filtered figure (recall@10 =
-  0.9907 at N=100 000) it was *not* exempt.
+  That exemption is only as good as the env: the qa-gate `sift-pax-recall` job
+  sets `PROXIMADB_SIFT_N=100000` for the whole binary, at which this arm performs
+  five 20 000-row flushes and reaches the **count** arm exactly like the two
+  cascade arms. So in the run behind the qa-gate's *logged* filtered figure
+  (recall@10 = 0.9907 at N=100 000) it was not exempt. That figure is a job-log
+  line and is published nowhere on develop -- the only filtered recall figure
+  published there is 0.996 at N=10 000 (`ENV_GATE_REGISTRY.adoc`, also in
+  TD-FPRUNE-1), which was taken in the *exempt* configuration.
 
-All four arms are the source of the recall and GET/byte figures published in
+The **cascade** arms are the source of the recall figures published in
 `docs/_internal/status/SIFT1M_RECALL_RATCHET_2026_06_30.adoc` and the
 `pax_rabitq_sq8_sift1m_recall_at_10` ledger claim in
-`docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`, and carried by the qa-gate
-`sift-pax-recall` job.
+`docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml` -- both are recall-only
+(`metric = "recall_at_10"`), and the status doc's own provenance line names
+`sift_pax_cascade_recall_at_10_ratchet`. Those two are what the re-baselining in
+"How to apply" item 3 scopes to.
+
+An earlier revision said "all four arms are the source of the recall and GET/byte
+figures ... and carried by the qa-gate job", which was wrong three ways: neither
+named artifact carries a GET or byte figure; the filtered arm publishes nothing
+on develop; and `sift_coalesced_rabitq_scan_rerank_eval` is `#[ignore]`d and both
+CI invocations omit `--ignored`, so no CI job carries it. Its own GET/byte figures
+live in separate ledger claims (`coalesced_rabitq_scan_rerank_sift`,
+`coalesced_rabitq_adaptive_m_sift1m`) and need no layout caveat: those runs are
+dated 2026-07-15/16, before the TD-COMPACT-5 training arm landed (#1207,
+2026-07-25), and a single-batch flush cannot reach count 5 -- so compaction
+legitimately never became due for them.
 
 === Confirmed by execution — and superseded by the `compaction:off` tag
 
