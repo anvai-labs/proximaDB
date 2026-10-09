@@ -235,7 +235,7 @@ which understates the GET savings a cloud budget gives you.
 |---|---|
 | `PROXIMADB_SIFT_DATASET_DIR` | corpus dir (**unset → test skips**) |
 | `PROXIMADB_SIFT_N` | insert only the first N base vectors |
-| `PROXIMADB_SIFT_QUERIES` | query count (default 1000) |
+| `PROXIMADB_SIFT_QUERIES` | query count — default **1000** for the two cascade arms, **100** for the filtered arm, which carries its own default |
 | `PROXIMADB_SIFT_RECALL_FLOOR` | fail below this recall@10 (default 0.90) |
 | `PROXIMADB_RECALL_DATASET_REQUIRED` | fail instead of skip when the corpus is missing |
 | `PROXIMADB_OBJECT_STORE_URL` | measure against a cloud/emulator base |
@@ -331,7 +331,7 @@ from the brute-force oracle rather than the provided file — expected when you
 insert a subset.
 
 Note `pairs=30`. Recall is measured over all 1000 queries, but the paired I/O
-and compute figures come from a 30-pair sample at N=100k (300 pairs at N=10k with the default 1000 queries (the ci.yml job sets 100 queries, so 100 pairs there),
+and compute figures come from a 30-pair sample at N=100k (300 pairs at N=10k with the default 1000 queries (the ci.yml job sets 100 queries, so 100 pairs there — which is the figure the test file's own comment quotes, scoped to CI without saying so),
 3 at N=1M). Do not read the I/O columns as 1000-query averages.
 
 Four numbers decide a configuration, and you want them **together**:
@@ -407,7 +407,14 @@ Reading it:
   in the table, and it is a shipped default rather than a knob.
 * Moving from the **local 1 MiB target to the `s3://` 8 MiB target cut GETs 22%
   for +6% bytes at identical recall** — a straight DEPTH-for-BYTES win, and the
-  largest effect we measured. **Same caveat as the withheld 8.4× above**, and
+  largest *GET* reduction available from configuration rather than from a format
+  change. Note it is **not** the largest effect in the table: the row-group
+  layout above beats it on both axes (−23.4% GETs and −74.1% bytes, against
+  −22.1% GETs for **+6.3%** bytes), and does so within one run. An earlier
+  revision called this "the largest effect of any knob we turned", which was
+  compatible with that because the layout is a shipped default rather than a
+  knob; dropping the knob scoping removed the only thing keeping the two
+  superlatives apart. **Same caveat as the withheld 8.4× above**, and
   stated here rather than only there because this is the figure a reader is most
   likely to act on.
 
@@ -416,8 +423,10 @@ Reading it:
   row 4 is a workstation under the `s3://` 8 MiB budget, so this crosses the
   machine, the budget **and the storage backend** — local-filesystem reads versus
   HTTP ranged GETs, the same confound the Caveats section names for latency.
-  Budget cannot in fact be varied alone this way: `IopsBudget::from_path` resolves
-  by scheme, so isolating it needs the per-location `io_budget` override
+  Budget cannot in fact be varied alone this way: `IopsBudget::for_path` consults
+  any registered per-location budget first and otherwise resolves by scheme (via
+  `for_scheme_and_env`, which is also where `PROXIMADB_DISK_CLASS` applies), so
+  isolating the budget needs the per-location `io_budget` override
   documented above, which this arm did not use. It is also not reached "by turning
   a knob" — it is reached by changing the store URL.
 
@@ -427,9 +436,18 @@ Reading it:
   until both rows are re-measured on one machine against one backend.
 * With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
   **81 GETs / 92 ms at recall 0.9860 probed vs 108 GETs / 144 ms at 0.9840
-  unprobed** (ratchet 0.984) — better on every axis, recall included. (The
-  ledger's 0.9870 is the nprobe=12 arm, which is not the comparison above;
-  quoting it as the top of a band was wrong.) On an **uncompacted**
+  unprobed** (ratchet 0.984) — better on every axis, recall included, **on the
+  1M bed**. (The ledger's 0.9870 is the nprobe=12 arm, which is not the
+  comparison above; quoting it as the top of a band was wrong.)
+
+  The sign flips below that scale, which matters because it is the scale the run
+  command above targets. TD-IVF2ENGAGE-1 measures the probe's recall *below*
+  unprobed at every scale it ran — 0.9880 vs 0.9905 at 20k, 0.9800 vs 0.9820 at
+  100k, 0.9800 vs 0.9845 at 333k — and the ledger's own
+  `rdstrat8_sift_ivf2_coarse_probe` entry records GETs/query going **up** 13 → 22
+  at 100k. So "better on every axis" is a 1M-bed result, not a general one: at
+  your likely scale expect to trade a little recall and possibly more round trips
+  for fewer bytes, and measure rather than assume. On an **uncompacted**
   segment there is no Region A0 to probe, so nprobe does nothing: that is the
   trap, and no env var substitutes for a compaction having run (training is
   already default-ON, and flush deliberately never emits A0). The admonition

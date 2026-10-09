@@ -50,8 +50,11 @@ tool that prints GETs/query.
   `var_os(...).is_some()` so even `=0` wraps the filesystem and changes the stack
   the latency numbers come from.
 +
-  Nor is there a bytes/query budget assertion in the documented run -- its asserts
-  are `measured > 0`, the paired-sample minimum, and `recall >= floor`. The byte
+  Nor is there a bytes/query budget assertion in the documented run. Its
+  *aggregate* asserts are `measured > 0`, the paired-sample minimum and
+  `recall >= floor`; it also asserts per pair (exact-vs-ground-truth equality,
+  non-zero GETs and bytes, and the single-vector-access equalities), so that is
+  the aggregate list rather than the whole set. The byte
   budget (`PROXIMADB_SIFT_COALESCED_BYTE_BUDGET`) is read only inside the
   `#[ignore]`d `sift_coalesced_rabitq_scan_rerank_eval`.
 * **Cloud budgets are reachable** through `PROXIMADB_OBJECT_STORE_URL`, which is
@@ -84,7 +87,9 @@ tool that prints GETs/query.
 == Adjacent defect found while filing this
 
 `sift_ivf2_coarse_probe_recall_ratchet` **failed a precondition and could not
-run** when this TD was filed. **FIXED** — TD-IVF2ENGAGE-1's change mints
+run** when this TD was filed. **FIXED** in the same change that files
+TD-IVF2ENGAGE-1 and TD-SIFTCOMPACT-1 — TD-SIFTCOMPACT-1 is where the minting
+decision is recorded, TD-IVF2ENGAGE-1 where the barrier is. It mints
 `next_object_id()` at that call site and adds a compaction-quiescence barrier, so
 the arm runs and is now the worked example the guide points at. The rest of this
 section is kept because it is the diagnosis, not the current state. The error
