@@ -39,10 +39,26 @@ number, the REST/axum listener binds it and the pgwire listener loses it — and
 precisely `"bytes remaining on stream"`. No second process is required. The
 harness also only waits on `GET /health` against `rest_port` plus a 200 ms sleep,
 so it never confirms that pgwire is what is listening on `pg_port`. The other
-path — another test or an unrelated process taking the port — is also real: the
-integration lanes run suites concurrently, so a sibling harness asking the kernel
-for a port at the same moment is an ordinary occurrence rather than bad luck.
-Option 1 below covers both paths.
+path — an unrelated process on the runner, or a socket lingering in TIME_WAIT
+from the suite that ran before this one — is also real, though narrower than it
+looks: **the integration lanes are built not to run suites concurrently.** The
+graph lane is a sequential `for test_file in tests/*graph*.rs` loop invoking
+`cargo test --test "$test_name" -- --test-threads=1` one suite at a time, every
+other lane has the same shape, `.cargo/config.toml` sets
+`[env] RUST_TEST_THREADS = "1"`, and `.config/nextest.toml` both pins
+`profile.integration` to `test-threads = 1` and puts every `_e2e`/`_integration_test`
+binary in a `serial-network` test-group with `max-threads = 1`. The cited job's
+own log shows strictly interleaved `Running <suite>` / `test result:` pairs with
+no overlap.
+
+That makes the self-collision above the **only** concurrent path available inside
+one CI job, which strengthens it rather than weakening the filing. An earlier
+revision of this paragraph asserted the opposite — that the lanes run suites
+concurrently — which is false and was the justification it offered for the
+secondary path.
+
+Option 1 below covers every path, because it removes the unowned window
+entirely.
 
 `git grep -l "fn free_port" -- 'tests/*.rs'` finds **75** files, and **all 75**
 drop the listener. There are two spellings of the same helper — `drop(l)` in 40
