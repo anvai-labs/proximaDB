@@ -443,8 +443,13 @@ if os.path.isfile(cargo):
         # to bump 13 more files over an unparseable root manifest and failed at
         # the end blaming the lock refresh, leaving the gate permanently red and
         # `set` permanently unable to repair it.
+        # NO trailing `\s*$`: the writer's regex has none, and adding it made
+        # the pre-flight refuse a shape the writer handles perfectly --
+        # `version = "0.2.0"  # comment` is one single-line matched-delimiter
+        # entry, the writer rewrites it correctly, and the pre-flight rejected it
+        # with a message that was false of the file.
         if len(re.findall(
-            r'(?m)^(\s*version\s*=\s*)["\'][^"\']*["\']\s*$', text[start:end]
+            r'(?m)^(\s*version\s*=\s*)["\'][^"\']*["\']', text[start:end]
         )) != 1:
             problems.append(
                 "Cargo.toml: [workspace.package] needs exactly one single-line "
@@ -590,8 +595,15 @@ path, version, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 # throughout, so a CRLF pom had all of its lines rewritten -- contradicting this
 # writer's own "keeps formatting intact". The lockfile editor in the same script
 # already does this; the pom writer did not inherit it.
-with open(path, encoding="utf-8", newline="") as fh:
-    src = fh.read()
+try:
+    with open(path, encoding="utf-8", newline="") as fh:
+        src = fh.read()
+except UnicodeDecodeError as exc:
+    # A pom may legally declare a non-UTF-8 encoding, and ET.parse honours that
+    # declaration -- so `check` reads such a file fine while this read threw a
+    # raw traceback out of the pre-flight.
+    sys.exit(f"{path}: not readable as UTF-8 ({exc}); this writer edits only "
+             "UTF-8 poms — not modified")
 
 # Locate /project/version by DEPTH, not by position relative to </parent>.
 # <project>'s children are an xs:all, so a project declaring <version> after
@@ -645,7 +657,8 @@ if span is None:
         _root = _ET.fromstring(src)
         _ns = _root.tag[: _root.tag.index("}") + 1] if _root.tag.startswith("{") else ""
         if _root.find(_ns + "parent") is not None:
-            print(f"  [SKIP] {path}: version inherited from <parent>")
+            if mode == "write":
+                print("  [SKIP] clients/java-embedded/pom.xml: version inherited from <parent>")
             raise SystemExit(0)
     except SystemExit:
         raise
@@ -683,13 +696,28 @@ try:
     # read stripped all 147 CRs from a CRLF pom and the guard did not fire. Only
     # a byte comparison against the file as it was read can detect that, because
     # newline translation happens at read time.
+    # `span` comes from a regex over the DECODED text, so lo/hi are CHARACTER
+    # offsets. An earlier revision sliced the raw bytes with them, which
+    # desynchronises by one position per extra UTF-8 byte before the span: a
+    # single non-ASCII character (or a BOM) anywhere above /project/version made
+    # this guard fire on a file where nothing was wrong, and `set` then refused
+    # the WHOLE tree with a message false of the file. Converting through the
+    # same decoding fixes that and still catches read-time newline translation,
+    # because that makes `src` disagree with the bytes on disk.
     lo, hi = span
     raw_before = open(path, "rb").read()
-    want = raw_before[:lo] + version.encode("utf-8") + raw_before[hi:]
+    lo_b = len(src[:lo].encode("utf-8"))
+    hi_b = len(src[:hi].encode("utf-8"))
+    want = raw_before[:lo_b] + version.encode("utf-8") + raw_before[hi_b:]
     if back.encode("utf-8") != want:
         sys.exit(f"{path}: bytes outside the version span changed — not modified")
     if mode == "write":
         os.replace(tmp, path)
+        # Printed by the writer, not by the caller: an unconditional echo in the
+        # shell printed "[SET] ... -> <version>" two lines after this program's
+        # own [SKIP] on an inheriting pom, which is a false claim of the exact
+        # kind this script's other comments cite twice.
+        print(f"  [SET]  clients/java-embedded/pom.xml -> {version}")
     else:
         os.unlink(tmp)
 except BaseException:
@@ -890,9 +918,13 @@ PYEOF
 
   # 13. The npm lockfiles' own version fields. These used to be LAST; the pom
   #     write now sits after them (and before the lock refresh), so "last" is no
-  #     longer accurate -- what still holds, and is the point, is that every
-  #     abort-capable step from here on is pre-flighted by a DRY RUN of itself,
-  #     so reaching this far means none of them will refuse. Identified STRUCTURALLY (doc["version"] and
+  #     longer accurate. What holds is narrower than an earlier revision of this
+  #     comment claimed: every abort-capable step from here on EXCEPT the final
+  #     `cargo update` is pre-flighted by a dry run of itself. The lock refresh is
+  #     not -- only `command -v cargo` is checked -- so a lock that cannot resolve
+  #     offline (a registry dep missing from Cargo.lock, say) still aborts AFTER
+  #     every manifest is bumped. That path exits 1 saying the tree is
+  #     inconsistent, which is honest, but it is not prevented. Identified STRUCTURALLY (doc["version"] and
   #     doc["packages"][""]["version"]), not positionally: a positional "first
   #     two version lines before node_modules/" walk silently corrupted a
   #     dependency pin on a lockfileVersion-1 lockfile (no `packages` object, no
@@ -916,7 +948,6 @@ PYEOF
   # abort cannot skip a package.json above" ordering stated for them.
   if [ -f "$REPO_ROOT/clients/java-embedded/pom.xml" ]; then
     python3 -c "$POM_EDIT_PY" "$REPO_ROOT/clients/java-embedded/pom.xml" "$version" write || exit 1
-    echo "  [SET]  clients/java-embedded/pom.xml -> $version"
   fi
 
   # 14. Cargo.lock LAST, because it is derived from every manifest edited above.

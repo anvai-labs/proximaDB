@@ -15,12 +15,20 @@
 == What is wrong
 
 `deploy/infrastructure/helm/proximadb/` holds exactly three files: `Chart.yaml`,
-`values.yaml`, `templates/deployment.yaml`. The template calls
-`{{- include "proximadb.imageConfiguration" . }}` at two places, and
-**`define "proximadb.imageConfiguration"` does not exist anywhere in the
-repository** — there is no `_helpers.tpl` in that chart, and the canonical chart
-defines `proximadb.image`, a different name. Helm fails a missing `include` at
-render time, so `helm template` / `helm install` against this directory cannot
+`values.yaml`, `templates/deployment.yaml`. It contains **zero `define`s**, has no
+`_helpers.tpl`, no `charts/` subdirectory and no `dependencies:` in `Chart.yaml`
+— yet `deployment.yaml` `include`s **six** named templates:
+`proximadb.fullname`, `proximadb.labels`, `proximadb.selectorLabels`,
+`proximadb.serviceAccountName`, `proximadb.name` and
+`proximadb.imageConfiguration`.
+
+Helm resolves named templates per chart (plus subcharts), so **all six are
+unresolvable** and the render dies at the FIRST one —
+`deployment.yaml:11`, `{{ include "proximadb.fullname" . }}` — not at the image
+include. Five of the six do exist in the canonical chart's
+`templates/_helpers.tpl`; `proximadb.imageConfiguration` is defined nowhere in
+the repository at all (the canonical chart defines `proximadb.image`, a different
+name). So `helm template` / `helm install` against this directory cannot
 succeed.
 
 `deploy/infrastructure/scripts/deploy-dev.sh` nevertheless sets
@@ -47,9 +55,10 @@ cannot render would make the audit pass without making anything work, and would
 hide the real problem behind five plausible-looking diffs. The honest options are
 to reconcile or delete the duplicate — not to version it.
 
-(`deploy/helm/legacy-proximadb/Chart.yaml` is also at 0.2.0 and unwatched.
-Nothing references it; it is named `legacy` and is presumed intentional, but it
-has no exclusion note either.)
+(`deploy/helm/legacy-proximadb/Chart.yaml` is also at 0.2.0 and unwatched. It is
+named `legacy` and presumed intentional, but it has no exclusion note either, and
+it IS referenced — `deploy/README.md:20` lists it as "Retained legacy chart
+values", so "nothing references it" would be wrong.)
 
 == How to apply
 
@@ -57,9 +66,11 @@ has no exclusion note either.)
   already recommends consolidating onto one chart. If `deploy/infrastructure/helm`
   has no capability the canonical chart lacks, delete it and repoint
   `deploy-dev.sh`, the README and the DEPLOYMENT_GUIDE at `deploy/helm/proximadb`.
-. **If it is kept**, give it a `_helpers.tpl` (or switch the template to
-  `proximadb.image`), set `values.yaml` `tag: ""` so the image follows
-  `appVersion`, add its `Chart.yaml` `version`/`appVersion` to the
+. **If it is kept**, it needs a `_helpers.tpl` defining all six names — switching
+  the one `proximadb.imageConfiguration` call to `proximadb.image` is NOT
+  sufficient, since the other five includes remain unresolved and the chart still
+  dies at `deployment.yaml:11`. Then set `values.yaml` `tag: ""` so the image
+  follows `appVersion`, add its `Chart.yaml` `version`/`appVersion` to the
   `version-sync.sh` file list, and drop the three terraform `tag` pins unless an
   environment genuinely needs to lag the chart.
 . **Either way**, add the in-place exclusion comment the gate's other
