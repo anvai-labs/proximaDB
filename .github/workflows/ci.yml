@@ -445,6 +445,8 @@ jobs:
         run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
       - name: Validate release build features (cloud-full + job timeouts)
         run: python3 scripts/check_release_build_features.py
+      - name: Check for unreachable .rs files (TD-ORPHAN-1)
+        run: python3 scripts/check_orphan_rust_files.py
       - name: Test release-build-features negative controls
         run: python3 -m unittest discover -s tests/scripts -p 'test_release_build_features.py'
 
