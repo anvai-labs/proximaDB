@@ -2,9 +2,13 @@
 """Negative controls for scripts/check_release_build_features.py.
 
 A guard that passes on both the broken and the fixed tree is worthless, so each
-of the three defect classes it exists to catch gets a mutation here. The real
-pre-fix tree (v0.4.0 prep, before this guard landed) produced 26 findings:
-14 + 7 missing job timeouts, 4 feature-less release targets, 1 image build.
+defect class it catches gets a mutation here. Measured against the real pre-fix
+tree (`ea710ae05`, v0.4.0 prep): **25** findings -- 4 feature-less release
+targets + 21 missing job timeouts (14 release.yml + 7 prerelease-ci.yml) + **0**
+image findings, because `deploy/docker/Dockerfile` already built with
+`cloud-full` (it landed in `ed91af6c4`). An earlier draft of this docstring said
+26 with 1 image finding; that counted the repo-root Dockerfile, which is the demo
+image and is deliberately not guarded.
 """
 from __future__ import annotations
 
@@ -157,6 +161,44 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
                 self.assertEqual(
                     result.returncode, 0, spelling + "\n" + result.stdout
                 )
+
+    def _rewrite_image_features(self, flag: str) -> None:
+        p = self.tree / "deploy/docker/Dockerfile"
+        text = p.read_text(encoding="utf-8")
+        old = "--features cloud-full,onnx"
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, flag), encoding="utf-8")
+
+    def test_image_feature_list_is_parsed_not_substring_matched(self) -> None:
+        """Order and `=` spelling must not decide the verdict.
+
+        An earlier revision tested `"--features cloud-full" in command`, which
+        rejected the correct `--features onnx,cloud-full` purely on ordering --
+        and the real line is `cloud-full,onnx`, one reorder from a false
+        failure -- while accepting the bogus `cloud-fullish`.
+        """
+        for flag in (
+            "--features onnx,cloud-full",
+            "--features=cloud-full,onnx",
+            "--features onnx,cloud-full,aws",
+        ):
+            with self.subTest(flag=flag, expect="pass"):
+                self.setUp()
+                self._rewrite_image_features(flag)
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 0, flag + "\n" + result.stdout)
+
+        for flag in (
+            "--features onnx",
+            "--features cloud-fullish",
+            "--features cloud-full-nope",
+        ):
+            with self.subTest(flag=flag, expect="fail"):
+                self.setUp()
+                self._rewrite_image_features(flag)
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1, flag)
+                self.assertIn("omits `--features cloud-full`", result.stdout)
 
     def test_a_documented_timeout_value_is_not_a_missing_one(self) -> None:
         """A trailing comment on the value must not read as absence."""

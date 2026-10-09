@@ -40,12 +40,14 @@ PUBLISHED_DOCKERFILE = "deploy/docker/Dockerfile"
 # workflow publishes. Cloud backends would defeat its stated purpose. Listed so
 # the omission reads as a decision rather than an oversight.
 EXEMPT_DOCKERFILES = {"deploy/docker/Dockerfile.alpine"}
+# `--features X` or `--features=X` on a shell command line.
+CARGO_FEATURES_RE = re.compile(r"--features[= ]+(?P<value>[^\s]+)")
 # A matrix `features:` entry, in any spelling YAML allows. Deliberately NOT
 # anchored on a double-quoted value: `features: \'\'`, bare `features: x`, a
 # bare `features:` (null) and a trailing `# comment` are all legal YAML and an
 # earlier revision of this guard passed every one of them while the target
 # shipped with no features at all.
-FEATURES_RE = re.compile(r"^(?P<indent>\s+)features:(?P<rest>.*)$")
+FEATURES_RE = re.compile(r"^\s+features:(?P<rest>.*)$")
 JOB_RE = re.compile(r"^  (?P<job>[A-Za-z][A-Za-z0-9_-]*):\s*$")
 
 
@@ -163,7 +165,15 @@ def check_dockerfiles(msgs: list[str]) -> None:
             # Strip a trailing comment so a mention of the feature in prose
             # cannot satisfy the check -- the flag must be on the command.
             command = re.split(r"(?:^|\s)#", line, maxsplit=1)[0]
-            if f"--features {REQUIRED_FEATURE}" not in command:
+            # Parse the list rather than substring-matching it, symmetrically
+            # with check_workflow_features. A raw `"--features cloud-full" in`
+            # test accepted `cloud-fullish` AND rejected the correct
+            # `--features onnx,cloud-full` purely on ordering -- and line 79
+            # here is `cloud-full,onnx`, one reorder away from a false failure.
+            listed: list[str] = []
+            for fm in CARGO_FEATURES_RE.finditer(command):
+                listed.extend(v.strip() for v in fm.group("value").split(","))
+            if REQUIRED_FEATURE not in listed:
                 _fail(
                     msgs,
                     f"{rel}:{n}: image build omits `--features {REQUIRED_FEATURE}` "
