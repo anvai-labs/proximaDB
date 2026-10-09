@@ -61,8 +61,9 @@ sibling, and `sift_coalesced_rabitq_scan_rerank_eval`. (An earlier revision said
 true of a test that reaches no trigger -- four is the count of helper users, not
 of affected tests.)
 
-Each reaches the trigger by a different arm, which is why an earlier revision of
-this list had only three entries:
+The three affected tests reach the trigger by two different arms, and the fourth
+reaches none -- which is the distinction an earlier revision of this passage
+collapsed:
 
 * the two cascade ratchets reach the **count** arm (>=100 000 rows at
   `BATCH_SIZE` 20 000 crosses the L0 threshold of 5);
@@ -256,7 +257,13 @@ Three independently reasonable decisions compose into silence:
   from them needs re-baselining — `docs/_internal/status/SIFT1M_RECALL_RATCHET_2026_06_30.adoc`
   and the `pax_rabitq_sq8_sift1m_recall_at_10` claim in
   `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml` (`status = "measured"`, N=100k
-  0.9905 / N=1M 0.9920), both taken at N>=100 000 where admission did fail.
+  0.9905 / N=1M 0.9920). **Not** "where admission did fail", as an earlier
+  revision said: those runs are dated 2026-06-30 and nothing scheduled compaction
+  from a flush until TD-WLP-7 (#1012) on 2026-07-15, so no admission check ran and
+  the layout was L0-only because compaction was UNREACHABLE. Re-run the same
+  pre-tag configuration on today's code and it is L0-only by the other route --
+  due at N>=100 000, then refused at admission. The status doc and the ledger
+  entry carry the same correction.
 . **Assert the intent.** Each ratchet that means to exercise a compacted layout
   should assert `compaction_ran`, as the IVF2 test already does. A test whose
   premise is silently unmet is worse than a missing test.

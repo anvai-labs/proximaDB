@@ -9,7 +9,8 @@ compaction was not merely rejected, it was **unreachable**. This run is dated
 2026-07-15, before which the post-flush hook was a stub and `compaction_error` was
 hardcoded `None`. So no admission check ran and there was no `warn!`.
 
-Re-run the same configuration today and the layout is still L0-only, by a
+Re-run the same configuration today -- meaning the 2026-06-30 tag set, before
+the helper pinned `compaction:off` -- and the layout is still L0-only, by a
 different route: compaction becomes due at N >= 100 000 and then fails the
 catalog-object-id admission check, with the error recorded on the flush result and
 logged at `warn!`. Either way the arms measured a pre-compaction layout with

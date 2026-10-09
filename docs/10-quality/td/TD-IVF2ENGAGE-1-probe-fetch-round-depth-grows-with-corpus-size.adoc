@@ -122,9 +122,9 @@ turns out to be. They are strengthened in the same change.
   collapsing ~15 descriptive `Err` paths and **six** `return Ok(None)` declines
   (`:3090`, `:3107`, `:3112`, `:3124`, `:3173`, `:3194` on `origin/develop`;
   `coarse_probe_survivors` starts at `:3067`. Those are `origin/develop` numbers
-  and the PR shifts them by +3 -- it edits a comment higher up in that file -- so
-  in the PR tree read :3093/:3110/:3115/:3127/:3176/:3197 with the function at
-  :3070. An earlier revision of this parenthetical said the PR does not touch the
+  and the PR shifts them by **+2** -- it edits a comment higher up in that file,
+  taking it from 9601 to 9603 lines -- so in the PR tree read
+  :3092/:3109/:3114/:3126/:3175/:3196 with the function at :3069. An earlier revision of this parenthetical said the PR does not touch the
   file, which stopped being true when it did) into one "no probe", with
   `record_ivf_probe_durable(0,0,0,0,true)` firing for both. This was item 1 while
   the engagement collapse was believed real; with engagement measured at 100% at
