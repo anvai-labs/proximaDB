@@ -255,14 +255,23 @@ Two further gates appear in the test file and neither belongs in the run above:
     flush** — no knob substitutes for a compaction having run.
 
     **Why the run above produces no A0 is worth stating precisely, because it is
-    not "flush declined to".** Compaction is armed by default on these
-    collections, and at `PROXIMADB_SIFT_N=100000` with a 20 000-row batch the
-    fifth flush crosses the L0 threshold of 5, so compaction becomes *due* and is
-    attempted. It then fails admission: the collection id is a name
-    (`sift_pax_ratchet_baseline`) and the boundary requires a decimal catalog
-    object id. The error is recorded on the flush result, logged at `warn`, and
-    the flush succeeds — so nothing surfaces it. **TD-SIFTCOMPACT-1** and
-    **TD-VECEVAL-1** carry this; the Caveats section below repeats it.
+    not "flush declined to".** The durable fact is that *these ratchet
+    collections do not compact*, so no A0 is ever written for nprobe to read.
+    How they come not to compact is being changed deliberately:
+
+    * **As originally written**, compaction was armed by default and at
+      `PROXIMADB_SIFT_N=100000` with a 20 000-row batch the fifth flush crossed
+      the L0 threshold of 5 — so compaction became *due*, was attempted, and
+      failed admission because the collection id is a name
+      (`sift_pax_ratchet_baseline`) where the boundary requires a decimal catalog
+      object id. The error was recorded on the flush result, logged at `warn`,
+      and the flush succeeded, so nothing surfaced it.
+    * **TD-SIFTCOMPACT-1** pins these collections `compaction:off` instead, which
+      makes the same conclusion *structural* rather than an accident of a
+      swallowed error — and makes the three CI-carried arms deterministic.
+
+    Either way nprobe is inert here. **TD-SIFTCOMPACT-1** and **TD-VECEVAL-1**
+    carry the detail; the Caveats section below repeats it.
 
     So nprobe measures byte-identical here however you set it, and "drive a
     compaction" is **not** something you can do in this harness as shipped —
