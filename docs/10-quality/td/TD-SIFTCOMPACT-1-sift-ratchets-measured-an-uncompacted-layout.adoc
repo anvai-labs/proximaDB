@@ -109,18 +109,40 @@ Zero accesses means the `Ann` site's guard did not fire:
 supports, and is weaker than the claim an earlier revision made here ("the only
 emitter … so the cascade declined").
 
-Three things produce that, and this observation does not separate them:
+**Four** things produce that, and this observation does not separate them. The
+fourth was added in round 5 and is now the most likely, because the same defect
+was confirmed by execution in the sibling IVF2 test (TD-IVF2ENGAGE-1):
 
 . The PAX coalesced cascade (`:593`) declined — the most plausible reading,
   since it is the emitter this configuration normally uses.
 . `discover_sstable_files_with_centroid_pruning` (`:2418`) also emits a proof and
   sits on the same non-orchestrated path (reached from `:1347` and `:2033`), so
   "the only emitter" was wrong. (`execute_orchestrated_search` at `:1141` IS
-  unreachable here: empty `index_configs` means `use_orchestrated_search` is
-  false.)
+  unreachable here, though the mechanism stated in an earlier revision was wrong:
+  it is not `index_configs`. `use_orchestrated_search` is
+  `ctx.metadata.use_axis_indexes && self.axis_manager().is_some()`, and the SIFT
+  context builds `StorageQueryMetadata { collection_id, ..Default::default() }`,
+  so the default-false `use_axis_indexes` closes that path.)
 . The search returned `Err`. The guard is `result.is_ok() && …`, so a failing
   search yields the identical `len() == 0`. "Still returning `Ok`" was asserted,
   not shown.
+. **The experiment had no compaction-quiescence barrier** (round 5; most likely).
+  `compaction_ran` means *enqueued*, not finished. At N=100000 with
+  `BATCH_SIZE = 20_000` the count arm fires on flush 5, the enqueue happens, and
+  the harness then builds ground truth and issues its first query *while* the
+  worker is writing the compacted output and running `delete_inputs_attempt` on
+  the L0 segments it just read. A query that enumerates a file and reads it after
+  retirement lands on exactly the `Ok(None)`/fail-over arms this TD is trying to
+  attribute. The sibling test's barrier is now in place; this experiment should
+  be re-run behind one before any of the three readings above is preferred.
+
+NOTE: the `compaction:off` tag that PR #1964 adds to the shared `collection()`
+helper makes this follow-up **un-runnable as shipped** — the tag wins over
+`GlobalCompactionGate::Armed`, so not even
+`PROXIMADB_L0_COMPACTION_ENABLED=1` re-arms those collections. Re-running it
+means temporarily dropping the tag in a scratch branch. That is a deliberate
+trade (the tag is what makes the three CI-carried ratchets deterministic), but it
+is a cost on this TD and is recorded rather than discovered.
 
 Separating them needs the per-decline recording in the work below. Until then
 "no proof emitted" is the finding and "the cascade declined" is the hypothesis —

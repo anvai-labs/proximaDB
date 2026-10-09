@@ -40,10 +40,15 @@ revision of this TD asserted one it could not support.
 
 What replicates:
 
-* **The probe arm is bit-identical.** Across every run observed — six by me and
-  four independently, spanning loadavg 2.5 to 11.0 — the probe arm returns the
-  same recall, the same GET count and the same byte count to the byte. It is not
-  sensitive to machine state at all.
+* **The probe arm is bit-identical _in long windows_.** Across every run
+  observed — six by me and four independently, spanning loadavg 2.5 to 11.0 —
+  the probe arm returned the same recall, GET count and byte count to the byte.
+  **Correction (round 5):** "not sensitive to machine state at all" was an
+  over-reach from only ever running long windows. With the same binary and data
+  at N=20000 and only `PROXIMADB_SIFT_QUERIES` varying, the probe arm reports
+  1488554 bytes/q at q∈{1,2}, 6159649 at q=5 and 5861939 at q∈{10,20,50,200}.
+  The stability is a property of running long enough for the background
+  compaction to have finished, not of the arm — see the cause below.
 * **The baseline arm is not.** Two shapes appear: ~3 GETs with ~6.3 MB, and
   ~5–7 GETs with ~1.5–1.6 MB. More round trips for fewer bytes — a different
   read *plan*, not noise in the same plan.
@@ -80,29 +85,58 @@ Candidate mechanisms, none tested, all with a named entry point:
 . **Bounded-concurrent `read_ranges`** (TD-RDSTRAT-12), whose `fetch_rounds` /
   `max_inflight` decide how ranges coalesce. A plan issuing 7 smaller reads
   instead of 3 large ones is exactly the observed signature.
-. **The measurement itself may be lying.** `IO_TRACE` is a `task_local!`, and its
-  own doc comment warns that "a `task_local!` does **not** cross
-  `tokio::spawn`, so those tasks must record through a captured handle"
-  (TD-OLAP-3,
-  `crates/modalities/proximadb-observability-engine/src/io_trace.rs:76-82`).
-  `measure()` wraps the whole query loop in ONE `io_trace::scope`, so a spawned
-  scan worker drops its bytes from the total — which presents as "bytes down,
-  GETs accounted elsewhere". **Rule this out first:** if the instrument is
-  nondeterministic, every number above is suspect, including the ones that look
-  stable.
+. **The measurement itself may be lying — RULED OUT (round 5), do not spend time
+  here.** `IO_TRACE` is a `task_local!` whose doc comment does warn that it does
+  not cross `tokio::spawn` (TD-OLAP-3,
+  `crates/modalities/proximadb-observability-engine/src/io_trace.rs:76-82`), and
+  an earlier revision of this TD told the next engineer to "rule this out first".
+  That was wrong: the one `tokio::spawn` fan-out on this path already handles it.
+  `search/mod.rs` captures `io_trace::current_handle()` with the comment
+  "`tokio::task_local!` does not propagate through the per-file spawns. Capture
+  once and rebind in each child so physical I/O and ANN proof counters remain
+  part of this query's measured cost", and each child rebinds via
+  `scope_with_handle`. The other fan-outs are `spawn_blocking` ranking over
+  already-read bytes, and `read_ranges` is `buffered`, not spawned.
 
-Consequence for anyone using this harness: state the machine state alongside any
-figure, and treat a baseline-arm delta smaller than ~0.5% recall or ~5x bytes as
-indistinguishable from run-to-run variation until the above is resolved. None of
-these numbers is in `BENCHMARK_EVIDENCE.toml`, and none should be until then.
+=== The cause, found in round 5: the harness, not the engine
+
+**The nondeterminism was an un-awaited compaction, and it is now fixed.**
+`compaction_ran` reports that compaction was ENQUEUED, not that it finished;
+workers are always live and later delete the inputs. So the baseline arm — which
+runs FIRST — raced both the compaction and the retirement of the segments it was
+reading, while the probe arm, running second after a long baseline arm, saw a
+settled layout. That asymmetry is the signature this TD recorded without
+explaining: the probe arm "bit-identical", the baseline arm not.
+
+Measured, same binary and data, only `PROXIMADB_SIFT_QUERIES` varying: the probe
+arm recorded **0 of 1** and **0 of 2** probes (no v3 segment existed yet), then
+5/5 and 10/10 at larger counts. The test now awaits
+`await_compaction_quiescence(60s)` before the first measurement, matching the
+precedent in `sst_ivf2_compaction_route_proof_test.rs` (TD-COMPACT-6 D1) that
+this test had borrowed `next_object_id()` from without its barrier.
+
+Consequence: the N=20k "strict win, no trade" table below was taken WITHOUT that
+barrier and should be re-measured before anyone cites it. None of these numbers
+is in `BENCHMARK_EVIDENCE.toml`, and none should be until it is re-taken.
 
 == The finding
 
 **What actually changes is how often the probe runs.** 200 of 200 queries record
-a probe at N=20k; 17 of 1000 at N=100k. The rest take the armed-but-missed
-**whole-Region-A fallback**, which is the GET budget the probe exists to avoid,
+a probe at N=20k; 17 of 1000 at N=100k. The rest do not benefit from the probe,
 and engagement that thin cannot pay for its own footer work — which is why bytes
 go *up* at 100k.
+
+**Round-5 correction:** an earlier revision said "the rest take the
+armed-but-missed whole-Region-A fallback" as a statement of fact. It is not
+established, and the two cases have opposite fixes. `probe_armed` is
+`header.a0_len > 0 && coarse_probe_enabled()`; when it is false no IVF runs at
+all and the fallback counter is never touched. At the test's default N the
+observed state was exactly that — 0 probes AND 0 fallbacks, i.e. **never
+armed**, not armed-and-missed. The distinction is now observable rather than
+assumed: `IoTrace::ivf_whole_region_fallback` already counts armed-but-whole-
+region segment reads and was being thrown away by `measure()`; the ratchet now
+reads it, reports `engaged / armed_reads`, and names the two cases separately in
+its failure messages.
 
 === Correction: the "constant prune ratio" is not a measurement
 

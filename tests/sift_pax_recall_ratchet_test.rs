@@ -1855,9 +1855,45 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
             .get("compaction_ran")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        "armed compaction must run inline on the 2nd flush (compaction_error: {:?})",
+        "armed compaction must be enqueued by the 2nd flush (compaction_error: {:?})",
         second.compaction_error
     );
+    // `compaction_ran` means ENQUEUED, not completed: `enqueue_due_compaction`
+    // returns Ok(true) once `schedule_compaction` has pushed to the task queue
+    // and notified a worker, and the flush log says so ("enqueued (async)").
+    // Workers are always live (>= 1) and later DELETE the inputs, so without a
+    // barrier the arms below race the compaction and the retirement of the
+    // segments they read. Measured, with only `PROXIMADB_SIFT_QUERIES` varying:
+    // the probe arm recorded 0 of 1 and 0 of 2 probes (no v3 segment existed
+    // yet), then 5 of 5 and 10 of 10 at larger counts; across default runs the
+    // baseline arm's bytes/q moved (26273265 / 26363199 / 26501081) while the
+    // probe arm's did not. The verdict was a function of how long the test's own
+    // query loop ran, and the doc claim that both arms compare "the same
+    // segment" was not guaranteed.
+    //
+    // This is the barrier the precedent this test borrows `next_object_id()`
+    // from already has (`sst_ivf2_compaction_route_proof_test.rs`, TD-COMPACT-6
+    // D1); it was the one piece not carried over. It also closes an edition-2024
+    // soundness hazard: `measure()` calls `std::env::set_var` while a live
+    // compaction worker reads env from other threads (`PROXIMADB_CACHE_ON_WRITE`,
+    // `PROXIMADB_PAX_WRITE_A0_TRAIN`, `PROXIMADB_IVF_K`). Before this PR the
+    // enqueue always failed, so no second thread existed -- minting the object id
+    // activated that hazard, and quiescing before the first `set_var` removes it.
+    match engine.compaction_manager() {
+        Some(cm) => {
+            let quiet = cm
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await;
+            assert!(
+                quiet,
+                "enqueued compaction did not quiesce within 60s; the arms below would \
+                 race it and measure different physical layouts"
+            );
+        }
+        None => panic!(
+            "no compaction manager: the v3 segment this test reads is written only by compaction"
+        ),
+    }
 
     async fn measure(
         engine: &SstEngine,
@@ -1865,7 +1901,7 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         queries: &[Vec<f32>],
         ground_truth: &[std::collections::HashSet<String>],
         probe_on: bool,
-    ) -> (f64, u64, u64, usize) {
+    ) -> (f64, u64, u64, usize, u64) {
         unsafe {
             if probe_on {
                 std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
@@ -1908,12 +1944,24 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         } else {
             0
         };
-        (recall, per_q_gets, per_q_bytes, measured)
+        // `ivf_whole_region_fallback` counts segment reads where the probe was
+        // ARMED and still read the whole region. Paired with the probe trace
+        // (also per segment read) it yields a same-unit engagement ratio, and it
+        // separates two opposite diagnoses the old message conflated: "no
+        // Region A0, so the probe never armed" vs "armed and missed". The
+        // snapshot was already captured here and this field thrown away.
+        (
+            recall,
+            per_q_gets,
+            per_q_bytes,
+            measured,
+            snap.ivf_whole_region_fallback,
+        )
     }
 
-    let (recall_base, gets_base, bytes_base, measured_base) =
+    let (recall_base, gets_base, bytes_base, measured_base, _fallback_base) =
         measure(&engine, &collection, &queries, &ground_truth, false).await;
-    let (recall_probe, gets_probe, bytes_probe, measured_probe) =
+    let (recall_probe, gets_probe, bytes_probe, measured_probe, fallback_probe) =
         measure(&engine, &collection, &queries, &ground_truth, true).await;
     let probe_trace = proximadb::storage::engines::sst::segment_format::drain_probe_trace();
 
@@ -1942,38 +1990,72 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
     // A non-empty trace is NOT evidence that the probe is doing its job: at
     // N=100_000 with PROXIMADB_SIFT_QUERIES=1000 it records 17 entries against
     // 1000 measured queries and `!is_empty()` certifies that happily, while the
-    // rest take the whole-Region-A fallback the probe exists to avoid. (This
-    // test's own query default is `100.min(DEFAULT_QUERIES)` = 100, so the 1000
-    // figure needs the env var.) Assert a proportion.
+    // rest never benefit from the probe at all. (This test's own query default
+    // is `100.min(DEFAULT_QUERIES)` = 100, so the 1000 figure needs the env var.)
+    // Assert a proportion instead.
     //
-    // Denominator is `measured_probe`, not `qcount`: `measure()` skips a query
-    // that returned no hits, so against `qcount` a search regression that
-    // emptied half the results would fail HERE with a false engagement
-    // diagnosis, masking the real defect.
-    //
-    // CAVEAT, and why this is a floor rather than a ratio: entries are pushed
-    // per SEGMENT READ, not per query, so with multiple v3 segments the count is
-    // not a query count in either direction. Read it as "the probe ran at least
-    // this often". Attributing the misses needs the per-query split that the
-    // swallowed `Err` currently prevents — TD-IVF2ENGAGE-1.
-    let engaged = probe_trace.len();
-    let engagement_floor = (measured_probe + 1) / 2; // >= 50% of MEASURED queries
-    assert!(
-        recall_probe >= recall_base - recall_drop,
-        "probe recall@{TOP_K} = {recall_probe:.4} dropped > {recall_drop} vs baseline {recall_base:.4}"
+    // Both terms are PER SEGMENT READ, which is what makes this a ratio rather
+    // than a floor: `probe_trace` is pushed once per segment read that probed,
+    // `ivf_whole_region_fallback` once per segment read that armed and read the
+    // whole region anyway. An earlier revision divided the per-segment-read
+    // numerator by `measured_probe` (per QUERY), so with two v3 segments 25%
+    // query engagement cleared a 50% floor -- the code said as much and then
+    // used it as the gate regardless.
+    let engaged = probe_trace.len() as u64;
+    let armed_reads = engaged + fallback_probe;
+    eprintln!(
+        "  probe engagement: {engaged} probed / {armed_reads} armed segment read(s) \
+         ({fallback_probe} armed-but-whole-region) over {measured_probe} measured queries"
     );
+
+    // Collect every verdict BEFORE asserting, then fail once with all of them.
+    // Asserting in sequence means the first failure hides the rest, and WHICH
+    // one comes first decides what the reader of a CI failure sees: at this
+    // test's DEFAULT N the probe does not engage at all (0 of 100 measured), and
+    // with the byte ratchet asserted first that surfaced as a 3.3% byte
+    // regression with no engagement number -- the same masking a previous
+    // revision reordered these to remove, pointed the other way. Reporting all
+    // three is the only ordering that is not a guess about which matters.
+    let mut failures: Vec<String> = Vec::new();
+
+    if armed_reads == 0 {
+        // Distinct from "armed and missed": no segment read had a parsable
+        // Region A0, so no IVF ran at all. The two have opposite fixes (write a
+        // v3 segment vs. investigate the decline path), and the previous single
+        // message asserted the second unconditionally -- "the rest fell back to
+        // the whole-Region-A scan" -- in a run where nothing had fallen back.
+        failures.push(
+            "the coarse probe never ARMED: no segment read had a parsable Region A0, so no \
+             IVF ran (the armed-but-whole-region counter is 0 too). The v3 layout is written \
+             only by compaction -- see TD-IVF2ENGAGE-1"
+                .to_string(),
+        );
+    } else {
+        let engagement_floor = (armed_reads + 1) / 2; // >= 50% of ARMED segment reads
+        if engaged < engagement_floor {
+            failures.push(format!(
+                "the coarse probe armed on {armed_reads} segment read(s) but probed on only \
+                 {engaged} (floor {engagement_floor}); the other {fallback_probe} took the \
+                 armed-but-whole-region fallback the probe exists to avoid -- see TD-IVF2ENGAGE-1"
+            ));
+        }
+    }
+    if recall_probe < recall_base - recall_drop {
+        failures.push(format!(
+            "probe recall@{TOP_K} = {recall_probe:.4} dropped > {recall_drop} vs baseline \
+             {recall_base:.4}"
+        ));
+    }
+    if bytes_probe >= bytes_base {
+        failures.push(format!(
+            "probe bytes/q = {bytes_probe} must read fewer than baseline {bytes_base}"
+        ));
+    }
     assert!(
-        bytes_probe < bytes_base,
-        "probe bytes/q = {bytes_probe} must read fewer than baseline {bytes_base}"
-    );
-    // LAST on purpose. Asserted before the two ratchets above, this masked the
-    // byte-ratchet failure that is the actual finding: the run died on
-    // engagement and never reported what the probe cost in bytes.
-    assert!(
-        engaged >= engagement_floor,
-        "coarse probe recorded only {engaged} probe(s) against {measured_probe} \
-         measured queries (floor {engagement_floor}); the rest fell back to the \
-         whole-Region-A scan — see TD-IVF2ENGAGE-1"
+        failures.is_empty(),
+        "TD-RDSTRAT-8 IVF2 coarse-probe ratchet failed ({} of 3 checks):\n  - {}",
+        failures.len(),
+        failures.join("\n  - ")
     );
     unsafe {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
