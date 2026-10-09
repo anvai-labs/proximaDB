@@ -149,12 +149,20 @@ Separating them needs the per-decline recording in the work below. Until then
 a distinction this document exists to respect, having already had one
 single-observation inference overturned.
 
-That is a **product** finding, not a test-baselining one: ANN engagement is lost
-on a compacted layout under this arm's write gates (`PAX_F32_TIER=1`,
-`PAX_WRITE_RG_LAYOUT=1`, no `BLOCK_CLUSTER`/`COALESCED_RABITQ`/`A0_TRAIN`).
-Relaxing the assertion to "per-segment" would convert a red test into a green one
-while the engagement loss stayed. An existing test that fails your change is
-evidence, not an obstacle.
+**If** the cascade reading is the right one, it is a product finding rather than
+a test-baselining one — ANN engagement would be lost on a compacted layout under
+this arm's write gates (`PAX_F32_TIER=1`, `PAX_WRITE_RG_LAYOUT=1`, no
+`BLOCK_CLUSTER`/`COALESCED_RABITQ`/`A0_TRAIN`). That conditional is the whole
+point: an earlier revision of this paragraph asserted it flatly, one paragraph
+after the sentence above says it is a hypothesis, and candidate (4) — no
+quiescence barrier — is rated the most likely of the four. The two cannot both
+stand, and the hedge is the one supported by the evidence.
+
+What does NOT depend on which reading is right: relaxing the assertion to
+"per-segment" would convert a red test into a green one without resolving
+anything, and `len() > 1` is structurally impossible, so the per-segment form
+would assert something that cannot happen. An existing test that fails your
+change is evidence, not an obstacle.
 
 The helper is therefore left unminted here, and the decision belongs below.
 
@@ -174,13 +182,18 @@ Three independently reasonable decisions compose into silence:
 == How to apply
 
 . **Investigate the ANN decline first — it is the lead, not a side effect.**
-  Minting the id surfaces a query that returns `Ok` with no ANN proof on a
-  compacted segment. Find which of the cascade's six `Ok(None)` declines fires
-  (they are mutually indistinguishable today — see TD-IVF2ENGAGE-1, same root
-  cause). Do NOT relax `assert_single_vector_access` to accommodate it: a
-  per-segment assertion would go green while the engagement loss remained, and
-  `len() > 1` is structurally impossible anyway, so a per-segment form would be
-  asserting something that cannot happen.
+  Minting the id surfaces a query with **no ANN proof** on a compacted segment.
+  (Whether that query returned `Ok` is itself unshown — candidate (3) above —
+  because the guard is `result.is_ok() && …`, so an `Err` produces the identical
+  zero. Record that first; it is one line and it eliminates a candidate.) Then
+  find which of the cascade's six `Ok(None)` declines fires — they are mutually
+  indistinguishable today, see TD-IVF2ENGAGE-1, same root cause. Do NOT relax
+  `assert_single_vector_access` to accommodate it: it would go green without
+  resolving anything, and `len() > 1` is structurally impossible anyway.
+
+  **Prerequisite, added after the fact:** this experiment needs a quiescence
+  barrier, or it reproduces candidate (4) rather than testing against it. The
+  sibling IVF2 test now has one; copy it.
 . **State the current intent explicitly**, which this change now does: the shared
   helper tags its collections `compaction:off`. That is behaviour-preserving —
   compaction does not run today either — and converts "intent achieved by an

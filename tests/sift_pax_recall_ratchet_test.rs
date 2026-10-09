@@ -284,8 +284,23 @@ fn collection(id: &str, base_location: String) -> Collection {
         // The collection NAME, not a decimal catalog object id — a known defect
         // tracked by TD-SIFTCOMPACT-1 and deliberately not fixed here.
         //
-        // Minting an id is a one-line change these tests do not survive: with a
-        // valid id compaction actually runs, and the sibling ratchet then dies on
+        // NOTE, corrected: with the `compaction:off` tag added below, minting an
+        // id here is BEHAVIOUR-NEUTRAL. `should_trigger_compaction` returns
+        // Ok(None) on `!resolve_compaction_armed(tags)` before anything else, and
+        // `params.get_collection_object_id()` is only reached inside the
+        // compaction-due block -- so compaction does not run with or without a
+        // valid id, and the id is never parsed. An earlier revision of this
+        // comment said "these tests do not survive it", which was true BEFORE the
+        // tag and is the justification it used for leaving the name in place.
+        //
+        // What the tag does cost is the attribution experiment: it is what makes
+        // TD-SIFTCOMPACT-1's follow-up un-runnable without dropping the tag, and
+        // it means that TD's "mint an id" step is now safe but no longer
+        // sufficient. The history below is kept because it is why the name is
+        // still here.
+        //
+        // Historically: with a valid id compaction actually ran, and the sibling
+        // ratchet then died on
         // the FIRST query at `assert_single_vector_access` with ZERO recorded
         // accesses — no ANN proof is emitted. "No proof emitted" is the
         // observation; "the cascade declined on the compacted segment" is one of
@@ -2215,7 +2230,10 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
     }
     assert!(
         failures.is_empty(),
-        "TD-RDSTRAT-8 IVF2 coarse-probe ratchet failed ({} of 3 checks):\n  - {}",
+        // Count, not a literal: the hard-coded "3" was a round-6 leftover from
+        // before the OFF-arm and per-query checks existed, so a run that tripped
+        // five of them printed "5 of 3 checks".
+        "TD-RDSTRAT-8 IVF2 coarse-probe ratchet failed ({} check(s)):\n  - {}",
         failures.len(),
         failures.join("\n  - ")
     );
