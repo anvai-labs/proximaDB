@@ -14,7 +14,7 @@
 
 == The defect
 
-The helper, duplicated in 40 test files:
+The helper, duplicated in 75 test files:
 
 [source,rust]
 ----
@@ -39,10 +39,10 @@ number, the REST/axum listener binds it and the pgwire listener loses it — and
 precisely `"bytes remaining on stream"`. No second process is required. The
 harness also only waits on `GET /health` against `rest_port` plus a 200 ms sleep,
 so it never confirms that pgwire is what is listening on `pg_port`. The other
-path — another test or an unrelated process taking the port — is also real, and
-option 1 below covers both. `tokio_postgres::connect` then reaches whatever is listening there, and
-a non-pgwire peer produces exactly the observed `"bytes remaining on stream"`:
-the client read bytes that are not a Postgres startup response.
+path — another test or an unrelated process taking the port — is also real: the
+integration lanes run suites concurrently, so a sibling harness asking the kernel
+for a port at the same moment is an ordinary occurrence rather than bad luck.
+Option 1 below covers both paths.
 
 `git grep -l "fn free_port" -- 'tests/*.rs'` finds **75** files, and **all 75**
 drop the listener. There are two spellings of the same helper — `drop(l)` in 40
@@ -72,8 +72,8 @@ per occurrence.
 . **Retry the connect, not the bind.** A bounded retry loop around
   `tokio_postgres::connect` closes the observed symptom but not the race: a
   foreign listener on the port makes every attempt fail the same way.
-. **One shared helper.** Whatever the mechanism, the 40 copies should become one
-  `tests/common/` helper, so this is fixed once rather than 40 times. The
+. **One shared helper.** Whatever the mechanism, the 75 copies should become one
+  `tests/common/` helper, so this is fixed once rather than 75 times. The
   duplication is why the defect is still here.
 
 Prefer 1 + 3. Option 2 alone converts a loud failure into a slow one.
