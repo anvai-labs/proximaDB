@@ -13,13 +13,12 @@ import json
 import os
 import re
 import tempfile
+import tomllib  # stdlib from 3.11, this project's floor
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import proximadb_sdk.chunking_strategies as chunking_package
-
-import tomllib  # stdlib from 3.11, this project's floor
 from proximadb_sdk.chunking_strategies import (
     ChunkContextRenderer,
     ChunkingConfig,
