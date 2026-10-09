@@ -540,7 +540,21 @@ artifact = "docs/_internal/status/SIFT1M_RECALL_RATCHET_2026_06_30.adoc"
 hardware = "local macOS arm64 (indicative; N=1M canonical = qa-gate `sift-pax-recall`, ubuntu-latest)"
 date = "2026-06-30"
 version = "v0.2"
-notes = """Real-dataset WS8 gate resolving the REPRESENTATIVENESS CAVEAT on the
+notes = """LAYOUT CAVEAT (added 2026-10-08, TD-SIFTCOMPACT-1): these figures
+describe an **L0-only, uncompacted** layout, not a compacted one -- and for these
+2026-06-30 figures compaction was UNREACHABLE, not merely rejected: nothing
+scheduled compaction from a flush until TD-WLP-7 (#1012) on 2026-07-15, before
+which the post-flush hook was a stub and `compaction_error` was hardcoded None.
+Re-run the same configuration today (meaning the 2026-06-30 tag set, before the
+helper pinned `compaction:off`) and the layout is still L0-only by a different
+route -- compaction becomes due at N >= 100 000 and then fails the
+catalog-object-id admission check, logged at `warn` and swallowed. Either way the
+arms measured a pre-compaction layout with nothing to signal it. That is now the STATED intent -- the shared collection
+helper pins `compaction:off`, which makes the layout deterministic rather than
+accidental -- but it means recall here is not evidence about the compacted
+product. See TD-SIFTCOMPACT-1 and TD-IVF2ENGAGE-1 (whose own headline finding was
+retracted after a compaction-quiescence barrier was added to the sibling test).
+Real-dataset WS8 gate resolving the REPRESENTATIVENESS CAVEAT on the
 synthetic pax_rabitq_sq8_recall_at_10 entry above. RESULT (2026-06-30, indicative):
 on REAL SIFT descriptors the PAX RaBitQ->SQ8 cascade holds recall@10 = 0.9905 at
 N=100k (200 queries, brute-force-L2 GT over the subset) -- well above the 0.90
