@@ -301,7 +301,12 @@ jobs:
   objstore-restart-qa-tier:
     name: Object-store QA tier (restart Azure+S3 + recall)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 90 was at the edge: the `--restart` job measured cold compiles of these
+    # cloud feature sets at ~85-90 min and was bumped 90 -> 150 for that reason.
+    # Splitting the lib-test out removes one full codegen peak, so this needs
+    # less than 150 -- but not 90. Record the post-split wall time in
+    # TD-OBJSTORE-5 and tighten to a measured ratchet.
+    timeout-minutes: 120
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
@@ -321,6 +326,22 @@ jobs:
             /usr/local/.ghcup \
             /usr/local/share/boost || true
           echo "Disk after reclaim:"; df -h /
+      # ubuntu-latest ships with NO swap, so a residual peak above 16GB does not
+      # slow down -- it OOM-kills the runner mid-compile. That is precisely what
+      # happened here: evicted at ~60 and 76 min with
+      # "runner has received a shutdown signal", warnings still streaming, test
+      # never run. 12G on the big ephemeral /mnt disk turns the spike into a
+      # slowdown instead of a dead runner. This mirrors the `--restart` job in
+      # ci.yml and the unit-matrix job, where the same mitigation is what makes a
+      # structurally identical build survive. CARGO_BUILD_JOBS stays 1 -- the
+      # established OOM-safe setting; raising it would re-risk the kill.
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - name: Install system deps
@@ -365,6 +386,22 @@ jobs:
             /usr/local/.ghcup \
             /usr/local/share/boost || true
           echo "Disk after reclaim:"; df -h /
+      # ubuntu-latest ships with NO swap, so a residual peak above 16GB does not
+      # slow down -- it OOM-kills the runner mid-compile. That is precisely what
+      # happened here: evicted at ~60 and 76 min with
+      # "runner has received a shutdown signal", warnings still streaming, test
+      # never run. 12G on the big ephemeral /mnt disk turns the spike into a
+      # slowdown instead of a dead runner. This mirrors the `--restart` job in
+      # ci.yml and the unit-matrix job, where the same mitigation is what makes a
+      # structurally identical build survive. CARGO_BUILD_JOBS stays 1 -- the
+      # established OOM-safe setting; raising it would re-risk the kill.
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - name: Install system deps
