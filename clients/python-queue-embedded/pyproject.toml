@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "proximadb_queue_embedded"
-version = "0.2.0"
+version = "0.4.0"
 description = "ProximaDB Queue (Embedded) — in-process tiered persistent queue with Python bindings"
 authors = [{name = "Vijaykumar Singh", email = "vijay@anvaiops.com"}]
 license = {text = "Apache-2.0"}

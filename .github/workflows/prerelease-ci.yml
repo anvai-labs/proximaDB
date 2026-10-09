@@ -45,7 +45,14 @@ on:
   push:
     branches:
       - main
-      - development
+      # `qa`, not `development`: there is no `development` branch in this repo
+      # (the promotion flow is feat -> develop -> qa -> main), so this trigger
+      # matched nothing and the Check Version Consistency gate below ran ONLY on
+      # main -- i.e. after the release had already been promoted. `qa` is the
+      # MEDIUM tier, which is where a version-consistency failure is still cheap
+      # to fix. Deliberately NOT `develop`: this workflow is heavy and mandate #7
+      # keeps runner cycles off every feature merge.
+      - qa
   workflow_dispatch:
     inputs:
       version:

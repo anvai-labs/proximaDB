@@ -4,15 +4,22 @@ All notable changes to ProximaDB will be documented in this file.
 
 ## [0.4.0] - unreleased
 
-Storage-substrate release (**415** commits since the `v0.3.0` tag, counted at
-this release branch's merge-base — the number moves with the anchor, so the
-anchor is stated: 415 at the branch point, 417 on `develop` at the time of
-writing. An earlier revision said 416, which counted this branch's own first
-commit. The tag was cut
-2026-08-15; the 0.3.0 entry below is dated 2026-08-05, when
-`chore(release): prepare v0.3.0` landed — the release spanned four promotion
-rounds between those dates, so both dates are real and mean different things.
-Commit counts here are anchored to the tag). Headline: ADR-094 unified the three
+Storage-substrate release (**172** commits since the `v0.3.0` tag, counted at
+this release branch's merge-base; 174 on `develop` at the time of writing.
+
+The anchor is `refs/tags/v0.3.0` **as it exists on origin** — a lightweight tag
+on `9e19fc2a3`, dated 2026-09-04 — because that is what a clone resolves and
+therefore the only anchor under which these numbers reproduce. A reviewer caught
+an earlier revision of this entry quoting 415 commits, 35 OpenAPI paths and three
+new ADRs: all of those were computed against a *stale local* `v0.3.0`, an
+annotated tag at `b1ed7817` (2026-08-15, an ancestor of origin's). `git fetch
+--tags` does not correct it — the update is rejected as "would clobber existing
+tag" — so anyone recomputing these figures should verify
+`git rev-parse v0.3.0` against `git ls-remote --tags origin v0.3.0` first.
+
+The 0.3.0 entry below is dated 2026-08-05, when `chore(release): prepare v0.3.0`
+landed; origin's tag was cut at the 2026-09-04 promotion. Both dates are real and
+mean different things — the prepare commit and the promotion that shipped it.) Headline: ADR-094 unified the three
 divergent storage substrates behind one compute seam, and the I/O-cost work that followed made
 round-trip count — not bytes, not CPU — the term the engine measures and the operator can tune.
 Full notes land with the docs-site PR (they must ship together with their nav
@@ -61,7 +68,7 @@ entry, or the strict build fails on an unpublished page).
   (TD-V1SUNSET-1).
 
 ### SDK & spec surface
-- TD-SPECRAT-1 took the generated OpenAPI surface from 35 paths at the v0.3.0 tag
+- TD-SPECRAT-1 took the generated OpenAPI surface from 45 paths at the v0.3.0 tag
   to 94, exposing the ABAC control
   plane, collections-admin, graph, time-series, rank search, CRUD and unified query to every
   generated SDK. Node SDK published to npm as `@anvailabs/proximadb-client`.
