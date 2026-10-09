@@ -286,8 +286,17 @@ jobs:
   # store (Azure then S3, Azurite stopped before the S3 group so cross-store
   # leakage fails loudly) + the cold recall ratchet on Azure. One cloud-full
   # server build (jobs=1, 16GB OOM ceiling) — separate runner from the
-  # cloud-emulator job so neither compile budget starves the other. The 90m cap
-  # is a measured ratchet: record the first cold-cache wall time in
+  # cloud-emulator job so neither compile budget starves the other.
+  #
+  # Every step in this scope links the `proximadb` lib compiled WITHOUT
+  # cfg(test), so they genuinely share one build. The MLflow seam test used to
+  # live here and did NOT share: `--lib` builds the lib-test target (cfg(test)
+  # over ~779k LOC, ~7,100 inline tests), a second near-cliff codegen peak that
+  # got this job evicted mid-compile at 76 of 90 minutes, twice in a row. It now
+  # has its own job below. CARGO_PROFILE_TEST_DEBUG=0 drops debug info, which is
+  # the other dominant term in rustc peak memory and link time here.
+  #
+  # The 90m cap is a measured ratchet: record the first cold-cache wall time in
   # TD-OBJSTORE-5 and tighten.
   objstore-restart-qa-tier:
     name: Object-store QA tier (restart Azure+S3 + recall)
@@ -296,6 +305,11 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
+      # Debug info dominates rustc peak memory and link time on this crate, and
+      # nothing here reads a backtrace symbol. This is a memory lever, not a
+      # speed one -- the failure mode being avoided is runner eviction.
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
       - name: Reclaim disk space
         run: |
@@ -324,6 +338,50 @@ jobs:
           restore-keys: sccache-qa-tier-${{ runner.os }}-
       - name: Restart proofs (Azure strict, S3 strict) + recall ratchet (Azure)
         run: bash scripts/run_cloud_emulator_tests.sh --qa
+
+  # TD-MLOPS-4 S1-remainder, split out of the QA tier (TD-OBJSTORE-5). It needs
+  # the `proximadb` lib-test target -- cfg(test) over ~779k LOC and ~7,100 inline
+  # tests, the largest codegen unit in the workspace -- which none of the QA
+  # tier's other steps build. Sharing a runner with them meant two near-cliff
+  # memory peaks in one 16GB job; it was evicted mid-compile twice. Its own
+  # runner gives it one peak. 60m rather than 90m: one build, no restart matrix.
+  mlflow-s3-artifact-seam:
+    name: MLflow S3 artifact seam (LocalStack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - name: Reclaim disk space
+        run: |
+          echo "Disk before reclaim:"; df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost || true
+          echo "Disk after reclaim:"; df -h /
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-mlflow-s3-seam"
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/cache@v6
+        with:
+          path: /home/runner/.cache/sccache
+          key: sccache-mlflow-s3-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: sccache-mlflow-s3-${{ runner.os }}-
+      - name: MLflow S3 artifact seam conformance
+        run: bash scripts/run_cloud_emulator_tests.sh --mlflow-s3
 
   cloud-emulator-object-store:
     name: Cloud object-store emulators (Azurite/LocalStack/fake-gcs)

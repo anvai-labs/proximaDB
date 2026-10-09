@@ -7,7 +7,7 @@
 # `make cloud-emulator-test` (local). Single source of truth so every CI path is
 # exactly the locally-runnable path.
 #
-# Usage: run_cloud_emulator_tests.sh [--fast|--all|--restart|--qa|--nightly]
+# Usage: run_cloud_emulator_tests.sh [--fast|--all|--restart|--qa|--mlflow-s3|--nightly]
 #   --fast : run ONLY the cheap object-store tier tests (~3-5 min — compiles just
 #            the small object-store crate, no main-crate compile, no OOM risk).
 #            Used by the develop early-detection job so a tier regression is caught
@@ -41,8 +41,9 @@ for arg in "$@"; do
     --all)  SCOPE="all" ;;
     --restart) SCOPE="restart" ;;
     --qa) SCOPE="qa" ;;
+    --mlflow-s3) SCOPE="mlflow-s3" ;;
     --nightly) SCOPE="nightly" ;;
-    *) echo "::error::unknown argument: $arg"; echo "usage: $0 [--fast|--all|--restart|--qa|--nightly]"; exit 2 ;;
+    *) echo "::error::unknown argument: $arg"; echo "usage: $0 [--fast|--all|--restart|--qa|--mlflow-s3|--nightly]"; exit 2 ;;
   esac
 done
 echo "==> Scope: $SCOPE"
@@ -253,9 +254,12 @@ if [ "$SCOPE" = "qa" ]; then
   # (cross-store isolation is part of the proof). The recall ratchet runs on ONE
   # strict backend (Azure): recall is a ranged-read/footer-fidelity check, not
   # the restart-correctness gate. Build BEFORE exercising emulators; jobs=1 for
-  # the 16GB-runner OOM ceiling (same rationale as --all). The QA budget is a
-  # measured ratchet: record the cold-cache wall time in TD-OBJSTORE-5 on the
-  # first run.
+  # the 16GB-runner OOM ceiling (same rationale as --all). Every step here links
+  # the `proximadb` lib compiled WITHOUT cfg(test), so the builds genuinely do
+  # share work -- which is why the MLflow `--lib` test was moved to its own
+  # `--mlflow-s3` scope: that one needs the lib-test target and does not share.
+  # The QA budget is a measured ratchet: record the cold-cache wall time in
+  # TD-OBJSTORE-5 on the first run.
   echo "==> TD-OBJSTORE-5 QA tier: build server (cloud-full) before emulator runs"
   CARGO_BUILD_JOBS=1 cargo test -p proximadb-server --features cloud-full \
     --test object_store_restart_recovery --no-run
@@ -268,16 +272,6 @@ if [ "$SCOPE" = "qa" ]; then
   CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full \
     --test objstore_backend_contract_test \
     -- --ignored --nocapture --test-threads=1
-
-  # TD-MLOPS-4 S1-remainder: the MLflow artifact seam battery against the
-  # REAL S3 protocol (the lane's LocalStack). cloud-full is already built; this
-  # is a near-free incremental lib-test run. AWS_ENDPOINT/AWS_* are the
-  # global exports pointing at the lane's S3 emulator.
-  echo "==> TD-MLOPS-4 S1: MLflow S3 artifact seam conformance (LocalStack)"
-  PROXIMADB_MLFLOW_ARTIFACTS_TEST_URL="s3://$CONTAINER_BUCKET/mlflow-seam-conformance" \
-    CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full --lib \
-    services::mlflow_artifact_s3::tests::s3_backend_passes_seam_conformance \
-    -- --exact --nocapture
 
   echo "==> QA tier [1/2]: Azure (Azurite, adls://) — restart proofs + recall ratchet"
   export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
@@ -304,6 +298,35 @@ if [ "$SCOPE" = "qa" ]; then
     -- --ignored --nocapture --test-threads=1 --skip cold_recall_ratchet
 
   echo "==> QA tier complete (Azure strict + S3 strict; GCS lives in --nightly)"
+  exit 0
+fi
+
+if [ "$SCOPE" = "mlflow-s3" ]; then
+  # TD-MLOPS-4 S1-remainder, split out of --qa (TD-OBJSTORE-5): the MLflow
+  # artifact seam battery against the REAL S3 protocol (the lane's LocalStack).
+  #
+  # Why its own scope. An earlier comment here claimed this was "a near-free
+  # incremental lib-test run" because cloud-full was already built. That was
+  # wrong, and it is what put the --qa job over the 16GB runner ceiling: the
+  # other --qa steps build INTEGRATION test targets, which link the `proximadb`
+  # lib compiled WITHOUT cfg(test). `--lib` builds a different target entirely --
+  # the lib-test, i.e. cfg(test) over ~779k LOC and ~7,100 inline tests. That is
+  # the single largest codegen unit in the workspace, not an increment, so --qa
+  # paid two near-cliff memory peaks and was evicted mid-compile
+  # ("runner has received a shutdown signal") at 76 of its 90 allowed minutes,
+  # twice in a row, having failed 6 of its last 8 runs.
+  #
+  # Splitting gives each peak its own fresh runner. It also puts this test where
+  # it belongs: it proves an MLflow artifact seam, not object-store restart
+  # correctness, and shares the --qa lane only because both want an S3 emulator.
+  echo "==> TD-MLOPS-4 S1: MLflow S3 artifact seam conformance (LocalStack)"
+  export AWS_ENDPOINT="http://127.0.0.1:$S3_EMULATOR_PORT" AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false
+  export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" AWS_REGION=us-east-1
+  PROXIMADB_MLFLOW_ARTIFACTS_TEST_URL="s3://$CONTAINER_BUCKET/mlflow-seam-conformance" \
+    CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full --lib \
+    services::mlflow_artifact_s3::tests::s3_backend_passes_seam_conformance \
+    -- --exact --nocapture
+  echo "==> MLflow S3 artifact seam: PASS"
   exit 0
 fi
 
