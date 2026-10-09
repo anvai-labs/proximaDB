@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 # Copyright (C) 2025 ProximaDB
 # SPDX-License-Identifier: Apache-2.0
-"""Find `.rs` files inside crate `src/` trees that no build reaches (TD-ORPHAN-1).
+"""Find `.rs` files that no build reaches (TD-ORPHAN-1).
 
-A file under a crate's `src/` is compiled only if one of these holds:
+Reachability, not a local name check. Roots come from `cargo metadata` -- every
+target's `src_path`, so autodiscovered bins/tests/benches/examples and explicit
+`[[bin]]` entries are all handled without guessing -- and the walk follows
+`mod x;`, `#[path = "..."]`, `#[cfg_attr(..., path = "...")]` and
+`include!("...")` from each root until nothing new is found.
 
-* a module declares it -- `mod foo;` / `pub mod foo;`, possibly behind attributes;
-* an attribute redirects a module at it -- `#[path = "f.rs"]` **or**
-  `#[cfg_attr(test, path = "f.rs")]`, the second of which is easy to miss and
-  accounts for four files an earlier revision of this detector wrongly reported;
-* `include!("f.rs")` pulls it in;
-* cargo autodiscovers it: `lib.rs`, `main.rs`, `build.rs`, `src/bin/*.rs` and
-  `src/bin/*/main.rs` (unless `autobins = false`), or a crate-root `tests/`,
-  `benches/`, `examples/` directory. Note a directory named `tests/` *inside* a
-  `src/` tree is NOT autodiscovered and still needs a `mod`.
+Transitivity is the whole point. A local rule -- "is this file's stem named in a
+`mod` somewhere in its parent directory" -- counts the children of an *orphaned*
+`mod.rs` as reached, because the declaration exists but nothing reaches the file
+making it. `src/storage/engines/sst/tests/mod.rs` is the live example: nothing
+declares it, and it declares 15 test modules totalling ~8.2k LOC that no build
+compiles.
 
 Comments are stripped before scanning, because a commented-out `mod x;` is not a
-declaration -- several `viper/tests/*.rs` files are orphaned exactly because their
-declarations sit behind `// TEMPORARILY DISABLED`.
+declaration -- four `viper/tests/*.rs` files are unreachable exactly because
+their declarations sit behind `// TEMPORARILY DISABLED`.
 
-Exit 1 and list the files when the count exceeds BASELINE, so the number can only
-go down. Verify a hit with the compiler using `--all-targets` (or
-`cargo test --no-run --lib` for root-crate files) -- a plain `cargo check -p <crate>`
-builds the lib only and cannot see a `cfg(test)`-gated file.
+Verify an individual hit with the compiler using `--all-targets`, or
+`cargo test --no-run --lib` for root-crate files. A bare `cargo check -p <crate>`
+builds the lib only and cannot see a `#[cfg(test)]`-gated file, so it will
+wrongly confirm one as unreachable.
 """
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -33,7 +35,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-BASELINE = 41  # TD-ORPHAN-1; lower this as files are removed or re-attached.
+BASELINE = 58  # TD-ORPHAN-1; lower this as files are removed or re-attached.
 
 MOD_RE = re.compile(
     r"^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
@@ -41,66 +43,160 @@ MOD_RE = re.compile(
 )
 PATH_RE = re.compile(r'#\[\s*(?:cfg_attr\s*\([^)]*?,\s*)?path\s*=\s*"([^"]+)"')
 INCLUDE_RE = re.compile(r'include!\s*\(\s*"([^"]+)"')
-SRC_TREE_RE = re.compile(r"^(?:src/|(?:crates|apps|clients)/[^/]+(?:/[^/]+)*?/src/)")
+# `include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/proto/x.rs"))` and friends:
+# take the last string literal, resolved against the crate root rather than the file.
+INCLUDE_CONCAT_RE = re.compile(r'include!\s*\(\s*concat!\((?P<args>[^)]*(?:\)[^)]*)*?)\)\s*\)')
 
 
-def _strip(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    return re.sub(r"//.*", "", text)
+def _strip_comments(text: str) -> str:
+    """Remove comments without being fooled by `//` or `/*` inside a string."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            out.append(ch)
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    out.append(text[i : i + 2])
+                    i += 2
+                    continue
+                out.append(text[i])
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
-def orphans() -> list[tuple[int, str]]:
-    listing = subprocess.run(
-        ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True
-    ).stdout.split()
-    files = [f for f in listing if f.endswith(".rs")]
-    raw = {}
-    for f in files:
+def _target_roots() -> set[str]:
+    meta = json.loads(
+        subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps", "--offline"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
+    roots = set()
+    for pkg in meta["packages"]:
+        for tgt in pkg["targets"]:
+            try:
+                roots.add(os.path.relpath(tgt["src_path"], ROOT))
+            except ValueError:
+                pass
+    return roots
+
+
+def _module_dir(rel: str) -> str:
+    base = os.path.basename(rel)
+    d = os.path.dirname(rel)
+    return d if base in ("mod.rs", "lib.rs", "main.rs") else os.path.join(d, base[:-3])
+
+
+def unreachable() -> list[tuple[int, str]]:
+    tracked = [
+        f
+        for f in subprocess.run(
+            ["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True
+        ).stdout.split()
+        if f.endswith(".rs")
+    ]
+    known = set(tracked)
+    text: dict[str, str] = {}
+    for f in tracked:
         try:
-            raw[f] = (ROOT / f).read_text(encoding="utf-8", errors="replace")
+            text[f] = _strip_comments((ROOT / f).read_text(encoding="utf-8", errors="replace"))
         except OSError:
-            raw[f] = ""
-    stripped = {f: _strip(t) for f, t in raw.items()}
+            text[f] = ""
 
-    declared: dict[str, set[str]] = {}
-    reached: set[str] = set()
-    generated: set[str] = set()
-    for f, text in stripped.items():
-        d, base = os.path.dirname(f), os.path.basename(f)
-        scope = d if base in ("mod.rs", "lib.rs", "main.rs") else os.path.join(d, base[:-3])
-        for m in MOD_RE.finditer(text):
-            declared.setdefault(scope, set()).add(m.group(1))
-        for pattern in (PATH_RE, INCLUDE_RE):
-            for m in pattern.finditer(text):
-                reached.add(os.path.normpath(os.path.join(d, m.group(1))))
-        if "include_proto!" in text:
-            generated.add(d)
+    # cargo roots, plus every crate root by convention: a crate outside the
+    # workspace (clients/rust/codegen) has no entry in `cargo metadata --no-deps`,
+    # so its `main.rs` would look unreachable although it is a real entry point.
+    roots = {r for r in _target_roots() if r in known}
+    roots |= {f for f in tracked if os.path.basename(f) in ("lib.rs", "main.rs", "build.rs")}
+    seen: set[str] = set()
+    queue = list(roots)
+    while queue:
+        cur = queue.pop()
+        if cur in seen or cur not in known:
+            continue
+        seen.add(cur)
+        body = text.get(cur, "")
+        mdir = _module_dir(cur)
+        crate_root = cur.split("/src/")[0] if "/src/" in cur else os.path.dirname(cur)
 
-    out: list[tuple[int, str]] = []
-    for f in files:
-        if not SRC_TREE_RE.match(f):
+        explicit: set[str] = set()
+        # `#[path]` and `include!` resolve against the directory holding THIS file
+        # (`protocol.rs` + `#[path = "protocol_tests.rs"]` is a sibling), whereas a
+        # conventional `mod x;` resolves inside the module directory. Resolving the
+        # former against the module dir loses every sibling redirect -- 22 files on
+        # this tree. Both bases are tried, which over-approximates reachability:
+        # the safe direction for a guard whose false positives mean deleting live code.
+        fdir = os.path.dirname(cur)
+        for m in PATH_RE.finditer(body):
+            for base in (fdir, mdir):
+                explicit.add(os.path.normpath(os.path.join(base, m.group(1))))
+        for m in INCLUDE_RE.finditer(body):
+            for base in (fdir, mdir):
+                explicit.add(os.path.normpath(os.path.join(base, m.group(1))))
+        for m in INCLUDE_CONCAT_RE.finditer(body):
+            lits = re.findall(r'"([^"]+)"', m.group("args"))
+            if lits:
+                tail = lits[-1].lstrip("/")
+                for base in (crate_root, fdir, mdir):
+                    explicit.add(os.path.normpath(os.path.join(base, tail)))
+        for cand in explicit:
+            if cand in known:
+                queue.append(cand)
+
+        declared = {m.group(1) for m in MOD_RE.finditer(body)}
+        # A `#[path]`-redirected module name must not also resolve conventionally.
+        for name in declared:
+            for cand in (
+                os.path.join(mdir, f"{name}.rs"),
+                os.path.join(mdir, name, "mod.rs"),
+            ):
+                cand = os.path.normpath(cand)
+                if cand in known:
+                    queue.append(cand)
+
+    out = []
+    for f in tracked:
+        if f in seen:
             continue
-        base, d = os.path.basename(f), os.path.dirname(f)
-        if base in ("lib.rs", "main.rs", "build.rs"):
+        if not re.match(r"^(?:src/|(?:crates|apps|clients)/[^/]+(?:/[^/]+)*?/src/)", f):
             continue
-        # cargo bin autodiscovery: src/bin/*.rs and src/bin/*/main.rs
-        if re.search(r"(^|/)src/bin/[^/]+\.rs$", f) or re.search(r"(^|/)src/bin/[^/]+/main\.rs$", f):
-            continue
-        if f in reached or d in generated or "/proto/" in f:
-            continue
-        name = os.path.basename(d) if base == "mod.rs" else base[:-3]
-        parent = os.path.dirname(d) if base == "mod.rs" else d
-        if name not in declared.get(parent, set()):
-            out.append((len((ROOT / f).read_text(errors="replace").splitlines()), f))
+        out.append((len((ROOT / f).read_text(errors="replace").splitlines()), f))
     out.sort(reverse=True)
     return out
 
 
 def main() -> int:
-    found = orphans()
+    found = unreachable()
     total = sum(n for n, _ in found)
     if len(found) > BASELINE:
-        print(f"orphan-rust-files: FAILED — {len(found)} files ({total:,} LOC), baseline {BASELINE}")
+        print(
+            f"orphan-rust-files: FAILED — {len(found)} files ({total:,} LOC), baseline {BASELINE}"
+        )
         for n, f in found:
             print(f"  {n:6d}  {f}")
         return 1

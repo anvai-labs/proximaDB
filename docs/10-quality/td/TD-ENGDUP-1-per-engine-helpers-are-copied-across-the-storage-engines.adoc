@@ -9,14 +9,14 @@
 | Severity | Low-to-medium. Behaviour is correct today and **no drift has been demonstrated** --
 an earlier revision of this file claimed two pieces of drift evidence and both were measurement
 artifacts (see "Measurement notes"). The cost is maintenance surface: a fix to one engine's copy
-does not reach the others, and 40 copies sit where one shared definition would do.
+does not reach the others, and 41 copies sit where one shared definition would do.
 | Owner | unassigned
 |===
 
 == What
 
 Across the storage-engine trees, **16 helper bodies are byte-identical (after comment and
-whitespace normalisation) in more than one engine, accounting for 40 removable copies**:
+whitespace normalisation) in more than one engine, accounting for 41 removable copies**:
 
 |===
 | Helper | LOC | Copies | Engines | Where
@@ -84,7 +84,7 @@ the one that exists", and that is what the first slice should answer.
 
 == Why consolidating is worth doing
 
-. **40 copies is 40 places to keep a fix.** No drift has been observed, but the surface is real,
+. **41 copies is 41 places to keep a fix.** No drift has been observed, but the surface is real,
   and `create_test_engines` being duplicated six ways means the test fixtures can drift
   independently -- the hazard mandate #11 exists to prevent.
 . **It is a cheap reduction of `src/storage`.** That module is 295,958 LOC -- 37% of the root
