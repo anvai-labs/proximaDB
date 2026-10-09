@@ -83,7 +83,7 @@ check certifies a probe that is effectively off, whatever the true engagement
 turns out to be. They are strengthened in the same change.
 
 1. **`assert!(!probe_trace.is_empty(), "... must engage the coarse probe ...")`**
-   is satisfied by 17/1000. A presence check certifies a probe that is
+   would be satisfied by 17 probes out of 1000 queries. A presence check certifies a probe that is
    effectively off. Replaced in this change by a **proportion** floor (>=50% of
    measured queries), which is what the assertion's own message always claimed
    to check.

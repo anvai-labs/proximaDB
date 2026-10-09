@@ -1061,7 +1061,15 @@ fn ivecs_round_trip_parses_neighbour_indices() {
 ///       coalescing assumes `cluster_order_pca_ivf` survivor locality.
 ///   (b) a SINGLE-FILE collection (one flush batch → one segment) isolates the
 ///       per-file "~1 RaBitQ GET" win, NOT conflated with the PR2 GET-budget
-///       compaction (the flush→compaction scheduler is unwired).
+///       compaction. NOTE: an earlier revision justified this with "the
+///       flush→compaction scheduler is unwired". That is false -- TD-WLP-7
+///       (ADR-061 D3) wired it, and its own comment records that the post-flush
+///       hook used to be a stub. The isolation holds for a different reason: one
+///       flush batch cannot reach the count arm's L0 threshold of 5, and this
+///       collection is now tagged `compaction:off`, which short-circuits
+///       `should_trigger_compaction` outright -- without which the TD-COMPACT-5
+///       TRAINING arm (threshold 1, any untrained L0 over 32 MB) would have armed
+///       on this single large segment. See TD-SIFTCOMPACT-1.
 /// Expects recall@10 ≈ 0.99 at the keep=100% RaBitQ scan AND range_gets/query ≪
 /// today's ~370. `#[ignore]` (needs SIFT1M); record into BENCHMARK_EVIDENCE.toml.
 #[tokio::test]
@@ -1142,7 +1150,10 @@ async fn sift_coalesced_rabitq_scan_rerank_eval() {
 
     // (b) SINGLE-FILE collection: flush the entire base in ONE batch → one segment
     // file, isolating the per-file "~1 RaBitQ GET" win from the PR2 GET-budget
-    // compaction (the flush→compaction scheduler is unwired).
+    // compaction. The scheduler IS wired (TD-WLP-7); what isolates this is the
+    // single batch (below the count arm's threshold of 5) plus the
+    // `compaction:off` tag, which also blocks the training arm that would
+    // otherwise fire at threshold 1 on a 32 MB+ untrained L0.
     let temp_dir = TempDir::new().unwrap();
     let collection = collection(
         "sift_coalesced_eval",
@@ -2128,8 +2139,10 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
     // Collect every verdict BEFORE asserting, then fail once with all of them.
     // Asserting in sequence means the first failure hides the rest, and WHICH
     // one comes first decides what the reader of a CI failure sees, and which
-    // failure is "first" is a guess about which one matters. Reporting all three
-    // is the only ordering that makes no such guess.
+    // failure is "first" is a guess about which one matters. Reporting all of
+    // them is the only ordering that makes no such guess. (Seven
+    // `failures.push` sites, up to five trippable at once -- an earlier revision
+    // said "all three", the same stale count the failure message itself carried.)
     //
     // NOTE: an earlier revision justified this with "at this test's DEFAULT N
     // the probe does not engage at all (0 of 100 measured) ... a 3.3% byte
@@ -2241,6 +2254,10 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "0");
         std::env::remove_var("PROXIMADB_TRACE_GETS");
+        // Set at the top of this test and previously not cleaned up here.
+        // Harmless under nextest (process per test); it leaked under plain
+        // `cargo test`.
+        std::env::remove_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB");
     }
 }
 

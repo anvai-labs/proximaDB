@@ -25,9 +25,22 @@ things then compose:
   collection — armed)"*. There is an existing unit test pinning
   `resolve_compaction_armed(&[])`. No SIFT test sets
   `L0_COMPACTION_ENABLED_ENV`.
-. The L0 threshold is 5 and the harness batches at 20 000, so any run inserting
-  ≥100 000 vectors reaches it. The default arm inserts the **full 1M** — 50
-  flushes.
+. `should_trigger_compaction` has **two** arms, and an earlier revision of this
+  TD described only the first:
++
+  * **COUNT arm** — L0 threshold 5, and the harness batches at 20 000, so any
+    run inserting >=100 000 vectors reaches it. The default arm inserts the
+    **full 1M** — 50 flushes.
+  * **TD-COMPACT-5 TRAINING arm** — threshold **1**: a single untrained L0 at or
+    above `PROXIMADB_TRAINING_COMPACTION_MIN_MB` (default 32 MB) arms it, gated
+    only on `ivf_probe_enabled()`, which is **default ON**. This matters for the
+    enumeration below: `sift_coalesced_rabitq_scan_rerank_eval` flushes the
+    entire base in ONE batch, so it never reaches count 5 — but its single L0 is
+    far over 32 MB and untrained, so the training arm armed it and it hit the
+    same swallowed admission error. It is a fourth `collection()` user and is now
+    tagged too. It also means the filtered ratchet's exemption at default
+    N=10 000 holds because 10 000 SIFT vectors are under the 32 MB floor, not
+    merely because the flush count is below 5.
 . `flush/mod.rs` catches the admission error, logs it at `warn!`, assigns
   `compaction_error` and **continues**: *"a compaction failure is recorded on the
   result but never fails the flush."*
@@ -50,7 +63,7 @@ so the threshold is never met there). These are the source of the recall and GET
 `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`, and carried by the qa-gate
 `sift-pax-recall` job.
 
-=== Confirmed by execution, and the fix is NOT one line
+=== Confirmed by execution — and superseded by the `compaction:off` tag
 
 Minting an id in the shared helper was the obvious fix. I made that change and
 ran `sift_pax_cascade_recall_at_10_ratchet_rg_layout` at N=100 000:
@@ -66,8 +79,16 @@ assertion `left == right` failed: each ratchet query must report one physical
 ----
 
 It inserted and flushed all 100 000 vectors, built ground truth, then died on the
-**first query**. With a valid id, compaction runs and the ratchet no longer gets
-the vector-access record it asserts.
+**first query**. At the time, with a valid id, compaction was attempted and the
+ratchet no longer got the vector-access record it asserts.
+
+**SUPERSEDED.** The shared `collection()` helper is now tagged `compaction:off`,
+and `should_trigger_compaction` returns `Ok(None)` on
+`!resolve_compaction_armed(tags)` **before** `params.get_collection_object_id()`
+is reached. So minting an id is now **behaviour-neutral** here: compaction runs
+neither with nor without one, and the id is never parsed. Everything below is the
+diagnosis as it stood, which is why the helper still passes a name — not a
+current statement that minting would break anything.
 
 === Correction: the failure is ZERO accesses, not more than one
 
@@ -164,7 +185,10 @@ anything, and `len() > 1` is structurally impossible, so the per-segment form
 would assert something that cannot happen. An existing test that fails your
 change is evidence, not an obstacle.
 
-The helper is therefore left unminted here, and the decision belongs below.
+The helper was therefore left unminted, and the decision belongs below. (With
+the tag in place that reason has lapsed: minting is now safe. It is also no
+longer *sufficient* — the tag is what blocks the attribution experiment, so that
+step needs the tag dropped as well.)
 
 == Why it was invisible
 
@@ -182,7 +206,10 @@ Three independently reasonable decisions compose into silence:
 == How to apply
 
 . **Investigate the ANN decline first — it is the lead, not a side effect.**
-  Minting the id surfaces a query with **no ANN proof** on a compacted segment.
+  Minting the id (and dropping the tag) surfaces a query with **no ANN proof**.
+  Do not describe the segment it read as "compacted" without checking: under
+  candidate (4) the query read a *retiring L0*, not the compacted output, which
+  is a different layout and a different bug.
   (Whether that query returned `Ok` is itself unshown — candidate (3) above —
   because the guard is `result.is_ok() && …`, so an `Err` produces the identical
   zero. Record that first; it is one line and it eliminates a candidate.) Then
@@ -217,3 +244,6 @@ Three independently reasonable decisions compose into silence:
   collision-prone identity domain that cannot be joined reliably with catalog,
   MVCC, deletion-vector, or compaction state". Mint an id
   (`next_object_id()`), keep the human name in `CollectionConfig.name`.
+  **Necessary but no longer sufficient:** with `compaction:off` on the helper,
+  minting alone changes nothing observable — the tag has to come off too, which
+  is the trade recorded above.
