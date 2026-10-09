@@ -72,10 +72,18 @@ print(v if v else "<MISSING-workspace.package.version>")' "$file" 2>/dev/null \
       python3 -c 'import sys,tomllib
 with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
 pins={}
-for table in ("dependencies","dev-dependencies","build-dependencies"):
-    for name,spec in d.get(table,{}).items():
+def walk(tbl, prefix=""):
+    for name,spec in (tbl or {}).items():
         if isinstance(spec,dict) and "path" in spec and "version" in spec:
-            pins[name]=spec["version"]
+            pins[prefix+name]=spec["version"]
+for table in ("dependencies","dev-dependencies","build-dependencies"):
+    walk(d.get(table))
+# `set` rewrites every `version = "X", path =` line in the file, so a pin under
+# [target.(cfg).dependencies] is written but was not read here. The root manifest
+# already has a target table for macos/aarch64, so this was one line from live.
+for cfg,tbl in (d.get("target") or {}).items():
+    for table in ("dependencies","dev-dependencies","build-dependencies"):
+        walk(tbl.get(table), prefix=f"target.{cfg}.")
 vals=set(pins.values())
 if not pins: print("<NO-PATH-DEP-PINS>")
 elif len(vals)==1: print(next(iter(vals)))
@@ -95,8 +103,14 @@ print(m.group(1) if m else "<NO-EMBEDDED-EXTRA-BOUND>")' "$file" 2>/dev/null \
     # A package-lock.json records the package's own version TWICE: top-level and
     # packages[""]. `package_json` above only sees the first, so the second could
     # drift unnoticed — which is half of what `set` writes.
+    # The `|| echo` is load-bearing, not decoration: without it a non-zero python
+    # exit propagates out of the command substitution and `set -e` terminates
+    # `check` with an EMPTY stderr, mid-list, before the remaining entries run —
+    # so the gate dies with no diagnostics on exactly the field it was added to
+    # watch. Verified by deleting `packages[""]["version"]`.
     package_lock_own)
-      python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"][""]["version"])' "$file" 2>/dev/null
+      python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"][""]["version"])' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>"
       ;;
     *)
       echo ""
