@@ -357,10 +357,9 @@ fn write_pax_segment_full_internal(
         // TD-WLP-4/WLP-9 eval opt-in (`PROXIMADB_PAX_FLUSH_CLUSTER=ivf`): apply
         // the compaction-grade PCA+IVF re-cluster at flush instead of the
         // bootstrap, so clustering quality is measurable without waiting on a
-        // compaction cadence. (An earlier revision said "the (unwired)
-        // flush→compaction scheduler". It is wired -- TD-WLP-7, ADR-061 D3 --
-        // and this PR corrects the same stale claim twice in
-        // tests/sift_pax_recall_ratchet_test.rs.) Default OFF ⇒ bootstrap.
+        // compaction cadence. (Not "the (unwired) flush→compaction scheduler",
+        // as an earlier revision said: TD-WLP-7 / ADR-061 D3 wired it in #1012.)
+        // Default OFF ⇒ bootstrap.
         if crate::storage::engines::sst::block_cluster::flush_cluster_ivf() {
             crate::storage::engines::sst::block_cluster::cluster_plan_pca_ivf(
                 records,

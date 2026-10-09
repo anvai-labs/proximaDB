@@ -847,8 +847,16 @@ impl SstEngine {
         // the compactor (the post-flush hook was a historical stub), so the
         // TD-WLP-4 armed-by-default re-cluster never ran and the read-side prune
         // it unlocks stayed dark. Run it inline (awaited) via the atomic-swap
-        // path (ADR-046 LSN-coherent read across the segment swap) — synchronous
-        // so it is deterministic and spawns no background worker thread. The
+        // path (ADR-046 LSN-coherent read across the segment swap).
+        //
+        // CORRECTION: this comment used to end "synchronous so it is
+        // deterministic and spawns no background worker thread". The call below
+        // is `enqueue_due_compaction`, which returns once the task is on the
+        // queue and a worker notified, and logs "enqueued (async)". So the work
+        // IS on a background worker, and a caller that needs the compacted
+        // product on disk must await `await_compaction_quiescence` -- which is
+        // the premise the SIFT IVF2 ratchet's barrier rests on, and reading this
+        // comment is how a reviewer would check that premise. The
         // segment this flush wrote is already committed at its final URL above,
         // so the merge reads a consistent L0 set. Best-effort: a compaction
         // failure is recorded on the result but never fails the flush.
@@ -1003,10 +1011,14 @@ impl SstEngine {
                     "filename".to_string(),
                     serde_json::Value::String(filename.to_string()),
                 );
-                // TD-WLP-7: whether the armed re-cluster compaction actually
-                // executed on this flush (distinct from `compaction_triggered`,
-                // which only means "armed + over threshold"). The integration
-                // gate asserts on this.
+                // TD-WLP-7: whether the armed re-cluster compaction was
+                // ENQUEUED by this flush (distinct from `compaction_triggered`,
+                // which only means "armed + over threshold"). It is set from
+                // `enqueue_due_compaction`'s Ok(true), so it does NOT mean the
+                // compaction finished -- an earlier revision of this comment said
+                // "actually executed", which callers relied on. Await
+                // `await_compaction_quiescence` if you need the product. The
+                // integration gate asserts on this.
                 metrics.insert(
                     "compaction_ran".to_string(),
                     serde_json::Value::Bool(compaction_ran),

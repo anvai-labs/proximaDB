@@ -541,11 +541,14 @@ hardware = "local macOS arm64 (indicative; N=1M canonical = qa-gate `sift-pax-re
 date = "2026-06-30"
 version = "v0.2"
 notes = """LAYOUT CAVEAT (added 2026-10-08, TD-SIFTCOMPACT-1): these figures
-describe an **L0-only, uncompacted** layout, not a compacted one. At N >= 100 000
-the harness crossed the L0 compaction threshold and compaction was attempted, but
-it failed the catalog-object-id admission check; the error was recorded on the
-flush result and logged at `warn`, so the arms measured a pre-compaction layout
-with nothing to signal it. That is now the STATED intent -- the shared collection
+describe an **L0-only, uncompacted** layout, not a compacted one -- and for these
+2026-06-30 figures compaction was UNREACHABLE, not merely rejected: nothing
+scheduled compaction from a flush until TD-WLP-7 (#1012) on 2026-07-15, before
+which the post-flush hook was a stub and `compaction_error` was hardcoded None.
+Re-run the same configuration today and the layout is still L0-only by a different
+route -- compaction becomes due at N >= 100 000 and then fails the
+catalog-object-id admission check, logged at `warn` and swallowed. Either way the
+arms measured a pre-compaction layout with nothing to signal it. That is now the STATED intent -- the shared collection
 helper pins `compaction:off`, which makes the layout deterministic rather than
 accidental -- but it means recall here is not evidence about the compacted
 product. See TD-SIFTCOMPACT-1 and TD-IVF2ENGAGE-1 (whose own headline finding was

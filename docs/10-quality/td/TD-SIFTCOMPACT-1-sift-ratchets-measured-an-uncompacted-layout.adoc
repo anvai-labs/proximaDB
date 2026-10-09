@@ -54,11 +54,12 @@ visibly broke.
 
 If compaction never ran, these ratchets measured an **L0-only, uncompacted,
 un-reclustered** layout — not the clustered PAX-LSM layout they appear to
-exercise. That affects **four** tests -- all four `collection()` users:
-`sift_pax_cascade_recall_at_10_ratchet`, its `_rg_layout` sibling,
-`sift_pax_filtered_cascade_recall_ratchet`, and
-`sift_coalesced_rabitq_scan_rerank_eval`. Three are CI-carried; the coalesced one
-is `#[ignore]`d.
+exercise. The shared `collection()` helper has **four** users, of which **three
+are affected**: `sift_pax_cascade_recall_at_10_ratchet`, its `_rg_layout`
+sibling, and `sift_coalesced_rabitq_scan_rerank_eval`. (An earlier revision said
+"four tests ... each reaching the trigger by a different arm", which cannot be
+true of a test that reaches no trigger -- four is the count of helper users, not
+of affected tests.)
 
 Each reaches the trigger by a different arm, which is why an earlier revision of
 this list had only three entries:
@@ -68,10 +69,20 @@ this list had only three entries:
 * `sift_coalesced_rabitq_scan_rerank_eval` flushes in ONE batch so it never
   reaches count 5, but its single untrained L0 is far over 32 MB, so the
   **training** arm armed it at threshold 1;
-* `sift_pax_filtered_cascade_recall_ratchet` is exempt at its own default
-  N=10 000 -- and the reason is the **32 MB floor**, not merely that one
-  sub-`BATCH_SIZE` flush is below count 5, since the training arm would fire at
-  threshold 1 regardless of the flush count. These are the source of the recall and GET/byte figures published in
+* `sift_pax_filtered_cascade_recall_ratchet` is exempt **at its own default
+  N=10 000** -- and the reason is the **32 MB floor**, not merely that one
+  sub-`BATCH_SIZE` flush is below count 5, since the training arm fires at
+  threshold 1 regardless of the flush count. So nothing was hidden for it at that
+  N and its L0-only layout is the intended one.
++
+  That exemption is only as good as the env, which matters because it does not
+  hold in the run the figures come from: the qa-gate `sift-pax-recall` job sets
+  `PROXIMADB_SIFT_N=100000` for the whole binary, at which this arm performs five
+  20 000-row flushes and reaches the **count** arm exactly like the two cascade
+  arms. In the run that produced the published filtered figure (recall@10 =
+  0.9907 at N=100 000) it was *not* exempt.
+
+All four arms are the source of the recall and GET/byte figures published in
 `docs/_internal/status/SIFT1M_RECALL_RATCHET_2026_06_30.adoc` and the
 `pax_rabitq_sq8_sift1m_recall_at_10` ledger claim in
 `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`, and carried by the qa-gate

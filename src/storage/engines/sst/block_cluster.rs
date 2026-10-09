@@ -61,8 +61,9 @@ fn env_flag_off(var: &str) -> bool {
 /// TD-WLP-4/WLP-9 eval opt-in: upgrade the **flush** (L0) ordering from the
 /// model-free sign-bit bootstrap ([`cluster_order`]) to the full PCA+IVF
 /// re-cluster ([`cluster_order_pca_ivf`]) — the ordering compaction normally
-/// applies, but reached at flush so it is measurable without the (unwired)
-/// flush→compaction scheduler. Default OFF: production L0 flush keeps the
+/// applies, but reached at flush so it is measurable without waiting on a
+/// compaction cadence. (Not "the (unwired) flush→compaction scheduler", as an
+/// earlier revision said: TD-WLP-7 / ADR-061 D3 wired it in #1012.) Default OFF: production L0 flush keeps the
 /// bootstrap (cold-start-safe, streaming), and the production re-cluster event
 /// remains compaction. Set `PROXIMADB_PAX_FLUSH_CLUSTER=ivf` to exercise PCA/IVF
 /// at flush (the SIFT recall eval uses this to validate clustering quality). The

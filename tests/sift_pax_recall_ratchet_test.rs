@@ -2185,7 +2185,9 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         // causes and silently excluded the one the toggle itself could produce.
         if cells_probe > 0 {
             failures.push(format!(
-                "the coarse probe DID engage ({cells_probe} cells probed, recorded on the \
+                "the coarse probe DID engage ({cells_probe} IVF cells visited in total \
+                 -- `ivf_cells_total`, not the probed subset, which is nprobe/k_c of it -- \
+                 recorded on the \
                  ungated durable counter) but `probe_trace` is empty -- so the trace gate, \
                  not the probe, is off. `record_probe_trace` is called only `if trace_on` \
                  (PROXIMADB_TRACE_GETS / TRACE_PAX_STAGES) while the durable counters are \
