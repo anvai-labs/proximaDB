@@ -118,13 +118,22 @@ trigger and fails loudly when admission declines.
 
 CORRECTION (round 6): an earlier revision said "the others set `id` to a name too
 and never hit that boundary, so the pattern looks fine by inspection and is not."
-They DO hit it. `collection()` sets no tags, so `resolve_compaction_armed(&[])` is
-true by default; at `PROXIMADB_SIFT_N=100000` with `BATCH_SIZE = 20_000` the fifth
-flush reaches `L0_COMPACTION_THRESHOLD = 5`, compaction becomes due, and the same
-admission error fires. The difference is only that those arms never assert on it:
-it lands in `compaction_error`, is logged at `warn`, and the flush succeeds. So
-the defect was broader than filed, and the sentence that congratulated itself for
-not trusting inspection was itself an inspection error — see TD-SIFTCOMPACT-1.
+They DID hit it, in the window between TD-WLP-7 (#1012, 2026-07-15 -- the first
+change to schedule compaction from a flush at all) and TD-SIFTCOMPACT-1. In that
+window `collection()` set no tags, so `resolve_compaction_armed(&[])` was true by
+default; at `PROXIMADB_SIFT_N=100000` with `BATCH_SIZE = 20_000` the fifth flush
+reached `L0_COMPACTION_THRESHOLD = 5`, compaction became due, and the same
+admission error fired. The difference was only that those arms never asserted on
+it: it landed in `compaction_error`, was logged at `warn`, and the flush
+succeeded. So the defect was broader than filed, and the sentence that
+congratulated itself for not trusting inspection was itself an inspection error
+-- see TD-SIFTCOMPACT-1.
+
+It no longer fires, in either direction. TD-SIFTCOMPACT-1 made `collection()` set
+`tags: vec!["compaction:off"]`, and `should_trigger_compaction` returns `Ok(None)`
+on `!resolve_compaction_armed(tags)` before the threshold or the object id is ever
+reached (`src/storage/engines/sst/flush/mod.rs`) -- so these arms are now off by
+decision rather than by a swallowed admission error.
 
 **The fix is two lines, and the canonical precedent is already in the repo.**
 `tests/sst_ivf2_compaction_route_proof_test.rs` mints an id for exactly this

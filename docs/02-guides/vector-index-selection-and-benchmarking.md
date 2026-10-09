@@ -92,7 +92,8 @@ AXIS and saw no difference":
 
 1. create the collection with a non-empty `index_configs`;
 2. run the server with `storage.optimization.enable_axis_indexes = true`
-   (see `config/cloud-object-store.toml`);
+   (`config/cloud-object-store.toml` is where the key lives, but note it ships
+   `= false` — that file shows you the path, not the value you want);
 3. build with the Cargo `axis` feature — it is in the default set, so this one
    is usually already true.
 
@@ -285,7 +286,10 @@ look like they belong in the documented run and do not:
     worth knowing because the second only reads as an improvement given the
     first:
 
-    * **Before TD-SIFTCOMPACT-1**, compaction was armed by default, and at
+    * **Between TD-WLP-7 and TD-SIFTCOMPACT-1** — that is, from #1012
+      (2026-07-15), which first wired flush to compaction at all; before it the
+      post-flush hook was a stub and nothing scheduled compaction from a flush —
+      compaction was armed by default, and at
       `PROXIMADB_SIFT_N=100000` with a 20 000-row batch the fifth flush crossed
       the L0 threshold of 5 — so compaction became *due*, was attempted, and
       failed admission because the collection id is a name
@@ -353,6 +357,18 @@ Rows are referenced by **label**, not by index — an earlier revision numbered
 them, then a row was inserted and the numbering silently desynchronised from the
 table's own `Source` column.
 
+* **No row in this table is in the evidence ledger.** Every GET and byte figure
+  below is read off a **job log**, not a recorded measurement — none of them
+  appears in `BENCHMARK_EVIDENCE.toml`. Nor is there a ledgered I/O figure for
+  *this* configuration to check them against: the ledger claim backing these
+  cascade arms, `pax_rabitq_sq8_sift1m_recall_at_10`, is recall-only
+  (`metric = "recall_at_10"`, TD-SIFTCOMPACT-1). The ledger does carry SIFT I/O
+  claims — `rdstrat8_sift_ivf2_coarse_probe` and `nprobe_sweep_trained_1m`, both
+  cited further down — but those are different runs on different beds and
+  hardware, so they are not a baseline for these rows. Per engineering mandate #6
+  that makes the figures here *reproducible* but not *ledgered*: cite them as
+  such, and land a ledger entry before quoting them as end-to-end evidence in an
+  ADR or a release claim.
 * **Exact scan**, **`[baseline]`** and **`[rg_layout]`** all come from one
   **qa-gate `sift-pax-recall`** run — the last successful one, 2026-09-04 — and
   are reproducible in CI. `[baseline]` and `[rg_layout]` are both logged in that

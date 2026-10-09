@@ -115,7 +115,7 @@ jobs:
       # Publish exactly the bytes `build` produced. Rebuilding here would mean
       # the artifact the build job verified is not the artifact that ships.
       - name: Download the verified site
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: docs-site
           path: site/
