@@ -250,9 +250,16 @@ SIFT1M subset, N=100 000, dim 128, top_k 10, recall over 1000 queries, I/O over
   Treat it as indicative, and re-measure on your own account before relying on
   it. (That gap is part of what TD-VECEVAL-1 covers.)
 * The harness forces `PROXIMADB_PAX_F32_TIER=1`, which is **default-OFF**
-  (`ENV_GATE_REGISTRY.adoc`) and changes which stripes a segment emits. So these
-  are *default + one opt-in gate*, not stock defaults — and that gate moves the
-  very bytes/query and bytes/GET columns below.
+  (`ENV_GATE_REGISTRY.adoc`) and changes which stripes a segment emits. So the
+  three ANN rows are *default + one opt-in gate*, not stock defaults — and that
+  gate moves the very bytes/query and bytes/GET columns below.
+* The **filtered** figure quoted earlier has a different provenance again: that
+  arm additionally forces `PROXIMADB_PAX_FOOTER_STATS=1` (also default-OFF) and
+  sets `PROXIMADB_PAX_WRITE_RG_LAYOUT=0`, i.e. it turns *off* the shipped default
+  this table shows to be the largest win. It is therefore *default + two opt-in
+  gates − one default*. Its comparison is still apples-to-apples — the
+  matching-geometry `[baseline]` arm in the same run is 0.9896 — but it is not
+  the configuration of rows 3–4.
 
 | Configuration | recall@10 | GETs/query | bytes/query | bytes/GET | Source |
 |---|---|---|---|---|---|
@@ -268,7 +275,11 @@ comparison is as controlled as this harness gets.
 Reading it:
 
 * ANN buys **−66% bytes** and **−85% compute** over an exact scan (164.57 ms →
-  25.47 ms in that run), but costs **~8–11× more round-trips**. On object storage
+  25.47 ms in that run), but costs **~8–11× more round-trips**. Note the scope:
+  that compares row 1 to **row 3**, both from the `[rg_layout]` arm. Without the
+  row-group layout the trade is *worse than nothing* on bytes — the `[baseline]`
+  arm's own exact leg was 78.2 MB against its ANN 97.8 MB, so comparing rows 1
+  and 2 across arms is not meaningful. On object storage
   that trade is the whole decision, and it is why the budget matters more than
   the knobs.
 * The **row-group layout alone cuts ANN GETs 70.43 → 53.97 (−23%) and bytes

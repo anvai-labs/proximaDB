@@ -217,9 +217,9 @@ jobs:
               - '*.adoc'
               - '*.md'
             # Separate from `docs`, for the reason the next comment gives: three
-            # other jobs (docs-authority, risk-coverage, design-status) are gated
-            # on `docs`, so adding mkdocs.yml to it would have changed their
-            # triggers too. TD-DOCSITE-1.
+            # other jobs (docs-authority, risk-coverage, capability-matrix) are
+            # gated on `docs`, so adding mkdocs.yml to it would have changed
+            # their triggers too. TD-DOCSITE-1.
             docs_site:
               - 'docs/**'
               - 'mkdocs.yml'
