@@ -255,15 +255,20 @@ jobs:
           PROXIMADB_SIFT_QUERIES: "1000"
           PROXIMADB_RECALL_DATASET_REQUIRED: "1"
           PROXIMADB_SIFT_CENTROID_MAX_RECALL_DROP: "0"
-        # --test-threads=1 is load-bearing, not tidiness: three arms in this
-        # file set process-global PAX gates (PROXIMADB_PAX_WRITE_RG_LAYOUT,
-        # PROXIMADB_PAX_FOOTER_STATS) with no mutex, and the file's own module
-        # header says it relies on nextest's process-per-test isolation. Run
-        # under libtest's default parallelism they share a process and can
-        # clobber each other's write geometry, which makes a RATCHET job flaky
-        # in the direction that matters (a wrong-geometry arm reads different
-        # bytes). Serialising removes the race without installing nextest here;
-        # each arm sets its own gates before writing, so serial order is safe.
+        # --test-threads=1 here is DEFENCE-IN-DEPTH, not a fix: this repo already
+        # serialises libtest via `.cargo/config.toml` `[env] RUST_TEST_THREADS =
+        # "1"` (that file's own `test-parallel` alias exists to override it), so
+        # this job has always run one test at a time. An earlier revision of this
+        # comment claimed the arms "had been running in parallel" and that the
+        # flag was load-bearing; both were false -- and the reference table is
+        # positive evidence against the race, since [baseline] and [rg_layout]
+        # set the same process-global gate and produced two DIFFERENT geometries
+        # from one run, which a parallel run could not have done.
+        #
+        # The flag is kept because cargo's `[env]` without `force = true` does
+        # NOT override an externally exported RUST_TEST_THREADS, so a runner or
+        # wrapper that exports it would reintroduce parallelism -- and the three
+        # arms in this file do share process-global PAX gates with no mutex.
         run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --test-threads=1 --nocapture
 
   # Validate the object-store access-tier cost lever (TD-168/TD-173) against REAL

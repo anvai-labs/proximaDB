@@ -193,20 +193,24 @@ PROXIMADB_SIFT_QUERIES=1000 \
     --test sift_pax_recall_ratchet_test --no-capture
 ```
 
-Use **nextest**, not a bare `cargo test`: three of the arms set process-global
-PAX env vars (`PROXIMADB_PAX_WRITE_RG_LAYOUT`, `PROXIMADB_PAX_FOOTER_STATS`) and
-the file has no mutex, relying instead on nextest's process-per-test isolation
-(its own module header says so). Under `cargo test` with default parallelism they
-share a process and can clobber each other's write geometry (mandate #11).
+Use **nextest** (mandate #11). Three of the arms set process-global PAX env vars
+(`PROXIMADB_PAX_WRITE_RG_LAYOUT`, `PROXIMADB_PAX_FOOTER_STATS`) with no mutex, so
+they must not run concurrently; nextest gives each test its own process, which
+makes that structural.
 
-The race needs *concurrency*, not merely one process: each arm sets its own gates
-before writing, so serialised execution is also safe. That is how CI runs it —
-the qa-gate `sift-pax-recall` job uses `cargo test … -- --test-threads=1
---nocapture`, which is where the **CI** rows in the table above come from.
-`--test-threads=1` was added in this PR precisely because the job had been
-running the arms in parallel; nextest's `--no-capture` serialises too, so either
-invocation reproduces those rows and a bare parallel `cargo test` reproduces
-neither.
+Inside this checkout a plain `cargo test` is also safe, for a reason worth
+knowing: `.cargo/config.toml` sets `[env] RUST_TEST_THREADS = "1"`, so libtest
+already runs one test at a time here, and the arms each set their own gates
+before writing. That is how the **CI** rows in the table above were produced —
+the qa-gate job runs `cargo test`, and it has always been serial.
+
+The reason to prefer nextest anyway is that neither protection travels. Cargo's
+`[env]` without `force = true` does **not** override an externally exported
+`RUST_TEST_THREADS`, and `.cargo/config.toml` only applies when you build from
+this directory tree — so a wrapper, a CI runner, or a copy of the test outside
+the repo can reintroduce parallelism silently. Nextest ignores
+`RUST_TEST_THREADS` entirely (that file says so) and isolates by process
+regardless.
 
 Do **not** add `PROXIMADB_RECALL_DATASET_REQUIRED=1` here. It exists so CI fails
 loudly instead of skipping, and it asserts that **all three** files are present —
@@ -257,18 +261,21 @@ Two further gates appear in the test file and neither belongs in the run above:
     **Why the run above produces no A0 is worth stating precisely, because it is
     not "flush declined to".** The durable fact is that *these ratchet
     collections do not compact*, so no A0 is ever written for nprobe to read.
-    How they come not to compact is being changed deliberately:
+    *How* they come not to compact changed deliberately, and both halves are
+    worth knowing because the second only reads as an improvement given the
+    first:
 
-    * **As originally written**, compaction was armed by default and at
+    * **Before TD-SIFTCOMPACT-1**, compaction was armed by default, and at
       `PROXIMADB_SIFT_N=100000` with a 20 000-row batch the fifth flush crossed
       the L0 threshold of 5 — so compaction became *due*, was attempted, and
       failed admission because the collection id is a name
       (`sift_pax_ratchet_baseline`) where the boundary requires a decimal catalog
       object id. The error was recorded on the flush result, logged at `warn`,
-      and the flush succeeded, so nothing surfaced it.
-    * **TD-SIFTCOMPACT-1** pins these collections `compaction:off` instead, which
-      makes the same conclusion *structural* rather than an accident of a
-      swallowed error — and makes the three CI-carried arms deterministic.
+      and the flush succeeded, so nothing surfaced it. The arms were measuring a
+      layout nothing had chosen.
+    * **TD-SIFTCOMPACT-1 pins these collections `compaction:off`**, which makes
+      the same conclusion *structural* rather than an accident of a swallowed
+      error — and makes the three CI-carried arms deterministic.
 
     Either way nprobe is inert here. **TD-SIFTCOMPACT-1** and **TD-VECEVAL-1**
     carry the detail; the Caveats section below repeats it.
@@ -368,10 +375,12 @@ Reading it:
   straight DEPTH-for-BYTES win, and the clearest tunable lever we measured.
 * With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
   **81 GETs / 92 ms probed vs 108 GETs / 144 ms unprobed** at recall
-  0.9860–0.9870 (ratchet 0.984) — better on every axis. On an **uncompacted**
+  0.9840–0.9870 (ratchet 0.984) — better on every axis. On an **uncompacted**
   segment there is no Region A0 to probe, so nprobe does nothing: that is the
-  trap, and the fix is to drive a compaction, not to set another env var
-  (training is already default-ON, and flush deliberately never emits A0).
+  trap, and no env var substitutes for a compaction having run (training is
+  already default-ON, and flush deliberately never emits A0). See the admonition
+  under *Knobs* for why that is **not** something you can arrange in this
+  harness as shipped.
 
 ## Caveats
 
