@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Guard: nothing under a published docs directory is silently mishandled.
+"""Guard: no file under a published docs directory is rendered wrongly.
 
 Two failure modes, neither of which `mkdocs build --strict` can catch.
+
+NOT in scope: whether a renderable page has a `nav` entry. A Markdown page with
+no nav entry still builds, publishes and lands in the search index, and this
+guard returns OK for it -- mkdocs reports that case ("pages exist in the docs
+directory, but are not included in the nav") as a WARNING, so it is caught by
+`mkdocs build --strict` in the Docs Site workflow, which is ADVISORY (a job in a
+separate workflow cannot appear in `ci-success.needs`). So the merge-blocking
+scope is "mkdocs cannot render it / serves it raw", not "it is reachable".
 
 **1. A page mkdocs cannot render.** `exclude_docs` drops `*.adoc` wholesale
 because mkdocs renders no AsciiDoc, so every `.adoc` under a published directory

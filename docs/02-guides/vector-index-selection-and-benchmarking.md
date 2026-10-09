@@ -36,7 +36,7 @@ redundant — they optimise different cost terms.
 | | **PAX IVF** (co-located) | **AXIS IVF** (separate index) |
 |---|---|---|
 | Where vectors live | In the data object, as typed stripes | In the data object |
-| Where the index lives | *No separate index* — IVF coarse directory inside the segment footer | A separate in-memory HNSW/IVF structure; materialized projection bytes live under `indexes/<projection>/` |
+| Where the index lives | *No separate index* — the IVF coarse directory is **Region A0**, inside the same object | A separate in-memory HNSW/IVF structure; materialized projection bytes live under `indexes/<projection>/` |
 | Payload fetch | Same object, same GET family | Second hop after the index returns ids |
 | Quantization | RaBitQ (~1 bit/dim) → SQ8/FP16 rerank, in-segment | Index-side (IVF/HNSW/flat) |
 | Filtered search | Metadata stripes co-resident → prune before ranking | Needs a join or post-filter |
@@ -186,10 +186,20 @@ so your own corpus works without precomputed neighbours.
 PROXIMADB_SIFT_DATASET_DIR=/path/to/your/vectors \
 PROXIMADB_SIFT_N=100000 \
 PROXIMADB_SIFT_QUERIES=1000 \
-PROXIMADB_RECALL_DATASET_REQUIRED=1 \
-  cargo test --release --features io-trace \
-    --test sift_pax_recall_ratchet_test -- --nocapture
+  cargo nextest run --release --features io-trace \
+    --test sift_pax_recall_ratchet_test --no-capture
 ```
+
+Use **nextest**, not `cargo test`: three of the arms set process-global PAX env
+vars (`PROXIMADB_PAX_WRITE_RG_LAYOUT`, `PROXIMADB_PAX_FOOTER_STATS`) and the file
+has no mutex, relying instead on nextest's process-per-test isolation — under
+`cargo test` they run on parallel libtest threads and can clobber each other's
+write geometry, so the numbers stop being reproducible (mandate #11).
+
+Do **not** add `PROXIMADB_RECALL_DATASET_REQUIRED=1` here. It exists so CI fails
+loudly instead of skipping, and it asserts that **all three** files are present —
+including `sift_groundtruth.ivecs`, which is otherwise optional. Set it only when
+you have the full TEXMEX set and want a missing corpus to be an error.
 
 Add `,aws` to `--features` and set `PROXIMADB_OBJECT_STORE_URL=s3://bucket/prefix`
 (plus `AWS_ENDPOINT`/credentials) to measure under a **cloud** I/O budget rather
@@ -206,10 +216,31 @@ which understates the GET savings a cloud budget gives you.
 | `PROXIMADB_SIFT_RECALL_FLOOR` | fail below this recall@10 (default 0.90) |
 | `PROXIMADB_RECALL_DATASET_REQUIRED` | fail instead of skip when the corpus is missing |
 | `PROXIMADB_OBJECT_STORE_URL` | measure against a cloud/emulator base |
-| `PROXIMADB_SIFT_COALESCED_BYTE_BUDGET` | fail above this bytes/query |
-| `PROXIMADB_COUNT_FS_IO=1` | process-global GET/byte counters |
-| `PROXIMADB_PAX_READ_COARSE_NPROBE` | coarse cells probed (recall↔GET trade) |
-| `PROXIMADB_PAX_BLOCK_CLUSTER=1` + `PROXIMADB_PAX_FLUSH_CLUSTER=ivf` | train the IVF coarse directory at flush |
+| `PROXIMADB_PAX_READ_COARSE_NPROBE` | coarse cells probed (recall↔GET trade) — **requires a compacted segment**, see below |
+
+Two further gates appear in the test file but do nothing in the invocation above,
+because they are read only inside the `#[ignore]`d coalesced eval
+(`sift_coalesced_rabitq_scan_rerank_eval`, which needs `-- --ignored`):
+`PROXIMADB_SIFT_COALESCED_BYTE_BUDGET` (bytes/query ceiling) and
+`PROXIMADB_COUNT_FS_IO` (process-global GET/byte counters, which that eval sets
+for itself). The run above derives its GET and byte figures from io_trace
+snapshots instead, which is why it needs `--features io-trace`.
+
+!!! warning "nprobe is inert until something compacts — and flush will not do it"
+
+    `PROXIMADB_PAX_READ_COARSE_NPROBE` probes **Region A0**, and
+    **compaction is the only write path that emits A0**: the flush entry point
+    passes `None` for the probe plan (`segment_format.rs` — *"two-level is
+    compaction-only (TD-RDSTRAT-8)"*), because IVF-at-flush measured **~80×
+    flush cost** and was dropped. Training is already default-ON
+    (`PROXIMADB_PAX_WRITE_A0_TRAIN`), so there is **no env var that trains at
+    flush** — turning knobs cannot substitute for driving a compaction.
+
+    The ratchet above never compacts, so nprobe is structurally inert there and
+    the arms will measure byte-identical however you set it. The tests that do
+    exercise it (`sift_ivf2_coarse_probe_recall_ratchet`,
+    `sift_ivf2_probe_release_bakeoff_eval`) are `#[ignore]`d and drive
+    compaction themselves.
 
 ### Reading the output
 
@@ -298,8 +329,10 @@ Reading it:
   straight DEPTH-for-BYTES win, and the clearest tunable lever we measured.
 * With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
   **81 GETs / 92 ms probed vs 108 GETs / 144 ms unprobed** at recall
-  0.9860–0.9870 (ratchet 0.984) — better on every axis. Untrained, nprobe does
-  nothing, which is the trap: train before you tune.
+  0.9860–0.9870 (ratchet 0.984) — better on every axis. On an **uncompacted**
+  segment there is no Region A0 to probe, so nprobe does nothing: that is the
+  trap, and the fix is to drive a compaction, not to set another env var
+  (training is already default-ON, and flush deliberately never emits A0).
 
 ## Caveats
 
