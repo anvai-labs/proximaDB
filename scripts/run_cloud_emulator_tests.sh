@@ -85,7 +85,11 @@ AZURITE_CONN="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;Account
 #
 # The S3 surface is reached only through standard AWS env vars (endpoint, keys,
 # region) and the `aws` CLI, so nothing outside this block is emulator-specific.
-S3_EMULATOR_IMAGE="localstack/localstack@sha256:17c2f79ca4e1f804eb912291a19713d4134806325ef0d21d4c1053161dfa72d0"
+# Overridable so CI can point at the GHCR mirror (.github/workflows/mirror-ci-images.yml)
+# while a local `make cloud-emulator-test` keeps working against the public source
+# with no GHCR credentials. The default stays on the upstream registry, so this
+# changes nothing until the mirror is populated and the override is set.
+S3_EMULATOR_IMAGE="${PROXIMADB_CI_S3_EMULATOR_IMAGE:-localstack/localstack@sha256:17c2f79ca4e1f804eb912291a19713d4134806325ef0d21d4c1053161dfa72d0}"
 # LocalStack serves every service on one edge port.
 S3_EMULATOR_PORT=4566
 # LocalStack accepts any credentials; these are the conventional placeholders.
@@ -98,8 +102,14 @@ S3_SECRET_KEY=test
 # would reproduce precisely the failure TD-CI-6 is about — an upstream image
 # moves and a required check dies in a PR with no storage changes.
 # Both verified multi-arch (amd64 + arm64) against their registries.
-AZURITE_IMAGE="mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5"
-FAKE_GCS_IMAGE="fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef"
+#
+# Registry note: only the LocalStack and fake-gcs images are on Docker Hub, where
+# anonymous pulls are rate-limited per IP across the runner fleet. Azurite comes
+# from mcr.microsoft.com, which is unlimited and needs no auth -- it is the
+# pattern the other two should follow. `mirror-ci-images.yml` copies all three
+# into GHCR; set the PROXIMADB_CI_*_IMAGE overrides to use it.
+AZURITE_IMAGE="${PROXIMADB_CI_AZURITE_IMAGE:-mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5}"
+FAKE_GCS_IMAGE="${PROXIMADB_CI_FAKE_GCS_IMAGE:-fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef}"
 
 cleanup() { docker rm -f azurite s3-emulator fake-gcs >/dev/null 2>&1 || true; }
 trap cleanup EXIT
