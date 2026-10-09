@@ -78,6 +78,15 @@ entry, or the strict build fails on an unpublished page).
   plane, collections-admin, graph, time-series, rank search, CRUD and unified query to every
   generated SDK. Node SDK published to npm as `@anvailabs/proximadb-client`.
 
+### Breaking
+- **Minimum supported Python is now 3.11** (`requires-python = ">=3.11"`); the published
+  wheels' abi3 tag moves `cp310` -> `cp311`, so 3.10 installs are refused by metadata rather
+  than failing at import. 3.10 reached upstream end-of-life on 2026-10-01. This also fixes a
+  real defect: `load_config_file()` for `*.toml` raised `ImportError: tomli is required` in
+  every normal install, because `tomli` was declared only in the `dev`/`test` extras behind
+  `python_version < '3.11'` markers and never in `[project].dependencies`. It now uses the
+  stdlib `tomllib`.
+
 ### Deprecations
 - VIPER engine deprecated (ADR-093); Hive proto arm retired (TD-CAT-8); `OltpCatalog` gated
   behind the `oltp-catalog` feature (TD-CAT-7.4).
@@ -89,6 +98,8 @@ entry, or the strict build fails on an unpublished page).
   (TD-DEPS-2).
 - The published OpenAPI contract still reports `info.version: 0.2.0`; it is hardcoded rather than
   derived from the crate version.
+- 75 e2e test harnesses pick their server port with a bind-read-drop TOCTOU, which turns CI red
+  at random on PRs that did not cause it (TD-TESTPORT-1).
 
 ## [0.3.0] - 2026-08-05
 
