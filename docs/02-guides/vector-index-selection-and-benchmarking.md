@@ -8,7 +8,7 @@ flowchart TB
   C[Collection] --> D{"index_configs non-empty<br/>AND enable_axis_indexes<br/>AND axis feature built?"}
   D -->|no — the default| P[PAX scan path<br/>one object]
   D -->|yes — opt-in| X["AXIS index<br/>in-memory HNSW/IVF"]
-  P --> P1[coarse IVF probe<br/>prune cells]
+  P --> P1["coarse IVF probe<br/>prune cells<br/>(compacted segments only)"]
   P1 --> P2[RaBitQ rank<br/>~1 bit/dim]
   P2 --> P3[SQ8/FP16 rerank]
   P3 --> R1[top-k + payload<br/>same object]
@@ -240,10 +240,11 @@ which understates the GET savings a cloud budget gives you.
 | `PROXIMADB_RECALL_DATASET_REQUIRED` | fail instead of skip when the corpus is missing |
 | `PROXIMADB_OBJECT_STORE_URL` | measure against a cloud/emulator base |
 | `PROXIMADB_PAX_READ_COARSE_NPROBE` | coarse cells probed (recall↔GET trade) — **requires a compacted segment**, see below |
-| `PROXIMADB_SEGMENT_INVARIANTS_CACHE_MB` | **leave unset.** Unset keeps the cache-free baseline the CI rows were measured under; any value opts the run into the corresponding route-time cache policy, which changes both the numbers and which query pairs the paired cohort admits |
+| `PROXIMADB_SEGMENT_INVARIANTS_CACHE_MB` | **leave unset.** Unset keeps the cache-free baseline the CI rows were measured under; any value opts the run into the corresponding route-time cache policy, which changes both the numbers and the cohort they are reported under (`cache_policy` is part of the cohort key, so its identity changes; admission itself is not narrowed) |
 | `PROXIMADB_SURVIVOR_CACHE_BUDGET_MB` | **leave unset**, same reason |
 
-The table above is the set that is useful to set for this run — not an
+The table above is the set worth *knowing about* for this run — two of its rows
+exist to say leave them alone — and not an
 exhaustive list of what the file reads (it also consults the `PROXIMADB_SIFT_IVF2_*`
 family, `PROXIMADB_SIFT_IVF_FLUSH`, `PROXIMADB_IVF_K`,
 `PROXIMADB_TRAINING_COMPACTION_MIN_MB`, `PROXIMADB_TRACE_GETS` and others, which
@@ -330,7 +331,7 @@ from the brute-force oracle rather than the provided file — expected when you
 insert a subset.
 
 Note `pairs=30`. Recall is measured over all 1000 queries, but the paired I/O
-and compute figures come from a 30-pair sample at N=100k (300 pairs at N=10k,
+and compute figures come from a 30-pair sample at N=100k (300 pairs at N=10k with the default 1000 queries (the ci.yml job sets 100 queries, so 100 pairs there),
 3 at N=1M). Do not read the I/O columns as 1000-query averages.
 
 Four numbers decide a configuration, and you want them **together**:
@@ -406,14 +407,24 @@ Reading it:
   in the table, and it is a shipped default rather than a knob.
 * Moving from the **local 1 MiB target to the `s3://` 8 MiB target cut GETs 22%
   for +6% bytes at identical recall** — a straight DEPTH-for-BYTES win, and the
-  largest effect of any knob we turned. **Same caveat as the withheld 8.4×
-  above**, and stated here rather than only there because this is the figure a
-  reader is most likely to act on: it divides row 3 (CI, local budget) by row 4
-  (workstation, `s3://` budget), so it crosses machines. It is published, where
-  8.4× is not, because both sides are the *same ANN arm* measured the same way
-  and only the budget differs — whereas 8.4× also changed which leg (exact vs
-  ANN) was being compared. Re-measure both rows on one machine before quoting
-  this as a number rather than a direction.
+  largest effect we measured. **Same caveat as the withheld 8.4× above**, and
+  stated here rather than only there because this is the figure a reader is most
+  likely to act on.
+
+  Be precise about what varies, because an earlier revision claimed "only the
+  budget differs" and that is false: row 3 is CI under the local 1 MiB budget and
+  row 4 is a workstation under the `s3://` 8 MiB budget, so this crosses the
+  machine, the budget **and the storage backend** — local-filesystem reads versus
+  HTTP ranged GETs, the same confound the Caveats section names for latency.
+  Budget cannot in fact be varied alone this way: `IopsBudget::from_path` resolves
+  by scheme, so isolating it needs the per-location `io_budget` override
+  documented above, which this arm did not use. It is also not reached "by turning
+  a knob" — it is reached by changing the store URL.
+
+  It is published where 8.4× is not for one narrower reason: the 22% holds the
+  *leg* constant, ANN on both sides, whereas 8.4× compares an exact leg against an
+  ANN leg and so carries one confound more. Treat it as a direction, not a number,
+  until both rows are re-measured on one machine against one backend.
 * With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
   **81 GETs / 92 ms at recall 0.9860 probed vs 108 GETs / 144 ms at 0.9840
   unprobed** (ratchet 0.984) — better on every axis, recall included. (The

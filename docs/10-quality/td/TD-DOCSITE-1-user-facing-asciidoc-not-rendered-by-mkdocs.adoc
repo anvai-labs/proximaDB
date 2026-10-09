@@ -8,7 +8,7 @@
 | Status | **Open.** Filed 2026-10-08 when the mkdocs pipeline was introduced; the site ships with the Markdown pages and excludes `*.adoc` wholesale.
 | Priority | **MEDIUM.** The site is coherent and strict-clean today, but a user following `05-concepts/index.md` hits links to pages that are not published. Content exists; it is unreachable from the site.
 | Component | `mkdocs.yml` (`exclude_docs`, `validation`), `scripts/check_docs_site_coverage.py`, `docs/.site-coverage-baseline.json`, `docs/00-product`, `docs/02-guides`, `docs/03-api-reference`, `docs/04-operations`, `docs/05-concepts`
-| Relates to | TD-VECEVAL-1 (the guide that prompted the site), mandate #12 (don't bolt on a fragile duplicate)
+| Relates to | TD-VECEVAL-1 (filed alongside the guide that prompted the site), mandate #12 (don't bolt on a fragile duplicate)
 | Blocked by | Nothing. Needs a decision on conversion vs a second renderer.
 |===
 

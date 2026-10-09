@@ -37,18 +37,38 @@ tool that prints GETs/query.
   truth is absent or a subset is inserted it computes a **brute-force oracle over
   the inserted rows**. So arbitrary customer corpora already work.
 * **The measurement is implemented:** per-query GET / ranged-GET / bytes /
-  compute-ms, via `PROXIMADB_COUNT_FS_IO` + the `CountingFileSystem` seam and the
-  `io_trace` records, plus recall against the oracle, plus a bytes/query budget
-  assertion.
+  compute-ms, via the **`io_trace` records**, plus recall against the oracle.
++
+  The seam matters for item 1 below, so be precise about it:
+  `record_physical_full_read` is **always-on query evidence** --
+  `src/storage/persistence/filesystem/mod.rs` says so in terms, and adds that
+  `PROXIMADB_COUNT_FS_IO` "controls only the separate process-global benchmark
+  counters". An earlier revision of this bullet credited
+  `PROXIMADB_COUNT_FS_IO` + the `CountingFileSystem` wrapper, which is the wrong
+  one: the documented run never sets that var (only the two `#[ignore]`d evals
+  do), and the guide tells readers **not** to, because the check is
+  `var_os(...).is_some()` so even `=0` wraps the filesystem and changes the stack
+  the latency numbers come from.
++
+  Nor is there a bytes/query budget assertion in the documented run -- its asserts
+  are `measured > 0`, the paired-sample minimum, and `recall >= floor`. The byte
+  budget (`PROXIMADB_SIFT_COALESCED_BYTE_BUDGET`) is read only inside the
+  `#[ignore]`d `sift_coalesced_rabitq_scan_rerank_eval`.
 * **Cloud budgets are reachable** through `PROXIMADB_OBJECT_STORE_URL`, which is
-  how the 4 MiB-vs-8 MiB budget difference was measured.
+  how the **local 1 MiB vs `s3://` 8 MiB** budget difference was measured.
+  (An earlier revision said "4 MiB-vs-8 MiB". That is the same provenance error
+  the guide page corrected and this TD republished: `IopsBudget::LOCAL.target` is
+  1 MiB and `S3.target` is 8 MiB; 4 MiB is the AZURE/CLOUD profile, and no
+  Azure-budget arm is measured anywhere in this work.)
 
 == How to apply
 
 1. **Add a subcommand to the existing `proximadb-ann-bench`** (do not create a
    third benchmark vehicle) — e.g. `proximadb-ann-bench io-cost` — that reuses
-   the test's `.fvecs`/`.ivecs` parser, brute-force oracle, and counter
-   snapshotting. Extract those three into a small lib module both callers share,
+   the test's `.fvecs`/`.ivecs` parser, brute-force oracle, and **`io_trace`
+   snapshotting** -- not the `CountingFileSystem` counters, per the seam note
+   above; wiring the user tool to a different counter set than the gate uses is
+   exactly the drift item 3 exists to prevent. Extract those three into a small lib module both callers share,
    rather than copying them.
 2. **Emit a machine-readable artifact** (JSON/CSV: `corpus_n`, `dim`, `top_k`,
    `nprobe`, `budget_target_bytes`, `recall_at_k`, `gets_per_query`,
