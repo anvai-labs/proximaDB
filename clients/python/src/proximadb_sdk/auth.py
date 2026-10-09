@@ -13,7 +13,7 @@ import logging
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -95,7 +95,7 @@ class AuthResult:
         """Check if the authentication token is expired"""
         if self.token_expires_at is None:
             return False
-        return datetime.now(timezone.utc) >= self.token_expires_at
+        return datetime.now(UTC) >= self.token_expires_at
 
     def has_permission(self, permission: Permission) -> bool:
         """Check if the user has a specific permission"""
@@ -405,7 +405,7 @@ class ProximaDBAuth:
                 # If timestamp is in milliseconds (> 1e12), convert to seconds
                 if timestamp > 1e12:
                     timestamp = timestamp / 1000.0
-                return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+                return datetime.fromtimestamp(timestamp, tz=UTC)
             except (ValueError, TypeError):
                 logger.warning(f"Could not parse expiration time: {expires_str}")
                 return None
@@ -448,7 +448,7 @@ class ProximaDBAuth:
 
         # Refresh if token expires within threshold
         threshold = timedelta(minutes=self.config.refresh_threshold_minutes)
-        return datetime.now(timezone.utc) >= (
+        return datetime.now(UTC) >= (
             self.auth_result.token_expires_at - threshold
         )
 

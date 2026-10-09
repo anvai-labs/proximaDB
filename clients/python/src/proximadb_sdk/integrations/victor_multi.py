@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +121,7 @@ class ProximaDBMultiModelProvider(ProximaDBEmbeddingProvider):
             "file_path": file_path_str,
             "language": language,
             "file_hash": file_hash,
-            "indexed_at": datetime.now(timezone.utc).isoformat(),
+            "indexed_at": datetime.now(UTC).isoformat(),
         }
         if metadata:
             base_meta.update(metadata)
@@ -273,7 +273,7 @@ class ProximaDBMultiModelProvider(ProximaDBEmbeddingProvider):
         - Nesting depth
         - Code churn (from git history, if available)
         """
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
 
         for metric in metrics:
             metric_record = {

@@ -275,6 +275,14 @@ jobs:
   #
   # Do NOT re-enable here — extend release-python.yml instead.
   #
+  # The `python:` version rows in the commented-out matrix below are HISTORICAL
+  # TEXT, not a floor declaration. Note the `3.9` rows: they were already below
+  # the then-current `requires-python = ">=3.10"` floor and survived that entire
+  # era untouched. They are deliberately left as-is when the floor moves (e.g.
+  # the 3.10 -> 3.11 raise), so a stale version here is not a gap — do not
+  # re-raise it. This file is `on: workflow_call` with ZERO callers in the repo,
+  # and the block no longer even defines the `build-wheels` job.
+  #
   # build-wheels:
   #   name: Build Wheels (${{ matrix.os }}, ${{ matrix.python }})
   #   needs: cache-check

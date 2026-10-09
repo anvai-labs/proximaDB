@@ -255,6 +255,15 @@ extend-exclude = '''
 )/
 '''
 
+# ruff does NOT read [tool.isort] -- it has its own isort implementation under
+# [tool.ruff.lint.isort]. Without this, ruff run from the REPO ROOT (which is how
+# .pre-commit-config.yaml invokes it: `--config clients/python/pyproject.toml`)
+# cannot infer `proximadb_sdk` as first-party, so it reports I001 on files that
+# are correctly ordered and the --fix hook rewrites them. It passed when run with
+# cwd=clients/python only because src-root inference happened to work there.
+[tool.ruff.lint.isort]
+known-first-party = ["proximadb_sdk", "proximadb"]
+
 [tool.isort]
 profile = "black"
 multi_line_output = 3

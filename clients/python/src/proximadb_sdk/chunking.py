@@ -30,6 +30,7 @@ import json
 import threading
 from collections import defaultdict
 from collections.abc import Callable
+from datetime import UTC
 from enum import Enum
 from typing import Any
 
@@ -776,7 +777,7 @@ def prepare_records(
         ...     filterable_fields=["section", "has_numbers"]
         ... )
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     # Extract chunks from response
     chunks = response.get("chunks", [])
@@ -870,8 +871,8 @@ def prepare_records(
 
         # 6. System metadata (extra)
         metadata["source_id"] = source_id
-        metadata["created_at"] = datetime.now(timezone.utc).isoformat()
-        metadata["indexed_at"] = datetime.now(timezone.utc).isoformat()
+        metadata["created_at"] = datetime.now(UTC).isoformat()
+        metadata["indexed_at"] = datetime.now(UTC).isoformat()
 
         record = {
             "id": chunk_id,

@@ -202,6 +202,18 @@ jobs:
               - 'clients/python/**'
               - 'clients/python-embedded/**'
               - 'proto/**'
+              # The three below were missing, so this filter could not see
+              # changes to its own inputs -- the same defect class the `rust:`
+              # filter's comment names. Root `pyproject.toml` is the maturin
+              # package that declares `requires-python` AND the ruff/mypy
+              # targets; `python-queue-embedded` is a third Python package with
+              # its own `requires-python`; and a change to ci.yml itself (e.g.
+              # editing the interpreter matrix) triggered neither python job.
+              # A PR raising the floor in the root package alone would have run
+              # no Python CI at all.
+              - 'pyproject.toml'
+              - 'clients/python-queue-embedded/**'
+              - '.github/workflows/ci.yml'
             ui:
               - 'ui/**'
               - '.github/workflows/ci.yml'
