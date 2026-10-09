@@ -27,24 +27,37 @@ extract_version_from_file() {
     return
   fi
 
+  # Every extractor below returns a `<MISSING-...>` sentinel when the file is
+  # present but the field is absent, because an EMPTY return reads as `[SKIP]`
+  # and `[SKIP]` passes. That fail-open was found in NINE places — deleting the
+  # version from the root pyproject, the SDK pyproject, clients/rust/Cargo.toml,
+  # ui/package.json, either Chart.yaml key, either __init__.py, or the root
+  # [package] version all made `check` PASS. A deleted field is exactly as much
+  # a release defect as a wrong one. (A missing FILE still skips; that is
+  # deliberate, since not every checkout has every client.)
+  local out
   case "$type" in
     cargo)
-      grep '^version = ' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/'
+      out=$(grep '^version = ' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/')
       ;;
     pyproject)
-      grep '^version = ' "$file" | sed 's/.*"\(.*\)".*/\1/'
+      out=$(grep '^version = ' "$file" | sed 's/.*"\(.*\)".*/\1/')
       ;;
     python_init)
-      grep '__version__' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/'
+      out=$(grep '__version__' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/')
       ;;
     yaml_version)
-      grep '^version:' "$file" | sed 's/.*: *\(.*\)/\1/'
+      out=$(grep '^version:' "$file" | sed 's/.*: *\(.*\)/\1/')
       ;;
     yaml_appversion)
-      grep '^appVersion:' "$file" | sed 's/.*"\(.*\)".*/\1/' | head -1
+      out=$(grep '^appVersion:' "$file" | sed 's/.*"\(.*\)".*/\1/' | head -1)
       ;;
     package_json)
-      grep '"version"' "$file" | head -1 | sed 's/.*: *"\(.*\)".*/\1/'
+      # NOT the first `"version"` line: in a lockfile that is the top-level
+      # field, and if it is deleted this silently falls through to
+      # packages[""] and prints a confident [OK]. Anchor to column 2, which is
+      # where both package.json's and a lockfile's own top-level field sit.
+      out=$(grep -m1 '^  "version"' "$file" | sed 's/.*: *"\(.*\)".*/\1/')
       ;;
     # `cargo` takes the FIRST `^version = ` line, which is [package]. The
     # [workspace.package] version is further down the file and was therefore
@@ -57,11 +70,11 @@ extract_version_from_file() {
     # it leaked a later table's version when `[workspace.package]` had none,
     # because the section flag was never reset at the next header.
     cargo_workspace)
-      python3 -c 'import sys,tomllib
+      out=$(python3 -c 'import sys,tomllib
 with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
 v=d.get("workspace",{}).get("package",{}).get("version")
 print(v if v else "<MISSING-workspace.package.version>")' "$file" 2>/dev/null \
-        || echo "<UNPARSEABLE-$file>"
+        || echo "<UNPARSEABLE-$file>")
       ;;
     # M2: intra-workspace path dependencies carry an explicit version
     # requirement that MUST track [workspace.package] — cargo fails with
@@ -69,7 +82,7 @@ print(v if v else "<MISSING-workspace.package.version>")' "$file" 2>/dev/null \
     # break the release gate was blind to. Reports the first mismatching pin so
     # the comparison fails with a useful value.
     cargo_path_dep_pins)
-      python3 -c 'import sys,tomllib
+      out=$(python3 -c 'import sys,tomllib
 with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
 pins={}
 def walk(tbl, prefix=""):
@@ -88,17 +101,17 @@ vals=set(pins.values())
 if not pins: print("<NO-PATH-DEP-PINS>")
 elif len(vals)==1: print(next(iter(vals)))
 else: print("<MIXED:"+",".join(f"{k}={v}" for k,v in sorted(pins.items()))+">")' "$file" 2>/dev/null \
-        || echo "<UNPARSEABLE-$file>"
+        || echo "<UNPARSEABLE-$file>")
       ;;
     # M2: the `embedded` extra pins the wheel this release builds. Its own upper
     # bound once excluded that wheel, making `pip install proximadb[embedded]`
     # unsatisfiable. Reports the LOWER bound so a stale pin fails.
     python_extra_lower_bound)
-      python3 -c 'import re,sys
+      out=$(python3 -c 'import re,sys
 s=open(sys.argv[1]).read()
 m=re.search(r"proximadb_embedded>=([0-9][^,\"]*),<", s)
 print(m.group(1) if m else "<NO-EMBEDDED-EXTRA-BOUND>")' "$file" 2>/dev/null \
-        || echo "<UNPARSEABLE-$file>"
+        || echo "<UNPARSEABLE-$file>")
       ;;
     # A package-lock.json records the package's own version TWICE: top-level and
     # packages[""]. `package_json` above only sees the first, so the second could
@@ -109,13 +122,19 @@ print(m.group(1) if m else "<NO-EMBEDDED-EXTRA-BOUND>")' "$file" 2>/dev/null \
     # so the gate dies with no diagnostics on exactly the field it was added to
     # watch. Verified by deleting `packages[""]["version"]`.
     package_lock_own)
-      python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"][""]["version"])' "$file" 2>/dev/null \
-        || echo "<UNPARSEABLE-$file>"
+      out=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"][""]["version"])' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>")
       ;;
     *)
       echo ""
+      return
       ;;
   esac
+  if [ -z "$out" ]; then
+    echo "<MISSING-$type-in-$file>"
+  else
+    echo "$out"
+  fi
 }
 
 cmd_get() {
@@ -287,14 +306,48 @@ PYEOF
   #    env!("CARGO_PKG_VERSION")) and the proximadb-embedded binding (which sets
   #    the Python package's __version__). Missing it meant a "0.4.0" release
   #    whose server said 0.2.0 while its own /health said 0.4.0.
-  perl -i -0pe 's/(\[workspace\.package\]\s*\nversion = )".*"/${1}"'"$version"'"/' "$REPO_ROOT/Cargo.toml"
-  echo "  [SET]  Cargo.toml [workspace.package] -> $version"
+  #    Steps 2 and 3 are python with ASSERTIONS rather than bare perl, because
+  #    both failed silently: step 2's regex required `version` to be the FIRST
+  #    key after the header (move `edition` above it and the substitution matched
+  #    nothing while `[SET]` printed anyway), and step 3's required `version`
+  #    BEFORE `path` — so a pin written `{ path = "...", version = "..." }` was
+  #    READ by check and never written by set, leaving a gate its own remediation
+  #    could not fix.
+  python3 - "$REPO_ROOT/Cargo.toml" "$version" <<'PYEOF' || exit 1
+import re
+import sys
 
-  # 3. Intra-workspace path dependencies carry an explicit version requirement,
-  #    which must track [workspace.package] or resolution fails with
-  #    "failed to select a version for the requirement".
-  perl -i -pe 's/version = "\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?", path =/version = "'"$version"'", path =/g' "$REPO_ROOT/Cargo.toml"
-  echo "  [SET]  Cargo.toml intra-workspace path deps -> $version"
+path, version = sys.argv[1], sys.argv[2]
+text = open(path).read()
+
+# [workspace.package] version, wherever it sits inside that table.
+m = re.search(r"^\[workspace\.package\]\s*$", text, re.M)
+if not m:
+    sys.exit(f"{path}: no [workspace.package] table — not modified")
+start = m.end()
+nxt = re.search(r"^\[", text[start:], re.M)
+end = start + (nxt.start() if nxt else len(text) - start)
+table = text[start:end]
+table_new, n = re.subn(
+    r'(?m)^(\s*version\s*=\s*)["\'][^"\']*["\']', r'\g<1>"' + version + '"', table, count=1
+)
+if n != 1:
+    sys.exit(f"{path}: [workspace.package] has no version key — not modified")
+text = text[:start] + table_new + text[end:]
+
+# Intra-workspace path-dep pins, in EITHER key order.
+pin = re.compile(
+    r'(\{[^{}\n]*?)version\s*=\s*["\']\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?["\']'
+    r'([^{}\n]*?path\s*=)'
+)
+text, a = pin.subn(r'\g<1>version = "' + version + r'"\g<2>', text)
+pin_rev = re.compile(
+    r'(\{[^{}\n]*?path\s*=[^{}\n]*?)version\s*=\s*["\']\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?["\']'
+)
+text, b = pin_rev.subn(r'\g<1>version = "' + version + '"', text)
+open(path, "w").write(text)
+print(f"  [SET]  Cargo.toml [workspace.package] + {a + b} path-dep pin(s) -> {version}")
+PYEOF
 
   # 4. pyproject.toml (root) — this is the canonical proximadb_embedded wheel.
   perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/pyproject.toml"

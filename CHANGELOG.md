@@ -4,7 +4,11 @@ All notable changes to ProximaDB will be documented in this file.
 
 ## [0.4.0] - unreleased
 
-Storage-substrate release (416 commits since the `v0.3.0` **tag**, cut
+Storage-substrate release (**415** commits since the `v0.3.0` tag, counted at
+this release branch's merge-base — the number moves with the anchor, so the
+anchor is stated: 415 at the branch point, 417 on `develop` at the time of
+writing. An earlier revision said 416, which counted this branch's own first
+commit. The tag was cut
 2026-08-15; the 0.3.0 entry below is dated 2026-08-05, when
 `chore(release): prepare v0.3.0` landed — the release spanned four promotion
 rounds between those dates, so both dates are real and mean different things.
