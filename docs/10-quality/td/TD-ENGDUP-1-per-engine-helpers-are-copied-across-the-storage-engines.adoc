@@ -1,0 +1,158 @@
+// Copyright (C) 2025 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-ENGDUP-1: 16 helper bodies are copied across the storage engines, and a generic copy already exists
+
+[cols="1,3"]
+|===
+| Status | **Open.** Filed 2026-10-09 from a structural sweep of the v0.4.0 tree
+(`develop` @ `9d6acc7f4`).
+| Severity | Low-to-medium. Behaviour is correct today and **no drift has been demonstrated** --
+an earlier revision of this file claimed two pieces of drift evidence and both were measurement
+artifacts (see "Measurement notes"). The cost is maintenance surface: a fix to one engine's copy
+does not reach the others, and 40 copies sit where one shared definition would do.
+| Owner | unassigned
+|===
+
+== What
+
+Across the storage-engine trees, **16 helper bodies are byte-identical (after comment and
+whitespace normalisation) in more than one engine, accounting for 40 removable copies**:
+
+|===
+| Helper | LOC | Copies | Engines | Where
+
+| `filter_candidates` | 21 | 7 | helix, nova, raptor, sst, swift, viper | `progressive_stages.rs` ×6 + `swift/stages.rs:154`
+| `compute_distances` (Binary stage) | 26 | 6 | helix, nova, raptor, sst, swift, viper | `progressive_stages.rs`
+| `create_test_engines` | 10 | 6 | helix, nova, raptor, sst, swift, viper | `progressive_stages.rs`
+| `compute_distances` (Int8 stage) | 30 | 5 | helix, nova, sst, swift, viper | `progressive_stages.rs`
+| `convert_filter_to_index` | 58 | 4 | helix, nova, raptor, viper | `helix/mod.rs`, `{nova,raptor,viper}/engine.rs`
+| `rls_record_filter` | 25 | 4 | helix, nova, sst, viper | `helix/mod.rs:2268`, `nova/engine.rs:2045`, `sst/trait_impl.rs:511`, `viper/engine.rs:3095`
+| `cleanup_compacted_files` | 11 | 3 | helix, sst, viper | `*/eventlog*.rs`
+| `for_search` | 11 | 3 | helix, sst, viper | `helix/proximablocks_strategy_reader.rs:82`, `sst/sst_reader.rs:108`, `viper/parquet_strategy_reader.rs:63`
+| `new` | 28 | 3 | helix, sst, viper | `src/datafusion/engine_adapters/*_adapter.rs`
+| `supports_filters_pushdown` | 19 | 3 | helix, sst, viper | `src/datafusion/engine_adapters/*_adapter.rs`
+| `new` | 10 | 3 | helix, sst, viper | `*/eventlog*.rs`
+| `create_filesystem_factory_sync` | 24 | 2 | sst, viper | `*/indexed_reader.rs`
+| `get_pca_model` | 24 | 2 | sst, swift | `sst/core.rs:1078`, `swift/engine.rs:915`
+| `get_quantization_engine` | 21 | 2 | raptor, viper | `raptor/engine.rs:445`, `viper/engine.rs:1808`
+| `mmap_parquet_file` | 15 | 2 | nova, viper | `nova/engine.rs:603`, `viper/engine.rs:707`
+| `extraction_capabilities` | 13 | 2 | nova, swift | `nova/extraction.rs:223`, `swift/extraction.rs:224`
+|===
+
+Only **three** sets live wholly inside `progressive_stages.rs`; `filter_candidates` is there in
+six of its seven sites; the remaining twelve are spread across the engine trees and the
+DataFusion adapters. That distribution is what determines the shape of the fix, and an earlier
+revision of this TD got it wrong by assuming all sixteen were in one file.
+
+=== The per-engine `progressive_stages.rs` files
+
+`src/storage/engines/<engine>/progressive_stages.rs` exists once per engine for **1,721 LOC**:
+
+|===
+| Engine | LOC | Identical non-blank lines shared with the SST copy
+
+| sst    | 271 | (baseline, 235 non-blank)
+| nova   | 267 | 192 / 231 (83%)
+| swift  | 273 | 194 / 236 (82%)
+| viper  | 268 | 192 / 232 (83%)
+| helix  | 302 | 194 / 263 (74%)
+| raptor | 340 | 174 / 298 (58%)
+|===
+
+Those percentages count any identical non-blank line anywhere in the file, which includes
+punctuation-only lines -- for nova, 42 of the 192 matches are braces and 7 are comments, leaving
+143 substantive. On a substantive-only basis the range is 59-85% rather than 58-83%. The headline
+is not overstated, but the measure is looser than "identical lines" suggests.
+
+`swift/stages.rs` (822 LOC, compiled via `swift/mod.rs:190`) shares 179 of its lines with
+`swift/progressive_stages.rs` and is **excluded** from the 1,721 total, so the duplication in
+that engine is larger than the table shows.
+
+== The finding that should drive the fix
+
+**A generic, already-compiled copy of these stages exists in-tree.**
+`src/storage/engines/core/progressive/stage.rs` (535 LOC, compiled via
+`src/storage/engines/core/mod.rs:19 pub mod progressive;`) defines `BinaryStage`, `Int8Stage`,
+`PqStage` and friends implementing `ProgressiveSearchStage` -- and its `compute_distances` bodies
+are **byte-identical** to the per-engine ones (Binary variant at `stage.rs:229`, Int8 at
+`stage.rs:302`), as are `new`, `quantization_level` and `can_skip`.
+
+So the generic abstraction is not hypothetical future work: it is written, compiled, and already
+duplicated by the six engine copies. Each cross-engine count above is therefore understated by
+one. The question is not "should we build a shared stage driver" but "why do the engines not use
+the one that exists", and that is what the first slice should answer.
+
+== Why consolidating is worth doing
+
+. **40 copies is 40 places to keep a fix.** No drift has been observed, but the surface is real,
+  and `create_test_engines` being duplicated six ways means the test fixtures can drift
+  independently -- the hazard mandate #11 exists to prevent.
+. **It is a cheap reduction of `src/storage`.** That module is 295,958 LOC -- 37% of the root
+  crate -- and 26 of the 41 top-level modules under `src/` reference `crate::storage::`. Shared
+  helpers are the part with no engine-specific semantics, so they carry the least behavioural
+  risk per line removed.
+. **The DataFusion adapter copies matter more than their size.** `new` and
+  `supports_filters_pushdown` are duplicated across the three `*_adapter.rs` files, and ADR-039
+  constrains what may live behind that seam -- three copies means three places to keep the lane
+  discipline right.
+
+== Options
+
+. **Answer the `engines/core/progressive/stage.rs` question first.** Determine why each engine
+  carries its own stage file when a generic one is compiled: genuine per-engine divergence
+  (RAPTOR's Int8 stage, ~78 lines, does look engine-specific), or drift from a migration that was
+  never finished. This is a reading task, not a refactor, and it decides whether option 2 is a
+  move or a redesign. Nothing else should start before it.
+. **Lift the twelve non-`progressive_stages` helpers** to a shared home. The bodies are
+  byte-identical, so the first pass is a move plus a `use`.
+. **Then collapse the stage files** according to what option 1 found.
+. **Guard it.** The duplicate-body detector used here is a content hash over normalised function
+  bodies; baselining the cross-engine clone count and ratcheting it down stops the class
+  regrowing.
+
+On the destination: `proximadb-engine-core` is the natural candidate because the root crate
+already depends on it (`Cargo.toml:775`) and it describes itself as "Shared engine-core ops +
+formats hoisted out of the root crate" -- so no new dependency edge is introduced. Note its
+fan-out of 20 (rank 2 of 152) is the number of crates it *depends on*, not the number depending
+on it; its fan-in is 2, so it is not yet a widely shared destination and lifting into it pulls 20
+edges into scope.
+
+== Verification
+
+* Byte-identity of each lifted body is the precondition: the move must be a pure relocation,
+  diffable before and after on the normalised body.
+* `cargo nx` and `cargo build --profile release-server` green. The ANN recall ratchets
+  (`sift_pax_cascade_recall_at_10_ratchet`, `tests/sift_pax_recall_ratchet_test.rs:575`, and
+  `sift_pax_filtered_cascade_recall_ratchet`, `:2472`) unchanged -- `compute_distances` and
+  `filter_candidates` are on the search path, so a behavioural change there moves recall.
+* `scripts/check-layering.sh` and `scripts/check_workspace_boundaries.py` green.
+* `make work-commit-check` green.
+
+== Measurement notes
+
+An earlier revision of this TD asserted two pieces of drift evidence. **Both were artifacts, and
+both are retracted:**
+
+* **"`convert_filter_to_index` ... raptor differs by two characters"** -- measured with a fixed
+  60-line window from the `fn` line, not the function's extent. At the real brace-matched extent
+  helix, nova, raptor and viper are all **identical** (md5 `af8321cc98`, 59 lines, 1,581
+  normalised chars); the two characters were the start of the *next* function. The function is
+  also defined in **six** engines, not five -- `sst/search/mod.rs:1171` was omitted, and its body
+  differs (1,674 chars), as does SWIFT's (`swift/engine.rs:834`, 1,365 chars, 56 lines). SWIFT and
+  SST genuinely differ; raptor does not. The table above was right while that prose was wrong,
+  which should have been caught by reading one against the other.
+* **"`compute_distances` exists in two different identical-body variants ... which is what
+  partial propagation looks like"** -- the two "variants" are the `BinaryStage` and `Int8Stage`
+  trait impls, two distinct methods on two distinct structs that coexist **in the same file in
+  every engine** (`sst/progressive_stages.rs:57` and `:128`, with a third at `:186` for Fp32).
+  They differ because one hamming-scores binary codes and the other dequantises int8. The 6-vs-5
+  gap is only that RAPTOR's Int8 stage is engine-specific. No partial propagation is demonstrated.
+
+Also worth recording: matching function **name+signature** rather than body reports ~26,000
+"duplicated" lines in this repo, because `fn main()` and `validate` recur with entirely
+different bodies. Hashing normalised **bodies** restricted to non-test files with bodies of 16+
+lines gives 52-53 cross-file clone sets and roughly 1,800-1,900 removable LOC repo-wide; that
+threshold is load-bearing and six of the sixteen rows above fall below it, so the sets here are
+the largest coherent *cross-engine* cluster rather than the largest sets overall.
+
+See also TD-ORPHAN-1.
