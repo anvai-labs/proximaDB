@@ -43,8 +43,17 @@ jobs:
             build-mode: none
           - language: javascript-typescript
             build-mode: none
+          # `none`, not `autobuild`: there is no `go.mod` at the repository root
+          # (the modules are `clients/go`, `clients/go/codegen`,
+          # `clients/go-embedded` — 21 .go files in total), so autobuild found no
+          # Go build, fell back to the build system it *did* detect, and compiled
+          # the whole 1.6M-LOC Rust workspace to analyse those 21 files. On a 16GB
+          # runner that is evicted mid-compile — `CodeQL Analyze (go)` failed with
+          # "runner has received a shutdown signal" while emitting *Rust* compiler
+          # warnings, which is how this was found. Buildless extraction matches
+          # every other language in this matrix and removes the Rust build.
           - language: go
-            build-mode: autobuild
+            build-mode: none
           - language: actions
             build-mode: none
     steps:
