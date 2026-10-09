@@ -1614,16 +1614,12 @@ class ProximaDBSyncGrpcClient:
                 for k, v in node.properties.items()
             },
             "created_at": (
-                datetime.fromtimestamp(
-                    node.created_at_ms / 1000, tz=UTC
-                ).isoformat()
+                datetime.fromtimestamp(node.created_at_ms / 1000, tz=UTC).isoformat()
                 if node.created_at_ms
                 else None
             ),
             "updated_at": (
-                datetime.fromtimestamp(
-                    node.updated_at_ms / 1000, tz=UTC
-                ).isoformat()
+                datetime.fromtimestamp(node.updated_at_ms / 1000, tz=UTC).isoformat()
                 if node.updated_at_ms
                 else None
             ),
@@ -1644,16 +1640,12 @@ class ProximaDBSyncGrpcClient:
             },
             "weight": edge.weight if edge.HasField("weight") else None,
             "created_at": (
-                datetime.fromtimestamp(
-                    edge.created_at_ms / 1000, tz=UTC
-                ).isoformat()
+                datetime.fromtimestamp(edge.created_at_ms / 1000, tz=UTC).isoformat()
                 if edge.created_at_ms
                 else None
             ),
             "updated_at": (
-                datetime.fromtimestamp(
-                    edge.updated_at_ms / 1000, tz=UTC
-                ).isoformat()
+                datetime.fromtimestamp(edge.updated_at_ms / 1000, tz=UTC).isoformat()
                 if edge.updated_at_ms
                 else None
             ),

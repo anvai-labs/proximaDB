@@ -469,9 +469,7 @@ def test_headers_triggers_refresh_when_near_expiry():
                 {
                     "access_token": "newtok",
                     "refresh_token": "newref",
-                    "expires_at": (
-                        datetime.now(UTC) + timedelta(hours=2)
-                    ).isoformat(),
+                    "expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
                 },
             )
         return FakeResponse(200, {})

@@ -1,13 +1,13 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-TESTPORT-1: 40 e2e harnesses pick a server port with a bind-read-drop TOCTOU
+= TD-TESTPORT-1: 75 e2e harnesses pick a server port with a bind-read-drop TOCTOU
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
 | Status | **Open.** Filed 2026-10-08 after it turned `Rust Integration Tests (graph)` red on an unrelated PR (#1965, a Python-floor bump touching zero Rust source).
 | Severity | Medium — no production code affected. It makes CI red at random on PRs that did not cause it, which is the expensive kind of flake: it costs a runner cycle plus the reviewer time to prove innocence.
-| Component | `tests/*_e2e.rs` (40 files declaring `fn free_port`), e.g. `tests/graph_select_pgwire_decline_e2e.rs:17-21`
+| Component | `tests/*_e2e.rs` (75 files declaring `fn free_port`, every one of them dropping the listener), e.g. `tests/graph_select_pgwire_decline_e2e.rs:17-21`
 | Evidence | CI run 37874140828, job 113646027384 (head `05f01d0b7`): `panicked at tests/graph_select_pgwire_decline_e2e.rs:119: connect: Error { kind: Io, cause: "bytes remaining on stream" }`. Develop's own CI run 37863295468 was green, so this was not a red-develop situation.
 | Related | TD-CONV-1 (a *different* e2e flake — CWD-relative catalog WAL; this one is ports, and the graph harness already anchors `metadata_url` under its `TempDir`)
 |===
@@ -28,15 +28,29 @@ fn free_port() -> u16 {
 
 Bind, read the port, **drop the listener**, then hand the bare number to the
 server to bind for itself. Between the `drop` and the server's own `bind`,
-anything on the machine may take that port — another test in the same CI job
-(nextest and the integration lanes run suites concurrently), or any unrelated
-process. `tokio_postgres::connect` then reaches whatever is listening there, and
+anything may take that port.
+
+**Including the harness itself, which is the likeliest path to the observed
+error.** `graph_select_pgwire_decline_e2e.rs:32-34` calls `free_port()` three
+times back to back for `pg_port`, `rest_port` and `grpc_port`, each releasing its
+port before the next call asks the kernel for one. If two calls return the same
+number, the REST/axum listener binds it and the pgwire listener loses it — and
+`tokio_postgres::connect` to `pg_port` then reads an **HTTP** response, which is
+precisely `"bytes remaining on stream"`. No second process is required. The
+harness also only waits on `GET /health` against `rest_port` plus a 200 ms sleep,
+so it never confirms that pgwire is what is listening on `pg_port`. The other
+path — another test or an unrelated process taking the port — is also real, and
+option 1 below covers both. `tokio_postgres::connect` then reaches whatever is listening there, and
 a non-pgwire peer produces exactly the observed `"bytes remaining on stream"`:
 the client read bytes that are not a Postgres startup response.
 
-`git grep -l "fn free_port" -- 'tests/*.rs'` finds **75** files; **40** of them
-contain the `drop(l)` form. The remaining 35 should be audited — some may already
-bind-and-hold.
+`git grep -l "fn free_port" -- 'tests/*.rs'` finds **75** files, and **all 75**
+drop the listener. There are two spellings of the same helper — `drop(l)` in 40
+files and `drop(listener)` in 35 — which is one copy-paste lineage, not two
+implementations. **None bind-and-hold**, so there is nothing to audit; an earlier
+revision of this TD said "40" and sent the reader to check whether the other 35
+were already safe, which is a known-false errand. That the body is identical
+across 75 files is the argument for fix option 3.
 
 == Why it is worth fixing rather than retrying
 
@@ -53,7 +67,8 @@ per occurrence.
 . **Bind and hold.** Pass the bound `TcpListener` to the server instead of a port
   number, so the port is never unowned. Correct by construction, and the only
   option with no window at all. Needs the server's bind path to accept a
-  pre-bound listener.
+  pre-bound listener — and for a harness that needs several ports, **all** of
+  them must be pre-bound, or the self-collision above survives.
 . **Retry the connect, not the bind.** A bounded retry loop around
   `tokio_postgres::connect` closes the observed symptom but not the race: a
   foreign listener on the port makes every attempt fail the same way.
@@ -65,7 +80,8 @@ Prefer 1 + 3. Option 2 alone converts a loud failure into a slow one.
 
 == How to apply
 
-Audit the 75 `free_port` declarations, extract one helper, and make it
-bind-and-hold. Until then: a `"bytes remaining on stream"` or `connect` panic in
+Extract the 75 identical `free_port` bodies into one helper and make it
+bind-and-hold. No audit is needed first — all 75 are the same two-spelling copy
+of the same defect. Until then: a `"bytes remaining on stream"` or `connect` panic in
 an `*_e2e.rs` harness on a PR that touches no server code is **this**, and the
 remedy is to re-run the job, not to bisect the PR.

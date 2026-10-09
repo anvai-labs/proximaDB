@@ -748,9 +748,7 @@ class TimeSeriesRepository:
             return timestamp
         epoch_ms = int(timestamp.replace(tzinfo=UTC).timestamp() * 1000)
         rounded_ms = epoch_ms - (epoch_ms % bucket_ms)
-        return datetime.fromtimestamp(rounded_ms / 1000, tz=UTC).replace(
-            tzinfo=None
-        )
+        return datetime.fromtimestamp(rounded_ms / 1000, tz=UTC).replace(tzinfo=None)
 
     def _aggregate_value(self, values: list[Any], aggregation: AggregationType) -> Any:
         if aggregation == AggregationType.COUNT:

@@ -448,9 +448,7 @@ class ProximaDBAuth:
 
         # Refresh if token expires within threshold
         threshold = timedelta(minutes=self.config.refresh_threshold_minutes)
-        return datetime.now(UTC) >= (
-            self.auth_result.token_expires_at - threshold
-        )
+        return datetime.now(UTC) >= (self.auth_result.token_expires_at - threshold)
 
     def _refresh_token(self) -> None:
         """Refresh JWT token using refresh token"""

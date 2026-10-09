@@ -648,9 +648,7 @@ class SecurityContext:
     request_id: str | None = None
     client_ip: str | None = None
     user_agent: str | None = None
-    authenticated_at: datetime = field(
-        default_factory=lambda: datetime.now(UTC)
-    )
+    authenticated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def has_permission(self, permission: str) -> bool:

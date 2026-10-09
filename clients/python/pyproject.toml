@@ -175,7 +175,13 @@ dev = [
     "sentence-transformers>=3.2,<7",
     "requests>=2.28.0",
     "grpcio-tools>=1.80.0",
-    "black>=22.0.0",
+    # Pinned like isort below, and for the same reason: CI's `black --check` is a
+    # HARD gate, so an unpinned ceiling makes it flap whenever black ships a
+    # major with new formatting. `>=22.0.0` resolved to 26.x in CI while
+    # .pre-commit-config.yaml pinned 24.10.0, and the two disagreed about which
+    # files are dirty -- so the local hook and the merge gate gave different
+    # answers. This pins the gate; the hook rev is a separate bump.
+    "black>=26.0.0,<27",
     # Pin the major: isort 7 vs 9 order the same imports differently
     # (9 collapses parenthesized single-imports), so an unpinned floor makes
     # the lint gate flap on every new major. Pin ~=9.0 = what CI resolves.

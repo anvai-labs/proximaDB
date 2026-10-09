@@ -281,7 +281,9 @@ jobs:
   # era untouched. They are deliberately left as-is when the floor moves (e.g.
   # the 3.10 -> 3.11 raise), so a stale version here is not a gap — do not
   # re-raise it. This file is `on: workflow_call` with ZERO callers in the repo,
-  # and the block no longer even defines the `build-wheels` job.
+  # and the `build-wheels:` lines below are commented out, so no such job is
+  # defined -- the parsed job list is cache-check, build-binaries, build-sdist,
+  # save-cache, summary.
   #
   # build-wheels:
   #   name: Build Wheels (${{ matrix.os }}, ${{ matrix.python }})

@@ -149,9 +149,7 @@ class SemanticCache:
                 cached_at_str = metadata.get("cached_at", "")
                 if cached_at_str:
                     cached_at = datetime.fromisoformat(cached_at_str)
-                    age_hours = (
-                        datetime.now(UTC) - cached_at
-                    ).total_seconds() / 3600
+                    age_hours = (datetime.now(UTC) - cached_at).total_seconds() / 3600
                     if age_hours > self.config.ttl_hours:
                         # Expired
                         self._stats["misses"] += 1
@@ -188,9 +186,7 @@ class SemanticCache:
                     collection=collection,
                     response=response,
                     embedding=result.get("vector", []),
-                    cached_at=(
-                        cached_at if cached_at_str else datetime.now(UTC)
-                    ),
+                    cached_at=(cached_at if cached_at_str else datetime.now(UTC)),
                     hit_count=metadata.get("hit_count", 0) + 1,
                 )
 
