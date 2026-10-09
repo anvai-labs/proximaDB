@@ -284,7 +284,16 @@ fn collection(id: &str, base_location: String) -> Collection {
         // The collection NAME, not a decimal catalog object id — a known defect
         // tracked by TD-SIFTCOMPACT-1 and deliberately not fixed here.
         //
-        // NOTE, corrected: with the `compaction:off` tag added below, minting an
+        // The live reason, stated first because the history below explains a
+        // decision whose original justification has lapsed: the id is left as a
+        // name because changing it is not needed and is not free. With the tag,
+        // minting is behaviour-neutral for compaction -- but `get_data_dir` keys
+        // the on-disk layout off `Collection.id`, so minting would move every
+        // temp path for the three CI-carried ratchets that share this helper. No
+        // gain, a re-baseline to verify. If a future change needs the decimal id
+        // here, mint it and re-run those three.
+        //
+        // History, corrected: with the `compaction:off` tag added below, minting an
         // id here is BEHAVIOUR-NEUTRAL. `should_trigger_compaction` returns
         // Ok(None) on `!resolve_compaction_armed(tags)` before anything else, and
         // `params.get_collection_object_id()` is only reached inside the
@@ -2254,9 +2263,12 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "0");
         std::env::remove_var("PROXIMADB_TRACE_GETS");
-        // Set at the top of this test and previously not cleaned up here.
-        // Harmless under nextest (process per test); it leaked under plain
-        // `cargo test`.
+        // Pinned at the top of this test IF UNSET, and previously not cleaned up
+        // here. Harmless under nextest (process per test). Under plain
+        // `cargo test` the removal is unconditional, so it also clears a value
+        // the caller supplied -- which is a (small) behaviour change in the
+        // caller's favour only if they did not want it to persist. Stated rather
+        // than glossed, since the point of this block is not to leak.
         std::env::remove_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB");
     }
 }
