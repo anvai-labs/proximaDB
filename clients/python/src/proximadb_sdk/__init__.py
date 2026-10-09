@@ -8,7 +8,7 @@ Licensed under the Apache License, Version 2.0
 """
 
 # Version information
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__ = "ProximaDB Contributors"
 
 # Protocol adapters (TD-126 Phase 3): loaded LAZILY via the package-level

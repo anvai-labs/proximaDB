@@ -1,6 +1,6 @@
 [package]
 name = "proximadb"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 autobenches = false
 authors = ["Vijaykumar Singh <vijay@anvaiops.com>"]
@@ -173,7 +173,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -556,7 +556,7 @@ proximadb-query-filter = { path = "crates/query/proximadb-query-filter" }
 proximadb-uql = { path = "crates/query/proximadb-uql" }
 proximadb-vector-query = { path = "crates/query/proximadb-vector-query" }
 # Extracted from src/services/catalog_introspection.rs (re-export shim keeps callers stable).
-proximadb-catalog-introspection = { version = "0.2.0", path = "crates/binding/proximadb-catalog-introspection" }
+proximadb-catalog-introspection = { version = "0.4.0", path = "crates/binding/proximadb-catalog-introspection" }
 
 # SQL Parsing
 sqlparser = { version = "0.59", features = ["visitor"] }
@@ -770,10 +770,10 @@ moka = { version = "0.12", features = ["future"] }
 # Provides direct buffer access to numpy arrays without Python .tolist() conversion
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
-proximadb-raptor-common = { version = "0.2.0", path = "crates/storage/proximadb-raptor-common" }
-proximadb-raptor-engine = { version = "0.2.0", path = "crates/storage/proximadb-raptor-engine" }
-proximadb-engine-core = { version = "0.2.0", path = "crates/storage/proximadb-engine-core" }
-proximadb-mongodb-parser = { version = "0.2.0", path = "crates/binding/proximadb-mongodb-parser" }
+proximadb-raptor-common = { version = "0.4.0", path = "crates/storage/proximadb-raptor-common" }
+proximadb-raptor-engine = { version = "0.4.0", path = "crates/storage/proximadb-raptor-engine" }
+proximadb-engine-core = { version = "0.4.0", path = "crates/storage/proximadb-engine-core" }
+proximadb-mongodb-parser = { version = "0.4.0", path = "crates/binding/proximadb-mongodb-parser" }
 
 # GPU acceleration dependencies (platform-specific)
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
