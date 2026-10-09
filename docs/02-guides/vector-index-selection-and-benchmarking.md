@@ -175,10 +175,11 @@ so your own corpus works without precomputed neighbours.
 !!! warning "This needs the repository, not a release"
 
     The harness is an integration test, so running it today requires a git
-    checkout, the pinned Rust toolchain and **`cargo-nextest`** (`make
-    install-fast-tools`, or `cargo install cargo-nextest --locked` — it is not
-    part of the pinned toolchain, so a fresh checkout gets `error: no such
-    command: nextest` without it). It is **not** in any released artifact, and
+    checkout, the pinned Rust toolchain, and — unless you use plain `cargo
+    test`, which is also safe inside this checkout (see below) —
+    **`cargo-nextest`** (`make install-fast-tools`, or `cargo install
+    cargo-nextest --locked`; it is not in the pinned toolchain, so a fresh
+    checkout gets `error: no such command: nextest` without it). It is **not** in any released artifact, and
     there is no `proximadb`-CLI equivalent yet.
     **TD-VECEVAL-1** tracks shipping it as a subcommand of
     `apps/proximadb-ann-bench` so it can be run against your own data without
@@ -277,16 +278,22 @@ Two further gates appear in the test file and neither belongs in the run above:
       the same conclusion *structural* rather than an accident of a swallowed
       error — and makes the three CI-carried arms deterministic.
 
-    Either way nprobe is inert here. **TD-SIFTCOMPACT-1** and **TD-VECEVAL-1**
-    carry the detail; the Caveats section below repeats it.
+    Either way nprobe is inert **in the documented run above** — the three
+    non-`#[ignore]`d arms — so it measures byte-identical there however you set
+    it. **TD-SIFTCOMPACT-1** and **TD-VECEVAL-1** carry the detail.
 
-    So nprobe measures byte-identical here however you set it, and "drive a
-    compaction" is **not** something you can do in this harness as shipped —
-    which is why `sift_ivf2_coarse_probe_recall_ratchet` is listed in the TDs as
-    blocked on the same admission error rather than as a worked example.
-    `sift_ivf2_probe_release_bakeoff_eval` (`#[ignore]`d) is the one that really
-    does produce a v3 segment, because it calls the compacted writer directly
-    rather than going through the flush trigger.
+    To exercise nprobe you need a compacted segment, which means a different
+    test in the same file:
+
+    * `sift_ivf2_coarse_probe_recall_ratchet` is the **worked example**. It
+      drives compaction through the *production* flush trigger — it mints a real
+      catalog object id so admission succeeds, and awaits compaction quiescence
+      before measuring — then compares probe ON against the whole-region scan
+      over that segment. `#[ignore]`d, so it needs `-- --ignored`.
+    * `sift_ivf2_probe_release_bakeoff_eval` (also `#[ignore]`d) is the
+      writer-direct alternative: it calls the compacted writer itself rather than
+      going through the flush trigger, which is what you want if you need the v3
+      layout without a compaction cadence.
 
 ### Reading the output
 
@@ -360,8 +367,11 @@ comparison is as controlled as this harness gets.
 Reading it:
 
 * ANN buys **−66% bytes** and **−85% compute** over an exact scan (164.57 ms →
-  25.47 ms in that run), but costs **~8–11× more round-trips**. Note the scope:
-  that compares row 1 to **row 3**, both from the `[rg_layout]` arm. Without the
+  25.47 ms in that run), but costs **~11× more round-trips** — 53.97/5.00 =
+  10.8×, comparing row 1 to **row 3**, both from the `[rg_layout]` arm. (Row 4's
+  `s3://` budget brings it down to 8.4×, which is where the "~8–11×" range an
+  earlier revision quoted came from; it spans two rows with different
+  provenance, so it is given per-row here instead.) Without the
   row-group layout the trade is *worse than nothing* on bytes — the `[baseline]`
   arm's own exact leg was 78.2 MB against its ANN 97.8 MB, so comparing rows 1
   and 2 across arms is not meaningful. On object storage
@@ -374,13 +384,15 @@ Reading it:
   for +6% bytes at identical recall** — a
   straight DEPTH-for-BYTES win, and the clearest tunable lever we measured.
 * With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
-  **81 GETs / 92 ms probed vs 108 GETs / 144 ms unprobed** at recall
-  0.9840–0.9870 (ratchet 0.984) — better on every axis. On an **uncompacted**
+  **81 GETs / 92 ms at recall 0.9860 probed vs 108 GETs / 144 ms at 0.9840
+  unprobed** (ratchet 0.984) — better on every axis, recall included. (The
+  ledger's 0.9870 is the nprobe=12 arm, which is not the comparison above;
+  quoting it as the top of a band was wrong.) On an **uncompacted**
   segment there is no Region A0 to probe, so nprobe does nothing: that is the
   trap, and no env var substitutes for a compaction having run (training is
-  already default-ON, and flush deliberately never emits A0). See the admonition
-  under *Knobs* for why that is **not** something you can arrange in this
-  harness as shipped.
+  already default-ON, and flush deliberately never emits A0). The admonition
+  under *Knobs* explains why the documented run never compacts, and which test to
+  use when you want the probed arm.
 
 ## Caveats
 
@@ -391,12 +403,13 @@ Reading it:
   HTTP overhead and is **not** comparable to the local-filesystem latency
   column. Compare GETs and bytes across backends; compare latency only within
   one backend.
-* `sift_ivf2_coarse_probe_recall_ratchet` currently fails a precondition
-  (it passes a collection *name* where a catalog object id is required). It is
-  `#[ignore]`d, so CI does not catch the drift. Use
-  `sift_ivf2_probe_release_bakeoff_eval` (which is `#[ignore]`d, so it needs
-  `-- --ignored`) for the clustered arm until that is
-  fixed.
+* The clustered/probed arm lives in `sift_ivf2_coarse_probe_recall_ratchet`,
+  which is `#[ignore]`d — so **no CI tier runs it** (both the ci.yml and qa-gate
+  invocations omit `--ignored`), and drift in it surfaces only when someone runs
+  it by hand. **TD-IVF2ENGAGE-1** records what it currently measures, including a
+  retraction worth reading: an earlier "engagement collapses at scale" finding
+  turned out to be an un-awaited background compaction in the harness, not a
+  product effect.
 
 ## See also
 

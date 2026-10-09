@@ -263,7 +263,9 @@ jobs:
         # flag was load-bearing; both were false -- and the reference table is
         # positive evidence against the race, since [baseline] and [rg_layout]
         # set the same process-global gate and produced two DIFFERENT geometries
-        # from one run, which a parallel run could not have done.
+        # from one run, which a racing run would almost certainly not have done
+        # (each arm writes 100k vectors across five flushes, so concurrent starts
+        # would have both flushing under whichever value was current).
         #
         # The flag is kept because cargo's `[env]` without `force = true` does
         # NOT override an externally exported RUST_TEST_THREADS, so a runner or
