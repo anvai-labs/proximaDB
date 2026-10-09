@@ -127,6 +127,7 @@ jobs:
   # PREPARATION - Extract version, validate, and prepare release
   # ============================================================================
   prepare:
+    timeout-minutes: 30
     name: Prepare Release
     runs-on: ubuntu-latest
     outputs:
@@ -198,6 +199,7 @@ jobs:
   # BUILD RUST BINARIES - Cross-platform binary builds
   # ============================================================================
   build-binaries:
+    timeout-minutes: 150
     name: Build ${{ matrix.target }}
     needs: prepare
     runs-on: ${{ matrix.os }}
@@ -209,7 +211,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
-            features: ""
+            features: "cloud-full"
 
           # Linux x86_64 (musl - static) - DISABLED for v0.2.0
           # Target installation issue - requires manual musl target setup
@@ -239,7 +241,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             archive: zip
-            features: ""
+            features: "cloud-full"
 
     steps:
       - name: Checkout
@@ -362,6 +364,7 @@ jobs:
   # BUILD SOURCE DISTRIBUTION - Python sdist
   # ============================================================================
   build-sdist:
+    timeout-minutes: 45
     name: Build Source Distribution
     needs: prepare
     runs-on: ubuntu-22.04
@@ -402,6 +405,7 @@ jobs:
   # ============================================================================
 
   build-rpm:
+    timeout-minutes: 45
     name: Build RPM Package
     needs: [prepare, build-binaries]
     runs-on: ubuntu-22.04
@@ -458,6 +462,7 @@ jobs:
           retention-days: 7
 
   build-deb:
+    timeout-minutes: 45
     name: Build DEB Package
     needs: [prepare, build-binaries]
     runs-on: ubuntu-22.04
@@ -520,6 +525,7 @@ jobs:
   #   ...
 
   build-msi:
+    timeout-minutes: 45
     name: Build MSI Installer
     needs: [prepare, build-binaries]
     runs-on: windows-2022
@@ -569,6 +575,7 @@ jobs:
   # to create the release. This prevents partial/broken releases.
   # ============================================================================
   validate-artifacts:
+    timeout-minutes: 30
     name: Validate Release Artifacts
     needs: [prepare, build-binaries, build-sdist, build-rpm, build-deb, build-msi]
     runs-on: ubuntu-latest
@@ -772,6 +779,7 @@ jobs:
   # CREATE GITHUB RELEASE - Consolidate all artifacts
   # ============================================================================
   create-release:
+    timeout-minutes: 30
     name: Create GitHub Release
     needs: [prepare, build-binaries, build-sdist, build-rpm, build-deb, build-msi, validate-artifacts]
     runs-on: ubuntu-latest
@@ -848,7 +856,11 @@ jobs:
           ```bash
           git clone https://github.com/anvai-labs/proximaDB
           cd proximaDB
-          cargo build --release --bin proximadb-server
+          # `cloud-full` = the S3 + Azure + GCS object-store backends, which the
+          # published binaries and container image are built with. Omit it and
+          # `file://` still works, but an `s3://`/`az://`/`gs://` URL fails with
+          # "feature for AmazonS3 not enabled" -- not compiled in.
+          cargo build --release --features cloud-full -p proximadb-server --bin proximadb-server
           ```
 
           #### Platform Packages (RPM/DEB/MSI)
@@ -913,6 +925,7 @@ jobs:
   # - Pre-publish verification step
   # ============================================================================
   publish-crates:
+    timeout-minutes: 30
     name: Publish to crates.io
     needs: [prepare, build-binaries, create-release]
     runs-on: ubuntu-latest
@@ -960,6 +973,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-npm:
+    timeout-minutes: 30
     name: Publish Node SDK to npm
     needs: [prepare, build-binaries, create-release]
     runs-on: ubuntu-latest
@@ -1022,6 +1036,7 @@ jobs:
   # UPDATE HOMEBREW FORMULA - macOS package manager
   # ============================================================================
   update-homebrew:
+    timeout-minutes: 30
     name: Update Homebrew Formula
     needs: [prepare, create-release]
     runs-on: ubuntu-latest
@@ -1097,6 +1112,7 @@ jobs:
   # It shows what WOULD happen during a real release without actually publishing.
   # ============================================================================
   dry-run-summary:
+    timeout-minutes: 30
     name: Dry Run Summary
     needs: [prepare, build-binaries, build-sdist, build-rpm, build-deb, build-msi, validate-artifacts]
     runs-on: ubuntu-latest
@@ -1220,6 +1236,7 @@ jobs:
   # POST-RELEASE VERIFICATION
   # ============================================================================
   verify-release:
+    timeout-minutes: 30
     name: Verify Release
     needs: [prepare, publish-crates, validate-artifacts]
     runs-on: ubuntu-latest
@@ -1256,6 +1273,7 @@ jobs:
   # In dry-run mode, artifacts are still cleaned up after the summary.
   # ============================================================================
   cleanup:
+    timeout-minutes: 30
     name: Cleanup Old Artifacts
     needs: [prepare, create-release, publish-crates, dry-run-summary]
     runs-on: ubuntu-latest
