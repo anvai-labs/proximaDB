@@ -281,30 +281,33 @@ fn next_object_id() -> String {
 
 fn collection(id: &str, base_location: String) -> Collection {
     Collection {
-        // NOTE: this is the collection NAME, not a decimal catalog object id, and
-        // that is a KNOWN DEFECT tracked by TD-SIFTCOMPACT-1 — deliberately not
-        // fixed here.
+        // The collection NAME, not a decimal catalog object id — a known defect
+        // tracked by TD-SIFTCOMPACT-1 and deliberately not fixed here.
         //
-        // Compaction is armed by default for untagged collections (`AppendBulk`
-        // is the default storage profile), and the flush/compaction-admission
-        // boundaries are fail-closed on a non-decimal id, so every flush past
-        // the L0 threshold fails admission — logged at `warn!` and then
-        // swallowed, because a compaction failure never fails the flush. These
-        // ratchets have therefore been measuring an L0-only, uncompacted layout.
+        // Minting an id is a one-line change these tests do not survive: with a
+        // valid id compaction actually runs, and the sibling ratchet then dies on
+        // the FIRST query at `assert_single_vector_access` with ZERO recorded
+        // accesses — the PAX coalesced cascade declines on the compacted segment
+        // and the ANN proof is never emitted. That is a product finding, so the
+        // assertion must stay strict; relaxing it would go green while the
+        // engagement loss remained.
         //
-        // Minting an id here is a ONE-LINE change that these tests do not
-        // survive: measured at N=100 000, compaction then runs and the very
-        // first query fails `assert_single_vector_access` — the ratchets encode
-        // a single-physical-access assumption that a compacted layout breaks.
-        // Fixing it therefore means deciding what these ratchets should measure
-        // and re-baselining their published numbers, which is TD-SIFTCOMPACT-1's
-        // job, not this change's.
+        // What IS fixed here is the silence: `compaction:off` below states that
+        // these arms measure an uncompacted layout, instead of achieving it by a
+        // swallowed admission error. Behaviour-preserving — compaction does not
+        // run today either.
         id: id.to_string(),
         config: Some(CollectionConfig {
             name: id.to_string(),
             dimension: DIMENSION as u32,
             distance_metric: Some(DistanceMetric::Euclidean as i32),
             storage_engine: Some(StorageEngine::Sst as i32),
+            // States what these arms measure. Without it, compaction is ARMED by
+            // default (`AppendBulk`) and only fails to run because admission
+            // rejects the non-decimal id above — an accident, not a decision.
+            // The IVF2 ratchet builds its Collection inline and is unaffected:
+            // it wants compaction and asserts `compaction_ran`.
+            tags: vec!["compaction:off".to_string()],
             ..Default::default()
         }),
         storage_assignment: Some(StorageAssignment {
@@ -1936,10 +1939,12 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         measured_base > 0 && measured_probe > 0,
         "no queries measured"
     );
-    // A non-empty trace is NOT evidence that the probe is doing its job: at the
-    // default N=100_000 it records 17 entries against 1000 measured queries and
-    // `!is_empty()` certifies that happily, while the rest take the
-    // whole-Region-A fallback the probe exists to avoid. Assert a proportion.
+    // A non-empty trace is NOT evidence that the probe is doing its job: at
+    // N=100_000 with PROXIMADB_SIFT_QUERIES=1000 it records 17 entries against
+    // 1000 measured queries and `!is_empty()` certifies that happily, while the
+    // rest take the whole-Region-A fallback the probe exists to avoid. (This
+    // test's own query default is `100.min(DEFAULT_QUERIES)` = 100, so the 1000
+    // figure needs the env var.) Assert a proportion.
     //
     // Denominator is `measured_probe`, not `qcount`: `measure()` skips a query
     // that returned no hits, so against `qcount` a search regression that

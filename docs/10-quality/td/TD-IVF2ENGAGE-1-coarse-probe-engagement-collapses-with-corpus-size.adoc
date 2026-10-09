@@ -5,11 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-10-08, the first time this eval could be run (see TD-VECEVAL-1).
+| Status | **Open.** Filed 2026-10-08, the first time this eval could be run.
 | Severity | Medium — no incorrect results; the probe silently stops paying for itself at scale, and two guards were too weak to notice.
 | Component | `src/storage/engines/sst/segment_format.rs` (coarse probe arm/fallback), `tests/sift_pax_recall_ratchet_test.rs::sift_ivf2_coarse_probe_recall_ratchet`
 | Evidence | Measured below on SIFT1M subsets, workstation, `--release --features io-trace`
-| Related | TD-RDSTRAT-8 (the probe), TD-VECEVAL-1 (why this was unrunnable), ADR-033 (DEPTH ≫ BYTES ordering)
+| Related | TD-RDSTRAT-8 (the probe), ADR-033 (DEPTH ≫ BYTES ordering)
 |===
 
 == What was measured
@@ -33,46 +33,54 @@ N=20 000, 200 queries, `IVF_K=64`:
 Σfetch_rounds=200`. Better recall, **−33% round trips**, −7.2% bytes — a strict
 win, no trade.
 
-=== Measurement hygiene: the figures move with L0 segment count
+=== Measurement hygiene: the figures move with MACHINE LOAD, and so does recall
 
-Three consecutive runs of the identical command agree closely — the probe arm is
-**byte-identical** (2 range GETs, 5 861 939 bytes, recall 0.9905 in all three)
-and the baseline varies by ~0.2% in bytes (6 326 526 / 6 316 695 / 6 316 552) and
-by one recall sample (0.9860 / 0.9884 / 0.9884).
+Six runs of the identical command on a quiet machine agree closely — the probe
+arm is **byte-identical** (2 range GETs, 5 861 939 bytes, recall 0.9905) and the
+baseline varies ~0.3% in bytes (6 316 552 … 6 338 539) and by one recall sample
+(0.9860 / 0.9884 / 0.9865).
 
-A fourth run of the *same command* gave wildly different numbers: baseline 5
-GETs / 1 596 718 bytes, probe 4 GETs / 840 467 bytes. The cause is visible in the
-GET trace. The three stable runs read one L0 segment plus its L1
-(`L0_20261008T234633`, `L1_20261008T234633`); the outlier read **two** L0
-segments (`L0_20261008T234423` and `L0_20261008T234424`) plus an L1. Segment names
-carry second granularity, so a write that straddles a wall-clock second boundary
-emits an extra L0, which changes the compaction input, the resulting L1 layout,
-and therefore the read plan — fewer, larger ranged GETs become more, smaller
-ones.
-
-So **no figure from this harness is comparable unless the L0 segment count is
-reported alongside it.** That is a precondition for the work below, not a footnote:
-a before/after comparison that silently differs in segment count measures the
-boundary, not the change. It also makes the "multiple segments after compaction"
-hypothesis below concrete rather than speculative — segment count demonstrably
-moves the I/O by 4x here.
-
-None of these numbers is ledgered in `BENCHMARK_EVIDENCE.toml`; they are
-workstation observations recorded to direct the work, not to claim performance.
-
-N=100 000, 1000 queries, same `IVF_K=64` (the test's **default** N):
+Under **saturating CPU contention** (16 busy loops on 16 cores) the same command
+gives a different regime entirely:
 
 [cols="1,1,1,1", options="header"]
 |===
 | Arm | recall@10 | range GETs/q | bytes/q
 
-| probe OFF | 0.9830 | 2 | 26 916 094
-| probe ON  | 0.9839 | 2 | 26 973 204
+| baseline, quiet | 0.9884 | 3 | 6 316 695
+| baseline, saturated | 0.9865 | **5** | **1 541 714**
+| probe, quiet | 0.9905 | 2 | 5 861 939
+| probe, saturated | 0.9880 | **4** | **817 363**
 |===
 
-`probes_recorded=17/1000`, `Σcells_total=1088 Σcells_probed=272
-Σfetch_rounds=34`. The byte ratchet **fails**: `bytes_probe < bytes_base` is
-false by 57 110 bytes/query.
+Reproduced in both directions: stable whenever the machine is idle, and the
+loaded regime appears on demand under saturation. A moderate load (loadavg ~4)
+does **not** reproduce it; it takes real saturation.
+
+**Recall moves too — 0.9905 to 0.9880 — and that is the part that matters.**
+Bytes and GETs shifting with the read plan is explicable; a different *survivor
+set* under load means something in the search path is making a
+concurrency- or time-dependent decision. For a **ratchet**, recall that depends
+on machine load is a correctness problem, not a benchmarking footnote: the gate
+can pass or fail on what else the runner was doing. The repo already knows to
+"run perf-sensitive checks on a quiet machine" (mandate #11), but a *recall*
+ratchet is not supposed to be perf-sensitive at all.
+
+NOTE: an earlier revision of this TD attributed the two regimes to **L0 segment
+count**, claiming a write straddling a wall-clock second emits an extra segment.
+That was **wrong, and self-inflicted**. Segment names are
+`L{level}_{%Y%m%dT%H%M%S}_{uuid8}` (`compaction_orchestrator.rs:663-665`), so the
+uuid makes a same-second collision impossible and a second boundary can neither
+add nor remove a segment. The "one vs two L0" reading came from a grep whose
+pattern (`(L0|L1)_[0-9T]+`) stops *before* the uuid, collapsing two distinct
+same-second segments into one entry. Independently, seven runs produced exactly
+two L0 segments in **both** regimes, the query path reads only the L1, and the L1
+is byte-identical across regimes. Segment count was constant throughout and is
+not the variable.
+
+So: no figure from this harness is comparable without stating the machine state
+it was taken under, and the open question is which decision in the search path is
+load-dependent.
 
 == The finding
 
@@ -147,7 +155,7 @@ unengaged probe measures nothing; neither does one over an untrained index.
   and `record_ivf_probe_durable(0,0,0,0,true)` fires for both. Nothing else
   distinguishes them: the only `warn!` on that path is an unrelated non-fatal
   footer-overlap case, and there is no error counter. Record the error distinctly
-  from the decline — AND record WHICH decline, since the eight reasons are also
+  from the decline — AND record WHICH decline, since the six reasons are also
   mutually indistinguishable, so splitting `Err` alone will not attribute the
   983. Until then every hypothesis below is unfalsifiable.
 . **Report `probed_rows` and per-query `fetch_rounds`.** The harness prints

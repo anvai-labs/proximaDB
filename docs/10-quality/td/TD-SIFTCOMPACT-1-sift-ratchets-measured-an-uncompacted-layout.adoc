@@ -42,10 +42,13 @@ visibly broke.
 If compaction never ran, these ratchets measured an **L0-only, uncompacted,
 un-reclustered** layout — not the clustered PAX-LSM layout they appear to
 exercise. That affects `sift_pax_cascade_recall_at_10_ratchet`,
-its `_rg_layout` sibling, and `sift_pax_filtered_cascade_recall_ratchet`, which
-are the source of the recall and GET/byte figures published in
-`docs/02-guides/vector-index-selection-and-benchmarking.md` and carried by the
-qa-gate `sift-pax-recall` job.
+its `_rg_layout` sibling, and `sift_pax_filtered_cascade_recall_ratchet` (the
+last only at N>=100 000; its own default N is 10 000, one sub-`BATCH_SIZE` flush,
+so the threshold is never met there). These are the source of the recall and GET/byte figures published in
+`docs/_internal/status/SIFT1M_RECALL_RATCHET_2026_06_30.adoc` and the
+`pax_rabitq_sq8_sift1m_recall_at_10` ledger claim in
+`docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`, and carried by the qa-gate
+`sift-pax-recall` job.
 
 === Confirmed by execution, and the fix is NOT one line
 
@@ -63,19 +66,55 @@ assertion `left == right` failed: each ratchet query must report one physical
 ----
 
 It inserted and flushed all 100 000 vectors, built ground truth, then died on the
-**first query**. That is the confirmation: with a valid id, compaction actually
-runs, the physical layout changes, and a query no longer reports exactly one
-vector access. Before the fix the same run completes and reports
-`ANN 53.97/53.97/25297445/20.90` — the published numbers.
+**first query**. With a valid id, compaction runs and the ratchet no longer gets
+the vector-access record it asserts.
 
-So the defect is real AND the remediation is larger than an id: these ratchets
-encode a **single-physical-access assumption** (`assert_single_vector_access`)
-that a compacted, multi-segment layout breaks. Fixing the id without deciding
-what the ratchets should measure converts three passing tests into three failing
-ones.
+=== Correction: the failure is ZERO accesses, not more than one
 
-The helper is therefore left as-is in that change, with the defect documented at
-the site, and the decision belongs here.
+An earlier revision of this TD read that panic as a *multi-segment* problem — "a
+single-physical-access assumption that a compacted, multi-segment layout breaks"
+— and proposed making `assert_single_vector_access` per-segment. **That reading
+is impossible**, and the proposal would have masked the real defect.
+
+Re-ran it and captured the values this time:
+
+[source]
+----
+panicked at tests/sift_pax_recall_ratchet_test.rs:516:5:
+assertion `left == right` failed: each ratchet query must report one physical
+  vector access
+  left: 0
+ right: 1
+----
+
+**Zero accesses, not more than one.** That is also structurally the only
+possibility: `record_completed_vector_access` has two call sites in
+`src/storage/engines/sst/search/mod.rs` (`:689` and `:756`, with an `_arc` twin at
+`:2228`/`:2277`), and the first is immediately followed by `return result;`, so
+they are **mutually exclusive** — at most ONE access is recorded per
+`search_vectors_unified` call, and `vector_accesses.len() > 1` cannot occur for a
+single measured search. A "per-segment" assertion would therefore be asserting
+something that cannot happen.
+
+The first revision of this TD read the same panic as a multi-segment problem
+because the quoted output was truncated exactly before the `left:`/`right:`
+lines. Those two lines are the whole diagnosis; dropping them is what let the
+misreading stand.
+
+Zero accesses means the `Ann` site's guard did not fire:
+`vector_ann_proof_count() > ann_proofs_before` (`search/mod.rs:753`). The only
+emitter for this configuration is the PAX coalesced cascade (`:593`), so **the
+ANN cascade declined on the compacted segment** — silently, with the search still
+returning `Ok`.
+
+That is a **product** finding, not a test-baselining one: ANN engagement is lost
+on a compacted layout under this arm's write gates (`PAX_F32_TIER=1`,
+`PAX_WRITE_RG_LAYOUT=1`, no `BLOCK_CLUSTER`/`COALESCED_RABITQ`/`A0_TRAIN`).
+Relaxing the assertion to "per-segment" would convert a red test into a green one
+while the engagement loss stayed. An existing test that fails your change is
+evidence, not an obstacle.
+
+The helper is therefore left unminted here, and the decision belongs below.
 
 == Why it was invisible
 
@@ -92,21 +131,25 @@ Three independently reasonable decisions compose into silence:
 
 == How to apply
 
-. **Decide what these ratchets should measure, first.** That is the actual
-  blocker, not the id. Either (a) they are meant to pin the single-segment
-  cascade, in which case compaction should be explicitly DISARMED
-  (`compaction:off` tag or `L0_COMPACTION_ENABLED_ENV`) so the intent is stated
-  rather than achieved by an admission failure; or (b) they are meant to pin the
-  compacted layout, in which case `assert_single_vector_access` must become a
-  per-segment assertion and every published figure sourced from them needs
-  re-baselining — the guide's table and any `BENCHMARK_EVIDENCE.toml` entry that
-  cites them.
-+
-Option (a) is cheap and makes today's numbers honest. Option (b) is what the test
-names imply and is the real work. Do not do (b) by accident, which is what
-minting the id alone amounts to.
-. **Then measure the delta** under whichever shape is chosen, at N=100 000, and
-  record recall, GETs/query and bytes/query.
+. **Investigate the ANN decline first — it is the lead, not a side effect.**
+  Minting the id surfaces a query that returns `Ok` with no ANN proof on a
+  compacted segment. Find which of the cascade's six `Ok(None)` declines fires
+  (they are mutually indistinguishable today — see TD-IVF2ENGAGE-1, same root
+  cause). Do NOT relax `assert_single_vector_access` to accommodate it: a
+  per-segment assertion would go green while the engagement loss remained, and
+  `len() > 1` is structurally impossible anyway, so a per-segment form would be
+  asserting something that cannot happen.
+. **State the current intent explicitly**, which this change now does: the shared
+  helper tags its collections `compaction:off`. That is behaviour-preserving —
+  compaction does not run today either — and converts "intent achieved by an
+  admission failure" into "intent stated", so the ratchets no longer depend on a
+  swallowed error to measure what they measure.
+. **Then decide whether these ratchets SHOULD exercise compaction.** If yes, that
+  is real work gated on the ANN decline above, and every published figure sourced
+  from them needs re-baselining — `docs/_internal/status/SIFT1M_RECALL_RATCHET_2026_06_30.adoc`
+  and the `pax_rabitq_sq8_sift1m_recall_at_10` claim in
+  `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml` (`status = "measured"`, N=100k
+  0.9905 / N=1M 0.9920), both taken at N>=100 000 where admission did fail.
 . **Assert the intent.** Each ratchet that means to exercise a compacted layout
   should assert `compaction_ran`, as the IVF2 test already does. A test whose
   premise is silently unmet is worse than a missing test.
