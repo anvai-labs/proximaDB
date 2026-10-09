@@ -306,6 +306,16 @@ cmd_check() {
     # F9: these two were stale at 0.2.0 and unwatched. python-queue-embedded is a
     # maturin-built [project] WITH a version (unlike python-embedded, which has
     # none by design and is excluded above with its reason).
+    #
+    # DELIBERATELY NOT HERE: deploy/infrastructure/helm/proximadb/{Chart,values}.yaml
+    # and the three terraform helm-values `image.tag` pins, all still at 0.2.0.
+    # That chart cannot render -- its template `include`s
+    # "proximadb.imageConfiguration", which is defined nowhere in the repo -- so
+    # adding it would make this gate pass over something that deploys nothing,
+    # and five plausible diffs would hide that. The canonical chart
+    # (deploy/helm/proximadb) needs no per-release edit anyway: `tag: ""` plus
+    # `default .Chart.AppVersion`, and its Chart.yaml IS in the list above.
+    # Filed as TD-HELMDUP-1.
     "clients/python-queue-embedded/pyproject.toml:pyproject"
     "clients/java-embedded/pom.xml:maven_pom"
   )
@@ -330,8 +340,13 @@ cmd_check() {
     # may yield a SKIP. Honouring the sentinel for any type made the VALUE
     # channel carry control information, so a literal `"version": "<SKIP:x>"` in
     # a manifest passed the gate. Now that is a `<...>` like any other: a FAIL.
-    if [ "${actual#<SKIP:}" != "$actual" ] \
-       && { [ "$type" = "cargo" ] || [ "$type" = "maven_pom" ]; }; then
+    # The reason must be one of the two literals the extractors emit. Narrowing
+    # to the two whitelisted TYPES was not enough: the value channel still
+    # carried control information, so `version = "<SKIP:anything>"` in
+    # clients/rust/Cargo.toml (valid TOML) or `<version>&lt;SKIP:x&gt;</version>`
+    # in the pom (valid XML) still passed the gate.
+    if { [ "$actual" = "<SKIP:inherits-workspace>" ] && [ "$type" = "cargo" ]; } \
+       || { [ "$actual" = "<SKIP:pom-inherits-parent>" ] && [ "$type" = "maven_pom" ]; }; then
       reason="${actual#<SKIP:}"
       echo "  [SKIP] $file ($type): ${reason%>}"
     elif [ "${actual#<}" != "$actual" ]; then
@@ -418,8 +433,24 @@ if os.path.isfile(cargo):
         start = m.end()
         nxt = re.search(r"^\[", text[start:], re.M)
         end = start + (nxt.start() if nxt else len(text) - start)
-        if not re.search(r'(?m)^\s*version\s*=\s*["\']', text[start:end]):
-            problems.append("Cargo.toml: [workspace.package] has no version key")
+        # The EXACT regex step 2's writer uses, with its count, against the same
+        # table slice. Probing only for an OPENING quote was a parallel
+        # predicate and it diverged: `version = """0.2.0"""` is valid TOML
+        # (tomllib reads 0.2.0, so `check` reports a clean mismatch) and matched
+        # the probe, but the writer needs a MATCHED single-line pair -- its
+        # substitution then produced `version = "0.4.0""0.2.0"""`, invalid
+        # TOML, with n == 1 so no abort and a FALSE [SET] printed. `set` went on
+        # to bump 13 more files over an unparseable root manifest and failed at
+        # the end blaming the lock refresh, leaving the gate permanently red and
+        # `set` permanently unable to repair it.
+        if len(re.findall(
+            r'(?m)^(\s*version\s*=\s*)["\'][^"\']*["\']\s*$', text[start:end]
+        )) != 1:
+            problems.append(
+                "Cargo.toml: [workspace.package] needs exactly one single-line "
+                "version = \"x.y.z\" entry with matched quote delimiters for `set` "
+                "to rewrite"
+            )
     # A pin whose requirement is not a bare x.y.z (e.g. "0.4" or "^0.4.0") is
     # READ by check and SKIPPED by set's regex, so set would report success and
     # leave check failing forever. Refuse up front instead.
@@ -603,7 +634,24 @@ for m in TAG.finditer(src):
         break
 
 if span is None:
-    sys.exit(f"{path}: no /project/version element (inherited from <parent>?) — not modified")
+    # Agree with the READER: a pom with a real <parent> and no own <version>
+    # legitimately inherits it, and `check` reports [SKIP] for exactly that
+    # shape. An earlier revision made the writer refuse, so the gate said "run
+    # `set`" and `set` then declined to bump ANYTHING -- the reader-writer
+    # dead-end this script documents elsewhere.
+    try:
+        import xml.etree.ElementTree as _ET
+
+        _root = _ET.fromstring(src)
+        _ns = _root.tag[: _root.tag.index("}") + 1] if _root.tag.startswith("{") else ""
+        if _root.find(_ns + "parent") is not None:
+            print(f"  [SKIP] {path}: version inherited from <parent>")
+            raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    sys.exit(f"{path}: no /project/version element and no <parent> — not modified")
 
 staged = src[:span[0]] + version + src[span[1]:]
 
@@ -614,19 +662,31 @@ tmp = path + ".version-sync.tmp"
 try:
     with open(tmp, "w", encoding="utf-8", newline="") as fh:
         fh.write(staged)
-    root = ET.parse(tmp).getroot()
+    try:
+        root = ET.parse(tmp).getroot()
+    except ET.ParseError as exc:
+        # Every other failure here is a `sys.exit(msg)`; an invalid-XML pom used
+        # to escape as a raw traceback from the PRE-FLIGHT, which is the mirror
+        # image of the zero-output diagnostics defect fixed for `check`.
+        sys.exit(f"{path}: staged edit is not valid XML ({exc}) — not modified")
     ns = root.tag[: root.tag.index("}") + 1] if root.tag.startswith("{") else ""
     el = root.find(ns + "version")
     if el is None or (el.text or "").strip() != version:
         sys.exit(f"{path}: staged edit did not land on /project/version — not modified")
     with open(tmp, encoding="utf-8", newline="") as fh:
         back = fh.read()
-    # And nothing else moved. The previous form compared lengths, which is
-    # TAUTOLOGICAL for `staged = src[:a] + version + src[b:]` -- it could never
-    # fire, which is why the CRLF rewrite above sailed through it. Compare the
-    # untouched prefix and suffix byte for byte instead.
+    # And nothing else moved -- compared against the ORIGINAL BYTES ON DISK.
+    # Two earlier forms of this guard were both dead code: comparing lengths is
+    # tautological for `staged = src[:a] + version + src[b:]`, and so is
+    # comparing the staged text against the in-memory `src` it was built from.
+    # Proven by mutation: with either form, dropping `newline=""` from the source
+    # read stripped all 147 CRs from a CRLF pom and the guard did not fire. Only
+    # a byte comparison against the file as it was read can detect that, because
+    # newline translation happens at read time.
     lo, hi = span
-    if back[:lo] != src[:lo] or back[lo + len(version):] != src[hi:]:
+    raw_before = open(path, "rb").read()
+    want = raw_before[:lo] + version.encode("utf-8") + raw_before[hi:]
+    if back.encode("utf-8") != want:
         sys.exit(f"{path}: bytes outside the version span changed — not modified")
     if mode == "write":
         os.replace(tmp, path)
@@ -828,8 +888,11 @@ PYEOF
   perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if 1..m/"version":/ && /"version":/' "$REPO_ROOT/clients/nodejs-embedded/package.json"
   echo "  [SET]  clients/nodejs-embedded/package.json -> $version"
 
-  # 13. The npm lockfiles' own version fields, LAST so an abort here cannot skip
-  #     a package.json above. Identified STRUCTURALLY (doc["version"] and
+  # 13. The npm lockfiles' own version fields. These used to be LAST; the pom
+  #     write now sits after them (and before the lock refresh), so "last" is no
+  #     longer accurate -- what still holds, and is the point, is that every
+  #     abort-capable step from here on is pre-flighted by a DRY RUN of itself,
+  #     so reaching this far means none of them will refuse. Identified STRUCTURALLY (doc["version"] and
   #     doc["packages"][""]["version"]), not positionally: a positional "first
   #     two version lines before node_modules/" walk silently corrupted a
   #     dependency pin on a lockfileVersion-1 lockfile (no `packages` object, no

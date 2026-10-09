@@ -1,0 +1,66 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-HELMDUP-1: a second Helm chart under deploy/infrastructure is unrenderable, stale, and documented
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-08 during the v0.4.0 version-sync audit, which found it as the third instance of the "a version string nothing watches" class.
+| Severity | **LOW**, and deliberately not raised. The first read of this looked like "four documented install paths would deploy the 0.2.0 image at a 0.4.0 release", which would be MEDIUM and user-visible. It is not: the chart cannot render at all, so those paths deploy nothing. The real defect is an abandoned duplicate that documentation still points at.
+| Component | `deploy/infrastructure/helm/proximadb/`, `deploy/infrastructure/terraform/environments/{dev,staging,production}/helm-values.yaml`, `deploy/infrastructure/scripts/deploy-dev.sh`
+| Evidence | Measured below. The canonical chart is `deploy/helm/proximadb/`.
+| Related | The `clients/python-embedded` precedent — a deliberately unwatched file that carries an in-place comment saying why. This chart has no such note, which is why the audit kept re-finding it.
+|===
+
+== What is wrong
+
+`deploy/infrastructure/helm/proximadb/` holds exactly three files: `Chart.yaml`,
+`values.yaml`, `templates/deployment.yaml`. The template calls
+`{{- include "proximadb.imageConfiguration" . }}` at two places, and
+**`define "proximadb.imageConfiguration"` does not exist anywhere in the
+repository** — there is no `_helpers.tpl` in that chart, and the canonical chart
+defines `proximadb.image`, a different name. Helm fails a missing `include` at
+render time, so `helm template` / `helm install` against this directory cannot
+succeed.
+
+`deploy/infrastructure/scripts/deploy-dev.sh` nevertheless sets
+`HELM_DIR="${PROJECT_ROOT}/deploy/infrastructure/helm/proximadb"`, and
+`deploy/infrastructure/README.md` plus
+`deploy/infrastructure/DEPLOYMENT_GUIDE.md` document it. So the documented
+dev-deploy path is broken independently of any version string.
+
+The stale versions are a symptom of the abandonment, not the defect:
+
+* `deploy/infrastructure/helm/proximadb/Chart.yaml` — `version: 0.1.0`, `appVersion: "0.2.0"`
+* `deploy/infrastructure/helm/proximadb/values.yaml` — `image.tag: "0.2.0"`
+* `deploy/infrastructure/terraform/environments/{dev,staging,production}/helm-values.yaml` — `image.tag: "0.2.0"` (x3)
+
+The canonical chart gets this right and needs no per-release edit:
+`deploy/helm/proximadb/values.yaml` has `tag: ""` and
+`templates/_helpers.tpl:68` is `{{- $tag := default .Chart.AppVersion .Values.image.tag }}`,
+so the image follows `appVersion`, which IS in the `version-sync.sh` gate.
+
+== Why the versions were not bumped for 0.4.0
+
+Deliberately. Editing `appVersion` and four `image.tag` pins in a chart that
+cannot render would make the audit pass without making anything work, and would
+hide the real problem behind five plausible-looking diffs. The honest options are
+to reconcile or delete the duplicate — not to version it.
+
+(`deploy/helm/legacy-proximadb/Chart.yaml` is also at 0.2.0 and unwatched.
+Nothing references it; it is named `legacy` and is presumed intentional, but it
+has no exclusion note either.)
+
+== How to apply
+
+. **Decide: reconcile or delete.** `docs/_internal/status/CONSOLIDATED_REVIEW_AND_TRACKING_2026_05_26.adoc`
+  already recommends consolidating onto one chart. If `deploy/infrastructure/helm`
+  has no capability the canonical chart lacks, delete it and repoint
+  `deploy-dev.sh`, the README and the DEPLOYMENT_GUIDE at `deploy/helm/proximadb`.
+. **If it is kept**, give it a `_helpers.tpl` (or switch the template to
+  `proximadb.image`), set `values.yaml` `tag: ""` so the image follows
+  `appVersion`, add its `Chart.yaml` `version`/`appVersion` to the
+  `version-sync.sh` file list, and drop the three terraform `tag` pins unless an
+  environment genuinely needs to lag the chart.
+. **Either way**, add the in-place exclusion comment the gate's other
+  deliberately-unwatched file has, so the next audit does not re-derive this.

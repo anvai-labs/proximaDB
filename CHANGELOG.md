@@ -100,6 +100,10 @@ entry, or the strict build fails on an unpublished page).
   derived from the crate version.
 - 75 e2e test harnesses pick their server port with a bind-read-drop TOCTOU, which turns CI red
   at random on PRs that did not cause it (TD-TESTPORT-1).
+- A duplicate Helm chart under `deploy/infrastructure/helm/proximadb` cannot render (its template
+  `include`s a helper defined nowhere), so the dev-deploy script and two deployment guides point
+  at a broken path. Its stale 0.2.0 version pins were deliberately NOT bumped for this release
+  (TD-HELMDUP-1).
 
 ## [0.3.0] - 2026-08-05
 
