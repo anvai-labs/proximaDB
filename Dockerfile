@@ -32,10 +32,7 @@ ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=1 \
     CARGO_PROFILE_RELEASE_LTO=false \
     CARGO_PROFILE_RELEASE_DEBUG=false
-# cloud-full: the image is how operators consume S3/ADLS/GCS object storage.
-# Without it `store_for_url("s3://...")` fails with "feature for AmazonS3 not
-# enabled" -- the backends are simply not compiled in.
-RUN cargo build --release -p proximadb-server --features cloud-full --jobs=2
+RUN cargo build --release -p proximadb-server --jobs=2
 
 # Stage 2: Unified runtime with Python and system dependencies
 FROM python:3.11-slim

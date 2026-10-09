@@ -21,7 +21,9 @@ COPY = (
     GUARD,
     ".github/workflows/release.yml",
     ".github/workflows/prerelease-ci.yml",
-    "Dockerfile",
+    # The PUBLISHED image (publish-image.yml `file:`), not the repo-root
+    # Dockerfile -- that one is the demo-compose image and is not guarded.
+    "deploy/docker/Dockerfile",
 )
 
 
@@ -84,13 +86,92 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("has no `timeout-minutes`", result.stdout)
 
-    def test_catches_an_image_built_without_cloud(self) -> None:
-        p = self.tree / "Dockerfile"
+    def test_catches_the_published_image_built_without_cloud(self) -> None:
+        p = self.tree / "deploy/docker/Dockerfile"
         text = p.read_text(encoding="utf-8")
-        p.write_text(text.replace("--features cloud-full ", ""), encoding="utf-8")
+        self.assertIn("--features cloud-full", text)
+        p.write_text(text.replace("--features cloud-full", "", 1), encoding="utf-8")
         result = _run(self.tree)
         self.assertEqual(result.returncode, 1)
         self.assertIn("omits `--features cloud-full`", result.stdout)
+
+    def test_a_feature_named_only_in_a_comment_does_not_satisfy_the_image_check(
+        self,
+    ) -> None:
+        """An earlier revision accepted any mention of the feature on the line."""
+        p = self.tree / "deploy/docker/Dockerfile"
+        text = p.read_text(encoding="utf-8")
+        p.write_text(
+            text.replace(
+                "--features cloud-full", "# was --features cloud-full", 1
+            ),
+            encoding="utf-8",
+        )
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1)
+
+    def _mutate_one_features_entry(self, replacement: str) -> None:
+        """Rewrite ONE of the two live targets, leaving the other intact.
+
+        Mutating both would trip the `found == 0` safety net instead of the
+        value check, which is how an earlier revision looked guarded while
+        letting a single reverted target through.
+        """
+        p = self.tree / ".github/workflows/release.yml"
+        text = p.read_text(encoding="utf-8")
+        old = '            features: "cloud-full"\n'
+        self.assertEqual(text.count(old), 2)
+        p.write_text(text.replace(old, replacement + "\n", 1), encoding="utf-8")
+
+    def test_rejects_every_empty_features_spelling(self) -> None:
+        """Each of these is legal YAML that ships a feature-less binary.
+
+        All three passed an earlier revision, whose regex required a
+        double-quoted value with nothing after it.
+        """
+        for spelling in (
+            "            features: ''",
+            "            features:",
+            '            features: ""  # TODO re-enable',
+            "            features: aws",
+            "            features: 'aws,azure'",
+        ):
+            with self.subTest(spelling=spelling):
+                self.setUp()
+                self._mutate_one_features_entry(spelling)
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1, spelling)
+                self.assertIn("must include `cloud-full`", result.stdout)
+
+    def test_accepts_every_legal_spelling_of_the_right_value(self) -> None:
+        for spelling in (
+            "            features: cloud-full",
+            '            features: "cloud-full"  # keep',
+            "            features: 'cloud-full'",
+            '            features: "cloud-full,onnx"',
+        ):
+            with self.subTest(spelling=spelling):
+                self.setUp()
+                self._mutate_one_features_entry(spelling)
+                result = _run(self.tree)
+                self.assertEqual(
+                    result.returncode, 0, spelling + "\n" + result.stdout
+                )
+
+    def test_a_documented_timeout_value_is_not_a_missing_one(self) -> None:
+        """A trailing comment on the value must not read as absence."""
+        p = self.tree / ".github/workflows/release.yml"
+        text = p.read_text(encoding="utf-8")
+        p.write_text(
+            text.replace(
+                "    timeout-minutes: 150",
+                "    timeout-minutes: 150  # Windows leg measured 66 min",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_a_commented_out_target_is_not_a_finding(self) -> None:
         """The disabled musl/macOS matrix entries keep `features: ""` in comments."""

@@ -431,6 +431,7 @@ jobs:
   deterministic-commit-contract:
     name: Deterministic Commit Contract
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     needs: changes
     steps:
       - uses: actions/checkout@v7

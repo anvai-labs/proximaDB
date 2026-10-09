@@ -860,7 +860,7 @@ jobs:
           # published binaries and container image are built with. Omit it and
           # `file://` still works, but an `s3://`/`az://`/`gs://` URL fails with
           # "feature for AmazonS3 not enabled" -- not compiled in.
-          cargo build --release --features cloud-full --bin proximadb-server
+          cargo build --release --features cloud-full -p proximadb-server --bin proximadb-server
           ```
 
           #### Platform Packages (RPM/DEB/MSI)
