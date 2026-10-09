@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: Apache-2.0
+= TD-ENGDUP-1: the progressive-stage helpers are copied across all six storage engines
+
+[cols="1,3"]
+|===
+| Status | **Open.** Filed 2026-10-09 from a structural sweep of the v0.4.0 tree
+(`develop` @ `9d6acc7f4`).
+| Severity | Medium. Behaviour is correct today, but a fix to one engine's copy does not reach
+the other five, and the copies have already drifted -- `compute_distances` exists in two
+*different* identical-body variants (26 LOC across six engines, 30 LOC across five), which is
+what partial propagation looks like.
+| Owner | unassigned
+|===
+
+== What
+
+`src/storage/engines/<engine>/progressive_stages.rs` exists once per engine -- SST, HELIX, NOVA,
+VIPER, RAPTOR, SWIFT -- for **1,721 LOC total**, and the six files are near-copies:
+
+|===
+| Engine | LOC | Identical lines shared with the SST copy
+
+| sst    | 271 | (baseline)
+| nova   | 267 | 192 / 231 (83%)
+| swift  | 273 | 194 / 236 (82%)
+| viper  | 268 | 192 / 232 (82%)
+| helix  | 302 | 194 / 263 (73%)
+| raptor | 340 | 174 / 298 (58%)
+|===
+
+Within them, **16 helper bodies are byte-identical (after comment and whitespace
+normalisation) across more than one engine**, accounting for **40 removable copies**:
+
+|===
+| Helper | LOC | Copies | Engines
+
+| `filter_candidates` | 21 | 7 | helix, nova, raptor, sst, swift, viper
+| `compute_distances` | 26 | 6 | helix, nova, raptor, sst, swift, viper
+| `create_test_engines` | 10 | 6 | helix, nova, raptor, sst, swift, viper
+| `compute_distances` (2nd variant) | 30 | 5 | helix, nova, sst, swift, viper
+| `convert_filter_to_index` | 58 | 4 | helix, nova, raptor, viper (SWIFT's copy has diverged -- see below)
+| `rls_record_filter` | 25 | 4 | helix, nova, sst, viper
+| `cleanup_compacted_files` | 11 | 3 | helix, sst, viper
+| `for_search` | 11 | 3 | helix, sst, viper
+| `supports_filters_pushdown` | 19 | 3 | helix, sst, viper
+| `new` | 28 | 3 | helix, sst, viper
+| `create_filesystem_factory_sync` | 24 | 2 | sst, viper
+| `get_pca_model` | 24 | 2 | sst, swift
+| `get_quantization_engine` | 21 | 2 | raptor, viper
+| `mmap_parquet_file` | 15 | 2 | nova, viper
+| `extraction_capabilities` | 13 | 2 | nova, swift
+| `new` (2nd variant) | 10 | 2 | sst, viper
+|===
+
+`filter_candidates` has seven copies across six engines because SWIFT carries it twice
+(`progressive_stages.rs:154` and `stages.rs:154`).
+
+Two notable ones sit outside `progressive_stages.rs`:
+
+* `convert_filter_to_index` (58 LOC) is the largest, and it is the clearest evidence of drift.
+  It is *defined in five engines* -- `helix/mod.rs:504`, `nova/engine.rs:2202`,
+  `viper/engine.rs:631`, `raptor/engine.rs:2978`, `swift/engine.rs:834`. Normalising each body
+  and hashing it: helix, nova and viper are **identical**; raptor differs by two characters;
+  SWIFT's is **materially different** (1,365 normalised chars against 1,581). So one of the five
+  has already diverged in substance and another in trivia, with nothing to signal either.
+* `supports_filters_pushdown` and `new` are duplicated across the three DataFusion engine
+  adapters (`src/datafusion/engine_adapters/{helix,sst,viper}_adapter.rs`), which matters
+  because ADR-039 constrains what may live behind that adapter seam -- three copies means three
+  places to keep the lane discipline correct.
+
+== Why it is worth consolidating
+
+. **A fix lands in one engine and silently misses five.** Two distinct identical-body variants of
+  `compute_distances` already coexist, so this has happened.
+. **It is the cheapest real reduction of `src/storage`.** That module is 295,958 LOC -- 37% of
+  the root crate -- and is referenced by 26 of the 41 top-level modules in `src/`. Shared
+  helpers are the part of it with no engine-specific semantics, so moving them out carries the
+  least behavioural risk per line removed.
+. **`proximadb-engine-core` already exists for exactly this.** It is the shared storage-layer
+  crate (fan-out 20, the second-highest in the workspace), so the destination needs no new
+  layering decision and no `scripts/check-layering.sh` change.
+. **`create_test_engines` is duplicated six ways**, so the test fixtures drift independently of
+  each other -- a determinism hazard of the kind mandate #11 exists to prevent.
+
+== Options
+
+. **Lift the 16 identical helpers into `proximadb-engine-core`** and have each engine's
+  `progressive_stages.rs` import them. Mechanical: the bodies are byte-identical, so the first
+  pass is a move plus a `use`, with no semantic decision. Removes ~40 copies.
+. **Then ask whether `progressive_stages.rs` should exist per engine at all.** With the shared
+  helpers gone, each file is left with only its engine-specific stage wiring; if that residue is
+  small, one generic staged-scan driver parameterised by engine is the real fix and the six
+  files collapse. This is the part that needs design, so it should not be bundled with step 1.
+. **Guard it.** The duplicate-body detector used to find this is a content hash over
+  normalised function bodies; baselining the cross-engine clone count and ratcheting it down
+  stops the class regrowing, in the style of the existing conformance ratchets.
+
+Do step 1 alone first. It is reviewable, behaviour-preserving and independently valuable, and it
+makes step 2's residue visible -- which is the information needed to decide step 2 at all.
+
+== Verification
+
+* Byte-identity of each lifted body is the precondition: the move must be a pure relocation,
+  verifiable by diffing the normalised body before and after.
+* `cargo nx` and `cargo build --profile release-server` green; the ANN recall ratchets
+  (`sift_pax_cascade_recall_at_10_ratchet` and the filtered arm) unchanged, since
+  `compute_distances` and `filter_candidates` are on the search path and a behavioural change
+  there would move recall.
+* `scripts/check-layering.sh` and `scripts/check_workspace_boundaries.py` green -- the
+  destination is an existing storage-layer crate, so no new edge is introduced, but the guard
+  should confirm it.
+* `make work-commit-check` green.
+
+== Measurement notes
+
+The clone set was found by hashing comment- and whitespace-normalised function bodies, not by
+matching names or signatures. Matching name+signature instead reports ~26,000 "duplicated" lines
+in this repo, which is wrong -- `fn main()` appears 36 times and `validate` 27 times with
+entirely different bodies. Across the whole repo the body-hash method finds 53 exact cross-file
+clone sets totalling ~1,903 removable LOC; the 16 cross-engine sets here are the largest coherent
+cluster within that.
+
+See also TD-ORPHAN-1, filed from the same sweep.

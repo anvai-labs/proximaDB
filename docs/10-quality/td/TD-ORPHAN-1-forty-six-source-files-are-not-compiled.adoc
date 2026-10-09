@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: Apache-2.0
+= TD-ORPHAN-1: 46 source files inside crate `src/` trees are not compiled by anything
+
+[cols="1,3"]
+|===
+| Status | **Open.** Filed 2026-10-09 from a structural sweep of the v0.4.0 tree
+(`develop` @ `9d6acc7f4`).
+| Severity | Medium. No runtime effect -- the files are not in any build -- but 18,367 lines
+read as live code: they are grepped, cited in review, and counted as coverage surface. Several
+are stale duplicates of code that moved to a crate, so a reader can follow the wrong copy.
+| Owner | unassigned
+|===
+
+== What
+
+In Rust a file under a crate's `src/` tree is only compiled if some module declares it
+(`mod foo;`), it is pulled in by `include!`/`#[path]`, or it is a cargo-autodiscovered target
+(`tests/`, `benches/`, `examples/` at the crate root, plus `lib.rs`/`main.rs`/`build.rs`).
+**46 tracked `.rs` files inside crate `src/` trees satisfy none of these**, totalling
+**18,367 LOC** -- 24 files / 10,062 LOC that look like tests, examples or benchmarks, and
+22 files / 8,305 LOC that look like production code.
+
+Concentration: `src/storage` 27 files, `src/core` 3, `src/metrics` 2, `src/network` 2, and one
+each in `src/observability`, `src/monitoring`, `src/bin` and `proximadb-orion-engine`.
+
+== Evidence
+
+Two files were proven uncompiled **by the compiler**, not by inspection: invalid Rust was
+appended to each and the owning crate still built clean.
+
+[source,console]
+----
+$ printf '\nthis is not valid rust at all !!! @@@\n' \
+    >> crates/horizontal/proximadb-geo-spatial-index/src/geo_index.rs
+$ cargo check -p proximadb-geo-spatial-index
+    Finished `dev` profile ... in 7.38s          # the file is not in the build
+
+$ printf '\n!!! not valid rust @@@ ###\n' \
+    >> crates/modalities/proximadb-orion-engine/src/multi_tenant.rs
+$ cargo check -p proximadb-orion-engine
+    Finished `dev` profile ... in 1m 25s
+----
+
+Two more were confirmed structurally:
+
+* `src/core/compression/markers.rs` (140 LOC) -- its sibling `src/core/compression/mod.rs` is a
+  seven-line re-export shim whose own header says *"Ownership has moved to the
+  `proximadb-compression` horizontal crate"*, and it contains **no** `mod markers;`. The only
+  `mod markers;` in the repo is `crates/horizontal/proximadb-compression/src/lib.rs:295`. Every
+  real consumer already imports `proximadb_compression::markers::*`. The two copies differ by
+  one comment line.
+* `crates/horizontal/proximadb-geo-spatial-index/src/geo_index.rs` (365 LOC) -- byte-identical
+  (md5 `942cfe0e...`) to `crates/horizontal/proximadb-document-geo-index/src/geo_index.rs`, which
+  *is* compiled. The two crates were extracted by separate TDs (TD-DECOMP-39 and TD-DECOMP-62)
+  and one left a copy behind.
+
+Spot-checked four more against their parent `mod.rs` -- `sst/readers/tests.rs`,
+`sst/compaction_tests.rs`, `observability/graph_linking.rs`,
+`storage/persistence/filesystem/hdfs.rs` -- none is declared.
+
+== The largest ones
+
+|===
+| File | LOC
+
+| `src/storage/engines/sst/readers/tests.rs` | 1391
+| `src/storage/engines/sst/compaction_tests.rs` | 1141
+| `src/observability/graph_linking.rs` | 884
+| `src/storage/engines/sst/unified_search_engine/tests.rs` | 813
+| `src/storage/engines/viper/tests/parquet_reader_tests.rs` | 777
+| `src/storage/engines/viper/tests/coverage_tests.rs` | 763
+| `src/storage/persistence/filesystem/hdfs.rs` | 703
+| `src/core/search/search_interface_tests.rs` | 644
+| `src/storage/engines/core/formats/columnar/search.rs` | 640
+| `src/monitoring/enterprise_dashboard.rs` | 626
+| `src/storage/engines/core/scan_implementation.rs` | 559
+| `src/storage/engines/helix/benchmarks.rs` | 548
+| `crates/modalities/proximadb-orion-engine/src/multi_tenant.rs` | 535
+| `src/storage/engines/raptor/tests.rs` | 519
+| `src/bin/score_lexical_corpus.rs` | 507
+|===
+
+The full list is reproducible with the detector in "Verification" below.
+
+== Why this matters beyond tidiness
+
+. **The test-looking files are not running.** 24 of the 46 are `*_tests.rs` / `benchmarks.rs` /
+  `*_examples.rs`. Whatever they assert is not asserted -- `sst/readers/tests.rs` and
+  `sst/compaction_tests.rs` alone are 2,532 lines of SST coverage that no CI job executes. That
+  is the opposite of the determinism mandate: a test nobody runs is worse than no test, because
+  it reads as coverage.
+. **The duplicates mislead.** `markers.rs` and `geo_index.rs` are stale copies of code that moved
+  to crates. A reader or an agent grepping a symbol finds the dead copy and may edit it.
+. **It inflates the decomposition surface.** The root crate is 58.3% of non-test Rust
+  (796,693 of 1,365,779 LOC). 8,305 of those lines are not even compiled, so the monolith is
+  measurably smaller than it looks -- useful to know when scoping ADR-094 work.
+
+== Options
+
+. **Delete, file by file, after a salvage read.** Default for the stale duplicates
+  (`markers.rs`, `geo_index.rs`) and for anything superseded.
+. **Re-attach the tests that still mean something.** For each `*_tests.rs`, decide: declare it
+  (`#[cfg(test)] mod ...;`), move it to the crate's `tests/` directory where cargo finds it
+  automatically, or delete it. Re-attaching will surface real failures -- that is the point, and
+  it must be done in small batches rather than one sweep.
+. **Add a guard so the class cannot regrow.** A detector in `scripts/` wired into
+  `work-commit-check` and the unconditional `deterministic-commit-contract` CI job, baselined at
+  the current count and ratcheted down -- the pattern `check_docs_site_coverage.py` already uses
+  for unservable docs (TD-DOCSITE-1).
+
+Sequencing matters: land the guard with a baseline **first**, so deletions ratchet the number
+down and nothing new slips in while the list is being worked.
+
+== Verification
+
+[source,python]
+----
+# An .rs file under a crate src/ tree is orphaned when no `mod <name>;` exists in its
+# parent module scope, it is not include!/#[path]-ed, and it is not a generated proto tree.
+# Beware two traps that produced wrong counts while this was being measured:
+#   * `**/*.rs` in a git pathspec does NOT match top-level files (src/lib.rs), and
+#   * excluding a *directory* because some file in it mentions OUT_DIR masks the whole
+#     subtree -- `src/lib.rs` mentions OUT_DIR, which silently hid all of src/.
+----
+
+Acceptance for any change under this TD:
+
+* `cargo build --profile release-server` and `cargo nx` stay green (a deletion of uncompiled
+  code cannot break either; if it does, the file was not orphaned and the detector is wrong).
+* `make work-commit-check` green.
+* The orphan count strictly decreases, and the guard's baseline is updated in the same PR.
+
+See also TD-ENGDUP-1, filed from the same sweep.
