@@ -2467,17 +2467,21 @@ jobs:
     needs: changes
     strategy:
       matrix:
-        # 3.9 dropped: the package declares requires-python ">=3.10".
+        # Floor is 3.11 (`requires-python = ">=3.11"`). 3.9 went when the floor
+        # was 3.10; 3.10 went when it reached upstream EOL in October 2026. 3.11
+        # stays because it is what Debian 12 — current stable — ships, and it has
+        # upstream support until October 2027.
         #
         # The matrix WIDTH is the cost dial (TD-CI-2). At promotion the full
-        # three-interpreter sweep runs; on feat->develop only 3.12 does, because
+        # interpreter sweep runs; on feat->develop only 3.12 does, because
         # the failure this lane exists to catch is almost never version-specific
         # -- a broken test breaks on every interpreter -- while the width is
-        # what costs runner time. Measured: 8.89 min mean per job-run, so three
-        # versions is 26.7 runner-minutes per PR and one is 8.9.
+        # what costs runner time. Measured: 8.89 min mean per job-run, so the
+        # two-version sweep is 17.8 runner-minutes per promotion and the
+        # single-version PR lane is 8.9 (it was 26.7 at three versions).
         python-version: >-
           ${{ (needs.changes.outputs.medium_tier == 'true'
-               && fromJSON('["3.10", "3.11", "3.12"]'))
+               && fromJSON('["3.11", "3.12"]'))
               || fromJSON('["3.12"]') }}
     # Runs at promotion (medium_tier) AND on any feat->develop PR that actually
     # touches Python (TD-CI-2). Before this, the suite was medium_tier-only, so

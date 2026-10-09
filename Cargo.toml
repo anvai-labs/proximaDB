@@ -375,7 +375,7 @@ xz2 = "0.1"
 zstd = "0.13"
 
 # Language bindings
-pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }  # abi3 floor = CPython 3.10 (our minimum supported Python); one wheel (cp310-abi3) installs on 3.10+
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }  # abi3 floor = CPython 3.11 (our minimum supported Python); one wheel (cp311-abi3) installs on 3.11+
 numpy = { version = "0.29" }
 
 # TurboQuant numerics (ADR-021, gated by `experimental-turboquant`).

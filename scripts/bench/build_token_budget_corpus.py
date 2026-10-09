@@ -19,10 +19,7 @@ from typing import Any
 
 import proximadb_sdk.chunking_strategies as chunking_package
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10 — tomllib is stdlib only in 3.11+
-    import tomli as tomllib
+import tomllib  # stdlib from 3.11, this project's floor
 from proximadb_sdk.chunking_strategies import (
     ChunkContextRenderer,
     ChunkingConfig,

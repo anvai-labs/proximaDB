@@ -14,14 +14,13 @@ authors = [
 ]
 license = {text = "Apache-2.0"}
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["vector", "database", "similarity", "search", "ml", "ai", "embeddings", "proximity"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Database",
@@ -184,7 +183,6 @@ dev = [
     "mypy>=1.0.0",
     "pre-commit>=2.20.0",
     "ruff>=0.0.280",
-    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 test = [
@@ -208,9 +206,6 @@ test = [
     "pyyaml>=6.0",
     "jsonschema>=4.0.0",
     "httpx>=0.24.0",
-    # scripts/bench/build_token_budget_corpus.py reads TOML; tomllib is stdlib
-    # only on 3.11+, so the bench corpus test needs the tomli backport on 3.10.
-    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 docs = [
@@ -243,7 +238,7 @@ where = ["src"]
 
 [tool.black]
 line-length = 88
-target-version = ['py310']
+target-version = ['py311']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -267,7 +262,7 @@ line_length = 88
 known_first_party = ["proximadb"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = false
 warn_unused_configs = true
 disallow_untyped_defs = false
@@ -333,7 +328,7 @@ filterwarnings = [
 minversion = "7.0"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 88
 
 [tool.ruff.lint]

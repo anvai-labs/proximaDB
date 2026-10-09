@@ -9,7 +9,7 @@ description = "ProximaDB Queue (Embedded) — in-process tiered persistent queue
 authors = [{name = "Vijaykumar Singh", email = "vijay@anvaiops.com"}]
 license = {text = "Apache-2.0"}
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["queue", "persistent", "pyo3", "tokio", "wal", "lsm"]
 classifiers = [
     "Development Status :: 4 - Beta",
