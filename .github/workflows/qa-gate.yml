@@ -255,7 +255,16 @@ jobs:
           PROXIMADB_SIFT_QUERIES: "1000"
           PROXIMADB_RECALL_DATASET_REQUIRED: "1"
           PROXIMADB_SIFT_CENTROID_MAX_RECALL_DROP: "0"
-        run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --nocapture
+        # --test-threads=1 is load-bearing, not tidiness: three arms in this
+        # file set process-global PAX gates (PROXIMADB_PAX_WRITE_RG_LAYOUT,
+        # PROXIMADB_PAX_FOOTER_STATS) with no mutex, and the file's own module
+        # header says it relies on nextest's process-per-test isolation. Run
+        # under libtest's default parallelism they share a process and can
+        # clobber each other's write geometry, which makes a RATCHET job flaky
+        # in the direction that matters (a wrong-geometry arm reads different
+        # bytes). Serialising removes the race without installing nextest here;
+        # each arm sets its own gates before writing, so serial order is safe.
+        run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --test-threads=1 --nocapture
 
   # Validate the object-store access-tier cost lever (TD-168/TD-173) against REAL
   # cloud APIs via emulators — Azurite (Azure), LocalStack (S3), fake-gcs (GCP) — the

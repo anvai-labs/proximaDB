@@ -175,8 +175,11 @@ so your own corpus works without precomputed neighbours.
 !!! warning "This needs the repository, not a release"
 
     The harness is an integration test, so running it today requires a git
-    checkout, the pinned Rust toolchain and `cargo test` — it is **not** in any
-    released artifact, and there is no `proximadb`-CLI equivalent yet.
+    checkout, the pinned Rust toolchain and **`cargo-nextest`** (`make
+    install-fast-tools`, or `cargo install cargo-nextest --locked` — it is not
+    part of the pinned toolchain, so a fresh checkout gets `error: no such
+    command: nextest` without it). It is **not** in any released artifact, and
+    there is no `proximadb`-CLI equivalent yet.
     **TD-VECEVAL-1** tracks shipping it as a subcommand of
     `apps/proximadb-ann-bench` so it can be run against your own data without
     building the server. Until then, treat this section as instructions for
@@ -190,11 +193,20 @@ PROXIMADB_SIFT_QUERIES=1000 \
     --test sift_pax_recall_ratchet_test --no-capture
 ```
 
-Use **nextest**, not `cargo test`: three of the arms set process-global PAX env
-vars (`PROXIMADB_PAX_WRITE_RG_LAYOUT`, `PROXIMADB_PAX_FOOTER_STATS`) and the file
-has no mutex, relying instead on nextest's process-per-test isolation — under
-`cargo test` they run on parallel libtest threads and can clobber each other's
-write geometry, so the numbers stop being reproducible (mandate #11).
+Use **nextest**, not a bare `cargo test`: three of the arms set process-global
+PAX env vars (`PROXIMADB_PAX_WRITE_RG_LAYOUT`, `PROXIMADB_PAX_FOOTER_STATS`) and
+the file has no mutex, relying instead on nextest's process-per-test isolation
+(its own module header says so). Under `cargo test` with default parallelism they
+share a process and can clobber each other's write geometry (mandate #11).
+
+The race needs *concurrency*, not merely one process: each arm sets its own gates
+before writing, so serialised execution is also safe. That is how CI runs it —
+the qa-gate `sift-pax-recall` job uses `cargo test … -- --test-threads=1
+--nocapture`, which is where the **CI** rows in the table above come from.
+`--test-threads=1` was added in this PR precisely because the job had been
+running the arms in parallel; nextest's `--no-capture` serialises too, so either
+invocation reproduces those rows and a bare parallel `cargo test` reproduces
+neither.
 
 Do **not** add `PROXIMADB_RECALL_DATASET_REQUIRED=1` here. It exists so CI fails
 loudly instead of skipping, and it asserts that **all three** files are present —
@@ -218,15 +230,21 @@ which understates the GET savings a cloud budget gives you.
 | `PROXIMADB_OBJECT_STORE_URL` | measure against a cloud/emulator base |
 | `PROXIMADB_PAX_READ_COARSE_NPROBE` | coarse cells probed (recall↔GET trade) — **requires a compacted segment**, see below |
 
-Two further gates appear in the test file but do nothing in the invocation above,
-because they are read only inside the `#[ignore]`d coalesced eval
-(`sift_coalesced_rabitq_scan_rerank_eval`, which needs `-- --ignored`):
-`PROXIMADB_SIFT_COALESCED_BYTE_BUDGET` (bytes/query ceiling) and
-`PROXIMADB_COUNT_FS_IO` (process-global GET/byte counters, which that eval sets
-for itself). The run above derives its GET and byte figures from io_trace
-snapshots instead, which is why it needs `--features io-trace`.
+Two further gates appear in the test file and neither belongs in the run above:
 
-!!! warning "nprobe is inert until something compacts — and flush will not do it"
+* `PROXIMADB_SIFT_COALESCED_BYTE_BUDGET` (bytes/query ceiling) is **inert here** —
+  it is read only inside the `#[ignore]`d `sift_coalesced_rabitq_scan_rerank_eval`,
+  which needs `-- --ignored`.
+* `PROXIMADB_COUNT_FS_IO` is **not inert — do not set it.** It is read by
+  *production* code, not the test: the filesystem factory wraps every filesystem
+  in `CountingFileSystem` when it is present. The check is
+  `var_os(...).is_some()`, so **even `PROXIMADB_COUNT_FS_IO=0` turns the wrapper
+  on** and changes the stack your latency numbers come from. The two `#[ignore]`d
+  evals set it for themselves deliberately; the documented run must not, and it
+  does not need to — it derives GET and byte figures from io_trace snapshots,
+  which is why it needs `--features io-trace`.
+
+!!! warning "nprobe is inert in this harness, and no env var fixes that"
 
     `PROXIMADB_PAX_READ_COARSE_NPROBE` probes **Region A0**, and
     **compaction is the only write path that emits A0**: the flush entry point
@@ -234,13 +252,25 @@ snapshots instead, which is why it needs `--features io-trace`.
     compaction-only (TD-RDSTRAT-8)"*), because IVF-at-flush measured **~80×
     flush cost** and was dropped. Training is already default-ON
     (`PROXIMADB_PAX_WRITE_A0_TRAIN`), so there is **no env var that trains at
-    flush** — turning knobs cannot substitute for driving a compaction.
+    flush** — no knob substitutes for a compaction having run.
 
-    The ratchet above never compacts, so nprobe is structurally inert there and
-    the arms will measure byte-identical however you set it. The tests that do
-    exercise it (`sift_ivf2_coarse_probe_recall_ratchet`,
-    `sift_ivf2_probe_release_bakeoff_eval`) are `#[ignore]`d and drive
-    compaction themselves.
+    **Why the run above produces no A0 is worth stating precisely, because it is
+    not "flush declined to".** Compaction is armed by default on these
+    collections, and at `PROXIMADB_SIFT_N=100000` with a 20 000-row batch the
+    fifth flush crosses the L0 threshold of 5, so compaction becomes *due* and is
+    attempted. It then fails admission: the collection id is a name
+    (`sift_pax_ratchet_baseline`) and the boundary requires a decimal catalog
+    object id. The error is recorded on the flush result, logged at `warn`, and
+    the flush succeeds — so nothing surfaces it. **TD-SIFTCOMPACT-1** and
+    **TD-VECEVAL-1** carry this; the Caveats section below repeats it.
+
+    So nprobe measures byte-identical here however you set it, and "drive a
+    compaction" is **not** something you can do in this harness as shipped —
+    which is why `sift_ivf2_coarse_probe_recall_ratchet` is listed in the TDs as
+    blocked on the same admission error rather than as a worked example.
+    `sift_ivf2_probe_release_bakeoff_eval` (`#[ignore]`d) is the one that really
+    does produce a v3 segment, because it calls the compacted writer directly
+    rather than going through the flush trigger.
 
 ### Reading the output
 

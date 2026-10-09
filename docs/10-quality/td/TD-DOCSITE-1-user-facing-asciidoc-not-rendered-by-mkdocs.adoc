@@ -36,7 +36,7 @@ Per-directory, the split matters because it separates "must publish" from
 | `04-operations` | 7 | 2 | yes
 | `05-concepts` | 6 | 4 | yes
 | `release-notes` | 2 | 0 | yes
-| `docs/` root | 2 | 2 | yes — `SUPPORTED_SURFACE.adoc` is unservable; `INDEX.adoc` is the repo-tree index and is excluded by name, so it is not one of the 30
+| `docs/` root | 2 | 2 | yes — but only `SUPPORTED_SURFACE.adoc` counts toward the 30; `INDEX.adoc` is the repo-tree index and is excluded by name
 | `00-product` | 4 | 0 | no — PRD/VISION/scorecards, internal product material
 | `rfcs` | 3 | 0 | no — RFC drafts and templates
 | `11-usecases` | 2 | 2 | no — dated internal design drafts
@@ -45,6 +45,13 @@ Per-directory, the split matters because it separates "must publish" from
 | `10-quality` | — | — | no — TD/debt register (the bulk of the corpus)
 | `12-design` | — | — | no — ADRs / design records (ditto)
 |===
+
+NOTE: the publish-yes `.adoc` column sums to **31**, while the baseline and the
+guard both report **30**. The one-file difference is `docs/INDEX.adoc`: it sits in
+a publish-yes directory but is excluded by name in `mkdocs.yml`, because the
+site's entry point is `docs/index.md`. An earlier revision of this table recorded
+the root as 1 `.adoc` and so summed to 30 by *undercounting* rather than by
+reconciling — the two numbers are both right and count different things.
 
 So the site's exclusion of `10-quality`/`12-design`/`_archive` is **correct and
 deliberate**: publishing the internal debt register would make the product's docs

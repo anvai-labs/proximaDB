@@ -80,9 +80,18 @@ Note why the *other* SIFT ratchets in the same file are unaffected: the decimal-
 requirement is enforced at the **flush/compaction-admission** boundary
 (`FlushParams::get_collection_object_id` and its compaction twin, in
 `crates/storage/proximadb-storage-traits/src/types.rs`), which only this test
-reaches — it is the one that drives v3 through the production compaction trigger.
-The others set `id` to a name too and never hit that boundary, so the pattern
-looks fine by inspection and is not.
+**asserts on** — it is the one that drives v3 through the production compaction
+trigger and fails loudly when admission declines.
+
+CORRECTION (round 6): an earlier revision said "the others set `id` to a name too
+and never hit that boundary, so the pattern looks fine by inspection and is not."
+They DO hit it. `collection()` sets no tags, so `resolve_compaction_armed(&[])` is
+true by default; at `PROXIMADB_SIFT_N=100000` with `BATCH_SIZE = 20_000` the fifth
+flush reaches `L0_COMPACTION_THRESHOLD = 5`, compaction becomes due, and the same
+admission error fires. The difference is only that those arms never assert on it:
+it lands in `compaction_error`, is logged at `warn`, and the flush succeeds. So
+the defect was broader than filed, and the sentence that congratulated itself for
+not trusting inspection was itself an inspection error — see TD-SIFTCOMPACT-1.
 
 **The fix is two lines, and the canonical precedent is already in the repo.**
 `tests/sst_ivf2_compaction_route_proof_test.rs` mints an id for exactly this
