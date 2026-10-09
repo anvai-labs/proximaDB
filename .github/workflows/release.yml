@@ -162,7 +162,10 @@ jobs:
 
       - name: Validate Cargo.toml Version
         run: |
-          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          # Structural, not `grep '^version = ' | head -1`: that slides down to
+          # [workspace.package] when [package] has no version line, so it
+          # compared the wrong field. Same fix as scripts/version-sync.sh.
+          CARGO_VERSION=$(bash scripts/version-sync.sh get)
           EXPECTED="${{ steps.version.outputs.version }}"
           # Remove pre-release suffix for comparison
           EXPECTED_BASE="${EXPECTED%%-*}"

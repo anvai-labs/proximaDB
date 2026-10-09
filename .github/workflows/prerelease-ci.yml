@@ -9,7 +9,7 @@
 #
 # TRIGGERS:
 #   1. Push to main branch
-#   2. Push to development branch
+#   2. Push to `qa` (or `main`) — see the `on.push.branches` note below
 #   3. Manual dispatch with optional version input
 #
 # WORKFLOW STAGES:

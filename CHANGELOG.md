@@ -4,8 +4,11 @@ All notable changes to ProximaDB will be documented in this file.
 
 ## [0.4.0] - unreleased
 
-Storage-substrate release (**172** commits since the `v0.3.0` tag, counted at
-this release branch's merge-base; 174 on `develop` at the time of writing.
+Storage-substrate release: **172** commits since the `v0.3.0` tag, counted at
+this release branch's merge-base; 174 on `develop` at the time of writing, and
+what finally ships is whatever `develop` holds at promotion — the two extra
+commits include the spill-tombstone-persistence work credited below, so treat
+172 as the anchored figure rather than the shipped one.
 
 The anchor is `refs/tags/v0.3.0` **as it exists on origin** — a lightweight tag
 on `9e19fc2a3`, dated 2026-09-04 — because that is what a clone resolves and
@@ -19,7 +22,9 @@ tag" — so anyone recomputing these figures should verify
 
 The 0.3.0 entry below is dated 2026-08-05, when `chore(release): prepare v0.3.0`
 landed; origin's tag was cut at the 2026-09-04 promotion. Both dates are real and
-mean different things — the prepare commit and the promotion that shipped it.) Headline: ADR-094 unified the three
+mean different things — the prepare commit and the promotion that shipped it.
+
+Headline: ADR-094 unified the three
 divergent storage substrates behind one compute seam, and the I/O-cost work that followed made
 round-trip count — not bytes, not CPU — the term the engine measures and the operator can tune.
 Full notes land with the docs-site PR (they must ship together with their nav
