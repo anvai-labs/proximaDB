@@ -22,9 +22,21 @@ Both are frozen in a baseline: the existing entries are listed, a NEW one fails,
 and removing one fails until its stale baseline entry is dropped. So the list can
 only shrink. See TD-DOCSITE-1.
 
-The published directories and the exclusion patterns are derived from
-`mkdocs.yml` rather than restated here, so the guard cannot drift from the site
-it guards.
+The published directories and the exclusion patterns are read from `mkdocs.yml`
+rather than restated here, so an edit to the site's scope moves this guard with
+it.
+
+Two known divergences, both in the FALSE-POSITIVE direction (noisy, never a
+bypass):
+
+* mkdocs unconditionally prepends its own implicit exclusions —
+  `GitIgnoreSpec.from_lines(['.*', '/templates/'])` in `structure/files.py` —
+  which this parser does not model. A dotfile or a `docs/templates/` entry would
+  be reported as new here while mkdocs excludes it anyway.
+* `is_excluded()` is consulted with only the non-`*.` patterns (see
+  `unpublished()`), so adding an extension glob like `*.toml` to `exclude_docs`
+  does NOT satisfy this guard. Only a directory or exact-path exclusion does —
+  which is what the error message should tell you, and does.
 """
 
 from __future__ import annotations
@@ -47,7 +59,14 @@ BASELINE = REPO / "docs" / ".site-coverage-baseline.json"
 # IS a page to mkdocs while the guard reported it as unservable.
 RENDERABLE = (".markdown", ".mdown", ".mkdn", ".mkd", ".md")
 
-# Files it copies verbatim and SHOULD: a real page can reference them.
+# Files mkdocs copies verbatim and SHOULD: a real page can reference them.
+#
+# This list is a deliberate HOLE, and the one to widen if something leaks. Any
+# file with one of these extensions passes unexamined, so an internal document
+# renamed `leak.pdf` under a published directory is served. `.pdf` is the
+# realistic case; `.svg`/`.js`/`.css` are the ones nothing would think to check.
+# The guard covers the non-asset class completely; it does not and cannot judge
+# the CONTENT of a legitimate asset type.
 ASSETS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".avif",
     ".woff", ".woff2", ".ttf", ".eot",

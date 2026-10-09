@@ -243,23 +243,31 @@ SIFT1M subset, N=100 000, dim 128, top_k 10, recall over 1000 queries, I/O over
 
 **Provenance, because it changes how much weight these carry:**
 
-* Rows 1–2 are from the **qa-gate `sift-pax-recall` job**, the last successful
-  run (2026-09-04). They are reproducible in CI.
-* Row 3 is **workstation-only and not in the evidence ledger** — no CI job sets
-  `PROXIMADB_OBJECT_STORE_URL`, so the `s3://` budget arm has never run in CI.
-  Treat it as indicative, and re-measure on your own account before relying on
-  it. (That gap is part of what TD-VECEVAL-1 covers.)
+Rows are referenced by **label**, not by index — an earlier revision numbered
+them, then a row was inserted and the numbering silently desynchronised from the
+table's own `Source` column.
+
+* **Exact scan**, **`[baseline]`** and **`[rg_layout]`** all come from one
+  **qa-gate `sift-pax-recall`** run — the last successful one, 2026-09-04 — and
+  are reproducible in CI. `[baseline]` and `[rg_layout]` are both logged in that
+  single run, which is what makes the layout comparison controlled.
+* **`s3://` budget** is **workstation-only and not in the evidence ledger** — no
+  CI job sets `PROXIMADB_OBJECT_STORE_URL`, so that arm has never run in CI.
+  Treat it as indicative and re-measure on your own account. (That gap is part of
+  what TD-VECEVAL-1 covers.)
 * The harness forces `PROXIMADB_PAX_F32_TIER=1`, which is **default-OFF**
-  (`ENV_GATE_REGISTRY.adoc`) and changes which stripes a segment emits. So the
-  three ANN rows are *default + one opt-in gate*, not stock defaults — and that
-  gate moves the very bytes/query and bytes/GET columns below.
+  (`ENV_GATE_REGISTRY.adoc`) and changes which stripes a segment emits — so no
+  row here is stock defaults, and that gate moves the very bytes/query and
+  bytes/GET columns. Note also that **`[baseline]` additionally sets
+  `PROXIMADB_PAX_WRITE_RG_LAYOUT=0`**, disabling a shipped default; that is the
+  point of the row, and its label says so.
 * The **filtered** figure quoted earlier has a different provenance again: that
   arm additionally forces `PROXIMADB_PAX_FOOTER_STATS=1` (also default-OFF) and
   sets `PROXIMADB_PAX_WRITE_RG_LAYOUT=0`, i.e. it turns *off* the shipped default
   this table shows to be the largest win. It is therefore *default + two opt-in
   gates − one default*. Its comparison is still apples-to-apples — the
   matching-geometry `[baseline]` arm in the same run is 0.9896 — but it is not
-  the configuration of rows 3–4.
+  the configuration of the `[rg_layout]` or `s3://` rows.
 
 | Configuration | recall@10 | GETs/query | bytes/query | bytes/GET | Source |
 |---|---|---|---|---|---|
@@ -268,8 +276,8 @@ SIFT1M subset, N=100 000, dim 128, top_k 10, recall over 1000 queries, I/O over
 | ANN, row-group layout (`[rg_layout]`) | 0.9896 | 53.97 | 25.3 MB | ~469 KB | CI |
 | **ANN, `s3://` budget (8 MiB target)** | 0.9896 | **42.03** | 26.9 MB | ~639 KB | workstation |
 
-Rows 2–4 are the same ANN configuration differing only in layout and budget, and
-rows 2–3 come from **one** qa-gate run (both arms logged in it), so the layout
+The three ANN rows are the same configuration differing only in layout and
+budget, and the two CI ones come from **one** qa-gate run, so the layout
 comparison is as controlled as this harness gets.
 
 Reading it:
