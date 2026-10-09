@@ -13,120 +13,105 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
+if TYPE_CHECKING:
+    from ..models.graph_collection_response_data import GraphCollectionResponseData
+    from ..models.graph_error_body import GraphErrorBody
+    from ..models.graph_response_metadata import GraphResponseMetadata
+
+
 T = TypeVar("T", bound="GraphCollectionResponse")
 
 
 @_attrs_define
 class GraphCollectionResponse:
-    """Server returns a `GraphResponse<T>` envelope around graph
-    collection metadata. The fields below are the common subset
-    SDKs rely on; extra server-side fields are passed through.
+    """Envelope around the serialized graph-collection object. The
+    payload is the port's collection record rendered as JSON — an
+    open object (the field set is the proto collection's, subject to
+    port evolution).
 
         Attributes:
-            graph_id (str | Unset):
-            name (None | str | Unset):
-            description (None | str | Unset):
-            node_count (int | None | Unset):
-            edge_count (int | None | Unset):
+            success (bool):
+            data (GraphCollectionResponseData | Unset):
+            error (GraphErrorBody | Unset):
+            metadata (GraphResponseMetadata | Unset):
     """
 
-    graph_id: str | Unset = UNSET
-    name: None | str | Unset = UNSET
-    description: None | str | Unset = UNSET
-    node_count: int | None | Unset = UNSET
-    edge_count: int | None | Unset = UNSET
+    success: bool
+    data: GraphCollectionResponseData | Unset = UNSET
+    error: GraphErrorBody | Unset = UNSET
+    metadata: GraphResponseMetadata | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        graph_id = self.graph_id
+        from ..models.graph_collection_response_data import GraphCollectionResponseData
+        from ..models.graph_error_body import GraphErrorBody
+        from ..models.graph_response_metadata import GraphResponseMetadata
 
-        name: None | str | Unset
-        if isinstance(self.name, Unset):
-            name = UNSET
-        else:
-            name = self.name
+        success = self.success
 
-        description: None | str | Unset
-        if isinstance(self.description, Unset):
-            description = UNSET
-        else:
-            description = self.description
+        data: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.data, Unset):
+            data = self.data.to_dict()
 
-        node_count: int | None | Unset
-        if isinstance(self.node_count, Unset):
-            node_count = UNSET
-        else:
-            node_count = self.node_count
+        error: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.error, Unset):
+            error = self.error.to_dict()
 
-        edge_count: int | None | Unset
-        if isinstance(self.edge_count, Unset):
-            edge_count = UNSET
-        else:
-            edge_count = self.edge_count
+        metadata: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metadata, Unset):
+            metadata = self.metadata.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
-        if graph_id is not UNSET:
-            field_dict["graph_id"] = graph_id
-        if name is not UNSET:
-            field_dict["name"] = name
-        if description is not UNSET:
-            field_dict["description"] = description
-        if node_count is not UNSET:
-            field_dict["node_count"] = node_count
-        if edge_count is not UNSET:
-            field_dict["edge_count"] = edge_count
+        field_dict.update(
+            {
+                "success": success,
+            }
+        )
+        if data is not UNSET:
+            field_dict["data"] = data
+        if error is not UNSET:
+            field_dict["error"] = error
+        if metadata is not UNSET:
+            field_dict["metadata"] = metadata
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_collection_response_data import GraphCollectionResponseData
+        from ..models.graph_error_body import GraphErrorBody
+        from ..models.graph_response_metadata import GraphResponseMetadata
+
         d = dict(src_dict)
-        graph_id = d.pop("graph_id", UNSET)
+        success = d.pop("success")
 
-        def _parse_name(data: object) -> None | str | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(None | str | Unset, data)
+        _data = d.pop("data", UNSET)
+        data: GraphCollectionResponseData | Unset
+        if isinstance(_data, Unset):
+            data = UNSET
+        else:
+            data = GraphCollectionResponseData.from_dict(_data)
 
-        name = _parse_name(d.pop("name", UNSET))
+        _error = d.pop("error", UNSET)
+        error: GraphErrorBody | Unset
+        if isinstance(_error, Unset):
+            error = UNSET
+        else:
+            error = GraphErrorBody.from_dict(_error)
 
-        def _parse_description(data: object) -> None | str | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(None | str | Unset, data)
-
-        description = _parse_description(d.pop("description", UNSET))
-
-        def _parse_node_count(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
-
-        node_count = _parse_node_count(d.pop("node_count", UNSET))
-
-        def _parse_edge_count(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
-
-        edge_count = _parse_edge_count(d.pop("edge_count", UNSET))
+        _metadata = d.pop("metadata", UNSET)
+        metadata: GraphResponseMetadata | Unset
+        if isinstance(_metadata, Unset):
+            metadata = UNSET
+        else:
+            metadata = GraphResponseMetadata.from_dict(_metadata)
 
         graph_collection_response = cls(
-            graph_id=graph_id,
-            name=name,
-            description=description,
-            node_count=node_count,
-            edge_count=edge_count,
+            success=success,
+            data=data,
+            error=error,
+            metadata=metadata,
         )
 
         graph_collection_response.additional_properties = d

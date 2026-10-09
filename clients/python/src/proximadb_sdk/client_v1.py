@@ -749,6 +749,10 @@ class ProximaDBClientV1:
             return sql_value.bool_value
         elif sql_value.HasField("bytes_value"):
             return bytes(sql_value.bytes_value)
+        elif sql_value.HasField("jsonb_value"):
+            # types.proto tag 9: JSONB bytes — surface the raw bytes like
+            # bytes_value; decoding to a JSON document is the caller's choice.
+            return bytes(sql_value.jsonb_value)
         elif sql_value.HasField("null_value"):
             return None
         elif sql_value.HasField("array_value"):

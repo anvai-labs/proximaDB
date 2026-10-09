@@ -244,6 +244,9 @@ fn sql_value_to_proxima(sql: &SqlValue) -> ProximaValue {
         Some(sql_value::Value::BoolValue(value)) => ProximaValue::Boolean(*value),
         Some(sql_value::Value::Int64Value(value)) => ProximaValue::Int64(*value),
         Some(sql_value::Value::BytesValue(value)) => ProximaValue::Binary(value.clone()),
+        // Canonical MessagePack JSONB decode (the shared helper) so a tag-9
+        // value compares equal across read paths.
+        Some(sql_value::Value::JsonbValue(value)) => ProximaValue::from_jsonb_or_binary(value),
         Some(sql_value::Value::NullValue(_)) | None => ProximaValue::Null,
         Some(sql_value::Value::ArrayValue(array)) => {
             ProximaValue::Array(array.values.iter().map(sql_value_to_proxima).collect())

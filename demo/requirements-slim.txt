@@ -12,7 +12,7 @@ sentence-transformers>=6.0.0
 # range could only ever resolve to a vulnerable build. The demo uses only
 # manual_seed / cuda.manual_seed_all / no_grad, which are stable across 2.x, and
 # never calls torch.jit.script, so raising the floor is behaviour-preserving here.
-torch>=2.13.0
+torch>=2.14.0+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Essential for demos

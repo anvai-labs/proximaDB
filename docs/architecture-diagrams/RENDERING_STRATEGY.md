@@ -8,7 +8,7 @@ visible on GitHub** with zero tooling, with PNG/SVG export for non-GitHub publis
 | Format | GitHub render | Standalone file | Best for |
 |---|---|---|---|
 | **Mermaid** `.mermaid` / embedded in `.md` | native (in `.md`) / via viewer | raw text | **PRIMARY — all diagrams** |
-| **PNG / SVG** (exported from Mermaid) | via `![](...)` | yes | Embedding in non-GitHub docs, PDFs, slides |
+| **PNG / SVG** (exported from Mermaid) | via image embeds (`![](...)`) | yes | Embedding in non-GitHub docs, PDFs, slides |
 | **ASCII art** | native (code block) | yes | Simple ideas, inline in prose, email-safe |
 
 1. **Mermaid-first and Mermaid-only.** Every diagram is Mermaid. `atlas.md` embeds the key

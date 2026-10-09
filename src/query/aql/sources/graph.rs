@@ -39,6 +39,9 @@ impl GraphAqlSource {
             PropValueData::DoubleValue(f) => AqlValue::Float(*f),
             PropValueData::BoolValue(b) => AqlValue::Bool(*b),
             PropValueData::BytesValue(b) => {
+                // Generic bytes may carry raw JSON from legacy producers — the
+                // heuristic stays; JSONB-declared fields (tag 9) decode through
+                // jsonb_to_json_lossy where declared.
                 if let Ok(json) = serde_json::from_slice(b) {
                     AqlValue::Jsonb(json)
                 } else {

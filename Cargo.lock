@@ -94,6 +94,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ambient-authority"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9d4ee0d472d1cd2e28c97dfa124b3d8d992e10eb0a035f33f5d12e3a177ba3b"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1014,9 +1020,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -1025,14 +1031,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1230,17 +1237,17 @@ dependencies = [
  "http 1.4.2",
  "http-body 0.4.6",
  "hyper 0.14.32",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-rustls 0.24.2",
  "hyper-rustls 0.27.9",
  "hyper-util",
  "pin-project-lite",
  "rustls 0.21.12",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tower",
  "tracing",
 ]
@@ -1405,7 +1412,7 @@ dependencies = [
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-util",
  "itoa",
  "matchit",
@@ -1457,14 +1464,14 @@ dependencies = [
  "fs-err",
  "http 1.4.2",
  "http-body 1.0.1",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-util",
  "pin-project-lite",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tower-service",
 ]
 
@@ -1823,6 +1830,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-fs-ext"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56ff379b70af8e08307a8f65e7040c7301cb4a572538ade16b4984f0da77847f"
+dependencies = [
+ "cap-primitives",
+ "cap-std",
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "cap-primitives"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b5f74729fd2f44701d1a8eb47e906cdb3ccd9ec0f02baad85a744b791940b18"
+dependencies = [
+ "ambient-authority",
+ "fs-set-times",
+ "io-extras",
+ "io-lifetimes 3.0.1",
+ "ipnet",
+ "maybe-owned",
+ "rustix 1.1.4",
+ "rustix-linux-procfs",
+ "windows-sys 0.61.2",
+ "winx",
+]
+
+[[package]]
+name = "cap-std"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ec78e242cfa2cfe276807ac2ecc00315a6c97786977414bcd1c3963b6c91b8"
+dependencies = [
+ "cap-primitives",
+ "io-extras",
+ "io-lifetimes 3.0.1",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1953,7 +2002,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -2080,7 +2129,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b85f248a4de22d204ceabc6299d89d2c70fbd7f09fea53c06c852369652d8139"
 dependencies = [
  "async-trait",
- "convert_case",
+ "convert_case 0.6.0",
  "json5",
  "pathdiff",
  "ron",
@@ -2130,6 +2179,15 @@ name = "convert_case"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "convert_case"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1af709f1f33454bf52eadfc8c78b3b9ef9cb26fb54d16dc9cd9a7299f899fd1b"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -2206,9 +2264,9 @@ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc32fast"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
 dependencies = [
  "cfg-if",
 ]
@@ -2253,9 +2311,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
+checksum = "e71406cd8807725f7ac2f999a4cdd32e98f829fdf65f528343cebf945e41df1e"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-deque",
@@ -2294,9 +2352,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-queue"
-version = "0.3.13"
+version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2378,13 +2436,9 @@ dependencies = [
 
 [[package]]
 name = "ctor"
-version = "0.2.9"
+version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
-dependencies = [
- "quote",
- "syn 2.0.118",
-]
+checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
 
 [[package]]
 name = "ctr"
@@ -3631,9 +3685,9 @@ dependencies = [
 
 [[package]]
 name = "flate2"
-version = "1.1.9"
+version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
@@ -3729,6 +3783,17 @@ checksum = "73fde052dbfc920003cfd2c8e2c6e6d4cc7c1091538c3a24226cec0665ab08c0"
 dependencies = [
  "autocfg",
  "tokio",
+]
+
+[[package]]
+name = "fs-set-times"
+version = "0.20.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
+dependencies = [
+ "io-lifetimes 2.0.4",
+ "rustix 1.1.4",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4508,9 +4573,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.11.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d22053281f852e11534f5198498373cbb59295120a20771d90f7ed1897490a72"
+checksum = "27b501faa50e7a26c3d3560ca625132f4078a17771f4810baf70475ae48cbe43"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -4550,12 +4615,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
  "http 1.4.2",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-util",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-native-certs",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tower-service",
  "webpki-roots 1.0.8",
 ]
@@ -4566,7 +4631,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
 dependencies = [
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-util",
  "pin-project-lite",
  "tokio",
@@ -4594,7 +4659,7 @@ checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
 dependencies = [
  "bytes",
  "http-body-util",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-util",
  "native-tls",
  "tokio",
@@ -4614,7 +4679,7 @@ dependencies = [
  "futures-util",
  "http 1.4.2",
  "http-body 1.0.1",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "ipnet",
  "libc",
  "percent-encoding",
@@ -4761,6 +4826,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4791,10 +4875,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "ipnet"
-version = "2.12.1"
+name = "io-extras"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
+checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
+dependencies = [
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "io-lifetimes"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
+
+[[package]]
+name = "io-lifetimes"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f0fb0570afe1fed943c5c3d4102d5358592d8625fda6a0007fdbe65a92fba96"
+
+[[package]]
+name = "ipnet"
+version = "2.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "is-terminal"
@@ -5011,9 +5117,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "10.4.0"
+version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
+checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -5236,6 +5342,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5335,9 +5451,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.2"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
+checksum = "ff9840bcc50b71349309900da0ce7279aa336ae71d73250b07998932c7d97c25"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -5472,6 +5588,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "maybe-owned"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5582,9 +5704,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniz_oxide"
-version = "0.8.9"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
@@ -5775,25 +5897,34 @@ dependencies = [
 
 [[package]]
 name = "napi"
-version = "2.16.17"
+version = "3.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55740c4ae1d8696773c78fdafd5d0e5fe9bc9f1b071c7ba493ba5c413a9184f3"
+checksum = "58c5f4d5375213fdb7be2655e152386e82f026f9a5ba36a75556e11359aafe09"
 dependencies = [
  "bitflags 2.13.0",
  "ctor",
- "napi-derive",
+ "futures",
+ "libc",
+ "napi-build",
  "napi-sys",
- "once_cell",
+ "nohash-hasher",
+ "rustc-hash 2.1.2",
 ]
 
 [[package]]
-name = "napi-derive"
-version = "2.16.13"
+name = "napi-build"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cbe2585d8ac223f7d34f13701434b9d5f4eb9c332cccce8dee57ea18ab8ab0c"
+checksum = "60fdf9b392c50e7c4170fa633bd909490ed7835cea4c046776d1a4dd8d2ae0ab"
+
+[[package]]
+name = "napi-derive"
+version = "3.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be5cc49fdef0239132348d2a2991d4e24b643ff6976ada349b20823b161ab28"
 dependencies = [
- "cfg-if",
- "convert_case",
+ "convert_case 0.12.0",
+ "ctor",
  "napi-derive-backend",
  "proc-macro2",
  "quote",
@@ -5802,26 +5933,24 @@ dependencies = [
 
 [[package]]
 name = "napi-derive-backend"
-version = "1.0.75"
+version = "6.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1639aaa9eeb76e91c6ae66da8ce3e89e921cd3885e99ec85f4abacae72fc91bf"
+checksum = "4c1c87a71568f3fe5c736b10878ff55064b250bb4ea4b48c8055713e07b9e463"
 dependencies = [
- "convert_case",
- "once_cell",
+ "convert_case 0.12.0",
  "proc-macro2",
  "quote",
- "regex",
  "semver",
  "syn 2.0.118",
 ]
 
 [[package]]
 name = "napi-sys"
-version = "2.4.0"
+version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "427802e8ec3a734331fec1035594a210ce1ff4dc5bc1950530920ab717964ea3"
+checksum = "85fbf1fa9f1babfe396d74bbbf52b3643770243e8f5b0b46715d4caf7f0dfc9a"
 dependencies = [
- "libloading",
+ "libloading 0.9.0",
 ]
 
 [[package]]
@@ -5870,6 +5999,12 @@ checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -6065,7 +6200,7 @@ dependencies = [
  "http-body-util",
  "httparse",
  "humantime",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "itertools 0.14.0",
  "md-5 0.10.6",
  "parking_lot",
@@ -6515,7 +6650,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tokio-util",
  "x509-certificate",
 ]
@@ -6914,7 +7049,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -6940,6 +7075,8 @@ dependencies = [
  "bytemuck",
  "bytes",
  "bzip2 0.5.2",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "chrono-tz",
  "clap",
@@ -6962,19 +7099,21 @@ dependencies = [
  "hostname 0.3.1",
  "http-body-util",
  "httpmock",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-util",
+ "include_dir",
  "ipnet",
  "jsonpath-rust",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken 11.0.0",
  "lazy_static",
  "lettre",
  "libc",
- "lru 0.18.2",
+ "lru 0.18.4",
  "lz4_flex 0.11.6",
  "memmap2",
  "metal",
  "metrics",
+ "mime_guess",
  "moka",
  "nalgebra 0.32.6",
  "nom 7.1.3",
@@ -7143,11 +7282,12 @@ dependencies = [
  "ring",
  "rmp-serde",
  "rocksdb",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-pemfile 2.2.0",
  "sandhi-core",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
  "snap",
@@ -7161,7 +7301,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-postgres",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tokio-stream",
  "toml 0.8.23",
  "tonic",
@@ -7188,7 +7328,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-abac"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-catalog",
  "proximadb-filter-expression",
@@ -7200,14 +7340,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-admin-ui"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "axum",
 ]
 
 [[package]]
 name = "proximadb-ann-bench"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proximadb",
@@ -7215,7 +7355,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-api"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-flight",
@@ -7223,7 +7363,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "prost-types",
  "proximadb-data-model",
  "proximadb-kernel",
@@ -7248,7 +7388,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-arrow-block-index"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "bytes",
@@ -7257,7 +7397,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-audit"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7271,7 +7411,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-automl"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7284,18 +7424,18 @@ dependencies = [
 
 [[package]]
 name = "proximadb-axis-tunnel"
-version = "0.2.0"
+version = "0.4.0"
 
 [[package]]
 name = "proximadb-batch-group-cache"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "proximadb-bench"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -7310,7 +7450,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-block-format"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -7328,7 +7468,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-bloom"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -7341,7 +7481,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-cache"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "crc32fast",
@@ -7356,7 +7496,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-catalog"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.0",
@@ -7401,7 +7541,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-catalog-introspection"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proximadb",
@@ -7415,7 +7555,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-catalog-schema"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.0",
@@ -7438,14 +7578,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-catapult"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "proximadb-cdc"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7466,7 +7606,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-cks-local"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7476,7 +7616,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-cks-objectstore"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7492,7 +7632,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-clustering-kernel"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "rand 0.8.6",
@@ -7500,7 +7640,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-codec"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "metal",
@@ -7516,7 +7656,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-compression"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "brotli 6.0.0",
@@ -7532,7 +7672,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-compression-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7541,7 +7681,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-concurrent"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -7551,7 +7691,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-config"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7564,7 +7704,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-connectors-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "arrow 59.3.0",
  "serde",
@@ -7572,11 +7712,11 @@ dependencies = [
 
 [[package]]
 name = "proximadb-cross-modal-fusion"
-version = "0.2.0"
+version = "0.4.0"
 
 [[package]]
 name = "proximadb-data-model"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-schema 59.3.0",
@@ -7590,7 +7730,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-distance-kernel"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7606,7 +7746,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-distance-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7615,7 +7755,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-document"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -7634,7 +7774,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-document-compression"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "lz4_flex 0.11.6",
@@ -7642,14 +7782,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-document-geo-index"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "proximadb-document-query"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "proximadb-kernel",
@@ -7659,7 +7799,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-embedded"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -7699,15 +7839,16 @@ dependencies = [
 
 [[package]]
 name = "proximadb-embedded-common"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-data-model",
+ "proximadb-records",
  "serde_json",
 ]
 
 [[package]]
 name = "proximadb-embedding"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7732,7 +7873,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-encoding-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7741,7 +7882,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-engine-core"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -7794,7 +7935,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-execution-contracts"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "arrow 59.3.0",
  "arrow-array 59.3.0",
@@ -7806,7 +7947,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-filter-expression"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -7816,7 +7957,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-filterable-metadata"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "dashmap",
@@ -7828,7 +7969,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-functions"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "dashmap",
  "proximadb-data-model",
@@ -7838,7 +7979,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-geo-queries"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-geo-types",
  "serde",
@@ -7846,7 +7987,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-geo-spatial-index"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-geo-queries",
  "proximadb-geo-types",
@@ -7855,21 +7996,21 @@ dependencies = [
 
 [[package]]
 name = "proximadb-geo-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "proximadb-geohash"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-geo-types",
 ]
 
 [[package]]
 name = "proximadb-graph"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -7892,7 +8033,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-arrow"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "arrow 59.3.0",
  "async-trait",
@@ -7904,7 +8045,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-engine-traits"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "proximadb-compression-types",
@@ -7914,7 +8055,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-model"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-proto",
  "serde",
@@ -7922,7 +8063,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-query"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "nom 7.1.3",
@@ -7935,7 +8076,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-subset"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-query",
  "tokio",
@@ -7943,7 +8084,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-hardware"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "num_cpus",
  "sysinfo",
@@ -7951,7 +8092,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-hardware-caps"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "num_cpus",
@@ -7964,12 +8105,13 @@ dependencies = [
 
 [[package]]
 name = "proximadb-iceberg-engine"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "apache-avro",
  "arrow-array 59.3.0",
  "arrow-schema 59.3.0",
  "async-trait",
+ "bincode",
  "bytes",
  "chrono",
  "futures",
@@ -7982,6 +8124,8 @@ dependencies = [
  "proximadb-storage-common",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -7989,14 +8133,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-implicit-id-generator"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "proximadb-index-storage"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -8005,7 +8149,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-index-traits"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8018,7 +8162,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-index-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8026,7 +8170,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-interner"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "dashmap",
  "proximadb-kernel",
@@ -8034,7 +8178,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-kafka-config"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8042,7 +8186,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-kafka-deserializer"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-kafka-config",
  "serde",
@@ -8051,7 +8195,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-kernel"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8065,7 +8209,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-ledger"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "serde",
@@ -8074,14 +8218,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-llm-config"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-config",
 ]
 
 [[package]]
 name = "proximadb-mcp"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -8091,7 +8235,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-memory-pool"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "parking_lot",
  "tracing",
@@ -8099,7 +8243,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-metrics"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8123,7 +8267,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-migrate"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -8135,7 +8279,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-mongodb-parser"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "nom 7.1.3",
@@ -8145,7 +8289,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-montecarlo"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "rand 0.8.6",
  "rayon",
@@ -8153,7 +8297,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-multimodel-codec"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "arrow-schema 59.3.0",
  "proximadb-catalog-schema",
@@ -8162,7 +8306,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-multimodel-plan"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8177,7 +8321,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-multimodel-query"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-data-model",
  "proximadb-document-query",
@@ -8191,7 +8335,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-mvcc-resolution"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-records",
  "tracing",
@@ -8199,7 +8343,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-network-middleware"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "ipnet",
@@ -8216,8 +8360,9 @@ dependencies = [
 
 [[package]]
 name = "proximadb-object-store"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "object_store",
@@ -8230,7 +8375,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-observability"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -8249,7 +8394,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-observability-engine"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8259,7 +8404,6 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "futures",
- "hex",
  "lettre",
  "num_cpus",
  "object_store",
@@ -8289,7 +8433,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-observability-query"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "proximadb-kernel",
@@ -8297,14 +8441,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-orion-engine"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
  "chrono",
  "dashmap",
- "lru 0.18.2",
+ "lru 0.18.4",
  "lz4_flex 0.11.6",
  "memmap2",
  "parking_lot",
@@ -8330,7 +8474,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-pgwire-translator"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -8341,7 +8485,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-pipeline-operator"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-filter-expression",
  "serde_json",
@@ -8349,11 +8493,12 @@ dependencies = [
 
 [[package]]
 name = "proximadb-proto"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "prost",
  "prost-types",
  "proximadb-kernel",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tonic",
@@ -8363,7 +8508,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-pushdown"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "serde",
@@ -8371,7 +8516,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-quantization-contracts"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8381,7 +8526,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-quantization-kernel"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8403,7 +8548,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-quantization-model"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-distance-kernel",
  "proximadb-quantization-types",
@@ -8412,7 +8557,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-quantization-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8421,7 +8566,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-query"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8439,7 +8584,9 @@ dependencies = [
  "proximadb-proto",
  "proximadb-query-filter",
  "proximadb-query-fusion",
+ "proximadb-records",
  "proximadb-runtime-common",
+ "proximadb-search-types",
  "proximadb-uql",
  "proximadb-vector-query",
  "rand 0.8.6",
@@ -8452,7 +8599,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-query-cache"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "arrow 59.3.0",
  "dashmap",
@@ -8465,25 +8612,25 @@ dependencies = [
 
 [[package]]
 name = "proximadb-query-capability"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "proximadb-query-clauses"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-query-filter",
 ]
 
 [[package]]
 name = "proximadb-query-filter"
-version = "0.2.0"
+version = "0.4.0"
 
 [[package]]
 name = "proximadb-query-fusion"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -8494,7 +8641,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-queue"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8503,6 +8650,7 @@ dependencies = [
  "dashmap",
  "once_cell",
  "prometheus",
+ "proximadb-runtime-common",
  "pyo3",
  "serde",
  "serde_json",
@@ -8511,11 +8659,12 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash 1.6.3",
+ "uuid",
 ]
 
 [[package]]
 name = "proximadb-rank-core"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8533,7 +8682,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-expr"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-kernel",
  "proximadb-rank-core",
@@ -8543,7 +8692,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-features"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-kernel",
  "proximadb-rank-core",
@@ -8553,7 +8702,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-onnx"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -8571,7 +8720,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-profile"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -8589,7 +8738,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-raptor-common"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proximadb-bloom",
@@ -8604,7 +8753,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-raptor-engine"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.0",
@@ -8636,7 +8785,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-recall-bench"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "half",
  "proximadb-catalog",
@@ -8648,20 +8797,21 @@ dependencies = [
 
 [[package]]
 name = "proximadb-record-buffer-pool"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "proximadb-records"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
  "half",
  "proximadb-data-model",
+ "proximadb-kernel",
  "proximadb-proto",
  "rmp-serde",
  "serde",
@@ -8671,7 +8821,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-algebra"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-data-model",
  "proximadb-relational-types",
@@ -8681,7 +8831,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-engine"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -8699,7 +8849,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-executor"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "proximadb-data-model",
@@ -8716,7 +8866,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-frontend"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-data-model",
  "proximadb-functions",
@@ -8729,7 +8879,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-planner"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-data-model",
  "proximadb-relational-algebra",
@@ -8742,7 +8892,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-reader"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -8755,7 +8905,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proximadb-data-model",
@@ -8766,7 +8916,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-resilience"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -8779,7 +8929,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rl-reward"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "tracing",
@@ -8787,7 +8937,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-runtime"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8819,7 +8969,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-runtime-common"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -8837,7 +8987,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-scan-cursor"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "proximadb-records",
@@ -8848,7 +8998,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-sdk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "httpmock",
@@ -8864,7 +9014,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-search-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proximadb-data-model",
@@ -8880,7 +9030,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-security"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8895,7 +9045,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-serialization"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -8919,13 +9069,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-server"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
  "libc",
  "proximadb",
  "proximadb-embedding",
+ "proximadb-queue",
  "proximadb-runtime-common",
  "reqwest 0.11.27",
  "serde",
@@ -8940,7 +9091,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-spark-jni"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "jni 0.21.1",
  "proximadb",
@@ -8950,7 +9101,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-sst-engine"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8980,7 +9131,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-common"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -9028,7 +9179,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-encryption"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9047,7 +9198,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-filesystem-types"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -9062,7 +9213,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-kv"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9072,7 +9223,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-operations"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9089,7 +9240,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-optimization"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proximadb-data-model",
@@ -9100,7 +9251,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-ports"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9119,7 +9270,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-strategy"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-proto",
  "serde_json",
@@ -9127,7 +9278,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-tenant"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9143,7 +9294,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-traits"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9166,7 +9317,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-transaction"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "parking_lot",
  "proximadb-kernel",
@@ -9179,7 +9330,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-subscription"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "tokio",
@@ -9187,7 +9338,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-tcp-multiplexer"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "tokio",
  "tracing",
@@ -9195,7 +9346,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-telemetry"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "proximadb-kernel",
  "tracing",
@@ -9203,7 +9354,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-tenant"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9219,13 +9370,13 @@ dependencies = [
 
 [[package]]
 name = "proximadb-tls"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
  "hex",
  "rcgen",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-pemfile 2.2.0",
  "serde",
  "sha2 0.10.9",
@@ -9233,14 +9384,14 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tracing",
  "x509-parser",
 ]
 
 [[package]]
 name = "proximadb-type-validators"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -9250,7 +9401,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-uql"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proximadb-document-query",
@@ -9267,7 +9418,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-usage-event"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "sandhi-core",
@@ -9278,11 +9429,11 @@ dependencies = [
 
 [[package]]
 name = "proximadb-utility-scorer"
-version = "0.2.0"
+version = "0.4.0"
 
 [[package]]
 name = "proximadb-vector"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -9312,7 +9463,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-vector-query"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "proximadb-distance-types",
@@ -9324,7 +9475,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-wal-segment-header"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proximadb-records",
@@ -9333,7 +9484,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-write-intent"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -9486,7 +9637,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash 2.1.2",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "socket2 0.6.4",
  "thiserror 2.0.20",
  "tokio",
@@ -9507,7 +9658,7 @@ dependencies = [
  "rand 0.9.4",
  "ring",
  "rustc-hash 2.1.2",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.20",
@@ -9850,7 +10001,7 @@ dependencies = [
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-rustls 0.27.9",
  "hyper-tls 0.6.0",
  "hyper-util",
@@ -9861,7 +10012,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-native-certs",
  "rustls-pki-types",
  "serde",
@@ -9870,7 +10021,7 @@ dependencies = [
  "sync_wrapper 1.0.2",
  "tokio",
  "tokio-native-tls",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tokio-util",
  "tower",
  "tower-http",
@@ -9896,7 +10047,7 @@ dependencies = [
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-rustls 0.27.9",
  "hyper-util",
  "js-sys",
@@ -9904,7 +10055,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
@@ -9912,7 +10063,7 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper 1.0.2",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tokio-util",
  "tower",
  "tower-http",
@@ -10064,6 +10215,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix-linux-procfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
+dependencies = [
+ "once_cell",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "rustls"
 version = "0.21.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10077,16 +10238,16 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.13",
+ "rustls-webpki 0.103.15",
  "subtle",
  "zeroize",
 ]
@@ -10142,10 +10303,10 @@ dependencies = [
  "jni 0.22.4",
  "log",
  "once_cell",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.13",
+ "rustls-webpki 0.103.15",
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
@@ -10170,9 +10331,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -10644,9 +10805,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.15.2"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
 dependencies = [
  "serde",
 ]
@@ -11625,11 +11786,11 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.4"
+version = "0.26.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
 dependencies = [
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "tokio",
 ]
 
@@ -11757,7 +11918,7 @@ dependencies = [
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.11.0",
+ "hyper 1.11.1",
  "hyper-timeout",
  "hyper-util",
  "percent-encoding",
@@ -11766,7 +11927,7 @@ dependencies = [
  "socket2 0.6.4",
  "sync_wrapper 1.0.2",
  "tokio",
- "tokio-rustls 0.26.4",
+ "tokio-rustls 0.26.5",
  "tokio-stream",
  "tower",
  "tower-layer",
@@ -12202,7 +12363,7 @@ dependencies = [
  "base64 0.22.1",
  "log",
  "percent-encoding",
- "rustls 0.23.43",
+ "rustls 0.23.44",
  "rustls-pki-types",
  "socks",
  "ureq-proto",
@@ -12291,9 +12452,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.24.1"
+version = "1.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
+checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -12993,6 +13154,16 @@ checksum = "524e57b2c537c0f9b1e69f1965311ec12182b4122e45035b1508cd24d2adadb1"
 dependencies = [
  "cfg-if",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "winx"
+version = "0.36.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
+dependencies = [
+ "bitflags 2.13.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

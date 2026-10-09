@@ -214,13 +214,52 @@ impl PaxSplitReader {
         out_schema: &SchemaRef,
     ) -> DFResult<Option<Vec<RecordBatch>>> {
         let path = &split.file_path;
-        let len = match self.filesystem_factory.metadata(path).await {
-            Ok(m) => m.size,
-            Err(_) => return Ok(None), // no cheap size → fall back
+        // TD-USUB-8: prefer the object size the PLANNER already knows. The
+        // segment locators get it free from `list()`, so the `HEAD` below is a
+        // dependent round trip spent rediscovering a number we were handed —
+        // and it is the first of the four in the cold-read chain, which nothing
+        // else can start without. `None` ⇒ fall back to the HEAD (external or
+        // hand-built splits that never carried a size).
+        let len = match split.object_size {
+            Some(size) => size,
+            None => match self.filesystem_factory.metadata(path).await {
+                Ok(m) => m.size,
+                Err(_) => return Ok(None), // no cheap size → fall back
+            },
         };
         if len < SEGMENT_INDEX_TRAILER_MIN {
             return Ok(None);
         }
+
+        // TD-USUB-8 slice 1: consult the GLOBAL SegmentIndexCache before paying
+        // for the index at all.
+        //
+        // `RangedSegmentReader::open_with_cache` has skipped these reads for a
+        // while, but only `record_store.rs` ever called it — this DataFusion lane
+        // built its own `metadata` → prefix → footer sequence and re-paid the
+        // whole chain on every read. The cache, the key type, and the stored type
+        // (`SegmentIndex`) all already existed; nothing was wired.
+        //
+        // Safe to key on path alone because a PAX segment is IMMUTABLE once
+        // written: flush and compaction emit fresh names rather than overwriting,
+        // so a path never denotes different bytes. (The tenant is also already in
+        // the path via `DrPathBuilder`; the tenant key below is for the cache's
+        // own per-tenant fair-share accounting, not for isolation.)
+        let cache_key = {
+            let tenant: &str = self.tenant_id.as_deref().unwrap_or("");
+            proximadb_cache::CacheKey::new(tenant, proximadb_cache::CacheKind::SegmentIndex, path)
+        };
+        let index_cache = crate::services::record_store::segment_index_cache();
+        if let Some(cache) = index_cache.as_ref()
+            && let Some(cached) = cache.get(&cache_key).await
+        {
+            // Warm: the prefix + footer (or the tail-probe loop) are skipped
+            // entirely — two dependent round trips removed from this read.
+            return self
+                .load_ranged_with_index(path, (*cached).clone(), out_schema)
+                .await;
+        }
+
         // TD-PAXRG-1: a v4 row-group segment DECLARES its index (the coalesced
         // footer + per-RG MinMax stats) in the header-prefix — no PAXZ tail
         // probe. One small GET decides; the footer renders as the layout-neutral
@@ -262,6 +301,20 @@ impl PaxSplitReader {
             None
         };
         if let Some(v4_index) = v4_index {
+            // Populate the cache so the next read of this immutable segment skips
+            // the prefix + footer reads above.
+            if let Some(cache) = index_cache.as_ref() {
+                // Weight = the index's own footprint proxy (block count), so the
+                // cache's fair-share accounting reflects what it is holding.
+                let weight = v4_index.blocks.len().max(1) as u32;
+                cache
+                    .insert(
+                        cache_key.clone(),
+                        weight,
+                        std::sync::Arc::new(v4_index.clone()),
+                    )
+                    .await;
+            }
             // Fall through to the shared prune + ranged-fetch stages with the
             // v4 index (boxed to keep the async-block sizing uniform).
             return self
@@ -289,6 +342,21 @@ impl PaxSplitReader {
                 Ok(None) | Err(_) => return Ok(None),
             }
         };
+        // Cache the probed index too. An earlier draft populated the cache only
+        // on the v4 branch, which left the legacy PAXZ path — the one this
+        // fixture and every pre-v4 segment take — re-probing the tail on every
+        // read. The probe is the more expensive of the two to repeat: it grows
+        // x4 on a short suffix, so a miss can cost several dependent reads.
+        if let Some(cache) = index_cache.as_ref() {
+            let weight = index.blocks.len().max(1) as u32;
+            cache
+                .insert(
+                    cache_key.clone(),
+                    weight,
+                    std::sync::Arc::new(index.clone()),
+                )
+                .await;
+        }
         self.load_ranged_with_index(path, index, out_schema).await
     }
 
@@ -911,6 +979,124 @@ mod tests {
             .find(|s| s.file_path.ends_with("seg.pax"))
             .expect("discovered seg.pax split");
         (split, file_len)
+    }
+
+    /// TD-USUB-8 slices 1–2: the second read of an immutable segment must not
+    /// re-fetch its index, and the saving is a fixed DEPTH ratchet.
+    ///
+    /// `FooterCache`/`SegmentIndexCache` and `open_with_cache` already existed,
+    /// but only `record_store.rs` used them — this lane rebuilt the index from
+    /// the object on every read.
+    ///
+    /// The assertion is `cold - warm == 3`, not `warm < cold`: the gap IS the
+    /// index-acquisition cost, and those reads are strictly dependent, so a
+    /// comparison against a moving target would not catch a regression. See
+    /// `docs/_internal/status/PAX_DATAFUSION_READ_DEPTH_2026_09_27.adoc`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_read_skips_the_index_fetch() {
+        // 8 MiB pool, 4 MiB per-tenant ceiling — ample for one segment index.
+        crate::services::record_store::init_segment_caches(
+            proximadb_cache::CacheBudget::new(8 << 20, 4 << 20),
+            None,
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fs = Arc::new(FilesystemFactory::create_default().await.unwrap());
+        let (split, _len) = multiblock_split(tmp.path(), 200, 400, &fs).await;
+        let (schema, map) = created_at_schema();
+        let reader = PaxSplitReader::new(schema.clone(), fs.clone(), map, vec![], None, None);
+
+        let cold = io_trace::scope(async {
+            reader
+                .load_ranged(&split, &schema)
+                .await
+                .unwrap()
+                .expect("ranged path");
+            io_trace::snapshot().expect("scope active").range_gets
+        })
+        .await;
+
+        let warm = io_trace::scope(async {
+            reader
+                .load_ranged(&split, &schema)
+                .await
+                .unwrap()
+                .expect("ranged path");
+            io_trace::snapshot().expect("scope active").range_gets
+        })
+        .await;
+
+        // TD-USUB-8 slice 2 — DEPTH RATCHET, printed for the evidence artifact.
+        //
+        // Read the difference, not the totals. The warm/cold gap is the
+        // index-acquisition cost, and those reads are STRICTLY DEPENDENT: the
+        // header prefix must return before the probe can start, and each probe
+        // iteration before the next. Nothing can be fetched until they finish, so
+        // they sit on the critical path and set latency.
+        //
+        // The remaining reads are per-surviving-block stripe fetches. They depend
+        // on the index but not on each other, so they are a WIDTH concern
+        // (addressed by range coalescing), not depth. Reporting the saving as a
+        // percentage of total requests would measure the wrong thing — ADR-033
+        // ranks DEPTH above WIDTH for exactly this reason.
+        // `saturating_sub`, not `-`: both are u64, and a regression that made a
+        // warm read COSTLIER than a cold one would panic with "attempt to
+        // subtract with overflow" before printing — losing exactly the
+        // diagnostic a future reader needs. Saturating to 0 still fails the
+        // assertion, but fails it legibly.
+        let index_acquisition = cold.saturating_sub(warm);
+        println!(
+            "DEPTH cold_range_gets={cold} warm_range_gets={warm} index_acquisition={index_acquisition}"
+        );
+        assert_eq!(
+            index_acquisition, 3,
+            "index acquisition should cost exactly 3 dependent reads for this v2 \
+             fixture (header prefix + 2 probe iterations), and a warm read should \
+             pay none of them. A change here means the index-acquisition path \
+             changed — re-derive it rather than adjusting the number: this is the \
+             DEPTH term ADR-033 ranks dominant. cold={cold} warm={warm}"
+        );
+    }
+
+    /// Caching must not change what is returned. Same segment, same predicate,
+    /// cold vs warm — identical rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cached_index_returns_identical_rows() {
+        crate::services::record_store::init_segment_caches(
+            proximadb_cache::CacheBudget::new(8 << 20, 4 << 20),
+            None,
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fs = Arc::new(FilesystemFactory::create_default().await.unwrap());
+        let (split, _len) = multiblock_split(tmp.path(), 200, 400, &fs).await;
+        let (schema, map) = created_at_schema();
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            col("created_at", schema.as_ref()).unwrap(),
+            Operator::GtEq,
+            lit(150_000i64),
+        ));
+        let reader = PaxSplitReader::new(schema.clone(), fs.clone(), map, vec![filter], None, None);
+
+        let first = collect_created_at(
+            &reader
+                .load_ranged(&split, &schema)
+                .await
+                .unwrap()
+                .expect("ranged"),
+        );
+        let second = collect_created_at(
+            &reader
+                .load_ranged(&split, &schema)
+                .await
+                .unwrap()
+                .expect("ranged"),
+        );
+        assert_eq!(first, second, "a cached index must not change results");
+        assert!(
+            !first.is_empty(),
+            "precondition: the filter matches something"
+        );
     }
 
     /// The P-Pushdown gate (TD-DOC-PUSHDOWN-1): a selective predicate makes the

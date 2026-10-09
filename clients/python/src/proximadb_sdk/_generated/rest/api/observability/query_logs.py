@@ -11,6 +11,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.error_response import ErrorResponse
 from ...models.query_logs_body import QueryLogsBody
 from ...models.query_logs_response_200 import QueryLogsResponse200
 from ...types import UNSET, Response, Unset
@@ -43,11 +44,16 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> QueryLogsResponse200 | None:
+) -> ErrorResponse | QueryLogsResponse200 | None:
     if response.status_code == 200:
         response_200 = QueryLogsResponse200.from_dict(response.json())
 
         return response_200
+
+    if response.status_code == 500:
+        response_500 = ErrorResponse.from_dict(response.json())
+
+        return response_500
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -57,7 +63,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[QueryLogsResponse200]:
+) -> Response[ErrorResponse | QueryLogsResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -72,8 +78,15 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     body: QueryLogsBody,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[QueryLogsResponse200]:
+) -> Response[ErrorResponse | QueryLogsResponse200]:
     """Query logs.
+
+     Reads are scoped by the path namespace — the same boundary the other
+    observability ops use (any authenticated caller may query any
+    namespace; TD-SPECRAT-2 tracks the ownership decision). Availability:
+    mounted unconditionally on the unified server (the default, port
+    5678); legacy multi-port mode mounts it only with gRPC enabled;
+    cluster-mode REST does not mount it.
 
     Args:
         namespace (str):
@@ -85,7 +98,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[QueryLogsResponse200]
+        Response[ErrorResponse | QueryLogsResponse200]
     """
 
     kwargs = _get_kwargs(
@@ -107,8 +120,15 @@ def sync(
     client: AuthenticatedClient | Client,
     body: QueryLogsBody,
     x_tenant_id: str | Unset = UNSET,
-) -> QueryLogsResponse200 | None:
+) -> ErrorResponse | QueryLogsResponse200 | None:
     """Query logs.
+
+     Reads are scoped by the path namespace — the same boundary the other
+    observability ops use (any authenticated caller may query any
+    namespace; TD-SPECRAT-2 tracks the ownership decision). Availability:
+    mounted unconditionally on the unified server (the default, port
+    5678); legacy multi-port mode mounts it only with gRPC enabled;
+    cluster-mode REST does not mount it.
 
     Args:
         namespace (str):
@@ -120,7 +140,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        QueryLogsResponse200
+        ErrorResponse | QueryLogsResponse200
     """
 
     return sync_detailed(
@@ -137,8 +157,15 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     body: QueryLogsBody,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[QueryLogsResponse200]:
+) -> Response[ErrorResponse | QueryLogsResponse200]:
     """Query logs.
+
+     Reads are scoped by the path namespace — the same boundary the other
+    observability ops use (any authenticated caller may query any
+    namespace; TD-SPECRAT-2 tracks the ownership decision). Availability:
+    mounted unconditionally on the unified server (the default, port
+    5678); legacy multi-port mode mounts it only with gRPC enabled;
+    cluster-mode REST does not mount it.
 
     Args:
         namespace (str):
@@ -150,7 +177,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[QueryLogsResponse200]
+        Response[ErrorResponse | QueryLogsResponse200]
     """
 
     kwargs = _get_kwargs(
@@ -170,8 +197,15 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     body: QueryLogsBody,
     x_tenant_id: str | Unset = UNSET,
-) -> QueryLogsResponse200 | None:
+) -> ErrorResponse | QueryLogsResponse200 | None:
     """Query logs.
+
+     Reads are scoped by the path namespace — the same boundary the other
+    observability ops use (any authenticated caller may query any
+    namespace; TD-SPECRAT-2 tracks the ownership decision). Availability:
+    mounted unconditionally on the unified server (the default, port
+    5678); legacy multi-port mode mounts it only with gRPC enabled;
+    cluster-mode REST does not mount it.
 
     Args:
         namespace (str):
@@ -183,7 +217,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        QueryLogsResponse200
+        ErrorResponse | QueryLogsResponse200
     """
 
     return (

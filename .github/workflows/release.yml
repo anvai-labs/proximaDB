@@ -44,7 +44,7 @@
 #
 #   Python Wheels are NOT built here. The pure-Python SDK (`proximadb`) and the
 #   native embedded engine (`proximadb_embedded`, one abi3 wheel per platform,
-#   CPython 3.10+) are built and published by `release-python.yml` on `python-v*`
+#   CPython 3.11+) are built and published by `release-python.yml` on `python-v*`
 #   tags — decoupled from this binary/OS-package release. This workflow (`v*`)
 #   only builds the server binaries, the sdist, and the OS packages below.
 #
@@ -162,7 +162,10 @@ jobs:
 
       - name: Validate Cargo.toml Version
         run: |
-          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          # Structural, not `grep '^version = ' | head -1`: that slides down to
+          # [workspace.package] when [package] has no version line, so it
+          # compared the wrong field. Same fix as scripts/version-sync.sh.
+          CARGO_VERSION=$(bash scripts/version-sync.sh get)
           EXPECTED="${{ steps.version.outputs.version }}"
           # Remove pre-release suffix for comparison
           EXPECTED_BASE="${EXPECTED%%-*}"
@@ -349,7 +352,7 @@ jobs:
           retention-days: 7
 
   # NOTE: Python embedded wheels are built by `release-python.yml` (native
-  # `proximadb_embedded`, one abi3 wheel per platform, CPython 3.10+), NOT here.
+  # `proximadb_embedded`, one abi3 wheel per platform, CPython 3.11+), NOT here.
   # A previously commented-out `build-embedded-wheels` job lived here; it was
   # removed as dead — its premise ("clients/python-embedded is pure Python, not
   # Rust") is also wrong now that the embedded engine is the root PyO3/maturin

@@ -41,9 +41,15 @@ data_dir = "/var/lib/proximadb"
 [source,toml]
 ----
 [api]
+unified_mode = true          # 5678 multiplexes REST + gRPC + Arrow Flight
+                             # (Arrow Flight is Experimental per
+                             # SUPPORTED_SURFACE; set in the shipped
+                             # config.toml / docker image; the
+                             # CODE default is false — k8s/helm artifacts run
+                             # legacy multi-port unless they set it)
 rest_port = 5678
-grpc_port = 5679
-arrow_flight_port = 5680
+grpc_port = 5679             # legacy multi-port mode only (unified_mode = false)
+arrow_flight_port = 5680     # legacy multi-port mode only
 max_request_size = 67108864
 rate_limit = 1000
 ----
@@ -59,6 +65,15 @@ metadata_url = "file:///var/lib/proximadb/metadata"
 [[storage.storage_locations]]
 url = "file:///var/lib/proximadb/data"
 weight = 1
+
+# Optional per-location I/O budget (TD-IOBUDGET-1): sizes ranged GETs for
+# THIS location. disk_class: "ssd" | "hdd" | "cloud"; explicit
+# min_bytes/target_bytes/max_bytes override the class profile (validated,
+# fail-closed at startup). Unset => URL-scheme default.
+#[storage.storage_locations.io_budget]
+#disk_class = "ssd"
+#target_bytes = 1048576
+#max_bytes = 8388608
 ----
 
 == WAL

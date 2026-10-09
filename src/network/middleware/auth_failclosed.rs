@@ -20,9 +20,8 @@
 //! `SecurityCoordinator` wired, the old behavior logged a warning and then
 //! served every request **unauthenticated** — i.e. it failed *open* on a
 //! security misconfiguration. This layer is attached only in that case and
-//! **fails closed**: data-plane requests (`/api/*`) are rejected with
-//! `503 Service Unavailable` while non-data-plane paths (health / liveness /
-//! metrics) still pass, so orchestrator probes keep working and the operator
+//! **fails closed**: all requests except explicit read-only liveness paths
+//! are rejected with `503 Service Unavailable`, so liveness probes keep working and the operator
 //! sees an up-but-degraded server rather than a silent auth bypass.
 //!
 //! The fix is scoped to the request layer because the REST router constructor
@@ -32,21 +31,19 @@
 use axum::{
     Json,
     extract::Request,
-    http::StatusCode,
+    http::{Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use serde_json::json;
 
-/// Path prefix of the authenticated data plane. Requests outside it (health,
-/// liveness, metrics) are allowed through even when auth is misconfigured.
-const DATA_PLANE_PREFIX: &str = "/api/";
-
 /// Reject data-plane requests with `503` when auth is enabled-but-unconfigured.
 /// This middleware is attached ONLY in the misconfigured case, so its presence
-/// is the signal — it always denies `/api/*` and passes everything else.
+/// is the signal. An allowlist also covers API aliases and future mounted routes.
 pub async fn auth_misconfigured_deny_data_plane(req: Request, next: Next) -> Response {
-    if req.uri().path().starts_with(DATA_PLANE_PREFIX) {
+    let liveness = matches!(*req.method(), Method::GET | Method::HEAD)
+        && matches!(req.uri().path(), "/health" | "/health/live" | "/healthz");
+    if !liveness {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
@@ -102,5 +99,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn aliases_and_future_routes_cannot_bypass_missing_coordinator() {
+        for path in [
+            "/mlflow-ui/ajax-api/2.0/mlflow/runs/search",
+            "/mlflow-ui/ajax-api/2.0/mlflow-artifacts/artifacts/private/file",
+            "/mlflow-ui/ajax-api/2.0/mlflow/experiments/create",
+            "/future-api",
+            "/metrics",
+        ] {
+            for method in [Method::GET, Method::POST, Method::PUT] {
+                let router = Router::new().fallback(|| async { "sensitive" }).layer(
+                    axum::middleware::from_fn(auth_misconfigured_deny_data_plane),
+                );
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .method(method)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            }
+        }
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .method(Method::POST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

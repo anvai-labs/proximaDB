@@ -1,0 +1,103 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-TESTPORT-1: 75 e2e harnesses pick a server port with a bind-read-drop TOCTOU
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-08 after it turned `Rust Integration Tests (graph)` red on an unrelated PR (#1965, a Python-floor bump touching zero Rust source).
+| Severity | Medium — no production code affected. It makes CI red at random on PRs that did not cause it, which is the expensive kind of flake: it costs a runner cycle plus the reviewer time to prove innocence.
+| Component | `tests/*_e2e.rs` (75 files declaring `fn free_port`, every one of them dropping the listener), e.g. `tests/graph_select_pgwire_decline_e2e.rs:17-21`
+| Evidence | CI run 37874140828, job 113646027384 (head `05f01d0b7`): `panicked at tests/graph_select_pgwire_decline_e2e.rs:119: connect: Error { kind: Io, cause: "bytes remaining on stream" }`. Develop's own CI run 37863295468 was green, so this was not a red-develop situation.
+| Related | TD-CONV-1 (a *different* e2e flake — CWD-relative catalog WAL; this one is ports, and the graph harness already anchors `metadata_url` under its `TempDir`)
+|===
+
+== The defect
+
+The helper, duplicated in 75 test files:
+
+[source,rust]
+----
+fn free_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let p = l.local_addr().expect("addr").port();
+    drop(l);          // <-- the window opens here
+    p
+}
+----
+
+Bind, read the port, **drop the listener**, then hand the bare number to the
+server to bind for itself. Between the `drop` and the server's own `bind`,
+anything may take that port.
+
+**Including the harness itself, which is the likeliest path to the observed
+error.** `graph_select_pgwire_decline_e2e.rs:32-34` calls `free_port()` three
+times back to back for `pg_port`, `rest_port` and `grpc_port`, each releasing its
+port before the next call asks the kernel for one. If two calls return the same
+number, the REST/axum listener binds it and the pgwire listener loses it — and
+`tokio_postgres::connect` to `pg_port` then reads an **HTTP** response, which is
+precisely `"bytes remaining on stream"`. No second process is required. The
+harness also only waits on `GET /health` against `rest_port` plus a 200 ms sleep,
+so it never confirms that pgwire is what is listening on `pg_port`. The other
+path — an unrelated process on the runner, or a socket lingering in TIME_WAIT
+from the suite that ran before this one — is also real, though narrower than it
+looks: **the integration lanes are built not to run suites concurrently.** The
+graph lane is a sequential `for test_file in tests/*graph*.rs` loop invoking
+`cargo test --test "$test_name" -- --test-threads=1` one suite at a time, every
+other lane has the same shape, `.cargo/config.toml` sets
+`[env] RUST_TEST_THREADS = "1"`, and `.config/nextest.toml` both pins
+`profile.integration` to `test-threads = 1` and puts every `_e2e`/`_integration_test`
+binary in a `serial-network` test-group with `max-threads = 1`. The cited job's
+own log shows strictly interleaved `Running <suite>` / `test result:` pairs with
+no overlap.
+
+That makes the self-collision above the **only** concurrent path available inside
+one CI job, which strengthens it rather than weakening the filing. An earlier
+revision of this paragraph asserted the opposite — that the lanes run suites
+concurrently — which is false and was the justification it offered for the
+secondary path.
+
+Option 1 below covers every path, because it removes the unowned window
+entirely.
+
+`git grep -l "fn free_port" -- 'tests/*.rs'` finds **75** files, and **all 75**
+drop the listener. There are two spellings of the same helper — `drop(l)` in 40
+files and `drop(listener)` in 35 — which is one copy-paste lineage, not two
+implementations. **None bind-and-hold**, so there is nothing to audit; an earlier
+revision of this TD said "40" and sent the reader to check whether the other 35
+were already safe, which is a known-false errand. That the body is identical
+across 75 files is the argument for fix option 3.
+
+== Why it is worth fixing rather than retrying
+
+The failure is indistinguishable, to a reviewer, from a real regression: it is a
+hard panic in an integration test on their PR. On #1965 it cost a full
+diagnosis — confirming the PR touched no Rust source, that its only Rust change
+was `abi3-py310` -> `abi3-py311` on an optional dependency not enabled in default
+builds, and that the suite ran at all only because `Cargo.toml` sits in ci.yml's
+`rust:` path filter — before it could be dismissed. That is the cost, repeated
+per occurrence.
+
+== Fix options, cheapest first
+
+. **Bind and hold.** Pass the bound `TcpListener` to the server instead of a port
+  number, so the port is never unowned. Correct by construction, and the only
+  option with no window at all. Needs the server's bind path to accept a
+  pre-bound listener — and for a harness that needs several ports, **all** of
+  them must be pre-bound, or the self-collision above survives.
+. **Retry the connect, not the bind.** A bounded retry loop around
+  `tokio_postgres::connect` closes the observed symptom but not the race: a
+  foreign listener on the port makes every attempt fail the same way.
+. **One shared helper.** Whatever the mechanism, the 75 copies should become one
+  `tests/common/` helper, so this is fixed once rather than 75 times. The
+  duplication is why the defect is still here.
+
+Prefer 1 + 3. Option 2 alone converts a loud failure into a slow one.
+
+== How to apply
+
+Extract the 75 identical `free_port` bodies into one helper and make it
+bind-and-hold. No audit is needed first — all 75 are the same two-spelling copy
+of the same defect. Until then: a `"bytes remaining on stream"` or `connect` panic in
+an `*_e2e.rs` harness on a PR that touches no server code is **this**, and the
+remedy is to re-run the job, not to bisect the PR.

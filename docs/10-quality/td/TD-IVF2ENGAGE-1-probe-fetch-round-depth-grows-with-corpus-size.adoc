@@ -1,0 +1,139 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-IVF2ENGAGE-1: the IVF2 coarse probe's fetch-round depth grows ~linearly with corpus size
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open**, but RETITLED and re-scoped 2026-10-08 after re-measurement. This TD was filed as "the probe engages on 1.7% of queries at N=100k, and the byte ratchet fails". **That finding was a harness artifact and is retracted** — see "What was retracted" below. What survives is a measured depth trend.
+| Severity | Low-Medium — no incorrect results, no engagement collapse. The probe pays for itself at every scale measured; the open question is how its round-trip count scales.
+| Component | `src/storage/engines/sst/segment_format.rs` (coarse probe arm/fallback), `tests/sift_pax_recall_ratchet_test.rs::sift_ivf2_coarse_probe_recall_ratchet`
+| Evidence | Measured below on SIFT1M subsets, workstation, `--release --features io-trace`, **behind the compaction-quiescence barrier added in the same change**
+| Related | TD-RDSTRAT-8 (the probe), TD-SIFTCOMPACT-1, ADR-033 (DEPTH >> BYTES ordering)
+|===
+
+== What was retracted, and why it matters
+
+The original filing claimed the probe engaged on **17 of 1000** queries at
+N=100 000 and that the byte ratchet therefore failed. Both numbers came from runs
+taken **before** the compaction-quiescence barrier existed: `compaction_ran`
+reports that compaction was *enqueued*, not finished, so the measured arms raced
+the compaction and the retirement of the segments they were reading.
+
+Re-measured behind the barrier, at the original filing's own headline
+configuration (N=100 000, 1000 queries, `IVF_K=64`):
+
+[cols="1,1,1,1,1", options="header"]
+|===
+| Arm | recall@10 | range GETs/q | bytes/q | probes
+
+| probe OFF | 0.9827 | 10 | 3 847 823 | --
+| probe ON  | 0.9808 |  7 | 2 672 940 | **1000 / 1000**
+|===
+
+**1000 of 1000, not 17** — and bytes/q fall 30.5%, so the byte ratchet passes.
+`ivf_whole_region_fallback` is 0 in every run at every scale. The engagement
+collapse did not exist; the measurement did not have a settled layout underneath
+it. The title, the severity rationale and the headline finding of the original
+filing are all withdrawn, which is why the file was renamed.
+
+The lesson is the one TD-SIFTCOMPACT-1 records independently: on this harness,
+*an un-awaited background compaction can manufacture any scaling story you care
+to look for*, because the first arm absorbs the race and the second does not.
+
+== What was measured
+
+**All figures below are post-barrier.** Each row is a full run of
+`sift_ivf2_coarse_probe_recall_ratchet` with `PROXIMADB_IVF_K=64`.
+
+[cols="1,1,1,1,1,1", options="header"]
+|===
+| N | queries | probes | bytes/q ON vs OFF | recall ON vs OFF | fetch_rounds per engaged query
+
+| 20 000  | 200  | 200 / 200   | 812 434 vs 1 462 655    | 0.9880 vs 0.9905 | **1.00**
+| 100 000 | 100  | 100 / 100   | 1 484 143 vs 3 724 940  | 0.9800 vs 0.9820 | **2.89**
+| 100 000 | 1000 | 1000 / 1000 | 2 672 940 vs 3 847 823  | 0.9808 vs 0.9827 | **2.77**
+| 333 000 | 200  | 200 / 200   | 7 209 456 vs 11 511 928 | 0.9800 vs 0.9845 | **5.95**
+|===
+
+=== The finding
+
+**`Sigma fetch_rounds` per engaged query rises monotonically with N: 1.00 -> 2.8 -> 5.95
+at 20k / 100k / 333k.** Every arm passes, the probe is a strict win on bytes at
+every scale, and recall stays within tolerance — so this is not a regression. It
+is a *scaling* question in the dimension ADR-033 ranks dominant: round trips, not
+bytes. A probe that halves bytes while tripling dependent fetch rounds is not
+obviously a win on object storage, where DEPTH is the dominant cost term.
+
+Two quantities that look like findings and are not:
+
+* `Sigma cells_total / engaged` is **64** and `cells_probed / engaged` is **16** in
+  every run — i.e. "25% of cells probed" is `nprobe / k_c` = 16/64, a *configured
+  constant*, not a measurement. (`geometric_nprobe(64) = ceil(sqrt(64) * 2.0) = 16`.)
+* The probe arm's bytes/q is **not** invariant to query count even post-barrier:
+  1 484 143 at q=100 vs 2 672 940 at q=1000, same N. The barrier removed the
+  layout race, not this. Most likely cache warm-up/eviction over the longer run,
+  which is also why the arms must be run in BOTH orders before any figure here is
+  ledgered — the baseline arm runs first and cold, the probe arm second and warm.
+
+== Two guards that were too weak either way
+
+Both were genuinely too weak, independent of the retracted finding: a presence
+check certifies a probe that is effectively off, whatever the true engagement
+turns out to be. They are strengthened in the same change.
+
+1. **`assert!(!probe_trace.is_empty(), "... must engage the coarse probe ...")`**
+   would be satisfied by 17 probes out of 1000 queries. A presence check certifies a probe that is
+   effectively off. Replaced in this change by a **proportion** floor (>=50% of
+   measured queries), which is what the assertion's own message always claimed
+   to check.
+2. **The probe's error path is swallowed.** `segment_format.rs` calls
+   `coarse_probe_survivors(...).await.ok().flatten()`, so `Err` and
+   `Ok(None)` both become "no probe" and take the same fallback. From the
+   recorded metrics — `record_ivf_probe_durable(0, 0, 0, 0, true)` for every miss
+   — a probe that *failed* is indistinguishable from one that legitimately
+   *declined*. Until that is split, a miss cannot be attributed to a reason.
+   (An earlier revision said "the 983 misses" -- 1000 minus 17, carried over from
+   the retracted measurement. Engagement is 100% at every scale measured and
+   `ivf_whole_region_fallback` is 0, so there are currently no misses to
+   attribute at all; see "How to apply" item 3.)
+
+== How to apply
+
+. **Characterise the fetch-round growth, which is the only live finding.**
+  `fetch_rounds` per engaged query measured 1.00 / 2.8 / 5.95 at N =
+  20k / 100k / 333k. Establish whether that is linear in N, in rows-per-cell, or
+  in `k_c`: `IVF_K=64` gives ~310 rows/cell at 20k against ~1 560 at 100k and
+  ~5 200 at 333k, so a probe that must touch most cells to reach top-k is the
+  obvious hypothesis and `nprobe`/`k_c` sizing is the obvious lever. Note that
+  `cells_probed / cells_total` is a CONFIGURED 16/64 and cannot speak to this.
+
+. **Re-measure at 1M, which is now possible.** The harness previously failed
+  deterministically at N >= ~333k: the first flush crossed the 32 MB training
+  floor, so a training compaction consumed the only L0 and the second flush had
+  nothing due (`compaction_ran` false, `compaction_error: None` -- a missing
+  enqueue with no error to point at). The test now pins
+  `PROXIMADB_TRAINING_COMPACTION_MIN_MB` so only the count arm fires. Run the
+  arms in BOTH orders, because the baseline arm currently runs first and cold
+  while the probe arm runs second and warm.
+
+. **Then, and only if the growth is a real cost, split the miss reason.**
+  `segment_format.rs` calls `coarse_probe_survivors(...).await.ok().flatten()`,
+  collapsing ~15 descriptive `Err` paths and **six** `return Ok(None)` declines
+  (`:3090`, `:3107`, `:3112`, `:3124`, `:3173`, `:3194` on `origin/develop`;
+  `coarse_probe_survivors` starts at `:3067`. Those are `origin/develop` numbers
+  and the PR shifts them by **+2** -- it edits a comment higher up in that file,
+  taking it from 9601 to 9603 lines -- so in the PR tree read
+  :3092/:3109/:3114/:3126/:3175/:3196 with the function at :3069. An earlier revision of this parenthetical said the PR does not touch the
+  file, which stopped being true when it did) into one "no probe", with
+  `record_ivf_probe_durable(0,0,0,0,true)` firing for both. This was item 1 while
+  the engagement collapse was believed real; with engagement measured at 100% at
+  every scale there are currently **no misses to attribute**, so it is
+  speculative work until a measurement says otherwise.
+
+. **Do not relax the byte ratchet.** `bytes_probe < bytes_base` is the correct
+  contract -- a probe that reads more bytes than the scan it replaces has no
+  reason to exist -- and it now PASSES at every scale measured (-44% at 20k,
+  -30% at 100k/1000q, -37% at 333k). An earlier revision of this TD said the
+  test "being red at the default N is the honest state"; it is green, and the red
+  was the un-awaited compaction.

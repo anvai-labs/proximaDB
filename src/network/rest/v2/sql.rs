@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use axum::{Extension, Json, extract::State};
+use proximadb_data_model::ProximaValue;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use utoipa::ToSchema;
@@ -50,6 +51,32 @@ pub struct SqlResponse {
     pub rows_scanned: u64,
     pub execution_time_ms: u64,
     pub request_id: String,
+}
+
+/// v2 SQL's row rendering policy: `proxima_to_json` (whose Binary spelling
+/// is already the per-byte int-array — the one form /api/v2/records' typed
+/// write parses, keeping binary SELECT↔write symmetric) with ONE override
+/// applied at ALL depths: Uuid DASHED, matching /api/v2/records' read
+/// rendering. Temporals are NOT symmetric with the records read path's
+/// typed {value, unit} objects — the SQL surface renders bare numbers
+/// (pre-existing); aligning them is a deliberate contract change, not a
+/// rendering cleanup.
+fn v2_row_render(value: &ProximaValue) -> serde_json::Value {
+    match value {
+        ProximaValue::Uuid(u) => serde_json::Value::String(
+            proximadb_kernel::uuid::Uuid::from_bytes(*u).to_hyphenated_string(),
+        ),
+        ProximaValue::Array(items) => {
+            serde_json::Value::Array(items.iter().map(v2_row_render).collect())
+        }
+        ProximaValue::Map(fields) | ProximaValue::Struct(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), v2_row_render(v)))
+                .collect(),
+        ),
+        other => proximadb_records::conversions::proxima_to_json(other),
+    }
 }
 
 fn validate_request(request: &SqlRequest) -> ApiResult<u64> {
@@ -153,10 +180,7 @@ pub async fn execute_sql(
                     .get(index)
                     .cloned()
                     .unwrap_or_else(|| format!("column_{index}"));
-                object.insert(
-                    column,
-                    proximadb_records::conversions::proxima_to_json(value),
-                );
+                object.insert(column, v2_row_render(value));
             }
             serde_json::Value::Object(object)
         })
@@ -176,6 +200,47 @@ pub async fn execute_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_row_render_is_depth_consistent() {
+        // One spelling per type at ALL depths: nested uuids stay dashed,
+        // nested binary stays the int-array (the /api/v2/records write
+        // form). A top-level-only composition left nested uuids undashed
+        // inside one response (round-6/7 review findings).
+        let row = ProximaValue::Map(
+            [
+                (
+                    "id".to_string(),
+                    ProximaValue::Uuid([
+                        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65,
+                        0x54, 0x40, 0x00, 0x00,
+                    ]),
+                ),
+                (
+                    "payload".to_string(),
+                    ProximaValue::Array(vec![
+                        ProximaValue::Binary(vec![0x00, 0x01, 0x02]),
+                        ProximaValue::Uuid([
+                            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x65,
+                            0x54, 0x40, 0x00, 0x00,
+                        ]),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            v2_row_render(&row),
+            serde_json::json!({
+                "id": "550e8400-e29b-41d4-a716-446554400000",
+                "payload": [
+                    [0, 1, 2],
+                    "550e8400-e29b-41d4-a716-446554400000"
+                ]
+            })
+        );
+    }
 
     #[test]
     fn validates_single_statement_and_deadline_bounds() {

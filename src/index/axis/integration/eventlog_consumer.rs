@@ -755,7 +755,19 @@ impl AxisEventLogConsumer {
                                                 serde_json::Value::Bool(b) => {
                                                     ProximaValue::Boolean(b)
                                                 }
-                                                _ => ProximaValue::Null,
+                                                // Round 19: the extraction
+                                                // contract changed (round 16:
+                                                // real arrays/objects instead
+                                                // of "[array]"/"[object]"
+                                                // placeholders) — lower
+                                                // structured values via the
+                                                // canonical JSON→ProximaValue
+                                                // mapping instead of Null.
+                                                other => {
+                                                    proximadb_records::conversions::json_to_proxima(
+                                                        &other,
+                                                    )
+                                                }
                                             };
                                             (k, proximadb_records::ProximaTreeNode::Value(pv))
                                         })

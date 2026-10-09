@@ -51,5 +51,5 @@ The ~27ms latency difference (1ms AXIS vs 28ms warm PAX) does not justify 8.6GB 
 == Related
 
 * #1145 (AXIS per-collection gate), #1155 (skip unused AXIS build at flush), #1158 (Stage-3 storage search for co-design), #1159 (recall fix: delta-merge metric + similarity + dequantize).
-* link:TD-SEARCH-2-parallel-morsel-search.adoc[TD-SEARCH-2] (parallel morsel search — the latency fix for cold PAX scans).
-* link:TD-RECALL-1-codesign-pax-scan-wrong-distances.adoc[TD-RECALL-1] (the recall investigation that proved the PAX scan works at 0.999).
+* link:../../10-quality/td/TD-SEARCH-2-parallel-morsel-search.adoc[TD-SEARCH-2] (parallel morsel search — the latency fix for cold PAX scans).
+* link:../../10-quality/td/TD-RECALL-1-codesign-pax-scan-wrong-distances.adoc[TD-RECALL-1] (the recall investigation that proved the PAX scan works at 0.999).

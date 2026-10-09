@@ -23,7 +23,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar
@@ -70,7 +70,7 @@ class OAuth2TokenResponse:
     refresh_token: str | None = None
     scope: str | None = None
     id_token: str | None = None
-    issued_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    issued_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @property
     def expires_at(self) -> datetime | None:
@@ -85,13 +85,13 @@ class OAuth2TokenResponse:
         if self.expires_at is None:
             return False
         # Consider expired 30 seconds before actual expiry for safety
-        return datetime.now(timezone.utc) >= (self.expires_at - timedelta(seconds=30))
+        return datetime.now(UTC) >= (self.expires_at - timedelta(seconds=30))
 
     def time_until_expiry(self) -> timedelta | None:
         """Get time until token expires."""
         if self.expires_at is None:
             return None
-        return self.expires_at - datetime.now(timezone.utc)
+        return self.expires_at - datetime.now(UTC)
 
 
 @dataclass
@@ -617,7 +617,7 @@ class RBACManager:
         if self._audit_callback:
             self._audit_callback(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "roles": roles,
                     "permission": permission,
                     "resource": resource,
@@ -648,9 +648,7 @@ class SecurityContext:
     request_id: str | None = None
     client_ip: str | None = None
     user_agent: str | None = None
-    authenticated_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    authenticated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def has_permission(self, permission: str) -> bool:
@@ -830,7 +828,7 @@ class AuditLogger:
         event = AuditEvent(
             event_id=str(uuid.uuid4()),
             event_type=event_type,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             user_id=context.user_id if context else "system",
             tenant_id=context.tenant_id if context else None,
             action=action,

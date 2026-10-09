@@ -51,18 +51,73 @@ use crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache;
 // reference (and the router below) resolves unchanged (behavior-neutral move).
 pub use proximadb_storage_common::segment_layout::SegmentFormat;
 
+// TD-USUB-5 / ADR-094 §4: the decode seam. `RecordReader` and its two
+// format-layer implementations live beside the formats they read; re-exported
+// here so the router and its callers keep one import path.
+pub use proximadb_storage_common::segment_reader::{
+    ParquetRecordReader, PaxRecordReader, RecordReader, SegmentReadContext,
+};
+
+/// Reads legacy row-based [`ProximaDataBlock`] segments (raw f32).
+///
+/// This implementation lives in the root crate rather than beside its two
+/// siblings in `proximadb-storage-common` because [`ProximaDataBlock`] is defined
+/// in `proximadb-engine-core`, which sits *above* the format layer. The trait is
+/// the seam that lets all three readers be selected uniformly anyway.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProximaBlocksRecordReader;
+
+impl RecordReader for ProximaBlocksRecordReader {
+    fn format(&self) -> SegmentFormat {
+        SegmentFormat::ProximaBlocks
+    }
+
+    fn read_records(
+        &self,
+        bytes: &[u8],
+        _ctx: &SegmentReadContext<'_>,
+    ) -> Result<Vec<ProximaRecord>> {
+        // The legacy block is self-describing — it carries its own column names,
+        // embeddings and tenant — so the catalog-derived context is unused.
+        Ok(ProximaDataBlock::deserialize(bytes, None)?.records)
+    }
+}
+
+/// The dispatch table: one [`RecordReader`] per [`SegmentFormat`].
+///
+/// This is the substance of TD-USUB-5's compute-seam change — the decode rule for
+/// a format is now addressable on its own, so adding a format is adding an arm
+/// here plus a magic in `SegmentFormat::detect`, never editing a decode body.
+///
+/// The `match` is deliberately exhaustive (no `_` arm) so a future
+/// [`SegmentFormat`] variant is a compile error here rather than a silent
+/// fall-back to the legacy decoder.
+pub fn record_reader_for(format: SegmentFormat) -> Box<dyn RecordReader> {
+    match format {
+        SegmentFormat::Pax => Box::new(PaxRecordReader),
+        SegmentFormat::Parquet => Box::new(ParquetRecordReader),
+        SegmentFormat::ProximaBlocks => Box::new(ProximaBlocksRecordReader),
+    }
+}
+
 /// Decode a persisted vector segment back to records, routing on the detected format.
 ///
-/// PAX segments are decoded via the format-layer inverse
-/// ([`proximadb_storage_common::pax_block::read_pax_segment_records`]); legacy
-/// segments via [`ProximaDataBlock::deserialize`]. This root-level router is the
-/// single mixed-read entry called from the cold-search, compaction, and recovery
-/// paths. Its signature is unchanged from before the detection + PAX-decode logic
-/// moved down to `proximadb-storage-common` — the move is behavior-neutral.
+/// Detection ([`SegmentFormat::detect`]) picks the format from the bytes' magic;
+/// [`record_reader_for`] picks the reader. PAX decodes via the format-layer
+/// inverse (`read_pax_segment_records`), Parquet via the canonical
+/// `parquet_bytes_to_record_batches` + Arrow→records mapping, legacy via
+/// [`ProximaDataBlock::deserialize`]. This root-level router is the single
+/// mixed-read entry called from the cold-search, compaction, and recovery paths.
+///
+/// Its signature and its behaviour on `PBLK`/`PXH1`/legacy bytes are unchanged by
+/// the move to trait dispatch — the same detection feeds the same decoders. The
+/// one behavioural difference is that Parquet bytes, which previously fell to the
+/// legacy default and were handed to a decoder that cannot read them, now reach a
+/// reader that can.
 ///
 /// `embedding_model_ids` / `user_column_keys` are the collection's schema keys used
 /// to reconstruct PAX records positionally (empty slices = best-effort defaults);
-/// they are ignored for the legacy format, which is self-describing.
+/// they are ignored for the legacy and Parquet formats, which are self-describing.
 ///
 /// `tenant_ctx` is the segment's owning tenant (from the catalog/path); it is
 /// stamped onto rows whose tenant column was dropped (catalog-resolution) and is
@@ -73,17 +128,8 @@ pub fn read_segment_records(
     user_column_keys: &[String],
     tenant_ctx: Option<&str>,
 ) -> Result<Vec<ProximaRecord>> {
-    match SegmentFormat::detect(bytes) {
-        SegmentFormat::Pax => Ok(
-            proximadb_storage_common::pax_block::read_pax_segment_records(
-                bytes,
-                embedding_model_ids,
-                user_column_keys,
-                tenant_ctx,
-            )?,
-        ),
-        SegmentFormat::ProximaBlocks => Ok(ProximaDataBlock::deserialize(bytes, None)?.records),
-    }
+    let ctx = SegmentReadContext::new(embedding_model_ids, user_column_keys, tenant_ctx);
+    record_reader_for(SegmentFormat::detect(bytes)).read_records(bytes, &ctx)
 }
 
 /// Write `records` as a PAX vector segment at `path` — the write-side inverse of
@@ -310,8 +356,10 @@ fn write_pax_segment_full_internal(
     let plan = if cluster {
         // TD-WLP-4/WLP-9 eval opt-in (`PROXIMADB_PAX_FLUSH_CLUSTER=ivf`): apply
         // the compaction-grade PCA+IVF re-cluster at flush instead of the
-        // bootstrap, so clustering quality is measurable without the (unwired)
-        // flush→compaction scheduler. Default OFF ⇒ bootstrap.
+        // bootstrap, so clustering quality is measurable without waiting on a
+        // compaction cadence. (Not "the (unwired) flush→compaction scheduler",
+        // as an earlier revision said: TD-WLP-7 / ADR-061 D3 wired it in #1012.)
+        // Default OFF ⇒ bootstrap.
         if crate::storage::engines::sst::block_cluster::flush_cluster_ivf() {
             crate::storage::engines::sst::block_cluster::cluster_plan_pca_ivf(
                 records,
@@ -1220,38 +1268,61 @@ pub(crate) async fn read_records_by_positions(
     embedding_model_ids: &[String],
     user_column_keys: &[String],
     tenant_ctx: Option<&str>,
+    // TD-RDSTRAT-13 PR-B 2b: the invariants cache the cascade just warmed —
+    // the rehydrate's header/footer reads become cache hits (zero GETs)
+    // instead of 3 duplicate IO ops per segment per query.
+    cache: Option<&SegmentInvariantsCache>,
 ) -> Result<Vec<Option<proximadb_records::ProximaRecord>>> {
     use proximadb_block_format::{PaxBlockReader, record::FlatRow};
     use proximadb_storage_common::segment_layout::{SegmentFooterIndex, SegmentHeaderPrefix};
 
+    // TD-RDSTRAT-13 PR-B: attribute the whole rehydration pass (metadata +
+    // header/footer + block fetches + decode) — the second Region-D read.
+    let rehydrate_started = std::time::Instant::now();
     let mut out: Vec<Option<proximadb_records::ProximaRecord>> = vec![None; positions.len()];
     if positions.is_empty() {
         return Ok(out);
     }
 
-    // 1-2. Header prefix + footer → block table (mirrors stage F; a
-    // non-coalesced segment is an error here — the cascade only runs on
-    // coalesced segments).
-    let size = fs
-        .metadata(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("rehydrate stat {path}: {e}"))?
-        .size;
-    if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
-        anyhow::bail!("rehydrate {path}: not a coalesced segment");
-    }
-    let read_len = (coalesced_header_prefetch_floor() as u64).min(size);
-    let header_bytes = fs
-        .read_range(path, 0, read_len)
-        .await
-        .map_err(|e| anyhow::anyhow!("rehydrate header {path}: {e}"))?;
-    let header = SegmentHeaderPrefix::parse(&header_bytes)
-        .map_err(|e| anyhow::anyhow!("rehydrate header parse {path}: {e}"))?;
-    let footer_bytes = fs
-        .read_range(path, header.footer_off, header.footer_len)
-        .await
-        .map_err(|e| anyhow::anyhow!("rehydrate footer {path}: {e}"))?;
-    let footer = SegmentFooterIndex::parse(&footer_bytes)?;
+    // 1-2. Header prefix + footer → block table. Cache-first (TD-RDSTRAT-13
+    // 2b): the probe warmed the invariants cache EARLIER IN THIS QUERY, so the
+    // rehydrate's lookups are L1 hits — no HEAD, no header GET, no footer GET.
+    // On a miss (cold cache), fall back to the exact stat+read path.
+    let (_header, footer) = if let Some(cache) = cache
+        && let Some(inv) = cache.get_or_promote(path).await.value()
+    {
+        match (
+            SegmentHeaderPrefix::parse(&inv.header_bytes),
+            SegmentFooterIndex::parse(&inv.footer_bytes),
+        ) {
+            (Ok(h), Ok(f)) => (h, f),
+            (Err(e), _) | (_, Err(e)) => {
+                anyhow::bail!("rehydrate cached layout {path}: {e}")
+            }
+        }
+    } else {
+        let size = fs
+            .metadata(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("rehydrate stat {path}: {e}"))?
+            .size;
+        if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
+            anyhow::bail!("rehydrate {path}: not a coalesced segment");
+        }
+        let read_len = (coalesced_header_prefetch_floor() as u64).min(size);
+        let header_bytes = fs
+            .read_range(path, 0, read_len)
+            .await
+            .map_err(|e| anyhow::anyhow!("rehydrate header {path}: {e}"))?;
+        let header = SegmentHeaderPrefix::parse(&header_bytes)
+            .map_err(|e| anyhow::anyhow!("rehydrate header parse {path}: {e}"))?;
+        let footer_bytes = fs
+            .read_range(path, header.footer_off, header.footer_len)
+            .await
+            .map_err(|e| anyhow::anyhow!("rehydrate footer {path}: {e}"))?;
+        let footer = SegmentFooterIndex::parse(&footer_bytes)?;
+        (header, footer)
+    };
     let mut block_start: Vec<u64> = Vec::with_capacity(footer.blocks.len());
     let mut acc = 0u64;
     for b in &footer.blocks {
@@ -1345,6 +1416,12 @@ pub(crate) async fn read_records_by_positions(
             }
         }
     }
+    crate::observability::io_trace::record_rehydrate_us(
+        rehydrate_started.elapsed().as_micros() as u64
+    );
+    crate::storage::engines::sst::metrics::record_rehydrate_us(
+        rehydrate_started.elapsed().as_micros() as u64,
+    );
     Ok(out)
 }
 
@@ -3969,6 +4046,9 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     //    dense — no bystander props/fp32). The dequant key (min + scale) is
     //    mirrored in the footer (already read), so there is NO separate 24 B
     //    Region-B-header GET — reconstruct the params + codes_base from the footer.
+    // TD-RDSTRAT-13 PR-B: this section (fetch + rerank) is one of the four
+    // attributed tail segments; the wall is recorded at the `scored` boundary.
+    let region_b_started = std::time::Instant::now();
     let dim = footer.embed_dim as usize;
     let sq8_params = coalesced_sq8::params_from_min_scale(footer.sq8_min, footer.sq8_scale);
     let query_norm_squared = if metric == RankMetric::Cosine {
@@ -4340,7 +4420,18 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         }
     }
     if scored.is_empty() {
+        crate::observability::io_trace::record_region_b_rerank_us(
+            region_b_started.elapsed().as_micros() as u64,
+        );
+        crate::storage::engines::sst::metrics::record_region_b_rerank_us(
+            region_b_started.elapsed().as_micros() as u64,
+        );
         return Ok(Some(Vec::new()));
+    }
+    {
+        let us = region_b_started.elapsed().as_micros() as u64;
+        crate::observability::io_trace::record_region_b_rerank_us(us);
+        crate::storage::engines::sst::metrics::record_region_b_rerank_us(us);
     }
     // Global top-k survivor rows (nearest-first; lower score = nearer).
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -4349,6 +4440,8 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     // 5. ADR-065 Region D: fetch ONLY the top-k OIDs from the row blocks (≤k
     //    coalesced GETs — vs PR2's M-survivor block fetches). Map top-k rows →
     //    blocks via cumulative row counts.
+    // TD-RDSTRAT-13 PR-B: fetch+decode wall attributed here (both arms).
+    let region_d_started = std::time::Instant::now();
     let mut block_start: Vec<u64> = Vec::with_capacity(footer.blocks.len());
     let mut acc = 0u64;
     for b in &footer.blocks {
@@ -4386,9 +4479,24 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             .is_some_and(|s| s.as_ref().is_some_and(|stats| stats.oid_chunk_len > 0))
     });
     if v4_chunk_fetch {
-        // TD-PAXRG-1 Phase D: per-RG OID-chunk fetch — the footer's stats
-        // payload addresses each RG's chunk; decode via decode_str_chunk.
-        for (&bi, locals) in &block_rows {
+        // TD-PAXRG-1 Phase D + TD-RDSTRAT-13 PR-B 2b: per-RG OID-chunk fetch,
+        // WAVED — the chunks were previously fetched strictly sequentially
+        // (up to ~top-k serial GETs; on object stores that is ~top-k × RTT).
+        // Same peek·batch·feed discipline as the legacy whole-block tail:
+        // classify via the side-effect-free peek, ONE bounded wave for the
+        // true-cold chunks (D4 bound: min(INFLIGHT,N) × chunk_len ≤ small —
+        // chunks are ~tens of bytes per row), then feed pre-fetched bytes
+        // through the SAME get_or_fetch seam so cache semantics, LRU and
+        // counters stay byte-identical; serial fallback on wave Err.
+        struct ChunkDesc {
+            start: u64,
+            range_len: u64,
+            row_count: usize,
+            encoding_id: u8,
+            is_lz4: bool,
+        }
+        let mut chunk_descs: Vec<ChunkDesc> = Vec::with_capacity(block_rows.len());
+        for &bi in block_rows.keys() {
             let b = footer.blocks.get(bi).ok_or_else(|| {
                 anyhow::anyhow!("coalesced scan OID chunk block {bi} is missing from footer")
             })?;
@@ -4413,39 +4521,161 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             let start = b.offset.checked_add(relative_start).ok_or_else(|| {
                 anyhow::anyhow!("coalesced scan OID chunk absolute offset overflows for block {bi}")
             })?;
+            chunk_descs.push(ChunkDesc {
+                start,
+                range_len,
+                row_count: b.row_count as usize,
+                encoding_id: stats.oid_encoding_id,
+                is_lz4: stats.oid_is_lz4,
+            });
+        }
+
+        enum ChunkSlot {
+            SiteServed,
+            Cold(usize),
+        }
+        let mut chunk_slots: Vec<ChunkSlot> = Vec::with_capacity(chunk_descs.len());
+        let mut chunk_cold_ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        for (desc_i, (_bi, _locals)) in block_rows.iter().enumerate() {
+            let desc = &chunk_descs[desc_i];
+            match survivor_cache {
+                // TD-IOBUDGET-2 review: L2-aware classification — a chunk
+                // resident in the persistent exact-key L2 would be served by
+                // the consume call's `get_or_fetch` with ZERO object-store
+                // GETs; classifying it Cold (DRAM-only peek) turned that free
+                // serve into a billed wave GET whose bytes were then dropped.
+                Some(sc)
+                    if sc
+                        .peek_exact_residency(CacheKind::Other, path, desc.start, desc.range_len)
+                        .await
+                        .is_some() =>
+                {
+                    chunk_slots.push(ChunkSlot::SiteServed);
+                }
+                _ => {
+                    chunk_slots.push(ChunkSlot::Cold(chunk_cold_ranges.len()));
+                    chunk_cold_ranges.push(desc.start..desc.start + desc.range_len);
+                }
+            }
+        }
+        let mut chunk_cold_bytes: Vec<Option<Vec<u8>>> = vec![None; chunk_cold_ranges.len()];
+        if !chunk_cold_ranges.is_empty() {
+            let batched = match fs
+                .read_ranges_prefetch(path, chunk_cold_ranges.clone())
+                .await
+            {
+                Ok(bufs) => bufs,
+                Err(_) => {
+                    // Defensive fallback to the sequential baseline shape.
+                    let mut seq = Vec::with_capacity(chunk_cold_ranges.len());
+                    for range in &chunk_cold_ranges {
+                        let b = fs
+                            .read_range(path, range.start, range.end - range.start)
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!("coalesced scan OID-chunk fallback {path}: {err}")
+                            })?;
+                        seq.push(b);
+                    }
+                    seq
+                }
+            };
+            // Metrics parity: one record per physical GET, at batch time.
+            for ((range, buf), slot) in chunk_cold_ranges
+                .iter()
+                .zip(batched)
+                .zip(chunk_cold_bytes.iter_mut())
+            {
+                record_get_physical(CacheTier::ResultPayload, range.end - range.start, trace_on);
+                *slot = Some(buf);
+            }
+            crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
+        }
+
+        for (desc_i, (bi, locals)) in block_rows.iter().enumerate() {
+            let desc = &chunk_descs[desc_i];
+            let pre = match &chunk_slots[desc_i] {
+                ChunkSlot::Cold(i) => Some(chunk_cold_bytes[*i].take().ok_or_else(|| {
+                    anyhow::anyhow!("coalesced scan OID-chunk fetch {path}: cold chunk {i} missing")
+                })?),
+                ChunkSlot::SiteServed => None,
+            };
             // ADR-065 Q3: same read-through cache class as the legacy OID path.
             let buf: Arc<[u8]> = if let Some(sc) = survivor_cache {
-                sc.get_or_fetch(CacheKind::Other, path, start, range_len, || async move {
-                    let b = fs.read_range(path, start, range_len).await?;
-                    record_get_physical(CacheTier::ResultPayload, range_len, trace_on);
-                    Ok(b)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("coalesced scan OID-chunk fetch {path}: {e}"))?
+                match pre {
+                    Some(mut pre) => sc
+                        .get_or_fetch(
+                            CacheKind::Other,
+                            path,
+                            desc.start,
+                            desc.range_len,
+                            || async {
+                                Ok::<_, proximadb_storage_filesystem_types::FilesystemError>(
+                                    std::mem::take(&mut pre),
+                                )
+                            },
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("coalesced scan OID-chunk fetch {path}: {e}")
+                        })?,
+                    None => {
+                        // SiteServed (or a peek/consume race): the original
+                        // baseline loader — records fire iff it truly runs.
+                        sc.get_or_fetch(
+                            CacheKind::Other,
+                            path,
+                            desc.start,
+                            desc.range_len,
+                            || async move {
+                                let b = fs.read_range(path, desc.start, desc.range_len).await?;
+                                record_get_physical(
+                                    CacheTier::ResultPayload,
+                                    desc.range_len,
+                                    trace_on,
+                                );
+                                Ok(b)
+                            },
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("coalesced scan OID-chunk fetch {path}: {e}")
+                        })?
+                    }
+                }
             } else {
-                let b = fs
-                    .read_range(path, start, range_len)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("coalesced scan OID-chunk fetch {path}: {e}"))?;
-                record_get_physical(CacheTier::ResultPayload, range_len, trace_on);
-                Arc::from(b)
+                match pre {
+                    Some(b) => Arc::from(b),
+                    None => {
+                        let b = fs
+                            .read_range(path, desc.start, desc.range_len)
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!("coalesced scan OID-chunk fetch {path}: {e}")
+                            })?;
+                        record_get_physical(CacheTier::ResultPayload, desc.range_len, trace_on);
+                        Arc::from(b)
+                    }
+                }
             };
-            if buf.len() as u64 != range_len {
+            if buf.len() as u64 != desc.range_len {
                 anyhow::bail!(
-                    "coalesced scan OID chunk fetch {path} block {bi} returned {} bytes, expected {range_len}",
-                    buf.len()
+                    "coalesced scan OID chunk fetch {path} block {bi} returned {} bytes, expected {}",
+                    buf.len(),
+                    desc.range_len
                 );
             }
             let oids = proximadb_block_format::decode_str_chunk_checked(
                 &buf,
-                stats.oid_encoding_id,
-                stats.oid_is_lz4,
-                b.row_count as usize,
+                desc.encoding_id,
+                desc.is_lz4,
+                desc.row_count,
             )
             .map_err(|err| {
                 anyhow::anyhow!("coalesced scan OID chunk decode {path} block {bi}: {err}")
             })?;
             for &local in locals {
+                let bi = *bi;
                 let oid = oids
                     .get(local)
                     .and_then(Option::as_ref)
@@ -4647,6 +4877,14 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                 }
             }
         }
+    }
+
+    // TD-RDSTRAT-13 PR-B: Region-D fetch+decode wall recorded at the boundary
+    // where all top-k OIDs are resolved.
+    {
+        let us = region_d_started.elapsed().as_micros() as u64;
+        crate::observability::io_trace::record_region_d_fetch_decode_us(us);
+        crate::storage::engines::sst::metrics::record_region_d_fetch_decode_us(us);
     }
 
     // 6. Build the top-k hits in nearest-first order (from `scored`); step 7
@@ -6034,6 +6272,134 @@ mod tests {
             pax_oids,
             vec!["pax_c", "pax_d"],
             "PAX segment oids (disjoint from legacy)"
+        );
+    }
+
+    /// TD-USUB-5 / ADR-094 §4 — converting [`read_segment_records`] from an
+    /// inline `match` to [`RecordReader`] dispatch must be **behaviour-neutral**
+    /// for the formats that already existed.
+    ///
+    /// The assertion is equality against the canonical decoders called
+    /// DIRECTLY — `ProximaDataBlock::deserialize` for the legacy format and
+    /// `read_pax_segment_records` for PAX — on whole `ProximaRecord`s, not just
+    /// oids. So the test fails if the trait indirection perturbs any field
+    /// (embeddings, props, timestamps, tenant), which a shape-only assertion
+    /// would miss.
+    #[test]
+    fn trait_dispatch_is_byte_identical_for_existing_formats() {
+        let legacy_records = vec![
+            rec(
+                "legacy_a",
+                1_700_000_000_000_000_000,
+                vec![1.0, 2.0, 3.0, 4.0],
+            ),
+            rec(
+                "legacy_b",
+                1_700_000_000_000_000_001,
+                vec![5.0, 6.0, 7.0, 8.0],
+            ),
+        ];
+        let legacy_bytes = ProximaDataBlock::new(legacy_records, BlockCompressionConfig::default())
+            .serialize()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let pax_path = dir.path().join("dispatch.pax");
+        let pax_records = vec![
+            rec(
+                "pax_c",
+                1_700_000_000_000_000_002,
+                vec![9.0, 10.0, 11.0, 12.0],
+            ),
+            rec(
+                "pax_d",
+                1_700_000_000_000_000_003,
+                vec![13.0, 14.0, 15.0, 16.0],
+            ),
+        ];
+        write_pax_segment(
+            &pax_path,
+            &pax_records,
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            None,
+            None,
+        )
+        .unwrap();
+        let pax_bytes = std::fs::read(&pax_path).unwrap();
+
+        // Legacy: router output == `ProximaDataBlock::deserialize` output.
+        let via_router = read_segment_records(&legacy_bytes, &[], &[], Some("t1")).unwrap();
+        let direct = ProximaDataBlock::deserialize(&legacy_bytes, None)
+            .unwrap()
+            .records;
+        assert_eq!(via_router, direct, "legacy decode changed under dispatch");
+
+        // PAX: router output == `read_pax_segment_records` output, with the
+        // catalog-derived context threaded through unchanged.
+        let via_router = read_segment_records(&pax_bytes, &[], &[], Some("t1")).unwrap();
+        let direct = proximadb_storage_common::pax_block::read_pax_segment_records(
+            &pax_bytes,
+            &[],
+            &[],
+            Some("t1"),
+        )
+        .unwrap();
+        assert_eq!(via_router, direct, "PAX decode changed under dispatch");
+
+        // The dispatch table agrees with detection for every format — the
+        // invariant that keeps "detected as X" and "decoded as X" from drifting.
+        for bytes in [&legacy_bytes[..], &pax_bytes[..]] {
+            let format = SegmentFormat::detect(bytes);
+            assert_eq!(record_reader_for(format).format(), format);
+        }
+    }
+
+    /// TD-USUB-5 — a Parquet object reaching the router is now DECODED rather
+    /// than handed to the legacy decoder that cannot read it.
+    ///
+    /// The second half is the part that matters for mandate #1: even without the
+    /// Parquet arm the old code did not return wrong rows here, it returned an
+    /// error — but it was an error about the wrong format. Naming the format
+    /// turns a mis-route into a decode.
+    #[test]
+    fn parquet_segment_routes_to_the_parquet_reader() {
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("city", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["pune", "austin"]))],
+        )
+        .unwrap();
+        let bytes = proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes(
+            &[batch],
+            schema,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(SegmentFormat::detect(&bytes), SegmentFormat::Parquet);
+        assert_eq!(
+            record_reader_for(SegmentFormat::Parquet).format(),
+            SegmentFormat::Parquet
+        );
+
+        let records = read_segment_records(&bytes, &[], &[], Some("tenant-9")).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records.iter().all(|r| r.tenant_id == "tenant-9"),
+            "tenant context must be stamped on the Parquet arm too"
+        );
+
+        // Non-vacuity: the legacy decoder genuinely cannot read these bytes, so
+        // the new arm is doing real work rather than shadowing a path that
+        // already happened to succeed.
+        assert!(
+            ProximaDataBlock::deserialize(&bytes, None).is_err(),
+            "legacy decoder must reject Parquet bytes — otherwise this test proves nothing"
         );
     }
 

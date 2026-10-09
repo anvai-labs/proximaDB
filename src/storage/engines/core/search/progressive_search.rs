@@ -863,6 +863,13 @@ impl ProgressiveSearchExecutor {
                                 ),
                             }
                         }
+                        crate::proto::proximadb_v1::sql_value::Value::JsonbValue(b) => {
+                            proximadb_v1::SqlValue {
+                                value: Some(
+                                    crate::proto::proximadb_v1::sql_value::Value::JsonbValue(b),
+                                ),
+                            }
+                        }
                         crate::proto::proximadb_v1::sql_value::Value::NullValue(n) => {
                             proximadb_v1::SqlValue {
                                 value: Some(

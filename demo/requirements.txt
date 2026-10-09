@@ -18,7 +18,7 @@ seaborn>=0.12.0
 
 # Progress bars and CLI
 tqdm>=4.70.0
-click>=8.4.2
+click>=8.5.0
 
 # HTTP clients
 aiohttp>=3.8.0
@@ -26,7 +26,7 @@ aiohttp-cors>=0.8.1
 httpx>=0.24.0
 
 # JSON handling
-orjson>=3.8.0
+orjson>=3.12.0
 
 # Logging
 structlog>=22.3.0
@@ -38,12 +38,12 @@ pytest-asyncio>=0.21.0
 # Development
 black>=22.12.0
 isort>=5.11.0
-mypy>=1.0.0
+mypy>=2.3.1
 
 # BERT embeddings for real-world demos
 sentence-transformers>=6.0.0
-torch>=2.13.0
+torch>=2.14.0+cpu
 
 # LLM support for RAG demo
-transformers>=5.15.1
+transformers>=5.16.1
 sentencepiece>=0.1.99

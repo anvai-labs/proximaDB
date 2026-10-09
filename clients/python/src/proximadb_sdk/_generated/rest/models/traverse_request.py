@@ -18,23 +18,21 @@ T = TypeVar("T", bound="TraverseRequest")
 
 @_attrs_define
 class TraverseRequest:
-    """Flat shape (no wrapper). Matches `RestTraversalRequest` in
-    proximadb-api.
-
-        Attributes:
-            start_node_id (str):
-            max_depth (int | Unset):  Default: 3.
-            edge_types (list[str] | Unset):
-            node_labels (list[str] | Unset):
-            algorithm (None | str | Unset): bfs | dfs | shortest_path
-            limit (int | None | Unset):
+    """
+    Attributes:
+        start_node_id (str):
+        max_depth (int | Unset):  Default: 5.
+        edge_types (list[str] | Unset):
+        node_labels (list[str] | Unset):
+        algorithm (str | Unset):  Default: 'bfs'.
+        limit (int | None | Unset):
     """
 
     start_node_id: str
-    max_depth: int | Unset = 3
+    max_depth: int | Unset = 5
     edge_types: list[str] | Unset = UNSET
     node_labels: list[str] | Unset = UNSET
-    algorithm: None | str | Unset = UNSET
+    algorithm: str | Unset = "bfs"
     limit: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -51,11 +49,7 @@ class TraverseRequest:
         if not isinstance(self.node_labels, Unset):
             node_labels = self.node_labels
 
-        algorithm: None | str | Unset
-        if isinstance(self.algorithm, Unset):
-            algorithm = UNSET
-        else:
-            algorithm = self.algorithm
+        algorithm = self.algorithm
 
         limit: int | None | Unset
         if isinstance(self.limit, Unset):
@@ -94,14 +88,7 @@ class TraverseRequest:
 
         node_labels = cast(list[str], d.pop("node_labels", UNSET))
 
-        def _parse_algorithm(data: object) -> None | str | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(None | str | Unset, data)
-
-        algorithm = _parse_algorithm(d.pop("algorithm", UNSET))
+        algorithm = d.pop("algorithm", UNSET)
 
         def _parse_limit(data: object) -> int | None | Unset:
             if data is None:

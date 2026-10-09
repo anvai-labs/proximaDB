@@ -1,6 +1,6 @@
 # ProximaDB Build and Test Makefile
 
-.PHONY: env-gate-check all clean build test test-python test-rust test-fast check-fast install-fast-tools benchmark release install help capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check deterministic-commit-contract-check work-commit-check validated-commit-check workspace-rebuild-baseline panic-policy-report panic-policy-no-regression panic-policy-module-guard panic-policy-baseline silent-failure-report silent-failure-no-regression silent-failure-baseline v1-proto-usage-report v1-proto-usage-no-regression v1-proto-usage-baseline hygiene-check proto-check verify-openapi-spec gen-go-sdk gen-ts-sdk gen-rust-sdk gen-python-sdk release-check query-conformance-check docs-claim-check design-status-check status-asof-check release-smoke cloud-emulator-test
+.PHONY: env-gate-check all clean build test test-python test-rust test-fast check-fast install-fast-tools benchmark release install help capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check deterministic-commit-contract-check branch-promotion-policy-check work-commit-check validated-commit-check workspace-rebuild-baseline panic-policy-report panic-policy-no-regression panic-policy-module-guard panic-policy-baseline silent-failure-report silent-failure-no-regression silent-failure-baseline v1-proto-usage-report v1-proto-usage-no-regression v1-proto-usage-baseline hygiene-check proto-check verify-openapi-spec gen-go-sdk gen-ts-sdk gen-rust-sdk gen-python-sdk release-check query-conformance-check docs-claim-check design-status-check status-asof-check release-smoke cloud-emulator-test
 
 # Default target
 all: build test
@@ -132,6 +132,12 @@ context-benchmark-check:
 deterministic-commit-contract-check:
 	@echo "🧷 Validating deterministic commit contract..."
 	python3 scripts/check_deterministic_commit_contract.py
+	python3 -m unittest discover -s tests/scripts -p 'test_deterministic_commit_contract.py'
+	python3 -m unittest discover -s tests/scripts -p 'test_cloud_emulator_harness.py'
+
+branch-promotion-policy-check:
+	@echo "🌿 Validating pull-request branch routes..."
+	python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
 
 proto-check:
 	@echo "🧬 Validating protobuf/OpenAPI contract drift..."
@@ -210,7 +216,7 @@ tenant-ingress-check:
 	@echo "Validating deployment-aware tenant ingress..."
 	python3 scripts/check_tenant_ingress_contract.py
 
-work-commit-check: fmt-check deterministic-commit-contract-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check
+work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check
 	@echo "✅ work-commit-check: deterministic architecture and commit guardrails passed"
 
 validated-commit-check: work-commit-check
@@ -456,7 +462,7 @@ integration-full: build-release
 	@echo "Stopping server..."
 	pkill -f proximadb-server || true
 
-# Cloud object-store emulator tier validation (TD-168/TD-173): Azurite/MinIO/fake-gcs
+# Cloud object-store emulator tier validation (TD-168/TD-173): Azurite/LocalStack/fake-gcs
 # via Docker. The exact path the qa-gate CI job runs (single source of truth).
 # Requires docker + aws/az CLIs + curl.
 cloud-emulator-test:
@@ -491,7 +497,7 @@ help:
 	@echo "  check              - Format + lint + test"
 	@echo "  hygiene-check      - Detect tracked backup/disabled/.victor artifacts"
 	@echo "  capability-matrix-check - Validate docs/_internal/roadmap/CAPABILITY_MATRIX.toml"
-	@echo "  deterministic-commit-contract-check - Validate zero-retry/test/docs guard wiring"
+	@echo "  deterministic-commit-contract-check - Validate retry-budget/test/docs guard wiring"
 	@echo "  tenant-path-check  - Enforce DrPathBuilder tenant path guard"
 	@echo "  tenant-ingress-check - Enforce deployment-aware tenant resolution at ingress"
 	@echo "  work-commit-check  - Fast deterministic architecture guard before commit/push"
@@ -614,3 +620,26 @@ tdd-precommit:
 	@$(MAKE) clippy
 	@$(MAKE) test-tdd-unit
 	@echo "✅ All TDD pre-commit checks passed!"
+
+# ── Documentation site (mkdocs + Material) ────────────────────────────────────
+# These targets mirror what CI runs; CI invokes the two commands inline rather
+# than calling `make`, so keep them in step (the docs-site workflow is
+# path-filtered on this Makefile so a drift here re-runs it).
+#
+# Note that `--strict` alone is NOT a gate: it only escalates WARNINGs, and
+# mkdocs ships link/nav checks at INFO — the `validation:` block in mkdocs.yml is
+# what makes a broken link or a page missing from the nav fail. The class mkdocs
+# cannot express at all (a link to an excluded file; a non-Markdown file served
+# as raw source) is checked by scripts/check_docs_site_coverage.py, which is the
+# merge-blocking half: it runs in ci.yml's `docs-validation`, while the strict
+# build runs in the separate Docs Site workflow and is advisory.
+.PHONY: docs-install docs-serve docs-build
+docs-install:
+	pip install -r requirements-docs.txt
+
+docs-serve: ## Serve the user-facing docs site locally on :8000
+	mkdocs serve
+
+docs-build: ## Build the docs site, failing on broken links
+	python3 scripts/check_docs_site_coverage.py
+	mkdocs build --strict

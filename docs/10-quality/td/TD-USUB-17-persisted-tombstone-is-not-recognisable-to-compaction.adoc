@@ -1,0 +1,57 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-17: A persisted spill tombstone is dead but NOT recognisable via `is_tombstone_at`, so compaction would not drop it
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-07, found while asserting — rather than assuming — that a synthesised tombstone round-trips as a tombstone.
+| Priority | **HIGH as a gate on slice 2c (compaction)**, inert before it. Reads are correct today; compaction is where the discrepancy bites.
+| Component | `crates/storage/proximadb-storage-common` (the system-columns Arrow/Parquet round-trip), `src/services/record_spill.rs` (flush synthesis), `crates/storage/proximadb-storage-common/src/pax_block.rs` (compaction's predicate)
+| Relates to | TD-USUB-1 (tombstone persistence), TD-USUB-11 (the precedent: the same round-trip silently dropped `valid_to_ns`), mandate #16a
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`flush` synthesises tombstones with `ProximaRecord::tombstone`, which sets
+`origin: Some("delete")` and `method: Some("tombstone")`. **The system-columns round-trip drops
+both.** Read back from the segment, the record has `origin == None` and `method == None`, while
+`valid_to_ns == Some(0)`, `created_at_ns` and `updated_at_ns` survive.
+
+Consequences:
+
+* `is_dead` is satisfied (it reads `valid_to_ns` via `is_visible_at`), so **every read boundary in
+  the spill store is correct** — suppression works, and that is what tombstone persistence needed.
+* `is_tombstone_at` is **not** satisfied: it additionally requires `origin == Some("delete")`. So a
+  persisted spill tombstone is *dead but not recognisably a tombstone*.
+* Production compaction identifies tombstones with `is_tombstone_at`
+  (`pax_block.rs`), so a compactor following that pattern would **not** drop these records. They
+  would accumulate in every rewritten segment.
+
+This is TD-USUB-11's failure mode recurring in the same serialization path: that one was `valid_to_ns`
+being silently dropped and resurrecting tombstones. The lesson there — do not assume a synthesised
+record's fields survive — is what produced this finding, since the test asserts the round-trip
+rather than trusting the constructor.
+
+== Current state, pinned
+
+`a_persisted_tombstone_round_trips_its_marker_and_tenant` now asserts the ACTUAL behaviour:
+`origin == None`, `method == None`, and `!is_tombstone_at(..)`. If the writer is later taught to
+carry those fields, that test fails loudly and points here — which is deliberate, so compaction's
+view cannot change silently.
+
+== How to apply
+
+Decide which layer owns it; do not do both.
+
+1. **Carry the fields.** Teach the system-columns writer/reader to round-trip `origin` and `method`.
+   This is the more general fix (any caller synthesising a record loses them today) and should be
+   checked against the PAX/Parquet schema's compatibility rules — it is a format change, so
+   mandate #8 applies: mixed-read-safe, version-marked, default-OFF until baked.
+2. **Or make compaction not depend on it.** Have the spill/compaction path treat `is_dead` as the
+   drop predicate for its own segments, and document why it differs from `is_tombstone_at`. Cheaper,
+   but it leaves two notions of "tombstone" in the codebase, which is how this discrepancy arose.
+
+Whichever is chosen, slice 2c must not land before it, or compaction will silently retain every
+tombstone it was meant to reclaim.

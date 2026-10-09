@@ -146,6 +146,56 @@ MATURITY_CONTRACT_RULES = [
             "This document states the *broad, durable vision*",
         ],
     },
+    {
+        # This operator-facing summary used to carry an independent maturity
+        # inventory that drifted far beyond the canonical support contract.
+        # Keep a small set of high-risk claims pinned here: the full matrix
+        # remains authoritative in docs/SUPPORTED_SURFACE.adoc.
+        "path": "docs/04-operations/production-readiness.adoc",
+        "required_substrings": [
+            "This status summary is subordinate to",
+            "**ORION graph operations** - 🟡 Beta",
+            "**Federated SQL** - 🟡 Beta",
+            "**Document CRUD/query/aggregation** - 🟡 Beta",
+            "**Security runtime** - 🟡 Beta",
+            "**Distributed cluster execution** - ⚠️ Experimental",
+            "**SWIFT / RAPTOR** - ⚠️ Experimental",
+            "**PULSAR / QUASAR** - ❌ Retired",
+        ],
+        "forbidden_substrings": [
+            "**ORION** - ✅ Production Ready",
+            "**SQL Query** - ✅ Production Ready",
+            "**Document Query** - ✅ Production Ready",
+            "**Graph Query** - ✅ Production Ready",
+            "**JWT Authentication** - ✅ Production Ready",
+            "**LangChain** - ✅ Production Ready",
+            "**Cluster Mode** - ⚠️ Beta",
+            "**PULSAR** - ❌ Experimental",
+            "**SWIFT** - ❌ Deprecated",
+        ],
+    },
+    {
+        # Keep a historical measurement distinct from the current PAX recall
+        # acceptance floor; they come from different paths and evidence.
+        "path": "README.adoc",
+        "required_substrings": [
+            "~97% (historical internal HNSW reference; not an SLA",
+        ],
+        "forbidden_substrings": [
+            "~97% (HNSW, M=32; floor 0.975",
+        ],
+    },
+    {
+        # The shipped Docker config enables unified mode, so the maintained
+        # Compose example must expose that port plus pgwire and must not hide
+        # the baked config behind a nonexistent host directory.
+        "path": "deploy/docker/docker-compose.yml",
+        "required_substrings": [
+            '"5678:5678"  # Unified REST + gRPC + Arrow Flight',
+            '"5433:5433"  # PostgreSQL wire protocol',
+            "../../config/config.toml:/config/config.toml:ro",
+        ],
+    },
     # REST /api/v3 is REMOVED — the document-ingest handler lives canonically at
     # /api/v2/collections/{id}/documents (folded from the former v3 surface). These
     # checks ensure v3 stays removed and the handler stays at v2.

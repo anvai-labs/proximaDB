@@ -324,9 +324,9 @@ cargo test --test raptor_integration
 
 == References
 
-* link:../../../../../../docs/technical/storage_engine_layouts.adoc[Storage Engine Design Overview]
-* link:p2_matrix_tests.rs[P² Matrix Implementation]
-* link:boundary_spillover_tests.rs[Boundary Detection Algorithm]
+* link:../../../../docs/_internal/archive/technical/storage_engine_layouts.adoc[Storage Engine Design Overview]
+* P² Matrix Implementation
+* Boundary Detection Algorithm
 * link:adaptive_pxk.rs[Adaptive P×K Coverage Formula]
 
 ---

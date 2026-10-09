@@ -2380,6 +2380,20 @@ fn lower_scalar_function(
     scope: &Scope,
     ctx: &mut LoweringCtx,
 ) -> Result<Expr, FrontendError> {
+    // TD-187: a windowed call (`… OVER (…)`) is NOT a plain scalar function —
+    // lowering it here would silently DROP the window spec (partition/order/
+    // frame) and produce a plain `Expr::FuncCall`, which the DataFusion-side
+    // fallback either mis-evaluates (for a name that happens to also be a
+    // registered scalar builtin) or declines on (for LAG/LEAD/RANK/etc.,
+    // which aren't registered as scalars) — decline unconditionally instead,
+    // every window function needs DataFusion's real window executor, and
+    // `ctx.sql()` reaches it once this frontend backs off.
+    if f.over.is_some() {
+        return Err(FrontendError::Unsupported(
+            "window function (requires DataFusion's window executor)".into(),
+        ));
+    }
+
     let raw_name = f.name.to_string();
     if matches!(
         raw_name.to_uppercase().as_str(),
@@ -2445,6 +2459,18 @@ fn lower_aggregate_call(
     f: &sqlparser::ast::Function,
     scope: &Scope,
 ) -> Result<AggregateExpr, FrontendError> {
+    // TD-187: an aggregate-named function used as a WINDOW aggregate
+    // (`avg(x) OVER (...)`) is not a plain GROUP BY aggregate — lowering it
+    // here would drop the window spec and (best case) fail an unrelated
+    // scope check, or (worst case) silently produce a whole-table aggregate
+    // instead of a per-partition one. Decline unconditionally so it falls
+    // through to DataFusion's real window executor, same reasoning as the
+    // scalar-function guard in `lower_scalar_function`.
+    if f.over.is_some() {
+        return Err(FrontendError::Unsupported(
+            "window aggregate (requires DataFusion's window executor)".into(),
+        ));
+    }
     let name = f.name.to_string().to_uppercase();
     // Detect DISTINCT and the argument(s).
     let (args, distinct) = match &f.args {
@@ -4403,6 +4429,41 @@ mod tests {
             Expr::FuncCall { name, .. } => assert_eq!(name, "some_udf"),
             other => panic!("expected FuncCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn window_function_declines_instead_of_dropping_the_over_clause() {
+        // TD-187: lowering a windowed call here (rather than declining) would
+        // silently DROP the `OVER (...)` clause and produce a plain scalar/
+        // aggregate `Expr` — which either mis-evaluates (for a name that
+        // happens to also be a registered scalar/aggregate builtin) or
+        // declines further downstream by luck (for names like LAG that
+        // aren't registered). Both `lower_scalar_function` (LAG/LEAD/RANK/…)
+        // and `lower_aggregate_call` (AVG/SUM/COUNT/MIN/MAX used as a window
+        // aggregate) must decline unconditionally whenever `f.over.is_some()`,
+        // so the caller always falls through to DataFusion's real window
+        // executor via the `ctx.sql()` fallback.
+        assert!(
+            lower_sql(
+                "SELECT id, age - lag(age) OVER (ORDER BY id) AS delta FROM users",
+                &catalog()
+            )
+            .is_err(),
+            "a bare LAG window call must decline, not silently drop OVER"
+        );
+        assert!(
+            lower_sql(
+                "SELECT id, avg(age) OVER (PARTITION BY id ORDER BY id) AS moving_avg FROM users",
+                &catalog()
+            )
+            .is_err(),
+            "an aggregate-named function used as a window aggregate must decline too"
+        );
+        // No regression: the same functions used WITHOUT a window clause still lower.
+        assert!(
+            lower_sql("SELECT id, avg(age) FROM users GROUP BY id", &catalog()).is_ok(),
+            "a genuine GROUP BY aggregate (no OVER) must keep lowering"
+        );
     }
 
     #[test]

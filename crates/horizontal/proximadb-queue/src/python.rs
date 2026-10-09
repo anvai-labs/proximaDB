@@ -196,7 +196,11 @@ impl PyConsumer {
     }
 }
 
-#[pyclass(name = "Message", module = "proximadb_queue_embedded._native")]
+#[pyclass(
+    name = "Message",
+    module = "proximadb_queue_embedded._native",
+    from_py_object
+)]
 #[derive(Clone)]
 pub struct PyMessage {
     #[pyo3(get)]
@@ -211,7 +215,11 @@ pub struct PyMessage {
     pub attempt_count: u32,
 }
 
-#[pyclass(name = "MessageReceipt", module = "proximadb_queue_embedded._native")]
+#[pyclass(
+    name = "MessageReceipt",
+    module = "proximadb_queue_embedded._native",
+    from_py_object
+)]
 #[derive(Clone)]
 pub struct PyMessageReceipt {
     #[pyo3(get)]

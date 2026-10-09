@@ -1,8 +1,8 @@
 //! File-based locking for multi-process coordination
 //!
 //! This module provides cross-process file locking using advisory locks.
-//! On Unix systems, it uses `flock()` via the standard library.
-//! On Windows, it uses `LockFileEx()`.
+//! On Unix systems, it uses `flock()`. The legacy guard does not implement
+//! exclusion on non-Unix platforms; strict conditional publication rejects them.
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
@@ -167,6 +167,99 @@ pub struct FileLockManager {
 }
 
 impl FileLockManager {
+    /// Conditionally replace one local file while holding the existing stable
+    /// directory lock. `None` means absent, not an empty file. Returns false on
+    /// lock contention or byte mismatch, and never overwrites on either outcome.
+    /// Optional guards compare sibling files under that same lock before replacing
+    /// the target. Guards are read-only; this is not a multi-file transaction.
+    ///
+    /// Every writer must cooperate with this lock; exclude legacy writers during
+    /// rollout. This is byte equality, not ABA-proof ownership: domain records
+    /// must carry a non-reused revision/incarnation where that guarantee is needed.
+    /// Rename is the publication boundary; successful return also requires file
+    /// and containing-directory sync. An error after rename is indeterminate.
+    ///
+    /// Async adapters must run this WHOLE function in one blocking task: dropping
+    /// an async caller must not drop the lock before a queued filesystem operation
+    /// finishes. No network-filesystem or power-loss guarantee is inferred here.
+    pub fn compare_exchange_file(
+        path: &Path,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        guards: &[(&Path, Option<&[u8]>)],
+    ) -> io::Result<bool> {
+        if !cfg!(unix) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "conditional file publication requires Unix advisory locking",
+            ));
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "conditional file requires a parent directory",
+                )
+            })?;
+        for candidate in std::iter::once(path).chain(guards.iter().map(|(path, _)| *path)) {
+            if candidate.parent() != Some(parent) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "conditional guards must share the target parent directory",
+                ));
+            }
+            let name = candidate.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "conditional file requires a filename",
+                )
+            })?;
+            if name.to_str().is_some_and(|name| {
+                name.eq_ignore_ascii_case("access.lock") || name.eq_ignore_ascii_case("leader.lock")
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot replace or guard a coordination lock inode",
+                ));
+            }
+        }
+        let _guard = match Self::acquire(parent, AccessMode::Exclusive) {
+            Ok(guard) => guard,
+            Err(FileLockError::WouldBlock { .. }) => return Ok(false),
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        for (candidate, expected) in std::iter::once((path, expected)).chain(guards.iter().copied())
+        {
+            match std::fs::symlink_metadata(candidate) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "conditional target and guards must be regular files, not symlinks",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let actual = match std::fs::read(candidate) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if actual.as_deref() != expected {
+                return Ok(false);
+            }
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(replacement)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|e| e.error)?;
+        File::open(parent)?.sync_all()?;
+        Ok(true)
+    }
+
     /// Create a lock manager and acquire the lock without waiting.
     ///
     /// This will return immediately if the lock cannot be acquired.
@@ -194,13 +287,31 @@ impl FileLockManager {
         let lock_file = data_path.join(mode.lock_file_name());
 
         // Create or open the lock file
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = options
             .open(&lock_file)
             .map_err(FileLockError::CreateFailed)?;
+        let metadata = file.metadata().map_err(FileLockError::CreateFailed)?;
+        if !metadata.is_file() {
+            return Err(FileLockError::InvalidPath(
+                "lock must be a regular file".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Err(FileLockError::InvalidPath(
+                    "lock must not have hard links".into(),
+                ));
+            }
+        }
 
         // Acquire the lock based on mode and blocking preference
         let lock_result = match mode {
@@ -212,21 +323,19 @@ impl FileLockManager {
 
         match lock_result {
             Ok(()) => {
-                // Write PID to lock file for debugging
-                let mut file_for_write = OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&lock_file)
-                    .map_err(FileLockError::CreateFailed)?;
-
                 let pid = std::process::id();
                 let owner = LockOwner {
                     pid,
                     mode: mode.to_string(),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                 };
-                let _ = serde_json::to_writer(&mut file_for_write, &owner);
-                let _ = writeln!(file_for_write);
+                // Only exclusive owners mutate diagnostics, through the locked
+                // descriptor. Reopening the pathname could truncate a different
+                // inode, and shared readers must not race each other's writes.
+                if mode != AccessMode::SharedRead && file.set_len(0).is_ok() {
+                    let _ = serde_json::to_writer(&mut file, &owner);
+                    let _ = writeln!(file);
+                }
 
                 tracing::debug!(
                     "Acquired {} lock on {} (PID: {})",

@@ -28,12 +28,12 @@ Co-design note: this also removes a silent divergence — with an empty registry
 now derives the SCHEME default (s3:// → S3 8 MiB; **file:// → LOCAL 1 MiB — the DEFAULT
 deployment's k ×4 on new compaction segments, reader nprobe ≈ ×2, self-adapting via each
 segment's stored k_c**) where it previously hard-coded CLOUD (4 MiB), which is exactly
-what the reader already assumed for that path. Intended but UNMEASURED at the new
-operating point: the SIFT-1M acceptance geometry was measured at the OLD k. Rollback
-levers today: `PROXIMADB_DISK_CLASS=hdd` (pod-wide) or per-location TOML
-`io_budget.disk_class = "hdd"`. **Required follow-up before qa promotion:** a local-bed
-compaction A/B (old-CLOUD-k vs new-LOCAL-k, acceptance pair first) — full narration in
-the TD-IVF-4 Resolution. New segments only; cell counts are per-segment
+what the reader already assumed for that path. **MEASURED 2026-09-03 (`iobudget2_file_geometry_sift1m`)**: object-cold bytes/q −51.1%,
+GETs/q −13.3%, recall 0.9835→0.9794 — which FAILED the then-0.98 floor, and the product
+owner accepted the trade: the recall floor drops 0.98 → 0.975 repo-wide (product decision
+2026-09-03), making the operating point shippable. Rollback levers remain
+(`PROXIMADB_DISK_CLASS=hdd` pod-wide or per-location TOML `disk_class = "hdd"`). Full
+tables in the TD-IVF-4 Resolution and `IOBUDGET2_CAMPAIGN_2026_09_03.adoc`. New segments only; cell counts are per-segment
 self-describing metadata (no format change, mixed-read-safe by construction); cross-host
 byte-determinism is a pre-existing config-driven class (cf. `PROXIMADB_IVF_K`).
 
@@ -61,21 +61,26 @@ flag wired to the constructor param at all three harness construction sites, and
 OFF arm now FAILS FAST if the gate leaks into its server env (the original defect class —
 an operator-exported gate silently engaging the "baseline").
 
-**Flip checklist (execute mechanically when the evidence exists):**
+**Flip checklist — steps 1 and 3 DONE 2026-09-03 (`read_strategy_chooser_sift1m_minio`):**
+the A/B re-ran on dataserver2-local MinIO with the fixed flag; engagement attested by the
+wiring print (x3 ON, x0 OFF) and a −41.6% object-cold GET delta (21.95 → 12.82) with
+byte-identical recall; the ON arm passes every gate the OFF arm fails; the warm-phase
+(cache-present) pair degrades nothing (−29.3% GETs, −6.9% p50) — the cache-tier evidence
+the estimator's ledger note names. The ledger claim exists. One logging follow-up: the
+`pax.range_estimator` tracing target emitted nothing at info level on the 2b binary —
+route it to a visible level in the flip PR so future runs self-attest.
 
-. Re-run the A/B on the SIFT-1M bed WITH the flag (both arms must pass their gates;
-   verify engagement via `pax.range_estimator` observe lines in the server log).
-. Add the ledger claim to `BENCHMARK_EVIDENCE.toml` (none exists for the chooser today).
-. Satisfy the cache-tier evidence the estimator's own ledger note names
-   ("default-OFF pending cache-tier evidence") — TD-SEARCH-3's estimator A/B
-   (GETs −24.11%, p50 −31.51%, recall 0.9800 parity) is real but explicitly gated on it,
-   and the 3.3M sibling claim narrowly failed the 1.10 peak-RSS gate (1.10209).
+**Flip checklist — the two steps the flip PR executes (this TD records them; execution is gated on product review of the campaign claim):**
+
+. (DONE — see above) Re-run the A/B with the flag; engagement attested; both-arm gate
+   outcomes recorded; ledger claim added.
+. (DONE — see above) Cache-tier paired evidence satisfied by the warm-phase pair.
 . Re-tier the env row (`ENV_GATE_REGISTRY.adoc:250`, tier `eval`) to a kill-switch named
    for what it DISABLES (`PROXIMADB_STORAGE_READ_STRATEGY_CHOOSER_DISABLE`), keeping the
    old name as deprecated alias — copy the `PROXIMADB_PAX_READ_COARSE_PROBE` flip shape.
 . Update the one default-OFF assertion: `segment_format.rs` "unset gate preserves
    behavior" test, and re-run the qa-gate recall suites (they assert recall only — the
-   chooser is byte-identical, GET-count-neutral on file:// — so they are expected green).
+   chooser is byte-identical, so they are expected green).
 
 == Verdict 3 — the AZURE profile default raise (4→16 MiB) is REFUSED on guard strikes
 

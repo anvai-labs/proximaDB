@@ -19,6 +19,7 @@ mod comprehensive_api_tests {
     fn create_test_collection_config(name: &str) -> CollectionConfig {
         CollectionConfig {
             name: name.to_string(),
+            embedding_config: None,
             dimension: 128,
             distance_metric: Some(DistanceMetric::Cosine as i32),
             storage_engine: Some(StorageEngine::Sst as i32),

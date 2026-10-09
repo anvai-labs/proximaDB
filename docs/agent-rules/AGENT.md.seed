@@ -10,7 +10,7 @@ for `AGENT.md` instead of `AGENTS.md`. The canonical shared index remains
 2. Read the model-specific guide when available:
    - Anthropic/Claude agents: `CLAUDE.md`
    - Gemini agents: `GEMINI.md`
-3. For TD/ADR filing, use `docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc`.
+3. For TD/ADR filing, use `docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc`. Before IMPLEMENTING a filed TD/ADR, verify its load-bearing premises against current source (including whether the mechanism it says to build already exists) and correct the document in the same PR when one is wrong.
 
 ## Mandatory Worktree Workflow
 

@@ -27,6 +27,15 @@ pub enum QueueError {
     #[error("queue persistence failure: {0}")]
     Persistence(String),
 
+    /// Conditional publication may have applied; this consumer must stop.
+    /// A failed response is not evidence that a durable ACK was rejected.
+    #[error("queue publication outcome indeterminate; close consumer and recover: {0}")]
+    PublicationIndeterminate(String),
+
+    /// Typed absence; permission failures and unavailable storage are NOT absence.
+    #[error("queue path not found: {0}")]
+    NotFound(String),
+
     /// Consumer lease conflict — another instance owns the partition.
     #[error("lease conflict on topic={topic}, partition={partition}: held by {holder}")]
     LeaseConflict {

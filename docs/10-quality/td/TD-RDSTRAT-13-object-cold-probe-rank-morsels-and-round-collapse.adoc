@@ -182,3 +182,77 @@ transfer) — explicitly out of this TD's scope, recorded as follow-up.
 |7 |Wave round growth from +1 footer range |Footer at index 0; extra round only when n ≡ 0 (mod width); visible in `fetch_rounds`
 |8 |Registry drift |No new gate; the `PROXIMADB_SEARCH_MORSEL_DEGREE` row's semantics widened with co-owner
 |===
+
+== PR-B 2a attribution table (MEASURED — dataserver2 disk bed, 2026-09-01)
+
+Clean single-segment bed (30 cells, 370k probed rows, 21.95 GETs/q, 58.5 MB/q, recall .9835,
+p50 350.6 ms, ~21k vec/s ingest). The four PR-B timers attribute the tail:
+
+|===
+|Stage |µs/query |Share of tail
+|Rehydrate (top-k rehydration pass) |168,347 |~48%
+|Region-B survivor fetch + SQ8 rerank |88,767 |~25%
+|Region-D top-k OID fetch + decode |19,743 |~6%
+|Probe rank (C2 timer, measured separately) |~50,000 |—
+|Cascade umbrella (all-inclusive) |350,865 |sum vs umbrella ≈ 96% attributed
+|===
+
+**GATE MET** — three stage timers + the separately-measured rank attribute ~92% of the ~300 ms
+tail (stage sum 276.9 ms; umbrella 350.9 ms covers rank + Region-A/A0/footer + hits build in the
+remainder). The attribution RE-RANKS the 2b candidates versus the exploration's expectation:
+
+1. **Rehydration (168 ms — #1, not Region-D fetch):** the duplicate top-k pass (metadata +
+   header/footer + whole-block fetches + full FlatRow decode) is the single largest tail term.
+   Fix: layout pass-through (thread the cascade's parsed size/header/footer) + wanted-rows-only
+   materialization.
+2. **Region-B (89 ms — #2):** fetch + rerank of 10k survivors. Fix: spawn_blocking/parallel
+   scoring if the fetch/rerank split shows compute domination; else coalescing-shape work.
+3. **Region-D fetch+decode (20 ms — #3, as-built):** the sequential v4 RG-chunk fetch is real
+   but small at this geometry — wave only if the post-1+2 profile still shows it.
+
+Result-identity/GET/bytes parity gates unchanged for every 2b candidate. Raw evidence:
+`dataserver2:/home/vsingh/rdstrat13/runs/tail_attrib/` (result.json + log).
+
+== PR-B 2b measured (2b-1 cache-first rehydrate + 2b-2 waved Region-D) — disk A/B
+
+Same bed shape, same protocol, 2a binary vs 2b binary on dataserver2: p50 350.6 → 343.8 ms
+(−2%); rehydrate 168.3 → 165.9 ms; region-D 19.7 → 17.9 ms; region-B 88.8 → 83.4 ms; GETs
+21.95 both; bytes 58.5 MB both; recall .9835 both; result-identity IDENTICAL. The
+IO-structure changes (−3 IO ops/segment/query; serial RG chunk GETs → one wave) are
+**RTT-levers**: near-neutral on local disk, and their object-store value is the removed
+serial-RTT terms (~top-k × RTT for region-D, 3 × RTT for rehydrate). The disk p50 residual is
+now precisely: region-B 83 ms (bytes-bound SQ8 survivor fetch — recall-gated pool-sizing
+lever), rehydrate 166 ms (block fetch + full-record decode — wanted-rows decode lever), rank
+48 ms, cascade/REST remainder ~46 ms.
+
+== S3/MinIO integration on the 2b binary (dataserver2 localhost) — 2026-09-02
+
+The same 2b release binary, run against MinIO (S3 API, localhost:9000) from dataserver2 with
+the full harness: clean single-segment bed (30 cells, 1M rows), **object_cold p50 = 586.1 ms,
+21.95 GETs/q, 58.5 MB/q, recall .9835** — a sub-second S3 cold query at strict parity (identity
+hashes equal to the disk runs). Attribution over S3: cascade umbrella 562.9 ms; rehydrate
+318.4 ms (#1 — RG-body block fetches over HTTP + full-record decode), region-B 146.0 ms, region-D
+23.2 ms, rank 44.9 ms (~95% attributed). The object-store suite (8/8) — including
+`armed_compaction_on_object_store_preserves_all_records` with its structural duplicate-detector
+assertion — passed against MinIO with the fix binary, verifying TD-COMPACT-13's retirement over
+the real S3 path. Deployment note: the suite requires the registry-documented
+`PROXIMADB_S3_ENDPOINT`/`PROXIMADB_S3_FORCE_PATH_STYLE` gates for the engine AND
+`AWS_ALLOW_HTTP=true` for the system-catalog's object_store client (plain HTTP).
+
+== Chooser A/B (Mac → dataserver2 MinIO @ 5.5 ms RTT, same binary, one env flip) — [SUPERSEDED 2026-09-03 by TD-IOBUDGET-2 / #1827: this A/B ran its ON arm un-engaged (the harness popped the gate and no CLI wire existed); do not cite as flip evidence — the corrected campaign is `read_strategy_chooser_sift1m_minio`]
+
+|===
+|Arm |p50 |GETs/q |bytes/q |region-B |region-D |rehydrate |cascade
+|OFF (fixed 8 MiB policy) |4271.0 |20.05 |62.1 MB |263.4 ms |15.2 ms |186.9 ms |462.9 ms
+|ON (16 MiB knee enumerated) |4193.7 |20.05 |62.1 MB |255.6 ms |16.2 ms |146.1 ms |413.8 ms
+|===
+
+Recall .9864 both; same 1-segment/30-cell bed. Verdict: **chooser ON is a modest
+tail win (rehydrate −22%, cascade −10.6%, p50 −1.8%) at zero GET/byte cost — but the 16 MiB
+GET knee does NOT bind on the S3/MinIO 8 MiB baseline at this geometry**: GETs/q are unchanged
+(the knee's 10.08→7.66 GET gain was measured on Azure's 4 MiB planner). The knee lever therefore
+applies to the **Azure default target** (raise 4 → the measured 16 MiB knee = −24% GETs at
+recall parity, per TD-SEARCH-3's own sweep) — a separate Azure-side change with the wire
+evidence already committed. The chooser default flip for object stores is evidence-backed as a
+modest, free tail win; the Region-A probe-cell GETs (11/q — the dominant GET population) are
+untouched by range caps by design (each cell is a distinct byte range).

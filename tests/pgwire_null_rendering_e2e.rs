@@ -207,8 +207,11 @@ async fn pgwire_renders_sql_null_over_simple_query() {
     //     in-memory sort path, which is already null-aware; the relational
     //     pipeline's own ORDER BY lowering is a separate path and out of scope
     //     for this NULL-*rendering* fix.)
+    // TD-185b: the sort column must be in the projection — the legacy reader
+    // orders only projected columns and now FAILS CLOSED on an unresolvable
+    // ORDER BY instead of silently returning storage order.
     let ordered_rows = client
-        .simple_query(&format!("SELECT id FROM {t} ORDER BY name ASC"))
+        .simple_query(&format!("SELECT id, name FROM {t} ORDER BY name ASC"))
         .await
         .expect("SELECT ORDER BY");
     let ordered_ids: Vec<String> = col_ordered(&ordered_rows, "id")

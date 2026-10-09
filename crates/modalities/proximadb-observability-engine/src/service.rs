@@ -508,21 +508,20 @@ impl ObservabilityService {
                     .attributes
                     .iter()
                     .filter_map(|(k, v)| {
-                        v.value.as_ref().and_then(|val| match val {
-                            crate::proto::proximadb_v1::sql_value::Value::StringValue(s) => {
-                                Some((k.clone(), s.clone()))
+                        // PERSISTED payload: bytes render as deterministic
+                        // HEX — the shared fn's lossy-UTF-8 spelling is for
+                        // the filter-matching path and would write U+FFFD
+                        // replacement chars irreversibly into stored spans.
+                        // Other non-null scalars (incl. Jsonb JSON text)
+                        // render through the shared fn (both were silently
+                        // dropped by the old `_` wildcard); null/unset and
+                        // containers still drop, this path's policy.
+                        match &v.value {
+                            Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(b)) => {
+                                Some((k.clone(), proximadb_kernel::hex_lower(b)))
                             }
-                            crate::proto::proximadb_v1::sql_value::Value::Int64Value(i) => {
-                                Some((k.clone(), i.to_string()))
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::NumberValue(f) => {
-                                Some((k.clone(), f.to_string()))
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::BoolValue(b) => {
-                                Some((k.clone(), b.to_string()))
-                            }
-                            _ => None,
-                        })
+                            _ => crate::query::sql_scalar_to_string(v).map(|s| (k.clone(), s)),
+                        }
                     })
                     .collect();
 

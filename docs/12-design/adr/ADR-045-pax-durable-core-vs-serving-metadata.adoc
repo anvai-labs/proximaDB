@@ -2,8 +2,9 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **amended by ADR-094 (2026-09-21)**: the "Layer A ships 1:1 to Iceberg" claim is scoped per-modality (see the amendment in Decision)
 |Date|2026-06-30
+|Amended by|ADR-094 (unified storage substrate and compute seam)
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-010 (refines its Layer-2 + Iceberg-integration sections), ADR-020 (WAL authority), ADR-025 (deletion vectors), ADR-027 (PAX single internal format), ADR-033 (dual-path), ADR-034 (read-path GET depth)
 |Supersedes|—
@@ -41,6 +42,31 @@ Three adversarially-verified findings drive the decision:
 Stratify the PAX segment into two layers with different durability/rebuild contracts.
 
 **Layer A — durable open core** (the source of truth; ships 1:1 to Iceberg):
+
+[IMPORTANT]
+====
+**Amendment (ADR-094, 2026-09-21) — "ships 1:1 to Iceberg" requires a Parquet-encoded
+Layer A, and therefore holds per-modality, not universally.**
+
+Premise 3 above is correct that Iceberg needs only three filesystem operations, so a
+durable core *can* be an Iceberg data file. But the Iceberg spec also constrains data files
+to **Avro, ORC or Parquet**. A `PBLK`/`PXH1`-encoded Layer A is none of those, so it cannot
+literally be an Iceberg data file — it would need conversion, which is exactly the 1:1
+property this clause claims.
+
+ADR-094 resolves this by making the encoding follow modality:
+
+* **Relational-only tables** — Layer A is **Parquet-encoded**, carrying PAX layout
+  discipline (MVCC columns, tenant column, per-column zone maps, row-group geometry). The
+  1:1 Iceberg claim then holds literally, and there is no second copy.
+* **Vector / multimodal tables** — Layer A stays `PBLK`/`PXH1`, because the ~100×
+  random-access advantage is decisive there (ADR-033) and the co-located vector + filter
+  stripes have no faithful Parquet representation. For this arm, "ships to Iceberg" means
+  *converted on export*, not 1:1.
+
+The Layer A/B split itself, and the inviolable co-location of filter and vector stripes in
+Layer A, are unchanged.
+====
 
 * The columnar stripes — including the vector embedding stripes **and** the co-located RaBitQ/SQ8
   rerank columns (the ANN cascade).

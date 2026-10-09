@@ -1,6 +1,6 @@
 {
   "name": "@anvailabs/proximadb-client",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "TypeScript/Node.js SDK for ProximaDB vector database",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -56,7 +56,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^4.1.11",
     "openapi-typescript": "7.13.0",
     "typescript": "^5.3.0",
     "vitest": "^4.1.7",

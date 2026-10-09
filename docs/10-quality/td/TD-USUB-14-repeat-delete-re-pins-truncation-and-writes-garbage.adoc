@@ -1,0 +1,62 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-14: A DELETE inserts a tombstone without checking the oid exists, so repeats re-pin truncation and persist garbage
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-07 by adversarial review of the tombstone-persistence change, which made the consequence durable.
+| Priority | **LOW** for safety (the direction is fail-closed), **MEDIUM** for cost once the spill gate is on: repeated no-op DELETEs now write one garbage-bearing segment per flush, and every scan reads every segment.
+| Component | `src/services/record_spill.rs` (`delete_record`, `flush`, `min_unflushed_lsn`)
+| Relates to | TD-USUB-1 (tombstone persistence), mandate #1
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`delete_record` inserts a tombstone whenever the partition has any segment, with **no check that
+the oid exists in one**:
+
+[source,rust]
+----
+if has_segments {
+    self.tombstones.insert(key.oid.clone());
+}
+----
+
+Two consequences, both reachable single-threaded with no race:
+
+**1. `min_unflushed_lsn` re-pins for an already-durable delete.** After a delete is persisted and
+cleared, a *repeat* DELETE of the same oid — an idempotent client retry, a WAL-replayed delete, or a
+DELETE matching nothing — re-inserts a tombstone, and the function refuses again. That is
+conservative (it retains more WAL, never less), so it is not unsafe. But it means the claim
+"present in the set ⇒ not yet durable" holds only in the direction that matters, not as a
+biconditional. The code comment and TD-USUB-1 now say so; the original wording did not.
+
+NOTE, added 2026-10-08: this TD examined only the *safe* side of that biconditional. The
+**dangerous** side — absent from the set while NOT durable — is also reachable, via an orphan left
+by a segment write that failed after the object landed, and it resurrects a deleted row under slice
+2b. That is **TD-USUB-18**, filed separately and mitigated fail-closed. Do not read this entry's
+"conservative, so not unsafe" as covering the whole predicate.
+
+**2. A DELETE of a nonexistent oid now produces durable garbage.** Before persistence, a spurious
+tombstone was an in-memory entry that a purge cleared. Now the next flush writes a synthesised
+tombstone record for a row that never existed, and does so once per flush. `merged_records` reads
+EVERY segment on EVERY scan (its own doc says so), so repeated no-op DELETEs inflate both storage
+and read cost without bound.
+
+Note the shipped tests end in this state: `a_tombstone_only_flush_persists_and_suppresses_across_instances`
+finishes with a `!delete_record("gone")` assertion, which leaves a spurious tombstone behind.
+
+== How to apply
+
+1. Only insert a tombstone when the oid is actually suppressible — i.e. when a segment holds a live
+   copy. The probe `delete_record` already performs for its return value answers exactly that
+   question; the insert currently happens *before* it, inside the guarded block, so the ordering
+   has to change rather than just the condition. Be careful: the insert is inside the guard
+   deliberately (TD-USUB-13), so moving it must preserve that the decision and the act are one step.
+2. If the probe is too expensive to take on the delete path, the alternative is to let flush drop
+   tombstones for oids no segment holds — but that requires reading the segments at flush time,
+   which is worse.
+3. Then tighten `min_unflushed_lsn`'s comment from "conservatively treated as not durable" to the
+   biconditional, and assert the repeat-DELETE case in a test.

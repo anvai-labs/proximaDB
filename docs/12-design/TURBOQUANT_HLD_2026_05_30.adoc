@@ -266,7 +266,7 @@ Each phase ships independently behind the feature flag. P5–P7 have no dependen
 * link:EMBEDDING_PRECISION_LLD_2026_05_22.adoc[EMBEDDING_PRECISION_LLD_2026_05_22] — Q12, Q14 (codebook lifecycle, hardware caps).
 * link:COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20.adoc[COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20] — `ExecutionRoute` cataloging.
 * link:adr/ADR-004-unified-explain-contract.adoc[ADR-004] — EXPLAIN contract.
-* link:adr/ADR-011-filtered-ann-routing.adoc[ADR-011] — filtered ANN routing policy.
+* ADR-011 — filtered ANN routing policy.
 * TurboQuant paper: https://arxiv.org/abs/2504.19874
 * RaBitQ paper: https://arxiv.org/abs/2405.12497
 * Reference implementation (NOT lifted): https://github.com/RyanCodrai/turbovec

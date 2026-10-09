@@ -8,7 +8,7 @@ branches.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -226,9 +226,7 @@ def test_parse_and_format_timestamp():
     assert dt.tzinfo is None
     naive = TimeSeriesRepository._parse_timestamp(datetime(2026, 1, 1, 5))
     assert naive == datetime(2026, 1, 1, 5)
-    aware = TimeSeriesRepository._parse_timestamp(
-        datetime(2026, 1, 1, 5, tzinfo=timezone.utc)
-    )
+    aware = TimeSeriesRepository._parse_timestamp(datetime(2026, 1, 1, 5, tzinfo=UTC))
     assert aware.tzinfo is None
     formatted = TimeSeriesRepository._format_timestamp(datetime(2026, 1, 1))
     assert formatted.endswith("Z")

@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// Convert a v1 SqlValue to the canonical ProximaValue.
 /// Magic prefix for JSONB-tagged BytesValue. Two bytes not valid in UTF-8
 /// so they will never appear at the start of raw binary data from users.
-const JSONB_MAGIC: &[u8] = b"\xff\xfeJSNB";
+const JSONB_MAGIC: &[u8] = proximadb_data_model::JSONB_LEGACY_MAGIC;
 
 /// Used at WAL/gRPC boundary deserialization so the rest of the system
 /// works entirely with ProximaValue.
@@ -35,6 +35,9 @@ pub fn sql_value_to_proxima_value(v: proximadb_proto::proximadb_v1::SqlValue) ->
                 ProximaValue::Binary(b)
             }
         }
+        // types.proto tag 9: JSONB by declaration — canonical decode-or-binary
+        // via the shared helper so a value compares equal across read paths.
+        Some(Value::JsonbValue(b)) => ProximaValue::from_jsonb_or_binary(&b),
         Some(Value::ObjectValue(obj)) => ProximaValue::Map(
             obj.fields
                 .into_iter()
@@ -88,10 +91,24 @@ pub fn proxima_value_to_sql_value(v: ProximaValue) -> proximadb_proto::proximadb
             Value::StringValue(json.to_string())
         }
         ProximaValue::Jsonb(json) => {
-            // JSONB stored as BytesValue with magic prefix — preserves binary-optimized semantics
-            let mut bytes = JSONB_MAGIC.to_vec();
-            bytes.extend_from_slice(json.to_string().as_bytes());
-            Value::BytesValue(bytes)
+            // TD-PROTO-2 round 4: emit the declared tag-9 variant with the
+            // canonical MessagePack payload — the legacy tag-8 magic+JSON-text
+            // encoding made the canonical decode, structured filters, and every
+            // JsonbValue render arm unreachable for engine search responses.
+            // The tag-8 magic form is still DECODED (below) for results
+            // serialized before this change.
+            match ProximaValue::to_jsonb_vec(&json) {
+                Ok(bytes) => Value::JsonbValue(bytes),
+                Err(_) => {
+                    // Preserve the established fallback encoding under its
+                    // legacy tag. Putting magic+JSON bytes under tag 9 would
+                    // violate tag 9's MessagePack contract and decode as
+                    // opaque binary.
+                    let mut bytes = JSONB_MAGIC.to_vec();
+                    bytes.extend_from_slice(json.to_string().as_bytes());
+                    Value::BytesValue(bytes)
+                }
+            }
         }
         ProximaValue::Null => {
             return SqlValue { value: None };
@@ -667,6 +684,22 @@ mod score_vector_tests {
     //! R-0 tests for the ScoreVector promotion into OptimizedSearchRecord.
     //! See roadmap/RANKING_FRAMEWORK_SPEC_2026_05_23.md §6.1.
     use super::*;
+
+    #[test]
+    fn jsonb_writes_the_declared_tag9_variant_on_search_results() {
+        let document = serde_json::json!({"kind": "fact", "active": true});
+
+        let sql = proxima_value_to_sql_value(ProximaValue::Jsonb(document.clone()));
+
+        let Some(proximadb_proto::proximadb_v1::sql_value::Value::JsonbValue(bytes)) = sql.value
+        else {
+            panic!("JSONB must use SqlValue.jsonb_value (tag 9)");
+        };
+        assert_eq!(
+            ProximaValue::from_jsonb_or_binary(&bytes),
+            ProximaValue::Jsonb(document)
+        );
+    }
 
     #[test]
     fn record_default_has_no_score_vector() {

@@ -29,11 +29,21 @@ refresh_interval_seconds = 30
 # Metadata storage (collection definitions, schemas)
 metadata_url = "file:///tmp/proximadb/metadata"
 
-# Data storage locations - ProximaDB distributes collections across these
+# Data storage locations - ProximaDB distributes collections across these.
+# Optional per-location I/O budget (TD-IOBUDGET-1): sizes the ranged GETs the
+# engine issues against THAT location. disk_class: "ssd" | "hdd" | "cloud";
+# explicit min_bytes/target_bytes/max_bytes override the class profile
+# (validated: 64 KiB <= min <= target <= max, fail-closed at startup).
+# Unset => the URL-scheme default; PROXIMADB_DISK_CLASS=hdd stays the
+# per-pod override for locations without an explicit disk_class.
 [[storage.storage_locations]]
 url = "file:///tmp/proximadb/d1"
 weight = 1
 tags = ["local", "disk1"]
+#[storage.storage_locations.io_budget]
+#disk_class = "ssd"
+#target_bytes = 1048576
+#max_bytes = 8388608
 
 [[storage.storage_locations]]
 url = "file:///tmp/proximadb/d2"
@@ -144,6 +154,8 @@ filter_first_max_selectivity = 0.1
 vector_first_min_selectivity = 0.5
 
 [api]
+# Local single-tenant development only. Set false before enabling [security].
+enable_pgwire = true
 # Unified Port Mode - all protocols on single port
 unified_mode = true
 
@@ -318,7 +330,8 @@ collection_affinity = true
 # PAX coarse-probe (IVF) — the master cloud-cost lever. Compaction trains +
 # emits the A0 coarse directory; search probes the nearest `nprobe` cells
 # instead of full-scanning. Cuts GETs/query ~4x and per-tenant COGS ~4x vs
-# full-scan (COGS measurement arc), recall ~0.98. Env overrides still win:
+# full-scan (COGS measurement arc), recall ~0.98 (floor 0.975 since
+# 2026-09-03 — TD-IOBUDGET-2). Env overrides still win:
 # PROXIMADB_PAX_READ_COARSE_PROBE, PROXIMADB_PAX_READ_COARSE_NPROBE,
 # PROXIMADB_PAX_WRITE_A0_TRAIN.
 # Default: all ON, geometric nprobe (sqrt(ncells) x multiplier).
@@ -328,9 +341,10 @@ collection_affinity = true
 # enable_write_train = true                  # compaction emits v3/A0 (the COGS unblock)
 # nprobe_multiplier = 2.0                    # nprobe = ceil(sqrt(ncells) x mult)
 #                                            # 2.0 is the compiled default. 1.0 was measured
-#                                            # BELOW the recall@10 >= 0.98 ratchet (0.9795 at
-#                                            # k_c=30) -- do not copy it. Lower only behind a
-#                                            # representative recall gate.
+#                                            # BELOW the recall floor (0.9795 at k_c=30, vs the
+#                                            # then-0.98 ratchet; the floor is 0.975 since
+#                                            # 2026-09-03) -- do not copy it. Lower only behind
+#                                            # a representative recall gate.
 # nprobe_min = 3
 # nprobe_max = 0                             # 0 = unlimited (capped at ncells)
 # ncomp_floor = 0                            # 0 = legacy coarse-PCA width formula (TD-IVF-3)
@@ -367,9 +381,11 @@ require_authentication = false
 default_session_timeout_minutes = 60
 
 [security.authentication.api_keys]
-# TD-TENANT-1 follow-up (a): an entry may carry roles = ["gateway"] to make
-# the key a gateway principal — enabling GatewayOnly tenant delegation.
-# Delegation ONLY: it grants no data-plane permission.
+# TD-TENANT-1 follow-up (a): a legacy config-backed entry may carry
+# roles = ["gateway"] to make the key a gateway principal — enabling
+# GatewayOnly tenant delegation. Registry-backed `pxk_` keys use their own
+# authoritative identity path and do not inherit this claim. Delegation ONLY:
+# it grants no UnifiedPermission.
 "dev-key" = { user_id = "devuser", permissions = ["*"], ip_restrictions = [] }
 
 # Generic OIDC provider (TD-SSO-1): bearer tokens from ANY compliant IdP,

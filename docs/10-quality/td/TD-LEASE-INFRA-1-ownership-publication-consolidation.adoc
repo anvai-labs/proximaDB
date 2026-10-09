@@ -1,0 +1,568 @@
+= TD-LEASE-INFRA-1: Consolidate ownership and conditional publication with adversarial TDD
+:status: In progress — P1 and queue P2 slice implemented; shared ownership integration pending
+:priority: P0 correctness foundation
+:owner: Storage / Runtime / Connectivity
+:date: 2026-09-13
+
+== Scope and authority
+
+Implement the existing
+link:../../12-design/UNIFIED_RESOURCE_LEASE_LOCKING_REVIEW_2026_06_24.adoc[resource lease correction mandate]
+using the inventory and semantics in
+link:../../12-design/LEASE_INFRASTRUCTURE_CONSOLIDATION_HLD.md[lease infrastructure consolidation HLD].
+Reuse existing object-store publication, resource identity, ownership manager,
+write-intent/fence, and local file-lock machinery. No standalone cloud lease
+service, new transaction authority, duplicated WAL, or Python pseudo-CAS backend.
+This is a bounded prerequisite to connector correctness, not a general transaction rewrite.
+
+== P0 evidence on develop b2436f234
+
+The P0 checkpoint changed only tests, test dependency features and design documents.
+Those tests assert desired safety semantics and intentionally fail
+against unchanged production algorithms; do not push them as a green or merge-ready PR.
+Final unfiltered two-crate run: *124 tests, 114 passed, 10 failed, 0 skipped*,
+7.252 seconds execution after compilation; nextest run
+`ea6a229a-7610-4269-a64b-8725789c9fe4`, retries disabled. All ten failures are
+the new safety cases below. This is correctness evidence, not a performance benchmark.
+Workspace formatting, diff whitespace and TD/ADR uniqueness checks pass.
+The server binary, provider-native conformance and CI were not run in P0;
+there are no production wiring changes in this checkpoint.
+
+Fresh independent review validated both deterministic interleavings and required
+the paused-PUT and empty-metadata additions. Review qualifications are incorporated
+below: invalid-parent and corrupt-state tests are contract hardening; long plain
+decoding breaks a public promise but is not a demonstrated live lease format.
+The HLD now explicitly allows a valid earlier commit's response to arrive after
+newer commits. The defect is publication into a previously pruned slot, not merely
+response-time disagreement with the head.
+
+[cols="1,3,4",options="header"]
+|===
+| Case | Observed result | Interpretation / limit
+| Q1 — two live holders
+| A and B both return `Ok(())` for one group/partition.
+| Deterministic real-LocalFs schedule: B's absent read is suspended; A completes
+read/write/rename/verification; B resumes. Acquisition mutual exclusion is refuted.
+| Q2 — read unavailable
+| B returns success after an injected failed read of A's existing live lease.
+| A storage outage is interpreted as absence and permits overwrite. QueueFs
+currently erases NotFound versus other I/O errors into Persistence(String).
+| Q3/Q4 — malformed/empty metadata
+| Acquisition succeeds and replaces the damaged state.
+| Target fail-closed policy tests, not evidence that normal atomic rename creates
+corruption or that the fixture contains a second live owner.
+| M1/M2 — pruned stale/empty parent
+| `Committed(1)` / `Committed(0)` with current tip v5.
+| False publication acknowledgment and reuse of old version slots. The tip is
+NOT overwritten. Lease acquisition trusts any `Committed(_)` as Acquired.
+| M3 — PUT paused after validation, same generation
+| Delayed PUT returns `Committed(1)` after successors reach v5 and prune v1.
+| A preflight latest-parent check alone cannot close check-to-publish races.
+| M4 — PUT paused across generation takeover
+| Delayed generation-5 PUT returns `Committed(1)` after generation 6 advances to v5 and prunes v1.
+| Generation precheck alone cannot prevent false stale success across retention.
+This primitive test does not yet exercise a complete DML/connector sink journey.
+| M5 — nonexistent parent
+| Parent 100 advances v0 to `Committed(101)`.
+| Proposed expected-parent validation, not a demonstrated normal lease caller
+path: inspected production lease callers obtain parents from durable reads.
+| M6 — plain long payload
+| Plain JSON decodes as generation 8872763515902061424 and loses its first 8 bytes.
+| Violates documented plain-to-fenced compatibility. Existing partition lease
+writers use fenced encoding; no claim that live lease logs contain plain JSON.
+|===
+
+Test anchors:
+
+* `crates/horizontal/proximadb-queue/tests/lease_atomicity.rs` — Q1-Q4.
+* `crates/storage/proximadb-iceberg-engine/src/manifest.rs` — M1-M6,
+  selected by `lease_invariant_`.
+
+Reproduction from the isolated worktree (jobs remain capped by repository config):
+
+[source,bash]
+----
+RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 RUST_MIN_STACK=8388608 \
+  cargo nextest run -p proximadb-queue -p proximadb-iceberg-engine \
+  --no-fail-fast --retries 0
+
+RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 RUST_MIN_STACK=8388608 \
+  cargo nextest run -p proximadb-queue -p proximadb-iceberg-engine \
+  -E 'test(lease_invariant_)' --no-fail-fast --retries 0
+
+RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 RUST_MIN_STACK=8388608 \
+  cargo nextest run -p proximadb-queue -p proximadb-iceberg-engine \
+  -E 'not test(lease_invariant_)' --no-fail-fast --retries 0
+----
+
+The complementary filter is a baseline control, not a way to waive negative
+tests for merge. Do not ignore, weaken or retry-away these safety assertions.
+The paused-read queue harness must be adapted when the serialization boundary
+changes: a correct lock-before-read implementation can exclude A while B pauses.
+A timeout under that design is a harness problem, not a proof of double ownership.
+
+== Reuse decision and gaps
+
+* `proximadb-object-store` already owns conditional create. Extend it only for
+  the proven missing conditional replacement/versioned-read capability, preserving
+  typed precondition, unavailable and unsupported outcomes.
+* Pinned `object_store` 0.13.2 has conditional update in memory; its LocalFileSystem
+  explicitly does not implement Update. Do not mistake emulator success for local
+  filesystem or cloud deployment certification.
+* `proximadb-runtime-common::file_lock` supplies existing Unix advisory locks
+  used by the embedded runtime. Reuse/certify it for local exclusion rather than
+  cloning flock. Its non-Unix success-without-locking branch is not strict-capable.
+  Advisory exclusion still needs durable publication, stable lock inode and
+  cooperation from every writer. Old writers must be drained/fenced on cutover.
+* `ManifestCommitter` currently lives in Iceberg and pulls storage dependencies
+  above horizontal queue. Extract generic mechanics downward with re-exports;
+  extract ownership once only after dependency audit, without copied state machines.
+* Unmarked legacy generation headers and arbitrary plain payloads are ambiguous.
+  A JSON heuristic cannot provide universal mixed-read-safe decoding. Explicit
+  codec/authority migration is required before promising automatic upgrades.
+
+== P1 prerequisite implementation (not the completed publication fix)
+
+Based on develop `3067592f5`, fast-forwarded without discarding P0 work.
+`ProximaObjectStore` now exposes the existing native `put_opts` operation and a
+single-GET `get_with_meta` read, using upstream PutOptions/PutResult/ObjectMeta
+and error types. All four existing write helpers delegate to this implementation;
+the existing full-read helper shares body/metadata retrieval and read accounting.
+No new storage trait, cloud authority, token family, format or environment gate.
+
+The tests went from missing-method compile failures to passing for the prerequisite
+surface. Negative cases cover competing updates, empty validators, stale memory
+revisions, missing versus unavailable reads, unsupported local updates, body/metadata
+coherence, streamed-body failure and committed-but-ambiguous responses.
+Memory tests do not establish provider-native cloud or cross-process local CAS.
+The local object-store backend continues to reject Update instead of emulating it.
+
+Independent review identified an overbroad retry claim; corrected to *no wrapper-added
+retry*. The underlying client may retry and return a conditional conflict after an
+earlier attempt committed. Added an explicit simulation, retained native errors and
+documented mandatory operation-identity reconciliation. The follow-up scoped review
+is clear; it is not an approval of the unfinished manifest or lease protocols.
+
+Final verification:
+
+* Object-store suite: *24 passed, 0 skipped*, including 11 new conditional-publication
+  tests; run `06737b0a-8388-4167-ab9d-6ac3bf055d27`.
+* Unfiltered object-store + Iceberg + queue suite: *148 tests, 138 passed, 10 failed,
+  0 skipped*; run `706ac4e9-28c6-4f36-932a-d79fc3f9069f`. All failures are the
+  previously recorded P0 cases, not waived or converted to ignored tests.
+* Actual default-feature `proximadb-server` binary builds successfully (13m14s
+  build elapsed, not runtime or performance evidence).
+* All-cloud-feature/all-target compile, refreshed strict scoped Clippy, workspace
+  formatting, layering, env registry, TD/ADR uniqueness and diff whitespace pass.
+* Doctest command passes but contains zero examples; no behavioral credit.
+
+Provider-native cloud conformance and deployment cutover were not performed.
+The ten P0 safety cases remain unresolved, unignored merge blockers. This task
+worktree is uncommitted; no PR, CI run, push or merge has been issued.
+
+== P1 opt-in head/retention prototype
+
+This section records the earlier prototype checkpoint. Its legacy-write refusal and
+unresolved-counterexample statements are superseded by the approved policy below.
+
+The existing `ManifestCommitter` now has explicit `create_versioned` / `open_versioned`
+entry points. No existing serving caller opts in, no environment gate was enabled,
+and no legacy authority is automatically converted. The default constructor reads
+the detected format but rejects versioned writes/pruning without explicit opt-in.
+
+The checksum/version-marked head embeds its current payload, version, generation,
+authority incarnation and per-invocation operation ID. A conditional replacement
+publishes it using the native validator from one body/metadata GET. The previous
+committed head is archived first; history deletion cannot invalidate an in-flight
+candidate because the candidate is inside the head PUT, not an external GC target.
+Delayed history recreation is eligible for a later pass and cannot publish a lease.
+Neither the head nor immutable format marker is pruned. A marker-only provisioning
+failure deliberately stays closed; recovery is explicit operator repair, not reset.
+
+The codec uses existing bincode and SHA-256 dependency versions with a 64 MiB body
+limit, explicit magic/version and checksum. Plain payload bytes no longer double as
+a generation header in this format. Legacy decoding remains unchanged and ambiguous.
+Retention age conversion overflow now errors rather than treating the age as zero,
+including in the legacy implementation.
+
+Conditional errors are reconciled against the operation ID in the current or retained
+historical record. A matching receipt proves committed; a different receipt at that
+version proves conflict. Missing/corrupt/unavailable receipt evidence after a possible
+commit returns indeterminate, including after a native conditional error. This is not
+an external idempotency API or a substitute for P2 progress receipts.
+
+Verification at this checkpoint:
+
+* Opt-in suite: *22 passed*, 38 complementary Iceberg tests filtered out, no retries;
+  run `cf06d700-d3b6-499c-aa24-d15354199321`. The initial eight tests failed to compile
+  on the absent API before implementation. Later deterministic schedules cover native
+  concurrent CAS, suspension across GC/takeover, delayed archive, response loss at
+  current/archived/pruned receipts and Precondition-after-applied-write.
+* The suite also checks corrupt/truncated/unknown-version envelopes, missing/deleted
+  authority, legacy refusal, plain/fenced history, partial provisioning, age overflow,
+  counted I/O and native local Update rejection without replacing the head.
+* Unfiltered three-crate run: *170 tests, 160 passed, 10 failed, 0 skipped*;
+  run `fa3514b5-a725-4f6b-b415-2383751b4980`. Failures are exactly the six legacy
+  publication and four queue ownership counterexamples. They remain merge blockers.
+* Fresh zero-context adversarial review found recursive format probes, missing race
+  coverage in the initial suite, and misleading partial-provisioning recovery docs.
+  Private legacy helpers, deterministic scheduling tests and corrected API docs
+  address those findings. Follow-up review is clear for prototype scope only.
+* Actual default-feature `proximadb-server` binary rebuild passes (5m25s). Strict
+  scoped Clippy for both changed storage crates, all targets and all cloud features,
+  passes with warnings denied (4m27s including the queued wait). These are build
+  durations, not runtime performance measurements or native-cloud certification.
+* Format, diff, env registry (268), TD/ADR uniqueness (92 ADR / 456 TD), and layering
+  (152 crates) checks pass.
+
+The review also makes the remaining cost explicit: default legacy operations incur
+two new absent-format GET probes each. Counted tests cap a legacy fenced commit at
+3 GET + 1 LIST + 1 PUT and fenced read at 3 GET; no nested probes. These requests
+affect existing callers even though new-format writes are opt-in. Failed GET attempts
+are not represented by the existing successful-read observer. Serving latency and
+attempted-I/O accounting remain rollout gates; no performance improvement is claimed.
+
+The shared sccache wrapper failed with Operation-not-permitted even in approved runs.
+The user-approved fallback ran Cargo without the wrapper, preserving incremental-off,
+the three-job cap and 8 MiB Rust stack. No cache files or other worktrees were removed.
+
+No provider-native deployment, local conditional-update adapter, live cutover,
+downward generic-publication extraction, ownership-core migration, push, PR or merge
+has occurred. These are execution gates, not implied by the passing opt-in tests.
+
+== Approved fail-closed policy and local acquisition checkpoint
+
+The human approved disabling legacy pruning and blocking ownership writes to presently
+gapped legacy logs until explicit migration. All legacy prune calls now fail without
+deleting objects, including empty logs. Exact parent, current continuity and generation
+are validated from one observed tip. Continuity is not historical proof: already-refilled
+pruned slots cannot be detected. Old writers AND pruners, including suspended calls,
+must be externally excluded before this policy or migration can provide its guarantee.
+
+`LegacyEncoding::{Plain,GenerationPrefixed}` declares historical interpretation; there
+is no payload sniffing. Lease/catalog serving callers declare the prefixed codec.
+Wrong legacy write operations and truncated declared headers fail closed. Warehouse
+plain payloads retain every byte and read with generation zero.
+
+`migrate_versioned(expected_tip)` preserves original source objects, records source
+identity/encoding/checksums, archives retained history before publishing authority, and
+rechecks the source inventory/tip. Completed retries open the current advanced head,
+never reset it. Marker-only failures stay closed pending operator reconciliation.
+Updated serving handles detect/pin persisted versioned authority for reads AND writes;
+constructing a handle never initializes/migrates a log. No deployment was migrated.
+
+The existing runtime `FileLockManager` now supplies whole-operation byte-conditioned
+local replacement: stable advisory lock, exact observed bytes, same-directory temporary
+file, file sync, rename, directory sync. Async callers retain the whole operation in a
+single blocking task. Symlink/hardlink lock targets are rejected before mutation and
+diagnostics use the locked descriptor, not a reopened path. Byte equality is NOT an
+ABA-proof ownership token. All writers must cooperate; a post-rename error is uncertain.
+
+Queue acquisition/renewal uses that existing primitive through `QueueFs` and the canonical
+`FileSystem` adapter. Typed NotFound is the only absence result; other read failures and
+empty/corrupt metadata propagate. Renew cannot reacquire missing/expired/superseded state.
+Existing traits advertise conditional replacement, unsupported by default; queue roots
+reject unsupported adapters before accepting data. Counting/fault decorators forward it;
+encrypted/transforming adapters do not bypass their semantics to claim support. Native
+local ObjectStore Update remains unsupported; these are different existing contracts.
+
+TDD reproduced linked-lock corruption and unsupported queue startup before their fixes.
+The new subprocess test proves cross-process exclusion and recovery after killing a lock
+holder; it does NOT certify power loss or a kill during publication. Post-publication
+error and renewal negatives exercise the queue port. Cancellation while the blocking
+operation is executing and crash injection around rename remain qualification gates.
+At this P1 checkpoint consumer ownership-conditioned ACK, release and incarnation remained
+pending; see the subsequent P2 queue checkpoint below. Sink fencing is still not delivered.
+Passing acquisition tests must not be called end-to-end connector correctness.
+
+Fresh adversarial review found that versioned retention ranked recursively listed
+noncanonical objects, then deleted canonical paths: a duplicate could evict the real
+predecessor and an unrelated old timestamp could bypass the canonical archive's age.
+Both new tests failed before the exact full-path filter and pass after it. An independent
+follow-up review is CLEAR for that fix. The local acquisition follow-up is CLEAR under
+the explicit cooperating-writer/Unix-local contract, not broader lifecycle certification.
+
+Verification:
+
+* Final unfiltered five-crate run: *297 passed, 0 skipped*, retries disabled;
+  `41d946c3-f476-4a93-896b-536f9232d5c2`. This includes all ten original counterexamples
+  under the approved policies, new lease renewal/error controls, and the 76-test Iceberg
+  suite with migration faults and retention distractors.
+* Root `--lib --features cluster` selected integration run: *61 passed*, 6458 unrelated
+  tests filtered out; `b3180ebe-9fec-40c3-a664-c30d922eb014`. Includes actual catalog and
+  partition serving handles across migration, local factory publication, decorator
+  forwarding and encrypted-local refusal. This run preceded the final canonical-retention
+  filter; that final change is covered by the refreshed 297-test suite.
+* Strict Clippy on all five affected crates, all targets and all features: PASS.
+  Besides simplifying the new lease predicate, this exposed existing feature-lane
+  warnings: PyO3 clone conversion now opts in explicitly (preserving behavior), and
+  the inverted-range test uses a slice reference rather than a misleading array literal.
+* Actual server binary build PASS after the final retention filter (6m21s including
+  build queue time; build duration is not runtime performance evidence). Workspace
+  format, diff whitespace, layering, env registry and TD uniqueness pass.
+
+No CI run, push, PR, merge or live migration has been performed.
+
+== Remaining execution gates
+
+=== P2 queue checkpoint
+
+Reused the existing runtime conditional replacement and filesystem/queue ports, adding a
+read-only sibling guard slice checked under their existing stable directory lock before
+one durable target replacement. No new transaction service, record format or WAL was added.
+
+Consumer ownership is now a non-reused UUID per Consumer, shared by clones. Renewal loss,
+cancelled operations and unknown ACK publication outcomes are terminal. ACK advances only
+a contiguous inclusive prefix under the admitted lease-byte guard; NACK schedules retry
+without progress. Conditional expired-tombstone release cannot delete a successor. Awaited
+shutdown retains release joins across cancellation, and client shutdown awaits live consumers.
+Lease-only groups block recovery skipping/reaping; corrupt or misidentified progress fails closed.
+
+TDD reproduced six original consumer failures, followed by client shutdown returning before
+release, late duplicate ACK topic ambiguity, and applied-but-error ACK permitting contradictory
+NACK/redelivery. Real-LocalFs delegated fault tests cover prepublication retry, uncertain ACK,
+cancelled publication/takeover, renewal guard drift, and cancellation/retry of awaited shutdown.
+The existing concurrent-ACK assertion is strengthened to require final offset 99, not merely
+an arbitrary parseable watermark at or below 99.
+
+Compatibility: Consumer is single-topic because the unchanged MessageId has no topic identity;
+multiple partitions remain supported. Consumer group names preserve exact portable ASCII
+components, including mixed-case deployment IDs, not sanitized aliases; conflicting directory case
+spellings are rejected. Noncanonical historical names need explicit operator migration. Topic paths
+are constrained to exact components before I/O, including producer and subscriber entry points.
+Historical unversioned maximum-ACK offsets do not prove contiguous completion: operators must
+audit/replay from a trusted checkpoint before using the new guarantee. No automatic historical
+repair or old-writer continuity is claimed. Tenant is routing metadata, not an authenticated queue
+consumer scope; current leases remain group/topic/partition-scoped.
+Old noncooperating writers must be excluded despite unchanged JSON layouts. Expiry is admission
+eligibility, not strict deadline enforcement at rename or fencing of external effects.
+
+Initial refreshed five-crate run: *319 passed, 0 skipped*, retries disabled,
+`b97adc50-5ebd-4759-b267-3f6bf06efd89`; this precedes the strengthened concurrent-ACK assertion.
+Strict five-crate all-target/all-feature Clippy passed. Root integration/server verification and
+the independent review disposition are recorded separately when complete.
+
+The first independent integration review correctly refuted the lowercase-only policy:
+the existing invalidation bus uses `podA`/`podB`. An added regression reproduced it;
+the repaired rule preserves spelling and rejects existing directory case aliases. A second
+negative reproduced topic-path escape and now passes with validation before producer or
+subscriber I/O. Consumer fault tests explicitly cover the TTL-bounded, terminal state after
+cancelling subscription before renewer registration; this is not prompt-release certification.
+
+The review also found embedding-drainer integration stuck polling a terminal consumer.
+The task now returns a typed failure on subscribe/poll/batch errors, logs it immediately,
+and awaits consumer release. Database ownership carries that result through shutdown and
+reports an unexpectedly completed configured drainer as unhealthy. Bounded database drain
+retains the same task on timeout and returns incomplete shutdown before storage teardown;
+retry awaits that task instead of detaching it or hanging indefinitely. It does not invent an
+automatic reacquisition supervisor; external restart/recovery remains an operational action.
+
+Recovery negatives reproduced swallowed LIST/read failures, malformed complete frames,
+maximum-offset overflow and incorrect split-archive backend selection. Recovery now fails
+closed on those errors, uses the explicitly injected archive adapter, preserves truncated-tail behavior,
+and checks counters. Further red controls proved empty bootstrap shadowing, archive overwrite,
+and loss after append plus a second restart: archive fallback now advances the existing disk
+writer above recovered segment IDs, and empty placeholders are never uploaded over archive data.
+New writes also reject exhausted offsets before appending a frame.
+
+Refreshed five-crate run after these fixes and the strengthened ACK assertion:
+*339 passed, 0 skipped*, retries disabled, `468b15f7-e158-449d-a698-eeba42b3fcc4`.
+The three new drainer tests are root-crate tests, not included in that count; final root/server
+verification and follow-up review were still pending at that intermediate checkpoint;
+their completed results are recorded below.
+
+The production bootstrap still injects only its root adapter; separate native-cloud archive
+wiring/certification is not provided by the explicit split-adapter tests. Local factory path
+mapping is part of this checkpoint and requires actual QueueClient end-to-end validation,
+not a test-only reimplementation of the URL mapper.
+
+Follow-up review found the production factory mixed absolute queue paths with relative listings,
+duplicating the physical root and hiding group entries. Mapping now preserves one coordinate
+system, rejects traversal/foreign/non-child entries, and tests the real client through factory
+creation, ACK discovery and restart. The fake mapper probe was removed. Slash-aware root joining
+also covers `file:///` in mapper-only tests (no writes at `/`). Independent bounded follow-up is
+CLEAR for the repaired adapter and previously reviewed ownership/lifecycle invariants; root tests
+subsequently validated the actual assembled implementation as recorded below.
+
+Exact-directory proof now rejects a backend that never lists the created identity instead of
+silently returning success. The test filesystem models directories under its existing state lock;
+new conformance controls test both valid empty directories and malformed listings. Refreshed
+five-crate run: *343 passed, 0 skipped*, retries disabled,
+`dbba3af0-80b3-4fa0-8f0c-a998056cb2a2`. Strict five-crate all-feature/all-target Clippy passed.
+
+Final assembled verification: the actual `proximadb-server` binary built successfully
+in the default-feature dev lane. Full `make work-commit-check` passed, including format,
+architecture boundaries, tenant-path/ingress, panic policy and environment registry checks.
+The first cluster-enabled root selection compiled successfully and ran 80 tests:
+76 passed and four embedding HTTP-fixture tests failed at loopback bind with sandbox
+`PermissionDenied` (run `a6d28225-4547-4632-b478-e3b4177f35ee`). That first run was not green.
+The approved loopback-enabled rerun passed *80/80 selected root tests*, 6,444 filtered out,
+with retries disabled (run `818e1d5e-cac7-468f-a58c-df1d172916b2`, 1.251 seconds execution).
+This includes the real factory QueueClient restart journey, invalidation-bus compatibility,
+drainer failure propagation and retained-task bounded shutdown. No source changes were needed
+between the sandbox-denied run and the passing rerun. Root test compilation reported 41 warnings,
+so strict affected-crate Clippy is not a claim of global warning cleanliness or full-root test coverage.
+
+These results apply to the uncommitted isolated checkpoint based on `3067592f54c8`.
+A develop-targeted PR still requires a fresh rebase/integration audit, exact-head review and CI;
+local verification is not merge authorization or evidence for a later rebased revision.
+
+=== Develop checkpoint review follow-up
+
+Committed and rebased cleanly onto develop `55de7ffa4`; the two incoming MLOps commits
+had no direct file overlap. Fresh zero-context review of `f6536f12a` found a new
+restart/reaper interaction: recovery seals the last populated segment, the reaper deletes it
+after all groups ACK, and a second restart could reset producer allocation to zero while
+consumers retained higher progress. The actual reaper/repeated-restart regression failed
+with no newly accepted message visible (`97d51f0b-e989-45bb-a514-7215d528fb5e`).
+Two additional negatives reproduced ignoring maximum group progress and accepting an
+exhausted durable offset (`97d2ec91-a54c-4bde-b286-53ef374c82f6`).
+
+Recovery now takes the checked successor of maximum durable group progress as an allocation
+floor, combining it with observed frame successors. Minimum group progress still controls
+replay skipping. Existing metadata is reused; no new record format or authority is introduced.
+This assumes group metadata remains retained, as the current reaper does; deleting that
+metadata administratively is not a supported way to reset allocation. Independent follow-up
+cleared the production repair; the intentional-gap test uses two polls to respect the existing
+memory read boundary. Post-repair five-crate run passed *346/346*, no skipped tests or retries
+(`a4c8cdfe-7516-49e1-a1fa-158918170950`). Root production `cargo clippy --lib --bins --
+-D warnings` passed. Remaining assembled rebuild/test and CI outcomes are recorded on the
+develop-targeted PR.
+
+This completes only the queue slice of P2. Shared ownership-core extraction, exact generation
+tokens across restore, typed receipts, new-group admission versus retention, sink fencing and
+sibling connector cutover remain open. No performance uplift, provider-native qualification,
+power-loss certification, CI, PR or merge is claimed.
+
+=== Factory queue upgrade admission follow-up
+
+Fresh merge review of `47244fea8` found that correcting the factory adapter's
+double-root mapping could leave previously accepted queue frames and progress invisible.
+Four old-mapping fixtures reproduced unsafe startup on the rebased branch
+(`4052c57b-8000-4151-9a94-d97f47f6e7a1`). Root admission now inspects the old location
+before any topic or writer is constructed, refusing nonempty/ambiguous layouts and
+inspection errors while leaving all source bytes untouched. Missing/empty directories
+are admitted; unchanged explicit filesystem-root/dot mappings skip the probe.
+
+A second review found that bare relative roots could bypass a custom local backend's
+`root_dir` when normalized to `file://`. The initial custom-root fixture inadvertently
+used an absolute TempDir path, so its failed runs (`c5ebad8c-1dfc-42b9-9734-723e06f4cc97`
+and `576fe7e7-9db6-411f-87a7-f567a66e1c85`) are NOT proof of that relative-root bug.
+The corrected fixtures explicitly construct and assert relative paths. Bare relative
+roots are refused before filesystem access, with explicit offline-migration guidance;
+absolute roots and explicitly scheme-qualified relative roots remain supported. Neither
+merely adding a scheme nor deleting the old directory is a migration. Operators must
+exclude old writers and reconcile both histories from backups and trusted progress.
+This reuses root-directory admission and the filesystem's existing LIST method, adding
+no format or public interface. Subsequent green validation and merge status are recorded
+on the develop-targeted PR; these red runs are regression evidence, not release clearance.
+
+A further public-boundary check found that QueueClient may use a descendant of the adapter's
+root. Matching only the adapter root skipped that queue's first admission call. Both public
+integration fixtures failed for frames and retained progress
+(`6c306b00-0529-4c0f-9b33-e78432c01fce`). Admission now compares old and corrected locations
+for each root-qualified directory creation, inspecting the exact legacy location when they
+differ. A clean descendant can still restart beside another descendant's legacy data. The
+probe does not run on unchanged root-relative operations or steady-state ACK/renewal/append.
+
+The positive custom-backend/explicit-relative-URL journey then reproduced a LIST spelling
+mismatch: the local backend returns an extra `./` while the adapter required a literal URL
+prefix (`5e5869e3-42a3-415a-873a-04813d647652`: 91/92 passed; only this journey failed).
+Local LIST confinement now compares path components after rejecting parent traversal;
+normalizing current-directory components also keeps dotted relative operation paths coherent.
+Nonlocal URL validation is unchanged. The public fixture exercises open/send/shutdown/restart
+and confirms explicit file URLs do not silently adopt a backend-relative anchor.
+
+The dotted root-relative public journey also failed before its repair: running the
+newly compiled integration binary's `dotted_root_relative_queue_preserves_list_caller_coordinates`
+test directly returned "did not list the exact directory identity" (0 passed, 1 failed).
+After confinement and direct-child validation, LIST now joins the validated child name
+onto the requested parent, preserving its leading `./` for queue identity checks.
+Root-qualified versus root-relative mapping is unchanged; returned backend filename
+case is retained so case-alias detection still rejects mismatched topic identities.
+
+The integration audit after rebasing onto `ca8d98e85` found that incoming pgwire
+authentication validation could return after the queue spawned its background tasks.
+Those tasks retain the client and need awaited shutdown, so constructor failure would
+strand them until runtime teardown. The public constructor rejection test reproduced
+queue state creation before the error (`8120bf08-1804-43e4-9b88-8abfb5560c92`, 95/97 passed).
+The other failure was the valid-startup control missing process embedding initialization;
+its fixture now follows the server prerequisite. Authentication resolution and rejection
+move before queue admission without changing the mode resolver or network wiring.
+
+Fresh review after the engine-policy rebase found that the production binary never
+observed the drainer's terminal task result: async work could keep arriving while
+consumption had stopped. A real-server regression reproduced this
+(`da535d64-e093-45ee-913f-065588db0909`): the failure was logged but the process
+remained alive past the deadline; the healthy signal-shutdown control passed.
+The initial fixture run failed config loading due to missing storage-location tags
+and is not defect evidence. Production now observes the existing drainer handle,
+performs awaited shutdown, and exits nonzero; a deployment supervisor owns restart.
+This deliberately does not reuse HTTP-dependent health or restart uncertain consumers
+in place. The binary tests require the specific supervisor path, completed shutdown,
+and replay of the unACKed message, and run in the dev-build CI lane.
+The corrected suite passed all three tests after the fix
+(`25a44937-19c5-4532-896b-4198f2626a9c`), and the exact serialized CI command
+also passed all three tests. Fresh source review cleared the supervision change.
+
+A subsequent pre-merge review found the other lifecycle edge: on SIGTERM/SIGINT,
+the executable treated the database's retained-task timeout as completed shutdown,
+skipping the remaining drains and exiting successfully. The extracted process sequencing
+reproduced both premature completion and swallowed terminal errors before the fix
+(`5ef4abca-cfa7-4d8a-a8c7-a9882b3384bd`: 13/15 passed, the two new controls failed).
+It now awaits retries while the existing queue remains attached, keeps runtime ownership
+in `Stopping`, and propagates completed errors. This is a private server adaptation of
+the existing database contract, not a new public shutdown interface. The controlled-effect
+test exercises that production sequencing function with a shorter test-only grace period;
+it is not claimed as a delayed-provider subprocess test. Existing actual-server controls
+still cover healthy signal shutdown and terminal failure with durable replay.
+The fixed pre-rebase suite passed 16/16 under nextest
+(`8bc311f1-7aec-4d07-afd6-27f54443fa5a`) and the exact serialized CI command;
+server and integration-test Clippy with warnings denied passed. All seven commits then
+rebased unchanged onto develop `769e4e6ac` (pgwire transaction/correctness changes).
+Fresh rebased validation and review are required before merge; pre-rebase green CI
+on `6c3ec41f1` does not clear this follow-up.
+The fresh rebased source review cleared the retry classifier and process ownership
+sequence. Nextest passed 16/16 lifecycle tests
+(`3d24f17f-2a45-4d96-8301-e87d1ce14fe9`) and 291/291 selected root/protocol/queue
+upgrade and pgwire transaction tests (`96ffac53-94c3-49f8-9e91-8a303fdb5f9d`,
+6,141 unrelated tests filtered out), with retries disabled. Incoming pgwire changes
+do not alter the shutdown classifier; this does not certify draining detached
+connection tasks or active transactions during process shutdown.
+
+=== Phase exits
+
+[cols="1,4,3",options="header"]
+|===
+| Phase | Deliverable | Exit
+| P0
+| Canonical index, state semantics, counterexamples and independent review.
+| Red evidence qualified; no unsupported safety claim.
+| P1
+| Harden conditional publication, non-reused authority and safe retention; reuse
+object-store and local exclusion seams.
+| Paused publication/GC tests green, backend conformance and mixed-reader/writer
+cutover proven; no default-on format switch.
+| P2
+| One ownership core; exact incarnation/generation; ownership-conditioned progress;
+queue contiguous ACK/NACK and lifecycle migration.
+| Deleted duplicate acquisition algorithms; first-acquire/renew/expiry/group
+controls preserved; no upward crate dependency.
+| P3
+| Exact-token sink barrier at canonical write admission/publication.
+| Old unaccepted writes rejected after takeover; acknowledged old WAL preserved
+and replayed across restart; protocol and internal-writer bypass tests green.
+| P4
+| Generated-client connector cutover, typed checkpoints, sibling contract journeys.
+| Negative connector cases green; old writers excluded; deployed backend certified.
+|===
+
+The queue checkpoint addresses the original shutdown-delete, renewal-loss, maximum-ACK and
+NACK-as-ACK findings. Do not claim exclusive external processing merely because ownership
+and progress tests become green; the destination still needs fencing.
+
+PR checkpoints target develop, stay coherent, build affected feature lanes and
+the actual server when implementation wiring changes, and require fresh exact-head
+green CI plus zero-context adversarial review. No admin bypass without explicit
+authorization for that PR. No measured performance uplift or production-readiness
+claim is made by this test/design checkpoint.

@@ -4,56 +4,294 @@ use crate::query::multimodal_router;
 use proximadb_records::{ProximaRecord, ProximaTreeNode};
 
 #[test]
+fn extract_where_handles_trailing_where_and_prefixed_columns() {
+    // WHERE ending the string must not panic (the -1/+7 dance sliced one
+    // past the end — abort-class under panic=abort).
+    for trailing in [
+        "SELECT ' WHERE ' FROM t WHERE",
+        "SELECT * FROM t WHERE\n",
+        "SELECT * FROM t WHERE\t",
+        "SELECT * FROM t WHERE\u{2003}",
+        "SELECT * FROM t WHERE\u{00a0}",
+        "SELECT * FROM t WHERE/* comment */",
+    ] {
+        assert!(PostgresProtocol::extract_select_where_clause(trailing).is_some());
+        assert!(PostgresProtocol::extract_select_where_predicates(trailing).is_none());
+        assert!(PostgresProtocol::extract_legacy_select_predicates(trailing).is_err());
+    }
+
+    // A 'limit_val' column must not shadow a later real LIMIT terminator.
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT * FROM t WHERE limit_val > 5 LIMIT 3",
+    );
+    assert_eq!(predicate, Some("limit_val > 5"));
+
+    // Clause keywords used as qualified identifiers are not clauses. The
+    // scanner must continue to the real top-level WHERE/ORDER BY tokens.
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT t.where FROM t WHERE t.limit > 5 ORDER BY t.id",
+    );
+    assert_eq!(predicate, Some("t.limit > 5"));
+
+    let predicate = PostgresProtocol::extract_select_where_clause(
+        "SELECT COUNT(*) FILTER (WHERE active) FROM t WHERE id = 7",
+    );
+    assert_eq!(predicate, Some("id = 7"));
+
+    for malformed in [
+        "SELECT * FROM t ( WHERE id = 7",
+        "SELECT * FROM t )",
+        "SELECT * FROM t (]",
+        "SELECT * FROM t ' \" WHERE id = 7",
+        "SELECT * FROM t /* WHERE id = 7",
+        "SELECT * FROM t WHERE id = 1 LIMIT 2 (",
+        "SELECT * FROM t WHERE id = 1 LIMIT 2 /* unterminated",
+    ] {
+        assert!(
+            PostgresProtocol::extract_legacy_select_predicates(malformed).is_err(),
+            "malformed structure must not become an unfiltered scan: {malformed}"
+        );
+    }
+    assert!(
+        PostgresProtocol::extract_legacy_select_predicates("SELECT somewhere FROM t")
+            .expect("an identifier containing WHERE is still WHERE-less")
+            .is_empty()
+    );
+}
+
+#[test]
+fn clean_identifier_respects_quoted_qualified_segments() {
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#""meta.score""#),
+        "meta.score"
+    );
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#"schema."meta.score""#),
+        "meta.score"
+    );
+    assert_eq!(
+        PostgresProtocol::clean_identifier(r#""schema"."score""#),
+        "score"
+    );
+}
+
+#[test]
+fn legacy_create_table_target_rejects_missing_or_unterminated_names() {
+    for query in [
+        "CREATE TABLE IF NOT EXISTS /* unterminated USING VECTOR",
+        "CREATE TABLE -- USING VECTOR",
+        "CREATE TABLE IF NOT EXISTS",
+        "CREATE TABLE USING VECTOR",
+        "CREATE TABLE IF NOT EXISTS USING VECTOR",
+        "CREATE TABLE /* comment-only */ USING VECTOR",
+        "CREATE TABLE (id INT) USING VECTOR",
+        "CREATE TABLE \"unterminated USING VECTOR",
+        "CREATE TABLE `unterminated USING VECTOR",
+        "CREATE TABLE ; USING VECTOR",
+        "CREATE TABLE ) USING VECTOR",
+        "CREATE TABLE , USING VECTOR",
+        "CREATE TABLE 123 USING VECTOR",
+        "CREATE TABLE foo-bar USING VECTOR",
+    ] {
+        let error = PostgresProtocol::extract_legacy_create_table_target(query)
+            .expect_err("malformed CREATE TABLE must fail closed");
+        assert!(
+            error.to_string().contains("valid table name"),
+            "got: {error}"
+        );
+    }
+
+    assert_eq!(
+        PostgresProtocol::extract_legacy_create_table_target(
+            "CREATE TABLE /* v2 */ IF NOT EXISTS `logs` USING VECTOR"
+        )
+        .expect("valid comment-separated target"),
+        ("logs".to_string(), true)
+    );
+    assert_eq!(
+        PostgresProtocol::extract_legacy_create_table_target(
+            "CREATE TABLE IF NOT EXISTS \"Team Logs\" (id INT) USING VECTOR"
+        )
+        .expect("quoted target may contain whitespace"),
+        ("team logs".to_string(), true)
+    );
+    assert_eq!(
+        PostgresProtocol::extract_legacy_create_table_target(
+            "CREATE TABLE IF NOT EXISTS \"team\"\"logs\" (id INT) USING VECTOR"
+        )
+        .expect("doubled quote escapes one identifier delimiter"),
+        ("team\"logs".to_string(), true)
+    );
+    for query in [
+        "CREATE TABLE IF\nNOT EXISTS logs USING VECTOR",
+        "CREATE TABLE IF\u{00a0}NOT\tEXISTS logs USING VECTOR",
+        "CREATE TABLE IF /* one */ NOT /* two */ EXISTS logs USING VECTOR",
+        "CREATE TABLE IF NOT EXISTS-- note\nlogs USING VECTOR",
+    ] {
+        assert_eq!(
+            PostgresProtocol::extract_legacy_create_table_target(query)
+                .expect("SQL trivia may separate IF NOT EXISTS"),
+            ("logs".to_string(), true)
+        );
+    }
+}
+
+#[test]
+fn document_json_output_preserves_jsonb_fields() {
+    let document = serde_json::json!({"profile": {"tier": "gold"}});
+    let object = crate::proto::proximadb_v1::SqlObject {
+        fields: [(
+            "metadata".to_string(),
+            crate::proto::proximadb_v1::SqlValue {
+                value: Some(crate::proto::proximadb_v1::sql_value::Value::JsonbValue(
+                    proximadb_data_model::ProximaValue::to_jsonb_vec(&document)
+                        .expect("encode JSONB test value"),
+                )),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+
+    let encoded = sql_object_to_json(&object);
+    let decoded: serde_json::Value =
+        serde_json::from_str(&encoded).expect("decode document JSON output");
+    assert_eq!(decoded["metadata"], document);
+}
+
+#[test]
 fn test_frontend_message() {
     assert_eq!(FrontendMessage::Query as u8, b'Q');
     assert_eq!(FrontendMessage::Terminate as u8, b'X');
 }
 
 #[test]
-fn transaction_control_is_rejected_until_atomic_semantics_exist() {
-    for statement in [
-        "BEGIN",
-        "BEGIN TRANSACTION;",
-        "BEGIN ISOLATION LEVEL SERIALIZABLE",
-        "START TRANSACTION",
-        "START TRANSACTION READ ONLY",
-        "COMMIT",
-        "COMMIT AND CHAIN",
-        "END WORK",
-        "ROLLBACK",
-        "ROLLBACK AND NO CHAIN",
-        "ABORT TRANSACTION",
-        "SAVEPOINT nested",
-        "RELEASE nested",
-        "RELEASE SAVEPOINT nested",
-        "ROLLBACK TO nested",
-        "PREPARE TRANSACTION 'tx-1'",
-        "COMMIT PREPARED 'tx-1'",
-        "ROLLBACK PREPARED 'tx-1'",
-        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
-        "SET CONSTRAINTS ALL DEFERRED",
-    ] {
-        assert_eq!(
-            transaction_control_policy(statement),
-            Some(TransactionControlPolicy::Unsupported),
-            "{statement} must not report false transaction success"
-        );
-    }
+fn transaction_control_classification_matches_adr018_p2d() {
+    use crate::network::postgres::protocol::{
+        TransactionControl, TransactionStatement, classify_transaction_statement,
+    };
+    let control = |s: &str| match classify_transaction_statement(s) {
+        Some(TransactionStatement::Control(c)) => Some(c),
+        _ => None,
+    };
+    let unsupported = |s: &str| match classify_transaction_statement(s) {
+        Some(TransactionStatement::Unsupported(reason)) => reason,
+        other => panic!("{s} must classify as Unsupported, got {other:?}"),
+    };
 
-    assert_eq!(transaction_control_policy("SELECT 1"), None);
+    // Real control per P2.D.
+    assert_eq!(
+        control("BEGIN"),
+        Some(TransactionControl::Begin { read_only: None })
+    );
+    assert_eq!(
+        control("BEGIN TRANSACTION;"),
+        Some(TransactionControl::Begin { read_only: None })
+    );
+    assert_eq!(
+        control("BEGIN WORK"),
+        Some(TransactionControl::Begin { read_only: None })
+    );
+    assert_eq!(
+        control("START TRANSACTION READ ONLY"),
+        Some(TransactionControl::Begin {
+            read_only: Some(true)
+        })
+    );
+    assert_eq!(
+        control("BEGIN READ WRITE"),
+        Some(TransactionControl::Begin {
+            read_only: Some(false)
+        })
+    );
+    assert_eq!(
+        control("BEGIN ISOLATION LEVEL READ COMMITTED"),
+        Some(TransactionControl::Begin { read_only: None })
+    );
+    assert_eq!(control("COMMIT"), Some(TransactionControl::Commit));
+    assert_eq!(control("END WORK"), Some(TransactionControl::Commit));
+    // Both spelled-out commit forms are real PG grammar — they must classify
+    // as Control, never fall through to the generic executor's silent OK.
+    assert_eq!(
+        control("COMMIT TRANSACTION"),
+        Some(TransactionControl::Commit)
+    );
+    assert_eq!(control("END TRANSACTION"), Some(TransactionControl::Commit));
+    assert_eq!(control("ROLLBACK"), Some(TransactionControl::Rollback));
+    assert_eq!(
+        control("ABORT TRANSACTION"),
+        Some(TransactionControl::Rollback)
+    );
+    assert_eq!(
+        control("SET TRANSACTION READ ONLY"),
+        Some(TransactionControl::SetTransaction {
+            read_only: Some(true)
+        })
+    );
+    assert_eq!(
+        control("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+        Some(TransactionControl::SetTransaction { read_only: None })
+    );
+    assert_eq!(
+        control("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),
+        Some(TransactionControl::SetTransaction {
+            read_only: Some(true)
+        })
+    );
+
+    // Recognized-but-unsupported: fail closed WITH the reason, never silently.
+    assert!(unsupported("BEGIN ISOLATION LEVEL SERIALIZABLE").contains("ISOLATION LEVEL"));
+    assert!(unsupported("COMMIT AND CHAIN").contains("CHAIN"));
+    assert!(unsupported("ROLLBACK AND NO CHAIN").contains("CHAIN"));
+    assert!(unsupported("SAVEPOINT nested").contains("savepoint"));
+    assert!(unsupported("RELEASE nested").contains("savepoint"));
+    assert!(unsupported("RELEASE SAVEPOINT nested").contains("savepoint"));
+    assert!(unsupported("ROLLBACK TO nested").contains("SAVEPOINT"));
+    assert!(unsupported("PREPARE TRANSACTION 'tx-1'").contains("two-phase"));
+    assert!(unsupported("COMMIT PREPARED 'tx-1'").contains("two-phase"));
+    // Unrecognized COMMIT/END/ROLLBACK tails fail closed — a typo'd COMMIT
+    // ("COMMIT TRANSACTON") must never silently no-op as a generic statement.
+    assert!(unsupported("COMMIT TRANSACTON").contains("unsupported"));
+    assert!(unsupported("END FROB").contains("unsupported"));
+    assert!(unsupported("ROLLBACK FROB").contains("unsupported"));
+    // A dangling READ mode is a syntax error, not a silent read-write BEGIN.
+    assert!(unsupported("BEGIN READ").contains("syntax error"));
+    assert!(unsupported("BEGIN READ FROB").contains("syntax error"));
+    assert!(unsupported("ROLLBACK PREPARED 'tx-1'").contains("two-phase"));
+    assert!(unsupported("SET CONSTRAINTS ALL DEFERRED").contains("CONSTRAINTS"));
+
+    // Not control statements at all.
+    assert!(classify_transaction_statement("SELECT 1").is_none());
+    assert!(classify_transaction_statement("SELECT * FROM t LIMIT 5").is_none());
+    assert!(classify_transaction_statement("INSERT INTO t VALUES (1)").is_none());
 }
 
 #[test]
-fn transaction_control_is_detected_before_a_multi_statement_batch_runs() {
+fn transaction_control_classifies_every_statement_in_a_mixed_batch() {
+    // ADR-018 P2.D: `BEGIN; INSERT …; COMMIT;` executes in one batch — the
+    // former whole-batch rejection is gone, replaced by per-statement
+    // classification in the loop (the historical silent-INSERT-drop bug stays
+    // fixed by per-statement dispatch + abort-on-error).
     let statements = PostgresProtocol::split_sql_statements(
         "BEGIN; INSERT INTO orders (id) VALUES (1); COMMIT;",
     );
-
-    assert!(
-        statements
-            .iter()
-            .any(|statement| transaction_control_policy(statement).is_some())
+    let kinds: Vec<bool> = statements
+        .iter()
+        .map(|s| {
+            matches!(
+                classify_transaction_statement(s),
+                Some(TransactionStatement::Control(_))
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            true,  /* BEGIN */
+            false, /* INSERT */
+            true   /* COMMIT */
+        ],
+        "control, DML, control — exactly what the batch loop dispatches on"
     );
 }
 
@@ -1169,7 +1407,8 @@ fn test_drop_table_with_if_exists() {
 #[test]
 fn order_by_single_column_default_asc_nulls_last() {
     let keys = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY name")
-        .expect("single-col ORDER BY must parse");
+        .unwrap()
+        .expect("single-col keys");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column, "name");
     assert!(!keys[0].desc);
@@ -1179,8 +1418,9 @@ fn order_by_single_column_default_asc_nulls_last() {
 
 #[test]
 fn order_by_explicit_desc_default_nulls_first() {
-    let keys =
-        PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY score DESC").unwrap();
+    let keys = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY score DESC")
+        .unwrap()
+        .expect("keys");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column, "score");
     assert!(keys[0].desc);
@@ -1192,7 +1432,8 @@ fn order_by_explicit_desc_default_nulls_first() {
 fn order_by_explicit_nulls_first_overrides_default() {
     let keys =
         PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY score ASC NULLS FIRST")
-            .unwrap();
+            .unwrap()
+            .expect("keys");
     assert_eq!(keys.len(), 1);
     assert!(!keys[0].desc);
     // Override: NULLS FIRST under ASC.
@@ -1203,7 +1444,8 @@ fn order_by_explicit_nulls_first_overrides_default() {
 fn order_by_explicit_nulls_last_overrides_default() {
     let keys =
         PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY score DESC NULLS LAST")
-            .unwrap();
+            .unwrap()
+            .expect("keys");
     assert_eq!(keys.len(), 1);
     assert!(keys[0].desc);
     // Override: NULLS LAST under DESC.
@@ -1215,7 +1457,8 @@ fn order_by_multi_column_preserves_declaration_order() {
     let keys = PostgresProtocol::extract_select_order_by(
         "SELECT * FROM t ORDER BY name ASC, score DESC, created_at",
     )
-    .expect("multi-col ORDER BY must parse (Phase 2)");
+    .unwrap()
+    .expect("multi-col keys (Phase 2)");
     assert_eq!(keys.len(), 3);
     assert_eq!(keys[0].column, "name");
     assert!(!keys[0].desc);
@@ -1230,7 +1473,8 @@ fn order_by_multi_column_per_key_nulls() {
     let keys = PostgresProtocol::extract_select_order_by(
         "SELECT * FROM t ORDER BY a NULLS FIRST, b DESC NULLS LAST",
     )
-    .unwrap();
+    .unwrap()
+    .expect("keys");
     assert_eq!(keys.len(), 2);
     assert!(keys[0].nulls_first); // explicit NULLS FIRST on ASC
     assert!(!keys[1].nulls_first); // explicit NULLS LAST on DESC
@@ -1239,7 +1483,8 @@ fn order_by_multi_column_per_key_nulls() {
 #[test]
 fn order_by_terminates_at_limit() {
     let keys = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY name LIMIT 10")
-        .unwrap();
+        .unwrap()
+        .expect("keys");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column, "name");
 }
@@ -1247,14 +1492,135 @@ fn order_by_terminates_at_limit() {
 #[test]
 fn order_by_terminates_at_offset() {
     let keys = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY name OFFSET 5")
-        .unwrap();
+        .unwrap()
+        .expect("keys");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].column, "name");
 }
 
 #[test]
 fn order_by_no_clause_returns_none() {
-    assert!(PostgresProtocol::extract_select_order_by("SELECT * FROM t").is_none(),);
+    assert!(
+        PostgresProtocol::extract_select_order_by("SELECT * FROM t")
+            .unwrap()
+            .is_none(),
+    );
+}
+
+// ---------------- TD-185b: ORDER BY fails closed, resolves aliases ----------------
+
+#[test]
+fn order_by_inside_a_window_clause_is_not_the_result_ordering() {
+    // The pgwire-accuracy lane caught this: the `OVER (… ORDER BY ts)` window
+    // specification matched the keyword probe and the projection tail became
+    // the "key". The scan must be paren-aware.
+    let result = PostgresProtocol::extract_select_order_by(
+        "select hostname, usage_user, usage_user - lag(usage_user) over \
+         (partition by hostname order by ts) as delta from cpu",
+    );
+    assert!(
+        result.unwrap().is_none(),
+        "a window ORDER BY is not a top-level ORDER BY"
+    );
+
+    // A real top-level clause after a window spec is still found, with the
+    // window's inner ORDER BY never contributing keys.
+    let keys = PostgresProtocol::extract_select_order_by(
+        "select hostname, avg(usage_user) over (partition by hostname order by ts \
+         rows between 1 preceding and current row) as moving_avg from cpu \
+         order by hostname, ts",
+    )
+    .unwrap()
+    .expect("top-level keys");
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].column, "hostname");
+    assert_eq!(keys[1].column, "ts");
+}
+
+#[test]
+fn order_by_malformed_clause_is_an_error_not_silent_unordered() {
+    // An ORDER BY that is present but unparsable must surface as Err — the
+    // caller fails closed instead of silently returning storage order.
+    let result = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY");
+    assert!(result.is_err(), "empty ORDER BY clause must error");
+    let result = PostgresProtocol::extract_select_order_by("SELECT * FROM t ORDER BY ,,");
+    assert!(result.is_err(), "segment-less ORDER BY clause must error");
+}
+
+#[test]
+fn projection_alias_extraction_resolves_order_by_aliases() {
+    let aliases = PostgresProtocol::extract_projection_aliases(
+        "SELECT k.k_person2 AS friend, n.name FROM knows k JOIN nation n ON true",
+    );
+    assert_eq!(aliases.len(), 1, "only explicit AS pairs, got {aliases:?}");
+    assert_eq!(aliases[0], ("k_person2".to_string(), "friend".to_string()));
+
+    // No projection / `SELECT *` → no aliases.
+    assert!(PostgresProtocol::extract_projection_aliases("SELECT * FROM t").is_empty());
+    assert!(PostgresProtocol::extract_projection_aliases("SELECT a FROM t").is_empty());
+}
+
+// ---------------- TD-PGWIRE-AUTH-1: pgwire auth-posture ladder ----------------
+
+use crate::network::postgres::protocol::PgwireAuthMode;
+
+#[test]
+fn pgwire_auth_authentication_enabled_forces_scram() {
+    // Fail-closed: when [security.authentication] is enabled, SCRAM is REQUIRED
+    // and no config/env combination lowers it — a trust request is warn-ignored.
+    assert_eq!(
+        PgwireAuthMode::resolve(true, Some("trust"), None),
+        PgwireAuthMode::ScramRequired
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(true, None, Some("trust")),
+        PgwireAuthMode::ScramRequired
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(true, None, None),
+        PgwireAuthMode::ScramRequired
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(true, Some("password"), None),
+        PgwireAuthMode::ScramRequired
+    );
+}
+
+#[test]
+fn pgwire_auth_env_overrides_config() {
+    // Env wins over config.
+    assert_eq!(
+        PgwireAuthMode::resolve(false, Some("password"), Some("trust")),
+        PgwireAuthMode::ScramRequired
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(false, Some("trust"), Some("password")),
+        PgwireAuthMode::Trust
+    );
+    // Config alone raises above the trust default.
+    assert_eq!(
+        PgwireAuthMode::resolve(false, None, Some("password")),
+        PgwireAuthMode::ScramRequired
+    );
+    // Case/alias tolerance.
+    assert_eq!(
+        PgwireAuthMode::resolve(false, Some(" SCRAM-SHA-256 "), None),
+        PgwireAuthMode::ScramRequired
+    );
+}
+
+#[test]
+fn pgwire_auth_defaults_to_trust_and_ignores_unknown_values() {
+    // The dev/embedded default: nothing configured ⇒ trust (byte-identical to
+    // the pre-TD-PGWIRE-AUTH-1 posture).
+    assert_eq!(
+        PgwireAuthMode::resolve(false, None, None),
+        PgwireAuthMode::Trust
+    );
+    assert_eq!(
+        PgwireAuthMode::resolve(false, Some("bogus"), Some("also-bogus")),
+        PgwireAuthMode::Trust
+    );
 }
 
 #[test]

@@ -1,0 +1,56 @@
+= TD-DISC-1: recluster discovery job always skips with `no_served_index`
+:status: Open
+:dim: D2
+:pillar: REL
+
+== Problem
+
+The `recluster` discovery job never clusters: over the REST v2 surface
+(`POST /api/v2/collections/{id}/discovery-jobs` with `{"kind":"recluster"}`)
+on a freshly created SST collection with 40 well-spread vectors (comfortably
+above the documented 16-vector recluster minimum), the job runs to
+`status=complete` but reports:
+
+```json
+"quality_metrics": { "recluster_skipped_no_served_index": 1.0 },
+"input_record_count": 0, "recluster_clusters": 0
+```
+
+The pass skips because no served index exists for the collection — meaning
+the recluster pipeline's precondition (a served/serving index) is never
+established by the create→insert→schedule flow the product documents.
+Empirically reproduced on **pristine develop** (`12b5af927`, 2026-09-14) with
+the identical phase, so it predates the ADR-093 S2 work that surfaced it.
+
+Location: the recluster pass in `src/services/discovery/executor.rs` (the
+`recluster_skipped_no_served_index` skip arm) and whatever index-serving
+registration the pass expects (`background_flush_context` / served-index
+registry). Either the registration never happens on the REST create path,
+or the pass looks it up too early.
+
+== Blast radius
+
+Recluster — the "atomic republish with cluster-quality metrics" leg of the
+discovery program — is effectively dead above the unit layer: the job
+completes green while doing nothing. Anything consuming
+`recluster_clusters` as a health signal reads a constant zero.
+
+== Current containment
+
+The recluster phase of `tests/discovery_job_republish_test.rs` early-returns
+behind a `RECLUSTER_KNOWN_DEFECT` constant with the reproduction evidence
+inline (landed with the ADR-093 S2 test repairs). Flip it to `false` to
+re-assert once fixed — that is the acceptance test.
+
+== Next action
+
+1. Trace where a collection's served index is supposed to register
+   (create-time? first flush?) and where the recluster pass looks it up.
+2. Decide the product answer: either recluster auto-builds the index when
+   absent (preferred — the job is the operator's only recluster entry
+   point), or the schedule endpoint rejects recluster jobs for
+   collections without a served index (fail loud instead of a green
+   no-op).
+3. Implement, flip `RECLUSTER_KNOWN_DEFECT`, assert `clusters >= 2`.
+
+Deps: none. Discovered by the ADR-093 S2 adversarial review (2026-09-14).

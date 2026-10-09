@@ -99,7 +99,8 @@ pub trait CatalogSnapshotStore: Send + Sync {
 
     /// Best-effort retention prune of superseded snapshot manifests. Default no-op —
     /// the local single-pod store keeps one rotating blob. The object-store
-    /// implementation caps the manifest log; see
+    /// implementation prunes only explicitly migrated versioned history; legacy
+    /// pruning errors without deleting source objects. See
     /// [`ManifestCommitter::prune_retention`]. Returns the count pruned.
     async fn prune_retention(
         &self,
@@ -226,7 +227,9 @@ impl ObjectStoreSnapshotStore {
         let manifests_prefix = manifests_prefix.into();
         let label = format!("{base_url}::{manifests_prefix}");
         Self {
-            committer: ManifestCommitter::new(store, manifests_prefix),
+            committer: ManifestCommitter::new(store, manifests_prefix).with_legacy_encoding(
+                proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+            ),
             label,
         }
     }
@@ -358,6 +361,36 @@ mod tests {
 
     fn published(w: SnapshotWrite) -> bool {
         matches!(w, SnapshotWrite::Published { .. })
+    }
+
+    #[tokio::test]
+    async fn catalog_serving_handle_continues_after_explicit_manifest_migration() {
+        let backing =
+            ProximaObjectStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let prefix = "catalog/migration";
+        let serving = ObjectStoreSnapshotStore::new(backing.clone(), "memory:///", prefix);
+        assert!(published(serving.write_atomic(5, b"before").await.unwrap()));
+        assert!(
+            serving
+                .prune_retention(2, std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        // All writers and pruners are quiescent during this explicit cutover.
+        ManifestCommitter::new(backing.clone(), prefix)
+            .with_legacy_encoding(
+                proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+            )
+            .migrate_versioned(0)
+            .await
+            .unwrap();
+        assert_eq!(serving.read().await.unwrap().unwrap().bytes, b"before");
+        assert!(published(serving.write_atomic(6, b"after").await.unwrap()));
+        assert!(!published(serving.write_atomic(5, b"stale").await.unwrap()));
+        let reopened = ObjectStoreSnapshotStore::new(backing, "memory:///", prefix);
+        let current = reopened.read().await.unwrap().unwrap();
+        assert_eq!((current.version, current.generation), (1, 6));
+        assert_eq!(current.bytes, b"after");
     }
 
     #[tokio::test]

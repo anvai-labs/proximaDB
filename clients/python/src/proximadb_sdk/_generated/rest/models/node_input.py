@@ -14,7 +14,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.embedding_input import EmbeddingInput
+    from ..models.node_input_embedding import NodeInputEmbedding
     from ..models.node_input_properties import NodeInputProperties
 
 
@@ -23,24 +23,22 @@ T = TypeVar("T", bound="NodeInput")
 
 @_attrs_define
 class NodeInput:
-    """Node payload nested inside `CreateNodeRequest.node`. Matches
-    `RestNodeInput` in proximadb-api's graph handler.
-
-        Attributes:
-            id (str):
-            labels (list[str] | Unset):
-            properties (NodeInputProperties | Unset):
-            embedding (EmbeddingInput | Unset):
+    """
+    Attributes:
+        id (str):
+        labels (list[str] | Unset):
+        properties (NodeInputProperties | Unset):
+        embedding (NodeInputEmbedding | Unset):
     """
 
     id: str
     labels: list[str] | Unset = UNSET
     properties: NodeInputProperties | Unset = UNSET
-    embedding: EmbeddingInput | Unset = UNSET
+    embedding: NodeInputEmbedding | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.embedding_input import EmbeddingInput
+        from ..models.node_input_embedding import NodeInputEmbedding
         from ..models.node_input_properties import NodeInputProperties
 
         id = self.id
@@ -75,7 +73,7 @@ class NodeInput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.embedding_input import EmbeddingInput
+        from ..models.node_input_embedding import NodeInputEmbedding
         from ..models.node_input_properties import NodeInputProperties
 
         d = dict(src_dict)
@@ -91,11 +89,11 @@ class NodeInput:
             properties = NodeInputProperties.from_dict(_properties)
 
         _embedding = d.pop("embedding", UNSET)
-        embedding: EmbeddingInput | Unset
+        embedding: NodeInputEmbedding | Unset
         if isinstance(_embedding, Unset):
             embedding = UNSET
         else:
-            embedding = EmbeddingInput.from_dict(_embedding)
+            embedding = NodeInputEmbedding.from_dict(_embedding)
 
         node_input = cls(
             id=id,

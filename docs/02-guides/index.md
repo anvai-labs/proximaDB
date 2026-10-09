@@ -36,6 +36,7 @@ flowchart TB
 | Guide | Description | Time |
 |-------|-------------|------|
 | [Vector Search](./vector-search.md) | Semantic search, filtering, hybrid search | 15 min |
+| [Vector Index Selection & Benchmarking](./vector-index-selection-and-benchmarking.md) | PAX IVF vs AXIS IVF, I/O budgets, measuring recall + GETs on your own dataset | 20 min |
 | [Multi-Model Joins](./multi-model-joins.md) | Cross-model SQL queries | 20 min |
 
 ## Data Model Guides
@@ -64,7 +65,7 @@ flowchart TB
 ## New Here?
 
 Start with:
-1. [Quick Start](../01-quick-start/) - Get running in 5 minutes
+1. [Quick Start](../01-quick-start/index.md) - Get running in 5 minutes
 2. [Vector Search](./vector-search.md) - Most common use case
 3. [Multi-Model Joins](./multi-model-joins.md) - What makes ProximaDB unique
 
@@ -91,4 +92,4 @@ Start with:
 
 ---
 
-*Looking for API docs?* See [API Reference](../03-api-reference/)
+*Looking for API docs?* See [API Reference](../03-api-reference/index.md)

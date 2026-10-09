@@ -1203,6 +1203,11 @@ impl ArrowProtoCodec {
             Some(Value::BoolValue(b)) => b.to_string(),
             Some(Value::NullValue(_)) => "null".to_string(),
             Some(Value::BytesValue(b)) => format!("{:?}", b),
+            // TD-PROTO-2: canonical compact JSON (same representation as
+            // REST), not a Rust Debug byte dump.
+            Some(Value::JsonbValue(b)) => {
+                proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(b)
+            }
             Some(Value::ArrayValue(_)) => "[array]".to_string(),
             Some(Value::ObjectValue(_)) => "{object}".to_string(),
             None => "null".to_string(),

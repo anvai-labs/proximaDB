@@ -237,7 +237,9 @@ fn test_bind_vector_parameter() {
         .unwrap();
 
     assert!(sql.contains("'embeddings'"));
-    assert!(sql.contains("[0.1,0.2,0.3,0.4]"));
+    // QUOTED vector splice (bare '[...]' was the round-15/20 churn — the
+    // substring form passed under both spellings).
+    assert!(sql.contains("'[0.1,0.2,0.3,0.4]'"));
 }
 
 /// Test binding JSON parameter
@@ -261,8 +263,13 @@ fn test_bind_json_parameter() {
         )
         .unwrap();
 
-    assert!(sql.contains("category"));
-    assert!(sql.contains("electronics"));
+    // STRICT pin of the Json splice shape (substring checks passed under
+    // every prior spelling the branch cycled through): a JSON OBJECT
+    // splices as QUOTED compact JSON text.
+    assert!(
+        sql.contains("'{\"category\":\"electronics\""),
+        "json container param must splice as quoted compact JSON, got: {sql}"
+    );
 }
 
 /// Test binding multiple mixed-type parameters
@@ -904,7 +911,7 @@ fn test_parameter_value_to_sql_string() {
     assert_eq!(ParameterValue::Null.to_sql_string(), "NULL");
     assert_eq!(
         ParameterValue::Vector(vec![1.0, 2.0, 3.0]).to_sql_string(),
-        "[1,2,3]"
+        "'[1,2,3]'"
     );
 }
 

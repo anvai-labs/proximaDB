@@ -1,0 +1,86 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CI-7: The Azure "strong read-back" that verifies the Cool tier never found its probe object
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Fixed on both backends (2026-10-08).** Found while adding the S3 arm of this read-back in TD-CI-6 — the new check failed, and the cause turned out to be pre-existing and shared with the Azure arm.
+| Priority | **MEDIUM.** No wrong behaviour shipped, but the only check that distinguishes "the tier was applied" from "the header was swallowed" has been reporting nothing since it was written, while `TECHNICAL_DEBT.adoc` cites it as the authoritative verification.
+| Component | `scripts/run_cloud_emulator_tests.sh` (the read-back blocks), `crates/storage/proximadb-object-store/src/lib.rs` (the probe tests' `from_url` usage)
+| Relates to | TD-CI-6 (the migration that surfaced it), TD-168 / TD-173 (the tier work it is supposed to verify), ADR-036 (access tier = the cost lever), mandate #1
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`object_store` 0.13 cannot surface a per-object tier on read, so the Rust probe tests can only
+assert that a tiered PUT was **accepted** and round-trips. A backend that silently ignores
+`x-amz-storage-class` satisfies that too — which is why the harness reads the resident tier back
+out-of-band (`az … --query blobTier`, and now `head-object --query StorageClass`). That read-back is
+the whole verification.
+
+**It was querying a key that does not exist.** Scope, stated precisely: only the **Azure** arm
+existed before this change (`origin/develop` has one `Strong read-back` block and no
+`head-object`/`StorageClass` anywhere). The S3 arm is NEW — adding it, and watching it fail
+immediately for the same reason, is what exposed the Azure one. An earlier draft of this entry said
+the read-back had been vacuous "on both backends", which was wrong: there was nothing on the S3 side
+to be vacuous.
+
+The probe tests do:
+
+[source,rust]
+----
+let os = ProximaObjectStore::from_url("s3://proximadb-test/cold/probe-s3.bin")?;  // path = PREFIX
+let p  = Path::from("cold/probe-s3.bin");
+os.put_with_tier(&p, …, ObjectAccessTier::Cool).await?;
+----
+
+`from_url`'s path component is a **prefix**, so the object lands at
+`cold/probe-s3.bin/cold/probe-s3.bin`. Measured against LocalStack:
+
+[source]
+----
+$ aws s3api list-objects-v2 --bucket proximadb-test \
+    --query 'Contents[].{Key:Key,Class:StorageClass}' --output table
+|     Class    |                  Key                  |
+|  STANDARD_IA |  cold/probe-s3.bin/cold/probe-s3.bin  |
+
+$ aws s3api head-object --bucket proximadb-test --key cold/probe-s3.bin
+An error occurred (404) when calling the HeadObject operation: Not Found
+----
+
+So the tier **is** applied correctly — `STANDARD_IA` is right there — and the check looking for it
+was looking one path segment short. The Azure probe has the identical shape
+(`az://…/cold/probe-azure.bin` + `Path::from("cold/probe-azure.bin")`), so its read-back has been
+failing the same way and printing `blobTier = '<unknown>'` on every run.
+
+It went unnoticed because the Azure arm is **warn-only**: a check that cannot fail and cannot find
+its subject produces the same output as a healthy one that simply has nothing to say.
+
+"Since it was written" is checked against history, not assumed: `git log -S` shows the read-back and
+the probe test were introduced by the **same commit** (`6274dbb05`, #483), and that commit's test
+already used the prefix-style `from_url`. So the check has never once found its blob.
+
+== What landed
+
+* Both read-backs now RESOLVE the key by listing and suffix-matching, rather than spelling it out.
+  That is robust to the prefix doubling and stays correct if the doubling is ever fixed.
+* The S3 arm **hard-fails** when the class is not `STANDARD_IA`, and also when no probe object is
+  found at all — because "no object" and "wrong tier" are both vacuity, and the previous code
+  treated the first as success.
+* The Azure arm is now a HARD failure too. Once the key was resolved it reported `Cool` on the
+  first run — so the reason for keeping it warn-only evaporated. The one case that still only warns
+  is `az` genuinely not being installed, which is now detected explicitly (`command -v az`) and
+  reported as a skip rather than hidden inside a generic "unverified" warning. A check that cannot
+  tell "absent tool" from "wrong tier" is the same defect in miniature.
+
+== What is still open
+
+1. **Fix the probe tests' `from_url` usage** so the key is not doubled — pass the bucket URL and let
+   `Path` carry the key, or pass the full URL and write to `Path::default()`. Low priority (the
+   doubling is harmless to the tests, which read through the same store), but it is a trap for the
+   next person who writes an out-of-band check against these objects, which is exactly what happened
+   here.
+2. Consider whether any OTHER warn-only verification in this harness can distinguish "healthy" from
+   "never ran" — the GCS arm self-skips, and this finding is the argument for auditing that too.

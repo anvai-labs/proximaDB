@@ -1,0 +1,54 @@
+= TD-PGW-3: simple-protocol executor silently ACKs unrecognized statements
+:status: Open
+:dim: D2
+:pillar: SEC
+
+== Problem
+
+On the pgwire **simple protocol**, a statement the server doesn't recognize
+returns `CommandComplete(0)` — an empty **success** — instead of a syntax
+error. Empirically probed (2026-09-14, during the pgwire-transactions
+review):
+
+```text
+simple_query("THIS IS NOT SQL")  →  Ok, CommandComplete(0)
+```
+
+No error, no row count, no signal. The statement falls through the
+classifier and the statement-shape dispatch to a generic tail that
+acknowledges whatever reached it. The same silent-OK class made a typo'd
+`COMMIT TRANSACTON` a silent no-op inside a transaction (fixed for the
+transaction-control statement family in the TD-076 PR — tails now fail
+closed with 0A000) — but the generic executor's tail remains for
+everything else.
+
+Extended-protocol multi-statement Parse and extended `SET` show related
+silent shapes (same generic tail).
+
+== Blast radius
+
+* **Clients silently mis-execute**: a mistyped or unsupported statement
+  reports success and the client proceeds on a false premise. The
+  transaction-control fix exists precisely because this class is dangerous
+  where it looks like a commit; the generic tail is the same hazard for
+  every other statement.
+* **Silent `Ok(failure)` anti-pattern** (repo directive): a wire success
+  that did nothing should be an error.
+* Distinguishing "unsupported but acknowledged" from "executed" is
+  impossible for the client.
+
+== Next action
+
+1. Inventory what actually reaches the generic tail (unparseable SQL,
+   known-unsupported families like TRUNCATE, empty statements) and classify
+   each: real syntax error (42601), unsupported-but-recognized (0A000 with
+   the ADR reason), or valid-no-op (rare; PG uses EmptyQueryResponse only
+   for truly empty input).
+2. Replace the tail's `send_command_complete("OK")` with the classified
+   response; keep EmptyQueryResponse for the empty case only.
+3. Guard with e2e negatives: `THIS IS NOT SQL` → 42601; a recognized-
+   unsupported family → 0A000 with reason; empty string → EmptyQueryResponse.
+
+Deps: the TD-076 transaction-control work already built the fail-closed
+pattern for the control-statement family — reuse its shape. Discovered
+2026-09-14 (pgwire-transactions review).

@@ -22,11 +22,9 @@ T = TypeVar("T", bound="CreateNodeRequest")
 
 @_attrs_define
 class CreateNodeRequest:
-    """Wrapped envelope: server expects `{"node": NodeInput}`.
-
+    """
     Attributes:
-        node (NodeInput): Node payload nested inside `CreateNodeRequest.node`. Matches
-            `RestNodeInput` in proximadb-api's graph handler.
+        node (NodeInput):
     """
 
     node: NodeInput

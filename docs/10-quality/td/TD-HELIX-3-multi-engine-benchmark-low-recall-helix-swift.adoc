@@ -1,0 +1,60 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-HELIX-3: `tests/all_engines_50k_benchmark.rs` shows HELIX (default engine) and SWIFT (experimental) at 2–3% search recall
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Discovered 2026-09-15 while gathering real measured evidence for `BENCHMARK_EVIDENCE.toml`'s `vector_search_latency`/`ingest_throughput` claims (the plan's PR-F evidence sprint; see `docs/_internal/status/BENCH_RUN_2026_09_15.adoc`).
+| Priority | **HIGH for HELIX** — it is a default (non-experimental) engine, so 2% recall is a production-facing correctness gap, not a gated feature. **LOW for SWIFT** — it is `experimental-engines`-gated and already documented as unsupported by default.
+| Component | HELIX index build/search path (`src/storage/engines/` HELIX implementation — not yet localized past the benchmark's black-box measurement); SWIFT likewise for the experimental engine.
+| Relates to | `tests/all_engines_50k_benchmark.rs` (the harness that surfaced this — `#[ignore]`d, not wired into any CI tier, which is why this went unnoticed); TD-HELIX-1, TD-HELIX-2 (different HELIX symptoms — dedup-scan visibility, load levels — NOT the same root cause as this search-recall gap, unconfirmed whether related); TD-RECALL-1/2 (different components, both Resolved).
+|===
+
+== Symptom
+
+`cargo test --release --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored`
+(optionally `--features experimental-engines` to include RAPTOR/SWIFT) inserts 10,000 random
+unit-normalized 128-dim vectors, flushes, waits 5s for async index build, then runs 10
+brute-force-verified top-10 queries per engine:
+
+[cols="1,1,1,1", options="header"]
+|===
+| Engine | Recall@10 | Avg latency | Rating
+| SST | 97.0% | 4.4–5.3ms | EXCELLENT
+| **HELIX** | **2.0%** | 1.4–1.5ms | **POOR**
+| NOVA | 100.0% | 18.7–23.3ms | GOOD/ACCEPTABLE
+| RAPTOR (experimental) | 100.0% | 11.9ms | GOOD
+| **SWIFT (experimental)** | **3.0%** | 26.9ms | **POOR**
+|===
+
+The harness's own correctness gate (`r.avg_recall >= 0.5` per engine, `all_engines_50k_benchmark.rs:446-453`)
+fails on HELIX before it ever reaches SWIFT in iteration order — meaning **this test currently
+panics under both feature configurations** (default: fails earlier on the unrelated
+`successful_count >= 4` engine-count assertion since only 3 default engines exist post-VIPER-retirement;
+`--features experimental-engines`: reaches the recall loop and fails on HELIX). Neither failure
+mode is visible anywhere today because the file is `#[ignore]`d and not referenced by any
+`.github/workflows/*.yml` job (verified: `grep -rn all_engines_50k_benchmark .github/ scripts/`
+returns nothing).
+
+HELIX's fast (1.4ms) but near-empty-result search strongly suggests the query is either not
+walking the built index at all (falling back to some cheap/empty path) or resolving against a
+stale/wrong index generation post-flush — 2% of 100 possible correct results (10 queries ×
+top-10) is close to what pure random chance would return. SWIFT's near-zero recall coupled with
+its markedly *higher* latency (27ms, slowest of all 5 engines) suggests a different failure shape
+(paying real search cost but scoring/matching wrong).
+
+== Why this matters for the evidence sprint
+
+The evidence-sprint PR uses SST's measured numbers (97% recall, correctness-verified)
+as the primary baseline for the `vector_search_latency` / `ingest_throughput` ledger claims,
+corroborated by NOVA/RAPTOR (100% recall). HELIX and SWIFT's throughput numbers were measured but
+are **excluded** from the promoted claims — a fast search over the wrong results is not evidence
+of anything the claims care about.
+
+== How to apply
+
+1. Reproduce: `cargo test --release --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored --features experimental-engines` (needs the feature to reach the HELIX assertion at all, since the default-feature run fails earlier on the stale engine-count check — see the companion filing this TD does not fix).
+2. Instrument HELIX's search path to confirm whether it is querying a built index, an empty/stale one, or the wrong generation post-flush (the 5s async-index-build wait in the harness may not be sufficient, or the index may not be getting the flushed segment at all — compare against SST/NOVA's equivalent post-flush search wiring).
+3. SWIFT: check whether its distance/scoring function or candidate-set construction is correct independent of HELIX (different code, likely different root cause despite the similar symptom).
+4. Separately (not this TD): the harness's `successful_count >= 4` assertion (`:440-444`) is stale for default (non-`experimental-engines`) builds — only 3 engines exist since VIPER's retirement (ADR-093) — so this benchmark cannot pass in its default-feature form at all. Either lower the threshold to match `benchmark_engines().len()` or make it feature-aware. Trivial, but not touched here to keep the evidence-sprint PR's diff scoped to docs/ledger only.

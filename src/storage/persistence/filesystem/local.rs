@@ -62,8 +62,10 @@ pub struct LocalFileSystem {
     config: LocalConfig,
     /// LRU cache for memory-mapped files (thread-safe)
     /// Files above MIN_MMAP_SIZE are cached for faster subsequent reads
-    mmap_cache: parking_lot::RwLock<
-        proximadb_runtime_common::cache::LruCache<PathBuf, std::sync::Arc<memmap2::Mmap>>,
+    mmap_cache: std::sync::Arc<
+        parking_lot::RwLock<
+            proximadb_runtime_common::cache::LruCache<PathBuf, std::sync::Arc<memmap2::Mmap>>,
+        >,
     >,
     /// Optional file encryption layer for transparent encryption at rest
     encryption_layer: Option<std::sync::Arc<crate::storage::encryption::FileEncryptionLayer>>,
@@ -153,8 +155,8 @@ impl LocalFileSystem {
 
         Ok(Self {
             config,
-            mmap_cache: parking_lot::RwLock::new(proximadb_runtime_common::cache::LruCache::new(
-                MMAP_CACHE_SIZE,
+            mmap_cache: std::sync::Arc::new(parking_lot::RwLock::new(
+                proximadb_runtime_common::cache::LruCache::new(MMAP_CACHE_SIZE),
             )),
             encryption_layer,
         })
@@ -349,8 +351,8 @@ impl LocalFileSystem {
 
         Ok(Self {
             config,
-            mmap_cache: parking_lot::RwLock::new(proximadb_runtime_common::cache::LruCache::new(
-                MMAP_CACHE_SIZE,
+            mmap_cache: std::sync::Arc::new(parking_lot::RwLock::new(
+                proximadb_runtime_common::cache::LruCache::new(MMAP_CACHE_SIZE),
             )),
             encryption_layer: None,
         })
@@ -402,6 +404,53 @@ impl LocalFileSystem {
 
 #[async_trait]
 impl FileSystem for LocalFileSystem {
+    async fn compare_exchange(
+        &self,
+        path: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        guards: &[(&str, Option<&[u8]>)],
+    ) -> FsResult<bool> {
+        if self.encryption_layer.is_some() {
+            return Err(FilesystemError::InvalidOperation(
+                "conditional coordination-file publication is not qualified for encrypted storage"
+                    .into(),
+            ));
+        }
+        let resolved = PathBuf::from(self.resolve_path(path)?);
+        let expected = expected.map(<[u8]>::to_vec);
+        let replacement = replacement.to_vec();
+        let guards = guards
+            .iter()
+            .map(|(path, expected)| {
+                Ok((
+                    PathBuf::from(self.resolve_path(path)?),
+                    expected.map(<[u8]>::to_vec),
+                ))
+            })
+            .collect::<FsResult<Vec<_>>>()?;
+        let cache = self.mmap_cache.clone();
+        tokio::task::spawn_blocking(move || {
+            let guards: Vec<_> = guards
+                .iter()
+                .map(|(path, expected)| (path.as_path(), expected.as_deref()))
+                .collect();
+            let result =
+                proximadb_runtime_common::file_lock::FileLockManager::compare_exchange_file(
+                    &resolved,
+                    expected.as_deref(),
+                    &replacement,
+                    &guards,
+                );
+            // Invalidate even on an indeterminate error. This remains in the same
+            // blocking task if the caller is cancelled after publication.
+            cache.write().pop(&resolved);
+            result.map_err(FilesystemError::Io)
+        })
+        .await
+        .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -630,6 +679,10 @@ impl FileSystem for LocalFileSystem {
 
     fn supports_append(&self) -> bool {
         true
+    }
+
+    fn supports_conditional_replace(&self) -> bool {
+        cfg!(unix) && self.encryption_layer.is_none()
     }
 
     async fn delete(&self, path: &str) -> FsResult<()> {
@@ -1984,5 +2037,88 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, FilesystemError::AlreadyExists(_)));
         assert_eq!(fs.read("commit.pax").await.unwrap(), b"first");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_publication_decorators_forward_and_encryption_rejects() {
+        use crate::storage::encryption::{
+            FileEncryptionLayer,
+            key_manager::{KeyManager, KeyVersionManager},
+        };
+        use proximadb_storage_filesystem_types::counting::{CountingFileSystem, GetCounters};
+        use proximadb_storage_filesystem_types::faults::FaultInjectingFileSystem;
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        let config = LocalConfig {
+            root_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let local: Arc<dyn FileSystem> =
+            Arc::new(LocalFileSystem::new(config.clone()).await.unwrap());
+        let counted: Arc<dyn FileSystem> = Arc::new(CountingFileSystem::new(
+            local,
+            Arc::new(GetCounters::default()),
+        ));
+        let fs = FaultInjectingFileSystem::new(counted);
+        assert!(fs.supports_conditional_replace());
+        assert!(
+            fs.compare_exchange("lease.meta", None, b"first", &[])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fs.compare_exchange("lease.meta", None, b"bad", &[])
+                .await
+                .unwrap()
+        );
+        assert!(
+            fs.compare_exchange("lease.meta", Some(b"first"), b"second", &[])
+                .await
+                .unwrap()
+        );
+        assert_eq!(fs.read("lease.meta").await.unwrap(), b"second");
+        assert!(
+            !fs.compare_exchange(
+                "offset.meta",
+                None,
+                b"progress",
+                &[("lease.meta", Some(b"first"))]
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            fs.compare_exchange(
+                "offset.meta",
+                None,
+                b"progress",
+                &[("lease.meta", Some(b"second"))]
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(fs.read("offset.meta").await.unwrap(), b"progress");
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let keys = Arc::new(KeyVersionManager::new(Arc::new(KeyManager::new(key))));
+        let encrypted = LocalFileSystem::new_with_encryption(
+            config,
+            Some(Arc::new(FileEncryptionLayer::new(keys, true, 4096))),
+        )
+        .await
+        .unwrap();
+        assert!(!encrypted.supports_conditional_replace());
+        assert!(matches!(
+            encrypted
+                .compare_exchange("lease.meta", Some(b"second"), b"bad", &[])
+                .await,
+            Err(FilesystemError::InvalidOperation(_))
+        ));
+        assert_eq!(
+            std::fs::read(dir.path().join("lease.meta")).unwrap(),
+            b"second"
+        );
     }
 }

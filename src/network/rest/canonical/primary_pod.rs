@@ -42,14 +42,14 @@
 //!
 //! ## Routes
 //!
-//! * `GET /api/v1/primary-pod/:tenant_id/:collection_id` — read
+//! * `GET /api/v2/primary-pod/:tenant_id/:collection_id` — read
 //!   current binding. 200 with `Bound { ... }` or `Unbound { ... }`.
-//! * `PUT /api/v1/primary-pod/:tenant_id/:collection_id` — assign or
+//! * `PUT /api/v2/primary-pod/:tenant_id/:collection_id` — assign or
 //!   re-assign. Body: `{ "pod": "...", "reason": "operator" }`.
 //!   200 with the new state and the optional previous binding.
-//! * `DELETE /api/v1/primary-pod/:tenant_id/:collection_id` — unbind.
+//! * `DELETE /api/v2/primary-pod/:tenant_id/:collection_id` — unbind.
 //!   200 with `{ removed: bool }`.
-//! * `GET /api/v1/primary-pod` — list every assignment. 200 with a
+//! * `GET /api/v2/primary-pod` — list every assignment. 200 with a
 //!   `count`-prefixed array sorted by `(tenant_id, collection_id)`.
 
 use axum::{
@@ -278,7 +278,7 @@ pub struct ListResponse {
 
 // ── Handlers ───────────────────────────────────────────────────────
 
-/// `GET /api/v1/primary-pod/:tenant_id/:collection_id`
+/// `GET /api/v2/primary-pod/:tenant_id/:collection_id`
 pub async fn get_primary_pod(
     user_context: Option<Extension<UnifiedUserContext>>,
     State(state): State<AppState>,
@@ -302,7 +302,7 @@ pub async fn get_primary_pod(
     }
 }
 
-/// `PUT /api/v1/primary-pod/:tenant_id/:collection_id`
+/// `PUT /api/v2/primary-pod/:tenant_id/:collection_id`
 pub async fn put_primary_pod(
     user_context: Option<Extension<UnifiedUserContext>>,
     State(state): State<AppState>,
@@ -364,7 +364,7 @@ pub async fn put_primary_pod(
     }))
 }
 
-/// `DELETE /api/v1/primary-pod/:tenant_id/:collection_id`
+/// `DELETE /api/v2/primary-pod/:tenant_id/:collection_id`
 pub async fn delete_primary_pod(
     user_context: Option<Extension<UnifiedUserContext>>,
     State(state): State<AppState>,
@@ -408,7 +408,7 @@ pub async fn delete_primary_pod(
     }))
 }
 
-/// `GET /api/v1/primary-pod`
+/// `GET /api/v2/primary-pod`
 pub async fn list_primary_pods(
     user_context: Option<Extension<UnifiedUserContext>>,
     State(state): State<AppState>,
