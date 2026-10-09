@@ -2467,10 +2467,15 @@ jobs:
     needs: changes
     strategy:
       matrix:
-        # Floor is 3.11 (`requires-python = ">=3.11"`). 3.9 went when the floor
-        # was 3.10; 3.10 went when it reached upstream EOL in October 2026. 3.11
-        # stays because it is what Debian 12 — current stable — ships, and it has
-        # upstream support until October 2027.
+        # Floor is 3.11 (`requires-python = ">=3.11"`). One criterion, applied
+        # consistently: do not drop an interpreter upstream still supports.
+        # 3.9 went when the floor was 3.10; 3.10 went when it reached upstream
+        # EOL on 2026-10-01. 3.11 stays because upstream supports it until
+        # October 2027 -- not because of any distro's packaging: current Debian
+        # stable (13 "trixie", since 2025-08-09) ships 3.13, so a distro test
+        # would argue for a HIGHER floor, and the oldest LTS still in support
+        # (Ubuntu 22.04, 3.10, to 2027) would argue for a lower one. Upstream
+        # support is the only self-consistent rule.
         #
         # The matrix WIDTH is the cost dial (TD-CI-2). At promotion the full
         # interpreter sweep runs; on feat->develop only 3.12 does, because
