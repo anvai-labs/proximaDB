@@ -358,14 +358,15 @@ them, then a row was inserted and the numbering silently desynchronised from the
 table's own `Source` column.
 
 * **No row in this table is in the evidence ledger.** Every GET and byte figure
-  below is read off a **job log**, not a recorded measurement — none of them
+  below is read off a run that was not recorded — a **job log** for the three
+  qa-gate rows, a workstation console for the `s3://` row — and none of them
   appears in `BENCHMARK_EVIDENCE.toml`. Nor is there a ledgered I/O figure for
   *this* configuration to check them against: the ledger claim backing these
   cascade arms, `pax_rabitq_sq8_sift1m_recall_at_10`, is recall-only
   (`metric = "recall_at_10"`, TD-SIFTCOMPACT-1). The ledger does carry SIFT I/O
   claims — `rdstrat8_sift_ivf2_coarse_probe` and `nprobe_sweep_trained_1m`, both
-  cited further down — but those are different runs on different beds and
-  hardware, so they are not a baseline for these rows. Per engineering mandate #6
+  discussed later in this section — but those are different runs on different beds
+  and hardware, so they are not a baseline for these rows. Per engineering mandate #6
   that makes the figures here *reproducible* but not *ledgered*: cite them as
   such, and land a ledger entry before quoting them as end-to-end evidence in an
   ADR or a release claim.
@@ -373,8 +374,8 @@ table's own `Source` column.
   **qa-gate `sift-pax-recall`** run — the last successful one, 2026-09-04 — and
   are reproducible in CI. `[baseline]` and `[rg_layout]` are both logged in that
   single run, which is what makes the layout comparison controlled.
-* **`s3://` budget** is **workstation-only and not in the evidence ledger** — no
-  CI job sets `PROXIMADB_OBJECT_STORE_URL`, so that arm has never run in CI.
+* **`s3://` budget** is **workstation-only** — no CI job sets
+  `PROXIMADB_OBJECT_STORE_URL`, so that arm has never run in CI.
   Treat it as indicative and re-measure on your own account. (That gap is part of
   what TD-VECEVAL-1 covers.)
 * The harness forces `PROXIMADB_PAX_F32_TIER=1`, which is **default-OFF**
@@ -450,7 +451,8 @@ Reading it:
   *leg* constant, ANN on both sides, whereas 8.4× compares an exact leg against an
   ANN leg and so carries one confound more. Treat it as a direction, not a number,
   until both rows are re-measured on one machine against one backend.
-* With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
+* With the IVF coarse directory **trained**, the ledgered 1M-scale sweep
+  (`nprobe_sweep_trained_1m`) records
   **81 GETs / 92 ms at recall 0.9860 probed vs 108 GETs / 144 ms at 0.9840
   unprobed** (ratchet 0.984) — better on every axis, recall included, **on the
   1M bed**. (The ledger's 0.9870 is the nprobe=12 arm, which is not the
