@@ -103,6 +103,7 @@ jobs:
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
       docs: ${{ steps.filter.outputs.docs }}
+      docs_site: ${{ steps.filter.outputs.docs_site }}
       td_citations: ${{ steps.filter.outputs.td_citations }}
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
@@ -227,6 +228,14 @@ jobs:
               - 'docs/**'
               - '*.adoc'
               - '*.md'
+            # Separate from `docs`, for the reason the next comment gives: three
+            # other jobs (docs-authority, risk-coverage, capability-matrix) are
+            # gated on `docs`, so adding mkdocs.yml to it would have changed
+            # their triggers too. TD-DOCSITE-1.
+            docs_site:
+              - 'docs/**'
+              - 'mkdocs.yml'
+              - 'scripts/check_docs_site_coverage.py'
             # Separate from `docs` on purpose: three other jobs are gated on
             # `docs`, and widening it would silently change their triggers too.
             # This one exists because a TD citation is invalidated by a RENAME in
@@ -1418,7 +1427,7 @@ jobs:
     name: Docs Validation
     runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true'
+    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true' || needs.changes.outputs.docs_site == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -1442,6 +1451,12 @@ jobs:
       # historical are skipped.
       - name: Check TD-cited test names resolve
         run: python3 scripts/check_td_cited_tests.py
+      # Blocking because this job IS in ci-success's needs, unlike the
+      # `Build docs (strict)` job in docs-site.yml — a separate workflow cannot
+      # appear in `needs`, so that one is advisory. Stdlib-only on purpose, so it
+      # costs no toolchain here. TD-DOCSITE-1.
+      - name: Check no user-facing page is silently unpublished
+        run: python3 scripts/check_docs_site_coverage.py
       - name: Check documentation links
         run: |
           echo "Checking for broken links in documentation..."

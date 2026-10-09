@@ -443,7 +443,7 @@ flowchart TB
 
 - [Storage Engines](./storage-engines.adoc) - How WAL feeds engines
 - [Query Planner](./query-planner.md) - Read path
-- [Backup & Restore](../04-operations/) - WAL in backups
+- [Backup & Restore](../04-operations/index.md) - WAL in backups
 
 ---
 

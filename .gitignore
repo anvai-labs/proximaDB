@@ -308,6 +308,8 @@ docs/log/
 !config.json
 # Versioned wire contracts (e.g. statistics-envelope.v1) must track without -f.
 !docs/12-design/contracts/*.json
+# Docs-site coverage baseline — the guard reads it, so it must track (TD-DOCSITE-1).
+!docs/.site-coverage-baseline.json
 # Pinned-model parity fixtures and the model catalog are hand-versioned test
 # sources (TD-SELECTOR-1 gate 5) — include_str! requires them in-tree.
 !crates/modalities/proximadb-rank-onnx/tests/fixtures/*.json
@@ -476,6 +478,8 @@ docs/archive/sessions/
 # MLflow conformance ratchets must stay tracked (negation must FOLLOW the blanket *.txt above)
 !clients/python/tests/mlflow_conformance_steps_2x.txt
 !clients/python/tests/mlflow_conformance_steps_3x.txt
+# Pinned docs-site toolchain — CI installs it, so it must track.
+!requirements-docs.txt
 
 # Consolidated config dir (configs/ merged into config/)
 /configs/

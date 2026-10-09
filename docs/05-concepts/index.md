@@ -54,7 +54,7 @@ flowchart TB
 | Module-level LLD ownership | [Module Component LLD Map](../12-design/MODULE_COMPONENT_LLD_2026_05_22.adoc) |
 | Documentation ownership and archive rules | [Documentation Consolidation Plan](../12-design/DOCUMENTATION_CONSOLIDATION_AND_ARCHIVE_PLAN_2026_05_22.adoc) |
 | Supported feature claims | [Supported Surface](../SUPPORTED_SURFACE.adoc) |
-| API and protocol references | [API Reference](../03-api-reference/) |
+| API and protocol references | [API Reference](../03-api-reference/index.md) |
 
 ## Design Principles
 
@@ -84,4 +84,4 @@ canonical owner instead of adding a parallel path. Use the design docs above to 
 - [Multi-Model Joins](../02-guides/multi-model-joins.md) - Cross-model SQL query patterns
 - [API Surface and Performance](../02-guides/api-surface-performance-guide.md) - Choosing SDK, SQL, UQL, REST/gRPC, pgwire, or Arrow Flight
 - [Configuration](../03-api-reference/configuration.adoc) - Runtime and deployment settings
-- [Internals](../06-internals/) - Contributor workflows and implementation details
+- [Internals](https://github.com/anvai-labs/proximaDB/tree/main/docs/06-internals) - Contributor workflows and implementation details

@@ -255,7 +255,23 @@ jobs:
           PROXIMADB_SIFT_QUERIES: "1000"
           PROXIMADB_RECALL_DATASET_REQUIRED: "1"
           PROXIMADB_SIFT_CENTROID_MAX_RECALL_DROP: "0"
-        run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --nocapture
+        # --test-threads=1 here is DEFENCE-IN-DEPTH, not a fix: this repo already
+        # serialises libtest via `.cargo/config.toml` `[env] RUST_TEST_THREADS =
+        # "1"` (that file's own `test-parallel` alias exists to override it), so
+        # this job has always run one test at a time. An earlier revision of this
+        # comment claimed the arms "had been running in parallel" and that the
+        # flag was load-bearing; both were false -- and the reference table is
+        # positive evidence against the race, since [baseline] and [rg_layout]
+        # set the same process-global gate and produced two DIFFERENT geometries
+        # from one run, which a racing run would almost certainly not have done
+        # (each arm writes 100k vectors across five flushes, so concurrent starts
+        # would have both flushing under whichever value was current).
+        #
+        # The flag is kept because cargo's `[env]` without `force = true` does
+        # NOT override an externally exported RUST_TEST_THREADS, so a runner or
+        # wrapper that exports it would reintroduce parallelism -- and the three
+        # arms in this file do share process-global PAX gates with no mutex.
+        run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --test-threads=1 --nocapture
 
   # Validate the object-store access-tier cost lever (TD-168/TD-173) against REAL
   # cloud APIs via emulators — Azurite (Azure), LocalStack (S3), fake-gcs (GCP) — the
