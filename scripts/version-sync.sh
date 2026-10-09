@@ -345,6 +345,16 @@ cmd_check() {
     # carried control information, so `version = "<SKIP:anything>"` in
     # clients/rust/Cargo.toml (valid TOML) or `<version>&lt;SKIP:x&gt;</version>`
     # in the pom (valid XML) still passed the gate.
+    #
+    # This narrows that channel but does not close it: a manifest whose version
+    # is literally `<SKIP:inherits-workspace>` (cargo) or
+    # `<SKIP:pom-inherits-parent>` (maven_pom) still skips. Both near misses are
+    # rejected -- any other reason text, and the right literal under the wrong
+    # extractor -- so what remains is one exact string per type. Left as is
+    # deliberately: cargo and maven both reject a non-semver version downstream,
+    # no tool emits the shape, and closing it means touching the extractors,
+    # which is where five successive hardening rounds each introduced a
+    # regression. Fix it with the deferred work, not alongside a release bump.
     if { [ "$actual" = "<SKIP:inherits-workspace>" ] && [ "$type" = "cargo" ]; } \
        || { [ "$actual" = "<SKIP:pom-inherits-parent>" ] && [ "$type" = "maven_pom" ]; }; then
       reason="${actual#<SKIP:}"

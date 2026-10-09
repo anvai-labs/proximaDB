@@ -27,8 +27,8 @@ mean different things — the prepare commit and the promotion that shipped it.
 Headline: ADR-094 unified the three
 divergent storage substrates behind one compute seam, and the I/O-cost work that followed made
 round-trip count — not bytes, not CPU — the term the engine measures and the operator can tune.
-Full notes land with the docs-site PR (they must ship together with their nav
-entry, or the strict build fails on an unpublished page).
+Full notes follow in their own change: a release-notes page must ship together
+with its nav entry, or `mkdocs build --strict` fails on an unpublished page.
 
 ### Storage substrate (ADR-094)
 - Durable relational spill store with read-merge, bounded memtable, segment discovery with
@@ -102,7 +102,8 @@ entry, or the strict build fails on an unpublished page).
   at random on PRs that did not cause it (TD-TESTPORT-1).
 - A duplicate Helm chart under `deploy/infrastructure/helm/proximadb` cannot render (its template
   `include`s a helper defined nowhere), so the dev-deploy script and two deployment guides point
-  at a broken path. Its stale 0.2.0 version pins were deliberately NOT bumped for this release
+  at a broken path. Its stale version pins (chart 0.1.0, appVersion and image tags 0.2.0) were
+  deliberately NOT bumped for this release
   (TD-HELMDUP-1).
 
 ## [0.3.0] - 2026-08-05

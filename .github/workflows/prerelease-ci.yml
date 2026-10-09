@@ -75,7 +75,7 @@ concurrency:
   # Dedup push+PR of the same branch into one group; cancel superseded
   # runs on feature/PR branches, but let protected-branch runs finish.
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.ref_name != 'main' && github.ref_name != 'develop' }}
+  cancel-in-progress: ${{ github.ref_name != 'main' && github.ref_name != 'qa' && github.ref_name != 'develop' }}
 
 jobs:
   # ============================================================================
@@ -125,6 +125,14 @@ jobs:
   prepare:
     name: Prepare Build
     needs: version-check
+    # On an automatic push to `qa` we want the version gate ONLY. This job is
+    # the fan-out point -- build-binaries, build-sdist and validate-artifacts all
+    # need it -- and that chain measured 3h25m and 4h13m on its last two main
+    # runs. Paying that on every develop->qa promotion to get a one-minute
+    # version check is the wrong trade (mandate #7). A push to main still runs
+    # the full matrix, and so does an explicit workflow_dispatch against `qa`,
+    # which is how you validate a release candidate on purpose.
+    if: ${{ !(github.event_name == 'push' && github.ref_name == 'qa') }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ needs.version-check.outputs.version }}
@@ -740,7 +748,10 @@ jobs:
     name: Pre-Release Summary
     needs: [prepare, validate-artifacts]
     runs-on: ubuntu-latest
-    if: always()
+    # `always()` so it still reports when a build leg fails -- but not on an
+    # automatic `qa` push, where `prepare` is skipped on purpose and there is
+    # nothing to summarise.
+    if: ${{ always() && !(github.event_name == 'push' && github.ref_name == 'qa') }}
     steps:
       - name: Download All Artifacts
         uses: actions/download-artifact@v8
@@ -821,7 +832,9 @@ jobs:
     name: Cleanup Artifacts
     needs: [prepare, validate-artifacts, prerelease-summary]
     runs-on: ubuntu-latest
-    if: always()
+    # Nothing is uploaded on an automatic `qa` push, so there is nothing to
+    # delete.
+    if: ${{ always() && !(github.event_name == 'push' && github.ref_name == 'qa') }}
     steps:
       - name: Delete Workflow Artifacts
         uses: geekyeggo/delete-artifact@v6
