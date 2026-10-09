@@ -357,6 +357,24 @@ jobs:
           path: /home/runner/.cache/sccache
           key: sccache-qa-tier-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: sccache-qa-tier-${{ runner.os }}-
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Restart proofs (Azure strict, S3 strict) + recall ratchet (Azure)
         run: bash scripts/run_cloud_emulator_tests.sh --qa
 
@@ -417,6 +435,24 @@ jobs:
           path: /home/runner/.cache/sccache
           key: sccache-mlflow-s3-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: sccache-mlflow-s3-${{ runner.os }}-
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: MLflow S3 artifact seam conformance
         run: bash scripts/run_cloud_emulator_tests.sh --mlflow-s3
 
@@ -468,6 +504,24 @@ jobs:
           sudo mkswap /mnt/swapfile-ci
           sudo swapon /mnt/swapfile-ci
           free -h
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Validate Cool tier against Azure/S3/GCS emulators
         # docker + aws/az CLIs are preinstalled on ubuntu-latest runners.
         run: bash scripts/run_cloud_emulator_tests.sh
