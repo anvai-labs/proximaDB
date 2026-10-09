@@ -82,6 +82,7 @@ jobs:
   # VERSION CHECK - Validate version consistency across codebase
   # ============================================================================
   version-check:
+    timeout-minutes: 30
     name: Check Version Consistency
     runs-on: ubuntu-latest
     outputs:
@@ -123,6 +124,7 @@ jobs:
   # PREPARE - Set up build parameters
   # ============================================================================
   prepare:
+    timeout-minutes: 30
     name: Prepare Build
     needs: version-check
     # On an automatic push to `qa` we want the version gate ONLY. This job is
@@ -147,6 +149,7 @@ jobs:
   # BUILD RUST BINARIES - Cross-platform binary builds
   # ============================================================================
   build-binaries:
+    timeout-minutes: 150
     name: Build ${{ matrix.target }}
     needs: prepare
     runs-on: ${{ matrix.os }}
@@ -158,7 +161,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
-            features: ""
+            features: "cloud-full"
 
           # Linux x86_64 (musl - static) - DISABLED for v0.2.0
           # Target installation issue - requires manual musl target setup
@@ -188,7 +191,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             archive: zip
-            features: ""
+            features: "cloud-full"
 
     steps:
       - name: Checkout
@@ -397,6 +400,7 @@ jobs:
   # BUILD SOURCE DISTRIBUTION
   # ============================================================================
   build-sdist:
+    timeout-minutes: 45
     name: Build Source Distribution
     needs: prepare
     runs-on: ubuntu-22.04
@@ -437,6 +441,7 @@ jobs:
   # VALIDATE ARTIFACTS - Pre-release validation gate
   # ============================================================================
   validate-artifacts:
+    timeout-minutes: 30
     name: Validate Artifacts
     needs: [prepare, build-binaries, build-sdist]
     runs-on: ubuntu-latest
@@ -745,6 +750,7 @@ jobs:
   # PRE-RELEASE SUMMARY - Generate release-ready.json
   # ============================================================================
   prerelease-summary:
+    timeout-minutes: 30
     name: Pre-Release Summary
     needs: [prepare, validate-artifacts]
     runs-on: ubuntu-latest
@@ -829,6 +835,7 @@ jobs:
   # CLEANUP
   # ============================================================================
   cleanup:
+    timeout-minutes: 30
     name: Cleanup Artifacts
     needs: [prepare, validate-artifacts, prerelease-summary]
     runs-on: ubuntu-latest
