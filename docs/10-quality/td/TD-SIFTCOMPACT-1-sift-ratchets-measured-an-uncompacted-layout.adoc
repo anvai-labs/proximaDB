@@ -8,7 +8,7 @@
 | Status | **Open.** Filed 2026-10-08, found by adversarial review of the TD-IVF2ENGAGE-1 change.
 | Severity | Medium-High — no incorrect query results, but published recall/GET evidence may describe a layout the tests were not meant to exercise.
 | Component | `tests/sift_pax_recall_ratchet_test.rs` (shared `collection()` helper), `src/storage/engines/sst/flush/mod.rs`, `crates/storage/proximadb-storage-common/src/compaction_override.rs`
-| Related | TD-IVF2ENGAGE-1 (the sibling fix), TD-WLP-4 / ADR-061 (armed-by-default compaction), TD-VECEVAL-1
+| Related | TD-IVF2ENGAGE-1 (the sibling fix), TD-WLP-4 / ADR-061 (armed-by-default compaction)
 |===
 
 == The defect
@@ -60,7 +60,7 @@ ran `sift_pax_cascade_recall_at_10_ratchet_rg_layout` at N=100 000:
 flushed 100000 base vectors
 ground truth rows=50: provided/filterable=33, brute-force=17
 thread 'sift_pax_cascade_recall_at_10_ratchet_rg_layout' panicked at
-  tests/sift_pax_recall_ratchet_test.rs:505:5:
+  tests/sift_pax_recall_ratchet_test.rs, in assert_single_vector_access:
 assertion `left == right` failed: each ratchet query must report one physical
   vector access
 ----
@@ -80,7 +80,9 @@ Re-ran it and captured the values this time:
 
 [source]
 ----
-panicked at tests/sift_pax_recall_ratchet_test.rs:516:5:
+panicked in assert_single_vector_access
+  (tests/sift_pax_recall_ratchet_test.rs; line numbers below are from the probe
+  tree, which carries the extra mint lines, so they do not match HEAD):
 assertion `left == right` failed: each ratchet query must report one physical
   vector access
   left: 0
@@ -102,10 +104,28 @@ lines. Those two lines are the whole diagnosis; dropping them is what let the
 misreading stand.
 
 Zero accesses means the `Ann` site's guard did not fire:
-`vector_ann_proof_count() > ann_proofs_before` (`search/mod.rs:753`). The only
-emitter for this configuration is the PAX coalesced cascade (`:593`), so **the
-ANN cascade declined on the compacted segment** — silently, with the search still
-returning `Ok`.
+`result.is_ok() && vector_ann_proof_count() > ann_proofs_before`
+(`search/mod.rs:753`). **No ANN proof was emitted** — which is what the data
+supports, and is weaker than the claim an earlier revision made here ("the only
+emitter … so the cascade declined").
+
+Three things produce that, and this observation does not separate them:
+
+. The PAX coalesced cascade (`:593`) declined — the most plausible reading,
+  since it is the emitter this configuration normally uses.
+. `discover_sstable_files_with_centroid_pruning` (`:2418`) also emits a proof and
+  sits on the same non-orchestrated path (reached from `:1347` and `:2033`), so
+  "the only emitter" was wrong. (`execute_orchestrated_search` at `:1141` IS
+  unreachable here: empty `index_configs` means `use_orchestrated_search` is
+  false.)
+. The search returned `Err`. The guard is `result.is_ok() && …`, so a failing
+  search yields the identical `len() == 0`. "Still returning `Ok`" was asserted,
+  not shown.
+
+Separating them needs the per-decline recording in the work below. Until then
+"no proof emitted" is the finding and "the cascade declined" is the hypothesis —
+a distinction this document exists to respect, having already had one
+single-observation inference overturned.
 
 That is a **product** finding, not a test-baselining one: ANN engagement is lost
 on a compacted layout under this arm's write gates (`PAX_F32_TIER=1`,
