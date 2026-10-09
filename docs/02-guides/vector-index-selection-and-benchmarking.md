@@ -36,7 +36,7 @@ redundant — they optimise different cost terms.
 | | **PAX IVF** (co-located) | **AXIS IVF** (separate index) |
 |---|---|---|
 | Where vectors live | In the data object, as typed stripes | In the data object |
-| Where the index lives | *No separate index* — the IVF coarse directory is **Region A0**, inside the same object | A separate in-memory HNSW/IVF structure; materialized projection bytes live under `indexes/<projection>/` |
+| Where the index lives | *No separate index* — the IVF coarse directory is **Region A0**, inside the same object (written by compaction only; a freshly flushed segment has none — see *Knobs*) | A separate in-memory HNSW/IVF structure; materialized projection bytes live under `indexes/<projection>/` |
 | Payload fetch | Same object, same GET family | Second hop after the index returns ids |
 | Quantization | RaBitQ (~1 bit/dim) → SQ8/FP16 rerank, in-segment | Index-side (IVF/HNSW/flat) |
 | Filtered search | Metadata stripes co-resident → prune before ranking | Needs a join or post-filter |
@@ -101,8 +101,14 @@ Budget the RAM: ADR-070 measures 8.6 GB for 1M × 768d vectors.
 **A caution that applies to both.** Index choice is secondary to the
 **I/O budget** (below). In our own measurements, moving the storage budget from
 the local **1 MiB** target to the `s3://` **8 MiB** target cut GETs/query by 22%
-at identical recall, while the IVF coalescing and nprobe knobs were *inert* on
-the un-clustered path. Measure the budget first.
+at identical recall, while the nprobe knob was *inert* on the un-clustered path
+(no Region A0 to probe — see *Knobs*). Measure the budget first.
+
+Read that 22% with the same caution the reference table carries: the two sides
+come from **different machines** (CI for the local budget, a workstation for
+`s3://`), so it is an indication of direction and rough size, not a within-run
+measurement. The GET and byte deltas are the reproducible part; treat latency
+across those two rows as not comparable at all.
 
 ## The I/O budget dominates — and it is tunable
 
@@ -194,7 +200,7 @@ PROXIMADB_SIFT_QUERIES=1000 \
     --test sift_pax_recall_ratchet_test --no-capture
 ```
 
-Use **nextest** (mandate #11). Three of the arms set process-global PAX env vars
+Use **nextest** (the repo's determinism-and-test-hygiene mandate, `docs/agent-rules/CLAUDE.md.seed` #11). Three of the arms set process-global PAX env vars
 (`PROXIMADB_PAX_WRITE_RG_LAYOUT`, `PROXIMADB_PAX_FOOTER_STATS`) with no mutex, so
 they must not run concurrently; nextest gives each test its own process, which
 makes that structural.
@@ -234,8 +240,15 @@ which understates the GET savings a cloud budget gives you.
 | `PROXIMADB_RECALL_DATASET_REQUIRED` | fail instead of skip when the corpus is missing |
 | `PROXIMADB_OBJECT_STORE_URL` | measure against a cloud/emulator base |
 | `PROXIMADB_PAX_READ_COARSE_NPROBE` | coarse cells probed (recall↔GET trade) — **requires a compacted segment**, see below |
+| `PROXIMADB_SEGMENT_INVARIANTS_CACHE_MB` | **leave unset.** Unset keeps the cache-free baseline the CI rows were measured under; any value opts the run into the corresponding route-time cache policy, which changes both the numbers and which query pairs the paired cohort admits |
+| `PROXIMADB_SURVIVOR_CACHE_BUDGET_MB` | **leave unset**, same reason |
 
-Two further gates appear in the test file and neither belongs in the run above:
+The table above is the set that is useful to set for this run — not an
+exhaustive list of what the file reads (it also consults the `PROXIMADB_SIFT_IVF2_*`
+family, `PROXIMADB_SIFT_IVF_FLUSH`, `PROXIMADB_IVF_K`,
+`PROXIMADB_TRAINING_COMPACTION_MIN_MB`, `PROXIMADB_TRACE_GETS` and others, which
+belong to the `#[ignore]`d arms). Two of them are worth calling out because they
+look like they belong in the documented run and do not:
 
 * `PROXIMADB_SIFT_COALESCED_BYTE_BUDGET` (bytes/query ceiling) is **inert here** —
   it is read only inside the `#[ignore]`d `sift_coalesced_rabitq_scan_rerank_eval`,
@@ -245,8 +258,10 @@ Two further gates appear in the test file and neither belongs in the run above:
   in `CountingFileSystem` when it is present. The check is
   `var_os(...).is_some()`, so **even `PROXIMADB_COUNT_FS_IO=0` turns the wrapper
   on** and changes the stack your latency numbers come from. The two `#[ignore]`d
-  evals set it for themselves deliberately; the documented run must not, and it
-  does not need to — it derives GET and byte figures from io_trace snapshots,
+  evals that measure filesystem counters — `sift_coalesced_rabitq_scan_rerank_eval`
+  and `sift_ivf2_coarse_probe_recall_ratchet` — set it for themselves
+  deliberately (the bakeoff eval does not set it at all); the documented run must
+  not, and it does not need to — it derives GET and byte figures from io_trace snapshots,
   which is why it needs `--features io-trace`.
 
 !!! warning "nprobe is inert in the documented run, and no env var fixes that"
@@ -256,8 +271,11 @@ Two further gates appear in the test file and neither belongs in the run above:
     passes `None` for the probe plan (`segment_format.rs` — *"two-level is
     compaction-only (TD-RDSTRAT-8)"*), because IVF-at-flush measured **~80×
     flush cost** and was dropped. Training is already default-ON
-    (`PROXIMADB_PAX_WRITE_A0_TRAIN`), so there is **no env var that trains at
-    flush** — no knob substitutes for a compaction having run.
+    (`PROXIMADB_PAX_WRITE_A0_TRAIN`), so **no env var makes flush emit A0** — no
+    knob substitutes for a compaction having run. (`PROXIMADB_PAX_FLUSH_CLUSTER=ivf`
+    does apply a compaction-grade PCA+IVF recluster at flush, which is why that
+    phrasing matters: it changes record *ordering*, while the probe plan handed to
+    the flush writer is still `None`, so there is no Region A0 either way.)
 
     **Why the run above produces no A0 is worth stating precisely, because it is
     not "flush declined to".** The durable fact is that *these ratchet
@@ -292,8 +310,11 @@ Two further gates appear in the test file and neither belongs in the run above:
       over that segment. `#[ignore]`d, so it needs `-- --ignored`.
     * `sift_ivf2_probe_release_bakeoff_eval` (also `#[ignore]`d) is the
       writer-direct alternative: it calls the compacted writer itself rather than
-      going through the flush trigger, which is what you want if you need the v3
-      layout without a compaction cadence.
+      going through the flush trigger. **It is not a general substitute** — it
+      hard-asserts a full 1 000 000-row corpus and exactly 100 queries and
+      requires `sift_groundtruth.ivecs`, and it reads neither
+      `PROXIMADB_SIFT_N` nor `PROXIMADB_SIFT_QUERIES`, so on your own corpus it
+      panics rather than scaling down. Use it only against complete SIFT1M.
 
 ### Reading the output
 
@@ -384,8 +405,15 @@ Reading it:
   97.8 → 25.3 MB (−74%) at identical recall 0.9896** — the largest single effect
   in the table, and it is a shipped default rather than a knob.
 * Moving from the **local 1 MiB target to the `s3://` 8 MiB target cut GETs 22%
-  for +6% bytes at identical recall** — a
-  straight DEPTH-for-BYTES win, and the clearest tunable lever we measured.
+  for +6% bytes at identical recall** — a straight DEPTH-for-BYTES win, and the
+  largest effect of any knob we turned. **Same caveat as the withheld 8.4×
+  above**, and stated here rather than only there because this is the figure a
+  reader is most likely to act on: it divides row 3 (CI, local budget) by row 4
+  (workstation, `s3://` budget), so it crosses machines. It is published, where
+  8.4× is not, because both sides are the *same ANN arm* measured the same way
+  and only the budget differs — whereas 8.4× also changed which leg (exact vs
+  ANN) was being compared. Re-measure both rows on one machine before quoting
+  this as a number rather than a direction.
 * With the IVF coarse directory **trained**, the ledgered 1M-scale sweep records
   **81 GETs / 92 ms at recall 0.9860 probed vs 108 GETs / 144 ms at 0.9840
   unprobed** (ratchet 0.984) — better on every axis, recall included. (The
@@ -403,14 +431,16 @@ Reading it:
   dimensionality, clustering and filter selectivity will move these numbers —
   which is exactly why the harness takes your dataset.
 * Latency under `PROXIMADB_OBJECT_STORE_URL` against a local emulator includes
-  HTTP overhead and is **not** comparable to the local-filesystem latency
-  column. Compare GETs and bytes across backends; compare latency only within
-  one backend.
+  HTTP overhead and is **not** comparable to local-filesystem latency. The
+  reference table deliberately has no latency column for that reason — compare
+  GETs and bytes across backends, and compare latency only within one backend,
+  using the `compute-ms` figures in the raw output rather than the table.
 * The probed arms — `sift_ivf2_coarse_probe_recall_ratchet` and
   `sift_ivf2_probe_release_bakeoff_eval`, both described under *Knobs* — are
   `#[ignore]`d, so **no CI tier runs either** (the ci.yml and qa-gate invocations
   both omit `--ignored`) and drift in them surfaces only when someone runs them
-  by hand. **TD-IVF2ENGAGE-1** records what they currently measure, including a
+  by hand. **TD-IVF2ENGAGE-1** records what the *coarse-probe* arm currently
+  measures — it says nothing about the bakeoff eval — including a
   retraction worth reading: an earlier "the probe barely engages" finding (1.7%
   of queries at N=100k) was an un-awaited background compaction in the harness,
   not a product effect — re-measured behind a barrier it is 1000/1000. Note what
@@ -423,4 +453,5 @@ Reading it:
 * `docs/12-design/RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc` — the cascade's phased rollout
 * `docs/12-design/VECTOR_LAKEBASE_ALIGNMENT_2026_05_28.adoc` — the separation/lakehouse trade-offs
 * `crates/storage/proximadb-storage-common/src/iops_budget.rs` — budget resolution order
-* `.github/workflows/qa-gate.yml` job `sift-pax-recall` — how CI runs this
+* `.github/workflows/ci.yml` (LIGHT tier, N=10 000) and
+  `.github/workflows/qa-gate.yml` job `sift-pax-recall` (N=100 000) — how CI runs this

@@ -63,7 +63,12 @@ tool that prints GETs/query.
 
 == Adjacent defect found while filing this
 
-`sift_ivf2_coarse_probe_recall_ratchet` **fails a precondition** and cannot run:
+`sift_ivf2_coarse_probe_recall_ratchet` **failed a precondition and could not
+run** when this TD was filed. **FIXED** — TD-IVF2ENGAGE-1's change mints
+`next_object_id()` at that call site and adds a compaction-quiescence barrier, so
+the arm runs and is now the worked example the guide points at. The rest of this
+section is kept because it is the diagnosis, not the current state. The error
+was:
 
 [source]
 ----
@@ -72,9 +77,12 @@ compaction admission requires a catalog-resolved collection object id for
 got "sift_ivf2_gate": invalid digit found in string
 ----
 
-It passes a collection *name* where a decimal catalog object id is now required.
-Because the test is `#[ignore]`d, CI never runs it, so the drift was invisible —
+It passed a collection *name* where a decimal catalog object id is now required.
+Because the test is `#[ignore]`d, CI never ran it, so the drift was invisible —
 the same ungated-rot pattern as the stale `rg_layout` "default OFF" comments.
+That `#[ignore]` is unchanged, so the arm is still outside every CI tier; what
+changed is that it can now be run by hand and produces measurements
+(TD-IVF2ENGAGE-1 records them).
 
 Note why the *other* SIFT ratchets in the same file are unaffected: the decimal-id
 requirement is enforced at the **flush/compaction-admission** boundary
@@ -115,9 +123,13 @@ which `get_collection_object_id`'s own doc comment warns against ("a second,
 collision-prone identity domain that cannot be joined reliably with catalog,
 MVCC, deletion-vector, or compaction state").
 
-Fixing it does not change CI, since the test stays `#[ignore]`d — the value is
-that the clustered-arm eval becomes runnable at all, which is what this TD needs
-in order to ship a harness whose arms are not vacuous. The
-clustered arm must be exercised through `sift_ivf2_probe_release_bakeoff_eval`
-until it is fixed. Worth folding into item 3: a gate that cannot run is not a
-gate.
+Fixing it did not change CI, since the test stays `#[ignore]`d — the value is
+that the clustered-arm eval became runnable at all, which is what this TD needs
+in order to ship a harness whose arms are not vacuous. Worth folding into item 3:
+a gate that cannot run is not a gate.
+
+An earlier revision of this paragraph said the clustered arm "must be exercised
+through `sift_ivf2_probe_release_bakeoff_eval` until it is fixed". Both halves are
+now wrong: it is fixed, and the bakeoff eval is not a general substitute — it
+hard-asserts a full 1M corpus and exactly 100 queries and requires precomputed
+ground truth, reading neither `PROXIMADB_SIFT_N` nor `PROXIMADB_SIFT_QUERIES`.
