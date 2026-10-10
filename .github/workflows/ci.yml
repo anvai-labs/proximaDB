@@ -2470,10 +2470,37 @@ jobs:
     needs: [changes, rust-test]
     if: needs.changes.outputs.extensive == 'true'
     continue-on-error: true
+    # 83 minutes then evicted mid-`Generate Coverage` with no logs uploaded on the
+    # v0.4.0 qa->main promotion -- the runner-OOM signature, not a coverage result.
+    # `cargo tarpaulin --lib` builds the `proximadb` lib-test target: cfg(test)
+    # over ~779k LOC and ~7,100 inline tests, which #1971 identified as the
+    # largest codegen unit in the workspace and fixed for three other jobs with
+    # exactly these three settings. ubuntu-latest ships NO swap, so a peak above
+    # 16GB kills the runner instead of slowing down; debug info is the other
+    # dominant term in rustc peak memory, and nothing here reads a backtrace
+    # symbol. An earlier revision of this change instead removed the job from
+    # `ci-success.needs`, which was wrong twice over: the tiering comment at the
+    # top of this file names coverage as part of the FULL qa->main gate, and
+    # whether `continue-on-error` even lets the aggregator see a `failure` is
+    # unsettled -- so de-gating may have fixed nothing while quietly ensuring the
+    # job can never gate again. Fix the eviction, keep the gate.
+    timeout-minutes: 120
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
+      # ubuntu-latest ships NO swap, so a residual peak above 16GB kills the
+      # runner rather than slowing down. 12G on the big ephemeral /mnt disk,
+      # mirroring the three jobs #1971 fixed and the two that already had it.
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
@@ -3118,6 +3145,7 @@ jobs:
       - rust-security
       - rust-build
       - rust-test
+      - rust-coverage
       - rust-integration-test-storage
       - rust-integration-test-authz
       - rust-integration-test-query
@@ -3127,7 +3155,6 @@ jobs:
       - rust-integration-test-api
       - object-store-emulator-tests
       - object-store-restart-recovery
-      - rust-coverage
       - python-lint
       - python-test
       - sdk-coverage-ratchet

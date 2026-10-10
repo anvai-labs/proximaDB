@@ -134,6 +134,12 @@ ENV RUST_LOG=info \
     PROXIMADB_METRICS_PORT=9090 \
     PROXIMADB_EMBED_MODEL_DIR=/var/lib/proximadb/models
 EXPOSE 5678 5679 5680 5433
+# NOTE: a HEALTHCHECK runs INSIDE the container, so it passes even when the
+# server binds loopback only and the published port is unreachable from the host.
+# It is structurally blind to that class of failure -- which is why a loopback
+# bind survived here unnoticed; CI's host-side `docker run -p 5678:5678` + curl
+# is what catches it. The entrypoint normalises bind_address to 0.0.0.0 for
+# exactly this reason.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:5678/health || exit 1
 VOLUME ["/data/proximadb"]
@@ -195,6 +201,12 @@ ENV RUST_LOG=info \
 EXPOSE 5678 5679 5680 5433
 
 # Health check
+# NOTE: a HEALTHCHECK runs INSIDE the container, so it passes even when the
+# server binds loopback only and the published port is unreachable from the host.
+# It is structurally blind to that class of failure -- which is why a loopback
+# bind survived here unnoticed; CI's host-side `docker run -p 5678:5678` + curl
+# is what catches it. The entrypoint normalises bind_address to 0.0.0.0 for
+# exactly this reason.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:5678/health || exit 1
 

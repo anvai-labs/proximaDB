@@ -150,8 +150,100 @@ refresh_models() {
     fetch_model_file "${MODEL_TOKENIZER_URL}" "${EMBED_MODEL_DIR}/tokenizer.json" "${MODEL_TOKENIZER_SHA256}"
 }
 
+# ─── Bind address (container reachability) ──────────────────────────────────
+# The shipped config/config.toml has `bind_address = "127.0.0.1"`, which is the
+# right default for a developer running the binary on a laptop and the WRONG one
+# for a container: a loopback listener inside a container namespace is
+# unreachable through `docker run -p`, so the published port accepts nothing.
+#
+# This was invisible because the image's own HEALTHCHECK curls localhost:5678
+# from INSIDE the container, where loopback works. The in-container healthcheck
+# is structurally incapable of catching it; CI's host-side
+# `docker run -p 5678:5678` + `curl localhost:5678/health` is what failed, after
+# the server had already logged "started successfully on 127.0.0.1:5678".
+#
+# So normalise it here, where we know we are in a container. In-process defaults
+# stay untouched (the binary on a laptop still binds loopback), and an operator
+# can still pin it: PROXIMADB_BIND_ADDRESS=127.0.0.1 restores the old behaviour,
+# and any other value is honoured verbatim.
+BIND_ADDRESS="${PROXIMADB_BIND_ADDRESS:-0.0.0.0}"
+
+# The value lands in a sed replacement, where `&` and `\` are metacharacters and
+# an embedded `"` or newline can append a whole config line. Verified: a crafted
+# value inserted a `node_id` line into the config. An operator is not an attacker,
+# but a config that silently gains a setting is a real bug -- so accept only what
+# a bind address can be: IPv4/IPv6 literals and hostname characters.
+case "${BIND_ADDRESS}" in
+    *[!0-9a-zA-Z.:_-]*|"")
+        echo "[entrypoint] WARN: PROXIMADB_BIND_ADDRESS='${BIND_ADDRESS}' is not a plausible bind address; ignoring it" >&2
+        BIND_ADDRESS="0.0.0.0"
+        ;;
+esac
+
+normalize_bind_address() {
+    config_path=""
+    want_config=0
+    for arg in "$@"; do
+        if [ "${want_config}" -eq 1 ]; then
+            config_path="${arg}"
+            want_config=0
+            continue
+        fi
+        case "${arg}" in
+            --config|-c) want_config=1 ;;
+            --config=*) config_path="${arg#--config=}" ;;
+        esac
+    done
+
+    if [ -z "${config_path}" ] || [ ! -f "${config_path}" ]; then
+        echo "[entrypoint] no --config file found; leaving bind_address to the binary's default" >&2
+        return 0
+    fi
+    if ! grep -qE '^[[:space:]]*bind_address[[:space:]]*=' "${config_path}"; then
+        echo "[entrypoint] ${config_path} declares no bind_address; leaving it alone" >&2
+        return 0
+    fi
+
+    current="$(sed -n 's/^[[:space:]]*bind_address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${config_path}" | head -1)"
+    if [ "${current}" = "${BIND_ADDRESS}" ]; then
+        echo "[entrypoint] bind_address already ${BIND_ADDRESS}" >&2
+        return 0
+    fi
+
+    # Write through the existing inode, NOT via rename. `mv` was wrong twice:
+    #
+    #   * rename(2) over a bind-mounted FILE fails EBUSY, and an unguarded `mv`
+    #     under `set -eu` then exits before exec. deploy/docker/docker-compose.yml
+    #     mounts `../../config/config.toml:/config/config.toml:ro` with
+    #     `restart: unless-stopped`, so that is a permanent crash loop -- strictly
+    #     worse than the loopback bind this function exists to fix.
+    #   * /config/config.toml is root-owned 0644 while the server runs as uid 999
+    #     (Dockerfile COPYs it after chowning /config, then USER proximadb). With a
+    #     TTY, GNU mv prompts "overriding mode 0644" and blocks on stdin forever.
+    #     docs/04-operations/deployment.adoc documents `docker run -it`, and CI
+    #     uses `-d`, so CI cannot catch that -- the same blindness the HEALTHCHECK
+    #     comment warns about, one layer up.
+    #
+    # `cat > file` needs only write permission on the file's directory-resolved
+    # inode, never a rename or a mode change: it works through a rw bind mount,
+    # fails inside the `if` on a :ro mount (so `set -e` stays suspended and the
+    # container still boots), and never prompts. The atomicity `mv` bought is not
+    # needed here -- nothing has read the config yet, the server is exec'd after.
+    tmp="${config_path}.bind.$$"
+    if sed "s|^\([[:space:]]*bind_address[[:space:]]*=[[:space:]]*\)\"[^\"]*\"|\1\"${BIND_ADDRESS}\"|" \
+        "${config_path}" > "${tmp}" 2>/dev/null && [ -s "${tmp}" ] \
+        && cat "${tmp}" > "${config_path}" 2>/dev/null; then
+        rm -f "${tmp}"
+        echo "[entrypoint] bind_address ${current} -> ${BIND_ADDRESS} (container reachability; set PROXIMADB_BIND_ADDRESS to override)" >&2
+    else
+        rm -f "${tmp}"
+        echo "[entrypoint] WARN: could not rewrite bind_address in ${config_path}; leaving ${current}" >&2
+    fi
+}
+
 refresh_tier_config
 refresh_models
+normalize_bind_address "$@"
 
 # Hand off to the server. `exec` so the server becomes PID 1 (signal
 # handling, OOM, healthchecks all work correctly).
