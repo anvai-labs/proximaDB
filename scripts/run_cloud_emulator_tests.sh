@@ -7,7 +7,7 @@
 # `make cloud-emulator-test` (local). Single source of truth so every CI path is
 # exactly the locally-runnable path.
 #
-# Usage: run_cloud_emulator_tests.sh [--fast|--all|--restart|--qa|--nightly]
+# Usage: run_cloud_emulator_tests.sh [--fast|--all|--restart|--qa|--mlflow-s3|--nightly]
 #   --fast : run ONLY the cheap object-store tier tests (~3-5 min — compiles just
 #            the small object-store crate, no main-crate compile, no OOM risk).
 #            Used by the develop early-detection job so a tier regression is caught
@@ -41,8 +41,9 @@ for arg in "$@"; do
     --all)  SCOPE="all" ;;
     --restart) SCOPE="restart" ;;
     --qa) SCOPE="qa" ;;
+    --mlflow-s3) SCOPE="mlflow-s3" ;;
     --nightly) SCOPE="nightly" ;;
-    *) echo "::error::unknown argument: $arg"; echo "usage: $0 [--fast|--all|--restart|--qa|--nightly]"; exit 2 ;;
+    *) echo "::error::unknown argument: $arg"; echo "usage: $0 [--fast|--all|--restart|--qa|--mlflow-s3|--nightly]"; exit 2 ;;
   esac
 done
 echo "==> Scope: $SCOPE"
@@ -84,7 +85,11 @@ AZURITE_CONN="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;Account
 #
 # The S3 surface is reached only through standard AWS env vars (endpoint, keys,
 # region) and the `aws` CLI, so nothing outside this block is emulator-specific.
-S3_EMULATOR_IMAGE="localstack/localstack@sha256:17c2f79ca4e1f804eb912291a19713d4134806325ef0d21d4c1053161dfa72d0"
+# Overridable so CI can point at the GHCR mirror (.github/workflows/mirror-ci-images.yml)
+# while a local `make cloud-emulator-test` keeps working against the public source
+# with no GHCR credentials. The default stays on the upstream registry, so this
+# changes nothing until the mirror is populated and the override is set.
+S3_EMULATOR_IMAGE="${PROXIMADB_CI_S3_EMULATOR_IMAGE:-localstack/localstack@sha256:17c2f79ca4e1f804eb912291a19713d4134806325ef0d21d4c1053161dfa72d0}"
 # LocalStack serves every service on one edge port.
 S3_EMULATOR_PORT=4566
 # LocalStack accepts any credentials; these are the conventional placeholders.
@@ -97,8 +102,14 @@ S3_SECRET_KEY=test
 # would reproduce precisely the failure TD-CI-6 is about — an upstream image
 # moves and a required check dies in a PR with no storage changes.
 # Both verified multi-arch (amd64 + arm64) against their registries.
-AZURITE_IMAGE="mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5"
-FAKE_GCS_IMAGE="fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef"
+#
+# Registry note: only the LocalStack and fake-gcs images are on Docker Hub, where
+# anonymous pulls are rate-limited per IP across the runner fleet. Azurite comes
+# from mcr.microsoft.com, which is unlimited and needs no auth -- it is the
+# pattern the other two should follow. `mirror-ci-images.yml` copies all three
+# into GHCR; set the PROXIMADB_CI_*_IMAGE overrides to use it.
+AZURITE_IMAGE="${PROXIMADB_CI_AZURITE_IMAGE:-mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5}"
+FAKE_GCS_IMAGE="${PROXIMADB_CI_FAKE_GCS_IMAGE:-fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef}"
 
 cleanup() { docker rm -f azurite s3-emulator fake-gcs >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -253,9 +264,12 @@ if [ "$SCOPE" = "qa" ]; then
   # (cross-store isolation is part of the proof). The recall ratchet runs on ONE
   # strict backend (Azure): recall is a ranged-read/footer-fidelity check, not
   # the restart-correctness gate. Build BEFORE exercising emulators; jobs=1 for
-  # the 16GB-runner OOM ceiling (same rationale as --all). The QA budget is a
-  # measured ratchet: record the cold-cache wall time in TD-OBJSTORE-5 on the
-  # first run.
+  # the 16GB-runner OOM ceiling (same rationale as --all). Every step here links
+  # the `proximadb` lib compiled WITHOUT cfg(test), so the builds genuinely do
+  # share work -- which is why the MLflow `--lib` test was moved to its own
+  # `--mlflow-s3` scope: that one needs the lib-test target and does not share.
+  # The QA budget is a measured ratchet: record the cold-cache wall time in
+  # TD-OBJSTORE-5 on the first run.
   echo "==> TD-OBJSTORE-5 QA tier: build server (cloud-full) before emulator runs"
   CARGO_BUILD_JOBS=1 cargo test -p proximadb-server --features cloud-full \
     --test object_store_restart_recovery --no-run
@@ -268,16 +282,6 @@ if [ "$SCOPE" = "qa" ]; then
   CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full \
     --test objstore_backend_contract_test \
     -- --ignored --nocapture --test-threads=1
-
-  # TD-MLOPS-4 S1-remainder: the MLflow artifact seam battery against the
-  # REAL S3 protocol (the lane's LocalStack). cloud-full is already built; this
-  # is a near-free incremental lib-test run. AWS_ENDPOINT/AWS_* are the
-  # global exports pointing at the lane's S3 emulator.
-  echo "==> TD-MLOPS-4 S1: MLflow S3 artifact seam conformance (LocalStack)"
-  PROXIMADB_MLFLOW_ARTIFACTS_TEST_URL="s3://$CONTAINER_BUCKET/mlflow-seam-conformance" \
-    CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full --lib \
-    services::mlflow_artifact_s3::tests::s3_backend_passes_seam_conformance \
-    -- --exact --nocapture
 
   echo "==> QA tier [1/2]: Azure (Azurite, adls://) — restart proofs + recall ratchet"
   export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
@@ -304,6 +308,35 @@ if [ "$SCOPE" = "qa" ]; then
     -- --ignored --nocapture --test-threads=1 --skip cold_recall_ratchet
 
   echo "==> QA tier complete (Azure strict + S3 strict; GCS lives in --nightly)"
+  exit 0
+fi
+
+if [ "$SCOPE" = "mlflow-s3" ]; then
+  # TD-MLOPS-4 S1-remainder, split out of --qa (TD-OBJSTORE-5): the MLflow
+  # artifact seam battery against the REAL S3 protocol (the lane's LocalStack).
+  #
+  # Why its own scope. An earlier comment here claimed this was "a near-free
+  # incremental lib-test run" because cloud-full was already built. That was
+  # wrong, and it is what put the --qa job over the 16GB runner ceiling: the
+  # other --qa steps build INTEGRATION test targets, which link the `proximadb`
+  # lib compiled WITHOUT cfg(test). `--lib` builds a different target entirely --
+  # the lib-test, i.e. cfg(test) over ~779k LOC and ~7,100 inline tests. That is
+  # the single largest codegen unit in the workspace, not an increment, so --qa
+  # paid two near-cliff memory peaks and was evicted mid-compile
+  # ("runner has received a shutdown signal") at 76 of its 90 allowed minutes,
+  # twice in a row, having failed 6 of its last 8 runs.
+  #
+  # Splitting gives each peak its own fresh runner. It also puts this test where
+  # it belongs: it proves an MLflow artifact seam, not object-store restart
+  # correctness, and shares the --qa lane only because both want an S3 emulator.
+  echo "==> TD-MLOPS-4 S1: MLflow S3 artifact seam conformance (LocalStack)"
+  export AWS_ENDPOINT="http://127.0.0.1:$S3_EMULATOR_PORT" AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false
+  export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" AWS_REGION=us-east-1
+  PROXIMADB_MLFLOW_ARTIFACTS_TEST_URL="s3://$CONTAINER_BUCKET/mlflow-seam-conformance" \
+    CARGO_BUILD_JOBS=1 cargo test -p proximadb --features cloud-full --lib \
+    services::mlflow_artifact_s3::tests::s3_backend_passes_seam_conformance \
+    -- --exact --nocapture
+  echo "==> MLflow S3 artifact seam: PASS"
   exit 0
 fi
 

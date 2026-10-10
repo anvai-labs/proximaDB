@@ -103,6 +103,10 @@ release-build-features-check:
 	@echo "📦 Validating what the release artifacts are compiled with..."
 	python3 scripts/check_release_build_features.py
 
+orphan-rust-files-check:
+	@echo "🧹 Checking for .rs files no build reaches..."
+	python3 scripts/check_orphan_rust_files.py
+
 hygiene-check:
 	@echo "🧹 Running tracked artifact hygiene check..."
 	@bad_files=$$(git ls-files | rg '(^|/)\.victor($$|/)|\.bak[0-9]*$$|\.disabled$$'); \
@@ -220,7 +224,7 @@ tenant-ingress-check:
 	@echo "Validating deployment-aware tenant ingress..."
 	python3 scripts/check_tenant_ingress_contract.py
 
-work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check release-build-features-check
+work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check release-build-features-check orphan-rust-files-check
 	@echo "✅ work-commit-check: deterministic architecture and commit guardrails passed"
 
 validated-commit-check: work-commit-check

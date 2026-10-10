@@ -210,6 +210,25 @@ def _docker_run_port_bindings(source: str) -> tuple[list[str], int, list[str], l
     return bindings, names, publish_all, host_network, images
 
 
+_OVERRIDE_RE = re.compile(r"^\$\{(?P<var>[A-Za-z_][A-Za-z0-9_]*):-(?P<default>.+)\}$")
+
+
+def _image_default(reference: str) -> tuple[str, str | None]:
+    """Resolve an image declaration to the reference a default run would use.
+
+    The declarations are overridable -- `${PROXIMADB_CI_X_IMAGE:-vendor/img@sha256:...}`
+    -- so CI can point at the GHCR mirror while a local run keeps working against
+    the public source with no credentials. The digest-pinning guarantee must still
+    hold on the value a default run actually resolves to, which is the default half
+    of that form; returning the override variable name too lets a caller assert the
+    indirection is the sanctioned one rather than an arbitrary expansion.
+    """
+    match = _OVERRIDE_RE.match(reference)
+    if match is None:
+        return reference, None
+    return match.group("default"), match.group("var")
+
+
 class CloudEmulatorHarnessTest(unittest.TestCase):
     def setUp(self) -> None:
         self.source = HARNESS.read_text(encoding="utf-8")
@@ -309,11 +328,22 @@ class CloudEmulatorHarnessTest(unittest.TestCase):
             f"every `docker run` image must come from a declared *_IMAGE variable; "
             f"declared={[n for n, _ in declared]} used={used}",
         )
-        for name, reference in declared:
+        for name, declaration in declared:
+            reference, override = _image_default(declaration)
+            if override is not None:
+                # Only the sanctioned override shape, so a declaration cannot be
+                # turned into an arbitrary shell expansion that this guard then
+                # reads as "pinned".
+                self.assertEqual(
+                    override,
+                    f"PROXIMADB_CI_{name}",
+                    f"{name} may only be overridden by PROXIMADB_CI_{name}",
+                )
             self.assertRegex(
                 reference,
                 r"@sha256:[0-9a-f]{64}$",
-                f"{name} must be immutable: pinned by digest, never a tag",
+                f"{name} must be immutable: pinned by digest, never a tag "
+                f"(declaration: {declaration})",
             )
         # And every `docker run` must take its image from one of those variables.
         # Checked POSITIONALLY (the image is the first non-flag, non-flag-argument
@@ -338,7 +368,7 @@ class CloudEmulatorHarnessTest(unittest.TestCase):
     def test_s3_emulator_image_is_pinned_by_digest(self) -> None:
         image = re.search(r'^S3_EMULATOR_IMAGE="([^"]+)"$', self.source, re.MULTILINE)
         self.assertIsNotNone(image, "the shared harness must declare S3_EMULATOR_IMAGE")
-        reference = image.group(1) if image else ""
+        reference, _ = _image_default(image.group(1) if image else "")
         self.assertRegex(
             reference,
             r"^[a-z0-9./-]+@sha256:[0-9a-f]{64}$",

@@ -31,6 +31,11 @@ jobs:
     name: Unit Tests (TDD)
     runs-on: ubuntu-latest
     strategy:
+      # The two toolchains are independent signals, so one must not cancel the
+      # other. Without this, a nightly failure cancelled the stable leg and the
+      # cancellation surfaced as a second "failure" in the checks list although
+      # stable had no failing step -- two red entries for one cause.
+      fail-fast: false
       matrix:
         rust: [stable]
         # Only test nightly on main branch
@@ -132,10 +137,20 @@ jobs:
           cargo clippy --lib --bins 2>&1 | tee clippy-output.txt || true
           echo "Clippy checks completed (advisory only)"
 
-      - name: Check formatting
+      # Advisory, matching the clippy and documentation steps above. Formatting
+      # is authoritatively gated by `Rust Format` in ci.yml, which pins
+      # `dtolnay/rust-toolchain@1.95.0` to match rust-toolchain.toml and is in
+      # `ci-success`'s needs, i.e. merge-blocking. This step adds nothing on
+      # `stable` beyond duplicating that gate with a different toolchain, and on
+      # `nightly` it checks a moving target: it was the one hard-failing step in
+      # this workflow and went red whenever nightly rustfmt changed its output,
+      # on rustfmt's release schedule rather than on any change here. It last
+      # passed 2026-09-04 and failed on unrelated branches thereafter.
+      - name: Check formatting (advisory — see ci.yml `Rust Format` for the gate)
+        continue-on-error: true
         run: |
-          cargo fmt -- --check
-          echo "Code is properly formatted"
+          cargo fmt -- --check && echo "Code is properly formatted" \
+            || echo "::warning::rustfmt (${{ matrix.rust }}) disagrees; the pinned gate is ci.yml Rust Format"
 
       - name: Check documentation
         if: matrix.rust != 'nightly' || github.ref == 'refs/heads/main'

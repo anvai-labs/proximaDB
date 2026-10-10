@@ -1,0 +1,166 @@
+# Mirror the CI emulator images into GHCR.
+#
+# Why this exists. The object-store emulator jobs pull three images. Two are on
+# Docker Hub, where an ANONYMOUS pull is rate-limited per IP across the whole
+# runner fleet -- so those jobs fail with "toomanyrequests: You have reached your
+# unauthenticated pull rate limit" and exit 125 within ~90 seconds, before any
+# compilation, for reasons unrelated to the change under test. Those jobs are in
+# `ci-success`'s needs, so that blocks the required check (TD-CI-6 records the
+# shape; it was found the same way, via a PR touching no object-store code).
+#
+# Authenticating the pull raises the ceiling, which is the immediate fix already
+# applied. Whether it REMOVES the ceiling depends on the account tier: free and
+# personal authenticated pulls are capped per account (200 / 6h at the time of
+# writing), while Pro/Team/Business are documented as unlimited. The tier here is
+# not recorded, so treat the quota argument as conditional -- the argument that
+# does not depend on it is credential scope: GHCR authenticates with the built-in
+# GITHUB_TOKEN, so no shared, write-capable secret is needed to pull at all. GHCR has no equivalent cap and
+# authenticates with the built-in GITHUB_TOKEN, so there is no secret to rotate,
+# share, or scope -- and no write-capable credential exposed to read-only jobs.
+#
+# The third image, Azurite, already demonstrates the pattern: it comes from
+# mcr.microsoft.com, which is unlimited and needs no auth. It is mirrored here
+# only so all three are reachable by one mechanism.
+#
+# Digest pinning is preserved deliberately. The emulator script pins every image
+# by digest because an upstream image moving is exactly the TD-CI-6 failure --
+# a required check dying in a PR with no storage changes. This workflow therefore
+# PRINTS the mirrored digests, which must then be pinned in the script; it does
+# not silently float a tag.
+name: Mirror CI Images (GHCR)
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why this run (recorded in the summary)'
+        required: false
+        type: string
+  schedule:
+    # Monthly. The sources are digest-pinned, so this is not chasing upstream
+    # changes -- it is keeping the mirror from being garbage-collected and
+    # re-proving the copy still works before CI depends on it.
+    - cron: '17 4 1 * *'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mirror-ci-images
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror emulator images to GHCR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # No repo file is read in this job -- the sources are literals below and
+      # the summary is built in /tmp -- so there is deliberately no checkout.
+      - uses: docker/setup-buildx-action@v4
+
+      # Source pull, authenticated so the mirror job does not hit the very rate
+      # limit it exists to remove. continue-on-error so a bad or absent token
+      # degrades to an anonymous pull rather than failing the mirror -- NOT for
+      # the fork case: the only triggers here are workflow_dispatch and schedule,
+      # neither of which runs from a fork.
+      #
+      # This job does read DOCKERHUB_TOKEN, which is the image PUSH credential.
+      # That is not the scope-widening the mirror exists to avoid (same repo,
+      # same secret, no new consumer) -- and it is the point: once the overrides
+      # are set, the jobs that pull on every PR stop needing that token at all.
+      - name: Log in to Docker Hub (source)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Destination push. GITHUB_TOKEN only -- no managed secret.
+      - name: Log in to GHCR (destination)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror by digest, multi-arch
+        env:
+          # Sources, digest-pinned, kept in lockstep with
+          # scripts/run_cloud_emulator_tests.sh. If you bump one, bump both.
+          SRC_S3: localstack/localstack@sha256:17c2f79ca4e1f804eb912291a19713d4134806325ef0d21d4c1053161dfa72d0
+          SRC_GCS: fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef
+          SRC_AZURITE: mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5
+          NS: ghcr.io/${{ github.repository_owner }}/ci-mirror
+        run: |
+          set -euo pipefail
+          # `imagetools create` copies the whole manifest list, so multi-arch
+          # (amd64 + arm64) survives -- the emulator script's comment records
+          # that both platforms were verified upstream, and a single-arch mirror
+          # would silently break arm64 runners later.
+          mirror() {
+            local name="$1" src="$2" dst="${NS}/$1:pinned"
+            echo "::group::$name"
+            docker buildx imagetools create -t "$dst" "$src"
+            # Read the digest BACK from the destination. `imagetools create` may
+            # re-serialize the manifest, so the mirrored digest is not assumed to
+            # equal the source digest -- it is measured.
+            local got
+            got="$(docker buildx imagetools inspect "$dst" --format '{{.Manifest.Digest}}')"
+            # A buildx template rename would make `inspect` print nothing and
+            # exit 0, which would emit a ref ending in a bare `@` and still go
+            # green. Fail loudly instead.
+            case "$got" in
+              sha256:????????????????????????????????????????????????????????????????) ;;
+              *) echo "::error::$name: digest read-back gave '$got', want sha256:<64 hex>"; exit 1 ;;
+            esac
+            # One ref shape only. An earlier revision also wrote `$dst@$got`
+            # here, i.e. `...:pinned@sha256:...` -- a valid Docker ref that this
+            # repo's own digest-pinning guard REJECTS, so copying it out of the
+            # log would have failed CI.
+            printf '| `%s` | `%s` | `%s` |\n' "$name" "$src" "${NS}/$name@$got" >> /tmp/mirror-table.md
+            docker buildx imagetools inspect "$dst" | sed -n '1,12p'
+            echo "::endgroup::"
+          }
+          : > /tmp/mirror-table.md
+          mirror s3-emulator   "$SRC_S3"
+          mirror fake-gcs      "$SRC_GCS"
+          mirror azurite       "$SRC_AZURITE"
+
+      - name: Summary — the refs to pin in the emulator script
+        run: |
+          {
+            echo "## Mirrored to GHCR"
+            echo ""
+            echo "Pin these in \`scripts/run_cloud_emulator_tests.sh\` (and in this"
+            echo "workflow's \`SRC_*\` if the upstream source moved):"
+            echo ""
+            echo "| image | source | mirrored ref to pin |"
+            echo "|---|---|---|"
+            cat /tmp/mirror-table.md
+            echo ""
+            echo "Then set these in the emulator jobs' \`env:\`"
+            echo '```yaml'
+            echo "      PROXIMADB_CI_S3_EMULATOR_IMAGE: <mirrored s3-emulator ref>"
+            echo "      PROXIMADB_CI_FAKE_GCS_IMAGE: <mirrored fake-gcs ref>"
+            echo "      PROXIMADB_CI_AZURITE_IMAGE: <mirrored azurite ref>"
+            echo '```'
+            echo ""
+            echo ""
+            echo "### Setting those three is NOT sufficient on its own"
+            echo ""
+            echo "A newly published GHCR package is **private**, and every workflow that"
+            echo "runs the emulator script declares \`permissions: contents: read\` only."
+            echo "An explicit permissions block sets every unlisted scope to \`none\`, so"
+            echo "\`GITHUB_TOKEN\` gets no \`packages\` scope -- and there is no \`ghcr.io\`"
+            echo "login in any of them. Pointing the refs at a private package without"
+            echo "the rest yields \`denied\` on \`docker run\`: a required check dying on an"
+            echo "image pull, which is exactly the TD-CI-6 shape this mirror prevents."
+            echo ""
+            echo "So also EITHER make the package public (simplest -- no token, no login,"
+            echo "no scope change), OR add \`packages: read\` to those jobs and a"
+            echo "\`docker/login-action\` step for \`ghcr.io\` before the emulator step."
+            echo "Until those are set, the script keeps its Docker Hub / MCR defaults,"
+            echo "so nothing changes behaviour before the mirror is proven."
+          } >> "$GITHUB_STEP_SUMMARY"

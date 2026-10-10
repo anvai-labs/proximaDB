@@ -445,6 +445,8 @@ jobs:
         run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
       - name: Validate release build features (cloud-full + job timeouts)
         run: python3 scripts/check_release_build_features.py
+      - name: Check for unreachable .rs files (TD-ORPHAN-1)
+        run: python3 scripts/check_orphan_rust_files.py
       - name: Test release-build-features negative controls
         run: python3 -m unittest discover -s tests/scripts -p 'test_release_build_features.py'
 
@@ -1894,6 +1896,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-cloud-emulator-fast"
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Run object-store tier tests against emulators (--fast)
         # docker + aws/az CLIs are preinstalled on ubuntu-latest runners.
         run: bash scripts/run_cloud_emulator_tests.sh --fast
@@ -1982,6 +2002,24 @@ jobs:
           path: /home/runner/.cache/sccache
           key: sccache-restart-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: sccache-restart-${{ runner.os }}-
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Prove full-server restart recovery over Azurite (adls://)
         # docker + aws/az CLIs preinstalled on ubuntu-latest; the script starts
         # Azurite and runs catalog_wal_and_sst_survive_fresh_local_disks.
@@ -2432,10 +2470,37 @@ jobs:
     needs: [changes, rust-test]
     if: needs.changes.outputs.extensive == 'true'
     continue-on-error: true
+    # 83 minutes then evicted mid-`Generate Coverage` with no logs uploaded on the
+    # v0.4.0 qa->main promotion -- the runner-OOM signature, not a coverage result.
+    # `cargo tarpaulin --lib` builds the `proximadb` lib-test target: cfg(test)
+    # over ~779k LOC and ~7,100 inline tests, which #1971 identified as the
+    # largest codegen unit in the workspace and fixed for three other jobs with
+    # exactly these three settings. ubuntu-latest ships NO swap, so a peak above
+    # 16GB kills the runner instead of slowing down; debug info is the other
+    # dominant term in rustc peak memory, and nothing here reads a backtrace
+    # symbol. An earlier revision of this change instead removed the job from
+    # `ci-success.needs`, which was wrong twice over: the tiering comment at the
+    # top of this file names coverage as part of the FULL qa->main gate, and
+    # whether `continue-on-error` even lets the aggregator see a `failure` is
+    # unsettled -- so de-gating may have fixed nothing while quietly ensuring the
+    # job can never gate again. Fix the eviction, keep the gate.
+    timeout-minutes: 120
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
+      # ubuntu-latest ships NO swap, so a residual peak above 16GB kills the
+      # runner rather than slowing down. 12G on the big ephemeral /mnt disk,
+      # mirroring the three jobs #1971 fixed and the two that already had it.
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
@@ -3080,6 +3145,7 @@ jobs:
       - rust-security
       - rust-build
       - rust-test
+      - rust-coverage
       - rust-integration-test-storage
       - rust-integration-test-authz
       - rust-integration-test-query
@@ -3089,7 +3155,6 @@ jobs:
       - rust-integration-test-api
       - object-store-emulator-tests
       - object-store-restart-recovery
-      - rust-coverage
       - python-lint
       - python-test
       - sdk-coverage-ratchet
