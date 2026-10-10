@@ -163,6 +163,13 @@ unified_mode = true
 grpc_port = 5679
 rest_port = 5678
 arrow_flight_port = 5680
+# Set explicitly so `server.bind_address` governs pgwire too. Without it,
+# `PostgresServerConfig::default()` hardcodes 127.0.0.1:5433 and src/database.rs
+# only re-derives the bind when `pg_port` is Some -- so a container publishing
+# -p 5433:5433 (both documented invocations do) accepted nothing even once 5678
+# was reachable. 5433 is the value that was already hardcoded, so this changes
+# nothing outside a container.
+pg_port = 5433
 
 # Protocol-specific settings (apply in both modes)
 [api.protocols.rest]
