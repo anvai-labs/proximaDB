@@ -95,3 +95,37 @@ failure is reproducible on a workstation with Docker (single source of truth).
 * Docker-credential-helper quirk on WSL workstations: pull with a clean
   `docker --config` dir if `docker-credential-desktop.exe` errors (documented in the
   script header, not code).
+
+== Measured: the QA tier's cold-cache budget, and why it was being evicted (2026-10-09)
+
+This TD asked for "the first cold-cache QA wall time ... to turn the 90-minute cap into a
+measured ratchet". Two runs on the v0.4.0 promotion recorded it, and both were **evicted rather
+than timed out**:
+
+|===
+| Attempt | Wall time | Outcome
+
+| 1 | ~60 min | `##[error]The runner has received a shutdown signal`, mid-compile
+| 2 | **76 min** of a 90-minute cap | same signature, mid-compile
+|===
+
+Neither emitted "exceeded the maximum execution time", so **more time was not the constraint** --
+raising the cap would have changed nothing. Compile warnings were still streaming at the kill in
+both, so no test executed. Over the preceding period the job failed **6 of its last 8 runs**,
+including on `qa`'s own push, i.e. independently of any change under review.
+
+**Cause.** The scope ran two near-cliff codegen peaks in one 16 GB runner. Every other step
+links the `proximadb` lib compiled *without* `cfg(test)`, so those genuinely share one build --
+but the MLflow seam test used `--lib`, which builds the **lib-test** target: `cfg(test)` over
+~779k LOC and ~7,100 inline tests, the largest codegen unit in the workspace. A comment in the
+script asserted it was "a near-free incremental lib-test run"; that was wrong, and it is what put
+the job over the ceiling.
+
+**Fix.** The MLflow test moved to its own `--mlflow-s3` scope and job, so each peak gets a fresh
+runner -- the same separation `--fast` and `--restart` already use. `CARGO_PROFILE_TEST_DEBUG=0`
+was also added, aligning this job with `cloud-emulator-object-store`, which already set it for
+this exact cliff and passes.
+
+**Still to record**, and what should finally close this item: the cold-cache wall time of the
+split `--qa` job and of `--mlflow-s3` separately, so the 90-minute cap can be tightened to a
+measured ratchet per job rather than a shared guess.
