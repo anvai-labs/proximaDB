@@ -9,9 +9,12 @@
 # shape; it was found the same way, via a PR touching no object-store code).
 #
 # Authenticating the pull raises the ceiling, which is the immediate fix already
-# applied. It does not remove it: authenticated Docker Hub pulls are still capped
-# PER ACCOUNT, so one shared credential across several repositories relocates the
-# bottleneck rather than removing it. GHCR has no equivalent cap and
+# applied. Whether it REMOVES the ceiling depends on the account tier: free and
+# personal authenticated pulls are capped per account (200 / 6h at the time of
+# writing), while Pro/Team/Business are documented as unlimited. The tier here is
+# not recorded, so treat the quota argument as conditional -- the argument that
+# does not depend on it is credential scope: GHCR authenticates with the built-in
+# GITHUB_TOKEN, so no shared, write-capable secret is needed to pull at all. GHCR has no equivalent cap and
 # authenticates with the built-in GITHUB_TOKEN, so there is no secret to rotate,
 # share, or scope -- and no write-capable credential exposed to read-only jobs.
 #
@@ -53,13 +56,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      # No repo file is read in this job -- the sources are literals below and
+      # the summary is built in /tmp -- so there is deliberately no checkout.
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/setup-buildx-action@v3
-
-      # Source pull. Authenticated so the mirror job itself does not hit the very
-      # rate limit it exists to remove. continue-on-error: a fork cannot read
-      # secrets, and an anonymous pull of three images usually still succeeds.
+      # Source pull, authenticated so the mirror job does not hit the very rate
+      # limit it exists to remove. continue-on-error so a bad or absent token
+      # degrades to an anonymous pull rather than failing the mirror -- NOT for
+      # the fork case: the only triggers here are workflow_dispatch and schedule,
+      # neither of which runs from a fork.
+      #
+      # This job does read DOCKERHUB_TOKEN, which is the image PUSH credential.
+      # That is not the scope-widening the mirror exists to avoid (same repo,
+      # same secret, no new consumer) -- and it is the point: once the overrides
+      # are set, the jobs that pull on every PR stop needing that token at all.
       - name: Log in to Docker Hub (source)
         continue-on-error: true
         uses: docker/login-action@v4
@@ -76,7 +86,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Mirror by digest, multi-arch
-        id: mirror
         env:
           # Sources, digest-pinned, kept in lockstep with
           # scripts/run_cloud_emulator_tests.sh. If you bump one, bump both.
@@ -99,7 +108,17 @@ jobs:
             # equal the source digest -- it is measured.
             local got
             got="$(docker buildx imagetools inspect "$dst" --format '{{.Manifest.Digest}}')"
-            echo "$name=$dst@$got" >> "$GITHUB_OUTPUT"
+            # A buildx template rename would make `inspect` print nothing and
+            # exit 0, which would emit a ref ending in a bare `@` and still go
+            # green. Fail loudly instead.
+            case "$got" in
+              sha256:????????????????????????????????????????????????????????????????) ;;
+              *) echo "::error::$name: digest read-back gave '$got', want sha256:<64 hex>"; exit 1 ;;
+            esac
+            # One ref shape only. An earlier revision also wrote `$dst@$got`
+            # here, i.e. `...:pinned@sha256:...` -- a valid Docker ref that this
+            # repo's own digest-pinning guard REJECTS, so copying it out of the
+            # log would have failed CI.
             printf '| `%s` | `%s` | `%s` |\n' "$name" "$src" "${NS}/$name@$got" >> /tmp/mirror-table.md
             docker buildx imagetools inspect "$dst" | sed -n '1,12p'
             echo "::endgroup::"
@@ -128,6 +147,20 @@ jobs:
             echo "      PROXIMADB_CI_AZURITE_IMAGE: <mirrored azurite ref>"
             echo '```'
             echo ""
+            echo ""
+            echo "### Setting those three is NOT sufficient on its own"
+            echo ""
+            echo "A newly published GHCR package is **private**, and every workflow that"
+            echo "runs the emulator script declares \`permissions: contents: read\` only."
+            echo "An explicit permissions block sets every unlisted scope to \`none\`, so"
+            echo "\`GITHUB_TOKEN\` gets no \`packages\` scope -- and there is no \`ghcr.io\`"
+            echo "login in any of them. Pointing the refs at a private package without"
+            echo "the rest yields \`denied\` on \`docker run\`: a required check dying on an"
+            echo "image pull, which is exactly the TD-CI-6 shape this mirror prevents."
+            echo ""
+            echo "So also EITHER make the package public (simplest -- no token, no login,"
+            echo "no scope change), OR add \`packages: read\` to those jobs and a"
+            echo "\`docker/login-action\` step for \`ghcr.io\` before the emulator step."
             echo "Until those are set, the script keeps its Docker Hub / MCR defaults,"
             echo "so nothing changes behaviour before the mirror is proven."
           } >> "$GITHUB_STEP_SUMMARY"
