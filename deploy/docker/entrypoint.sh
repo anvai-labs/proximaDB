@@ -246,7 +246,14 @@ normalize_bind_address() {
     # holding API keys and a JWT secret from being cloned world-readable.
     tmp="$(mktemp "${TMPDIR:-/tmp}/proximadb-config.XXXXXX" 2>/dev/null)" || tmp=""
     if [ -z "${tmp}" ]; then
-        echo "[entrypoint] WARN: no writable scratch dir (TMPDIR=${TMPDIR:-/tmp}); leaving bind_address ${current}. The container will NOT be reachable on its published ports." >&2
+        # TMPDIR is preferred because it survives a read-only /config, but it is
+        # not always the writable one: `--read-only` rootfs with a WRITABLE
+        # /config bind mount and no tmpfs is the mirror image, and the earlier
+        # next-to-the-config placement handled exactly that. Try both.
+        tmp="$(mktemp "$(dirname "${config_path}")/proximadb-config.XXXXXX" 2>/dev/null)" || tmp=""
+    fi
+    if [ -z "${tmp}" ]; then
+        echo "[entrypoint] WARN: no writable scratch dir (tried TMPDIR=${TMPDIR:-/tmp} and $(dirname "${config_path}")); leaving bind_address ${current}. The container will NOT be reachable on its published ports." >&2
         return 0
     fi
     chmod 0600 "${tmp}" 2>/dev/null || true
@@ -314,6 +321,16 @@ if [ -n "${NORMALIZED_CONFIG}" ]; then
                 ;;
             --config=*)
                 set -- "$@" "--config=${NORMALIZED_CONFIG}"
+                ;;
+            # Must mirror normalize_bind_address's arms exactly. They diverged
+            # once: detection accepted these two, the rebuild did not, so the
+            # server got the ORIGINAL path while the log below announced the
+            # normalized one.
+            -c=*)
+                set -- "$@" "-c=${NORMALIZED_CONFIG}"
+                ;;
+            -c?*)
+                set -- "$@" "-c${NORMALIZED_CONFIG}"
                 ;;
             *)
                 set -- "$@" "${arg}"

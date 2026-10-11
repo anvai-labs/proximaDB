@@ -1192,18 +1192,39 @@ mod container_bind_regression_tests {
     //! rewrite silently failed and the listener stayed on loopback.
     use super::*;
 
-    fn container_shaped_config(bind: &str, pgwire_bind: &str) -> MultiServerConfig {
+    /// The shape the shipped config actually produces. The pgwire bind is
+    /// DERIVED from `PostgresServerConfig::default()`, not supplied: an earlier
+    /// version passed "127.0.0.1:5433" as a literal, so flipping that default to
+    /// 0.0.0.0 -- one line, and exactly the class of change that caused this
+    /// outage -- left all 136 tests in this crate green while the published
+    /// image would again exit 1 at the listener preflight.
+    fn container_shaped_config(bind: &str) -> MultiServerConfig {
         let mut config = MultiServerConfig {
             unified_mode: true,
             unified_bind_address: bind.to_string(),
             ..Default::default()
         };
         config.tls_config.bind_interface = bind.to_string();
+        // `server_builder.rs` sets this from `api_config.enable_pgwire`, which
+        // the shipped config leaves true.
         config.postgres_config.enable_postgres = true;
-        config.postgres_config.bind_address = pgwire_bind
-            .parse()
-            .expect("test literal is a valid socket address");
         config
+    }
+
+    #[test]
+    fn the_pgwire_default_is_loopback() {
+        // The invariant the "starts" test below depends on. Pinned separately so
+        // a change to the default fails HERE, naming the cause, rather than
+        // silently making the other test vacuous.
+        let default = PostgresServerConfig::default();
+        assert!(
+            default.bind_address.ip().is_loopback(),
+            "PostgresServerConfig::default() binds {}, which is not loopback. With \
+             `[api] pg_port` unset the published image relies on this default to \
+             keep pgwire off 0.0.0.0; a non-loopback default makes the server fail \
+             closed at boot under trust-mode auth.",
+            default.bind_address
+        );
     }
 
     fn single_tenant() -> proximadb_tenant::TenantDeploymentMode {
@@ -1217,7 +1238,7 @@ mod container_bind_regression_tests {
         // What the image ships: the rewrite moves the unified surface to
         // 0.0.0.0 while pgwire keeps the builder's loopback default, because
         // `pg_port` is NOT set in config/config.toml.
-        let config = container_shaped_config("0.0.0.0", "127.0.0.1:5433");
+        let config = container_shaped_config("0.0.0.0");
         config
             .validate_listener_security(false, false, &single_tenant())
             .expect("the published image must start after entrypoint.sh rewrites bind_address");
@@ -1230,7 +1251,10 @@ mod container_bind_regression_tests {
         // fail: an unauthenticated trust-mode listener is loopback-only. The
         // test pins the containment, so a future config change that reintroduces
         // `pg_port` fails here instead of in a release.
-        let config = container_shaped_config("0.0.0.0", "0.0.0.0:5433");
+        let mut config = container_shaped_config("0.0.0.0");
+        config.postgres_config.bind_address = "0.0.0.0:5433"
+            .parse()
+            .expect("test literal is a valid socket address");
         let err = config
             .validate_listener_security(false, false, &single_tenant())
             .expect_err("a non-loopback trust-mode pgwire listener must be refused");
@@ -1245,17 +1269,24 @@ mod container_bind_regression_tests {
         // The guard on the actual artifact: if this starts failing, the image
         // will fail closed at boot on 0.0.0.0 and `Test Container Health` will
         // go red with `Failed to start multi-server`.
+        // Both keys drag a trust-mode listener onto `server.bind_address`, which
+        // is 0.0.0.0 in a container: pg_port via the pgwire branch of
+        // `validate_listener_security`, mcp_port via the MCP branch. Either one
+        // makes the published image fail closed at boot.
         let shipped = include_str!("../../../../config/config.toml");
-        for (lineno, line) in shipped.lines().enumerate() {
-            let trimmed = line.trim();
-            assert!(
-                !(trimmed.starts_with("pg_port") && trimmed.contains('=')),
-                "config/config.toml:{} sets pg_port, which drags the pgwire listener onto \
-                 server.bind_address (0.0.0.0 in a container) and makes the server fail \
-                 closed at boot. Making pgwire reachable needs per-connection auth \
-                 (TD-PGWIRE-AUTH-1), not this toggle.",
-                lineno + 1
-            );
+        for key in ["pg_port", "mcp_port"] {
+            for (lineno, line) in shipped.lines().enumerate() {
+                let trimmed = line.trim();
+                assert!(
+                    !(trimmed.starts_with(key) && trimmed.contains('=')),
+                    "config/config.toml:{} sets {}, which drags a trust-mode listener onto \
+                     server.bind_address (0.0.0.0 in a container) and makes the server fail \
+                     closed at boot. Reaching those surfaces needs per-connection auth \
+                     (TD-PGWIRE-AUTH-1), not this toggle.",
+                    lineno + 1,
+                    key
+                );
+            }
         }
     }
 }

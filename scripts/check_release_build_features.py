@@ -208,6 +208,22 @@ def _dockerfile_instructions(text: str) -> list[tuple[int, str]]:
     return out
 
 
+# The runtime user. `groupadd -r proximadb && useradd -r -g proximadb proximadb`
+# on the shipped bases yields uid/gid 999, so the numeric spelling is the same
+# owner and must not be a false positive. Matched by EQUALITY, not prefix: an
+# earlier `startswith("proximadb")` also accepted `proximadbX`.
+RUNTIME_OWNERS = frozenset(
+    {
+        "proximadb",
+        "proximadb:proximadb",
+        "999",
+        "999:999",
+        "proximadb:999",
+        "999:proximadb",
+    }
+)
+
+
 def _lands_runtime_config(instruction: str) -> bool:
     """Does this COPY put a file at /config/config.toml, however spelled?
 
@@ -226,11 +242,11 @@ def _lands_runtime_config(instruction: str) -> bool:
     dest, sources = args[-1], args[:-1]
     if dest in ("/config/config.toml", "/config/config.toml/"):
         return True
-    if dest.rstrip("/") == "/config":
-        return any(
-            src.rstrip("/").endswith("config.toml") or src.rstrip("/").endswith("/config")
-            for src in sources
-        )
+    if dest.rstrip("/") == "/config" and sources:
+        # Any copy into /config may land config.toml; the source need not be
+        # named for it. `COPY /build/defaults/ /config/` slipped through a check
+        # that required the source to look like a config.
+        return True
     return False
 
 
@@ -261,6 +277,7 @@ def check_runtime_config_ownership(msgs: list[str]) -> None:
     text = path.read_text(encoding="utf-8")
     stage = "<implicit>"
     per_stage: dict[str, int] = {}
+    serving_stages: list[str] = []
     for lineno, instruction in _dockerfile_instructions(text):
         upper = instruction.upper()
         if upper.startswith("FROM"):
@@ -268,8 +285,18 @@ def check_runtime_config_ownership(msgs: list[str]) -> None:
             stage = match.group(1) if match else instruction.split()[1]
             continue
         # A config moved into place by a RUN defeats a COPY-only check.
+        if upper.startswith("USER") and "proximadb" in instruction:
+            if stage not in serving_stages:
+                serving_stages.append(stage)
+            continue
         if upper.startswith("RUN") and "/config/config.toml" in instruction:
-            if re.search(r"\b(mv|cp|install|ln)\b", instruction):
+            # Anything that WRITES it, not an enumerated verb list: `cat >`,
+            # `tee`, `sed -i` and a bare redirect all defeated `mv|cp|install|ln`.
+            # chown/chmod are the legitimate exceptions -- they FIX ownership.
+            only_fixes_perms = re.fullmatch(
+                r"RUN\s+(?:(?:chown|chmod)\s+[^&|;]*(?:&&\s*)?)+", instruction, re.IGNORECASE
+            )
+            if not only_fixes_perms:
                 _fail(
                     msgs,
                     f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{stage}` puts the "
@@ -278,7 +305,9 @@ def check_runtime_config_ownership(msgs: list[str]) -> None:
                     "docstring for why that makes the image unreachable)",
                 )
             continue
-        if not upper.startswith("COPY") or not _lands_runtime_config(instruction):
+        if not (upper.startswith("COPY") or upper.startswith("ADD")) or not _lands_runtime_config(
+            instruction
+        ):
             continue
         per_stage[stage] = per_stage.get(stage, 0) + 1
         owner = re.search(r"--chown=(\S+)", instruction)
@@ -291,20 +320,32 @@ def check_runtime_config_ownership(msgs: list[str]) -> None:
                 "entrypoint.sh cannot rewrite bind_address; the image binds "
                 "127.0.0.1 and is unreachable on its published ports",
             )
-        elif not owner.group(1).startswith("proximadb"):
+        elif owner.group(1) not in RUNTIME_OWNERS:
             _fail(
                 msgs,
                 f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{stage}`: "
                 f"`--chown={owner.group(1)}` is not the user the server runs as "
                 "(`proximadb`), so the config is still unwritable at runtime",
             )
-    runtime_stages = [st for st in per_stage if st.startswith("runtime")]
-    if not runtime_stages:
+    # Per SERVING stage, not "any stage named runtime*". Deleting the `runtime`
+    # stage's COPY while `runtime-full` kept its own satisfied the old check and
+    # shipped an image that binds 127.0.0.1 on every port: with no config at
+    # /config/config.toml entrypoint.sh reports "no --config file found" and
+    # leaves the binary's loopback default. Verified by building it.
+    serving = [st for st in serving_stages if not per_stage.get(st)]
+    if serving:
         _fail(
             msgs,
-            f"{PUBLISHED_DOCKERFILE}: found no `COPY ... /config/config.toml` in "
-            "any runtime stage -- this guard has lost its target; re-point it "
-            "rather than deleting it",
+            f"{PUBLISHED_DOCKERFILE}: stage(s) {', '.join(sorted(serving))} run the "
+            "server (`USER proximadb`) but no instruction puts a config at "
+            "/config/config.toml -- that image binds 127.0.0.1 on every port and "
+            "is unreachable through `docker run -p`",
+        )
+    if not serving_stages:
+        _fail(
+            msgs,
+            f"{PUBLISHED_DOCKERFILE}: found no stage with `USER proximadb` -- this "
+            "guard has lost its target; re-point it rather than deleting it",
         )
 
 

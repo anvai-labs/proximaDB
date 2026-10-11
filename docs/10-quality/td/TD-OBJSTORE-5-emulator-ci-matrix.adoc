@@ -3,7 +3,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Core S1–S4 matrix and S2 contract LANDED; cost ratchet incomplete (reconciled 2026-07-21).** #1072 is the path-gated strict Azurite restart job; #1080 is the sequential Azure+S3 QA tier plus Azure recall ratchet and nightly best-effort GCS; #1088 adds production-backend prefix/LIST/exact-HEAD/GCS-pagination contracts and the cloud-compaction e2e; #1129 adds strict Azure/S3 `write_if_absent` conflict tests and caching/encryption decorator guards. fake-gcs remains correctly best-effort because it does not enforce `ifGenerationMatch=0`. **Cost ratchet now MEASURED (2026-10-11) — see "Measured wall times" below; this TD's last open item is closed.** The figure that was missing is recorded from six consecutive green QA-tier runs.
+| Status | **CLOSED (2026-10-11) — core S1–S4 matrix, S2 contract, and the cost ratchet are all landed.** (Previously "cost ratchet incomplete", reconciled 2026-07-21.) #1072 is the path-gated strict Azurite restart job; #1080 is the sequential Azure+S3 QA tier plus Azure recall ratchet and nightly best-effort GCS; #1088 adds production-backend prefix/LIST/exact-HEAD/GCS-pagination contracts and the cloud-compaction e2e; #1129 adds strict Azure/S3 `write_if_absent` conflict tests and caching/encryption decorator guards. fake-gcs remains correctly best-effort because it does not enforce `ifGenerationMatch=0`. **Cost ratchet now MEASURED (2026-10-11) — see "Measured wall times" below; this TD's last open item is closed.** The figure that was missing is recorded from six consecutive green QA-tier runs.
 | Severity | High — object-store durability regressions currently surface only on the live anvaiops testbed (days-long feedback loop); batch 3 proved a class of bug the file:// suites structurally cannot catch.
 | Component | `scripts/run_cloud_emulator_tests.sh`, `.github/workflows/ci.yml` (`object-store-emulator-tests`), `.github/workflows/qa-gate.yml`, `apps/proximadb-server/tests/object_store_restart_recovery.rs`
 | Relates | ADR-063 (D8), TD-OBJSTORE-1/2/4, TD-168 (Cool-tier emulator validation)
@@ -83,10 +83,10 @@ headroom is understated, never overstated.
 | Job | Cap | Green runs (newest first) | Max | Headroom
 
 | `objstore-restart-qa-tier`
-| 120
+| 130
 | 66, 73, 72, 72, 70, 73 — plus **81 pre-split** (run `37935965003`, green)
 | 81
-| 1.48×
+| 1.6× (120 was 1.48×, under the 1.5× policy)
 
 | `cloud-emulator-object-store`
 | 120
@@ -95,10 +95,10 @@ headroom is understated, never overstated.
 | 1.8× (cap was 90 = 1.36×, under policy)
 
 | `mlflow-s3-artifact-seam`
-| 75
+| 80
 | 35, 36, 33, 35, 49, 48
-| 49
-| 1.5×
+| 49.7
+| 1.6× (75 was 1.51×, on the line)
 |===
 
 Two conclusions, both of which correct an earlier reading:
@@ -130,7 +130,8 @@ Two corrections to how that window is read, both found in review:
   therefore conservative, never tight.
 
 **`mlflow-s3-artifact-seam` was the one genuinely thin cap.** At 60 it carried
-only 1.2× over its measured 49-min cold-cache peak. Raised to 75 here. This is
+only 1.2× over its measured 49.7-min cold-cache peak. Raised to 80 here; 75
+was tried first and is 1.51×, on the policy line rather than clear of it. This is
 the failure mode `Docker Build` demonstrated on the same promotion: capped at 45
 with a 43-min cold build, it cancelled `Test Container Health` one minute in, so
 the only check that proves the published image accepts connections on its

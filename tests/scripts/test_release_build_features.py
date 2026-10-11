@@ -313,6 +313,100 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
                     result.stdout,
                 )
 
+    RUNTIME_COPY = (
+        "COPY --from=builder --chown=proximadb:proximadb "
+        "/build/config/config.toml /config/config.toml"
+    )
+    FULL_COPY = (
+        "COPY --from=builder-full --chown=proximadb:proximadb "
+        "/build/config/config.toml /config/config.toml"
+    )
+
+    def test_a_serving_stage_with_no_config_at_all_is_caught(self) -> None:
+        """The tenth evasion: delete ONE stage's COPY, not the ownership.
+
+        "Any stage whose name starts with runtime" meant deleting the `runtime`
+        stage's COPY was masked by `runtime-full` keeping its own. Built that
+        image: with nothing at /config/config.toml the entrypoint reports "no
+        --config file found" and the server binds 127.0.0.1 on every port, so
+        `docker run -p` reaches nothing -- on the one tier where no test runs.
+        """
+        for label, needle in (("runtime", self.RUNTIME_COPY), ("runtime-full", self.FULL_COPY)):
+            with self.subTest(stage=label):
+                self.setUp()
+                p = self.tree / "deploy/docker/Dockerfile"
+                text = p.read_text(encoding="utf-8")
+                self.assertIn(needle, text, "guard has lost its target")
+                p.write_text(text.replace(needle + "\n", "", 1), encoding="utf-8")
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("unreachable", result.stdout)
+
+    OWNER_SPELLINGS = {
+        "--chown=proximadb:proximadb": False,
+        "--chown=proximadb": False,
+        # groupadd -r / useradd -r on the shipped bases yield uid/gid 999, so the
+        # numeric form is the SAME owner; rejecting it was a false positive.
+        "--chown=999:999": False,
+        "--chown=999": False,
+        # An earlier prefix test (`startswith("proximadb")`) accepted these.
+        "--chown=proximadbX:proximadbX": True,
+        "--chown=proximadb-build": True,
+        "--chown=root:root": True,
+    }
+
+    def test_ownership_guard_matches_the_owner_exactly(self) -> None:
+        for spelling, should_fail in self.OWNER_SPELLINGS.items():
+            with self.subTest(owner=spelling):
+                self.setUp()
+                p = self.tree / "deploy/docker/Dockerfile"
+                text = p.read_text(encoding="utf-8")
+                p.write_text(
+                    text.replace("--chown=proximadb:proximadb", spelling, 1),
+                    encoding="utf-8",
+                )
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1 if should_fail else 0, result.stdout)
+
+    WRITE_PATHS = {
+        "ADD instead of COPY": (
+            "ADD --from=builder /build/config/config.toml /config/config.toml",
+            True,
+        ),
+        "RUN cat redirect": (
+            "COPY --from=builder /build/config/config.toml /tmp/c.toml\n"
+            "RUN cat /tmp/c.toml > /config/config.toml",
+            True,
+        ),
+        "RUN tee": (
+            "COPY --from=builder /build/config/config.toml /tmp/c.toml\n"
+            "RUN tee /config/config.toml < /tmp/c.toml",
+            True,
+        ),
+        "dir copy, source not named config": (
+            "COPY --from=builder /build/defaults/ /config/",
+            True,
+        ),
+        "a RUN that only fixes perms is legitimate": (
+            "COPY --from=builder --chown=proximadb:proximadb "
+            "/build/config/config.toml /config/config.toml\n"
+            "RUN chown proximadb:proximadb /config/config.toml",
+            False,
+        ),
+    }
+
+    def test_ownership_guard_covers_every_way_the_config_is_written(self) -> None:
+        """`mv|cp|install|ln` was an enumerated verb list; `cat >`, `tee` and
+        `sed -i` all wrote the config past it, and ADD was not inspected."""
+        for label, (spelling, should_fail) in self.WRITE_PATHS.items():
+            with self.subTest(path=label):
+                self.setUp()
+                p = self.tree / "deploy/docker/Dockerfile"
+                text = p.read_text(encoding="utf-8")
+                p.write_text(text.replace(self.RUNTIME_COPY, spelling, 1), encoding="utf-8")
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1 if should_fail else 0, result.stdout)
+
     def test_ownership_guard_is_checked_per_stage(self) -> None:
         """Breaking ONE runtime stage must fail even though the other is fine.
 
@@ -334,16 +428,35 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("runtime-full", result.stdout)
 
-    def test_ownership_guard_reports_a_lost_target(self) -> None:
-        """If the COPY disappears the guard must say so, not pass vacuously."""
+    def test_every_config_copy_removed_names_the_serving_stages(self) -> None:
+        """Removing every config lands on the per-stage finding, not vacuity.
+
+        The guard reports the serving stages by name here rather than the
+        generic lost-target message, because `USER proximadb` is still present
+        and so the target has NOT been lost -- the config has.
+        """
         p = self.tree / "deploy/docker/Dockerfile"
         text = p.read_text(encoding="utf-8")
         lines = [
-            line
-            for line in text.splitlines()
-            if "/config/config.toml" not in line
+            line for line in text.splitlines() if "/config/config.toml" not in line
         ]
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("run the server", result.stdout)
+        self.assertIn("unreachable", result.stdout)
+
+    def test_ownership_guard_reports_a_lost_target(self) -> None:
+        """If the guard can no longer find a serving stage it must say so.
+
+        This is the self-protection branch: a Dockerfile refactor that drops
+        `USER proximadb` leaves the guard with nothing to check, and passing
+        silently would retire the protection without anyone noticing.
+        """
+        p = self.tree / "deploy/docker/Dockerfile"
+        text = p.read_text(encoding="utf-8")
+        self.assertIn("USER proximadb", text)
+        p.write_text(text.replace("USER proximadb", "USER root"), encoding="utf-8")
         result = _run(self.tree)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("lost its target", result.stdout)
