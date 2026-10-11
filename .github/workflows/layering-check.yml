@@ -10,7 +10,16 @@ concurrency:
   # Dedup push+PR of the same branch into one group; cancel superseded
   # runs on feature/PR branches, but let protected-branch runs finish.
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.ref_name != 'main' && github.ref_name != 'develop' }}
+  # Mirrors ci.yml. `qa` must be exempt, not just main/develop: this workflow runs
+  # on a push to qa AND on the `qa -> main` promotion PR, and both land in the
+  # same group because the group key is `head_ref || ref_name` and the PR's
+  # head_ref IS `qa`. With cancellation on, whichever started second killed the
+  # other, and `gh pr checks` renders a cancelled run as "fail" -- so the
+  # promotion PR showed a phantom failure for a check that had actually passed
+  # on its own run. That cost two separate misdiagnoses during the v0.4.0 cut.
+  # Exempting PRs that target qa/main as well keeps a promotion run alive while
+  # the source branch churns, which is why qa-gate.yml sets `false` outright.
+  cancel-in-progress: ${{ !(github.event_name == 'pull_request' && contains(fromJson('["qa", "main"]'), github.base_ref)) && !contains(fromJson('["main", "develop", "qa"]'), github.ref_name) }}
 
 # Least-privilege default GITHUB_TOKEN scope (CodeQL actions/missing-workflow-permissions).
 # Default read-only; the single job elevates only what it needs.
