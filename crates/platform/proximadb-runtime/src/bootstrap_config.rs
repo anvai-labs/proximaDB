@@ -1172,3 +1172,90 @@ mod tests {
         assert!(!arrow_config.is_tls_enabled());
     }
 }
+
+#[cfg(test)]
+mod container_bind_regression_tests {
+    //! The published image must start with `server.bind_address = 0.0.0.0`.
+    //!
+    //! `deploy/docker/entrypoint.sh` rewrites `bind_address` to `0.0.0.0`
+    //! because a loopback listener is unreachable through `docker run -p`. That
+    //! rewrite is not optional, so every listener the shipped config enables has
+    //! to survive `validate_listener_security` at `0.0.0.0` -- otherwise the
+    //! server fails closed before binding anything and the whole image is dead,
+    //! not merely missing a port.
+    //!
+    //! This regressed once and cost three promotion rounds. `[api] pg_port` was
+    //! set in the shipped config, which makes `src/database.rs` re-derive the
+    //! pgwire bind from `server.bind_address`; at `0.0.0.0` that is a
+    //! non-loopback trust-mode listener, which `validate_trust_only_listener`
+    //! refuses. It stayed hidden because the config was root-owned, so the
+    //! rewrite silently failed and the listener stayed on loopback.
+    use super::*;
+
+    fn container_shaped_config(bind: &str, pgwire_bind: &str) -> MultiServerConfig {
+        let mut config = MultiServerConfig {
+            unified_mode: true,
+            unified_bind_address: bind.to_string(),
+            ..Default::default()
+        };
+        config.tls_config.bind_interface = bind.to_string();
+        config.postgres_config.enable_postgres = true;
+        config.postgres_config.bind_address = pgwire_bind
+            .parse()
+            .expect("test literal is a valid socket address");
+        config
+    }
+
+    fn single_tenant() -> proximadb_tenant::TenantDeploymentMode {
+        proximadb_tenant::TenantDeploymentMode::SingleTenant {
+            default_tenant: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn container_bind_with_pgwire_left_on_loopback_starts() {
+        // What the image ships: the rewrite moves the unified surface to
+        // 0.0.0.0 while pgwire keeps the builder's loopback default, because
+        // `pg_port` is NOT set in config/config.toml.
+        let config = container_shaped_config("0.0.0.0", "127.0.0.1:5433");
+        config
+            .validate_listener_security(false, false, &single_tenant())
+            .expect("the published image must start after entrypoint.sh rewrites bind_address");
+    }
+
+    #[test]
+    fn container_bind_dragging_pgwire_off_loopback_fails_closed() {
+        // Setting `[api] pg_port` re-derives the pgwire bind from
+        // `server.bind_address`, which in a container is 0.0.0.0. This MUST
+        // fail: an unauthenticated trust-mode listener is loopback-only. The
+        // test pins the containment, so a future config change that reintroduces
+        // `pg_port` fails here instead of in a release.
+        let config = container_shaped_config("0.0.0.0", "0.0.0.0:5433");
+        let err = config
+            .validate_listener_security(false, false, &single_tenant())
+            .expect_err("a non-loopback trust-mode pgwire listener must be refused");
+        assert!(
+            err.to_string().contains("loopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_config_does_not_set_pg_port() {
+        // The guard on the actual artifact: if this starts failing, the image
+        // will fail closed at boot on 0.0.0.0 and `Test Container Health` will
+        // go red with `Failed to start multi-server`.
+        let shipped = include_str!("../../../../config/config.toml");
+        for (lineno, line) in shipped.lines().enumerate() {
+            let trimmed = line.trim();
+            assert!(
+                !(trimmed.starts_with("pg_port") && trimmed.contains('=')),
+                "config/config.toml:{} sets pg_port, which drags the pgwire listener onto \
+                 server.bind_address (0.0.0.0 in a container) and makes the server fail \
+                 closed at boot. Making pgwire reachable needs per-connection auth \
+                 (TD-PGWIRE-AUTH-1), not this toggle.",
+                lineno + 1
+            );
+        }
+    }
+}

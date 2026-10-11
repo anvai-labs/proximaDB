@@ -46,6 +46,9 @@ RELEASE_WORKFLOWS = (
 TIMED_WORKFLOWS = RELEASE_WORKFLOWS + (
     ".github/workflows/ci.yml",
     ".github/workflows/qa-gate.yml",
+    # Builds AND publishes the shipped image, so an unbounded job here is on the
+    # release path.
+    ".github/workflows/publish-image.yml",
 )
 REQUIRED_FEATURE = "cloud-full"
 # The image the publish workflow actually ships (publish-image.yml `file:`).
@@ -70,6 +73,9 @@ FEATURES_RE = re.compile(r"^\s+features:(?P<rest>.*)$")
 TIMEOUT_VALUE_RE = re.compile(
     r"^    timeout-minutes:\s*(?:\d+(?:\.\d+)?|\$\{\{.*\}\})\s*(?:#.*)?$"
 )
+# A literal cap must be a real bound. `0` matched TIMEOUT_VALUE_RE and read as
+# "bounded" while cancelling the job instantly.
+TIMEOUT_ZERO_RE = re.compile(r"^    timeout-minutes:\s*0+(?:\.0+)?\s*(?:#.*)?$")
 # Three spellings, all legal, each of which previously let a job with NO cap
 # through with exit 0, because an unmatched key folds the job's body into the
 # PREVIOUS job -- whose cap then satisfies the check for both, and the unmatched
@@ -161,6 +167,12 @@ def check_workflow_timeouts(msgs: list[str]) -> None:
                 continue
             reusable = any(re.match(r"^    uses:", b) for b in body)
             bounded = any(TIMEOUT_VALUE_RE.match(b) for b in body)
+            if job is not None and any(TIMEOUT_ZERO_RE.match(b) for b in body):
+                _fail(
+                    msgs,
+                    f"{rel}: job `{job}` has `timeout-minutes: 0`, which cancels "
+                    f"the job instantly rather than bounding it",
+                )
             if job is not None and not bounded and not reusable:
                 _fail(
                     msgs,
@@ -170,49 +182,129 @@ def check_workflow_timeouts(msgs: list[str]) -> None:
             job, body = m.group("job"), []
 
 
+def _dockerfile_instructions(text: str) -> list[tuple[int, str]]:
+    """Logical instructions with line continuations joined and comments stripped.
+
+    A guard that reads raw lines is defeated by `COPY --from=builder \\` plus a
+    continuation, which is ordinary Dockerfile style.
+    """
+    out: list[tuple[int, str]] = []
+    buf, first = "", 0
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.strip()
+        if not buf and (not stripped or stripped.startswith("#")):
+            continue
+        if not buf:
+            first = lineno
+        if stripped.endswith("\\"):
+            buf += stripped[:-1] + " "
+            continue
+        buf += stripped
+        # A trailing comment on the instruction must not hide the target.
+        out.append((first, re.sub(r"\s+#.*$", "", buf).strip()))
+        buf = ""
+    if buf:
+        out.append((first, buf.strip()))
+    return out
+
+
+def _lands_runtime_config(instruction: str) -> bool:
+    """Does this COPY put a file at /config/config.toml, however spelled?
+
+    Covers the exec/JSON form, a quoted destination, and a directory copy --
+    each of which defeated an `endswith("/config/config.toml")` check.
+    """
+    body = instruction[len("COPY") :]
+    # The exec/JSON form `COPY ["src", "dst"]` must normalise to the same
+    # argument list as the shell form; leaving the brackets attached made the
+    # destination parse as a bare "]" and the whole instruction slip through.
+    tokens = re.findall(r'"[^"]*"|\S+', body)
+    args = [t.strip('"[], ') for t in tokens if not t.startswith("--")]
+    args = [a for a in args if a]
+    if not args:
+        return False
+    dest, sources = args[-1], args[:-1]
+    if dest in ("/config/config.toml", "/config/config.toml/"):
+        return True
+    if dest.rstrip("/") == "/config":
+        return any(
+            src.rstrip("/").endswith("config.toml") or src.rstrip("/").endswith("/config")
+            for src in sources
+        )
+    return False
+
+
 def check_runtime_config_ownership(msgs: list[str]) -> None:
-    """Every `COPY ... config.toml /config/config.toml` must carry --chown.
+    """The runtime config must be owned by the user the server runs as.
 
     Not style. In each runtime stage the Dockerfile does
     `chown -R proximadb:proximadb ... /config` and only AFTER that copies the
     config in, so without `--chown` the file lands root-owned 0644 while the
     server runs as uid 999. entrypoint.sh then cannot rewrite `bind_address`,
-    the server binds 127.0.0.1, `-p` cannot reach it, and the container is
+    the server binds 127.0.0.1, `-p` cannot reach it, and the image is
     unreachable on its published ports.
 
-    That shipped, and cost a full promotion round: `Test Container Health`
+    That shipped, and cost three promotion rounds: `Test Container Health`
     failed on a tree that already contained the loopback fix, and the warning
     explaining it was scrolled away by `docker logs | tail -100`.
 
     Guarded here because `Docker Build` only runs on the extensive tier
     (`main`-targeted PRs), so nothing else catches a regression until a release.
+    Checked PER STAGE: an earlier revision counted matches across the whole
+    file, so breaking one of the two shipped stages left the other satisfying
+    the check.
     """
     path = ROOT / PUBLISHED_DOCKERFILE
     if not path.exists():
         _fail(msgs, f"{PUBLISHED_DOCKERFILE}: missing")
         return
-    found = 0
-    for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        stripped = line.strip()
-        if not stripped.startswith("COPY"):
+    text = path.read_text(encoding="utf-8")
+    stage = "<implicit>"
+    per_stage: dict[str, int] = {}
+    for lineno, instruction in _dockerfile_instructions(text):
+        upper = instruction.upper()
+        if upper.startswith("FROM"):
+            match = re.search(r"\sAS\s+(\S+)", instruction, re.IGNORECASE)
+            stage = match.group(1) if match else instruction.split()[1]
             continue
-        if not stripped.endswith("/config/config.toml"):
+        # A config moved into place by a RUN defeats a COPY-only check.
+        if upper.startswith("RUN") and "/config/config.toml" in instruction:
+            if re.search(r"\b(mv|cp|install|ln)\b", instruction):
+                _fail(
+                    msgs,
+                    f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{stage}` puts the "
+                    "runtime config in place with a RUN rather than a COPY "
+                    "--chown; ownership is then unguarded (see this guard's "
+                    "docstring for why that makes the image unreachable)",
+                )
             continue
-        found += 1
-        if "--chown=" not in stripped:
+        if not upper.startswith("COPY") or not _lands_runtime_config(instruction):
+            continue
+        per_stage[stage] = per_stage.get(stage, 0) + 1
+        owner = re.search(r"--chown=(\S+)", instruction)
+        if owner is None:
             _fail(
                 msgs,
-                f"{PUBLISHED_DOCKERFILE}:{i}: `{stripped}` has no `--chown=` -- "
-                "the `chown -R ... /config` above runs BEFORE this COPY, so the "
-                "config lands root-owned and entrypoint.sh cannot rewrite "
-                "bind_address; the image binds 127.0.0.1 and is unreachable on "
-                "its published ports",
+                f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{stage}`: "
+                f"`{instruction}` has no `--chown=` -- the `chown -R ... /config` "
+                "above runs BEFORE this COPY, so the config lands root-owned and "
+                "entrypoint.sh cannot rewrite bind_address; the image binds "
+                "127.0.0.1 and is unreachable on its published ports",
             )
-    if found == 0:
+        elif not owner.group(1).startswith("proximadb"):
+            _fail(
+                msgs,
+                f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{stage}`: "
+                f"`--chown={owner.group(1)}` is not the user the server runs as "
+                "(`proximadb`), so the config is still unwritable at runtime",
+            )
+    runtime_stages = [st for st in per_stage if st.startswith("runtime")]
+    if not runtime_stages:
         _fail(
             msgs,
-            f"{PUBLISHED_DOCKERFILE}: no `COPY ... /config/config.toml` found -- "
-            "this guard has lost its target; re-point it rather than deleting it",
+            f"{PUBLISHED_DOCKERFILE}: found no `COPY ... /config/config.toml` in "
+            "any runtime stage -- this guard has lost its target; re-point it "
+            "rather than deleting it",
         )
 
 

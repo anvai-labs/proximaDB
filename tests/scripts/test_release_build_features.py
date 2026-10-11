@@ -43,6 +43,7 @@ COPY = (
     # an absent workflow would pass for the wrong reason.
     ".github/workflows/ci.yml",
     ".github/workflows/qa-gate.yml",
+    ".github/workflows/publish-image.yml",
 )
 
 
@@ -249,6 +250,115 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         result = _run(self.tree)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("has no `--chown=`", result.stdout)
+
+    # Every spelling below defeated an earlier `startswith("COPY") and
+    # endswith("/config/config.toml")` check while leaving the image
+    # unreachable. The last entry is a legal form that must NOT be flagged.
+    CONFIG_COPY = (
+        "COPY --from=builder --chown=proximadb:proximadb "
+        "/build/config/config.toml /config/config.toml"
+    )
+    OWNERSHIP_EVASIONS = {
+        "line continuation": (
+            "COPY --from=builder \\\n    /build/config/config.toml \\\n"
+            "    /config/config.toml",
+            True,
+        ),
+        "exec/JSON form": (
+            'COPY --from=builder ["/build/config/config.toml", '
+            '"/config/config.toml"]',
+            True,
+        ),
+        "quoted destination": (
+            'COPY --from=builder /build/config/config.toml "/config/config.toml"',
+            True,
+        ),
+        "trailing comment": (
+            "COPY --from=builder /build/config/config.toml "
+            "/config/config.toml  # default cfg",
+            True,
+        ),
+        "RUN mv into place": (
+            "COPY --from=builder /build/config/config.toml /tmp/config.toml\n"
+            "RUN mv /tmp/config.toml /config/config.toml",
+            True,
+        ),
+        "directory copy": ("COPY --from=builder /build/config/ /config/", True),
+        "wrong owner": (
+            "COPY --from=builder --chown=root:root /build/config/config.toml "
+            "/config/config.toml",
+            True,
+        ),
+        "legal exec form WITH chown": (
+            "COPY --from=builder --chown=proximadb:proximadb "
+            '["/build/config/config.toml", "/config/config.toml"]',
+            False,
+        ),
+    }
+
+    def test_ownership_guard_resists_every_known_evasion(self) -> None:
+        for name, (spelling, should_fail) in self.OWNERSHIP_EVASIONS.items():
+            with self.subTest(spelling=name):
+                self.setUp()
+                p = self.tree / "deploy/docker/Dockerfile"
+                text = p.read_text(encoding="utf-8")
+                self.assertIn(self.CONFIG_COPY, text, "guard has lost its target")
+                p.write_text(
+                    text.replace(self.CONFIG_COPY, spelling, 1), encoding="utf-8"
+                )
+                result = _run(self.tree)
+                self.assertEqual(
+                    result.returncode,
+                    1 if should_fail else 0,
+                    result.stdout,
+                )
+
+    def test_ownership_guard_is_checked_per_stage(self) -> None:
+        """Breaking ONE runtime stage must fail even though the other is fine.
+
+        An earlier revision counted matches across the whole file, so a
+        regression in `runtime` was masked by `runtime-full` still being right.
+        """
+        p = self.tree / "deploy/docker/Dockerfile"
+        text = p.read_text(encoding="utf-8")
+        full = (
+            "COPY --from=builder-full --chown=proximadb:proximadb "
+            "/build/config/config.toml /config/config.toml"
+        )
+        self.assertIn(full, text)
+        p.write_text(
+            text.replace(full, "COPY --from=builder-full /build/config/config.toml /config/config.toml", 1),
+            encoding="utf-8",
+        )
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("runtime-full", result.stdout)
+
+    def test_ownership_guard_reports_a_lost_target(self) -> None:
+        """If the COPY disappears the guard must say so, not pass vacuously."""
+        p = self.tree / "deploy/docker/Dockerfile"
+        text = p.read_text(encoding="utf-8")
+        lines = [
+            line
+            for line in text.splitlines()
+            if "/config/config.toml" not in line
+        ]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("lost its target", result.stdout)
+
+    def test_rejects_a_zero_timeout(self) -> None:
+        """`timeout-minutes: 0` cancels instantly; it is not a bound."""
+        p = self.tree / ".github/workflows/ci.yml"
+        text = p.read_text(encoding="utf-8")
+        cap_re = re.compile(r"^    timeout-minutes: \d+.*$", re.MULTILINE)
+        mutated, n = cap_re.subn("    timeout-minutes: 0", text, count=1)
+        self.assertEqual(n, 1)
+        p.write_text(mutated, encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("cancels", result.stdout)
 
     def test_catches_the_published_image_built_without_cloud(self) -> None:
         p = self.tree / "deploy/docker/Dockerfile"
