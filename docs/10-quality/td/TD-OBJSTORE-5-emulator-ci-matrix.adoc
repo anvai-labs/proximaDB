@@ -89,10 +89,10 @@ headroom is understated, never overstated.
 | 1.48×
 
 | `cloud-emulator-object-store`
-| 90
+| 120
 | 62, 61, 54, 62, 66, 55
 | 66
-| 1.4×
+| 1.8× (cap was 90 = 1.36×, under policy)
 
 | `mlflow-s3-artifact-seam`
 | 75
@@ -168,6 +168,13 @@ failure is reproducible on a workstation with Docker (single source of truth).
   script header, not code).
 
 == Measured: the QA tier's cold-cache budget, and why it was being evicted (2026-10-09)
+
+NOTE: This section predates <<measured-wall-times>> and counts only the two
+attempts visible at the time; that section lists three real failures (54.9, 76.2,
+77.2 min) plus a fourth that is 93 minutes of *queue*, not execution. The wall
+figures below are job wall-clock and so are queue-inflated the same way — read
+them as upper bounds. The diagnosis (runner eviction, not timeout) is unchanged
+and is what both sections agree on.
 
 This TD asked for "the first cold-cache QA wall time ... to turn the 90-minute cap into a
 measured ratchet". Two runs on the v0.4.0 promotion recorded it, and both were **evicted rather

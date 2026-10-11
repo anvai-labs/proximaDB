@@ -167,6 +167,10 @@ refresh_models() {
 # can still pin it: PROXIMADB_BIND_ADDRESS=127.0.0.1 restores the old behaviour,
 # and any other value is honoured verbatim.
 BIND_ADDRESS="${PROXIMADB_BIND_ADDRESS:-0.0.0.0}"
+# Set by normalize_bind_address when it cannot write the config in place; the
+# exec below then points the server at this copy instead.
+NORMALIZED_CONFIG=""
+FALLBACK_CONFIG="${TMPDIR:-/tmp}/proximadb-config.normalized.toml"
 
 # The value lands in a sed replacement, where `&` and `\` are metacharacters and
 # an embedded `"` or newline can append a whole config line. Verified: a crafted
@@ -236,8 +240,25 @@ normalize_bind_address() {
         rm -f "${tmp}"
         echo "[entrypoint] bind_address ${current} -> ${BIND_ADDRESS} (container reachability; set PROXIMADB_BIND_ADDRESS to override)" >&2
     else
+        # In-place failed. Two real causes, both observed: the file is root-owned
+        # 0644 while we run as uid 999 (the Dockerfile COPY landed before the
+        # chown -- fixed there, but a bind-mounted config can reproduce it), and
+        # docker-compose.yml mounts the config `:ro`.
+        #
+        # Do NOT fall through to booting with the loopback bind. That is the
+        # defect this function exists to fix and it fails as an *unreachable
+        # container* -- `-p` cannot reach a loopback listener, the in-container
+        # HEALTHCHECK is structurally blind to it, and the CI health check's
+        # `docker logs | tail -100` scrolls this warning away. It cost one full
+        # promotion round to find. Write the normalized copy somewhere writable
+        # and point the server at that instead.
+        if [ -s "${tmp}" ] && cat "${tmp}" > "${FALLBACK_CONFIG}" 2>/dev/null; then
+            NORMALIZED_CONFIG="${FALLBACK_CONFIG}"
+            echo "[entrypoint] ${config_path} is not writable; using a normalized copy at ${FALLBACK_CONFIG} (bind_address ${current} -> ${BIND_ADDRESS})" >&2
+        else
+            echo "[entrypoint] WARN: could not rewrite bind_address in ${config_path}, and could not write ${FALLBACK_CONFIG}; leaving ${current}. The container will NOT be reachable on its published ports." >&2
+        fi
         rm -f "${tmp}"
-        echo "[entrypoint] WARN: could not rewrite bind_address in ${config_path}; leaving ${current}" >&2
     fi
 }
 
@@ -247,4 +268,37 @@ normalize_bind_address "$@"
 
 # Hand off to the server. `exec` so the server becomes PID 1 (signal
 # handling, OOM, healthchecks all work correctly).
+if [ -n "${NORMALIZED_CONFIG}" ]; then
+    # Rebuild the argument list with the --config value replaced, preserving
+    # every other argument and its order. Done inline rather than in a function
+    # because `set --` only rewrites the positional parameters of its own shell,
+    # and echoing the list back would corrupt any argument containing a space.
+    n=$#
+    i=0
+    want=0
+    while [ "${i}" -lt "${n}" ]; do
+        arg="$1"
+        shift
+        i=$((i + 1))
+        if [ "${want}" -eq 1 ]; then
+            want=0
+            set -- "$@" "${NORMALIZED_CONFIG}"
+            continue
+        fi
+        case "${arg}" in
+            --config | -c)
+                want=1
+                set -- "$@" "${arg}"
+                ;;
+            --config=*)
+                set -- "$@" "--config=${NORMALIZED_CONFIG}"
+                ;;
+            *)
+                set -- "$@" "${arg}"
+                ;;
+        esac
+    done
+    echo "[entrypoint] serving with the normalized config: $*" >&2
+fi
+
 exec /usr/local/bin/proximadb-server "$@"

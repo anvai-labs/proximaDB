@@ -557,8 +557,12 @@ jobs:
   proto-compat:
     name: Proto Compatibility (T4.2)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    # max 5 min over 14 runs, 2026-10-09..11; wider history holds ~9 min
+    timeout-minutes: 60
+    # was 20, which is BELOW two real green runs: 31.0 min (run 33717025328)
+    # and 22.1 min (34268005745). Neither is a hang -- `Install Python SDK
+    # (editable) and test deps` took 29.1 and 20.0 min of them, i.e. pip
+    # dependency resolution. An earlier revision claimed a ~9 min wider-history
+    # figure; that was wrong.
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.proto == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     steps:
@@ -752,7 +756,7 @@ jobs:
     name: Python SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # max 3 min over 14 runs, 2026-10-09..11; wider history holds ~9 min
+    # max 7 min over 14 runs, 2026-10-09..11 (run 37870748694)
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -785,7 +789,7 @@ jobs:
   python-sdk-round-trip:
     name: Python SDK round-trip (ADR-068 D5)
     runs-on: ubuntu-24.04
-    timeout-minutes: 70  # max 34 min over 14 runs, 2026-10-09..11
+    timeout-minutes: 70  # max 36 min over 14 runs, 2026-10-09..11 (run 37880949062)
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -1098,7 +1102,8 @@ jobs:
   python-lint:
     name: Python Lint
     runs-on: ubuntu-24.04
-    timeout-minutes: 15  # max 4 min over 14 runs, 2026-10-09..11
+    timeout-minutes: 25
+    # was 15 against a 12.8-min green span (SDK dependency install)
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.proto == 'true'
     steps:
@@ -1198,8 +1203,8 @@ jobs:
     name: Rust SDK Lint
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    # max 3 min over 14 runs, 2026-10-09..11; full history holds 11.7 min, pre-dating the
-    # same 2026-09-03 dependency fix as sdk-contract-gates.
+    # max 3 min over 14 runs, 2026-10-09..11; full history holds 12.0 min, pre-dating the
+    # same 2026-09-02 dependency fix as sdk-contract-gates.
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true'
     steps:
@@ -1233,8 +1238,8 @@ jobs:
     name: SDK OpenAPI Contract Gate (${{ matrix.sdk }})
     runs-on: ubuntu-24.04
     timeout-minutes: 40
-    # max 4 min over 14 runs, 2026-10-09..11, 3 legs. Full history holds a 25.7-min
-    # observation (2026-08); that collapsed to ~3 min on 2026-09-03 when
+    # max 4 min over 14 runs, 2026-10-09..11, 3 legs. Full history holds a 26.4-min
+    # observation (2026-08); that collapsed to ~3 min on 2026-09-02 when
     # `clients/rust/Cargo.toml` dropped its non-optional path dep on
     # proximadb-embedded and stopped dragging the monolith. Capped above the old
     # figure so a regression of that dep fails loudly instead of by cancellation.
@@ -1317,7 +1322,7 @@ jobs:
   connectors-contract-gates:
     name: Connectors Contract Gate (${{ matrix.kind }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 60  # max 28 min over 14 runs, 2026-10-09..11, 3 legs
+    timeout-minutes: 60  # max 28 min over 14 runs, 2026-10-09..11, 2 legs (rest/flight)
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1369,7 +1374,9 @@ jobs:
     timeout-minutes: 60
     # NOT measured: path-gated on spark_jni, so it is absent from the sample.
     # `clients/jvm/spark-connector/run-smoke.sh:14` builds
-    # `--manifest-path $REPO_ROOT/Cargo.toml` -- the ROOT workspace -- and caches
+    # `--manifest-path $REPO_ROOT/Cargo.toml -p proximadb-spark-jni`: ONE package,
+    # but `crates/binding/proximadb-spark-jni` carries a non-optional
+    # `proximadb = { path = "../../.." }` dep, so it drags the monolith. It caches
     # it (`workspaces: ". -> target"` below), where comparable builds measure
     # 28-37 min. At 30 this would have cancelled the TD-097 JNI link proof.
     needs: changes
@@ -1547,9 +1554,10 @@ jobs:
     name: Rust Compile (${{ matrix.shape }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # max 28 min over 14 runs, 2026-10-09..11, 2 legs (lib/test). An earlier comment said 4:
-    # prefix-keying on `Rust Compile (` also matches the SEPARATE
-    # rust-compile-benches job, folding it in.
+    # max 32 min over 14 runs, 2026-10-09..11 (run 37926571641, `Rust Compile
+    # (test)`), 2 legs (lib/test). An earlier comment said 28 min / 4 legs: 28
+    # understated the window, and the 4 counted the SEPARATE rust-compile-benches
+    # job, whose literal name `Rust Compile (benches)` the prefix also matches.
     needs: changes
     if: needs.changes.outputs.compile == 'true'
     # CARGO_BUILD_JOBS=1: serial compilation keeps peak memory bounded. The
@@ -1724,7 +1732,8 @@ jobs:
     name: Rust Tests (${{ matrix.test-type }})
     runs-on: ubuntu-24.04
     # Fail fast instead of the 360-min default if a hang sneaks in; the healthy
-    # job finishes in ~30-45 min (compile-bound at CARGO_BUILD_JOBS=1).
+    # job finishes in 51-70 min, measured from step spans (compile-bound at
+    # CARGO_BUILD_JOBS=1). An earlier note here said ~30-45; that understated it.
     timeout-minutes: 120
     # was 90; step spans reach 51-70 min
     needs: [changes, rust-build]
@@ -1868,7 +1877,8 @@ jobs:
     # 709/710 fast tests pass before the job was cancelled on the final N=100k
     # recall harness. If a future dependency edge makes the remaining graph
     # heavy again, fail after 10 wasted minutes, not 15.
-    timeout-minutes: 10
+    timeout-minutes: 20
+    # was 10 against a 9.6-min green span (1.04x)
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1992,8 +2002,9 @@ jobs:
     # The `--restart` scope (scripts/run_cloud_emulator_tests.sh) builds 3 test
     # targets across distinct cloud feature sets (azure; aws,azure,gcp) at
     # CARGO_BUILD_JOBS=1 (OOM-safe on the 16GB runner). No other CI job builds
-    # these feature sets, so they are always a COLD compile (~85-90 min) — the
-    # prior 90-min budget timed out at the edge. Bumped to 150 for reliable
+    # these feature sets, so they are always a COLD compile. Measured step span
+    # 129.8 min, not the ~85-90 an earlier note claimed, which is why 150 was
+    # only 1.16x. Bumped again to 200 for
     # headroom. (Efficiency follow-up: warm these feature sets in a shared
     # earlier job, or split the contract test out of --restart.)
     timeout-minutes: 200
@@ -2230,7 +2241,8 @@ jobs:
   rust-integration-test-authz:
     name: Rust Integration Tests (authz e2e)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45; green spans reach 30-34 min across the integration legs
     env:
       RUST_MIN_STACK: "8388608"
     # `needs: [changes]` ONLY — deliberately not `rust-build`. `rust-build` is
@@ -2285,7 +2297,8 @@ jobs:
   rust-integration-test-query:
     name: Rust Integration Tests (query)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45; green spans reach 30-34 min across the integration legs
     needs: [changes, rust-build]
     if: |
       !inputs.skip_tests &&
@@ -2323,7 +2336,7 @@ jobs:
     name: Rust Integration Tests (pgwire accuracy)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # was 45 against a measured 35-min step span
+    # was 45 against a measured 38-min step span
     needs: [changes]
     if: |
       !inputs.skip_tests &&
@@ -2417,7 +2430,8 @@ jobs:
   rust-integration-test-graph:
     name: Rust Integration Tests (graph)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45; green spans reach 30-34 min across the integration legs
     needs: [changes, rust-build]
     if: |
       !inputs.skip_tests &&
@@ -2449,7 +2463,8 @@ jobs:
   rust-integration-test-cluster:
     name: Rust Integration Tests (cluster)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45; green spans reach 30-34 min across the integration legs
     needs: [changes, rust-build]
     if: |
       !inputs.skip_tests &&
@@ -2536,9 +2551,9 @@ jobs:
     # `cargo tarpaulin --lib` builds the `proximadb` lib-test target: cfg(test)
     # over ~779k LOC and ~7,100 inline tests, which #1971 identified as the
     # largest codegen unit in the workspace and fixed for three other jobs with
-    # exactly these three settings. ubuntu-latest ships only ~2 GiB of swap
-    # (measured: 14 GiB total after this step adds 12), so a peak above
-    # 16GB kills the runner instead of slowing down; debug info is the other
+    # exactly these three settings. ubuntu-24.04 (this job's runner) ships only
+    # ~2 GiB of swap (measured: 14 GiB total after this step adds 12), so a peak
+    # above ~18GB kills the runner instead of slowing down; debug info is the other
     # dominant term in rustc peak memory, and nothing here reads a backtrace
     # symbol. An earlier revision of this change instead removed the job from
     # `ci-success.needs`, which was wrong twice over: the tiering comment at the
@@ -2554,7 +2569,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
-      # ubuntu-latest ships only ~2 GiB of swap, so a residual peak above ~18GB kills the
+      # ubuntu-24.04 ships only ~2 GiB of swap, so a residual peak above ~18GB kills the
       # runner rather than slowing down. 12G on the big ephemeral /mnt disk,
       # mirroring the three jobs #1971 fixed and the two that already had it.
       - name: Add swap headroom
@@ -2619,7 +2634,8 @@ jobs:
   python-test:
     name: Python SDK Tests (${{ matrix.python-version }})
     runs-on: ubuntu-24.04
-    # Defense-in-depth: the suite runs in ~9min (measured, TD-CI-2; the "~5min"
+    # Defense-in-depth: the suite itself runs in ~9min (measured, TD-CI-2; the
+    # job's step span reaches 14 min including setup; the "~5min"
     # this comment used to claim was stale). If a future test leaks a
     # non-daemon thread / unshutdown pool, the interpreter's atexit join can hang
     # the job for hours. Cap it so a leak fails fast instead of stalling CI.
@@ -2794,7 +2810,8 @@ jobs:
   chunking-conformance:
     name: Chunking Conformance + Quality Evals (TD-CHUNK-1/3)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
+    # was 15 against a 14.4-min green span (run 33816799344, 1.04x)
     needs: changes
     if: ${{ !inputs.skip_tests && needs.changes.outputs.python == 'true' }}
     steps:
@@ -3008,7 +3025,18 @@ jobs:
             curl -s http://localhost:5678/health | jq .
           else
             echo "=== Health Check Failed - Container Logs ==="
+            # HEAD first, not just the tail. entrypoint.sh logs its bind_address
+            # decision at container START, so `tail -100` scrolled the one line
+            # that explains an unreachable container off the top -- the reason a
+            # loopback bind survived a full promotion round looking like a
+            # timeout. Keep both: head for the boot decisions, tail for the
+            # failure.
+            echo "--- first 60 lines (entrypoint + bind decisions) ---"
+            docker logs test-container 2>&1 | head -60
+            echo "--- last 100 lines ---"
             docker logs test-container 2>&1 | tail -100
+            echo "--- what the server actually bound ---"
+            docker logs test-container 2>&1 | grep -iE 'bind|listening|starting .* on' | head -20 || true
             docker stop test-container || true
             docker rm test-container || true
             exit 1
@@ -3156,10 +3184,11 @@ jobs:
     # Release-mode compile of the recall test binary (pulls the full root crate) +
     # 10k-vector ingest measured 30m17s on 2026-08-09 (#1552) — right at the prior
     # 30m cap, so it tipped to CANCELLED under normal runner variance and blocked
-    # every storage/query-touching PR via the `ci-success` aggregator. 45m gives
-    # comfortable headroom without masking a genuine hang.
+    # every storage/query-touching PR via the `ci-success` aggregator. 60m gives
+    # comfortable headroom without masking a genuine hang (was 45m, only 1.26x
+    # of the measured 38-min step span).
     timeout-minutes: 60
-    # was 45 against a measured 35-min step span
+    # was 45 against a measured 38-min step span
     # only run when search/flush/WAL/PAX/cascade code changes
     # core_changes is required, not decorative: nprobe_multiplier/min/max and the
     # coarse-probe gates live in src/core/config.rs, which matches core_changes

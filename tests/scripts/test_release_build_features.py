@@ -19,6 +19,7 @@ are deliberately not added together.
 from __future__ import annotations
 
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -160,21 +161,51 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         false positive on a workflow GitHub would happily run."""
         p = self.tree / ".github/workflows/ci.yml"
         text = p.read_text(encoding="utf-8")
+        # Keyed on a REGEX, not a comment literal. An earlier revision searched
+        # for "    timeout-minutes: 30  # measured max 13 min"; a later pass in
+        # the same PR relabelled every such comment, the replace became a no-op,
+        # and both subTests silently re-asserted the baseline. Verified then by
+        # narrowing TIMEOUT_VALUE_RE and seeing 0 failures.
+        cap_re = re.compile(r"^    timeout-minutes: \d+.*$", re.MULTILINE)
+        self.assertIsNotNone(cap_re.search(text), "no job-level cap found to mutate")
         for spelling in (
             "    timeout-minutes: ${{ fromJSON(vars.CLIPPY_CAP) }}",
             "    timeout-minutes: 30.5",
         ):
             with self.subTest(spelling=spelling):
-                p.write_text(
-                    text.replace(
-                        "    timeout-minutes: 30  # measured max 13 min",
-                        spelling,
-                        1,
-                    ),
-                    encoding="utf-8",
-                )
+                mutated, n = cap_re.subn(spelling, text, count=1)
+                self.assertEqual(n, 1, "mutation did not apply")
+                self.assertNotEqual(mutated, text, "mutation was a no-op")
+                p.write_text(mutated, encoding="utf-8")
                 result = _run(self.tree)
                 self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_a_quoted_or_underscored_job_key_cannot_evade(self) -> None:
+        """Same class as the trailing-comment evasion, two more legal spellings.
+
+        A quoted key is valid YAML and GitHub reads the job id as `rust-clippy`;
+        a leading underscore is explicitly allowed in a job id. Either one, left
+        unmatched, folds the job body into the previous job.
+        """
+        for key in ('  "rust-clippy":', "  _rustclippy:"):
+            with self.subTest(key=key):
+                self.setUp()
+                p = self.tree / ".github/workflows/ci.yml"
+                lines = p.read_text(encoding="utf-8").splitlines()
+                out, seen, killed = [], False, False
+                for line in lines:
+                    if line == "  rust-clippy:":
+                        out.append(key)
+                        seen = True
+                        continue
+                    if seen and not killed and line.startswith("    timeout-minutes:"):
+                        killed = True
+                        continue
+                    out.append(line)
+                self.assertTrue(killed, "mutation did not remove the cap")
+                p.write_text("\n".join(out) + "\n", encoding="utf-8")
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1, result.stdout)
 
     def test_a_reusable_workflow_job_is_exempt(self) -> None:
         """GitHub REJECTS job-level `timeout-minutes` on a `uses:` job, so

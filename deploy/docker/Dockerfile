@@ -121,7 +121,12 @@ RUN mkdir -p /data/proximadb /config /log /var/lib/proximadb/models && \
 COPY --from=builder-full /build/target/release/proximadb-server /usr/local/bin/proximadb-server
 # Config from builder-full (not the bookworm `builder`) so this target doesn't
 # pull the minimal builder's full compile into the graph — only builder-full builds.
-COPY --from=builder-full /build/config/config.toml /config/config.toml
+# --chown is load-bearing: the `chown -R ... /config` above runs BEFORE this
+# COPY, so without it the file lands root-owned 0644 while the server runs as
+# uid 999. entrypoint.sh could then not rewrite bind_address, so the published
+# image kept binding 127.0.0.1 and `Test Container Health` failed with the fix
+# present in the tree (measured: CI run 38068651767).
+COPY --from=builder-full --chown=proximadb:proximadb /build/config/config.toml /config/config.toml
 COPY --from=models --chown=proximadb:proximadb /models/ /var/lib/proximadb/models/
 RUN chown proximadb:proximadb /usr/local/bin/proximadb-server
 USER proximadb
@@ -175,7 +180,12 @@ RUN mkdir -p /data/proximadb /config /log /var/lib/proximadb && \
 COPY --from=builder /build/target/release/proximadb-server /usr/local/bin/proximadb-server
 
 # Copy default configuration
-COPY --from=builder /build/config/config.toml /config/config.toml
+# --chown is load-bearing: the `chown -R ... /config` above runs BEFORE this
+# COPY, so without it the file lands root-owned 0644 while the server runs as
+# uid 999. entrypoint.sh could then not rewrite bind_address, so the published
+# image kept binding 127.0.0.1 and `Test Container Health` failed with the fix
+# present in the tree (measured: CI run 38068651767).
+COPY --from=builder --chown=proximadb:proximadb /build/config/config.toml /config/config.toml
 
 # Set ownership
 RUN chown proximadb:proximadb /usr/local/bin/proximadb-server

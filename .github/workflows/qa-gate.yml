@@ -469,7 +469,7 @@ jobs:
     # promotion merge) — that cold ~35-40m compile + emulator round-trips pushed this
     # job past the old 60m cap on #980. 90m leaves headroom for the first (cold) run
     # while sccache warms; subsequent runs compile far less.
-    timeout-minutes: 90
+    timeout-minutes: 120  # was 90 against a 66.1-min green span (1.36x, under the 1.5x policy)
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
@@ -535,7 +535,7 @@ jobs:
   rust-coverage-ratchet:
     name: Rust Coverage Ratchet
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120  # was 90 against green spans of 78.4-80.2 min (1.12x) -- the tightest cap in this file
     # FIRST CUT: cargo-llvm-cov over the full workspace is heavy. 60m was too
     # tight — it timed out mid-lib-test-run (deep into the graph/index tests),
     # so the seed artifact was never produced. 90m lets it complete + emit the

@@ -70,12 +70,24 @@ FEATURES_RE = re.compile(r"^\s+features:(?P<rest>.*)$")
 TIMEOUT_VALUE_RE = re.compile(
     r"^    timeout-minutes:\s*(?:\d+(?:\.\d+)?|\$\{\{.*\}\})\s*(?:#.*)?$"
 )
+# Three spellings, all legal, each of which previously let a job with NO cap
+# through with exit 0, because an unmatched key folds the job's body into the
+# PREVIOUS job -- whose cap then satisfies the check for both, and the unmatched
+# job is never even named:
+#   * `rust-clippy:  # the lint gate`  -- a trailing comment on the key
+#   * `"rust-clippy":`                 -- a quoted key (GitHub job id rust-clippy)
+#   * `_rustclippy:`                   -- GitHub job ids may start with `_`
+# The quoted form also compounds with the `uses:` exemption below: folded into a
+# reusable job, the merged body inherits that exemption too.
+#
 # `(#.*)?` is load-bearing, not tidiness: without it a job key written
 # `rust-clippy:  # the lint gate` does not match, so the whole job body is
 # absorbed into the PREVIOUS job's body. That job's own `timeout-minutes` then
 # satisfies the check for both and the commented job is never even named --
 # verified: the guard exited 0 with `rust-clippy` carrying no cap at all.
-JOB_RE = re.compile(r"^  (?P<job>[A-Za-z][A-Za-z0-9_-]*):\s*(#.*)?$")
+JOB_RE = re.compile(
+    r"^  (?P<job>\"[^\"]+\"|'[^']+'|[_A-Za-z][A-Za-z0-9_-]*):\s*(#.*)?$"
+)
 
 
 def _scalar(rest: str) -> str:
