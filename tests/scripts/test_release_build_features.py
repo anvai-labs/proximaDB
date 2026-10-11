@@ -9,6 +9,12 @@ image findings, because `deploy/docker/Dockerfile` already built with
 `cloud-full` (it landed in `ed91af6c4`). An earlier draft of this docstring said
 26 with 1 image finding; that counted the repo-root Dockerfile, which is the demo
 image and is deliberately not guarded.
+
+Those 25 were measured with the timeout check scoped to the two release
+workflows. The scope later widened to the pipeline workflows, which on
+`6b25150ff` held **41** further unbounded jobs (39 in ci.yml, 2 in qa-gate.yml),
+all bounded in the same change. The two counts are against different trees and
+are deliberately not added together.
 """
 from __future__ import annotations
 
@@ -28,6 +34,11 @@ COPY = (
     # The PUBLISHED image (publish-image.yml `file:`), not the repo-root
     # Dockerfile -- that one is the demo-compose image and is not guarded.
     "deploy/docker/Dockerfile",
+    # In TIMED_WORKFLOWS. These MUST be copied: the guard `continue`s past a
+    # workflow that does not exist, so omitting them here would make every
+    # pipeline-timeout assertion below vacuously green.
+    ".github/workflows/ci.yml",
+    ".github/workflows/qa-gate.yml",
 )
 
 
@@ -89,6 +100,30 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         result = _run(self.tree)
         self.assertEqual(result.returncode, 1)
         self.assertIn("has no `timeout-minutes`", result.stdout)
+
+    def test_catches_a_missing_timeout_in_the_pipeline_workflow(self) -> None:
+        """The bound is not release-only: ci.yml jobs are in scope too.
+
+        `Docker Build` capped at 45 min let a 43-min cold build cancel
+        `Test Container Health`. An unbounded job is the same defect against
+        GitHub's 6h default, so ci.yml and qa-gate.yml are guarded as well.
+        """
+        for rel in (".github/workflows/ci.yml", ".github/workflows/qa-gate.yml"):
+            with self.subTest(workflow=rel):
+                self.setUp()
+                p = self.tree / rel
+                lines = p.read_text(encoding="utf-8").splitlines()
+                last = max(
+                    i
+                    for i, l in enumerate(lines)
+                    if l.strip().startswith("timeout-minutes:")
+                )
+                del lines[last]
+                p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("has no `timeout-minutes`", result.stdout)
+                self.assertIn(rel, result.stdout)
 
     def test_catches_the_published_image_built_without_cloud(self) -> None:
         p = self.tree / "deploy/docker/Dockerfile"

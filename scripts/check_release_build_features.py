@@ -12,11 +12,16 @@ Two defects this exists to catch, both found while cutting v0.4.0:
    (`deploy/docker/Dockerfile`) always had them; the standalone binaries did
    not, which is the asymmetry this guard now pins on both sides.
 
-2. **No job timeouts in either release workflow.** TD-CI-5 recorded a
+2. **No job timeouts.** TD-CI-5 recorded a
    `Feature Matrix (cloud-full+onnx)` leg hanging 121 minutes -- that TD judged
    it a transient runner problem, and `cloud-full` alone builds clean, so the
    lesson taken here is only the missing bound: with no `timeout-minutes` a hung
-   release job runs to GitHub's 6-hour default.
+   job runs to GitHub's 6-hour default. The converse is just as real and was
+   measured on the v0.4.0 promotion: a bound set too tight silently disarms the
+   step behind it -- `Docker Build` at 45 min let a 43-min cold build cancel
+   `Test Container Health`, the only check that proves the published image
+   accepts connections. So the scope is every job in the release AND pipeline
+   workflows, and the caps there are set from measured durations.
 
 This is a text/YAML guard on purpose: it must hold without a toolchain, and it
 is the artifact contract, not behaviour.
@@ -31,6 +36,16 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 RELEASE_WORKFLOWS = (
     ".github/workflows/release.yml",
     ".github/workflows/prerelease-ci.yml",
+)
+# The timeout bound is not a release-only concern: `Docker Build` in ci.yml was
+# capped at 45 min, a cold image build took 43, and `Test Container Health` --
+# the only check that starts the published image and connects to its published
+# port -- was cancelled 1 minute in. An unbounded job is the same defect with
+# GitHub's 6h default instead of a cap, so every job in the pipeline workflows
+# carries a bound too.
+TIMED_WORKFLOWS = RELEASE_WORKFLOWS + (
+    ".github/workflows/ci.yml",
+    ".github/workflows/qa-gate.yml",
 )
 REQUIRED_FEATURE = "cloud-full"
 # The image the publish workflow actually ships (publish-image.yml `file:`).
@@ -101,7 +116,7 @@ def check_workflow_features(msgs: list[str]) -> None:
 
 
 def check_workflow_timeouts(msgs: list[str]) -> None:
-    for rel in RELEASE_WORKFLOWS:
+    for rel in TIMED_WORKFLOWS:
         path = ROOT / rel
         if not path.exists():
             continue
@@ -126,7 +141,7 @@ def check_workflow_timeouts(msgs: list[str]) -> None:
                 _fail(
                     msgs,
                     f"{rel}: job `{job}` has no `timeout-minutes` -- a hung "
-                    f"release job would run to GitHub's 6h default (TD-CI-5)",
+                    f"job would run to GitHub's 6h default (TD-CI-5)",
                 )
             job, body = m.group("job"), []
 
@@ -201,7 +216,8 @@ def main() -> int:
     print(
         "release-build-features: OK "
         f"(both release workflows and {PUBLISHED_DOCKERFILE} build with "
-        f"`{REQUIRED_FEATURE}`, every release job bounded)"
+        f"`{REQUIRED_FEATURE}`, every job in {len(TIMED_WORKFLOWS)} workflows "
+        "bounded)"
     )
     return 0
 

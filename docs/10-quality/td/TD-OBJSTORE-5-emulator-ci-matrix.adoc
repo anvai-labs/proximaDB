@@ -3,7 +3,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Core S1–S4 matrix and S2 contract LANDED; cost ratchet incomplete (reconciled 2026-07-21).** #1072 is the path-gated strict Azurite restart job; #1080 is the sequential Azure+S3 QA tier plus Azure recall ratchet and nightly best-effort GCS; #1088 adds production-backend prefix/LIST/exact-HEAD/GCS-pagination contracts and the cloud-compaction e2e; #1129 adds strict Azure/S3 `write_if_absent` conflict tests and caching/encryption decorator guards. fake-gcs remains correctly best-effort because it does not enforce `ifGenerationMatch=0`. This TD remains open because the first cold-cache QA wall time has not been recorded to turn the 90-minute cap into a measured ratchet.
+| Status | **Core S1–S4 matrix and S2 contract LANDED; cost ratchet incomplete (reconciled 2026-07-21).** #1072 is the path-gated strict Azurite restart job; #1080 is the sequential Azure+S3 QA tier plus Azure recall ratchet and nightly best-effort GCS; #1088 adds production-backend prefix/LIST/exact-HEAD/GCS-pagination contracts and the cloud-compaction e2e; #1129 adds strict Azure/S3 `write_if_absent` conflict tests and caching/encryption decorator guards. fake-gcs remains correctly best-effort because it does not enforce `ifGenerationMatch=0`. **Cost ratchet now MEASURED (2026-10-11) — see "Measured wall times" below; this TD's last open item is closed.** The figure that was missing is recorded from six consecutive green QA-tier runs.
 | Severity | High — object-store durability regressions currently surface only on the live anvaiops testbed (days-long feedback loop); batch 3 proved a class of bug the file:// suites structurally cannot catch.
 | Component | `scripts/run_cloud_emulator_tests.sh`, `.github/workflows/ci.yml` (`object-store-emulator-tests`), `.github/workflows/qa-gate.yml`, `apps/proximadb-server/tests/object_store_restart_recovery.rs`
 | Relates | ADR-063 (D8), TD-OBJSTORE-1/2/4, TD-168 (Cool-tier emulator validation)
@@ -29,7 +29,7 @@ Target coverage by tier (Azure=Azurite `adls://`, S3=MinIO `s3://`, GCS=fake-gcs
 |===
 | Tier | Coverage | Cost bound
 | PR (path-gated) | Azurite restart repro STRICT (`--features azure` only) + backend contract tests (production root `FileSystem` backends, all 3 emulators) | one single-backend server build
-| QA (develop→qa) | one `cloud-full` build; Azure then S3 emulators SEQUENTIALLY (stop each before the next); restart proof per store; recall ratchet on ONE strict backend (Azure) | measured ratchet — record the cold-cache wall time on first run (existing emulator QA job alone ≈52 min)
+| QA (develop→qa) | one `cloud-full` build; Azure then S3 emulators SEQUENTIALLY (stop each before the next); restart proof per store; recall ratchet on ONE strict backend (Azure) | **measured: 66–73 min over 6 green runs** (cap 120 ⇒ 1.6× headroom). The pre-split ≈52 min estimate was low.
 | Nightly / 32 GB runner | GCS compatibility (restart + recall, best-effort) + cross-backend recall | off the promotion path
 |===
 
@@ -68,6 +68,59 @@ correctness test, not the restart gate; threshold identical to the file:// basel
 (backend must be recall-neutral; any delta is a read-path bug). The "fits the 90 min
 budget" claim becomes a **measured ratchet on a cold-cache run** (record the first
 run's wall time in this TD), not an assertion.
+
+[[measured-wall-times]]
+== Measured wall times (recorded 2026-10-11, v0.4.0 promotion)
+
+Read from the Actions API across the last twelve `qa-gate.yml` runs, so these are
+observations, not estimates. `min` is a floor of the job's
+`completed_at - started_at`.
+
+[cols="3,1,2,1,2", options="header"]
+|===
+| Job | Cap | Green runs (newest first) | Max | Headroom
+
+| `objstore-restart-qa-tier`
+| 120
+| 66, 73, 72, 72, 70, 73
+| 73
+| 1.6×
+
+| `cloud-emulator-object-store`
+| 90
+| 62, 61, 54, 62, 66, 55
+| 66
+| 1.4×
+
+| `mlflow-s3-artifact-seam`
+| 75
+| 35, 36, 33, 35, 49, 48
+| 49
+| 1.5×
+|===
+
+Two conclusions, both of which correct an earlier reading:
+
+**The 90-minute cap was never the defect.** One pre-split run completed the QA
+tier *successfully* in 81 min under the 90 cap. The four failures in that window
+(54, 76, 77 min, plus one cancelled at 95) were the 16 GB memory cliff, not time:
+`ubuntu-latest` ships **no swap**, so a peak above 16 GB evicts the runner rather
+than degrading it, and the failure renders as `The runner has received a shutdown
+signal` — not a timeout message. The fix was the 12 G `/mnt` swapfile plus
+`CARGO_PROFILE_TEST_DEBUG=0`, and splitting the MLflow `--lib` test into its own
+job. Raising 90→120 was precautionary and is not what turned the job green; the
+evidence is that it now lands at 66–73, comfortably inside the old 90.
+
+**`mlflow-s3-artifact-seam` was the one genuinely thin cap.** At 60 it carried
+only 1.2× over its measured 49-min cold-cache peak. Raised to 75 here. This is
+the failure mode `Docker Build` demonstrated on the same promotion: capped at 45
+with a 43-min cold build, it cancelled `Test Container Health` one minute in, so
+the only check that proves the published image accepts connections on its
+published port silently did not run. A cap set near the measured maximum does not
+fail loudly — it disarms whatever step runs last.
+
+The first two `mlflow-s3-artifact-seam` runs (48, 49) are the cold-cache figures;
+the later 33–36 are warm. Caps are set against the cold number.
 
 *S4 — Nightly tier.* GCS: restart (`gs://` now accepted by the test) + recall,
 best-effort per the documented fake-gcs/object_store incompatibility; plus

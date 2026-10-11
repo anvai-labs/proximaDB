@@ -73,6 +73,7 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 2 min
     outputs:
       # Three-tier CI (feat -> develop -> qa -> main):
       #   * feat -> develop runs the LIGHT jobs (compile + fmt/clippy + layering
@@ -414,6 +415,7 @@ jobs:
   hygiene-check:
     name: Hygiene Guardrails
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -453,6 +455,7 @@ jobs:
   repository-identity:
     name: Canonical Repository Identity
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -462,6 +465,7 @@ jobs:
   docs-authority:
     name: Docs Authority (no retired/engine drift)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.docs == 'true'
     steps:
@@ -474,6 +478,7 @@ jobs:
   risk-coverage:
     name: Risk-Coverage Contract
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.docs == 'true'
     steps:
@@ -484,6 +489,7 @@ jobs:
   oss-docs-decontamination:
     name: OSS Docs Decontamination
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -495,6 +501,7 @@ jobs:
   rust-format:
     name: Rust Format
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -511,6 +518,7 @@ jobs:
   capability-matrix:
     name: Capability Matrix
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     # Run on rust changes (evidence refs point at source) AND on docs changes:
     # the validator now also guards the maturity-contract reconciliation in
@@ -549,6 +557,7 @@ jobs:
   proto-compat:
     name: Proto Compatibility (T4.2)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 5 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.proto == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     steps:
@@ -600,6 +609,7 @@ jobs:
   openapi-spec-drift:
     name: OpenAPI Spec From Code (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 60  # measured max 29 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -628,6 +638,7 @@ jobs:
   go-sdk-codegen-drift:
     name: Go SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.go_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -660,6 +671,7 @@ jobs:
   ts-sdk-codegen-drift:
     name: TS SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.nodejs_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -687,6 +699,7 @@ jobs:
   rust-sdk-codegen-drift:
     name: Rust SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 3 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -737,6 +750,7 @@ jobs:
   python-sdk-codegen-drift:
     name: Python SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 3 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -769,6 +783,7 @@ jobs:
   python-sdk-round-trip:
     name: Python SDK round-trip (ADR-068 D5)
     runs-on: ubuntu-24.04
+    timeout-minutes: 70  # measured max 34 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -811,6 +826,7 @@ jobs:
   panic-policy-report:
     name: Panic Policy Report (WS-2 Stage 1)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -833,6 +849,7 @@ jobs:
   panic-policy-no-regression:
     name: Panic Policy No Regression (WS-2 Stage 2)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: [changes, panic-policy-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -849,6 +866,7 @@ jobs:
   panic-policy-module-guard:
     name: Panic Policy Critical Modules (WS-2 Stage 3)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: [changes, panic-policy-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -869,6 +887,7 @@ jobs:
   v1-proto-usage-report:
     name: v1 Proto Usage Report (TD-123)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.v1_proto_usage == 'true'
     steps:
@@ -891,6 +910,7 @@ jobs:
   v1-proto-usage-no-regression:
     name: v1 Proto Usage No Regression (TD-123)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: [changes, v1-proto-usage-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.v1_proto_usage == 'true'
     steps:
@@ -907,6 +927,7 @@ jobs:
   rust-clippy:
     name: Rust Clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 30  # measured max 13 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -958,6 +979,7 @@ jobs:
   feature-matrix:
     name: Feature Matrix (${{ matrix.label }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 110  # measured max 53 min, 15 legs
     needs: changes
     if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true'
     strategy:
@@ -1056,6 +1078,7 @@ jobs:
   rust-security:
     name: Security Audit
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 4 min
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -1070,6 +1093,7 @@ jobs:
   python-lint:
     name: Python Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 4 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.proto == 'true'
     steps:
@@ -1107,6 +1131,7 @@ jobs:
   go-lint:
     name: Go SDK Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.go_sdk == 'true'
     steps:
@@ -1129,6 +1154,7 @@ jobs:
   nodejs-lint:
     name: Node.js SDK Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.nodejs_sdk == 'true'
     steps:
@@ -1146,6 +1172,7 @@ jobs:
   ui-build:
     name: Admin UI Install + Build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 2 min
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     steps:
@@ -1165,6 +1192,7 @@ jobs:
   rust-sdk-lint:
     name: Rust SDK Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 3 min
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true'
     steps:
@@ -1197,6 +1225,7 @@ jobs:
   sdk-contract-gates:
     name: SDK OpenAPI Contract Gate (${{ matrix.sdk }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 4 min, 4 legs
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1276,6 +1305,7 @@ jobs:
   connectors-contract-gates:
     name: Connectors Contract Gate (${{ matrix.kind }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 60  # measured max 28 min, 3 legs
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1324,6 +1354,7 @@ jobs:
   spark-jni-smoke:
     name: Spark Connector JNI Smoke (TD-097)
     runs-on: ubuntu-24.04
+    timeout-minutes: 30  # sample legs were skipped (path-gated)
     needs: changes
     if: needs.changes.outputs.spark_jni == 'true'
     steps:
@@ -1349,6 +1380,7 @@ jobs:
   sdk-security-scan:
     name: SDK Security Scan
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 4 min
     needs: changes
     if: |
       needs.changes.outputs.python == 'true' ||
@@ -1433,6 +1465,7 @@ jobs:
   docs-validation:
     name: Docs Validation
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs: changes
     if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true' || needs.changes.outputs.docs_site == 'true'
     steps:
@@ -1496,6 +1529,7 @@ jobs:
   rust-compile:
     name: Rust Compile (${{ matrix.shape }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 60  # measured max 28 min, 4 legs
     needs: changes
     if: needs.changes.outputs.compile == 'true'
     # CARGO_BUILD_JOBS=1: serial compilation keeps peak memory bounded. The
@@ -1551,6 +1585,7 @@ jobs:
   rust-compile-benches:
     name: Rust Compile (benches)
     runs-on: ubuntu-24.04
+    timeout-minutes: 50  # measured max 25 min
     needs: [changes]
     if: needs.changes.outputs.compile == 'true' && needs.changes.outputs.medium_tier == 'true'
     env:
@@ -1591,6 +1626,7 @@ jobs:
   rust-build:
     name: Rust Build (${{ matrix.profile }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 75  # measured max 37 min, 3 legs
     needs: [changes]
     if: needs.changes.outputs.rust == 'true' && !inputs.skip_tests
     strategy:
@@ -2959,6 +2995,7 @@ jobs:
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-24.04
+    timeout-minutes: 120  # extensive-only (main); not in the develop/qa sample
     needs: [rust-build]
     if: |
       inputs.run_benchmarks ||
@@ -3046,6 +3083,7 @@ jobs:
   promotion-freshness:
     name: Promotion Freshness (head must contain source branch)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     if: github.event_name == 'pull_request' && contains(fromJson('["qa", "main"]'), github.base_ref)
     steps:
       - uses: actions/checkout@v7
@@ -3145,6 +3183,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # measured max 1 min
     needs:
       - deterministic-commit-contract
       - rust-format
