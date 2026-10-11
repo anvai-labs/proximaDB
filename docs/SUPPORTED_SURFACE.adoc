@@ -74,14 +74,32 @@ cross-surface REST/gRPC/Flight/pgwire admit/deny matrix passes.
 Authenticated deployments require credentials on REST, gRPC and Arrow Flight
 whenever a security coordinator is configured, even if the legacy
 `security.authentication.enabled` flag is false.
-Until request-bound authorization is implemented, MCP and pgwire are restricted
-to unauthenticated, single-tenant loopback deployments. Set
-`[api] enable_pgwire = false` and omit `mcp_port` in authenticated deployments.
-Unsupported listener combinations are rejected before any listener is bound;
-multi-tenant serving without a security coordinator is also rejected.
-The default pgwire listener binds loopback, not all network interfaces.
-MCP remains off by default and cannot be enabled in portless (UDS) mode.
-These restrictions are containment, not a claim of authenticated MCP or pgwire support.
+An *unauthenticated* listener is restricted to single-tenant loopback deployments, and
+unsupported listener combinations are rejected before any listener is bound (multi-tenant
+serving without a security coordinator is also rejected). This applies per listener:
+
+* *MCP* has no per-connection authentication, so the restriction is unconditional. It
+  remains off by default, cannot be enabled in portless (UDS) mode, and `mcp_port` must be
+  omitted in authenticated deployments.
+* *pgwire* can authenticate (SCRAM-SHA-256, TD-PGWIRE-AUTH-1), so what the preflight
+  admits depends on its resolved posture:
+** *trust, no security coordinator* — the dev and shipped default: single-tenant and
+   loopback only. The default listener binds `127.0.0.1`, not all interfaces.
+** *trust, with a security coordinator* — refused at *any* address, loopback included
+   (the allowance requires no coordinator). Either raise pgwire to SCRAM
+   (`[security.pgwire] auth = "password"`; `[security.authentication] enabled = true`
+   forces it) or set `[api] enable_pgwire = false`.
+** *SCRAM* — the listener is authenticated, so it may bind any interface at any tenancy.
+
+*Container consequence (TD-PGWIRE-CONTAINER-1).* In the published image the entrypoint
+rewrites `[server] bind_address` to `0.0.0.0`, but pgwire is exempt: the shipped config
+deliberately leaves `[api] pg_port` unset, so the listener stays on the container's
+`127.0.0.1:5433` and a published `5433` accepts no connections. pgwire is *running*, not
+disabled, and reachable from a host-local binary or from inside the container's network
+namespace. Setting `pg_port` without first enabling SCRAM is fail-closed — the listener
+preflight refuses it and the server exits 1.
+
+These restrictions are containment, not a claim of authenticated MCP support.
 ====
 
 REST `/api/v2` is the **sole canonical REST surface** for all ProximaDB clients as of 2026-09-11.

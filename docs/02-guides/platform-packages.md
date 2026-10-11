@@ -210,7 +210,7 @@ The default configuration file is installed at:
 ### Default Ports
 
 - **Unified Port**: `5678` (REST, gRPC; Arrow Flight experimental)
-- **PostgreSQL Wire Protocol**: `5433` (if enabled)
+- **PostgreSQL Wire Protocol**: `5433` (enabled by default, bound to `127.0.0.1`)
 
 ### Default Data Directory
 
@@ -292,7 +292,14 @@ notepad "C:\ProgramData\ProximaDB\config.toml"
 # Port for unified REST/gRPC/Arrow Flight (default: 5678)
 port = 5678
 
-# PostgreSQL wire protocol port (default: 5433)
+# PostgreSQL wire protocol port (default: 5433, bound to 127.0.0.1).
+#
+# Leave this COMMENTED unless the pgwire listener authenticates. Setting it makes
+# the server re-derive the pgwire bind from `[server] bind_address`; if that is
+# not loopback, the boot-time listener preflight refuses an unauthenticated
+# single-tenant pgwire listener and the server exits 1. Enable pgwire SCRAM first
+# (`[security.authentication] enabled = true`, or `[security.pgwire] auth =
+# "password"`) -- TD-PGWIRE-AUTH-1 / TD-PGWIRE-CONTAINER-1.
 # pg_port = 5433
 
 [storage]

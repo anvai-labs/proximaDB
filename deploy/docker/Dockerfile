@@ -144,6 +144,18 @@ ENV RUST_LOG=info \
     PROXIMADB_ARROW_IPC_PORT=5680 \
     PROXIMADB_METRICS_PORT=9090 \
     PROXIMADB_EMBED_MODEL_DIR=/var/lib/proximadb/models
+# 5433 is DECLARATIVE metadata only, and listing it is not a claim that a host can
+# connect. EXPOSE publishes nothing by itself; it records the port the server
+# would use. In this image pgwire listens on 127.0.0.1:5433, because the shipped
+# config deliberately leaves `[api] pg_port` unset and so `src/database.rs` never
+# re-derives the pgwire bind from the 0.0.0.0 `bind_address` the entrypoint
+# writes. `-p 5433:5433` (and `docker run -P`) therefore publish a port that
+# accepts no connections. That is containment, not breakage: moving the listener
+# to 0.0.0.0 under the trust auth default is refused by
+# `validate_trust_only_listener` at boot and the server exits 1. Serving pgwire
+# from outside requires per-connection auth on the listener (pgwire SCRAM,
+# TD-PGWIRE-AUTH-1) and only then `[api] pg_port`. See
+# docs/10-quality/td/TD-PGWIRE-CONTAINER-1-pgwire-unreachable-in-a-container-without-auth.adoc
 EXPOSE 5678 5679 5680 5433
 # NOTE: a HEALTHCHECK runs INSIDE the container, so it passes even when the
 # server binds loopback only and the published port is unreachable from the host.
@@ -219,7 +231,20 @@ ENV RUST_LOG=info \
 # 5679: gRPC API
 # 5680: Arrow Flight (bulk ingest, columnar zero-copy)
 # 5433: PostgreSQL wire protocol (pgwire) — pgvector / psql / pgAdmin
-#       compatibility; enabled by default per PostgresServerConfig
+#       compatibility; the listener is enabled by default per PostgresServerConfig,
+#       but LOOPBACK-BOUND, so it is not reachable from the host (see below).
+# 5433 is DECLARATIVE metadata only, and listing it is not a claim that a host can
+# connect. EXPOSE publishes nothing by itself; it records the port the server
+# would use. In this image pgwire listens on 127.0.0.1:5433, because the shipped
+# config deliberately leaves `[api] pg_port` unset and so `src/database.rs` never
+# re-derives the pgwire bind from the 0.0.0.0 `bind_address` the entrypoint
+# writes. `-p 5433:5433` (and `docker run -P`) therefore publish a port that
+# accepts no connections. That is containment, not breakage: moving the listener
+# to 0.0.0.0 under the trust auth default is refused by
+# `validate_trust_only_listener` at boot and the server exits 1. Serving pgwire
+# from outside requires per-connection auth on the listener (pgwire SCRAM,
+# TD-PGWIRE-AUTH-1) and only then `[api] pg_port`. See
+# docs/10-quality/td/TD-PGWIRE-CONTAINER-1-pgwire-unreachable-in-a-container-without-auth.adoc
 EXPOSE 5678 5679 5680 5433
 
 # Health check

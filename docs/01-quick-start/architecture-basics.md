@@ -62,7 +62,9 @@ Single port (`5678`) for multiple protocols:
 | **gRPC** | High-performance services | `proximadb.v2.ProximaRecordService` |
 | **Arrow Flight** _(experimental)_ | Data analytics, BI tools | `do_put()` streaming |
 
-Plus PostgreSQL wire protocol on port `5433` for SQL clients. (Arrow Flight as a
+Plus PostgreSQL wire protocol on port `5433` for SQL clients — bound to `127.0.0.1` unless
+the listener authenticates (pgwire SCRAM), so it is host-local and not reachable through a
+port published from a container (`TD-PGWIRE-CONTAINER-1`). (Arrow Flight as a
 customer-facing transport is **experimental**; REST/gRPC are the supported surfaces.)
 
 **Why it matters:** One connection, any protocol. No need to run multiple services.
