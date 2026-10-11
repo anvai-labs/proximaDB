@@ -226,6 +226,30 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("called-elsewhere", result.stdout)
 
+    def test_catches_a_runtime_config_copied_without_chown(self) -> None:
+        """The defect that shipped: an unreachable published image.
+
+        `chown -R ... /config` runs BEFORE the config COPY, so without
+        `--chown` the file is root-owned while the server runs as uid 999.
+        entrypoint.sh then cannot rewrite bind_address, the server binds
+        127.0.0.1, and `-p` cannot reach it. Reproduced in a container: the
+        same minimal image built without `--chown` lands the config `root:root`;
+        with it, `proximadb:proximadb`.
+
+        `Docker Build` runs only on the extensive tier, so without this guard a
+        regression is invisible until a release.
+        """
+        p = self.tree / "deploy/docker/Dockerfile"
+        text = p.read_text(encoding="utf-8")
+        needle = "COPY --from=builder --chown=proximadb:proximadb"
+        self.assertIn(needle, text, "guard has lost its target")
+        p.write_text(
+            text.replace(needle, "COPY --from=builder", 1), encoding="utf-8"
+        )
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("has no `--chown=`", result.stdout)
+
     def test_catches_the_published_image_built_without_cloud(self) -> None:
         p = self.tree / "deploy/docker/Dockerfile"
         text = p.read_text(encoding="utf-8")

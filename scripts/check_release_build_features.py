@@ -170,6 +170,52 @@ def check_workflow_timeouts(msgs: list[str]) -> None:
             job, body = m.group("job"), []
 
 
+def check_runtime_config_ownership(msgs: list[str]) -> None:
+    """Every `COPY ... config.toml /config/config.toml` must carry --chown.
+
+    Not style. In each runtime stage the Dockerfile does
+    `chown -R proximadb:proximadb ... /config` and only AFTER that copies the
+    config in, so without `--chown` the file lands root-owned 0644 while the
+    server runs as uid 999. entrypoint.sh then cannot rewrite `bind_address`,
+    the server binds 127.0.0.1, `-p` cannot reach it, and the container is
+    unreachable on its published ports.
+
+    That shipped, and cost a full promotion round: `Test Container Health`
+    failed on a tree that already contained the loopback fix, and the warning
+    explaining it was scrolled away by `docker logs | tail -100`.
+
+    Guarded here because `Docker Build` only runs on the extensive tier
+    (`main`-targeted PRs), so nothing else catches a regression until a release.
+    """
+    path = ROOT / PUBLISHED_DOCKERFILE
+    if not path.exists():
+        _fail(msgs, f"{PUBLISHED_DOCKERFILE}: missing")
+        return
+    found = 0
+    for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped.startswith("COPY"):
+            continue
+        if not stripped.endswith("/config/config.toml"):
+            continue
+        found += 1
+        if "--chown=" not in stripped:
+            _fail(
+                msgs,
+                f"{PUBLISHED_DOCKERFILE}:{i}: `{stripped}` has no `--chown=` -- "
+                "the `chown -R ... /config` above runs BEFORE this COPY, so the "
+                "config lands root-owned and entrypoint.sh cannot rewrite "
+                "bind_address; the image binds 127.0.0.1 and is unreachable on "
+                "its published ports",
+            )
+    if found == 0:
+        _fail(
+            msgs,
+            f"{PUBLISHED_DOCKERFILE}: no `COPY ... /config/config.toml` found -- "
+            "this guard has lost its target; re-point it rather than deleting it",
+        )
+
+
 def check_dockerfiles(msgs: list[str]) -> None:
     """Every image that compiles the server must compile the cloud backends.
 
@@ -232,6 +278,7 @@ def main() -> int:
     check_workflow_features(msgs)
     check_workflow_timeouts(msgs)
     check_dockerfiles(msgs)
+    check_runtime_config_ownership(msgs)
     if msgs:
         print("release-build-features: FAILED")
         for m in msgs:
@@ -241,7 +288,7 @@ def main() -> int:
         "release-build-features: OK "
         f"(both release workflows and {PUBLISHED_DOCKERFILE} build with "
         f"`{REQUIRED_FEATURE}`, every job in {len(TIMED_WORKFLOWS)} workflows "
-        "bounded)"
+        "bounded, runtime config copied --chown)"
     )
     return 0
 
