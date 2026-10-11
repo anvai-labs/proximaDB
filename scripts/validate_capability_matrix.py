@@ -187,13 +187,27 @@ MATURITY_CONTRACT_RULES = [
     },
     {
         # The shipped Docker config enables unified mode, so the maintained
-        # Compose example must expose that port plus pgwire and must not hide
-        # the baked config behind a nonexistent host directory.
+        # Compose example must expose that port and must not hide the baked
+        # config behind a nonexistent host directory.
+        #
+        # It must NOT publish pgwire. The shipped config leaves `[api] pg_port`
+        # unset, so pgwire stays on 127.0.0.1:5433 inside the container and a
+        # published 5433 accepts nothing (TD-PGWIRE-CONTAINER-1). The previous
+        # rule here REQUIRED that mapping, i.e. it enforced the untrue claim.
+        #
+        # The forbidden substring is the active list entry at its YAML indent,
+        # so the explanatory comment that replaced it cannot satisfy this rule
+        # by accident -- a commented-out mapping would otherwise match a bare
+        # '"5433:5433"' substring and the guard would pass vacuously.
         "path": "deploy/docker/docker-compose.yml",
         "required_substrings": [
             '"5678:5678"  # Unified REST + gRPC + Arrow Flight',
-            '"5433:5433"  # PostgreSQL wire protocol',
             "../../config/config.toml:/config/config.toml:ro",
+            "# pgwire is NOT published",
+            "TD-PGWIRE-CONTAINER-1",
+        ],
+        "forbidden_substrings": [
+            '\n      - "5433:5433"',
         ],
     },
     # REST /api/v3 is REMOVED — the document-ingest handler lives canonically at

@@ -218,7 +218,7 @@ ProximaDBClient  ──(protocol adapter)──▶  BaseProtocolAdapter
 
 == pgwire lowering (PostgreSQL wire)
 
-Port `5433`. SQL in → engine out:
+Port `5433` (bound to `127.0.0.1` unless the listener authenticates -- see the port table below). SQL in → engine out:
 
 ....
 psql / pgvector client
@@ -243,7 +243,7 @@ psql / pgvector client
 | 5678 | Multiplexed REST, gRPC v2, Arrow Flight | Default unified endpoint; canonical REST v2, typed RPC, and columnar transfer | REST Supported; gRPC/Flight Beta by capability
 | 5679 | gRPC v2 | Legacy multi-port mode only | Beta
 | 5680 | Arrow Flight | Legacy multi-port mode only | Beta
-| 5433 | PostgreSQL wire | SQL clients / pgvector | Beta
+| 5433 | PostgreSQL wire | SQL clients / pgvector | Beta, *loopback-bound* under the trust auth default -- host-local only, and not reachable through a port published from a container (TD-PGWIRE-CONTAINER-1). Serving it off loopback requires pgwire SCRAM (TD-PGWIRE-AUTH-1) plus `[api] pg_port`.
 |====
 
 Unified mode (default) serves all protocols on one port; multi-port mode is the

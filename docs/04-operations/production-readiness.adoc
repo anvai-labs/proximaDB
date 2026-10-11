@@ -338,7 +338,12 @@ does not acquire a support tier merely by appearing in the repository.
   admin/status APIs, stronger online revocation, and pgwire credential binding
   remain incomplete.
 * **PostgreSQL wire protocol** - 🟡 Beta on port 5433 (autocommit SQL
-  subset).
+  subset). *Loopback-only unless the listener authenticates:* under the trust
+  default the boot-time listener preflight admits pgwire on loopback only, so in
+  the published container it binds `127.0.0.1:5433` and a published 5433 accepts
+  nothing. Serving it off loopback requires pgwire SCRAM
+  (`[security.authentication] enabled` or `[security.pgwire] auth = "password"`,
+  TD-PGWIRE-AUTH-1) plus `[api] pg_port`; see TD-PGWIRE-CONTAINER-1.
 * **Hybrid retrieval, time-series, and event foundations** - 🟡 Beta.
 
 === Transport Modes

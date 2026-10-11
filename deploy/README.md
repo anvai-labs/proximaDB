@@ -52,15 +52,21 @@ Release and deployment assets should stay under `deploy/`. Avoid adding new root
 # Pull and run
 docker run -d \
   -p 5678:5678 \
-  -p 5433:5433 \
   -v proximadb-data:/data \
   vjsingh1984/proximadb:latest
 
 # Or build locally
 cd deploy/docker
 docker build -t proximadb:local .
-docker run -d -p 5678:5678 -p 5433:5433 proximadb:local
+docker run -d -p 5678:5678 proximadb:local
 ```
+
+> **pgwire (5433) is not published, and publishing it would not help.** The entrypoint
+> rewrites `[server] bind_address` to `0.0.0.0` so published ports are reachable, but
+> pgwire is deliberately exempt: the shipped config leaves `[api] pg_port` unset, so the
+> listener stays on `127.0.0.1:5433` *inside* the container and `-p 5433:5433` publishes a
+> port that accepts no connections. See
+> [Reaching pgwire](#postgresql-wire-protocol-pgwire-is-loopback-only-in-the-container).
 
 ### Docker Compose (Development)
 
@@ -73,9 +79,11 @@ docker-compose --profile monitoring up -d
 
 # Access:
 # - Unified REST + gRPC + Arrow Flight: localhost:5678
-# - PostgreSQL wire protocol: localhost:5433
 # - Prometheus: http://localhost:9090
 # - Grafana: http://localhost:3000
+#
+# NOT localhost:5433 — pgwire listens on 127.0.0.1:5433 inside the container, so
+# Compose deliberately does not publish it. See "PostgreSQL wire protocol" below.
 ```
 
 ### Kubernetes with Helm
@@ -199,9 +207,52 @@ gcloud container clusters get-credentials proximadb-gke \
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 5678 | HTTP/gRPC/Arrow | Unified multiplexed surface (REST + gRPC + Arrow Flight; `unified_mode = true` in the shipped config.toml/docker image — the code default is false, and shipped k8s/helm artifacts run multi-port) |
-| 5433 | PostgreSQL wire | SQL clients (pgvector-compatible) |
+| 5433 | PostgreSQL wire | SQL clients (pgvector-compatible). **In-container: loopback only** — reachable from a locally-run binary or from inside the container's network namespace, not through a published port. See below. |
 | 5679 / 5680 | gRPC / Arrow IPC | Legacy multi-port mode only (`unified_mode = false`) |
 | 9090 | HTTP | Metrics (Prometheus) |
+
+### PostgreSQL wire protocol (pgwire) is loopback-only in the container
+
+pgwire runs in the published image — it is not disabled — but it listens on
+`127.0.0.1:5433` inside the container, so there is nothing for a published host port to
+reach. This is deliberate containment, not a defect.
+
+**Why.** `deploy/docker/entrypoint.sh` rewrites `[server] bind_address` to `0.0.0.0`
+because `docker run -p` cannot reach a loopback listener. `src/database.rs` re-derives the
+pgwire bind from `bind_address` *only* when `[api] pg_port` is set, and the shipped
+`config/config.toml` deliberately leaves it unset. Setting it moves pgwire to
+`0.0.0.0:5433`, which `validate_trust_only_listener`
+(`crates/platform/proximadb-runtime/src/bootstrap_config.rs`) refuses before binding any
+socket: with `[security]` off the listener is trust-mode, and an unauthenticated
+single-tenant listener is admitted on **loopback only**. The server then exits 1 and the
+whole container dies rather than losing one port.
+
+**Where pgwire does work today**
+
+```bash
+# 1. A locally-run binary — loopback is the host's loopback.
+cargo run --release --bin proximadb-server
+psql -h 127.0.0.1 -p 5433 -U postgres -d proximadb
+
+# 2. From inside the container's network namespace. The image ships no psql client,
+#    so attach one that shares the namespace (and therefore its loopback):
+docker run --rm -it --network container:proximadb postgres:16 \
+  psql -h 127.0.0.1 -p 5433 -U postgres -d proximadb
+```
+
+**Serving it from the host** requires per-connection authentication on the listener
+(pgwire SCRAM, `TD-PGWIRE-AUTH-1`), after which the loopback containment no longer
+applies:
+
+1. enable `[security]` with `[security.authentication] enabled = true` (or
+   `[security.pgwire] auth = "password"`) and provision
+   `[security.authentication.scram_users]`;
+2. set `[api] pg_port = 5433` so the pgwire bind follows `[server] bind_address`;
+3. publish the port (`-p 5433:5433`, or a Compose/Service entry).
+
+Step 2 without step 1 is **fail-closed, not degraded**: the boot-time listener preflight
+refuses the listener and the server exits 1. Tracked in
+`docs/10-quality/td/TD-PGWIRE-CONTAINER-1-pgwire-unreachable-in-a-container-without-auth.adoc`.
 
 ### Environment Variables
 

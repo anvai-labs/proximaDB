@@ -53,7 +53,7 @@ These are in-process Python embedded measurements. They are useful for choosing 
 | Python embedded | In-process wheel | Local apps, notebooks, agent runtimes, benchmarks | No network hop; fastest developer loop. | Process-local deployment and Python ABI packaging. |
 | REST/gRPC unified | `localhost:5678` | General application APIs, health, admin, Iceberg REST under `/iceberg/v1` | Broad client compatibility, one server port. | JSON/HTTP or gRPC framing overhead. |
 | Dedicated gRPC | `localhost:5679` when unified mode is off | High-throughput service-to-service RPC | Typed protobuf contracts and streaming. | Separate port only in multi-port mode. |
-| PostgreSQL wire | `localhost:5433` | SQL tools, pgvector-style clients, BI compatibility | Works with existing SQL clients. | SQL parsing and row protocol overhead. |
+| PostgreSQL wire | `localhost:5433` (loopback-bound) | SQL tools, pgvector-style clients, BI compatibility | Works with existing SQL clients. | SQL parsing and row protocol overhead. Host-local only: under the trust auth default the listener is admitted on loopback only, so a port published from a container reaches nothing — serving it off loopback needs pgwire SCRAM (TD-PGWIRE-AUTH-1) plus `[api] pg_port` (TD-PGWIRE-CONTAINER-1). |
 | Arrow Flight / Flight SQL | `localhost:5680` | Analytical reads/writes, columnar streaming | High-throughput Arrow-native transport. | Requires Arrow Flight clients. |
 | Iceberg REST Catalog | `localhost:5678/iceberg/v1` | Spark, Trino, DuckDB, Flink, PyIceberg catalog access | Open table interoperability without a custom connector. | Catalog/projection surface; not the hot record write path. |
 

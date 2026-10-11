@@ -11,8 +11,29 @@ services:
     restart: unless-stopped
     ports:
       - "5678:5678"  # Unified REST + gRPC + Arrow Flight
-      - "5433:5433"  # PostgreSQL wire protocol
       - "9090:9090"  # Prometheus metrics
+      # pgwire is NOT published, because in this image it cannot serve a host
+      # connection. `entrypoint.sh` rewrites `[server] bind_address` to 0.0.0.0 so
+      # the published ports are reachable, but pgwire is deliberately exempt:
+      # `src/database.rs` only re-derives the pgwire bind from `bind_address` when
+      # `[api] pg_port` is set, and the shipped config deliberately leaves it
+      # unset, so pgwire stays on 127.0.0.1:5433 INSIDE the container. Mapping
+      # host 5433 to it here would publish a port that accepts no connections,
+      # hold host port 5433 (a common second local Postgres) for nothing, and make
+      # `docker ps` affirmative evidence of a listener that is not there.
+      #
+      # To actually serve pgwire from outside, give the listener per-connection
+      # authentication first (pgwire SCRAM, TD-PGWIRE-AUTH-1) -- then the
+      # loopback containment in `validate_trust_only_listener` no longer applies:
+      #   1. enable `[security]` with `[security.authentication] enabled = true`
+      #      (or `[security.pgwire] auth = "password"`) and provision
+      #      `[security.authentication.scram_users]`;
+      #   2. set `[api] pg_port = 5433` so the pgwire bind follows `bind_address`;
+      #   3. add a host mapping for 5433 back into this list.
+      # Doing step 2 WITHOUT step 1 is fail-closed, not degraded: the listener
+      # preflight refuses an unauthenticated non-loopback pgwire listener before
+      # binding any socket, the server exits 1, and the whole container dies.
+      # See docs/10-quality/td/TD-PGWIRE-CONTAINER-1-pgwire-unreachable-in-a-container-without-auth.adoc
     volumes:
       - proximadb-data:/data/proximadb
       - ../../config/config.toml:/config/config.toml:ro

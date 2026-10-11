@@ -105,6 +105,12 @@ for result in results:
 
 ## SQL Interface
 
+> **Connecting on 5433?** pgwire binds `127.0.0.1:5433` unless the listener enforces its
+> own per-connection authentication (pgwire SCRAM, `TD-PGWIRE-AUTH-1`). So `localhost:5433`
+> works against a locally-run `proximadb-server`, but **not** through a port published from
+> a container — there, reach it from inside the container's network namespace, or enable
+> SCRAM and then set `[api] pg_port`. See `TD-PGWIRE-CONTAINER-1`.
+
 ```bash
 # Connect via psql (PostgreSQL wire protocol)
 psql -h localhost -p 5433 -U postgres

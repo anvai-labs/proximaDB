@@ -9,7 +9,11 @@
 #
 # Prerequisites — a ProximaDB built from THIS code, with pgwire enabled:
 #   cargo build --release -p proximadb-server        # or: make build-server
-#   ./target/release/proximadb-server -c config/config.toml   # pgwire on 5433 (pg_port in [api])
+#   ./target/release/proximadb-server -c config/config.toml   # pgwire on 127.0.0.1:5433
+#   # pgwire is on by default (`[api] enable_pgwire`); do NOT set `pg_port` to enable it.
+#   # Run the binary locally: in the published container pgwire is loopback-only, so a
+#   # published 5433 accepts nothing and moving it off loopback fails closed at boot
+#   # (TD-PGWIRE-CONTAINER-1).
 #
 # Unlike the cross-modal demo this needs ONLY pgwire — no REST seeding. The `mc_price` UDF
 # lives on the DataFusion compute engine, so a query must engage OLAP (an aggregate over a
