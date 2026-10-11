@@ -29,6 +29,7 @@ is the artifact contract, not behaviour.
 from __future__ import annotations
 
 import pathlib
+import posixpath
 import re
 import sys
 
@@ -239,8 +240,8 @@ def _lands_runtime_config(instruction: str) -> bool:
     args = [a for a in args if a]
     if not args:
         return False
-    dest, sources = args[-1], args[:-1]
-    if dest in ("/config/config.toml", "/config/config.toml/"):
+    dest, sources = posixpath.normpath(args[-1]), args[:-1]
+    if dest == "/config/config.toml":
         return True
     if dest.rstrip("/") == "/config" and sources:
         # Any copy into /config may land config.toml; the source need not be
@@ -248,6 +249,41 @@ def _lands_runtime_config(instruction: str) -> bool:
         # that required the source to look like a config.
         return True
     return False
+
+
+def _run_only_fixes_perms(instruction: str) -> bool:
+    """Is this RUN purely a legitimate ownership/mode fix on the config?
+
+    An earlier version checked only the VERB, so `RUN chown root:root
+    /config/config.toml` passed -- which reproduces the original defect exactly
+    -- and `RUN chmod 000` passed too, which is worse: uid 999 then cannot even
+    read the file, so neither the rewrite nor the server works.
+    """
+    body = instruction[len("RUN") :].strip()
+    for part in re.split(r"&&|;", body):
+        tokens = part.split()
+        if not tokens:
+            continue
+        verb, rest = tokens[0], tokens[1:]
+        if verb == "chown":
+            owners = [t.strip('"') for t in rest if not t.startswith("-")]
+            if not owners or owners[0] not in RUNTIME_OWNERS:
+                return False
+        elif verb == "chmod":
+            modes = [t for t in rest if not t.startswith("-")]
+            if not modes:
+                return False
+            mode = modes[0]
+            # The owner must keep write: the entrypoint rewrites this file.
+            if re.fullmatch(r"[0-7]?([0-7])[0-7][0-7]", mode):
+                user_digit = int(mode[-3])
+                if not user_digit & 0o2:
+                    return False
+            elif not re.search(r"u[+=][^,]*w|a[+=][^,]*w|\+w", mode):
+                return False
+        else:
+            return False
+    return True
 
 
 def check_runtime_config_ownership(msgs: list[str]) -> None:
@@ -275,31 +311,46 @@ def check_runtime_config_ownership(msgs: list[str]) -> None:
         _fail(msgs, f"{PUBLISHED_DOCKERFILE}: missing")
         return
     text = path.read_text(encoding="utf-8")
-    stage = "<implicit>"
-    per_stage: dict[str, int] = {}
-    serving_stages: list[str] = []
+    # Keyed by a UNIQUE index per FROM, not by name: an un-named `FROM` used to
+    # key on its BASE IMAGE, so two un-named `FROM debian:bookworm-slim` stages
+    # collided and a config copied in a non-serving stage satisfied a serving
+    # one. `parent` carries `FROM <stage> AS <child>` inheritance, because a
+    # child really does inherit the parent's config and user -- treating that as
+    # config-less was a false failure on the idiomatic way to add a variant.
+    stage_key = -1
+    names: dict[str, int] = {}
+    parent: dict[int, int] = {}
+    per_stage: dict[int, int] = {}
+    labels: dict[int, str] = {}
+    serving_stages: list[int] = []
     for lineno, instruction in _dockerfile_instructions(text):
         upper = instruction.upper()
         if upper.startswith("FROM"):
+            stage_key += 1
+            tokens = instruction.split()
+            base = tokens[1] if len(tokens) > 1 else "<unknown>"
             match = re.search(r"\sAS\s+(\S+)", instruction, re.IGNORECASE)
-            stage = match.group(1) if match else instruction.split()[1]
+            name = match.group(1) if match else f"{base}#{stage_key}"
+            labels[stage_key] = name
+            names[name] = stage_key
+            if base in names:
+                parent[stage_key] = names[base]
             continue
         # A config moved into place by a RUN defeats a COPY-only check.
-        if upper.startswith("USER") and "proximadb" in instruction:
-            if stage not in serving_stages:
-                serving_stages.append(stage)
+        if upper.startswith("USER"):
+            who = instruction.split()[1] if len(instruction.split()) > 1 else ""
+            if who.strip('"') in RUNTIME_OWNERS:
+                if stage_key not in serving_stages:
+                    serving_stages.append(stage_key)
             continue
         if upper.startswith("RUN") and "/config/config.toml" in instruction:
             # Anything that WRITES it, not an enumerated verb list: `cat >`,
             # `tee`, `sed -i` and a bare redirect all defeated `mv|cp|install|ln`.
             # chown/chmod are the legitimate exceptions -- they FIX ownership.
-            only_fixes_perms = re.fullmatch(
-                r"RUN\s+(?:(?:chown|chmod)\s+[^&|;]*(?:&&\s*)?)+", instruction, re.IGNORECASE
-            )
-            if not only_fixes_perms:
+            if not _run_only_fixes_perms(instruction):
                 _fail(
                     msgs,
-                    f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{stage}` puts the "
+                    f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{labels.get(stage_key, stage_key)}` puts the "
                     "runtime config in place with a RUN rather than a COPY "
                     "--chown; ownership is then unguarded (see this guard's "
                     "docstring for why that makes the image unreachable)",
@@ -309,22 +360,22 @@ def check_runtime_config_ownership(msgs: list[str]) -> None:
             instruction
         ):
             continue
-        per_stage[stage] = per_stage.get(stage, 0) + 1
-        owner = re.search(r"--chown=(\S+)", instruction)
+        per_stage[stage_key] = per_stage.get(stage_key, 0) + 1
+        owner = re.search(r'--chown=("[^"]*"|\S+)', instruction)
         if owner is None:
             _fail(
                 msgs,
-                f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{stage}`: "
+                f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{labels.get(stage_key, stage_key)}`: "
                 f"`{instruction}` has no `--chown=` -- the `chown -R ... /config` "
                 "above runs BEFORE this COPY, so the config lands root-owned and "
                 "entrypoint.sh cannot rewrite bind_address; the image binds "
                 "127.0.0.1 and is unreachable on its published ports",
             )
-        elif owner.group(1) not in RUNTIME_OWNERS:
+        elif owner.group(1).strip('"') not in RUNTIME_OWNERS:
             _fail(
                 msgs,
-                f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{stage}`: "
-                f"`--chown={owner.group(1)}` is not the user the server runs as "
+                f"{PUBLISHED_DOCKERFILE}:{lineno}: stage `{labels.get(stage_key, stage_key)}`: "
+                f"`--chown={owner.group(1).strip('\"')}` is not the user the server runs as "
                 "(`proximadb`), so the config is still unwritable at runtime",
             )
     # Per SERVING stage, not "any stage named runtime*". Deleting the `runtime`
@@ -332,7 +383,17 @@ def check_runtime_config_ownership(msgs: list[str]) -> None:
     # shipped an image that binds 127.0.0.1 on every port: with no config at
     # /config/config.toml entrypoint.sh reports "no --config file found" and
     # leaves the binary's loopback default. Verified by building it.
-    serving = [st for st in serving_stages if not per_stage.get(st)]
+    def has_config(key: int) -> bool:
+        """A stage has a config if it copies one, or inherits from one that does."""
+        seen: set[int] = set()
+        while key is not None and key not in seen:
+            if per_stage.get(key):
+                return True
+            seen.add(key)
+            key = parent.get(key)  # type: ignore[assignment]
+        return False
+
+    serving = [labels.get(st, str(st)) for st in serving_stages if not has_config(st)]
     if serving:
         _fail(
             msgs,

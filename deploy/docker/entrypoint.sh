@@ -207,12 +207,15 @@ normalize_bind_address() {
         echo "[entrypoint] no --config file found; leaving bind_address to the binary's default" >&2
         return 0
     fi
-    if ! grep -qE '^[[:space:]]*bind_address[[:space:]]*=' "${config_path}"; then
+    # `--` so a config path beginning with `-` is a FILE, not an option. Without
+    # it grep/sed parsed it as a flag, reported "declares no bind_address" for a
+    # file that declares one, and left the loopback bind with a reassuring log.
+    if ! grep -qE -- '^[[:space:]]*bind_address[[:space:]]*=' "${config_path}"; then
         echo "[entrypoint] ${config_path} declares no bind_address; leaving it alone" >&2
         return 0
     fi
 
-    current="$(sed -n 's/^[[:space:]]*bind_address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${config_path}" | head -1)"
+    current="$(sed -n -e 's/^[[:space:]]*bind_address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' -- "${config_path}" | head -1)"
     if [ "${current}" = "${BIND_ADDRESS}" ]; then
         echo "[entrypoint] bind_address already ${BIND_ADDRESS}" >&2
         return 0
@@ -259,7 +262,7 @@ normalize_bind_address() {
     chmod 0600 "${tmp}" 2>/dev/null || true
 
     if ! sed "s|^\([[:space:]]*bind_address[[:space:]]*=[[:space:]]*\)\"[^\"]*\"|\1\"${BIND_ADDRESS}\"|" \
-        "${config_path}" > "${tmp}" 2>/dev/null || [ ! -s "${tmp}" ]; then
+        -- "${config_path}" > "${tmp}" 2>/dev/null || [ ! -s "${tmp}" ]; then
         rm -f "${tmp}"
         echo "[entrypoint] WARN: could not normalize ${config_path}; leaving ${current}. The container will NOT be reachable on its published ports." >&2
         return 0
@@ -337,6 +340,9 @@ if [ -n "${NORMALIZED_CONFIG}" ]; then
                 ;;
         esac
     done
+    # $* is fine for a LOG line (the exec'd list above is byte-exact); it only
+    # renders ambiguously for an argument containing whitespace. The comment
+    # above is about rebuilding the list, not about printing it.
     echo "[entrypoint] serving with the normalized config: $*" >&2
 fi
 

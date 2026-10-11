@@ -407,6 +407,98 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
                 result = _run(self.tree)
                 self.assertEqual(result.returncode, 1 if should_fail else 0, result.stdout)
 
+    def test_an_inherited_serving_stage_is_not_a_finding(self) -> None:
+        """`FROM runtime AS variant` inherits the parent's config and user.
+
+        The per-serving-stage rule initially treated any added stage carrying
+        `USER proximadb` as config-less, which false-failed the idiomatic way to
+        add an image variant with a message asserting something untrue.
+        """
+        for extra in (
+            "FROM runtime AS runtime-slim\nUSER proximadb\n",
+            "FROM runtime AS dbg\nUSER proximadb\nRUN echo hi\n",
+        ):
+            with self.subTest(stage=extra.splitlines()[0]):
+                self.setUp()
+                p = self.tree / "deploy/docker/Dockerfile"
+                p.write_text(p.read_text(encoding="utf-8") + "\n" + extra, encoding="utf-8")
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_a_numeric_user_is_still_a_serving_stage(self) -> None:
+        """`USER 999:999` is the same user as `USER proximadb`.
+
+        The guard accepted `--chown=999` as that owner while requiring the
+        literal string `proximadb` in USER, so switching to the numeric form and
+        deleting the config passed with exit 0 -- the cheapest route back to an
+        image that binds loopback on every port.
+        """
+        p = self.tree / "deploy/docker/Dockerfile"
+        lines = p.read_text(encoding="utf-8").splitlines()
+        # Must mutate the SAME stage whose config is removed. An earlier version
+        # replaced the FIRST `USER proximadb`, which lives in `runtime-full`,
+        # while deleting `runtime`'s COPY -- so the assertion held for the wrong
+        # reason and the control passed even with the fix reverted.
+        start = next(
+            i for i, l in enumerate(lines) if l.strip().upper().endswith("AS RUNTIME")
+        )
+        out, dropped, switched = [], False, False
+        for i, line in enumerate(lines):
+            if i > start and not dropped and line == self.RUNTIME_COPY:
+                dropped = True
+                continue
+            if i > start and not switched and line.strip() == "USER proximadb":
+                out.append("USER 999:999")
+                switched = True
+                continue
+            out.append(line)
+        self.assertTrue(dropped and switched, "mutation did not apply to the runtime stage")
+        p.write_text("\n".join(out) + "\n", encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("unreachable", result.stdout)
+
+    PERM_RUNS = {
+        "chown to root reproduces the defect": ("RUN chown root:root /config/config.toml", True),
+        "chmod 000 is worse than the defect": ("RUN chmod 000 /config/config.toml", True),
+        "chmod 0444 drops the owner's write": ("RUN chmod 0444 /config/config.toml", True),
+        "chown to the runtime user is legitimate": (
+            "RUN chown proximadb:proximadb /config/config.toml",
+            False,
+        ),
+        "chmod 0640 keeps the owner's write": ("RUN chmod 0640 /config/config.toml", False),
+    }
+
+    def test_a_perms_fixing_run_is_judged_on_owner_and_mode(self) -> None:
+        """Checking only the VERB let `chown root:root` and `chmod 000` pass."""
+        for label, (extra, should_fail) in self.PERM_RUNS.items():
+            with self.subTest(case=label):
+                self.setUp()
+                p = self.tree / "deploy/docker/Dockerfile"
+                text = p.read_text(encoding="utf-8")
+                p.write_text(
+                    text.replace(self.RUNTIME_COPY, self.RUNTIME_COPY + "\n" + extra, 1),
+                    encoding="utf-8",
+                )
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1 if should_fail else 0, result.stdout)
+
+    def test_legal_spellings_of_a_correct_copy_are_not_findings(self) -> None:
+        """Quoted owners and non-normalised destinations are both legal."""
+        cases = {
+            'quoted --chown': ('--chown=proximadb:proximadb', '--chown="proximadb:proximadb"'),
+            "dotted destination": ("/config/config.toml\n", "/config/./config.toml\n"),
+        }
+        for label, (needle, repl) in cases.items():
+            with self.subTest(case=label):
+                self.setUp()
+                p = self.tree / "deploy/docker/Dockerfile"
+                text = p.read_text(encoding="utf-8")
+                self.assertIn(needle, text)
+                p.write_text(text.replace(needle, repl, 1), encoding="utf-8")
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_ownership_guard_is_checked_per_stage(self) -> None:
         """Breaking ONE runtime stage must fail even though the other is fine.
 
