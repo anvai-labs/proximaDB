@@ -21,6 +21,10 @@ jobs:
   layering-validation:
     name: Validate Workspace Layering
     runs-on: ubuntu-latest
+    # max 0.3 min green step span over 60 runs since 2026-10-09 (57 green);
+    # script guards only, no build. 1.5x is under the 15-min floor, so the
+    # floor applies.
+    timeout-minutes: 15
     permissions:
       contents: read        # checkout
       pull-requests: write  # "Post results to PR (on failure)" via actions/github-script

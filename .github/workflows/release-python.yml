@@ -46,6 +46,9 @@ jobs:
   build-sdk:
     name: Build SDK (proximadb)
     runs-on: ubuntu-latest
+    # max 0.4 min green step span over 16 runs since 2026-07-06 (16 green);
+    # pure-Python wheel. 1.5x is under the 15-min floor, so the floor applies.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -66,6 +69,12 @@ jobs:
   build-embedded-wheels:
     name: Build embedded wheels (${{ matrix.os }} ${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # Slowest leg governs: max 59 min green step span (`windows-2022 x86_64`),
+    # then `macos-14 aarch64` at 53 min, over 16 runs since 2026-07-06 (3-5
+    # green per leg). 1.5x of 59 -> 90. Legs measured under their EXPANDED
+    # names; the pre-rename `(x86_64)`/`(aarch64)` spellings in the API are the
+    # same legs under the older `name:` template and are included.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -145,6 +154,9 @@ jobs:
   build-embedded-sdist:
     name: Build embedded sdist (proximadb_embedded)
     runs-on: ubuntu-latest
+    # max 1.5 min green step span over 16 runs since 2026-07-06 (16 green);
+    # `maturin sdist` does not compile. Floor applies.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - name: Build sdist (maturin, root package)
@@ -176,6 +188,9 @@ jobs:
           - os: macos-14
             target: aarch64
     runs-on: ${{ matrix.os }}
+    # max 0.1 min green step span over 16 runs since 2026-07-06 (1 green per
+    # leg); installs the built wheel and imports it. Floor applies.
+    timeout-minutes: 15
     steps:
       - uses: actions/setup-python@v7
         with:
@@ -247,6 +262,11 @@ jobs:
     if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.publish_testpypi == 'true' || startsWith(github.ref, 'refs/tags/python-v')) }}
     continue-on-error: true
     runs-on: ubuntu-latest
+    # max 0.2 min green step span over 16 runs since 2026-07-06 (1 green);
+    # upload only. Floor applies. Bounding this matters more than the duration
+    # suggests: an unbounded publish job holds the `pypi` deployment
+    # environment for up to GitHub's 6h default.
+    timeout-minutes: 15
     environment:
       name: testpypi
     permissions:
@@ -273,6 +293,9 @@ jobs:
     needs: [build-sdk]
     if: ${{ github.event.inputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/python-v') && !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc') }}
     runs-on: ubuntu-latest
+    # max 0.3 min green step span over 16 runs since 2026-07-06 (3 green);
+    # upload only. Floor applies.
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/project/proximadb/
@@ -294,6 +317,9 @@ jobs:
     needs: [build-embedded-wheels, build-embedded-sdist, test-embedded-wheels]
     if: ${{ github.event.inputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/python-v') && !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc') }}
     runs-on: ubuntu-latest
+    # max 0.4 min green step span over 16 runs since 2026-07-06 (1 green);
+    # upload only. Floor applies.
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/project/proximadb-embedded/

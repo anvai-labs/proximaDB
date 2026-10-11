@@ -30,6 +30,11 @@ jobs:
   unit-tests:
     name: Unit Tests (TDD)
     runs-on: ubuntu-latest
+    # Compile-bound, not test-bound: slowest GREEN step span 110 min (`stable`
+    # leg, run 2026-07-14) over 60 runs since 2026-07-05 (25 green `stable`
+    # legs, 48 green `nightly` legs); 1.5x -> 170. Step spans, not
+    # completed_at-started_at: the latter includes queue time.
+    timeout-minutes: 170
     strategy:
       # The two toolchains are independent signals, so one must not cancel the
       # other. Without this, a nightly failure cancelled the stable leg and the
@@ -167,6 +172,8 @@ jobs:
   integration-tests:
     name: Integration Tests (TDD)
     runs-on: ubuntu-latest
+    # max 66 min green step span over 60 runs since 2026-07-05 (25 green); 1.5x -> 100.
+    timeout-minutes: 100
     needs: unit-tests  # Run after unit tests pass
 
     steps:
@@ -227,6 +234,9 @@ jobs:
   python-sdk-tests:
     name: Python SDK Tests (TDD)
     runs-on: ubuntu-latest
+    # max 5.3 min green step span over 60 runs since 2026-07-05 (25 green);
+    # 1.5x is under the 15-min floor, so the floor applies.
+    timeout-minutes: 15
     needs: unit-tests
 
     steps:
@@ -282,6 +292,13 @@ jobs:
   benchmark-regression:
     name: Benchmark Regression Detection
     runs-on: ubuntu-latest
+    # NO green history: `if: github.ref == 'refs/heads/main'`, and none of the
+    # 60 runs since 2026-07-05 recorded this job green. Cap justified from the
+    # work instead -- `cargo install critcmp` plus `cargo bench` TWICE (HEAD
+    # and main), each an optimized build of every bench target. Sized just
+    # above the 110-min `unit-tests` observation, which is one build of the
+    # same tree. Re-measure from a green run on main.
+    timeout-minutes: 120
     if: github.ref == 'refs/heads/main'
     continue-on-error: true
     needs: unit-tests
@@ -345,6 +362,8 @@ jobs:
   tdd-compliance:
     name: TDD Compliance Check
     runs-on: ubuntu-latest
+    # max 96 min green step span over 60 runs since 2026-07-05 (18 green); 1.5x -> 150.
+    timeout-minutes: 150
     needs: unit-tests
 
     steps:
@@ -433,6 +452,9 @@ jobs:
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    # max 3.8 min green step span over 60 runs since 2026-07-05 (56 green);
+    # 1.5x is under the 15-min floor, so the floor applies.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -466,6 +488,9 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
+    # max 0.1 min green step span over 60 runs since 2026-07-05 (18 green);
+    # `if: always()` aggregation only. Floor applies.
+    timeout-minutes: 15
     needs: [unit-tests, python-sdk-tests, tdd-compliance, security-audit]
     if: always()
 

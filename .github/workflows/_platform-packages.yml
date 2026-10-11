@@ -47,6 +47,12 @@ jobs:
   build-rpm:
     name: Build RPM Package
     runs-on: ubuntu-22.04
+    # NO green history: `workflow_call` reusable workflow with zero recorded
+    # runs. Peer: release.yml's own `Build RPM Package` -- the same fpm recipe
+    # over a prebuilt binary, fpm install included -- max 1.2 min green step
+    # span over 60 runs since 2026-02-20 (5 green). Nothing here compiles.
+    # 1.5x is under the 15-min floor, so the floor applies.
+    timeout-minutes: 15
     outputs:
       built: ${{ steps.build.outputs.success }}
     steps:
@@ -128,6 +134,10 @@ jobs:
   build-deb:
     name: Build DEB Package
     runs-on: ubuntu-22.04
+    # NO green history (reusable workflow, zero recorded runs). Peer:
+    # release.yml `Build DEB Package`, max 1.0 min green step span over 60 runs
+    # since 2026-02-20 (5 green). Floor applies.
+    timeout-minutes: 15
     outputs:
       built: ${{ steps.build.outputs.success }}
     steps:
@@ -206,6 +216,12 @@ jobs:
   build-dmg:
     name: Build DMG Installer
     runs-on: macos-14
+    # NO green history AND no peer: release.yml packages rpm/deb/msi but has no
+    # DMG job, so there is no measured datum for this one anywhere. Cap from
+    # the work: `brew install create-dmg` on macos-14 plus hdiutil over an
+    # already-built binary -- no compilation. Set above the 15-min floor only
+    # for the unmeasured Homebrew install. Re-measure once a caller exists.
+    timeout-minutes: 20
     outputs:
       built: ${{ steps.build.outputs.success }}
     steps:
@@ -305,6 +321,11 @@ jobs:
   build-msi:
     name: Build MSI Installer
     runs-on: windows-2022
+    # NO green history (reusable workflow, zero recorded runs). Peer:
+    # release.yml `Build MSI Installer` -- the same WiX recipe over a prebuilt
+    # binary -- max 2.5 min green step span over 60 runs since 2026-02-20
+    # (5 green). Floor applies.
+    timeout-minutes: 15
     outputs:
       built: ${{ steps.build.outputs.success }}
     steps:

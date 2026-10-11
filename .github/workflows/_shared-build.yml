@@ -75,6 +75,11 @@ jobs:
   cache-check:
     name: Check Build Cache
     runs-on: ubuntu-latest
+    # NO green history: a `workflow_call` reusable workflow with ZERO runs
+    # recorded by the Actions API -- nothing in the repo currently calls it, so
+    # its jobs would also inherit no bound from a caller. Cap from the work: a
+    # cache-key computation plus `cache/restore`. Re-measure once a caller exists.
+    timeout-minutes: 15
     outputs:
       cache-hit: ${{ steps.cache.outputs.cache-hit }}
       cache-key: ${{ steps.cache.outputs.key }}
@@ -122,6 +127,14 @@ jobs:
     needs: cache-check
     if: needs.cache-check.outputs.cache-hit != 'true'
     runs-on: ${{ matrix.os }}
+    # NO green history (reusable workflow, zero recorded runs). Measured from
+    # the PEER doing identical work -- `cargo build --release --target` of the
+    # same three binaries -- in prerelease-ci.yml/release.yml: slowest green
+    # step span 66 min (`Build x86_64-pc-windows-msvc`, 7 green legs over 60
+    # prerelease-ci runs since 2026-02-21; release.yml's windows leg measured
+    # 62 min). 1.5x -> 100; set to 150 to match the sibling cap on that same
+    # build in release.yml rather than bound identical work more tightly here.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -532,6 +545,11 @@ jobs:
     needs: cache-check
     if: needs.cache-check.outputs.cache-hit != 'true'
     runs-on: ubuntu-22.04
+    # NO green history (reusable workflow, zero recorded runs). Peer:
+    # `Build Source Distribution` in release.yml, max 1.3 min green step span
+    # over 60 runs since 2026-02-20 (7 green); `maturin sdist` does not
+    # compile. 1.5x is under the 15-min floor, so the floor applies.
+    timeout-minutes: 15
     outputs:
       built-count: ${{ steps.summary.outputs.count }}
     steps:
@@ -584,6 +602,9 @@ jobs:
     needs: [cache-check, build-binaries, build-sdist]
     if: always() && needs.cache-check.outputs.cache-hit != 'true'
     runs-on: ubuntu-latest
+    # NO green history (reusable workflow, zero recorded runs). Two steps: an
+    # echo and `cache/save`. Floor applies.
+    timeout-minutes: 15
     steps:
       - name: Create Cache Manifest
         run: |
@@ -607,6 +628,9 @@ jobs:
     needs: [cache-check, build-binaries, build-sdist]
     if: always()
     runs-on: ubuntu-latest
+    # NO green history (reusable workflow, zero recorded runs). One step that
+    # sums the matrix outputs. Floor applies.
+    timeout-minutes: 15
     outputs:
       total-count: ${{ steps.count.outputs.total }}
     steps:
