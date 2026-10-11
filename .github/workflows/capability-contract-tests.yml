@@ -36,6 +36,12 @@ jobs:
   capability-contract-tests:
     name: Capability Contract Tests
     runs-on: ubuntu-latest
+    # NO green history: `if: false` (disabled), so every run since 2026-09-07
+    # records this job skipped, never green. Cap from the work --
+    # `cargo test --test capability_contract_test` on a cold cache is one debug
+    # build of the workspace, which ci.yml's own test jobs are capped at 60-120
+    # min for. Re-measure when this job is re-enabled.
+    timeout-minutes: 60
     if: false  # DISABLED - test file in wrong directory
 
     steps:
@@ -64,6 +70,10 @@ jobs:
   capability-snapshot-check:
     name: Check Capability Snapshots
     runs-on: ubuntu-latest
+    # NO green history (`if: false`, skipped in every run since 2026-09-07).
+    # Same cold-cache workspace build as `capability-contract-tests` above;
+    # re-measure when re-enabled.
+    timeout-minutes: 60
     if: false  # DISABLED - test file in wrong directory
 
     steps:
@@ -107,6 +117,10 @@ jobs:
   capability-matrix:
     name: Generate Capability Matrix
     runs-on: ubuntu-latest
+    # NO green history (`if: false`, skipped in every run since 2026-09-07).
+    # Same cold-cache workspace build as `capability-contract-tests` above;
+    # re-measure when re-enabled.
+    timeout-minutes: 60
     if: false  # DISABLED - test file in wrong directory
 
     steps:

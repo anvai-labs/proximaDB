@@ -44,6 +44,29 @@ COPY = (
     ".github/workflows/ci.yml",
     ".github/workflows/qa-gate.yml",
     ".github/workflows/publish-image.yml",
+    # The rest of TIMED_WORKFLOWS. Adding a workflow to that tuple WITHOUT
+    # adding it here is the mistake this file has already made once: the guard
+    # skips a file it cannot find (`if not path.exists(): continue`), so the new
+    # scope asserts nothing and the suite stays green. Kept in lockstep by
+    # `test_the_copy_list_covers_every_timed_workflow` below, which reads the
+    # tuple out of the guard rather than restating it.
+    ".github/workflows/_platform-packages.yml",
+    ".github/workflows/_shared-build.yml",
+    ".github/workflows/branch-route-guard.yml",
+    ".github/workflows/capability-contract-tests.yml",
+    ".github/workflows/codeql.yml",
+    ".github/workflows/docs-site.yml",
+    ".github/workflows/flake-rerun.yml",
+    ".github/workflows/infrastructure-deploy.yml",
+    ".github/workflows/layering-check.yml",
+    ".github/workflows/mirror-ci-images.yml",
+    ".github/workflows/objstore-nightly.yml",
+    ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
+    ".github/workflows/public-overflow-runner-smoke.yml",
+    ".github/workflows/release-python.yml",
+    ".github/workflows/tdd.yml",
+    ".github/workflows/tier-config-fingerprint.yml",
+    ".github/workflows/windows-compile-ratchet.yml",
 )
 
 
@@ -129,6 +152,106 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("has no `timeout-minutes`", result.stdout)
                 self.assertIn(rel, result.stdout)
+
+    def test_catches_a_missing_timeout_in_every_newly_scoped_workflow(self) -> None:
+        """Every workflow added to TIMED_WORKFLOWS must really be asserted on.
+
+        Not a restatement of the ci.yml control above. The widening left 31 jobs
+        across 10 files unbounded, and the way a widening goes wrong here is
+        silent: the guard skips a workflow it cannot find in the tree, so naming
+        a file in TIMED_WORKFLOWS without copying it into the fixture makes the
+        new assertions vacuous. This deletes one cap per newly scoped workflow
+        and requires the guard to exit 1 AND to name that file.
+        """
+        newly_scoped = [
+            ".github/workflows/_platform-packages.yml",
+            ".github/workflows/_shared-build.yml",
+            ".github/workflows/branch-route-guard.yml",
+            ".github/workflows/capability-contract-tests.yml",
+            ".github/workflows/codeql.yml",
+            ".github/workflows/docs-site.yml",
+            ".github/workflows/flake-rerun.yml",
+            ".github/workflows/infrastructure-deploy.yml",
+            ".github/workflows/layering-check.yml",
+            ".github/workflows/mirror-ci-images.yml",
+            ".github/workflows/objstore-nightly.yml",
+            ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
+            ".github/workflows/public-overflow-runner-smoke.yml",
+            ".github/workflows/release-python.yml",
+            ".github/workflows/tdd.yml",
+            ".github/workflows/tier-config-fingerprint.yml",
+            ".github/workflows/windows-compile-ratchet.yml",
+        ]
+        for rel in newly_scoped:
+            with self.subTest(workflow=rel):
+                self.setUp()
+                p = self.tree / rel
+                lines = p.read_text(encoding="utf-8").splitlines()
+                caps = [
+                    i
+                    for i, l in enumerate(lines)
+                    if l.startswith("    timeout-minutes:")
+                ]
+                self.assertTrue(caps, f"{rel} has no job-level cap to delete")
+                del lines[caps[-1]]
+                p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("has no `timeout-minutes`", result.stdout)
+                self.assertIn(rel, result.stdout)
+
+    def test_the_copy_list_covers_every_timed_workflow(self) -> None:
+        """COPY must not drift behind TIMED_WORKFLOWS.
+
+        Read out of the guard, not restated, because restating it is how the two
+        lists diverge. A workflow in the tuple but absent from the fixture is
+        skipped by the guard, which is the vacuous-green failure mode.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_guard", ROOT / GUARD)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(
+            sorted(set(mod.TIMED_WORKFLOWS) - set(COPY)),
+            [],
+            "TIMED_WORKFLOWS names a workflow the fixture does not copy; the "
+            "guard skips a missing file, so those assertions would be vacuous",
+        )
+
+    def test_an_unlisted_workflow_with_jobs_is_a_finding(self) -> None:
+        """A NEW workflow must not escape the guard by not being listed.
+
+        The scope was opt-in before: bounding the release and pipeline tiers
+        left every other file out of the tuple and therefore unchecked. A
+        workflow added tomorrow would be unchecked the same way, so the guard
+        now reads the directory and fails on anything with a `jobs:` block that
+        the tuple does not name.
+        """
+        p = self.tree / ".github/workflows/zz-newcomer.yml"
+        p.write_text(
+            "name: Newcomer\non:\n  push:\njobs:\n"
+            "  newcomer:\n    runs-on: ubuntu-latest\n"
+            "    timeout-minutes: 15\n    steps:\n      - run: true\n",
+            encoding="utf-8",
+        )
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("not in TIMED_WORKFLOWS", result.stdout)
+        self.assertIn("zz-newcomer.yml", result.stdout)
+
+    def test_a_jobless_workflow_is_not_a_finding(self) -> None:
+        """The completeness check must not fire on a file with no jobs.
+
+        Otherwise the only way to keep it green is to list every stray YAML in
+        the directory, and a guard that cries wolf gets the listing padded until
+        it means nothing.
+        """
+        p = self.tree / ".github/workflows/zz-jobless.yml"
+        p.write_text("name: Jobless\non:\n  workflow_dispatch:\n", encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_a_job_key_with_a_trailing_comment_cannot_evade(self) -> None:
         """The confirmed evasion: a comment on the job KEY hid a missing cap.
