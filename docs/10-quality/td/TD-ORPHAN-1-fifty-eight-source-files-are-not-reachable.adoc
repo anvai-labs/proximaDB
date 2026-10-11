@@ -1,0 +1,183 @@
+// Copyright (C) 2025 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-ORPHAN-1: 58 source files inside crate `src/` trees are not reachable from any build
+
+[cols="1,3"]
+|===
+| Status | **Open.** Filed 2026-10-09 from a structural sweep of the v0.4.0 tree
+(`develop` @ `9d6acc7f4`).
+| Severity | Medium. No runtime effect -- the files are not in any build -- but 25,603 lines
+read as live code: they are grepped, cited in review, and counted as coverage surface. Several
+are stale duplicates of code that moved to a crate, so a reader can follow the wrong copy.
+| Owner | unassigned
+|===
+
+== What
+
+A `.rs` file under a crate's `src/` tree is compiled only if one of these holds:
+
+* a module declares it -- `mod foo;` / `pub mod foo;`, possibly behind attributes;
+* an attribute redirects a module at it -- `#[path = "foo.rs"]` **or**
+  `#[cfg_attr(test, path = "foo.rs")]`;
+* `include!("foo.rs")` pulls it in;
+* cargo autodiscovers it: `lib.rs`, `main.rs`, `build.rs`, `src/bin/*.rs` and
+  `src/bin/*/main.rs` (the root manifest sets `autobenches = false` but never `autobins`, so bin
+  autodiscovery is live), or a **crate-root** `tests/`, `benches/`, `examples/` directory.
+
+A directory named `tests/` *inside* a `src/` tree is **not** autodiscovered and still needs a
+`mod`. Comments must be stripped before scanning, because a commented-out declaration is not a
+declaration -- four `viper/tests/*.rs` files are orphaned precisely because `viper/tests/mod.rs`
+has their `mod` lines behind `// TEMPORARILY DISABLED: Tests with import issues from storage
+engine consolidation`.
+
+**Reachability is transitive, and that is the whole measurement.** A local test -- "is this
+file's stem named in a `mod` somewhere in its parent directory" -- counts the children of an
+*unreachable* `mod.rs` as reached, because the declaration exists but nothing reaches the file
+making it. `src/storage/engines/sst/tests/mod.rs` is the live case: nothing declares it, and it
+declares 15 sibling test modules. Declaring that one file reclaims **16 files / 8,201 LOC** at a
+stroke, which a local test can never show. An earlier revision of this TD used a local test and
+undercounted by 17 files / 9,183 LOC.
+
+**58 tracked files are unreachable from any cargo target root, totalling 25,603 LOC** -- 36
+files / 17,040 LOC that look like tests, examples or benchmarks, and 22 files / 8,563 LOC that
+look like production code (20 files / 7,663 LOC of which are in the root crate; the other two
+are in `crates/`).
+
+Concentration: `src/storage` 41, `src/core` 3, `src/metrics` 2, `src/network` 2, and one each in
+`src/observability`, `src/monitoring`, `src/index`, `src/config`, `src/compute`, `src/services`,
+`src/vector`, top-level `src/background_task_optimization.rs`, `proximadb-orion-engine` and
+`proximadb-geo-spatial-index`.
+
+== Evidence
+
+Two files were proven uncompiled **by the compiler**, not by inspection: invalid Rust was
+appended to each and the owning crate still built clean.
+
+[source,console]
+----
+$ printf '\nthis is not valid rust at all !!! @@@\n' \
+    >> crates/horizontal/proximadb-geo-spatial-index/src/geo_index.rs
+$ cargo check -p proximadb-geo-spatial-index --all-targets
+    Finished `dev` profile ...                   # the file is not in the build
+
+$ printf '\n!!! not valid rust @@@ ###\n' \
+    >> crates/modalities/proximadb-orion-engine/src/multi_tenant.rs
+$ cargo check -p proximadb-orion-engine --all-targets
+    Finished `dev` profile ...
+----
+
+NOTE: `--all-targets` (or `cargo test --no-run --lib` for root-crate files) is **required**. A
+plain `cargo check -p <crate>` builds the lib only and therefore cannot see a `cfg(test)`-gated
+file -- so it would wrongly confirm a file reached by `#[cfg_attr(test, path = ...)]` as
+orphaned. That is exactly how an earlier revision of this TD reported five files that are in
+fact compiled.
+
+Two more were confirmed structurally:
+
+* `src/core/compression/markers.rs` (140 LOC) -- its sibling `src/core/compression/mod.rs` is a
+  seven-line re-export shim whose own header says *"Ownership has moved to the
+  `proximadb-compression` horizontal crate"*, and it contains **no** `mod markers;`. The only
+  `mod markers;` in the repo is `crates/horizontal/proximadb-compression/src/lib.rs:295`. Two
+  files import `proximadb_compression::markers`; **zero** reference `core::compression::markers`.
+  The two copies differ by exactly one line -- a trailing comment on line 58.
+* `crates/horizontal/proximadb-geo-spatial-index/src/geo_index.rs` (365 LOC) -- byte-identical
+  (md5 `942cfe0e...`) to `crates/horizontal/proximadb-document-geo-index/src/geo_index.rs`, which
+  *is* compiled (`lib.rs:13 pub mod geo_index;`). TD-DECOMP-39 and TD-DECOMP-62 extracted
+  overlapping geo subsystems and one left its copy behind; **TD-DECOMP-64 already records the
+  competing-abstraction half of this**, and its "Future work (algorithm dedup)" section overlaps
+  option 1 below.
+
+== The fifteen largest
+
+|===
+| File | LOC
+
+| `src/storage/engines/sst/readers/tests.rs` | 1391
+| `src/storage/engines/sst/tests/sst_compactor_tests.rs` | 1268
+| `src/storage/engines/sst/tests/flush_recovery_tdd_test.rs` | 985
+| `src/storage/engines/sst/tests/arrowblock_compaction_test.rs` | 954
+| `src/storage/engines/sst/tests/cross_format_interop_benchmark.rs` | 885
+| `src/observability/graph_linking.rs` | 884
+| `src/storage/engines/sst/unified_search_engine/tests.rs` | 813
+| `src/storage/engines/viper/tests/parquet_reader_tests.rs` | 777
+| `src/storage/knowledge_graph/types.rs` | 765
+| `src/storage/engines/viper/tests/coverage_tests.rs` | 763
+| `src/storage/persistence/filesystem/hdfs.rs` | 703
+| `src/storage/engines/sst/tests/arrowblock_full_lifecycle_test.rs` | 667
+| `src/core/search/search_interface_tests.rs` | 644
+| `src/storage/engines/core/formats/columnar/search.rs` | 640
+| `src/monitoring/enterprise_dashboard.rs` | 626
+|===
+
+`scripts/check_orphan_rust_files.py` prints the full 58 and is the authority; this table is only
+the head of that list.
+
+== Why this matters beyond tidiness
+
+. **The test-looking files are not running, and it is 17,040 lines of them.** 36 of the 58 are
+  `*_tests.rs` / `benchmarks.rs` / `*_examples.rs`. The largest single block is the
+  `src/storage/engines/sst/tests/` subtree -- 16 files, 8,201 LOC, led by `sst_compactor_tests.rs`
+  (1,268), `flush_recovery_tdd_test.rs` (985) and `arrowblock_compaction_test.rs` (954) -- all
+  dead because the `mod.rs` that declares them is itself unreachable. `sst/readers/tests.rs` adds
+  **1,391 lines with 27 test functions**. A test that reads as coverage but never runs is worse
+  than no test, which is what mandate #11 is guarding against.
+. **The duplicates mislead.** `markers.rs` and `geo_index.rs` are stale copies of code that moved
+  to crates. A reader -- or an agent -- grepping a symbol finds the dead copy and may edit it.
+. **It shrinks the decomposition surface slightly.** The root crate is 58.3% of the Rust under
+  `src/` + `crates/` (796,693 of 1,365,779 LOC, test code included -- this is not a non-test
+  filter). 7,663 of its lines are not reachable, so the monolith is marginally smaller than it
+  looks when scoping ADR-094 work.
+
+== Options
+
+. **Delete, file by file, after a salvage read.** Default for the stale duplicates
+  (`markers.rs`, `geo_index.rs`) and for anything superseded.
+. **Re-attach the tests that still mean something.** For each, decide: declare it, move it to the
+  crate's root `tests/` directory where cargo finds it automatically, or delete it. Re-attaching
+  will surface real failures -- that is the point, and it must be done in small batches. Note the
+  `viper/tests/*.rs` four were disabled deliberately ("import issues from storage engine
+  consolidation"), so those have a known reason to re-examine rather than restore blindly.
+. **The guard is landed with this TD.** `scripts/check_orphan_rust_files.py` is baselined at 41
+  and fails above it, wired into `work-commit-check` and the unconditional
+  `deterministic-commit-contract` CI job -- the baseline-and-ratchet pattern
+  `check_docs_site_coverage.py` uses for TD-DOCSITE-1.
+
+== Verification
+
+* `python3 scripts/check_orphan_rust_files.py` -- OK at or below the baseline; it prints every
+  file when it fails, and says when the baseline can be lowered.
+* Confirm any individual file with the compiler using `--all-targets`, never a bare
+  `cargo check -p`.
+* `cargo build --profile release-server` and `cargo nx` stay green: deleting uncompiled code
+  cannot break either, and if it does, the file was not orphaned and the detector is wrong.
+* `make work-commit-check` green, and the baseline lowered in the same PR as any removal.
+
+== Measurement notes
+
+Recorded because the naive approaches give wrong answers, and an earlier revision of this file
+published two of them:
+
+* **`#[cfg_attr(test, path = "...")]` is a declaration.** Matching only `#[path = ...]` misses
+  four files (`sst/{compaction,collections,writer}_tests.rs` and
+  `proximadb-sst-engine/src/row_filter_tests.rs`) that are compiled into the lib test target --
+  and `compaction_tests.rs` runs in CI today via `cargo nextest run --lib` (`ci.yml:1758`).
+* **`src/bin/*.rs` is autodiscovered**, so `src/bin/score_lexical_corpus.rs` is a built bin.
+* **Checking only the parent `mod.rs` is wrong**, twice over. `compaction_tests.rs` is declared
+  in `compaction.rs:3220`, not in `mod.rs` -- and a declaration only counts if the *declaring*
+  file is itself reachable, which is what makes the `sst/tests/` subtree dead.
+* **`#[path]` and `include!` resolve against the directory holding the declaring file**, while a
+  conventional `mod x;` resolves inside the module directory. Resolving the former against the
+  module directory loses every sibling redirect -- 22 files on this tree, including
+  `protocol_tests.rs` (`protocol.rs:7231`).
+* **A crate outside the workspace has no entry in `cargo metadata --no-deps`**, so
+  `clients/rust/codegen/src/main.rs` looks unreachable unless crate roots are also seeded by
+  convention.
+* **LOC here are `splitlines()` counts.** Twelve of the 58 files have no trailing newline, so
+  `wc -l` totals 12 lower; the aggregate figures quoted from the repo elsewhere in this file are
+  `wc -l`.
+* A git pathspec `**/*.rs` matches **zero** files at this rev -- it requires an intervening
+  directory, so it silently drops `src/lib.rs` and everything else at a tree root.
+* Excluding a *directory* because some file in it mentions `OUT_DIR` masks the whole subtree.
+  `src/lib.rs:292` mentions it in a comment, which hid all of `src/` and made the count read 3.
+
+See also TD-ENGDUP-1 and TD-DECOMP-64.

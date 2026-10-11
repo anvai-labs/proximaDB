@@ -6,8 +6,8 @@ This document captures the naming conventions applied across the
 ProximaDB Rust crates to keep struct, enum, and trait names
 distinguishable across modules. It was extracted from the multi-round
 disambiguation pass logged in
-link:../../roadmap/NOMENCLATURE_DISAMBIGUATION_PASS_2026_05_24.adoc[the
-nomenclature pass roadmap] and the commit series tagged
+the
+nomenclature pass roadmap and the commit series tagged
 `refactor: disambiguate ...` (rounds 1-16, May 2026).
 
 == Motivation

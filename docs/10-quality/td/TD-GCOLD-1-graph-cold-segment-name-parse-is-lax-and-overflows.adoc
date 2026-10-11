@@ -1,0 +1,95 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GCOLD-1: Graph cold-segment name parsing is lax and its sequence resume overflows
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **RESOLVED 2026-10-07.** `parse_seg_seq` requires width 16 and the `[0-9a-f]` alphabet; the two resume sites AND the write site all refuse on exhaustion (`checked_add` at resume, `fetch_update` + requeue-on-refusal at the write, since `fetch_add` on an `AtomicU64` is not covered by `overflow-checks` and wraps in both profiles); and the same overflow class in `merge_segment_directory` (`TRAILER + dir_len`, both `offset + len` ranges) is checked. Pinned by `seg_name_maps_to_exactly_one_sequence_and_sorts_by_it` (asserts the injectivity and ordering PROPERTIES; mutation-kills the full removal and every half-fix tried, including uppercase-only), `index_load_refuses_an_exhausted_sequence_rather_than_overflowing`, and `write_refuses_at_sequence_exhaustion_and_requeues_the_batch`. Filed 2026-10-06, found while adopting this module as the precedent for TD-USUB-1's spill-segment discovery.
+| Priority | **LOW.** Both require an object whose NAME is anomalous under the partition prefix, which nothing in the system writes — so neither is reachable from normal operation. Recorded because the names are attacker- or corruption-influenced inputs, and because this module is cited as the pattern to copy.
+| Component | `src/graph/cold_segment_store.rs` (`parse_seg_seq`, the two resume sites, the write site in `write_segment`, and `merge_segment_directory`'s trailer/directory arithmetic)
+| Relates to | TD-USUB-1 (spill-segment discovery, which copied this module's design), mandates #1 and #4
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`cold_segment_store.rs` solves durable segment discovery the way TD-USUB-1 now does: a
+zero-padded hex sequence in the name (`seg-{seq:016x}.gcseg`), recovered by `parse_seg_seq` and
+resumed past the highest value found, "so new segments never clobber existing ones". The design is
+right — it is why TD-USUB-1 adopted it. Two details of the implementation are not.
+
+=== 1. `seq + 1` overflows on a filename-controlled value (mandate #4, then #1)
+
+`cold_segment_store.rs:247` and `:305`:
+
+[source,rust]
+----
+max_seq = max_seq.max(seq + 1);
+----
+
+`seq` comes from the object's NAME. `seg-ffffffffffffffff.gcseg` is well-formed and parses to
+`u64::MAX`, so `seq + 1` **panics in debug** — forbidden in production code by mandate #4 — and
+**wraps to 0 in release**, which is worse: the store then resumes at 0 and re-issues names that
+live segments already hold. Unlike the spill store, this writer does not use a conditional create,
+so a wrap would silently overwrite.
+
+Fix: `checked_add`, refusing explicitly on exhaustion rather than panicking or wrapping.
+
+=== 2. `parse_seg_seq` accepts names the writer never emits (mandate #1)
+
+`cold_segment_store.rs:536-540`:
+
+[source,rust]
+----
+fn parse_seg_seq(path: &str) -> Option<u64> {
+    let name = path.rsplit('/').next()?;
+    let hex = name.strip_prefix("seg-")?.strip_suffix(".gcseg")?;
+    u64::from_str_radix(hex, 16).ok()
+}
+----
+
+Two gaps, both of which break the single property the name exists to carry — that a lexicographic
+sort of a listing equals sequence order:
+
+* **No width check.** `seg-9.gcseg` parses to 9, and `seg-10.gcseg` sorts *before* it. The writer
+  always pads to 16, so any other width is not a name this store wrote.
+* **No case check.** `from_str_radix` accepts either case, so `seg-00000000000000ff.gcseg` and
+  `seg-00000000000000FF.gcseg` are two distinct objects claiming one sequence — a set holding both
+  has no defined order.
+
+Fix: reject any width but 16 and any uppercase digit, mirroring
+`parse_spill_seq` in `src/services/record_spill.rs`.
+
+== What was done
+
+1. **`parse_seg_seq` requires the ALLOWED alphabet**, not the absence of a class someone thought
+   of: width exactly 16 and every byte in `[0-9a-f]`. The recipe this TD originally carried —
+   "reject any width but 16 and any uppercase digit" — was **insufficient**, because
+   `from_str_radix` also accepts a leading `+`, so `seg-+0000000000000ff.gcseg` still claimed the
+   sequence `seg-00000000000000ff.gcseg` owns, and `+` (0x2B) sorts ahead of `0` (0x30). That
+   half-fix shipped once in `parse_spill_seq` and had to be corrected; the original wording of this
+   section would have reproduced it. Recorded because TD-GCOLD-2 directs a future reader back here
+   to extract a shared helper.
+2. **Both resume sites use `checked_add`** with an explicit refusal, AND so does the write site.
+   Refusing only at resume was off by one: `fetch_add` on an `AtomicU64` is not covered by
+   `overflow-checks`, so it wraps silently in *both* profiles — a name carrying `u64::MAX - 1`
+   resumed to `MAX` without refusing, and two writes later the counter wrapped to 0 and re-issued
+   `seg-0000000000000000.gcseg`. The write site now uses `fetch_update` and requeues the pending
+   batch on refusal, so the class is closed at the point of consumption.
+3. **Tests assert the properties, not a rejection list:**
+   `seg_name_maps_to_exactly_one_sequence_and_sorts_by_it` (injectivity and
+   lexicographic-equals-numeric; mutation-kills the full removal and every half-fix tried, including
+   uppercase-only) and `index_load_refuses_an_exhausted_sequence_rather_than_overflowing`.
+4. **The same overflow class in `merge_segment_directory`** — `TRAILER + dir_len` and both
+   `offset + len` ranges, all derived from the segment's own trailer/directory — was folded in. In
+   release that sum wrapped, which made the truncation guard *pass* and issued a reversed
+   `get_range`.
+
+== Residual
+
+The heal-from-tails resume site is not directly tested: the loop calls `merge_segment_directory`
+first, so a max-named object with a garbage body fails on the trailer before reaching the resume.
+Reaching it needs a hand-built valid segment body. The construct is byte-identical to the covered
+sidecar site.
+

@@ -82,6 +82,22 @@ lazy_static! {
         "proximadb_ivf_probe_rank_calls_agg_total",
         "Coarse-probe rank invocations (divide IVF_PROBE_RANK_US by this for the mean compute term)",
     );
+    pub static ref REGION_B_RERANK_US: IntCounter = counter(
+        "proximadb_region_b_rerank_us_agg_total",
+        "Cumulative Region-B survivor fetch+rerank wall microseconds (TD-RDSTRAT-13 PR-B tail attribution)",
+    );
+    pub static ref REGION_D_FETCH_DECODE_US: IntCounter = counter(
+        "proximadb_region_d_fetch_decode_us_agg_total",
+        "Cumulative Region-D top-k OID fetch+decode wall microseconds (TD-RDSTRAT-13 PR-B tail attribution)",
+    );
+    pub static ref REHYDRATE_US: IntCounter = counter(
+        "proximadb_rehydrate_us_agg_total",
+        "Cumulative top-k rehydration wall microseconds (TD-RDSTRAT-13 PR-B)",
+    );
+    pub static ref CASCADE_TOTAL_US: IntCounter = counter(
+        "proximadb_cascade_total_us_agg_total",
+        "Cumulative whole-cascade wall microseconds (TD-RDSTRAT-13 PR-B umbrella)",
+    );
 }
 
 /// Tier label for the per-tier aggregate counters. Must stay in sync with the
@@ -131,4 +147,24 @@ pub fn record_metadata_op() {
 pub fn record_ivf_probe_rank_us(us: u64) {
     IVF_PROBE_RANK_US.inc_by(us);
     IVF_PROBE_RANK_CALLS.inc();
+}
+
+/// Record the Region-B survivor fetch+rerank wall in microseconds (PR-B).
+pub fn record_region_b_rerank_us(us: u64) {
+    REGION_B_RERANK_US.inc_by(us);
+}
+
+/// Record the Region-D top-k OID fetch+decode wall in microseconds (PR-B).
+pub fn record_region_d_fetch_decode_us(us: u64) {
+    REGION_D_FETCH_DECODE_US.inc_by(us);
+}
+
+/// Record the top-k rehydration wall in microseconds (PR-B).
+pub fn record_rehydrate_us(us: u64) {
+    REHYDRATE_US.inc_by(us);
+}
+
+/// Record the whole-cascade umbrella wall in microseconds (PR-B).
+pub fn record_cascade_total_us(us: u64) {
+    CASCADE_TOTAL_US.inc_by(us);
 }

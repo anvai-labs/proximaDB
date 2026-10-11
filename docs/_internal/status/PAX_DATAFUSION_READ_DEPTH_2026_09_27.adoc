@@ -1,0 +1,133 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= PAX DataFusion-lane cold read depth — measurement (TD-USUB-8 slices 0–2)
+:toc:
+:status-as-of: 2026-09-27
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Date (UTC) | 2026-09-27
+| Version | proximadb 0.3.0 @ PR #1943 (`feat/usub8-depth-measurement`) — the commit that CONTAINS the ratchet. Its parent `c1a3e7731` has no `DEPTH` line to print.
+| Source | `src/datafusion/engine_adapters/pax_adapter.rs` — `warm_read_skips_the_index_fetch`
+| Command | `cargo test -p proximadb --lib warm_read_skips_the_index_fetch -- --nocapture`
+| Environment | Range-coalescing gates **unset** (`PROXIMADB_FS_READ_RANGES_COALESCE_GAP` / `_MAX`). See "The totals are environment-dependent; the ratchet is not".
+| Hardware | **Irrelevant.** These are request COUNTS, deterministic for a given segment; no timing is claimed.
+|===
+
+== What is measured, and what is deliberately not
+
+ADR-033 ranks `DEPTH ≫ WIDTH ≫ BYTES ≫ CPU` for object storage. This measures **depth** on the
+DataFusion PAX lane (`PaxSplitReader::load_ranged`) — the count of **dependent** round trips
+that must complete before any data can be fetched.
+
+It is **not** a latency or throughput measurement, and the figures must not be read as a
+percentage of total requests. See "Why the percentage would mislead".
+
+== Result
+
+[cols="1,1,1", options="header"]
+|===
+| | `range_gets` | Index acquisition (dependent)
+| Cold read | 203 | **3**
+| Warm read (index cached) | 200 | **0**
+|===
+
+**Index-acquisition round trips on the critical path: 3 → 0.**
+
+The 3 are, for this v2 fixture: the header prefix read, then two tail-probe iterations (the
+probe grows ×4 on a short suffix). They are strictly serial — the prefix must return before the
+probe can start, and each iteration before the next — and nothing can be fetched until they
+finish.
+
+The remaining 200 are per-surviving-block stripe fetches. They depend on the index but **not on
+each other**, so they are a WIDTH concern (addressed by range coalescing), not depth.
+
+== Why the percentage would mislead
+
+3 of 203 is ~1.5% of requests, and reporting it that way would be wrong in both directions:
+
+* it **understates** the latency effect, because the 3 are serial and on the critical path while
+  the 200 are parallelisable;
+* it **overstates** nothing useful, because the ratio is an artifact of this fixture's block
+  count (200 blocks). A 10-block segment would show 3 of 13 — the same depth saving, a very
+  different percentage.
+
+Depth is the quantity; request count is not.
+
+== The totals are environment-dependent; the ratchet is not
+
+`203` and `200` hold with the range-coalescing gates unset. With
+`PROXIMADB_FS_READ_RANGES_COALESCE_GAP` / `_MAX` set, `FilesystemFactory::read_ranges` coalesces
+the stripe fetches and the same test reports `cold_range_gets=4 warm_range_gets=1` — because
+coalescing collapses the 200 independent WIDTH reads, exactly as intended.
+
+**The difference stays 3 in both configurations**, which is the reason the ratchet asserts the
+difference rather than either total. It is also a second, independent demonstration that the 200
+are width and the 3 are depth: coalescing moves one and cannot touch the other.
+
+== Where the depth went (slices 0–2)
+
+[cols="1,2,1", options="header"]
+|===
+| Operation | Status | Slice
+| `HEAD` for object size | **removed** — the planner already had the size from `list()`; it is now carried in `FileSplit.object_size` | 0 (#1936)
+| Header-prefix read | skipped on a warm read | 1 (#1941)
+| Footer read (v4) / tail probe (v2) | skipped on a warm read | 1 (#1941)
+| Stripe fetches | unchanged (width, not depth) | —
+|===
+
+== A property worth recording: this lane's depth is observable *when the split carries a size*
+
+`load_ranged`'s own body has four I/O call sites: the `metadata` HEAD and three `read_range`
+calls. It then delegates to `load_ranged_with_index`, which issues the rest — per-block footer
+and column-metadata reads via `block_layout_ranged`, and the batched stripe fetch — and those
+are where the bulk of the 203 comes from.
+
+What matters is that **every one of those is a `read_range`/`read_ranges`, and none is a HEAD**.
+Since `range_gets` counts ranged reads but not HEADs, **slice 0 made this lane's depth visible
+to `io_trace` for any split that carries `object_size`** — which is every split both PAX
+locators produce, since each calls `with_object_size(..)` off the `list()` metadata.
+
+The qualifier is load-bearing, so state it rather than round it up to "fully observable": the
+HEAD is *skipped*, not removed. A split reaching this reader without `object_size` — an
+externally constructed or hand-built split — still takes it, and that round trip is invisible to
+`range_gets`. Anyone measuring depth on such a split must count it separately, exactly as on the
+`RangedSegmentReader` lane below.
+
+That is specific to this lane. `RangedSegmentReader`'s own `SegmentReadStats` still excludes both
+the `HEAD` (`vector_segment_size`) and the index-locate suffix reads, so **that** struct cannot
+attribute depth. Any measurement there must count them explicitly. Do not generalise "range_gets
+measures depth".
+
+Chasing that down is filed as **TD-USUB-12**: the index-locate read is not one read but a growing
+`loop`, and it is paid per segment in a scan loop rather than once.
+
+[NOTE]
+====
+The first draft of that TD — and of this paragraph — went further and claimed those GETs are
+**missing from the metered `object_store_gets`**. That was wrong, and inverted; TD-USUB-12 now
+carries the correction.
+
+`proximadb-object-store` installs a process-global recorder hook (`record_range_read` →
+`io_trace::record_range_gets`), so the acquisition GETs *are* metered — and the reader's manual
+`read_stats()` forward then counts the block-body reads a **second** time. The lane's real defect
+is a double-count, not an under-count; it is not reachable from a server boot path today; and
+what survives is the observability claim, that `SegmentReadStats` cannot separate serial
+acquisition from parallelisable body fetching.
+
+The bad step is worth naming: the crate was searched for the symbol `record_range_gets`, when the
+mechanism is a hook calling `record_range_read` resolved at an install site in another crate.
+Absence of a name is not absence of a mechanism.
+
+This does not touch the measurement above, which is a different lane and was derived by execution.
+====
+
+== Scope
+
+* Warm-path only. A cold process still pays the 3, and every node warms independently — which
+  is the remaining case for catalog-resident Layer B (slice 3), alongside planner-time pruning
+  that a read-side cache cannot provide.
+* The ratchet asserts `cold - warm == 3`. If the index-acquisition path changes, re-derive the
+  number rather than adjusting it: this is the term ADR-033 ranks dominant, and it degrades
+  silently.

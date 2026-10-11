@@ -140,6 +140,7 @@ fn simulate(rounds: u64) -> (Vec<(String, Regret)>, f64, f64) {
             cardinality: CardinalityClass::Large,
             partition_fanout: PartitionFanout::Many,
             pax_backed: false,
+            native_registerable: false,
             // TD-ROUTE-3: a native-eligible (single-scan scalar-aggregate) shape,
             // so the controller flipping this case to Native reflects a route the
             // real `route_select_advised` would actually take (Native is not an

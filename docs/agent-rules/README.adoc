@@ -30,7 +30,7 @@ starting point so no one starts from a blank machine.
 == The TD/ADR convention is still committed and shared
 
 Filing a Technical Debt item or an ADR follows
-link:../../12-design/HOW_TO_FILE_TD_AND_ADR.adoc[HOW_TO_FILE_TD_AND_ADR] (one file
+link:../12-design/HOW_TO_FILE_TD_AND_ADR.adoc[HOW_TO_FILE_TD_AND_ADR] (one file
 per entry; prefer a topic-scoped id like `TD-CAT-1`; never reuse a number already
 on `develop`; the `td-adr-unique` CI guard backstops). That doc, the
 `scripts/check_td_adr_unique.py` guard, and the `docs/10-quality/td/` directory

@@ -1,0 +1,62 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-19: An unresolvable (resident + tombstoned) oid pins WAL truncation forever, with no bound and no alarm
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-08 by the round-7 review of the tombstone-persistence slice, which created this state deliberately by choosing to fail closed.
+| Priority | **LOW to reach, HIGH to diagnose.** Needs the `upsert_record` / `delete_record` race on ONE oid (no preemption required on a multi-thread runtime, but a narrow window). Once reached, the partition can never compute a truncation point again short of a write to that same oid, a DROP, or a restart — and nothing meters it.
+| Component | `src/services/record_spill.rs` (`flush`'s `ambiguous` set, `min_unflushed_lsn`, `upsert_record`, `purge_durable_objects`)
+| Relates to | TD-USUB-16 (the race), TD-USUB-18 (the same fail-closed-with-no-exit shape), TD-GCOLD-3 (the identical shape in the graph cold store), mandate #1
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`flush` refuses to resolve an oid that is both resident and tombstoned, because the authoritative
+order is the WAL's LSN order and `tombstones` carries no LSN (TD-USUB-16). That is the right call —
+the alternative destroyed an acknowledged INSERT. But the consequence was not stated:
+
+* the oid stays in `tombstones`, so `min_unflushed_lsn` takes its `!self.tombstones.is_empty()` arm
+  and returns `Err` on **every** subsequent call;
+* the only three things that clear it are an `upsert_record` of *that same oid* (which clears the
+  tombstone), `purge_durable_objects` (DROP), and process restart;
+* so a healthy, idle partition can pin the WAL **indefinitely** — unbounded WAL growth, which is the
+  cost term slice 2b exists to control;
+* each flush emits one `warn!` naming the oid count, and nothing meters or alarms on it.
+
+This is the shape the same PR files **TD-GCOLD-3** for ("the cold-segment buffer grows without
+bound and nothing alarms") and that **TD-USUB-18** records for the orphan counter ("the flag is a
+refusal, not a reconciliation... no exit"). Filing it here keeps that standard consistent rather
+than leaving this instance as the one unrecorded case.
+
+What TD-USUB-16 does say is that "unflushed state is bounded by one row plus one tombstone per
+racing oid" — true of MEMORY, and silent about the WAL, which is the part that grows.
+
+== A third resolver, omitted from both the code comment and TD-USUB-16
+
+`delete_record` has an already-suppressed branch: when the resident copy is itself dead it removes
+the memtable row. That is a third way an ambiguous oid can stop being ambiguous, and neither the
+`ambiguous` block's comment nor TD-USUB-16 mentions it. Worth adding to both so the next reader does
+not conclude the only exits are upsert / DROP / restart.
+
+(Checked while filing: the `resident_lsns` entry that branch leaves behind can only LOWER the
+reported minimum — a minimum over a superset — so it retains more WAL, never less. Safe direction.)
+
+== How to apply
+
+1. **Meter it.** Export the ambiguous-oid count as a gauge, so "this partition stopped truncating"
+   is visible rather than inferable from a repeated `warn!`. This is the minimum, and is what
+   TD-GCOLD-3 asks for in its own module.
+2. **Give it an exit.** The real fix is to make the ordering knowable: carry the LSN with the
+   tombstone (`tombstones: DashMap<String, u64>` rather than `DashSet<String>`), after which the
+   flush can resolve the race by comparing LSNs instead of refusing. That removes this TD,
+   TD-USUB-16's race, and the "cannot resolve" clause in the `ambiguous` block all at once, and is
+   the shape slice 2b wants anyway. Cost: one more field per pending delete.
+3. Until then, state the consequence where an operator will see it — the refusal message from
+   `min_unflushed_lsn` should name the ambiguous oids, since they are the actionable detail (a write
+   to any of them clears it).
+
+Option 2 is the one to schedule; it is also a prerequisite worth weighing against slice 2b, because
+2b's value is bounded by how often a partition can actually truncate.

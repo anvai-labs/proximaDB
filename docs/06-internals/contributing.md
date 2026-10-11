@@ -422,7 +422,7 @@ Contributors recognized in:
 
 ### Documentation
 
-- [CLAUDE.md](../../CLAUDE.md) - Project instructions
+- CLAUDE.md - Project instructions
 - [Architecture](../05-concepts/) - Technical concepts
 - [Design Patterns](../12-design/DESIGN_PATTERNS.adoc) - Code patterns
 

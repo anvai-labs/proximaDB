@@ -9,7 +9,7 @@
 | Status | **Resolved** — #557 fixed the query-path keying (`collection.id` instead of the name); verified post-ADR-031 that insert and query both key on the same decimal `object_id`. Regression guard added.
 | Severity | Critical — the production Approximate search path gets **zero ANN benefit**; every query falls back to a full SST/memtable scan.
 | Component | AXIS index routing — `src/index/axis/management/manager.rs`
-| Tracked-by | link:../../12-design/STORAGE_FORMAT_DECISION_FRAMEWORK_2026_06_29.adoc[Storage-Format Decision Framework] (PR #553); link:TD_096_S1_RECALL_RECONCILIATION_2026_06_28.adoc[TD-096 S1 Reconciliation] (#534/#545)
+| Tracked-by | link:../../12-design/STORAGE_FORMAT_DECISION_FRAMEWORK_2026_06_29.adoc[Storage-Format Decision Framework] (PR #553); link:../../_internal/status/TD_096_S1_RECALL_RECONCILIATION_2026_06_28.adoc[TD-096 S1 Reconciliation] (#534/#545)
 | Pillar | REL (correctness), PERF
 |===
 

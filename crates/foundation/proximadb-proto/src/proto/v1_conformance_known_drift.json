@@ -1,0 +1,4 @@
+{
+  "_doc": "TD-PROTO-2 known-drift ledger: pre-existing v1-mirror ↔ proto mismatches, ratcheted DOWN only. Regenerate with UPDATE_V1_DRIFT_SNAPSHOT=1 cargo test -p proximadb-proto --lib v1_conformance after fixing drift. New drift is never added here — it is fixed.",
+  "findings": []
+}

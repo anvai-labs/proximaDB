@@ -1,0 +1,127 @@
+# User-facing documentation site (mkdocs + Material).
+#
+# Two jobs, matching the feat -> develop -> qa -> main promotion flow:
+#   * `build`  — runs on every docs-touching PR and on develop. `--strict` plus
+#     the `validation:` block in mkdocs.yml, so a broken link, a bad anchor or a
+#     page missing from the nav FAILS rather than shipping a silently wrong site.
+#
+#     NOT merge-blocking: `develop` requires only the `CI Success` aggregator,
+#     and a job in a SEPARATE workflow cannot appear in its `needs`. Making this
+#     required means either adding `Docs Site / Build docs (strict)` to branch
+#     protection, or folding the build into `ci.yml`. The cheap part — the
+#     coverage guard, which needs no toolchain — is already blocking: it runs in
+#     ci.yml's `docs-validation`, which IS in `ci-success.needs`.
+#   * `deploy` — publishes to GitHub Pages from `main` only, so the public site
+#     tracks the released branch rather than in-flight work.
+#
+#     PREREQUISITE, not yet done: GitHub Pages must be enabled for this repo with
+#     source "GitHub Actions" (Settings -> Pages). Until then `configure-pages`
+#     fails with "Get Pages site failed", so the first push to `main` after this
+#     merges will show a red Deploy job. That is a one-time repo setting, not a
+#     code change.
+#
+# Path-filtered on purpose: CI runners are a shared finite resource, and a docs
+# site rebuild has no bearing on a Rust-only change.
+name: Docs Site
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.txt'
+      - 'scripts/check_docs_site_coverage.py'
+      - '.github/workflows/docs-site.yml'
+      - 'Makefile'
+  push:
+    branches: [develop, main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.txt'
+      - 'scripts/check_docs_site_coverage.py'
+      - '.github/workflows/docs-site.yml'
+      - 'Makefile'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PR builds are cheap and superseded by the next push, so cancel them (mandate
+# #7 — runners are a shared finite resource). `main` is EXEMPT, because
+# workflow-level cancellation cancels the whole RUN including a running `deploy`,
+# and a job-level `concurrency:` block is only an extra queueing constraint — it
+# does NOT exempt the job from its parent run being cancelled. An earlier
+# revision of this file claimed it did; it does not. Cancelling a run mid Pages
+# deployment can leave the published site partial.
+concurrency:
+  group: docs-site-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    name: Build docs (strict)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+      - name: Install pinned docs toolchain
+        run: pip install -r requirements-docs.txt
+      - name: Guard — no user-facing page silently unpublished
+        # Needs no toolchain: mkdocs cannot report this at all (a link to an
+        # excluded file is an unraisable INFO), so it is checked out-of-band.
+        run: python3 scripts/check_docs_site_coverage.py
+      - name: Build (strict)
+        # --strict only escalates WARNINGs, and mkdocs ships link/nav checks at
+        # INFO; the `validation:` block in mkdocs.yml raises them, which is what
+        # makes this step meaningful rather than a formality. If it breaks on a
+        # link into docs/12-design or docs/10-quality, the fix is NOT to relax
+        # strict: those trees are excluded by design (see mkdocs.yml), so link
+        # to a published page or drop the link.
+        run: mkdocs build --strict
+      - name: Upload site artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-site
+          path: site/
+          retention-days: 7
+
+  deploy:
+    name: Deploy to GitHub Pages
+    # `main` only — the published site follows the released branch.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Serialises concurrent deployments against each other. This does NOT
+    # protect against the workflow-level cancel above — that is handled by
+    # exempting `main` there.
+    concurrency:
+      group: docs-site-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Publish exactly the bytes `build` produced. Rebuilding here would mean
+      # the artifact the build job verified is not the artifact that ships.
+      - name: Download the verified site
+        uses: actions/download-artifact@v8
+        with:
+          name: docs-site
+          path: site/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+      - id: deployment
+        uses: actions/deploy-pages@v4

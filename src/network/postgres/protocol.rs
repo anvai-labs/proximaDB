@@ -24,6 +24,7 @@ use super::session::{Session, SessionManager};
 use super::translator::QueryTranslator;
 use super::types::{FieldDescription, PgType};
 use crate::catalog::CatalogManager;
+use crate::core::utils::find_ascii_ci;
 use crate::graph::GraphService;
 use crate::network::arrow_ipc::ArrowProtoCodec;
 use crate::observability::ObservabilityService;
@@ -41,6 +42,26 @@ use crate::services::{DdlService, DmlService};
 use crate::storage::document::DocumentService;
 use proximadb_data_model::ProximaType;
 use proximadb_data_model::ProximaValue;
+
+use proximadb_records::conversions::sql_value_to_json;
+
+fn sql_object_to_json(obj: &crate::proto::proximadb_v1::SqlObject) -> String {
+    let value = serde_json::Value::Object(
+        obj.fields
+            .iter()
+            .map(|(key, value)| (key.clone(), sql_value_to_json(value)))
+            .collect(),
+    );
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Startup packet length ceiling (real postgres caps this at 10000 bytes;
+/// this is generous headroom for connection params, not a real limit).
+const MAX_STARTUP_MESSAGE_LEN: i32 = 65536;
+/// General pgwire message/CopyData length ceiling — bounds a garbage-but-
+/// positive length prefix from requesting an absurd allocation, while
+/// staying well above any legitimate query/batch/bulk-COPY payload.
+const MAX_PGWIRE_MESSAGE_LEN: i32 = 256 * 1024 * 1024;
 
 /// PostgreSQL protocol handler
 pub struct PostgresProtocol {
@@ -123,33 +144,361 @@ pub struct PostgresProtocol {
     /// resolver REST/gRPC/Arrow use). `None` = unwired ⇒ identity carries no
     /// stable id (pgwire ABAC inert for policy lookup, same default REST had).
     stable_id_resolver: Option<Arc<dyn proximadb_tenant::TenantStableIdResolver>>,
+    /// TD-PGWIRE-AUTH-1: coordinator for the SCRAM-SHA-256 mode — verifier
+    /// lookups + post-exchange identity resolution. `None` ⇒ SCRAM
+    /// unavailable (trust mode only).
+    security_coordinator: Option<Arc<crate::security::SecurityCoordinator>>,
+    /// TD-PGWIRE-AUTH-1: the resolved pgwire authentication posture (trust |
+    /// SCRAM-required), resolved once at startup in `database.rs`.
+    pgwire_auth: PgwireAuthMode,
+    /// ADR-018 P2.D (TD-076): per-connection transaction write buffer.
+    /// Writes inside an explicit transaction accumulate here and replay
+    /// sequentially at COMMIT; ROLLBACK discards; dropping the connection
+    /// drops the buffer (implicit rollback — in-memory until COMMIT, exactly
+    /// per the ADR). Lives on the protocol (not `Session`) because it is
+    /// per-connection protocol state, like `prepared_statements`/`portals`.
+    transaction_buffer: TransactionBuffer,
 }
 
+/// The pgwire authentication posture (TD-PGWIRE-AUTH-1). Resolved ONCE at
+/// startup: `security` disabled ⇒ Trust; `[security.authentication] enabled`
+/// FORCES `ScramRequired` (fail-closed, mirrors Flight's
+/// "coordinator present requires a credential" rule); otherwise the
+/// `[security.pgwire] auth` config / `PROXIMADB_PGWIRE_AUTH` env ladder
+/// applies (it can raise pgwire above the global default but never lower it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PgwireAuthMode {
+    /// Trust authentication: no credential exchange (dev / embedded default).
+    #[default]
+    Trust,
+    /// SCRAM-SHA-256 required: a startup without a successful exchange is
+    /// rejected with FATAL 28000/28P01.
+    ScramRequired,
+}
+
+impl PgwireAuthMode {
+    /// Resolve the effective posture (TD-PGWIRE-AUTH-1) — pure, unit-testable.
+    ///
+    /// Ladder: `[security.authentication] enabled` FORCES
+    /// [`PgwireAuthMode::ScramRequired`] (fail-closed — mirrors Arrow Flight's
+    /// "coordinator present requires a credential" rule); a `trust` request
+    /// under it is warn-ignored. Otherwise the `PROXIMADB_PGWIRE_AUTH` env
+    /// override wins over the `[security.pgwire] auth` config value; unknown
+    /// values warn and fall back to trust. The CALLER errors at boot when the
+    /// result is `ScramRequired` but no coordinator was built.
+    pub fn resolve(
+        auth_enabled: bool,
+        env_override: Option<&str>,
+        configured: Option<&str>,
+    ) -> Self {
+        let normalize = |value: &str| match value.trim().to_ascii_lowercase().as_str() {
+            "password" | "scram" | "scram-sha-256" => Some(Self::ScramRequired),
+            "trust" => Some(Self::Trust),
+            _ => None,
+        };
+        let env_mode = env_override.and_then(normalize);
+        if let Some(value) = env_override
+            && env_mode.is_none()
+        {
+            tracing::warn!(
+                value = %value,
+                "ignoring unknown PROXIMADB_PGWIRE_AUTH value (expected 'trust' or 'password')"
+            );
+        }
+        if auth_enabled {
+            if env_mode == Some(Self::Trust) || configured.map(normalize) == Some(Some(Self::Trust))
+            {
+                tracing::warn!(
+                    "pgwire auth downgrade to trust ignored: [security.authentication] \
+                     enabled forces SCRAM-SHA-256 on pgwire (TD-PGWIRE-AUTH-1)"
+                );
+            }
+            return Self::ScramRequired;
+        }
+        env_mode
+            .or_else(|| configured.and_then(normalize))
+            .unwrap_or(Self::Trust)
+    }
+}
+
+/// A transaction-control statement classified for execution
+/// (ADR-018 P2.D / TD-076).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransactionControlPolicy {
-    Unsupported,
+pub(crate) enum TransactionControl {
+    /// `BEGIN` / `START TRANSACTION`.
+    Begin { read_only: Option<bool> },
+    /// `COMMIT` / `END`.
+    Commit,
+    /// `ROLLBACK` / `ABORT`.
+    Rollback,
+    /// `SET TRANSACTION [characteristics]` / `SET SESSION CHARACTERISTICS` —
+    /// carries the READ ONLY/WRITE flag (`None` = unchanged). ISOLATION LEVEL
+    /// READ COMMITTED is accepted-and-ignored (it IS the semantics P2.D
+    /// provides); other levels decline.
+    SetTransaction { read_only: Option<bool> },
 }
 
-fn transaction_control_policy(query: &str) -> Option<TransactionControlPolicy> {
-    let normalized = query.trim().trim_end_matches(';').trim().to_uppercase();
-    let words: Vec<&str> = normalized.split_whitespace().collect();
+/// What one statement means for transaction state: real control to execute,
+/// or a recognized-but-unsupported form that must fail closed with the
+/// carried reason — never silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TransactionStatement {
+    Control(TransactionControl),
+    Unsupported(String),
+}
+
+/// True when the whitespace-tokenized tail grants the READ ONLY/WRITE mode we
+/// honor. Returns `Err(reason)` for modes we cannot claim (SERIALIZABLE,
+/// REPEATABLE READ, DEFERRABLE) — an honest Unsupported, not a silent accept.
+fn parse_transaction_mode_tail(words: &[&str]) -> Result<Option<bool>, String> {
+    let mut read_only = None;
+    let mut index = 0;
+    while index < words.len() {
+        match words[index] {
+            "READ" => {
+                let next = words.get(index + 1).copied().unwrap_or_default();
+                match next {
+                    "ONLY" => {
+                        read_only = Some(true);
+                        index += 2;
+                    }
+                    "WRITE" => {
+                        read_only = Some(false);
+                        index += 2;
+                    }
+                    // A bare/dangling READ (e.g. "BEGIN READ", "BEGIN READ
+                    // FROB") is a syntax error in PostgreSQL — fail closed
+                    // instead of silently granting a read-write BEGIN. (The
+                    // "READ" inside ISOLATION LEVEL READ <level> never starts
+                    // this arm: it arrives via the ISOLATION arm below.)
+                    _ => {
+                        return Err("syntax error in transaction mode (expected READ ONLY | \
+                             READ WRITE | ISOLATION LEVEL ...)"
+                            .to_string());
+                    }
+                }
+            }
+            "ISOLATION" => {
+                // ISOLATION LEVEL <level>
+                let level = words.get(index + 2).copied().unwrap_or_default();
+                if level != "READ" {
+                    return Err(
+                        "only ISOLATION LEVEL READ COMMITTED is provided (ADR-018 P2.D; \
+                         real MVCC is Phase 3)"
+                            .to_string(),
+                    );
+                }
+                // Validate the level itself — "ISOLATION LEVEL READ FROB" is a
+                // syntax error, not a silent accept.
+                let _ = words
+                    .get(index + 3)
+                    .copied()
+                    .filter(|l| *l == "COMMITTED" || *l == "UNCOMMITTED")
+                    .ok_or_else(|| {
+                        "unsupported ISOLATION LEVEL (only READ COMMITTED is provided; \
+                     real MVCC is Phase 3)"
+                            .to_string()
+                    })?;
+                index += 4;
+            }
+            "WORK" | "TRANSACTION" | "DEFERRABLE" => {
+                // DEFERRABLE is a no-op under READ COMMITTED.
+                index += 1;
+            }
+            "NOT" if words.get(index + 1).copied() == Some("DEFERRABLE") => {
+                index += 2;
+            }
+            other => {
+                return Err(unsupported_mode_reason(other));
+            }
+        }
+    }
+    Ok(read_only)
+}
+
+/// Heap-backed reason for an unsupported transaction mode (the caller-facing
+/// `Unsupported` carries String — a leaked &'static str per statement is not
+/// acceptable).
+fn unsupported_mode_reason(mode: &str) -> String {
+    format!("unsupported transaction mode `{mode}` (ADR-018 P2.D)")
+}
+
+/// Bounds for the P2.D in-memory write buffer (mirrors "in-memory until
+/// COMMIT" honesty: an unbounded transaction could OOM the process).
+const TRANSACTION_MAX_ENTRIES: usize = 10_000;
+const TRANSACTION_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// One buffered transactional DML (ADR-018 P2.D). Gates (primary-pod,
+/// tenant visibility) already ran at BUFFER time, so replay is
+/// authorization-preserved.
+#[derive(Clone)]
+struct TransactionBufferEntry {
+    statement: crate::services::dml::DmlStatement,
+    tenant_ctx: Option<crate::storage::tenant::context::TenantContext>,
+    approx_bytes: usize,
+    /// Written table + resolved write tenant, captured at push time so COMMIT
+    /// replay can run the SAME mandate-#16b OLAP-result-cache invalidation the
+    /// direct write path runs after every `execute_scoped` — without it a
+    /// committed transaction leaves stale cached results for the table.
+    table: String,
+    write_tenant: String,
+}
+
+/// Bounded in-memory write buffer for one explicit transaction.
+#[derive(Default)]
+struct TransactionBuffer {
+    read_only: bool,
+    /// SET TRANSACTION characteristics observed OUTSIDE a transaction apply
+    /// to the NEXT BEGIN (PostgreSQL session-default semantics).
+    pending_read_only: Option<bool>,
+    entries: Vec<TransactionBufferEntry>,
+    total_bytes: usize,
+}
+
+impl TransactionBuffer {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+        self.read_only = false;
+    }
+}
+
+/// Buffer-time CommandComplete summary for a DML statement: (kind, row hint,
+/// approximate serialized size for the buffer bound).
+fn dml_summary(
+    statement: &crate::services::dml::DmlStatement,
+) -> (&'static str, Option<u64>, usize) {
+    use crate::services::dml::DmlStatement as D;
+    match statement {
+        D::Insert {
+            columns, values, ..
+        } => {
+            let n = values.len() as u64;
+            let width = columns.len().max(1);
+            (
+                "INSERT",
+                Some(n),
+                64usize.saturating_mul(values.len().saturating_mul(width)),
+            )
+        }
+        D::Upsert { values, .. } => {
+            let n = values.len() as u64;
+            (
+                "INSERT",
+                Some(n),
+                64usize.saturating_mul(n.saturating_add(1) as usize),
+            )
+        }
+        D::Update { assignments, .. } => (
+            "UPDATE",
+            None,
+            64usize.saturating_mul(assignments.len().saturating_add(1)),
+        ),
+        D::InsertSelect { .. } => ("INSERT", None, 4096),
+        D::InsertOverwrite { .. } => ("INSERT", None, 4096),
+        D::Delete { .. } => ("DELETE", None, 256),
+    }
+}
+
+/// Classify one statement against the transaction-control grammar.
+/// `None` = not a control statement (execute normally). P2.D scope: real
+/// BEGIN/COMMIT/ROLLBACK (+ SET TRANSACTION READ ONLY|WRITE, ISOLATION LEVEL
+/// READ COMMITTED); savepoints and two-phase commit stay fail-closed
+/// Unsupported with the reason spelled out.
+fn classify_transaction_statement(query: &str) -> Option<TransactionStatement> {
+    let normalized = query.trim().trim_end_matches(';').trim();
+    let upper = normalized.to_ascii_uppercase();
+    let words: Vec<&str> = upper.split_whitespace().collect();
     let first = words.first().copied().unwrap_or_default();
     let second = words.get(1).copied().unwrap_or_default();
-    let is_control = matches!(
-        first,
-        "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE"
-    ) || (first == "START" && second == "TRANSACTION")
-        || (first == "PREPARE" && second == "TRANSACTION")
-        || (first == "SET" && matches!(second, "TRANSACTION" | "CONSTRAINTS"))
-        || (words.as_slice().starts_with(&[
-            "SET",
-            "SESSION",
-            "CHARACTERISTICS",
-            "AS",
-            "TRANSACTION",
-        ]));
+    let unsupported =
+        |reason: &'static str| Some(TransactionStatement::Unsupported(reason.to_string()));
 
-    is_control.then_some(TransactionControlPolicy::Unsupported)
+    match first {
+        "BEGIN" | "START" => {
+            if first == "START" && second != "TRANSACTION" {
+                return None;
+            }
+            let tail = &words[if first == "START" { 2 } else { 1 }..];
+            let read_only = match parse_transaction_mode_tail(tail) {
+                Ok(read_only) => read_only,
+                Err(reason) => {
+                    return Some(TransactionStatement::Unsupported(reason));
+                }
+            };
+            Some(TransactionStatement::Control(TransactionControl::Begin {
+                read_only,
+            }))
+        }
+        "COMMIT" | "END" => match (second, words.len()) {
+            (_, 1) => Some(TransactionStatement::Control(TransactionControl::Commit)),
+            ("WORK", 2) => Some(TransactionStatement::Control(TransactionControl::Commit)),
+            ("TRANSACTION", 2) => Some(TransactionStatement::Control(TransactionControl::Commit)),
+            ("PREPARED", _) => {
+                unsupported("two-phase commit (COMMIT PREPARED) is not supported (ADR-018 P2.D)")
+            }
+            ("AND", _) => unsupported("COMMIT AND CHAIN is not supported (ADR-018 P2.D)"),
+            // Fail closed on an unrecognized tail: falling through to the
+            // generic executor here made a typo'd COMMIT (e.g. "COMMIT
+            // TRANSACTON") a silent success that committed nothing while the
+            // buffered writes stranded in memory.
+            other => Some(TransactionStatement::Unsupported(format!(
+                "unsupported {first} tail {other:?} (ADR-018 P2.D)"
+            ))),
+        },
+        "ROLLBACK" | "ABORT" => match (second, words.len()) {
+            (_, 1) => Some(TransactionStatement::Control(TransactionControl::Rollback)),
+            ("WORK", 2) => Some(TransactionStatement::Control(TransactionControl::Rollback)),
+            ("TRANSACTION", 2) => Some(TransactionStatement::Control(TransactionControl::Rollback)),
+            ("TO", _) => unsupported(
+                "SAVEPOINT/ROLLBACK TO SAVEPOINT is not supported yet (ADR-018 P2.D \
+                 defers savepoints to Phase 3)",
+            ),
+            ("PREPARED", _) => {
+                unsupported("two-phase commit (ROLLBACK PREPARED) is not supported (ADR-018 P2.D)")
+            }
+            ("AND", _) => unsupported("ROLLBACK AND [NO] CHAIN is not supported (ADR-018 P2.D)"),
+            other => Some(TransactionStatement::Unsupported(format!(
+                "unsupported {first} tail {other:?} (ADR-018 P2.D)"
+            ))),
+        },
+        "SAVEPOINT" | "RELEASE" => unsupported(
+            "SAVEPOINT/RELEASE is not supported yet (ADR-018 P2.D defers \
+             savepoints to Phase 3)",
+        ),
+        "PREPARE" if second == "TRANSACTION" => {
+            unsupported("two-phase commit (PREPARE TRANSACTION) is not supported (ADR-018 P2.D)")
+        }
+        "SET" => {
+            let session_characteristics = words.as_slice().starts_with(&[
+                "SET",
+                "SESSION",
+                "CHARACTERISTICS",
+                "AS",
+                "TRANSACTION",
+            ]);
+            if second == "CONSTRAINTS" {
+                return unsupported(
+                    "SET CONSTRAINTS is not supported (constraint deferral is not implemented)",
+                );
+            }
+            if second != "TRANSACTION" && !session_characteristics {
+                return None;
+            }
+            let read_only = match parse_transaction_mode_tail(
+                &words[if session_characteristics { 5 } else { 2 }..],
+            ) {
+                Ok(read_only) => read_only,
+                Err(reason) => {
+                    return Some(TransactionStatement::Unsupported(reason));
+                }
+            };
+            Some(TransactionStatement::Control(
+                TransactionControl::SetTransaction { read_only },
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Slice 6.3 gate-input bundle. Distinct type per surface for module
@@ -465,6 +814,9 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            security_coordinator: None,
+            pgwire_auth: PgwireAuthMode::Trust,
+            transaction_buffer: TransactionBuffer::default(),
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -487,6 +839,24 @@ impl PostgresProtocol {
         self
     }
 
+    /// TD-PGWIRE-AUTH-1: attach the security coordinator so the SCRAM-SHA-256
+    /// mode can resolve verifiers + identities (the last surface the
+    /// coordinator is threaded into — REST/gRPC/Flight already carry it).
+    pub fn with_security_coordinator(
+        mut self,
+        coordinator: Arc<crate::security::SecurityCoordinator>,
+    ) -> Self {
+        self.security_coordinator = Some(coordinator);
+        self
+    }
+
+    /// TD-PGWIRE-AUTH-1: set the resolved authentication posture (trust |
+    /// SCRAM-required).
+    pub fn with_pgwire_auth_mode(mut self, mode: PgwireAuthMode) -> Self {
+        self.pgwire_auth = mode;
+        self
+    }
+
     /// Create a new protocol handler with DDL/DML services for catalog integration
     pub fn with_catalog_services(
         stream: TcpStream,
@@ -495,8 +865,10 @@ impl PostgresProtocol {
         vector_ops: Arc<VectorOperationsService>,
         catalog_manager: Arc<CatalogManager>,
     ) -> Self {
-        let ddl_service = Arc::new(DdlService::new(catalog_manager.clone()));
         let dml_service = Arc::new(DmlService::new(catalog_manager.clone(), vector_ops.clone()));
+        let ddl_service = Arc::new(
+            DdlService::new(catalog_manager.clone()).with_record_store(dml_service.record_store()),
+        );
 
         Self {
             stream,
@@ -524,6 +896,9 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            security_coordinator: None,
+            pgwire_auth: PgwireAuthMode::Trust,
+            transaction_buffer: TransactionBuffer::default(),
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -542,12 +917,14 @@ impl PostgresProtocol {
         catalog_manager: Arc<CatalogManager>,
         canonical_store: Arc<crate::services::record_store::DirectWalTableRecordStore>,
     ) -> Self {
-        let ddl_service = Arc::new(DdlService::new(catalog_manager.clone()));
         let dml_service = Arc::new(DmlService::with_direct_record_storage(
             catalog_manager.clone(),
             vector_ops.clone(),
-            canonical_store,
+            canonical_store.clone(),
         ));
+        let ddl_service = Arc::new(
+            DdlService::new(catalog_manager.clone()).with_record_store(dml_service.record_store()),
+        );
 
         Self {
             stream,
@@ -575,6 +952,9 @@ impl PostgresProtocol {
             tenant_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             tier_header_trust: proximadb_tenant::HeaderTrustPolicy::default(),
             stable_id_resolver: None,
+            security_coordinator: None,
+            pgwire_auth: PgwireAuthMode::Trust,
+            transaction_buffer: TransactionBuffer::default(),
             tenant_deployment_mode: proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
         }
     }
@@ -793,11 +1173,14 @@ impl PostgresProtocol {
 
     /// Attach catalog-backed DDL/DML services to an existing protocol handler.
     pub fn with_catalog_manager(mut self, catalog_manager: Arc<CatalogManager>) -> Self {
-        self.ddl_service = Some(Arc::new(DdlService::new(catalog_manager.clone())));
-        self.dml_service = Some(Arc::new(DmlService::new(
+        let dml_service = Arc::new(DmlService::new(
             catalog_manager.clone(),
             self.vector_ops.clone(),
-        )));
+        ));
+        self.ddl_service = Some(Arc::new(
+            DdlService::new(catalog_manager.clone()).with_record_store(dml_service.record_store()),
+        ));
+        self.dml_service = Some(dml_service);
         self.catalog_manager = Some(catalog_manager);
         self
     }
@@ -810,7 +1193,6 @@ impl PostgresProtocol {
         canonical_store: Arc<crate::services::record_store::DirectWalTableRecordStore>,
         conditional_key_store: Option<Arc<dyn proximadb_storage_ports::ConditionalKeyStore>>,
     ) -> Self {
-        self.ddl_service = Some(Arc::new(DdlService::new(catalog_manager.clone())));
         // F5 / TD-OLTP-WIRING-1: fence pgwire writes on the SAME shared CKS as
         // gRPC/REST (threaded from SharedServices via DirectPgwireWriteServices).
         let mut dml = DmlService::with_direct_record_storage(
@@ -821,7 +1203,11 @@ impl PostgresProtocol {
         if let Some(cks) = conditional_key_store {
             dml = dml.with_conditional_key_store(cks);
         }
-        self.dml_service = Some(Arc::new(dml));
+        let dml = Arc::new(dml);
+        self.ddl_service = Some(Arc::new(
+            DdlService::new(catalog_manager.clone()).with_record_store(dml.record_store()),
+        ));
+        self.dml_service = Some(dml);
         self.catalog_manager = Some(catalog_manager);
         self
     }
@@ -844,12 +1230,14 @@ impl PostgresProtocol {
         let Some(catalog_manager) = self.catalog_manager.clone() else {
             return self;
         };
-        self.ddl_service = Some(Arc::new(
-            DdlService::new(catalog_manager)
-                .with_rank_profile_store(store)
-                .with_rank_services(services)
-                .with_function_store(function_store),
-        ));
+        let mut ddl = DdlService::new(catalog_manager)
+            .with_rank_profile_store(store)
+            .with_rank_services(services)
+            .with_function_store(function_store);
+        if let Some(dml) = self.dml_service.as_ref() {
+            ddl = ddl.with_record_store(dml.record_store());
+        }
+        self.ddl_service = Some(Arc::new(ddl));
         self
     }
 
@@ -923,10 +1311,9 @@ impl PostgresProtocol {
             }
 
             // Read message length
-            let length = self.read_i32().await? as usize;
-            if length < 4 {
-                return Err(anyhow!("Invalid message length"));
-            }
+            let length = self
+                .read_validated_length(4, MAX_PGWIRE_MESSAGE_LEN, "message")
+                .await?;
 
             // Read message body
             let body_len = length - 4;
@@ -942,6 +1329,16 @@ impl PostgresProtocol {
                 b'S' => self.handle_sync().await?,
                 b'H' => self.handle_flush().await?,
                 b'C' => self.handle_close(&body).await?,
+                b'p' => {
+                    // TD-PGWIRE-AUTH-1: a password/SASL message outside the
+                    // startup exchange is a protocol violation (mirrors PG's
+                    // 08P01). The startup exchange reads its b'p' messages
+                    // inline in `handle_startup`, never via this loop.
+                    warn!("Unexpected password/SASL message outside authentication");
+                    self.send_error("FATAL", "08P01", "password message outside authentication")
+                        .await?;
+                    return Err(anyhow!("unexpected SASL message in main loop"));
+                }
                 _ => {
                     warn!("Unknown message type: {}", msg_type as char);
                     self.send_error("ERROR", "XX000", "Unknown message type")
@@ -956,10 +1353,9 @@ impl PostgresProtocol {
     /// Handle startup handshake
     async fn handle_startup(&mut self) -> Result<()> {
         // Read startup message length
-        let length = self.read_i32().await? as usize;
-        if length < 8 {
-            return Err(anyhow!("Invalid startup message length"));
-        }
+        let length = self
+            .read_validated_length(8, MAX_STARTUP_MESSAGE_LEN, "startup message")
+            .await?;
 
         // Read protocol version
         let version = self.read_i32().await?;
@@ -997,6 +1393,22 @@ impl PostgresProtocol {
         let params = self.read_bytes(param_len).await?;
         let params = self.parse_startup_params(&params)?;
 
+        // TD-PGWIRE-AUTH-1: SCRAM-required mode runs the SASL exchange FIRST and
+        // builds the session identity from the VERIFIED credential. The bare-
+        // assertion gates below are then subsumed (the credential supplies the
+        // subject; `resolve_request_identity` reconciles the asserted tenant
+        // against the credential's binding — TD-ABAC-10). Failure paths send
+        // their own FATAL before returning.
+        let scram_identity = match self.pgwire_auth {
+            PgwireAuthMode::Trust => None,
+            PgwireAuthMode::ScramRequired => match self.scram_startup_auth(&params).await {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    return Err(anyhow!("pgwire SCRAM authentication failed: {error}"));
+                }
+            },
+        };
+
         let startup_tenant = match Self::resolve_startup_tenant(
             params.get("database").map(String::as_str),
             &self.tenant_deployment_mode,
@@ -1009,10 +1421,12 @@ impl PostgresProtocol {
         };
 
         // TD-TENANT-1: the startup `database` doubles as the tenant/catalog
-        // (TD-064) and pgwire runs trust auth — the assertion is bare by
-        // definition. Under a strict policy, reject the connection at the
-        // handshake (SQLSTATE 28000) instead of granting the asserted tenant.
-        if let Some(database) = params.get("database")
+        // (TD-064) and — in TRUST mode — the assertion is bare by definition.
+        // Under a strict policy, reject the connection at the handshake
+        // (SQLSTATE 28000) instead of granting the asserted tenant. Skipped in
+        // SCRAM mode: the verified credential owns the tenant binding.
+        if self.pgwire_auth == PgwireAuthMode::Trust
+            && let Some(database) = params.get("database")
             && let Err(message) = self.check_pgwire_tenant_assertion(database)
         {
             self.send_error("FATAL", "28000", &message).await?;
@@ -1024,8 +1438,10 @@ impl PostgresProtocol {
         // bare, unauthenticated subject at the handshake rather than letting ABAC
         // enforce against a spoofable id. Default-OFF surface (`abac-policy`);
         // under `Open` (default) the assertion is accepted like the tenant's.
+        // Skipped in SCRAM mode: the subject is credential-derived.
         #[cfg(feature = "abac-policy")]
-        if let Some(user) = params.get("user")
+        if self.pgwire_auth == PgwireAuthMode::Trust
+            && let Some(user) = params.get("user")
             && let Err(message) = self.check_pgwire_subject_assertion(user)
         {
             self.send_error("FATAL", "28000", &message).await?;
@@ -1046,13 +1462,34 @@ impl PostgresProtocol {
                 self.stable_id_resolver.as_deref(),
             ));
             session.database = startup_tenant;
+            // TD-PGWIRE-AUTH-1: in SCRAM mode the VERIFIED identity replaces the
+            // trust-asserted one, and the credential's tenant binding is
+            // authoritative (it also authenticates the tier claim below under
+            // strict policies — previously structurally impossible over pgwire).
+            let tier_binding = scram_identity.as_ref().and_then(|resolved| {
+                resolved.user_context.as_ref().and_then(|context| {
+                    context.tenant_id.as_ref().map(|tenant_id| {
+                        proximadb_tenant::AuthenticatedTenantBinding {
+                            tenant_id: tenant_id.clone(),
+                            is_gateway_principal: context.is_gateway_principal(),
+                        }
+                    })
+                })
+            });
+            if let Some(resolved) = &scram_identity {
+                if let Some(context) = &resolved.user_context {
+                    session.user = context.user_id.clone();
+                }
+                session.identity = Some(resolved.identity.clone());
+                session.database = resolved.identity.tenant.clone();
+            }
             // Open-core cache tier hook: a `proximadb_tier` startup parameter
             // (control-plane supplied) records the connection tenant's tier for
             // the cache policy. database == tenant/catalog (TD-064). Opaque id.
-            // ADR-0053 W8: gated by tier_header_trust. pgwire has no
-            // authenticated binding (trust auth), so the binding is None and
-            // any strict policy drops the claim (warned, never SQLSTATE) —
-            // under strict policies the startup parameter is inert.
+            // ADR-0053 W8: gated by tier_header_trust. In TRUST mode pgwire has
+            // no authenticated binding, so the binding is None and any strict
+            // policy drops the claim (warned, never SQLSTATE). In SCRAM mode the
+            // credential's binding authenticates the claim (TD-PGWIRE-AUTH-1).
             // TD-TENANT-3: the shared claim vocabulary. pgwire's spelling
             // differs because the PG startup-parameter grammar forbids `-`, so
             // the canonical `x-tenant-tier` cannot be spelled here — the
@@ -1063,7 +1500,11 @@ impl PostgresProtocol {
             let db = session.database.clone();
             match (
                 db.is_empty(),
-                proximadb_tenant::resolve_tier_claim(tier_claim, None, self.tier_header_trust),
+                proximadb_tenant::resolve_tier_claim(
+                    tier_claim,
+                    tier_binding.as_ref(),
+                    self.tier_header_trust,
+                ),
             ) {
                 // Rejected: DROPPED (never SQLSTATE). pgwire's drop was fully
                 // silent — count it (ADR-0053 W8) so a strict deployment can
@@ -1104,6 +1545,313 @@ impl PostgresProtocol {
         Ok(())
     }
 
+    /// TD-PGWIRE-AUTH-1: run the SCRAM-SHA-256 server exchange over the startup
+    /// message stream and resolve the verified identity through
+    /// [`crate::security::request_identity::resolve_request_identity`]. Sends
+    /// every wire message itself — AuthenticationSASL → (client
+    /// SASLInitialResponse) → AuthenticationSASLContinue → (client SASLResponse)
+    /// → AuthenticationSASLFinal — and on any failure the FATAL error; the
+    /// caller only closes the connection. On success the caller still sends
+    /// AuthenticationOk + parameters (PostgreSQL's message order).
+    async fn scram_startup_auth(
+        &mut self,
+        params: &HashMap<String, String>,
+    ) -> Result<crate::security::request_identity::ResolvedIdentity> {
+        use crate::network::postgres::scram::{ScramExchange, ScramVerifier, generate_nonce};
+
+        let Some(coordinator) = self.security_coordinator.clone() else {
+            self.send_error(
+                "FATAL",
+                "28000",
+                "SCRAM authentication required but no security coordinator is configured",
+            )
+            .await?;
+            return Err(anyhow!("pgwire SCRAM required with no coordinator"));
+        };
+        let Some(username) = params
+            .get("user")
+            .map(String::as_str)
+            .filter(|user| !user.is_empty())
+            .map(str::to_owned)
+        else {
+            self.send_error(
+                "FATAL",
+                "28000",
+                "no PostgreSQL user name specified in startup packet",
+            )
+            .await?;
+            return Err(anyhow!("pgwire SCRAM: missing user"));
+        };
+
+        // Auth-time rate limit — the query-loop limiter only covers queries, and
+        // the credential-stuffing target is the handshake itself.
+        if let Some(limiter) = self.rate_limiter.clone()
+            && let Err(retry_after) = limiter.check_and_consume(self.peer_ip).await
+        {
+            self.send_error(
+                "FATAL",
+                "53300",
+                "too many sign-in attempts for this address; retry later",
+            )
+            .await?;
+            return Err(anyhow!(
+                "pgwire SCRAM rate limited (retry after {retry_after}s)"
+            ));
+        }
+
+        // Advertise exactly one mechanism — never `-PLUS` (no TLS channel to bind).
+        self.send_authentication_sasl(&[super::scram::MECHANISM])
+            .await?;
+
+        // Client SASLInitialResponse (b'p').
+        let (mechanism, initial) = self.read_sasl_initial_response().await?;
+        if mechanism == "*" {
+            self.send_error("FATAL", "28000", "SASL authentication canceled")
+                .await?;
+            return Err(anyhow!("pgwire SASL canceled by client"));
+        }
+        if mechanism != super::scram::MECHANISM {
+            self.send_error("FATAL", "28000", "unsupported SASL mechanism")
+                .await?;
+            return Err(anyhow!("pgwire SASL: client chose {mechanism}"));
+        }
+
+        // Unknown user: run the full exchange against a mock verifier so the
+        // failure surfaces at client-final with identical message shape and
+        // timing (RFC 5803 anti-enumeration).
+        let server_rng = || {
+            ScramVerifier::mock(&ring::rand::SystemRandom::new())
+                .map_err(|error| anyhow!("server RNG failed: {error:?}"))
+        };
+        let verifier = match coordinator.scram_verifier(&username) {
+            Some(verifier) => verifier,
+            None => match server_rng() {
+                Ok(verifier) => verifier,
+                Err(error) => {
+                    self.send_error("FATAL", "XX000", "internal authentication error")
+                        .await?;
+                    return Err(error);
+                }
+            },
+        };
+        let server_nonce = match generate_nonce() {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                self.send_error("FATAL", "XX000", "internal authentication error")
+                    .await?;
+                return Err(anyhow!("server RNG failed: {error:?}"));
+            }
+        };
+
+        let (exchange, server_first) = match ScramExchange::start(verifier, &initial, &server_nonce)
+        {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.send_scram_failure(&error).await?;
+                return Err(anyhow!("pgwire SASL: bad client-first ({error:?})"));
+            }
+        };
+        self.send_authentication_sasl_continue(server_first.as_bytes())
+            .await?;
+
+        // Client SASLResponse (b'p') — the client-final message.
+        let client_final = self.read_sasl_response().await?;
+        match exchange.finish(&client_final) {
+            Ok(server_final) => {
+                self.send_authentication_sasl_final(server_final.as_bytes())
+                    .await?;
+            }
+            Err(error) => {
+                // Uniform 28P01 for wrong password AND malformed final (and the
+                // unknown-user mock path lands here identically).
+                self.send_scram_failure(&error).await?;
+                return Err(anyhow!("pgwire SASL: authentication failed for {username}"));
+            }
+        }
+
+        // The proof is verified: resolve the credential into the session identity.
+        let resolved = crate::security::request_identity::resolve_request_identity(
+            Some(&coordinator),
+            Some(crate::security::AuthenticationData::ScramAuthenticated {
+                username: username.clone(),
+            }),
+            params.get("database").map(String::as_str),
+            Some(&username),
+            self.tenant_header_trust,
+            &self.tenant_deployment_mode,
+            self.stable_id_resolver.as_deref(),
+        )
+        .await;
+        match resolved {
+            Ok(resolved) => Ok(resolved),
+            Err(error) => {
+                if matches!(
+                    error,
+                    crate::security::request_identity::IdentityError::Assertion(_)
+                ) {
+                    warn!(
+                        target: "proximadb::tenant_audit",
+                        surface = "pgwire",
+                        user = %username,
+                        "tenant assertion rejected after SCRAM authentication"
+                    );
+                }
+                let (code, message) = Self::identity_error_to_pgwire(&error);
+                self.send_error("FATAL", code, &message).await?;
+                Err(anyhow!("pgwire SCRAM identity resolution failed: {error}"))
+            }
+        }
+    }
+
+    /// Map [`crate::security::request_identity::IdentityError`] onto the pgwire
+    /// error vocabulary (template: Arrow's `identity_error_to_flight_status`).
+    fn identity_error_to_pgwire(
+        error: &crate::security::request_identity::IdentityError,
+    ) -> (&'static str, String) {
+        use crate::security::request_identity::IdentityError;
+        match error {
+            IdentityError::Authentication(message) => (
+                "28P01",
+                format!("password authentication failed: {message}"),
+            ),
+            IdentityError::Assertion(_) => (
+                "28000",
+                "invalid authorization: tenant assertion rejected".to_string(),
+            ),
+            IdentityError::TenantResolution(err) => {
+                ("28000", format!("invalid authorization: {err}"))
+            }
+        }
+    }
+
+    /// Uniform FATAL for SCRAM exchange failures. Malformed and
+    /// AuthenticationFailed share one message so a wrong password and a garbage
+    /// message are indistinguishable on the wire.
+    async fn send_scram_failure(&mut self, error: &super::scram::ScramError) -> Result<()> {
+        let (code, message) = match error {
+            super::scram::ScramError::ChannelBindingUnsupported => (
+                "28000",
+                "channel binding is not supported over this connection",
+            ),
+            super::scram::ScramError::Unsupported => ("28000", "unsupported SASL feature"),
+            _ => ("28P01", "password authentication failed"),
+        };
+        self.send_error("FATAL", code, message).await
+    }
+
+    /// AuthenticationSASL (`'R'` + 10): advertise the SASL mechanisms as a
+    /// NUL-terminated list with a list-terminating NUL.
+    async fn send_authentication_sasl(&mut self, mechanisms: &[&str]) -> Result<()> {
+        let mut payload: Vec<u8> = Vec::new();
+        for mechanism in mechanisms {
+            payload.extend_from_slice(mechanism.as_bytes());
+            payload.push(0);
+        }
+        payload.push(0);
+        self.write_buffer.put_u8(b'R');
+        self.write_buffer.put_i32((4 + 4 + payload.len()) as i32);
+        self.write_buffer.put_i32(10);
+        self.write_buffer.put_slice(&payload);
+        self.flush_write_buffer().await
+    }
+
+    /// AuthenticationSASLContinue (`'R'` + 11): the server-first message.
+    async fn send_authentication_sasl_continue(&mut self, data: &[u8]) -> Result<()> {
+        self.write_buffer.put_u8(b'R');
+        self.write_buffer.put_i32((4 + 4 + data.len()) as i32);
+        self.write_buffer.put_i32(11);
+        self.write_buffer.put_slice(data);
+        self.flush_write_buffer().await
+    }
+
+    /// AuthenticationSASLFinal (`'R'` + 12): the `v=<base64 signature>` message.
+    async fn send_authentication_sasl_final(&mut self, data: &[u8]) -> Result<()> {
+        self.write_buffer.put_u8(b'R');
+        self.write_buffer.put_i32((4 + 4 + data.len()) as i32);
+        self.write_buffer.put_i32(12);
+        self.write_buffer.put_slice(data);
+        self.flush_write_buffer().await
+    }
+
+    /// Read a client SASLInitialResponse (b'p'): NUL-terminated mechanism name,
+    /// then an i32 initial-response length (-1 = absent) and that many bytes.
+    async fn read_sasl_initial_response(&mut self) -> Result<(String, Vec<u8>)> {
+        let msg_type = self.read_byte().await?;
+        if msg_type != b'p' {
+            return Err(anyhow!(
+                "expected SASLInitialResponse ('p'), got {:?}",
+                msg_type as char
+            ));
+        }
+        let length = self.read_sasl_message_length("SASLInitialResponse").await?;
+        let body = self.read_bytes(length - 4).await?;
+        let nul = body
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| anyhow!("malformed SASLInitialResponse: no mechanism terminator"))?;
+        let mechanism = String::from_utf8(body[..nul].to_vec())?;
+        let rest = &body[nul + 1..];
+        if rest.len() < 4 {
+            return Err(anyhow!(
+                "malformed SASLInitialResponse: truncated response length"
+            ));
+        }
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&rest[..4]);
+        let initial_len = i32::from_be_bytes(len_bytes);
+        let initial = if initial_len < 0 {
+            Vec::new()
+        } else {
+            let initial_len = initial_len as usize;
+            if rest.len() < 4 + initial_len {
+                return Err(anyhow!("malformed SASLInitialResponse: truncated response"));
+            }
+            rest[4..4 + initial_len].to_vec()
+        };
+        Ok((mechanism, initial))
+    }
+
+    /// Read a client SASLResponse (b'p'): the raw client-final message bytes.
+    async fn read_sasl_response(&mut self) -> Result<Vec<u8>> {
+        let msg_type = self.read_byte().await?;
+        if msg_type != b'p' {
+            return Err(anyhow!(
+                "expected SASLResponse ('p'), got {:?}",
+                msg_type as char
+            ));
+        }
+        let length = self.read_sasl_message_length("SASLResponse").await?;
+        self.read_bytes(length - 4).await
+    }
+
+    /// Read and validate a SASL frame's i32 length prefix (pre-authentication,
+    /// so it must reject a bogus/hostile value before it ever reaches a `usize`
+    /// cast or an allocation — a negative length sign-extends to a huge `usize`,
+    /// and `Vec::with_capacity` on that aborts the `panic = "abort"` release
+    /// build). SCRAM frames are always small; 64KiB is generous headroom.
+    async fn read_sasl_message_length(&mut self, what: &str) -> Result<usize> {
+        self.read_validated_length(4, 65536, what).await
+    }
+
+    /// Read and validate an i32 length prefix before it becomes a `usize`
+    /// allocation size. A raw negative value (e.g. a hostile `-1`) sign-
+    /// extends to `usize::MAX` on an unchecked `as usize` cast, which then
+    /// passes any naive `length < N` floor check unchanged and drives
+    /// `Vec::with_capacity(usize::MAX - N)` — a capacity-overflow panic that
+    /// aborts the process under the `release-server` profile's
+    /// `panic = "abort"` (an unauthenticated remote DoS if the reader runs
+    /// pre-auth, as pgwire's startup and main-loop readers do). `min` is the
+    /// frame's own header size (the length field counts itself); `max`
+    /// bounds the body so a garbage-but-positive length can't request an
+    /// absurd allocation either.
+    async fn read_validated_length(&mut self, min: i32, max: i32, what: &str) -> Result<usize> {
+        let raw = self.read_i32().await?;
+        if !(min..=max).contains(&raw) {
+            return Err(anyhow!("invalid {what} length: {raw}"));
+        }
+        Ok(raw as usize)
+    }
+
     /// Parse startup parameters
     fn parse_startup_params(&self, data: &[u8]) -> Result<HashMap<String, String>> {
         let mut params = HashMap::new();
@@ -1126,14 +1874,71 @@ impl PostgresProtocol {
         let query = self.parse_cstring(body)?;
         debug!("Received query: {}", query);
 
-        if transaction_control_policy(&query).is_some() {
+        // ADR-018 P2.D (TD-076): classify once; real control executes,
+        // recognized-but-unsupported forms fail closed with the reason.
+        // SINGLE statements only: a multi-statement batch is split below and
+        // classified per statement — whole-string classification would
+        // mis-read a mid-batch word ("BEGIN WORK; ..." tokenizes
+        // words[1] as "WORK;") and reject valid PG batches with 0A000.
+        let transaction_statement = if Self::split_sql_statements(&query).len() == 1 {
+            classify_transaction_statement(&query)
+        } else {
+            None
+        };
+
+        // In a FAILED transaction every non-control statement errors until
+        // ROLLBACK (PostgreSQL 25P02 semantics).
+        if !matches!(
+            &transaction_statement,
+            Some(TransactionStatement::Control(_))
+        ) && self.transaction_state_is_failed().await
+        {
+            self.send_error(
+                "ERROR",
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )
+            .await?;
+            self.send_ready_for_query('E').await?;
+            return Ok(());
+        }
+
+        match transaction_statement {
+            Some(TransactionStatement::Control(control)) => {
+                return self.handle_transaction_control(control, true).await;
+            }
+            Some(TransactionStatement::Unsupported(reason)) => {
+                self.send_error("ERROR", "0A000", &reason).await?;
+                self.send_ready_for_query(self.transaction_status_byte().await)
+                    .await?;
+                return Ok(());
+            }
+            None => {}
+        }
+
+        // P2.D: DDL inside a transaction is rejected — the buffer is DML-only,
+        // and executing DDL immediately would make ROLLBACK silently not undo
+        // it (worse than a clean rejection).
+        let upper = query.to_uppercase();
+        // COPY too: its writes bypass the DML-only buffer, so executing one
+        // inside a transaction would make ROLLBACK silently not undo it.
+        if (upper.starts_with("CREATE")
+            || upper.starts_with("ALTER")
+            || upper.starts_with("DROP")
+            || upper.starts_with("COPY"))
+            && self.transaction_in_progress().await
+        {
             self.send_error(
                 "ERROR",
                 "0A000",
-                "transactions are not supported; pgwire executes individual statements in autocommit mode",
+                "transactional DDL is not supported yet (ADR-018 P2.D); commit or roll back the current transaction first",
             )
             .await?;
-            self.send_ready_for_query('I').await?;
+            // The send_error hook FAILED the transaction (any error inside an
+            // active txn aborts it) — report the true post-error status byte,
+            // not a hardcoded in-transaction 'T'.
+            self.send_ready_for_query(self.transaction_status_byte().await)
+                .await?;
             return Ok(());
         }
 
@@ -1145,7 +1950,8 @@ impl PostgresProtocol {
                         .await?;
                 }
             }
-            self.send_ready_for_query('I').await?;
+            self.send_ready_for_query(self.transaction_status_byte().await)
+                .await?;
             return Ok(());
         }
 
@@ -1163,23 +1969,40 @@ impl PostgresProtocol {
         // disappeared. This was a data-loss bug, not a feature gap.
         let statements = Self::split_sql_statements(&query);
         if statements.is_empty() {
-            self.send_ready_for_query('I').await?;
+            self.send_ready_for_query(self.transaction_status_byte().await)
+                .await?;
             return Ok(());
         }
-        if statements
-            .iter()
-            .any(|statement| transaction_control_policy(statement).is_some())
-        {
-            self.send_error(
-                "ERROR",
-                "0A000",
-                "transactions are not supported; pgwire executes individual statements in autocommit mode",
-            )
-            .await?;
-            self.send_ready_for_query('I').await?;
-            return Ok(());
-        }
+        // NOTE (ADR-018 P2.D): the former whole-batch transaction rejection is
+        // gone — control statements execute inline in the loop below, which is
+        // what makes `BEGIN; INSERT …; COMMIT;` work. Per-statement
+        // classification + abort-on-error remain, so the historical
+        // silent-INSERT-drop bug stays fixed by construction.
         for statement in statements {
+            // Control statements execute inline (no per-statement RFQ; the
+            // batch sends one at the end from the session status byte).
+            match classify_transaction_statement(&statement) {
+                Some(TransactionStatement::Control(control)) => {
+                    self.handle_transaction_control(control, false).await?;
+                    continue;
+                }
+                Some(TransactionStatement::Unsupported(reason)) => {
+                    self.send_error("ERROR", "0A000", &reason).await?;
+                    self.transaction_fail_if_active().await;
+                    break;
+                }
+                None => {}
+            }
+            // FAILED-transaction gate inside batches: 25P02 until ROLLBACK.
+            if self.transaction_state_is_failed().await {
+                self.send_error(
+                    "ERROR",
+                    "25P02",
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                )
+                .await?;
+                break;
+            }
             // Translate each statement to ProximaDB format.
             let translated = match self.translator.translate(&statement) {
                 Ok(t) => t,
@@ -1188,7 +2011,10 @@ impl PostgresProtocol {
                         .await?;
                     // Stop processing subsequent statements on error to
                     // match PostgreSQL's "abort on error" semantics
-                    // inside a multi-statement query.
+                    // inside a multi-statement query. Inside a transaction
+                    // the abort also FAILS the transaction (25P02 from here
+                    // until ROLLBACK).
+                    self.transaction_fail_if_active().await;
                     break;
                 }
             };
@@ -1216,6 +2042,7 @@ impl PostgresProtocol {
                 Ok(Err(e)) => {
                     self.send_error("ERROR", "XX000", &format!("execution failed: {}", e))
                         .await?;
+                    self.transaction_fail_if_active().await;
                     break;
                 }
                 Err(panic_payload) => {
@@ -1244,8 +2071,9 @@ impl PostgresProtocol {
             }
         }
 
-        // Send ready for query
-        self.send_ready_for_query('I').await?;
+        // Send ready for query — status byte reflects the transaction state.
+        self.send_ready_for_query(self.transaction_status_byte().await)
+            .await?;
 
         Ok(())
     }
@@ -1263,6 +2091,267 @@ impl PostgresProtocol {
         } else {
             "unrecoverable error (panic payload not stringifiable)".to_string()
         }
+    }
+
+    // ── ADR-018 P2.D (TD-076): transaction control + buffering ──────────
+
+    async fn transaction_status_byte(&self) -> char {
+        self.session.read().await.transaction_state.status_byte()
+    }
+
+    async fn transaction_in_progress(&self) -> bool {
+        matches!(
+            self.session.read().await.transaction_state,
+            super::session::TransactionState::InTransaction
+        )
+    }
+
+    async fn transaction_is_read_only(&self) -> bool {
+        self.transaction_buffer.read_only
+    }
+
+    async fn transaction_state_is_failed(&self) -> bool {
+        matches!(
+            self.session.read().await.transaction_state,
+            super::session::TransactionState::Failed
+        )
+    }
+
+    /// Abort an ACTIVE transaction on a statement error (the batch loop's
+    /// error/panic breaks). No-op when idle.
+    async fn transaction_fail_if_active(&mut self) {
+        let mut session = self.session.write().await;
+        if matches!(
+            session.transaction_state,
+            super::session::TransactionState::InTransaction
+        ) {
+            session.fail_transaction();
+        }
+    }
+
+    /// Push one gated DML statement into the transaction buffer. Fails with
+    /// the `54000` reason when the P2.D memory bounds are exceeded (and
+    /// aborts the transaction — an over-budget buffer is not silently
+    /// truncated).
+    async fn transaction_push(
+        &mut self,
+        statement: crate::services::dml::DmlStatement,
+        tenant_ctx: Option<crate::storage::tenant::context::TenantContext>,
+        approx_bytes: usize,
+        table: String,
+        write_tenant: String,
+    ) -> Result<(), String> {
+        if self.transaction_buffer.entries.len() >= TRANSACTION_MAX_ENTRIES
+            || self
+                .transaction_buffer
+                .total_bytes
+                .saturating_add(approx_bytes)
+                > TRANSACTION_MAX_BYTES
+        {
+            self.session.write().await.fail_transaction();
+            self.transaction_buffer.clear();
+            return Err(format!(
+                "transaction exceeds the in-memory write buffer limit ({TRANSACTION_MAX_ENTRIES} statements / {TRANSACTION_MAX_BYTES} bytes); the transaction has been aborted (ADR-018 P2.D)"
+            ));
+        }
+        self.transaction_buffer.total_bytes = self
+            .transaction_buffer
+            .total_bytes
+            .saturating_add(approx_bytes);
+        self.transaction_buffer
+            .entries
+            .push(TransactionBufferEntry {
+                statement,
+                tenant_ctx,
+                approx_bytes,
+                table,
+                write_tenant,
+            });
+        Ok(())
+    }
+
+    /// Execute one classified transaction-control statement. Sends the
+    /// CommandComplete always; sends ReadyForQuery only when `send_rfq`
+    /// (the simple-query single-statement path — batch and extended paths
+    /// send one RFQ at Sync/batch end, from the session status byte).
+    async fn handle_transaction_control(
+        &mut self,
+        control: TransactionControl,
+        send_rfq: bool,
+    ) -> Result<()> {
+        use super::session::TransactionState;
+        let completion: &'static str = match control {
+            TransactionControl::Begin { read_only } => {
+                {
+                    let mut session = self.session.write().await;
+                    match session.transaction_state {
+                        // Nested BEGIN: PostgreSQL warns and keeps the outer
+                        // transaction (no NoticeResponse helper yet — no-op,
+                        // documented in the ADR amendment).
+                        TransactionState::InTransaction => {}
+                        // BEGIN in an ABORTED transaction is also a no-op in
+                        // PostgreSQL: only ROLLBACK escapes the failed state.
+                        // Treating Failed as fresh here silently discarded the
+                        // aborted transaction's pending writes while letting
+                        // subsequent writes commit in a new transaction — a
+                        // silent data-loss shape, not a PG-compatible
+                        // "warning and stay aborted".
+                        TransactionState::Failed => {}
+                        TransactionState::Idle => {
+                            session.begin_transaction();
+                            let buffer = &mut self.transaction_buffer;
+                            buffer.clear();
+                            // Explicit BEGIN characteristics override the
+                            // session default (PG): `BEGIN READ WRITE` after
+                            // `SET SESSION CHARACTERISTICS ... READ ONLY` is a
+                            // read-write transaction.
+                            buffer.read_only =
+                                read_only.or(buffer.pending_read_only).unwrap_or(false);
+                            buffer.pending_read_only = None;
+                        }
+                    }
+                }
+                "BEGIN"
+            }
+            TransactionControl::SetTransaction { read_only } => {
+                {
+                    let session = self.session.write().await;
+                    if matches!(session.transaction_state, TransactionState::InTransaction) {
+                        if let Some(read_only) = read_only {
+                            self.transaction_buffer.read_only = read_only;
+                        }
+                    } else if read_only.is_some() {
+                        self.transaction_buffer.pending_read_only = read_only;
+                    }
+                }
+                "SET"
+            }
+            TransactionControl::Commit => {
+                let state = self.session.read().await.transaction_state;
+                match state {
+                    // COMMIT outside a transaction: no-op (PG tag COMMIT).
+                    TransactionState::Idle => "COMMIT",
+                    // COMMIT in a FAILED transaction behaves as ROLLBACK and
+                    // reports the ROLLBACK tag (PostgreSQL semantics).
+                    TransactionState::Failed => {
+                        self.transaction_buffer.clear();
+                        self.session.write().await.rollback_transaction();
+                        "ROLLBACK"
+                    }
+                    TransactionState::InTransaction => {
+                        if let Err(error) = self.replay_transaction_buffer().await {
+                            // Replay failure: already-replayed entries are
+                            // durable (documented P2.D divergence), the
+                            // transaction is FAILED, and the buffer is kept
+                            // for ROLLBACK. The error response is already on
+                            // the wire.
+                            error!("transaction COMMIT replay failed: {error:#}");
+                            // Only the single-statement path owns its RFQ here —
+                            // batch/extended paths send exactly one RFQ at
+                            // Sync/batch end; an extra one desyncs the wire.
+                            if send_rfq {
+                                self.send_ready_for_query(self.transaction_status_byte().await)
+                                    .await?;
+                            }
+                            return Ok(());
+                        }
+                        self.transaction_buffer.clear();
+                        self.session.write().await.commit_transaction();
+                        "COMMIT"
+                    }
+                }
+            }
+            TransactionControl::Rollback => {
+                self.transaction_buffer.clear();
+                self.session.write().await.rollback_transaction();
+                "ROLLBACK"
+            }
+        };
+        self.send_command_complete(completion).await?;
+        if send_rfq {
+            self.send_ready_for_query(self.transaction_status_byte().await)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Drain the P2.D write buffer: sequential `execute_scoped` per entry.
+    /// First failure → the error is sent, the transaction FAILS, and the
+    /// already-replayed statements stay durable (documented divergence —
+    /// full atomicity is ADR-018 P3.B).
+    async fn replay_transaction_buffer(&mut self) -> Result<()> {
+        let Some(dml_service) = self.dml_service.clone() else {
+            self.send_error(
+                "ERROR",
+                "XX000",
+                "transaction buffer holds writes but no DML service is wired",
+            )
+            .await?;
+            self.session.write().await.fail_transaction();
+            return Err(anyhow!("transaction replay without DML service"));
+        };
+        let timeout_ms: Option<u64> = self
+            .session
+            .read()
+            .await
+            .parameters
+            .get("statement_timeout")
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0);
+        let entries = std::mem::take(&mut self.transaction_buffer.entries);
+        let mut replayed_bytes = 0usize;
+        for (index, entry) in entries.iter().enumerate() {
+            replayed_bytes = replayed_bytes.saturating_add(entry.approx_bytes);
+            let replay = match timeout_ms {
+                Some(ms) => match tokio::time::timeout(
+                    std::time::Duration::from_millis(ms),
+                    dml_service.execute_scoped(entry.statement.clone(), entry.tenant_ctx.as_ref()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow!(
+                        "canceling statement due to statement timeout (transaction replay)"
+                    )),
+                },
+                None => {
+                    dml_service
+                        .execute_scoped(entry.statement.clone(), entry.tenant_ctx.as_ref())
+                        .await
+                }
+            };
+            match replay {
+                Ok(_) => {
+                    // Mandate #16b: same tenant-scoped OLAP result-cache
+                    // invalidation the direct write path runs — replay is a
+                    // real write, not a cache-transparent one.
+                    super::relational_pipeline::invalidate_olap_result_cache_for(
+                        &entry.write_tenant,
+                        &entry.table,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    // Keep the UNREPLAYED remainder so ROLLBACK is a clean
+                    // discard; the transaction is FAILED either way.
+                    self.transaction_buffer.entries = entries[index + 1..].to_vec();
+                    self.transaction_buffer.total_bytes = self
+                        .transaction_buffer
+                        .total_bytes
+                        .saturating_sub(replayed_bytes);
+                    self.send_error(
+                        "ERROR",
+                        "25P02",
+                        &format!("transaction replay failed: {e}; the transaction has aborted"),
+                    )
+                    .await?;
+                    self.session.write().await.fail_transaction();
+                    return Err(anyhow!("transaction replay failed: {e}"));
+                }
+            }
+        }
+        self.transaction_buffer.total_bytes = 0;
+        Ok(())
     }
 
     /// Split a multi-statement SQL query on top-level semicolons.
@@ -1356,14 +2445,19 @@ impl PostgresProtocol {
             .unwrap_or(rest)
             .trim_start();
 
-        let (name, value) = if let Some(eq_index) = rest.find('=') {
-            (&rest[..eq_index], &rest[eq_index + 1..])
-        } else {
-            let upper = rest.to_ascii_uppercase();
-            let Some(to_index) = upper.find(" TO ") else {
+        // Both separators found OUTSIDE quotes (a quoted name may contain
+        // ' TO '; a quoted value may contain '='), then split at whichever
+        // comes first — mis-splitting garbles the name and silently skips
+        // the tenant assertion gate below.
+        let eq_pos = crate::core::utils::find_ascii_ci_outside_quotes(rest, "=");
+        let to_pos = crate::core::utils::find_ascii_ci_outside_quotes(rest, " TO ");
+        let (name, value) = match (eq_pos, to_pos) {
+            (Some(eq), Some(to)) if eq < to => (&rest[..eq], &rest[eq + 1..]),
+            (_, Some(to)) => (&rest[..to], &rest[to + " TO ".len()..]),
+            (Some(eq), None) => (&rest[..eq], &rest[eq + 1..]),
+            (None, None) => {
                 return Err(anyhow!("expected SET name = value or SET name TO value"));
-            };
-            (&rest[..to_index], &rest[to_index + " TO ".len()..])
+            }
         };
 
         let name = name.trim().trim_matches('"').to_ascii_lowercase();
@@ -1375,11 +2469,9 @@ impl PostgresProtocol {
     }
 
     fn strip_set_value_literal(value: &str) -> String {
-        let value = value.trim().trim_end_matches(';').trim();
-        if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-            return value[1..value.len() - 1].replace("''", "'");
-        }
-        value.trim_matches('"').to_string()
+        // Same rule as strip_sql_literal (the two byte-identical twins
+        // merged — one decode policy for pgwire literals).
+        Self::strip_sql_literal(value)
     }
 
     /// Execute a translated query
@@ -1445,14 +2537,52 @@ impl PostgresProtocol {
     ) -> Result<()> {
         let upper = query.to_uppercase();
 
-        if transaction_control_policy(query).is_some() {
+        // ADR-018 P2.D: the extended protocol honors the same control
+        // classification. No ReadyForQuery here — Sync sends it from the
+        // session status byte.
+        let transaction_statement = classify_transaction_statement(query);
+        // Failed-txn gate FIRST (mirrors handle_query / PG): every
+        // non-control statement in an aborted transaction reports 25P02 —
+        // including otherwise-unsupported forms, so both wire paths agree.
+        if !matches!(
+            &transaction_statement,
+            Some(TransactionStatement::Control(_))
+        ) && self.transaction_state_is_failed().await
+        {
             return self
                 .send_error(
                     "ERROR",
-                    "0A000",
-                    "transactions are not supported; pgwire executes individual statements in autocommit mode",
+                    "25P02",
+                    "current transaction is aborted, commands ignored until end of transaction block",
                 )
                 .await;
+        }
+        match transaction_statement {
+            Some(TransactionStatement::Control(control)) => {
+                return self.handle_transaction_control(control, false).await;
+            }
+            Some(TransactionStatement::Unsupported(reason)) => {
+                return self.send_error("ERROR", "0A000", &reason).await;
+            }
+            None => {}
+        }
+        {
+            let upper_for_ddl = upper.trim().to_string();
+            // COPY gates like DDL: un-buffered writes are un-rollbackable.
+            if (upper_for_ddl.starts_with("CREATE")
+                || upper_for_ddl.starts_with("ALTER")
+                || upper_for_ddl.starts_with("DROP")
+                || upper_for_ddl.starts_with("COPY"))
+                && self.transaction_in_progress().await
+            {
+                return self
+                    .send_error(
+                        "ERROR",
+                        "0A000",
+                        "transactional DDL is not supported yet (ADR-018 P2.D); commit or roll back the current transaction first",
+                    )
+                    .await;
+            }
         }
 
         // Handle SHOW commands converted to SELECT
@@ -1535,8 +2665,12 @@ impl PostgresProtocol {
             return self.send_empty_result().await;
         }
 
-        // Handle SELECT queries
-        if upper.starts_with("SELECT") {
+        // Handle SELECT queries. TD-185a: WITH (CTE) statements are dispatched
+        // here too — before this, `WITH …` failed the SELECT gate and fell
+        // through every DML branch to the terminal "OK" fallthrough, returning
+        // a clean success with ZERO rows (the recursive-CTE empty-result bug;
+        // TPC-DS `cte` was a silent false pass for the same reason).
+        if upper.starts_with("SELECT") || upper.starts_with("WITH") {
             // S5c new-pipeline interception. When the env flag is
             // set AND the SQL lowers cleanly against the in-memory
             // relational engine's catalog, route through
@@ -1553,6 +2687,24 @@ impl PostgresProtocol {
                     Ok(pr) => self.emit_pipeline_result(pr).await,
                     Err(msg) => self.send_relational_error(&msg).await,
                 };
+            }
+            // TD-185a fail-closed: the pipeline declined a WITH query (the shared
+            // frontend lowers no CTE over native storage, and a non-materialized
+            // table set never reaches the DataFusion floor). Never hand a WITH to
+            // the legacy single-table path — its FROM-token walk can only misparse
+            // the CTE name. Rewriting into a real error converts the silent
+            // zero-row answer into an actionable one.
+            if upper.starts_with("WITH") {
+                return self
+                    .send_error(
+                        "ERROR",
+                        "0A000",
+                        "WITH (CTE) queries require every referenced table to be \
+                         materialized (ALTER TABLE … MATERIALIZE) so the DataFusion \
+                         route can serve them; the relational frontend declines CTE \
+                         lowering on native storage (TD-185a).",
+                    )
+                    .await;
             }
             if let Some((column, value)) = Self::extract_simple_constant_select(query) {
                 return self.send_single_value_result(&column, &value).await;
@@ -1650,7 +2802,13 @@ impl PostgresProtocol {
                     {
                         Ok(result) => {
                             if upper.starts_with("CREATE TABLE")
-                                && let Some(table_name) = self.extract_create_table_name(query)
+                                // The AST name (quoted/mixed-case names
+                                // diverged from string extraction — a stray
+                                // backing collection was minted while the
+                                // real table got none). Under
+                                // upper.starts_with("CREATE TABLE") with a
+                                // parsed statement it is ALWAYS Some.
+                                && let Some(table_name) = ddl_table.clone()
                             {
                                 self.ensure_relational_backing_collection(
                                     &table_name,
@@ -1745,21 +2903,6 @@ impl PostgresProtocol {
 
         // Handle other commands
         self.send_command_complete("OK").await
-    }
-
-    fn extract_create_table_name(&self, query: &str) -> Option<String> {
-        let upper = query.to_ascii_uppercase();
-        let table_pos = upper.find("CREATE TABLE")?;
-        let after_table = query[table_pos + "CREATE TABLE".len()..].trim_start();
-        let after_table = after_table
-            .strip_prefix("IF NOT EXISTS")
-            .map(str::trim_start)
-            .unwrap_or(after_table);
-        let table_end = after_table
-            .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
-            .unwrap_or(after_table.len());
-        let table_name = Self::clean_identifier(&after_table[..table_end]);
-        (!table_name.is_empty()).then_some(table_name.to_lowercase())
     }
 
     async fn ensure_relational_backing_collection(
@@ -2346,8 +3489,7 @@ impl PostgresProtocol {
         // `ns.table` for cross-namespace routing (dropping the qualifier, as
         // `clean_identifier` does for column refs, broke
         // `pgwire_enforces_cross_namespace_fk_referential_actions`).
-        let upper = query.to_ascii_uppercase();
-        let from_pos = upper.find("FROM ")?;
+        let from_pos = find_ascii_ci(query, "FROM ")?;
         let after_from = &query[from_pos + 5..];
         let table_end = after_from
             .find(|c: char| c.is_whitespace() || c == ';')
@@ -2356,7 +3498,8 @@ impl PostgresProtocol {
         if table.is_empty() {
             None
         } else {
-            Some(table.trim_matches('"').to_string())
+            // The ONE shared decoder (create/read symmetric).
+            Some(crate::core::utils::decode_identifier(table).to_string())
         }
     }
 
@@ -2375,8 +3518,7 @@ impl PostgresProtocol {
 
     /// Extract LIMIT value from query
     fn extract_limit(&self, query: &str) -> Option<usize> {
-        let upper = query.to_uppercase();
-        let limit_pos = upper.find("LIMIT ")?;
+        let limit_pos = find_ascii_ci(query, "LIMIT ")?;
         let after_limit = &query[limit_pos + 6..];
         let limit_end = after_limit
             .find(|c: char| !c.is_ascii_digit())
@@ -2405,11 +3547,10 @@ impl PostgresProtocol {
     }
 
     fn extract_selected_column_names(query: &str) -> Vec<String> {
-        let upper = query.to_ascii_uppercase();
-        let Some(select_pos) = upper.find("SELECT ") else {
+        let Some(select_pos) = find_ascii_ci(query, "SELECT ") else {
             return Vec::new();
         };
-        let Some(from_pos) = upper.find(" FROM ") else {
+        let Some(from_pos) = find_ascii_ci(query, " FROM ") else {
             return Vec::new();
         };
 
@@ -2433,6 +3574,9 @@ impl PostgresProtocol {
 
     fn extract_select_where_predicates(query: &str) -> Option<Vec<SelectPredicate>> {
         let predicate = Self::extract_select_where_clause(query)?;
+        if predicate.is_empty() {
+            return None;
+        }
 
         // OR detected: try to fold `col = v1 OR col = v2` into `col IN (v1, v2)`.
         // Mixed-column OR, non-equality OR, and AND/OR combinations return None so
@@ -2451,6 +3595,48 @@ impl PostgresProtocol {
         }
 
         Some(predicates)
+    }
+
+    fn extract_legacy_select_predicates(query: &str) -> anyhow::Result<Vec<SelectPredicate>> {
+        let not_delimiter = |ch: char| {
+            ch.is_whitespace()
+                || (ch.is_ascii()
+                    && !crate::core::utils::is_identifier_byte(ch as u8)
+                    && !matches!(ch, '.' | '`' | '"' | '\''))
+        };
+        let mut search_from = 0usize;
+        let mut needs_full_validation = true;
+        let aware_where = loop {
+            let found = if needs_full_validation {
+                needs_full_validation = false;
+                crate::core::utils::find_ascii_ci_at_top_level_checked(query, "WHERE")
+                    .map_err(|reason| anyhow::anyhow!("malformed SELECT structure: {reason}"))?
+            } else {
+                crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "WHERE")
+                    .map(|relative| search_from + relative)
+            };
+            let Some(position) = found else {
+                break None;
+            };
+            let end = position + "WHERE".len();
+            if query[..position]
+                .chars()
+                .next_back()
+                .is_none_or(not_delimiter)
+                && query[end..].chars().next().is_none_or(not_delimiter)
+            {
+                break Some(position);
+            }
+            search_from = end;
+        };
+        if Self::extract_select_where_clause(query).is_some() {
+            Self::extract_select_where_predicates(query)
+                .ok_or_else(|| anyhow::anyhow!("unsupported or malformed WHERE predicate"))
+        } else if aware_where.is_some() {
+            Err(anyhow::anyhow!("unsupported or malformed WHERE clause"))
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn split_or_predicates(predicate: &str) -> Vec<&str> {
@@ -2587,13 +3773,17 @@ impl PostgresProtocol {
     ///
     /// Phase 2 of ADR-018: multi-column ORDER BY + explicit NULLS
     /// placement. Postgres defaults: ASC → NULLS LAST, DESC → NULLS
-    /// FIRST. Returns `None` if no ORDER BY clause is present, or
-    /// if any individual key is malformed (the caller falls back to
-    /// no-ordering — the existing behavior for unsupported clauses).
-    fn extract_select_order_by(query: &str) -> Option<Vec<OrderByKey>> {
+    /// FIRST. `Ok(None)` = no ORDER BY present; `Ok(keys)` = parsed
+    /// keys; `Err(reason)` = an ORDER BY clause IS present but cannot
+    /// be parsed — the caller must FAIL CLOSED (TD-185b): silently
+    /// returning unordered rows for an ordered query is a wrong
+    /// answer, not a graceful degradation.
+    fn extract_select_order_by(query: &str) -> Result<Option<Vec<OrderByKey>>, String> {
         let upper = query.to_ascii_uppercase();
-        let pos = Self::find_keyword_outside_literals(&upper, " ORDER BY ")?;
-        let after = query[pos + " ORDER BY ".len()..].trim();
+        let Some(pos) = Self::find_order_by_clause(&upper) else {
+            return Ok(None);
+        };
+        let after = query[pos + " ORDER BY".len()..].trim();
         // Terminate at LIMIT / OFFSET / `;` / end.
         let upper_after = after.to_ascii_uppercase();
         let mut end = after.len();
@@ -2606,19 +3796,101 @@ impl PostgresProtocol {
         }
         let clause = after[..end].trim().trim_end_matches(';').trim();
         if clause.is_empty() {
-            return None;
+            return Err("ORDER BY clause is empty".to_string());
         }
         // Split on top-level commas (literal-aware).
         let segments = Self::split_top_level_commas(clause);
         if segments.is_empty() {
-            return None;
+            return Err("ORDER BY clause could not be segmented".to_string());
         }
         let mut keys: Vec<OrderByKey> = Vec::with_capacity(segments.len());
         for raw in segments {
-            let parsed = Self::parse_one_order_by_key(raw.trim())?;
+            let Some(parsed) = Self::parse_one_order_by_key(raw.trim()) else {
+                return Err(format!(
+                    "ORDER BY key `{}` is not a supported \
+                     `<col> [ASC|DESC] [NULLS FIRST|LAST]` form on the legacy \
+                     single-table reader (TD-185b)",
+                    raw.trim()
+                ));
+            };
             keys.push(parsed);
         }
-        Some(keys)
+        Ok(Some(keys))
+    }
+
+    /// Locate the top-level `ORDER BY` keyword in an uppercased query.
+    /// Unlike a bare `" ORDER BY "` probe, this also matches a clause at
+    /// end-of-string (`… ORDER BY` with nothing after — TD-185b must ERROR
+    /// on that, not silently return unordered rows) and requires a
+    /// non-identifier boundary after `BY`, so `ORDER BYZ`-style text never
+    /// matches. Literal-aware (`ORDER BY` inside a single-quoted string is
+    /// skipped) AND paren-aware: the `ORDER BY` inside a window's
+    /// `OVER (… ORDER BY …)` is a window specification, not the result
+    /// ordering — matching it turned the key into expression tail text (the
+    /// `ts) as delta from cpu` failure the pgwire-accuracy lane caught).
+    fn find_order_by_clause(upper: &str) -> Option<usize> {
+        let mut in_single_quote = false;
+        let mut paren_depth = 0usize;
+        let bytes = upper.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let ch = upper[index..].chars().next()?;
+            if ch == '\'' {
+                // '' inside a literal is an escaped quote, not a boundary.
+                if in_single_quote && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                in_single_quote = !in_single_quote;
+                index += 1;
+                continue;
+            }
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                _ => {}
+            }
+            if paren_depth == 0 && !in_single_quote && upper[index..].starts_with(" ORDER BY") {
+                let after = index + " ORDER BY".len();
+                let boundary = bytes
+                    .get(after)
+                    .is_none_or(|b| !crate::core::utils::is_identifier_byte(*b));
+                if boundary {
+                    return Some(index);
+                }
+            }
+            index += ch.len_utf8();
+        }
+        None
+    }
+
+    /// Extract `(source_column, alias)` pairs from the projection list so an
+    /// ORDER BY key can resolve through an output alias (TD-185b):
+    /// `SELECT k.k_person2 AS friend … ORDER BY friend` yields
+    /// `("k_person2", "friend")`. Only explicit `AS` aliases are recognized —
+    /// the implicit `expr alias` form is ambiguous with expression text.
+    fn extract_projection_aliases(query: &str) -> Vec<(String, String)> {
+        let Some(select_pos) = find_ascii_ci(query, "SELECT ") else {
+            return Vec::new();
+        };
+        let Some(from_pos) = find_ascii_ci(query, " FROM ") else {
+            return Vec::new();
+        };
+        let projection = query[select_pos + 7..from_pos].trim();
+        if projection.is_empty() || projection == "*" {
+            return Vec::new();
+        }
+        Self::split_top_level_commas(projection)
+            .iter()
+            .filter_map(|item| {
+                let item = item.trim();
+                let item_upper = item.to_ascii_uppercase();
+                let as_pos = Self::find_keyword_outside_literals(&item_upper, " AS ")?;
+                let source = Self::clean_identifier(item[..as_pos].trim());
+                let alias = Self::clean_identifier(item[as_pos + " AS ".len()..].trim());
+                (!source.is_empty() && !alias.is_empty() && alias != "*").then_some((source, alias))
+            })
+            .collect()
     }
 
     /// Parse one `<col> [ASC|DESC] [NULLS FIRST|NULLS LAST]` segment.
@@ -2707,12 +3979,57 @@ impl PostgresProtocol {
     }
 
     fn extract_select_where_clause(query: &str) -> Option<&str> {
-        let upper = query.to_ascii_uppercase();
-        let where_pos = upper.find(" WHERE ")?;
-        let mut predicate = query[where_pos + 7..].trim();
-        for terminator in [" ORDER BY ", " GROUP BY ", " LIMIT ", " OFFSET "] {
-            if let Some(pos) = Self::find_keyword_outside_literals(predicate, terminator) {
-                predicate = predicate[..pos].trim();
+        // WHERE locate via the crate's TOP-LEVEL scanner (depth- and
+        // quote-aware). The boundary check excludes identifier bytes,
+        // '.', AND quote/delimiter bytes — a backtick-quoted column
+        // NAMED `where` passed the old check and gutted the predicate
+        // into a silent unfiltered scan.
+        let not_delimiter = |ch: char| {
+            ch.is_whitespace()
+                || (ch.is_ascii()
+                    && !crate::core::utils::is_identifier_byte(ch as u8)
+                    && !matches!(ch, '.' | '`' | '"' | '\''))
+        };
+        let mut predicate = {
+            let mut found = None;
+            let mut search_from = 0usize;
+            while let Some(rel) =
+                crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "WHERE")
+            {
+                let pos = search_from + rel;
+                let end = pos + 5;
+                let boundary = query[..pos].chars().next_back().is_none_or(not_delimiter)
+                    && query[end..].chars().next().is_none_or(not_delimiter);
+                if boundary {
+                    found = Some(&query[end..]);
+                    break;
+                }
+                search_from = end;
+            }
+            found?.trim()
+        };
+        for terminator in ["ORDER BY", "GROUP BY", "LIMIT", "OFFSET"] {
+            // Iterate ALL occurrences until one passes the boundary test —
+            // a first match inside `limit_val` must not hide a later real
+            // terminator; the shared not_delimiter class also rejects
+            // qualified ('t.limit') and backtick-quoted (`limit`) names.
+            let mut search_from = 0usize;
+            while let Some(rel) = crate::core::utils::find_ascii_ci_at_top_level(
+                &predicate[search_from..],
+                terminator,
+            ) {
+                let pos = search_from + rel;
+                let end = pos + terminator.len();
+                let boundary = predicate[..pos]
+                    .chars()
+                    .next_back()
+                    .is_none_or(not_delimiter)
+                    && predicate[end..].chars().next().is_none_or(not_delimiter);
+                if boundary {
+                    predicate = predicate[..pos].trim();
+                    break;
+                }
+                search_from = pos + terminator.len();
             }
         }
         Some(predicate.trim_end_matches(';').trim())
@@ -2836,25 +4153,57 @@ impl PostgresProtocol {
     }
 
     fn extract_select_limit(query: &str) -> Option<usize> {
-        let upper = query.to_ascii_uppercase();
-        let limit_pos = upper.rfind(" LIMIT ")?;
-        let after_limit = query[limit_pos + " LIMIT ".len()..]
-            .trim()
-            .trim_end_matches(';')
-            .trim();
+        // The AWARE top-level scanner, LAST occurrence (rfind parity) —
+        // a LIMIT inside a trailing comment or string literal silently
+        // truncated results ('-- LIMIT 1' returned 1 row instead of 5).
+        let bytes = query.as_bytes();
+        let mut last: Option<usize> = None;
+        let mut search_from = 0usize;
+        while let Some(rel) =
+            crate::core::utils::find_ascii_ci_at_top_level(&query[search_from..], "LIMIT")
+        {
+            let pos = search_from + rel;
+            let end = pos + 5;
+            let boundary = pos > 0
+                && !crate::core::utils::is_identifier_byte(bytes[pos - 1])
+                && bytes[pos - 1] != b'.'
+                && bytes[pos - 1] != b'`'
+                && (end >= bytes.len() || !crate::core::utils::is_identifier_byte(bytes[end]));
+            if boundary {
+                last = Some(pos);
+            }
+            search_from = pos + 5;
+        }
+        let limit_pos = last?;
+        let after_limit = query[limit_pos + 5..].trim().trim_end_matches(';').trim();
         let token = after_limit.split_whitespace().next()?;
         token.parse::<usize>().ok()
     }
 
     fn clean_identifier(identifier: &str) -> String {
-        identifier
-            .trim()
-            .trim_matches('"')
-            .split('.')
-            .next_back()
-            .unwrap_or(identifier)
-            .trim_matches('"')
-            .to_string()
+        // Split on the last dot OUTSIDE quoted segments: "meta.score" is one
+        // column, while schema."meta.score" and "schema"."score" retain the
+        // delimiters needed for the shared decoder.
+        let trimmed = identifier.trim();
+        let mut quote = None;
+        let mut segment_start = 0usize;
+        let mut chars = trimmed.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            if let Some(delimiter) = quote {
+                if ch == delimiter {
+                    if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+            } else if matches!(ch, '"' | '`') {
+                quote = Some(ch);
+            } else if ch == '.' {
+                segment_start = index + ch.len_utf8();
+            }
+        }
+        crate::core::utils::decode_identifier(&trimmed[segment_start..]).to_string()
     }
 
     /// Detect store type for SELECT queries
@@ -2931,7 +4280,13 @@ impl PostgresProtocol {
         };
 
         let limit = Self::extract_select_limit(query);
-        let order_by = Self::extract_select_order_by(query);
+        let order_by = match Self::extract_select_order_by(query) {
+            Ok(Some(keys)) => Some(keys),
+            Ok(None) => None,
+            // TD-185b: an unparsable ORDER BY must error, never silently
+            // degrade to storage order.
+            Err(reason) => return Err(anyhow!("{reason}")),
+        };
         // Fetch all matching rows BEFORE LIMIT when we need to ORDER BY —
         // sorting then truncating is the only correct semantics. With no
         // ORDER BY the planner keeps the limit pushdown.
@@ -2977,11 +4332,10 @@ impl PostgresProtocol {
                     .await?
             }
             Err(_) => {
-                let predicates = if query.to_ascii_uppercase().contains(" WHERE ") {
-                    Self::extract_select_where_predicates(query).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                // The aware gate distinguishes a WHERE-less query from a
+                // present but unsupported predicate. The latter must fail
+                // closed instead of becoming an unfiltered legacy scan.
+                let predicates = Self::extract_legacy_select_predicates(query)?;
                 dml_service
                     .select_table_records_with_projection(
                         table_name,
@@ -3015,28 +4369,46 @@ impl PostgresProtocol {
         if let Some(keys) = order_by.as_ref() {
             // Resolve each key's column to its row index up-front so
             // the per-row hot path is `Vec<usize>` lookups, not
-            // string matching.
-            let resolved: Vec<(usize, bool, bool)> = keys
-                .iter()
-                .filter_map(|k| {
-                    let idx = result
-                        .selected_columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&k.column));
-                    match idx {
-                        Some(i) => Some((i, k.desc, k.nulls_first)),
-                        None => {
-                            warn!(
-                                target: "proximadb::pgwire::order_by",
-                                column = %k.column,
-                                "ORDER BY column not found in projection; \
-                                 skipping this key"
-                            );
-                            None
-                        }
-                    }
-                })
-                .collect();
+            // string matching. TD-185b: keys resolve against projected
+            // columns AND projection aliases (`SELECT x AS y … ORDER
+            // BY y`); an unresolvable key is a FAIL-CLOSED error, not
+            // a warn-and-skip — silently returning storage order for
+            // an ordered query is a wrong answer (the graph-LDBC
+            // ORDER BY drop this closes).
+            let aliases = Self::extract_projection_aliases(query);
+            let mut resolved: Vec<(usize, bool, bool)> = Vec::with_capacity(keys.len());
+            let mut unresolved: Vec<&str> = Vec::new();
+            for k in keys {
+                let idx = result
+                    .selected_columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&k.column))
+                    .or_else(|| {
+                        aliases
+                            .iter()
+                            .find(|(_, alias)| alias.eq_ignore_ascii_case(&k.column))
+                            .and_then(|(source, _)| {
+                                result
+                                    .selected_columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(source))
+                            })
+                    });
+                match idx {
+                    Some(i) => resolved.push((i, k.desc, k.nulls_first)),
+                    None => unresolved.push(&k.column),
+                }
+            }
+            if !unresolved.is_empty() {
+                return Err(anyhow!(
+                    "ORDER BY column(s) `{}` do not resolve to a projected column or \
+                     alias on the legacy single-table reader (TD-185b). Include them in \
+                     the SELECT projection, order by a projected alias, or rewrite the \
+                     query into a relational-pipeline shape (join/GROUP BY/derived \
+                     table/materialized table).",
+                    unresolved.join("`, `")
+                ));
+            }
             if !resolved.is_empty() {
                 result.rows.sort_by(|a, b| {
                     for (idx, desc, nulls_first) in resolved.iter() {
@@ -3170,8 +4542,7 @@ impl PostgresProtocol {
     ) -> Option<crate::proto::proximadb_v1::DocumentFilter> {
         use crate::proto::proximadb_v1::DocumentFilter;
 
-        let upper = query.to_uppercase();
-        let where_pos = upper.find("WHERE")?;
+        let where_pos = find_ascii_ci(query, "WHERE")?;
         let where_clause = &query[where_pos + 5..];
 
         // Simple parsing: look for $.field op value patterns
@@ -3297,21 +4668,7 @@ impl PostgresProtocol {
 
     /// Convert SqlObject to JSON string
     fn sql_object_to_json(&self, obj: &crate::proto::proximadb_v1::SqlObject) -> String {
-        use crate::proto::proximadb_v1::sql_value::Value as SqlVal;
-
-        let mut map = serde_json::Map::new();
-        for (k, v) in &obj.fields {
-            let json_val = match &v.value {
-                Some(SqlVal::StringValue(s)) => serde_json::Value::String(s.clone()),
-                Some(SqlVal::Int64Value(i)) => serde_json::json!(*i),
-                Some(SqlVal::NumberValue(f)) => serde_json::json!(*f),
-                Some(SqlVal::BoolValue(b)) => serde_json::Value::Bool(*b),
-                Some(SqlVal::NullValue(_)) => serde_json::Value::Null,
-                _ => serde_json::Value::Null,
-            };
-            map.insert(k.clone(), json_val);
-        }
-        serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+        sql_object_to_json(obj)
     }
 
     /// Execute an observability store query (logs, metrics)
@@ -3504,22 +4861,31 @@ impl PostgresProtocol {
     }
 
     /// Execute a graph query
+    /// TD-GRAPH-PGWIRE-1: a plain `SELECT * FROM <graph collection>` over
+    /// pgwire has no query semantics to serve — pgwire is documented as NOT
+    /// the graph query surface (`docs/SUPPORTED_SURFACE.adoc`: "unified query
+    /// port (`/api/v2/query`) or the graph service — they are not replaceable
+    /// by pgwire"). This used to fabricate a `(table_name, 0, 0)` row
+    /// regardless of whether the collection existed or had data — a silent
+    /// wrong answer, not a real query. Decline honestly instead: calling
+    /// `GraphService::get_stats` here would be unsafe, not just
+    /// unimplemented — it resolves via `get_or_create_graph_engine`, so a
+    /// bare stats lookup on a nonexistent/misspelled name would silently
+    /// provision a new empty graph collection as a side effect of a stray
+    /// SELECT, which is worse than today's placeholder.
     async fn execute_graph_query(&mut self, table_name: &str, _query: &str) -> Result<()> {
-        debug!("Executing graph query on table: {}", table_name);
-
-        // For now, return basic graph info
-        // Full graph query support requires integration with GraphService
-
-        let fields = vec![
-            FieldDescription::new("graph_name", PgType::Text),
-            FieldDescription::new("node_count", PgType::Int8),
-            FieldDescription::new("edge_count", PgType::Int8),
-        ];
-        self.send_row_description(&fields).await?;
-
-        // Return placeholder data - actual implementation would query GraphService
-        self.send_data_row(&[table_name, "0", "0"]).await?;
-        self.send_command_complete("SELECT 1").await
+        debug!("Declining unsupported graph query on table: {}", table_name);
+        self.send_error(
+            "ERROR",
+            "0A000",
+            &format!(
+                "SELECT over graph collection '{table_name}' is not supported over pgwire — \
+                 the SQL/pgwire surface does not implement graph query or traversal semantics. \
+                 Use gRPC proximadb.v2.ProximaGraphService (node/edge/traversal/stats RPCs, or \
+                 the openCypher ExecuteQuery subset) or REST GET /api/v2/graphs/{table_name}."
+            ),
+        )
+        .await
     }
 
     /// Extract time range from WHERE clause
@@ -3529,10 +4895,8 @@ impl PostgresProtocol {
         default_start: i64,
         default_range: i64,
     ) -> (i64, i64) {
-        let upper = query.to_uppercase();
-
         // Look for BETWEEN ... AND ...
-        if let Some(_between_pos) = upper.find("BETWEEN") {
+        if let Some(_between_pos) = find_ascii_ci(query, "BETWEEN") {
             // Complex parsing - for now use defaults
             return (default_start - default_range, default_start);
         }
@@ -3567,10 +4931,9 @@ impl PostgresProtocol {
 
     /// Extract service filter from query
     fn extract_service_filter(&self, query: &str) -> Vec<String> {
-        let upper = query.to_uppercase();
         let mut services = Vec::new();
 
-        if let Some(service_pos) = upper.find("SERVICE") {
+        if let Some(service_pos) = find_ascii_ci(query, "SERVICE") {
             let after = &query[service_pos..];
             // Look for = 'value' pattern
             if let Some(eq_pos) = after.find('=') {
@@ -3588,9 +4951,7 @@ impl PostgresProtocol {
 
     /// Extract metric name from WHERE clause
     fn extract_metric_name(&self, query: &str) -> Option<String> {
-        let upper = query.to_uppercase();
-
-        if let Some(name_pos) = upper.find("METRIC_NAME") {
+        if let Some(name_pos) = find_ascii_ci(query, "METRIC_NAME") {
             let after = &query[name_pos..];
             if let Some(eq_pos) = after.find('=') {
                 let value_start = after[eq_pos + 1..].trim();
@@ -3651,6 +5012,80 @@ impl PostgresProtocol {
         }
     }
 
+    fn extract_legacy_create_table_target(query: &str) -> Result<(String, bool)> {
+        let table_pos = find_ascii_ci(query, "TABLE")
+            .ok_or_else(|| anyhow!("CREATE TABLE is missing its TABLE keyword"))?;
+        let after_clause =
+            crate::core::utils::skip_leading_ws_and_comments(&query[table_pos + "TABLE".len()..]);
+        let (if_not_exists, after_table) = crate::core::utils::strip_if_not_exists(after_clause);
+
+        if after_table.is_empty() || after_table.starts_with("/*") || after_table.starts_with("--")
+        {
+            return Err(anyhow!("CREATE TABLE is missing a valid table name"));
+        }
+
+        let bytes = after_table.as_bytes();
+        let quoted = matches!(bytes.first(), Some(b'"' | b'`'));
+        let table_end = if quoted {
+            let delimiter = bytes[0];
+            let mut index = 1usize;
+            let mut end = None;
+            while index < bytes.len() {
+                if bytes[index] == delimiter {
+                    if bytes.get(index + 1) == Some(&delimiter) {
+                        index += 2;
+                        continue;
+                    }
+                    end = Some(index + 1);
+                    break;
+                }
+                index += 1;
+            }
+            end.ok_or_else(|| {
+                anyhow!(
+                    "CREATE TABLE is missing a valid table name: unterminated quoted identifier"
+                )
+            })?
+        } else {
+            after_table
+                .find(|c: char| c.is_whitespace() || c == '(')
+                .unwrap_or(after_table.len())
+        };
+
+        let tail = &after_table[table_end..];
+        let valid_boundary = tail.is_empty()
+            || tail
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace() || ch == '(');
+        if !valid_boundary {
+            return Err(anyhow!("CREATE TABLE has an invalid table-name boundary"));
+        }
+
+        let raw_name = &after_table[..table_end];
+        let table_name = crate::core::utils::decode_identifier(raw_name).to_lowercase();
+        let valid_unquoted = || {
+            let mut chars = raw_name.chars();
+            let Some(first) = chars.next() else {
+                return false;
+            };
+            (first == '_' || first.is_alphabetic())
+                && chars.all(|ch| ch == '_' || ch == '$' || ch.is_alphanumeric())
+        };
+        if table_name.is_empty()
+            || (!quoted
+                && (!valid_unquoted()
+                    || matches!(
+                        table_name.to_ascii_uppercase().as_str(),
+                        "IF" | "NOT" | "EXISTS" | "USING" | "AS" | "WITH" | "SELECT"
+                    )))
+        {
+            return Err(anyhow!("CREATE TABLE is missing a valid table name"));
+        }
+
+        Ok((table_name, if_not_exists))
+    }
+
     /// Execute CREATE TABLE - creates a ProximaDB collection
     /// Supports multiple store types:
     /// - Vector: CREATE TABLE name (id TEXT, embedding vector(dim)) [USING VECTOR]
@@ -3660,29 +5095,19 @@ impl PostgresProtocol {
     async fn execute_create_table(&mut self, query: &str) -> Result<()> {
         let upper = query.to_uppercase();
 
-        // Check if IF NOT EXISTS was specified (ADR-018 Phase 2)
-        let if_not_exists = upper.contains("IF NOT EXISTS");
-
-        // Extract table name: CREATE TABLE [IF NOT EXISTS] name
-        let table_start = if if_not_exists {
-            upper.find("EXISTS").map(|p| p + 6)
-        } else {
-            upper.find("TABLE").map(|p| p + 5)
+        // The ONE strip (a contains() + first-EXISTS find armed the flag
+        // and mis-sliced the name from text inside a DEFAULT literal).
+        // Comment-tolerant: 'TABLE /* v2 */ IF NOT EXISTS docs' regressed
+        // to table_name '/*' with the flag lost. Invalid/comment-only input
+        // must return a syntax error, never a successful empty-name no-op.
+        let (table_name, if_not_exists) = match Self::extract_legacy_create_table_target(query) {
+            Ok(target) => target,
+            Err(error) => {
+                return self
+                    .send_error("ERROR", "42601", &format!("Parse error: {error}"))
+                    .await;
+            }
         };
-
-        let Some(start) = table_start else {
-            return self.send_command_complete("OK").await;
-        };
-
-        let after_table = query[start..].trim();
-        let table_end = after_table
-            .find(|c: char| c.is_whitespace() || c == '(')
-            .unwrap_or(after_table.len());
-        let table_name = after_table[..table_end].trim().to_lowercase();
-
-        if table_name.is_empty() {
-            return self.send_command_complete("OK").await;
-        }
 
         // Detect store type from USING clause or column types
         let store_type = self.detect_store_type(&upper);
@@ -4012,6 +5437,43 @@ impl PostgresProtocol {
                     crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
                 });
 
+                // ADR-018 P2.D: inside an explicit transaction the write
+                // BUFFERS (the primary-pod + tenant-visibility gates above
+                // already ran at statement time) and replays sequentially at
+                // COMMIT. Read-only transactions reject writes here (25006).
+                if self.transaction_in_progress().await {
+                    if self.transaction_is_read_only().await {
+                        return self
+                            .send_error(
+                                "ERROR",
+                                "25006",
+                                &format!(
+                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
+                                    dml_summary(&statement).0
+                                ),
+                            )
+                            .await;
+                    }
+                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
+                    if let Err(reason) = self
+                        .transaction_push(
+                            statement,
+                            tenant_ctx,
+                            approx_bytes.max(query.len()),
+                            table.clone(),
+                            write_tenant.clone(),
+                        )
+                        .await
+                    {
+                        return self.send_error("ERROR", "54000", &reason).await;
+                    }
+                    let tag = if kind == "INSERT" {
+                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
+                    } else {
+                        format!("{kind} 0")
+                    };
+                    return self.send_command_complete(&tag).await;
+                }
                 match dml_service
                     .execute_scoped(statement, tenant_ctx.as_ref())
                     .await
@@ -4134,6 +5596,43 @@ impl PostgresProtocol {
                     crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
                 });
 
+                // ADR-018 P2.D: inside an explicit transaction the write
+                // BUFFERS (the primary-pod + tenant-visibility gates above
+                // already ran at statement time) and replays sequentially at
+                // COMMIT. Read-only transactions reject writes here (25006).
+                if self.transaction_in_progress().await {
+                    if self.transaction_is_read_only().await {
+                        return self
+                            .send_error(
+                                "ERROR",
+                                "25006",
+                                &format!(
+                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
+                                    dml_summary(&statement).0
+                                ),
+                            )
+                            .await;
+                    }
+                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
+                    if let Err(reason) = self
+                        .transaction_push(
+                            statement,
+                            tenant_ctx,
+                            approx_bytes.max(query.len()),
+                            table.clone(),
+                            write_tenant.clone(),
+                        )
+                        .await
+                    {
+                        return self.send_error("ERROR", "54000", &reason).await;
+                    }
+                    let tag = if kind == "INSERT" {
+                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
+                    } else {
+                        format!("{kind} 0")
+                    };
+                    return self.send_command_complete(&tag).await;
+                }
                 match dml_service
                     .execute_scoped(statement, tenant_ctx.as_ref())
                     .await
@@ -4250,6 +5749,43 @@ impl PostgresProtocol {
                     crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
                 });
 
+                // ADR-018 P2.D: inside an explicit transaction the write
+                // BUFFERS (the primary-pod + tenant-visibility gates above
+                // already ran at statement time) and replays sequentially at
+                // COMMIT. Read-only transactions reject writes here (25006).
+                if self.transaction_in_progress().await {
+                    if self.transaction_is_read_only().await {
+                        return self
+                            .send_error(
+                                "ERROR",
+                                "25006",
+                                &format!(
+                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
+                                    dml_summary(&statement).0
+                                ),
+                            )
+                            .await;
+                    }
+                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
+                    if let Err(reason) = self
+                        .transaction_push(
+                            statement,
+                            tenant_ctx,
+                            approx_bytes.max(query.len()),
+                            table.clone(),
+                            write_tenant.clone(),
+                        )
+                        .await
+                    {
+                        return self.send_error("ERROR", "54000", &reason).await;
+                    }
+                    let tag = if kind == "INSERT" {
+                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
+                    } else {
+                        format!("{kind} 0")
+                    };
+                    return self.send_command_complete(&tag).await;
+                }
                 match dml_service
                     .execute_scoped(statement, tenant_ctx.as_ref())
                     .await
@@ -4308,9 +5844,9 @@ impl PostgresProtocol {
 
         // Extract table name
         let table_start = if upper.contains("IF EXISTS") {
-            upper.find("EXISTS").map(|p| p + 6)
+            find_ascii_ci(query, "EXISTS").map(|p| p + 6)
         } else {
-            upper.find("TABLE").map(|p| p + 5)
+            find_ascii_ci(query, "TABLE").map(|p| p + 5)
         };
 
         let Some(start) = table_start else {
@@ -4381,9 +5917,8 @@ impl PostgresProtocol {
         }
 
         // Extract table name
-        let copy_pos = upper
-            .find("COPY ")
-            .ok_or_else(|| anyhow::anyhow!("Invalid COPY syntax"))?;
+        let copy_pos =
+            find_ascii_ci(query, "COPY ").ok_or_else(|| anyhow::anyhow!("Invalid COPY syntax"))?;
         let after_copy = query[copy_pos + 5..].trim();
         let table_end = after_copy
             .find(|c: char| c.is_whitespace() || c == '(')
@@ -4473,10 +6008,9 @@ impl PostgresProtocol {
             match msg_type {
                 b'd' => {
                     // CopyData message
-                    let length = self.read_i32().await? as usize;
-                    if length < 4 {
-                        continue;
-                    }
+                    let length = self
+                        .read_validated_length(4, MAX_PGWIRE_MESSAGE_LEN, "CopyData")
+                        .await?;
                     let data = self.read_bytes(length - 4).await?;
                     all_data.extend(data);
                 }
@@ -4488,7 +6022,9 @@ impl PostgresProtocol {
                 }
                 b'f' => {
                     // CopyFail message
-                    let length = self.read_i32().await? as usize;
+                    let length = self
+                        .read_validated_length(4, MAX_PGWIRE_MESSAGE_LEN, "CopyFail")
+                        .await?;
                     let msg = self.read_bytes(length - 4).await?;
                     let error_msg = String::from_utf8_lossy(&msg);
                     warn!("COPY failed: {}", error_msg);
@@ -5075,6 +6611,19 @@ impl PostgresProtocol {
         query: &str,
         max_rows: i32,
     ) -> Result<()> {
+        // Hardening: the fast paths below bypass execute_query_with_controls,
+        // so enforce the failed-transaction gate here too — a Failed txn must
+        // never serve rows regardless of shape (25P02, same as the simple and
+        // batch paths).
+        if self.transaction_state_is_failed().await {
+            return self
+                .send_error(
+                    "ERROR",
+                    "25P02",
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                )
+                .await;
+        }
         if max_rows > 0 {
             if self
                 .portals
@@ -5259,7 +6808,8 @@ impl PostgresProtocol {
 
     /// Handle Sync message
     async fn handle_sync(&mut self) -> Result<()> {
-        self.send_ready_for_query('I').await
+        self.send_ready_for_query(self.transaction_status_byte().await)
+            .await
     }
 
     /// Handle Flush message
@@ -5332,6 +6882,21 @@ impl PostgresProtocol {
 
     /// Send error response
     async fn send_error(&mut self, severity: &str, code: &str, message: &str) -> Result<()> {
+        // ADR-018 P2.D (TD-076): ANY ERROR inside an active transaction —
+        // other than the aborted-transaction marker itself — FAILS the
+        // transaction (PostgreSQL semantics: subsequent commands are ignored
+        // with 25P02 until ROLLBACK). One hook here covers every statement
+        // path (simple, extended, DML, SELECT) without each having to
+        // remember.
+        if code != "25P02" {
+            let mut session = self.session.write().await;
+            if matches!(
+                session.transaction_state,
+                super::session::TransactionState::InTransaction
+            ) {
+                session.fail_transaction();
+            }
+        }
         let len = 4 + 1 + severity.len() + 1 + 1 + code.len() + 1 + 1 + message.len() + 1 + 1;
         self.write_buffer.put_u8(b'E');
         self.write_buffer.put_i32(len as i32);

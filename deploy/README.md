@@ -52,14 +52,14 @@ Release and deployment assets should stay under `deploy/`. Avoid adding new root
 # Pull and run
 docker run -d \
   -p 5678:5678 \
-  -p 5679:5679 \
+  -p 5433:5433 \
   -v proximadb-data:/data \
   vjsingh1984/proximadb:latest
 
 # Or build locally
 cd deploy/docker
 docker build -t proximadb:local .
-docker run -d -p 5678:5678 -p 5679:5679 proximadb:local
+docker run -d -p 5678:5678 -p 5433:5433 proximadb:local
 ```
 
 ### Docker Compose (Development)
@@ -72,8 +72,8 @@ docker-compose up -d
 docker-compose --profile monitoring up -d
 
 # Access:
-# - REST API: http://localhost:5678
-# - gRPC: localhost:5679
+# - Unified REST + gRPC + Arrow Flight: localhost:5678
+# - PostgreSQL wire protocol: localhost:5433
 # - Prometheus: http://localhost:9090
 # - Grafana: http://localhost:3000
 ```
@@ -198,9 +198,9 @@ gcloud container clusters get-credentials proximadb-gke \
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 5678 | HTTP | REST API |
-| 5679 | gRPC | gRPC API |
-| 5680 | TCP | Arrow IPC (bulk data) |
+| 5678 | HTTP/gRPC/Arrow | Unified multiplexed surface (REST + gRPC + Arrow Flight; `unified_mode = true` in the shipped config.toml/docker image — the code default is false, and shipped k8s/helm artifacts run multi-port) |
+| 5433 | PostgreSQL wire | SQL clients (pgvector-compatible) |
+| 5679 / 5680 | gRPC / Arrow IPC | Legacy multi-port mode only (`unified_mode = false`) |
 | 9090 | HTTP | Metrics (Prometheus) |
 
 ### Environment Variables
@@ -209,8 +209,8 @@ gcloud container clusters get-credentials proximadb-gke \
 |----------|---------|-------------|
 | `PROXIMADB_BIND_ADDRESS` | `0.0.0.0` | Listen address |
 | `PROXIMADB_REST_PORT` | `5678` | REST API port |
-| `PROXIMADB_GRPC_PORT` | `5679` | gRPC API port |
-| `PROXIMADB_ARROW_IPC_PORT` | `5680` | Arrow IPC port |
+| `PROXIMADB_GRPC_PORT` | `5679` | gRPC API port (legacy multi-port mode) |
+| `PROXIMADB_ARROW_IPC_PORT` | `5680` | Arrow IPC port (legacy multi-port mode) |
 | `PROXIMADB_METRICS_PORT` | `9090` | Metrics port |
 | `PROXIMADB_DATA_DIR` | `/data/proximadb` | Data directory |
 | `PROXIMADB_DEFAULT_ENGINE` | `sst` | Default storage engine |

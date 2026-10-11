@@ -20,7 +20,7 @@
 //!   "rank_overrides": { ... }
 //! }
 //! ```
-//! Same shape REST `/v1/rank/search` accepts, so SDKs can lift their
+//! Same shape REST `/api/v2/rank/search` accepts, so SDKs can lift their
 //! existing serialisation.
 //!
 //! Wire contract — response (one Arrow IPC stream):

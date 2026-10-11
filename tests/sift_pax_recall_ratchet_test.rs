@@ -260,14 +260,82 @@ fn vid(i: u32) -> String {
     format!("v{i}")
 }
 
+/// Mint a catalog-style decimal collection object id (ADR-075:
+/// `CollectionObjectId = u64`).
+///
+/// The SST flush and compaction-admission paths are fail-closed on a decimal id
+/// (`FlushParams::get_collection_object_id` /
+/// `CompactionParams::get_collection_object_id`, in
+/// `crates/storage/proximadb-storage-traits/src/types.rs`), so a bare-engine
+/// test that drives either must supply one — the human name belongs in
+/// `CollectionConfig.name`. Do NOT hash the name here: that boundary's own doc
+/// comment warns it would create "a second, collision-prone identity domain that
+/// cannot be joined reliably with catalog, MVCC, deletion-vector, or compaction
+/// state". Mirrors the production catalog's monotonic mint without standing up
+/// the catalog, as `tests/sst_ivf2_compaction_route_proof_test.rs` already does.
+fn next_object_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
 fn collection(id: &str, base_location: String) -> Collection {
     Collection {
+        // The collection NAME, not a decimal catalog object id — a known defect
+        // tracked by TD-SIFTCOMPACT-1 and deliberately not fixed here.
+        //
+        // The live reason, stated first because the history below explains a
+        // decision whose original justification has lapsed: the id is left as a
+        // name because changing it is not needed and is not free. With the tag,
+        // minting is behaviour-neutral for compaction -- but `get_data_dir` keys
+        // the on-disk layout off `Collection.id`, so minting would move every
+        // temp path for the three CI-carried ratchets that share this helper. No
+        // gain, a re-baseline to verify. If a future change needs the decimal id
+        // here, mint it and re-run those three.
+        //
+        // History, corrected: with the `compaction:off` tag added below, minting an
+        // id here is BEHAVIOUR-NEUTRAL. `should_trigger_compaction` returns
+        // Ok(None) on `!resolve_compaction_armed(tags)` before anything else, and
+        // `params.get_collection_object_id()` is only reached inside the
+        // compaction-due block -- so compaction does not run with or without a
+        // valid id, and the id is never parsed. An earlier revision of this
+        // comment said "these tests do not survive it", which was true BEFORE the
+        // tag and is the justification it used for leaving the name in place.
+        //
+        // What the tag does cost is the attribution experiment: it is what makes
+        // TD-SIFTCOMPACT-1's follow-up un-runnable without dropping the tag, and
+        // it means that TD's "mint an id" step is now safe but no longer
+        // sufficient. The history below is kept because it is why the name is
+        // still here.
+        //
+        // Historically: with a valid id compaction actually ran, and the sibling
+        // ratchet then died on
+        // the FIRST query at `assert_single_vector_access` with ZERO recorded
+        // accesses — no ANN proof is emitted. "No proof emitted" is the
+        // observation; "the cascade declined on the compacted segment" is one of
+        // four candidate explanations and is NOT established -- TD-SIFTCOMPACT-1
+        // lists them and rates the most likely as a harness artifact (that
+        // experiment had no compaction-quiescence barrier either, the same defect
+        // retracted in TD-IVF2ENGAGE-1). So the assertion stays strict because a
+        // zero-proof query is a real signal either way, not because a product
+        // defect has been demonstrated.
+        //
+        // What IS fixed here is the silence: `compaction:off` below states that
+        // these arms measure an uncompacted layout, instead of achieving it by a
+        // swallowed admission error. Behaviour-preserving — compaction does not
+        // run today either.
         id: id.to_string(),
         config: Some(CollectionConfig {
             name: id.to_string(),
             dimension: DIMENSION as u32,
             distance_metric: Some(DistanceMetric::Euclidean as i32),
             storage_engine: Some(StorageEngine::Sst as i32),
+            // States what these arms measure. Without it, compaction is ARMED by
+            // default (`AppendBulk`) and only fails to run because admission
+            // rejects the non-decimal id above — an accident, not a decision.
+            // The IVF2 ratchet builds its Collection inline and is unaffected:
+            // it wants compaction and asserts `compaction_ran`.
+            tags: vec!["compaction:off".to_string()],
             ..Default::default()
         }),
         storage_assignment: Some(StorageAssignment {
@@ -1002,7 +1070,15 @@ fn ivecs_round_trip_parses_neighbour_indices() {
 ///       coalescing assumes `cluster_order_pca_ivf` survivor locality.
 ///   (b) a SINGLE-FILE collection (one flush batch → one segment) isolates the
 ///       per-file "~1 RaBitQ GET" win, NOT conflated with the PR2 GET-budget
-///       compaction (the flush→compaction scheduler is unwired).
+///       compaction. NOTE: an earlier revision justified this with "the
+///       flush→compaction scheduler is unwired". That is false -- TD-WLP-7
+///       (ADR-061 D3) wired it, and its own comment records that the post-flush
+///       hook used to be a stub. The isolation holds for a different reason: one
+///       flush batch cannot reach the count arm's L0 threshold of 5, and this
+///       collection is now tagged `compaction:off`, which short-circuits
+///       `should_trigger_compaction` outright -- without which the TD-COMPACT-5
+///       TRAINING arm (threshold 1, any untrained L0 over 32 MB) would have armed
+///       on this single large segment. See TD-SIFTCOMPACT-1.
 /// Expects recall@10 ≈ 0.99 at the keep=100% RaBitQ scan AND range_gets/query ≪
 /// today's ~370. `#[ignore]` (needs SIFT1M); record into BENCHMARK_EVIDENCE.toml.
 #[tokio::test]
@@ -1083,7 +1159,10 @@ async fn sift_coalesced_rabitq_scan_rerank_eval() {
 
     // (b) SINGLE-FILE collection: flush the entire base in ONE batch → one segment
     // file, isolating the per-file "~1 RaBitQ GET" win from the PR2 GET-budget
-    // compaction (the flush→compaction scheduler is unwired).
+    // compaction. The scheduler IS wired (TD-WLP-7); what isolates this is the
+    // single batch (below the count arm's threshold of 5) plus the
+    // `compaction:off` tag, which also blocks the training arm that would
+    // otherwise fire at threshold 1 on a 32 MB+ untrained L0.
     let temp_dir = TempDir::new().unwrap();
     let collection = collection(
         "sift_coalesced_eval",
@@ -1556,7 +1635,10 @@ async fn sift_ivf2_probe_release_bakeoff_eval() {
         .into_iter()
         .map(|row| row.into_iter().take(TOP_K).map(vid).collect())
         .collect();
-    let recall_floor = 0.98;
+    // TD-IOBUDGET-2 (product decision 2026-09-03): 0.98 -> 0.975 for the
+    // economical default geometry (k=122 file://: bytes -51%, GETs -13%,
+    // recall 0.9794). Historical TD numbers keep their original contexts.
+    let recall_floor = 0.975;
     let file_counts = csv_usize_env("PROXIMADB_SIFT_IVF2_FILE_COUNTS", &[1, 4]);
     let nprobes = csv_usize_env("PROXIMADB_SIFT_IVF2_NPROBE_SWEEP", &[4, 8, 16, 32]);
     let layout_proof = env_enabled("PROXIMADB_SIFT_IVF2_LAYOUT_PROOF");
@@ -1720,6 +1802,25 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
             &std::env::var("PROXIMADB_SIFT_IVF_K").unwrap_or_else(|_| "64".to_string()),
         );
         std::env::set_var("PROXIMADB_TRACE_GETS", "1");
+        // Pin the TD-COMPACT-5 training arm out of the way so only the COUNT arm
+        // can fire. Without this the test fails deterministically at N >= ~333k,
+        // and the failure looks like the opposite of what it is: at that scale
+        // the FIRST flush's segment (n/2 rows) crosses the 32 MB training floor,
+        // so flush #1 enqueues a training compaction that consumes the only L0;
+        // flush #2 then has nothing due, `enqueue_due_compaction` returns
+        // Ok(false), and the assert below reports "must be enqueued by the 2nd
+        // flush (compaction_error: None)" -- a missing enqueue, with no error to
+        // point at. Confirmed by execution: N=333000 fails, and the same run with
+        // PROXIMADB_TRAINING_COMPACTION_MIN_MB raised passes (200/200 probes).
+        //
+        // The quiescence barrier below cannot fix this: it runs AFTER the
+        // compaction_ran assert, so it can neither await nor absorb a
+        // first-flush compaction. Pinning states the intent instead -- this test
+        // is about the count-triggered compaction product -- and it unblocks the
+        // 333k/1M re-measurement the TDs ask for.
+        if std::env::var_os("PROXIMADB_TRAINING_COMPACTION_MIN_MB").is_none() {
+            std::env::set_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB", "1000000");
+        }
     }
 
     let base_path = match dataset_path("sift_base.fvecs") {
@@ -1767,7 +1868,7 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
 
     let temp_dir = TempDir::new().unwrap();
     let collection = Collection {
-        id: "sift_ivf2_gate".to_string(),
+        id: next_object_id(),
         config: Some(CollectionConfig {
             name: "sift_ivf2_gate".to_string(),
             dimension: DIMENSION as u32,
@@ -1812,9 +1913,48 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
             .get("compaction_ran")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        "armed compaction must run inline on the 2nd flush (compaction_error: {:?})",
+        "armed compaction must be enqueued by the 2nd flush (compaction_error: {:?})",
         second.compaction_error
     );
+    // `compaction_ran` means ENQUEUED, not completed: `enqueue_due_compaction`
+    // returns Ok(true) once `schedule_compaction` has pushed to the task queue
+    // and notified a worker, and the flush log says so ("enqueued (async)").
+    // Workers are always live (>= 1) and later DELETE the inputs, so without a
+    // barrier the arms below race the compaction and the retirement of the
+    // segments they read. Measured, with only `PROXIMADB_SIFT_QUERIES` varying:
+    // the probe arm recorded 0 of 1 and 0 of 2 probes (no v3 segment existed
+    // yet), then 5 of 5 and 10 of 10 at larger counts; across default runs the
+    // baseline arm's bytes/q moved (26273265 / 26363199 / 26501081) while the
+    // probe arm's did not. The verdict was a function of how long the test's own
+    // query loop ran, and the doc claim that both arms compare "the same
+    // segment" was not guaranteed.
+    //
+    // This is the barrier the precedent this test borrows `next_object_id()`
+    // from already has (`sst_ivf2_compaction_route_proof_test.rs`, TD-COMPACT-6
+    // D1); it was the one piece not carried over. It also closes an edition-2024
+    // soundness hazard: `measure()` calls `std::env::set_var` while a compaction
+    // worker reads env from other threads (`PROXIMADB_CACHE_ON_WRITE`,
+    // `PROXIMADB_PAX_WRITE_A0_TRAIN`, `PROXIMADB_IVF_K`). To be precise about
+    // why -- an earlier revision of this comment said "no second thread existed"
+    // before this PR, which is wrong: the workers are started unconditionally at
+    // engine construction and always existed. What did not exist was a RUNNING
+    // compaction. Quiescing removes the overlap with compaction's own env reads;
+    // it does not remove the workers, which stay live across both arms.
+    match engine.compaction_manager() {
+        Some(cm) => {
+            let quiet = cm
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await;
+            assert!(
+                quiet,
+                "enqueued compaction did not quiesce within 60s; the arms below would \
+                 race it and measure different physical layouts"
+            );
+        }
+        None => panic!(
+            "no compaction manager: the v3 segment this test reads is written only by compaction"
+        ),
+    }
 
     async fn measure(
         engine: &SstEngine,
@@ -1822,7 +1962,16 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         queries: &[Vec<f32>],
         ground_truth: &[std::collections::HashSet<String>],
         probe_on: bool,
-    ) -> (f64, u64, u64, usize) {
+    ) -> (
+        f64,
+        u64,
+        u64,
+        usize,
+        u64,
+        usize,
+        Vec<(u64, u64, u64, u64)>,
+        u64,
+    ) {
         unsafe {
             if probe_on {
                 std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
@@ -1832,29 +1981,50 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         }
         let _ = proximadb::storage::engines::sst::segment_format::drain_get_trace();
         let _ = proximadb::storage::engines::sst::segment_format::drain_probe_trace();
-        let (recall, measured, snap, _us) = proximadb::observability::io_trace::scope(async {
-            let mut recall_sum = 0.0f64;
-            let mut measured = 0usize;
-            for (qi, query) in queries.iter().enumerate() {
-                let got = search_topk(engine, collection, query.clone()).await;
-                if got.is_empty() {
-                    continue;
+        let (recall, measured, snap, queries_with_probe, probe_rows) =
+            proximadb::observability::io_trace::scope(async {
+                let mut recall_sum = 0.0f64;
+                let mut measured = 0usize;
+                // Per-QUERY engagement, kept alongside the per-segment-read ratio
+                // below. The ratio answers "of the reads that armed, how many
+                // probed", which structurally cannot see a query that never reached
+                // the coalesced path or hit a pre-arm early return -- i.e. it cannot
+                // detect the "engages on a small fraction of queries" shape at all,
+                // except through the degenerate zero case. Draining per query costs
+                // nothing and restores the query-level view.
+                let mut queries_with_probe = 0usize;
+                let mut probe_rows: Vec<(u64, u64, u64, u64)> = Vec::new();
+                for (qi, query) in queries.iter().enumerate() {
+                    let got = search_topk(engine, collection, query.clone()).await;
+                    // Drain per query: the rows still aggregate (they are collected
+                    // into `probe_rows` and returned), and emptiness per drain is
+                    // what makes the per-query count possible.
+                    let rows =
+                        proximadb::storage::engines::sst::segment_format::drain_probe_trace();
+                    let probed_this_query = !rows.is_empty();
+                    probe_rows.extend(rows);
+                    if got.is_empty() {
+                        continue;
+                    }
+                    if probed_this_query {
+                        queries_with_probe += 1;
+                    }
+                    let got_ids: std::collections::HashSet<String> =
+                        got.into_iter().take(TOP_K).collect();
+                    recall_sum +=
+                        got_ids.intersection(&ground_truth[qi]).count() as f64 / TOP_K as f64;
+                    measured += 1;
                 }
-                let got_ids: std::collections::HashSet<String> =
-                    got.into_iter().take(TOP_K).collect();
-                recall_sum += got_ids.intersection(&ground_truth[qi]).count() as f64 / TOP_K as f64;
-                measured += 1;
-            }
-            let recall = if measured > 0 {
-                recall_sum / measured as f64
-            } else {
-                0.0
-            };
-            let snap =
-                proximadb::observability::io_trace::snapshot().expect("io_trace scope active");
-            (recall, measured, snap, Vec::<u64>::new())
-        })
-        .await;
+                let recall = if measured > 0 {
+                    recall_sum / measured as f64
+                } else {
+                    0.0
+                };
+                let snap =
+                    proximadb::observability::io_trace::snapshot().expect("io_trace scope active");
+                (recall, measured, snap, queries_with_probe, probe_rows)
+            })
+            .await;
         let per_q_gets = if measured > 0 {
             snap.range_gets / measured as u64
         } else {
@@ -1865,14 +2035,65 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         } else {
             0
         };
-        (recall, per_q_gets, per_q_bytes, measured)
+        // `ivf_whole_region_fallback` counts segment reads where the probe was
+        // ARMED and still read the whole region. Paired with the probe trace
+        // (also per segment read) it yields a same-unit engagement ratio, and it
+        // separates two opposite diagnoses the old message conflated: "no
+        // Region A0, so the probe never armed" vs "armed and missed". The
+        // snapshot was already captured here and this field thrown away.
+        (
+            recall,
+            per_q_gets,
+            per_q_bytes,
+            measured,
+            snap.ivf_whole_region_fallback,
+            queries_with_probe,
+            probe_rows,
+            // Ungated, unlike `probe_trace`: `record_ivf_probe_durable` is called
+            // on BOTH the engaged and the fallback path with no `trace_on` guard,
+            // while `record_probe_trace` is called only `if trace_on`. Non-zero
+            // cells therefore prove the probe engaged even when the trace vector
+            // is empty, which is the only way to tell "probe worked, tracing off"
+            // from "never armed".
+            snap.ivf_cells_total,
+        )
     }
 
-    let (recall_base, gets_base, bytes_base, measured_base) =
-        measure(&engine, &collection, &queries, &ground_truth, false).await;
-    let (recall_probe, gets_probe, bytes_probe, measured_probe) =
-        measure(&engine, &collection, &queries, &ground_truth, true).await;
-    let probe_trace = proximadb::storage::engines::sst::segment_format::drain_probe_trace();
+    let (
+        recall_base,
+        gets_base,
+        bytes_base,
+        measured_base,
+        fallback_base,
+        // Unused on purpose: the OFF-arm check below uses `_rows_base`, which
+        // counts probe rows unconditionally, rather than this counter, which is
+        // only incremented after the empty-result `continue` and so cannot see a
+        // baseline query that probed but returned nothing.
+        _qprobe_base,
+        _rows_base,
+        cells_base,
+    ) = measure(&engine, &collection, &queries, &ground_truth, false).await;
+    let (
+        recall_probe,
+        gets_probe,
+        bytes_probe,
+        measured_probe,
+        fallback_probe,
+        queries_with_probe,
+        probe_trace,
+        cells_probe,
+    ) = measure(&engine, &collection, &queries, &ground_truth, true).await;
+    // With the probe OFF, `coarse_probe_enabled()` is false so `probe_armed`
+    // cannot be true: both counters must be identically zero. Asserting it is the
+    // only thing that checks the two arms really were configured differently --
+    // otherwise a gate that silently stopped toggling would read as a clean pass.
+    // Deliberately NOT a bare assert here: an early hard assert would lose every
+    // measured number below, which is the thing the collect-then-report structure
+    // exists to avoid. Folded into `failures` instead (see below). Uses
+    // `_rows_base`, which counts probe rows unconditionally, rather than
+    // `qprobe_base`, which is only incremented after the empty-result `continue`
+    // and so cannot see a baseline query that probed but returned nothing.
+    let off_arm_activity = (fallback_base, _rows_base.len(), cells_base);
 
     eprintln!(
         "=== TD-RDSTRAT-8 IVF2 coarse probe (N={n}, {qcount} queries, top-{TOP_K}, IVF_K from env) ===\n  \
@@ -1896,22 +2117,161 @@ async fn sift_ivf2_coarse_probe_recall_ratchet() {
         measured_base > 0 && measured_probe > 0,
         "no queries measured"
     );
-    assert!(
-        !probe_trace.is_empty(),
-        "PROXIMADB_PAX_READ_COARSE_PROBE=1 must engage the coarse probe on the v3 segment"
+    // A non-empty trace is NOT evidence that the probe is doing its job: a
+    // presence check is satisfied by one probe out of any number of queries, so
+    // it certifies a probe that is effectively off. Assert a proportion instead.
+    //
+    // NOTE: an earlier revision of this comment justified the change with
+    // "at N=100_000 with PROXIMADB_SIFT_QUERIES=1000 it records 17 entries
+    // against 1000 measured queries". That measurement is RETRACTED -- it was
+    // taken before the compaction-quiescence barrier above existed, so the arms
+    // raced the compaction. Re-measured behind the barrier, that exact config
+    // records 1000 of 1000 (TD-IVF2ENGAGE-1). The proportion floor is still the
+    // right guard -- a presence check is weak whatever the true engagement is --
+    // but it is not fixing an observed collapse.
+    //
+    // Both terms are PER SEGMENT READ, which is what makes this a ratio rather
+    // than a floor: `probe_trace` is pushed once per segment read that probed,
+    // `ivf_whole_region_fallback` once per segment read that armed and read the
+    // whole region anyway. An earlier revision divided the per-segment-read
+    // numerator by `measured_probe` (per QUERY), so with two v3 segments 25%
+    // query engagement cleared a 50% floor -- the code said as much and then
+    // used it as the gate regardless.
+    let engaged = probe_trace.len() as u64;
+    let armed_reads = engaged + fallback_probe;
+    eprintln!(
+        "  probe engagement: {engaged} probed / {armed_reads} armed segment read(s) \
+         ({fallback_probe} armed-but-whole-region); {queries_with_probe} of \
+         {measured_probe} measured queries probed at least once"
     );
+
+    // Collect every verdict BEFORE asserting, then fail once with all of them.
+    // Asserting in sequence means the first failure hides the rest, and WHICH
+    // one comes first decides what the reader of a CI failure sees, and which
+    // failure is "first" is a guess about which one matters. Reporting all of
+    // them is the only ordering that makes no such guess. (Seven
+    // `failures.push` sites, up to five trippable at once -- an earlier revision
+    // said "all three", the same stale count the failure message itself carried.)
+    //
+    // NOTE: an earlier revision justified this with "at this test's DEFAULT N
+    // the probe does not engage at all (0 of 100 measured) ... a 3.3% byte
+    // regression". Also RETRACTED, same cause: post-barrier the default config
+    // measures 100 of 100 probed and bytes 60% BELOW baseline, and the test is
+    // green. The collect-then-report structure stands on its own reasoning.
+    let mut failures: Vec<String> = Vec::new();
+
+    // The probe-OFF arm must record NOTHING: `coarse_probe_enabled()` is false,
+    // so `probe_armed` cannot be true. Nothing else checks that the two arms were
+    // configured differently, so without this a gate that silently stopped
+    // toggling would read as a clean pass.
+    if off_arm_activity != (0, 0, 0) {
+        failures.push(format!(
+            "the probe-OFF arm recorded probe activity (fallback={}, probe_rows={}, \
+             cells_total={}); the two arms were not configured differently, so every \
+             comparison below is meaningless",
+            off_arm_activity.0, off_arm_activity.1, off_arm_activity.2
+        ));
+    }
+
+    if armed_reads == 0 {
+        // Both counters zero. Name the candidates rather than asserting one:
+        // an earlier message said "the rest fell back to the whole-Region-A
+        // scan" in a run where nothing had fallen back, and the replacement
+        // then asserted "no segment read had a parsable Region A0", which is
+        // only one of three states that produce this.
+        // `cells_probe` is recorded WITHOUT the `trace_on` guard that
+        // `probe_trace` is behind, so it separates "the probe worked and tracing
+        // was off" from everything else. Without it this branch named three
+        // causes and silently excluded the one the toggle itself could produce.
+        if cells_probe > 0 {
+            failures.push(format!(
+                "the coarse probe DID engage ({cells_probe} IVF cells visited in total \
+                 -- `ivf_cells_total`, not the probed subset, which is nprobe/k_c of it -- \
+                 recorded on the \
+                 ungated durable counter) but `probe_trace` is empty -- so the trace gate, \
+                 not the probe, is off. `record_probe_trace` is called only `if trace_on` \
+                 (PROXIMADB_TRACE_GETS / TRACE_PAX_STAGES) while the durable counters are \
+                 not, so any caller that clears it reads 0% engagement on a working probe"
+            ));
+        } else {
+            failures.push(
+                "the coarse probe recorded NOTHING: 0 probes, 0 armed-but-whole-region \
+                 reads, 0 cells. Four states produce this and these counters cannot \
+                 separate them: (a) no segment read had a parsable Region A0, so the probe \
+                 never armed -- the v3 layout is written only by compaction; (b) the \
+                 coalesced path was never entered at all (cascade declined, or generic-scan \
+                 fail-over) -- see TD-SIFTCOMPACT-1; (c) a pre-arm early return (header \
+                 parse, stale-size guard, size floor); (d) the read gate itself is off, i.e. \
+                 `coarse_probe_enabled()` is false even though this arm set it -- which the \
+                 probe-OFF check above cannot catch, because if BOTH arms are off it \
+                 passes. See TD-IVF2ENGAGE-1"
+                    .to_string(),
+            );
+        }
+    } else {
+        let engagement_floor = (armed_reads + 1) / 2; // >= 50% of ARMED segment reads
+        if engaged < engagement_floor {
+            failures.push(format!(
+                "the coarse probe armed on {armed_reads} segment read(s) but probed on only \
+                 {engaged} (floor {engagement_floor}); the other {fallback_probe} took the \
+                 armed-but-whole-region fallback the probe exists to avoid -- see TD-IVF2ENGAGE-1"
+            ));
+        }
+        // And the per-QUERY floor, which the ratio above cannot express. Today
+        // the two agree (2 L0 compact to exactly 1 L1, inputs retired, so armed
+        // reads == measured queries), but they diverge the moment the layout
+        // mixes a trained v3 with an untrained L0, or segment discovery skips
+        // the v3 for most queries: per-query engagement can be arbitrarily low
+        // while the ratio still reads 100%.
+        let query_floor = (measured_probe + 1) / 2;
+        if queries_with_probe < query_floor {
+            failures.push(format!(
+                "only {queries_with_probe} of {measured_probe} measured queries probed at \
+                 least once (floor {query_floor}) -- the per-armed-read ratio can read 100% \
+                 while most queries never reach a trained segment. See TD-IVF2ENGAGE-1"
+            ));
+        }
+    }
+    if recall_probe < recall_base - recall_drop {
+        failures.push(format!(
+            "probe recall@{TOP_K} = {recall_probe:.4} dropped > {recall_drop} vs baseline \
+             {recall_base:.4}"
+        ));
+    }
+    // CONFOUND, disclosed rather than claimed away: the baseline arm runs FIRST
+    // (cold SegmentInvariantsCache, cold page cache on the just-written L1) and
+    // the probe arm second (warm). Nothing is invalidated between them, so part
+    // of this gap is cold-vs-warm. The barrier above makes "the same segment"
+    // true; it does not make "the same cache state" true. Measured signature of
+    // exactly that: the gap narrows from -60% at 100 queries to -30% at 1000 as
+    // a fixed warm-up advantage amortises. Direction and ordering are stable, so
+    // this works as a ratchet -- but no figure from here belongs in
+    // BENCHMARK_EVIDENCE.toml until the arms are run in both orders.
+    if bytes_probe >= bytes_base {
+        failures.push(format!(
+            "probe bytes/q = {bytes_probe} must read fewer than baseline {bytes_base}"
+        ));
+    }
     assert!(
-        recall_probe >= recall_base - recall_drop,
-        "probe recall@{TOP_K} = {recall_probe:.4} dropped > {recall_drop} vs baseline {recall_base:.4}"
-    );
-    assert!(
-        bytes_probe < bytes_base,
-        "probe bytes/q = {bytes_probe} must read fewer than baseline {bytes_base}"
+        failures.is_empty(),
+        // Count, not a literal: the hard-coded "3" was a round-6 leftover from
+        // before the OFF-arm and per-query checks existed, so a run that tripped
+        // five of them printed "5 of 3 checks".
+        "TD-RDSTRAT-8 IVF2 coarse-probe ratchet failed ({} check(s)):\n  - {}",
+        failures.len(),
+        failures.join("\n  - ")
     );
     unsafe {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "0");
         std::env::remove_var("PROXIMADB_TRACE_GETS");
+        // Pinned at the top of this test IF UNSET, and previously not cleaned up
+        // here. Harmless under nextest (process per test). Under plain
+        // `cargo test` the removal is unconditional, so it also clears a value
+        // the caller supplied -- which is a (small) behaviour change in the
+        // caller's favour only if they did not want it to persist. Stated rather
+        // than glossed, since the point of this block is not to leak.
+        std::env::remove_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB");
     }
 }
 

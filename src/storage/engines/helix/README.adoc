@@ -1169,10 +1169,10 @@ pca_retrain_interval_hours = 48     # Less frequent training
 
 == References
 
-* link:../../../../docs/storage/helix-engine-deep-dive.adoc[HELIX Engine Deep Dive] (to be created)
-* link:../README.adoc[Storage Engines Overview]
+* HELIX Engine Deep Dive (to be created)
+* Storage Engines Overview
 * link:../../../../docs/09-roadmap/implementation/[Implementation Guides]
-* link:../../../../docs/performance/[Performance Documentation]
+* Performance Documentation
 
 **Academic Papers**:
 

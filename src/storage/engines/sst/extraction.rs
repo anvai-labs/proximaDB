@@ -176,9 +176,24 @@ impl VectorExtractor for SstExtractor {
                     .props
                     .iter()
                     .map(|(k, node)| {
+                        // REHYDRATION format, not an API rendering: the
+                        // AXIS consumer re-parses this JSON back into
+                        // ProximaValue (Value::String stays String, arrays
+                        // stay arrays), so the FILTER spelling keeps
+                        // extraction-recovered records filtering IDENTICALLY
+                        // to live ones (a Binary renders as the int-array on
+                        // both sides; the canonical base64 string would
+                        // rehydrate as String and silently diverge). Display
+                        // surfaces read through the canonical converter, not
+                        // this extractor. KNOWN family divergence (tracked
+                        // in TD-PROTO-2): helix/swift still render the
+                        // canonical spelling and raptor its raw prost
+                        // envelope — all feed the same AXIS rehydration, so
+                        // recovered-record filtering diverges per engine
+                        // until the family converges here.
                         let value = match node {
                             proximadb_records::ProximaTreeNode::Value(value) => {
-                                crate::core::search::sql_value_filter::proxima_value_to_json(value)
+                                crate::core::search::sql_value_filter::proxima_value_to_filter_literal(value)
                             }
                             proximadb_records::ProximaTreeNode::Object(subtree) => {
                                 let object =

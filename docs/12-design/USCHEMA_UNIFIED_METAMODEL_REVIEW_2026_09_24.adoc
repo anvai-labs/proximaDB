@@ -1,0 +1,122 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= Review — "A Unified Metamodel for NoSQL and Relational Databases" (U-Schema, arXiv:2105.06494)
+:toc:
+:status-as-of: 2026-09-24
+
+Full read of Fernández Candel, Sevilla Ruiz & García-Molina, *A Unified Metamodel for NoSQL and
+Relational Databases* (arXiv:2105.06494v2, May 2021), assessed against ProximaDB's canonical
+record model and the ADR-094 unification work.
+
+**Verdict up front:** one directly actionable defect found and reproduced (TD-USCHEMA-1), one
+genuinely missing concept worth adopting (*structural variation*), and a clear boundary — the
+paper is about **logical schema representation for tooling**, not about storage layout, read
+paths, or cost. It is orthogonal to ADR-094, not an alternative to it.
+
+== What the paper actually proposes
+
+U-Schema is a unified *logical* metamodel (expressed in Ecore/EMF) covering relational plus the
+four common NoSQL paradigms (columnar, document, key-value, graph). Its contributions:
+
+* **Structural variation as a first-class concept.** A schema type (entity or relationship) is a
+  *set of variations*; each variation is a set of named properties. This exists because
+  schemaless stores let objects of one type differ in structure.
+* **Four relationship kinds distinguished:** aggregation (embedding), reference (key-matching),
+  graph relationship type (with its own attributes and variations), and generalisation.
+* **Formal forward/reverse mappings** per paradigm, with a defined notion of *canonical mapping*
+  (forward-complete and trivially bidirectional).
+* **Two flavors:** *Full Variability* (all variations retained) and *Union Schema* (one
+  variation per type, with an `optional` flag). Conversion Full → Union is explicitly lossy and
+  one-way.
+* **Schema inference by MapReduce** for schemaless stores, with measured scalability (inference
+  cost 2×–18× a baseline aggregate query, improving with scale).
+* **The m+m argument:** with a unified model you need `n + n` mappings, not `n × (n − 1)`.
+
+== Where it lands on ProximaDB
+
+ProximaDB's canonical record already carries most of U-Schema's structural vocabulary, which is
+a good sign for the model's fit:
+
+[cols="1,2", options="header"]
+|===
+| U-Schema concept | ProximaDB equivalent
+| Entity type | `CatalogTableSchema` / collection
+| Attribute + primitive/collection types | `ProximaColumn` + `ProximaType`
+| Key | primary key / `oid`
+| **Aggregation** | `ProximaRecord.props` (`ProximaTree`, nested)
+| **Reference** | `TypedRef::ForeignKey { table, id }`
+| **Relationship type** | `EdgeShape` + `TypedRef::GraphEdge`
+| Union schema | `infer_proxima_schema`
+| **Structural variation** | **absent — no representation at all**
+| Generalisation / inheritance | absent
+| — | `TypedRef::Embedding` + `EmbeddingCell`: a **vector modality the paper does not model**
+|===
+
+=== The one actionable defect (TD-USCHEMA-1)
+
+`infer_proxima_schema` is a Union Schema in the paper's precise sense, and it violates the
+paper's union rule 3: a key seen with two irreconcilable types should yield two features, not
+one. ProximaDB instead locks the type to the first record and coerces the rest to NULL.
+
+Reproduced with a two-record probe (`Int64` then `String`): the String value becomes `None`.
+On `record_spill.rs` that is survivable — the msgpack tail still holds it. On
+`proximadb-iceberg-engine`'s schema-less `write_records_to_parquet`, **the Parquet column is the
+data and the value is silently lost on export.** Details and remedy in TD-USCHEMA-1.
+
+Worth noting this is the *same shape* as the problem TD-USUB-6 hit independently on the PAX
+side: a typed stripe cannot represent every value of a heterogeneous key, and the design there
+converged on "keep in the tail whatever the stripe cannot reproduce exactly". That is a
+variation-aware answer arrived at empirically; the paper supplies the vocabulary and the
+general rule.
+
+=== The concept worth adopting: structural variation
+
+ProximaDB decides which props to promote to typed columns from a **static** list —
+`resolve_flush_shred_spec` reads `config.filterable_columns`. U-Schema's `StructuralVariation`
+carries `count`, `firstTimestamp`, `lastTimestamp` per variation, which would make that decision
+evidence-driven instead.
+
+That is a direct fit with the co-design mandate's "optimise toward the measured trace
+distribution, not static heuristics", and it feeds TD-USUB-6's per-path write-amplification
+story: the arms differ precisely because one declares exact types and the other does not, and
+variation statistics would say *which keys are worth declaring*.
+
+The paper also supplies the common/specific distinction (`optional`), which ProximaDB loses by
+marking every inferred column `nullable: true`. A key present in every record could be NOT NULL —
+useful to the planner, not merely cosmetic.
+
+== Where it does NOT apply — the honest boundary
+
+Four reasons not to over-adopt this:
+
+. **It is a logical model; ProximaDB's current hard problems are physical.** The paper's own
+  conclusion defers physical schemas to future work ("U-Schema-Physical... will be extracted
+  from data stores"): indexes, physical distribution, layout. Everything ADR-094 has been
+  fighting — read depth, footer round trips, residual tails, manifest-vs-glob — is in the layer
+  U-Schema explicitly does not cover. It cannot substitute for that work.
+. **No vector modality.** Embeddings, quantization, and ANN have no representation. ProximaDB's
+  fifth paradigm would need a genuine extension, not a mapping. Any claim that U-Schema "covers
+  ProximaDB's models" would be false.
+. **Its applications are tooling, not runtime.** §10 proposes migration, schema query languages,
+  synthetic data generation, and visualisation. Valuable, but none is on ProximaDB's critical
+  path today, and adopting Ecore/EMF to get them would import a Java/Eclipse toolchain into a
+  Rust codebase — a large, low-payoff dependency.
+. **Inference is a full-scan batch operation.** Measured at 2×–18× a baseline aggregate query.
+  Running it to discover variations over a large collection is expensive, which argues for
+  tracking variation statistics **incrementally at write time** rather than adopting the
+  MapReduce inference design as-is.
+
+== Recommendation
+
+. **Do now:** fix TD-USCHEMA-1 — fail closed on the lossy export path, then implement union
+  rules 1–3 in `infer_proxima_schema`. This is a silent-data-loss defect, and the paper's rules
+  are a ready-made, principled specification for the fix.
+. **Do next, measured:** track per-key variation statistics at write time (count, first/last
+  seen) and use them to drive shred-spec selection, replacing the static `filterable_columns`
+  list. Gate on measurement per mandate #6.
+. **Borrow the vocabulary, not the framework:** "structural variation", "union vs full
+  variability", "common vs specific features" are precise terms for things ProximaDB already
+  does ad hoc. Adopting the language is free and improves the ADRs. Adopting Ecore/EMF is not
+  justified.
+. **Do not** treat U-Schema as an alternative to ADR-094. They address different layers, and the
+  paper says so itself.

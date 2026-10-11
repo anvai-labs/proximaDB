@@ -636,13 +636,18 @@ impl TantivyLogIndex {
 
     /// Convert SqlValue to string for indexing
     fn sql_value_to_string(&self, value: &SqlValue) -> String {
+        // Tokens keep THIS site's spellings: bytes as the length placeholder
+        // and null/unset as the empty token (the shared fn returns None for
+        // all three — per-site policy); other scalars + Jsonb render
+        // through the ONE shared crate fn; containers RECURSE (nested
+        // arrays/objects contribute their tokens to the _all field — a
+        // scalar-only flattening dropped depth-2+ content from the index).
+        if let Some(s) = super::sql_scalar_to_string(value) {
+            return s;
+        }
         match &value.value {
-            Some(SqlValueVariant::StringValue(s)) => s.clone(),
-            Some(SqlValueVariant::Int64Value(i)) => i.to_string(),
-            Some(SqlValueVariant::NumberValue(f)) => f.to_string(),
-            Some(SqlValueVariant::BoolValue(b)) => b.to_string(),
-            Some(SqlValueVariant::NullValue(_)) => String::new(),
             Some(SqlValueVariant::BytesValue(b)) => format!("<bytes:{}>", b.len()),
+            Some(SqlValueVariant::NullValue(_)) | None => String::new(),
             Some(SqlValueVariant::ArrayValue(arr)) => arr
                 .values
                 .iter()
@@ -655,7 +660,9 @@ impl TantivyLogIndex {
                 .map(|(k, v)| format!("{}:{}", k, self.sql_value_to_string(v)))
                 .collect::<Vec<_>>()
                 .join(" "),
-            None => String::new(),
+            // Unreachable for the variants the shared fn covers; the
+            // wildcard only keeps the match total.
+            _ => String::new(),
         }
     }
 }
@@ -663,6 +670,7 @@ impl TantivyLogIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::proximadb_v1::SqlArray;
     use std::collections::HashMap;
 
     fn make_log(
@@ -957,6 +965,89 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "log1");
+    }
+
+    #[test]
+    fn fulltext_search_indexes_decoded_jsonb_fields() {
+        let document = serde_json::json!({"request_id": "req-jsonb-42"});
+        let fields = [(
+            "context".to_string(),
+            SqlValue {
+                value: Some(SqlValueVariant::JsonbValue(
+                    proximadb_data_model::ProximaValue::to_jsonb_vec(&document)
+                        .expect("encode JSONB test value"),
+                )),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let index = TantivyLogIndex::new("test_ns").expect("create index");
+        let logs = vec![make_log_with_fields(
+            "jsonb-log",
+            "Request processed",
+            "api",
+            Severity::Info,
+            1000,
+            fields,
+        )];
+
+        index.index_logs(&logs).expect("index logs");
+        index.commit().expect("commit index");
+        let results = index
+            .search("req-jsonb-42", &LogSearchOptions::with_limit(10))
+            .expect("search JSONB contents");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "jsonb-log");
+    }
+
+    #[test]
+    fn fulltext_search_indexes_nested_container_depth() {
+        // Containers recurse — a nested array's elements (and a nested
+        // object's k:v tokens) must reach the _all field. A scalar-only
+        // flattening rendered depth-2+ content as "" and silently dropped
+        // it from the index (round-8 review finding).
+        let fields = [(
+            "tags".to_string(),
+            SqlValue {
+                value: Some(SqlValueVariant::ArrayValue(SqlArray {
+                    values: vec![
+                        SqlValue {
+                            value: Some(SqlValueVariant::StringValue("outer".to_string())),
+                        },
+                        SqlValue {
+                            value: Some(SqlValueVariant::ArrayValue(SqlArray {
+                                values: vec![SqlValue {
+                                    value: Some(SqlValueVariant::StringValue(
+                                        "inner-depth2".to_string(),
+                                    )),
+                                }],
+                            })),
+                        },
+                    ],
+                })),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let index = TantivyLogIndex::new("test_ns").expect("create index");
+        let logs = vec![make_log_with_fields(
+            "nested-log",
+            "Request processed",
+            "api",
+            Severity::Info,
+            1000,
+            fields,
+        )];
+
+        index.index_logs(&logs).expect("index logs");
+        index.commit().expect("commit index");
+        let results = index
+            .search("inner-depth2", &LogSearchOptions::with_limit(10))
+            .expect("search nested tokens");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "nested-log");
     }
 
     #[test]

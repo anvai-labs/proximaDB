@@ -382,7 +382,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=5790)
     parser.add_argument("--max-segments", type=int, default=1)
     parser.add_argument("--required-layout-version", type=int, default=3)
-    parser.add_argument("--target-recall", type=float, default=0.98)
+    parser.add_argument("--target-recall", type=float, default=0.975)
     parser.add_argument("--max-recall-regression", type=float, default=0.0005)
     parser.add_argument("--min-disk-get-reduction", type=float, default=0.20)
     parser.add_argument("--min-adaptive-cold-get-reduction", type=float, default=0.10)

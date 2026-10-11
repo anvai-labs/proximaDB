@@ -137,6 +137,13 @@ mod tests {
             (Some(SqlValueVariant::StringValue(va)), Some(SqlValueVariant::StringValue(vb))) => {
                 va == vb
             }
+            // TD-PROTO-2: JSONB compares by canonical decode — byte equality
+            // would be encoding-fragile, and the wildcard made it always
+            // false.
+            (Some(SqlValueVariant::JsonbValue(va)), Some(SqlValueVariant::JsonbValue(vb))) => {
+                proximadb_data_model::ProximaValue::jsonb_to_json_lossy(va)
+                    == proximadb_data_model::ProximaValue::jsonb_to_json_lossy(vb)
+            }
             (Some(SqlValueVariant::Int64Value(va)), Some(SqlValueVariant::NumberValue(vb))) => {
                 (*va as f64 - vb).abs() < f64::EPSILON
             }

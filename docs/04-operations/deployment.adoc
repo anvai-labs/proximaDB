@@ -20,7 +20,7 @@ cargo run --release --bin proximadb-server
 ----
 docker run -it --rm \
   -p 5678:5678 \
-  -p 5679:5679 \
+  -p 5433:5433 \
   vjsingh1984/proximadb:latest
 ----
 

@@ -223,7 +223,7 @@ impl<'a> GraphHandle<'a> {
     ///
     /// Kept on the facade's permissive `BatchNodesResponse` DTO rather than
     /// the typed `batch_create_nodes().send()`: the facade tolerates both the
-    /// `GraphResponse` envelope (`data.count`) and the legacy flat
+    /// `GraphResponse` envelope (`data.created_count`) and the legacy flat
     /// `added_count` shape, whereas the generated `BatchNodesResponse` models
     /// only the envelope. The wire connection still flows through the shared
     /// transport via `self.client.post`.
@@ -269,10 +269,10 @@ impl<'a> GraphHandle<'a> {
     /// the generated `get_node` operation's path/verb).
     ///
     /// Kept on the facade's permissive `GraphNode` DTO + hand-formatted path
-    /// rather than the typed `get_node().send()`: the generated `NodeResponse`
-    /// carries `labels: Vec<String>` and no `vector`, while the facade
-    /// `GraphNode` exposes a single `label` and an optional `vector`, and
-    /// `404` must surface as `Ok(None)` (the typed builder folds `404` into
+    /// rather than the typed `get_node().send()`: the generated response wraps
+    /// a canonical node with `labels` and `embedding`, while the facade exposes
+    /// the first `label` and the embedding `vector` directly. `404` must also
+    /// surface as `Ok(None)` (the typed builder folds it into
     /// `Error::ErrorResponse`). The wire connection, auth, and error mapping
     /// still flow through the shared transport via `self.client.get`.
     #[cfg(feature = "client")]
@@ -283,8 +283,8 @@ impl<'a> GraphHandle<'a> {
             self.name,
             id
         );
-        match self.client.get::<GraphNode>(&url).await {
-            Ok(node) => Ok(Some(node)),
+        match self.client.get::<GraphResponse<CanonicalNode>>(&url).await {
+            Ok(response) => Ok(Some(response.data.into())),
             Err(ProximaError::Network(crate::error::NetworkError::HttpError {
                 status: 404,
                 ..
@@ -651,11 +651,10 @@ impl<'a> TraversalBuilder<'a> {
     /// server-true field names.
     ///
     /// Kept on the facade's permissive `TraversalResult` DTO rather than the
-    /// typed `traverse_graph().send()`: the generated `TraverseResponse`
-    /// nests `NodeResponse`/`EdgeResponse` (labels as `Vec`, no `vector`),
-    /// which would require a lossy lowering into the facade `GraphNode`/
-    /// `GraphEdge`. The wire connection flows through the shared transport
-    /// via `self.handle.client.post`.
+    /// typed `traverse_graph().send()`: its canonical nodes/edges require an
+    /// explicit lowering (`labels`/`embedding` and canonical edge field names)
+    /// into the facade `GraphNode`/`GraphEdge`. The wire connection flows
+    /// through the shared transport via `self.handle.client.post`.
     #[cfg(feature = "client")]
     pub async fn execute(self) -> Result<TraversalResult> {
         let start_node_id = self.start_node.ok_or_else(|| {
@@ -680,7 +679,9 @@ impl<'a> TraversalBuilder<'a> {
             self.handle.client.url(),
             self.handle.name
         );
-        self.handle.client.post(&url, &request).await
+        let response: GraphResponse<CanonicalTraversalResult> =
+            self.handle.client.post(&url, &request).await?;
+        Ok(response.data.into())
     }
 }
 
@@ -852,7 +853,7 @@ struct BatchNodesRequest {
 #[derive(Debug, Deserialize)]
 struct BatchNodesResponse {
     /// Server returns a `GraphResponse<BatchResults<Node>>` envelope.
-    /// `data.count` is the canonical added count; `added_count` is a
+    /// `data.created_count` is the canonical added count; `added_count` is a
     /// flatter legacy shape we still accept for back-compat with older
     /// mocks.
     #[serde(default)]
@@ -865,7 +866,7 @@ impl BatchNodesResponse {
     fn added_count(&self) -> usize {
         self.data
             .as_ref()
-            .and_then(|d| d.count)
+            .and_then(|d| d.created_count.or(d.count))
             .or(self.added_count)
             .unwrap_or(0)
     }
@@ -888,7 +889,7 @@ impl BatchEdgesResponse {
     fn added_count(&self) -> usize {
         self.data
             .as_ref()
-            .and_then(|d| d.count)
+            .and_then(|d| d.created_count.or(d.count))
             .or(self.added_count)
             .unwrap_or(0)
     }
@@ -898,6 +899,83 @@ impl BatchEdgesResponse {
 struct BatchData {
     #[serde(default)]
     count: Option<usize>,
+    #[serde(default)]
+    created_count: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphResponse<T> {
+    data: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalEmbedding {
+    vector: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalNode {
+    id: String,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    properties: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    embedding: Option<CanonicalEmbedding>,
+}
+
+impl From<CanonicalNode> for GraphNode {
+    fn from(node: CanonicalNode) -> Self {
+        Self {
+            id: node.id,
+            label: node.labels.into_iter().next(),
+            properties: node.properties,
+            vector: node.embedding.map(|embedding| embedding.vector),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalEdge {
+    from_node_id: String,
+    to_node_id: String,
+    edge_type: String,
+    #[serde(default)]
+    properties: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    weight: Option<f64>,
+}
+
+impl From<CanonicalEdge> for GraphEdge {
+    fn from(edge: CanonicalEdge) -> Self {
+        Self {
+            source: edge.from_node_id,
+            target: edge.to_node_id,
+            relationship: edge.edge_type,
+            properties: edge.properties,
+            weight: edge.weight,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalTraversalResult {
+    #[serde(default)]
+    nodes: Vec<CanonicalNode>,
+    #[serde(default)]
+    edges: Vec<CanonicalEdge>,
+    #[serde(default)]
+    paths: Vec<Vec<String>>,
+}
+
+impl From<CanonicalTraversalResult> for TraversalResult {
+    fn from(result: CanonicalTraversalResult) -> Self {
+        Self {
+            nodes: result.nodes.into_iter().map(GraphNode::from).collect(),
+            edges: result.edges.into_iter().map(GraphEdge::from).collect(),
+            paths: result.paths,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1239,13 +1317,20 @@ mod tests {
 
     #[test]
     fn batch_responses_accept_graph_response_envelope_and_legacy_added_count() {
-        // Spec envelope: {success, data: {results: [...], count: N}}
+        // Spec envelope: the success count is explicit and may be lower than
+        // the request/result length when individual items are rejected.
         let nodes: BatchNodesResponse = serde_json::from_value(json!({
             "success": true,
-            "data": {"results": [{"id": "n1"}], "count": 2}
+            "data": {
+                "created_count": 1,
+                "updated_count": 0,
+                "failed_count": 1,
+                "results": [{"id": "n1"}],
+                "errors": [{"id": "n2", "error": "rejected"}]
+            }
         }))
         .unwrap();
-        assert_eq!(nodes.added_count(), 2);
+        assert_eq!(nodes.added_count(), 1);
 
         // Legacy flat shape for back-compat.
         let nodes_legacy: BatchNodesResponse =
@@ -1254,10 +1339,16 @@ mod tests {
 
         let edges: BatchEdgesResponse = serde_json::from_value(json!({
             "success": true,
-            "data": {"results": [], "count": 1}
+            "data": {
+                "created_count": 0,
+                "updated_count": 0,
+                "failed_count": 1,
+                "results": [],
+                "errors": [{"id": "e1", "error": "rejected"}]
+            }
         }))
         .unwrap();
-        assert_eq!(edges.added_count(), 1);
+        assert_eq!(edges.added_count(), 0);
     }
 
     #[test]

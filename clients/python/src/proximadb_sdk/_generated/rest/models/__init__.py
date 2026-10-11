@@ -5,19 +5,62 @@
 # fails if this directory drifts from a fresh regeneration.
 """Contains all the data models used in inputs/outputs"""
 
+from .abac_attr_value_type_0 import AbacAttrValueType0
+from .abac_attr_value_type_1 import AbacAttrValueType1
+from .abac_attr_value_type_2 import AbacAttrValueType2
+from .abac_attr_value_type_3 import AbacAttrValueType3
+from .abac_attribute_binding import AbacAttributeBinding
+from .abac_attribute_binding_attrs import AbacAttributeBindingAttrs
+from .abac_attribute_bindings_response import AbacAttributeBindingsResponse
+from .abac_column_scope import AbacColumnScope
+from .abac_comparison_operator import AbacComparisonOperator
+from .abac_effect import AbacEffect
+from .abac_field_mask import AbacFieldMask
+from .abac_filter_expression import AbacFilterExpression
+from .abac_grant_action import AbacGrantAction
+from .abac_grant_enforcement import AbacGrantEnforcement
+from .abac_grant_grantee_request import AbacGrantGranteeRequest
+from .abac_grant_record import AbacGrantRecord
+from .abac_grantee_type_0 import AbacGranteeType0
+from .abac_grantee_type_1 import AbacGranteeType1
+from .abac_grantee_user import AbacGranteeUser
+from .abac_operator_error_response import AbacOperatorErrorResponse
+from .abac_policy_binding import AbacPolicyBinding
+from .abac_policy_bindings_response import AbacPolicyBindingsResponse
+from .abac_post_attribute_binding_request import AbacPostAttributeBindingRequest
+from .abac_post_attribute_binding_request_attrs import (
+    AbacPostAttributeBindingRequestAttrs,
+)
+from .abac_post_grant_request import AbacPostGrantRequest
+from .abac_post_grant_response import AbacPostGrantResponse
+from .abac_predicate_object_response import AbacPredicateObjectResponse
+from .abac_predicate_objects_response import AbacPredicateObjectsResponse
+from .abac_put_policy_binding_request import AbacPutPolicyBindingRequest
+from .abac_put_tenant_posture_request import AbacPutTenantPostureRequest
+from .abac_scope_type_0 import AbacScopeType0
+from .abac_scope_type_1 import AbacScopeType1
+from .abac_scope_type_2 import AbacScopeType2
+from .abac_tenant_security_posture import AbacTenantSecurityPosture
+from .affinity_delete_response import AffinityDeleteResponse
+from .affinity_delete_response_status import AffinityDeleteResponseStatus
+from .affinity_list_item import AffinityListItem
+from .affinity_list_response import AffinityListResponse
+from .affinity_response import AffinityResponse
+from .affinity_response_status import AffinityResponseStatus
 from .append_model_evidence_mutation import AppendModelEvidenceMutation
 from .append_model_evidence_mutation_operation import (
     AppendModelEvidenceMutationOperation,
 )
 from .apply_model_registry_mutation_request import ApplyModelRegistryMutationRequest
+from .assignment_reason import AssignmentReason
 from .batch_create_edges_request import BatchCreateEdgesRequest
 from .batch_create_nodes_request import BatchCreateNodesRequest
-from .batch_edges_response import BatchEdgesResponse
-from .batch_edges_response_data import BatchEdgesResponseData
-from .batch_nodes_response import BatchNodesResponse
-from .batch_nodes_response_data import BatchNodesResponseData
 from .bulk_log_ingest_request import BulkLogIngestRequest
 from .bulk_metric_ingest_request import BulkMetricIngestRequest
+from .canonical_edge import CanonicalEdge
+from .canonical_edge_properties import CanonicalEdgeProperties
+from .canonical_node import CanonicalNode
+from .canonical_node_properties import CanonicalNodeProperties
 from .capabilities_response import CapabilitiesResponse
 from .capabilities_response_error_envelope import CapabilitiesResponseErrorEnvelope
 from .capabilities_response_limits import CapabilitiesResponseLimits
@@ -49,6 +92,7 @@ from .catalog_embedding_model_version import CatalogEmbeddingModelVersion
 from .catalog_embedding_output_contract import CatalogEmbeddingOutputContract
 from .catalog_evaluation_evidence import CatalogEvaluationEvidence
 from .catalog_evaluation_evidence_metrics import CatalogEvaluationEvidenceMetrics
+from .catalog_introspection_result import CatalogIntrospectionResult
 from .catalog_lineage_input import CatalogLineageInput
 from .catalog_lineage_input_kind import CatalogLineageInputKind
 from .catalog_model_access import CatalogModelAccess
@@ -66,8 +110,7 @@ from .collection_v2_response import CollectionV2Response
 from .collection_v2_summary import CollectionV2Summary
 from .create_collection_v2_request import CreateCollectionV2Request
 from .create_collection_v2_response import CreateCollectionV2Response
-from .create_document_collection_body import CreateDocumentCollectionBody
-from .create_document_collection_response_200 import CreateDocumentCollectionResponse200
+from .create_document_collection_request import CreateDocumentCollectionRequest
 from .create_edge_request import CreateEdgeRequest
 from .create_graph_request import CreateGraphRequest
 from .create_model_registry_request import CreateModelRegistryRequest
@@ -77,14 +120,25 @@ from .create_observability_namespace_response import (
     CreateObservabilityNamespaceResponse,
 )
 from .delete_collection_v2_response import DeleteCollectionV2Response
-from .delete_graph_response import DeleteGraphResponse
-from .delete_node_response import DeleteNodeResponse
 from .delete_record_v2_response import DeleteRecordV2Response
+from .doc_aggregate_request import DocAggregateRequest
+from .doc_aggregate_response import DocAggregateResponse
+from .doc_batch_insert_request import DocBatchInsertRequest
+from .doc_batch_insert_response import DocBatchInsertResponse
+from .doc_collection_list_response import DocCollectionListResponse
+from .doc_create_collection_response import DocCreateCollectionResponse
+from .doc_delete_ack import DocDeleteAck
+from .doc_index_definition import DocIndexDefinition
+from .doc_index_list_response import DocIndexListResponse
+from .doc_index_list_response_indexes_item import DocIndexListResponseIndexesItem
+from .doc_insert_request import DocInsertRequest
+from .doc_open_object import DocOpenObject
+from .doc_query_response import DocQueryResponse
+from .doc_response import DocResponse
+from .doc_update_request import DocUpdateRequest
+from .doc_update_response import DocUpdateResponse
 from .edge_input import EdgeInput
 from .edge_input_properties import EdgeInputProperties
-from .edge_response import EdgeResponse
-from .edge_response_properties_type_0 import EdgeResponsePropertiesType0
-from .embedding_input import EmbeddingInput
 from .entity_dto import EntityDto
 from .entity_dto_flexible_metadata import EntityDtoFlexibleMetadata
 from .entity_embedding_input import EntityEmbeddingInput
@@ -101,8 +155,48 @@ from .fusion_hit import FusionHit
 from .fusion_search_request import FusionSearchRequest
 from .fusion_search_response import FusionSearchResponse
 from .fusion_stats_dto import FusionStatsDto
+from .graph_batch_edges_response import GraphBatchEdgesResponse
+from .graph_batch_nodes_response import GraphBatchNodesResponse
+from .graph_collection_list_response import GraphCollectionListResponse
+from .graph_collection_list_response_data_item import (
+    GraphCollectionListResponseDataItem,
+)
 from .graph_collection_response import GraphCollectionResponse
+from .graph_collection_response_data import GraphCollectionResponseData
+from .graph_components_data import GraphComponentsData
+from .graph_components_response import GraphComponentsResponse
+from .graph_cycles_data import GraphCyclesData
+from .graph_cycles_response import GraphCyclesResponse
+from .graph_ddl_data import GraphDdlData
+from .graph_ddl_response import GraphDdlResponse
+from .graph_edge_batch_results import GraphEdgeBatchResults
+from .graph_edge_query import GraphEdgeQuery
+from .graph_edge_query_properties import GraphEdgeQueryProperties
+from .graph_edge_query_response import GraphEdgeQueryResponse
+from .graph_edge_query_results import GraphEdgeQueryResults
+from .graph_edge_response import GraphEdgeResponse
+from .graph_embedding import GraphEmbedding
+from .graph_error_body import GraphErrorBody
+from .graph_error_body_code import GraphErrorBodyCode
+from .graph_error_response import GraphErrorResponse
+from .graph_node_batch_results import GraphNodeBatchResults
+from .graph_node_list_response import GraphNodeListResponse
+from .graph_node_query import GraphNodeQuery
+from .graph_node_query_properties import GraphNodeQueryProperties
+from .graph_node_query_response import GraphNodeQueryResponse
+from .graph_node_query_results import GraphNodeQueryResults
+from .graph_node_response import GraphNodeResponse
+from .graph_query_data import GraphQueryData
+from .graph_query_request import GraphQueryRequest
+from .graph_query_response import GraphQueryResponse
+from .graph_response_metadata import GraphResponseMetadata
+from .graph_shortest_path_data import GraphShortestPathData
+from .graph_shortest_path_response import GraphShortestPathResponse
+from .graph_stats import GraphStats
 from .graph_stats_response import GraphStatsResponse
+from .graph_traversal_data import GraphTraversalData
+from .graph_traversal_response import GraphTraversalResponse
+from .graph_traversal_stats import GraphTraversalStats
 from .health_response import HealthResponse
 from .hnsw_config_input import HnswConfigInput
 from .hnsw_config_output import HnswConfigOutput
@@ -123,16 +217,12 @@ from .ingest_documents_response import IngestDocumentsResponse
 from .ingest_log_body import IngestLogBody
 from .ingest_log_response_200 import IngestLogResponse200
 from .ingested_record import IngestedRecord
-from .insert_document_body import InsertDocumentBody
-from .insert_document_response_200 import InsertDocumentResponse200
 from .insert_error import InsertError
 from .insert_records_request import InsertRecordsRequest
 from .insert_records_response import InsertRecordsResponse
 from .ivf_config_input import IvfConfigInput
 from .ivf_config_output import IvfConfigOutput
 from .list_collections_v2_response import ListCollectionsV2Response
-from .list_document_collections_response_200 import ListDocumentCollectionsResponse200
-from .list_graphs_response import ListGraphsResponse
 from .list_model_registries_response import ListModelRegistriesResponse
 from .log_entry_input import LogEntryInput
 from .log_entry_input_fields import LogEntryInputFields
@@ -148,23 +238,45 @@ from .model_registry_record_response import ModelRegistryRecordResponse
 from .nl_translate_request import NlTranslateRequest
 from .nl_translate_result import NlTranslateResult
 from .node_input import NodeInput
+from .node_input_embedding import NodeInputEmbedding
 from .node_input_properties import NodeInputProperties
-from .node_response import NodeResponse
-from .node_response_properties_type_0 import NodeResponsePropertiesType0
 from .observability_ingest_response import ObservabilityIngestResponse
+from .pin_list_item import PinListItem
+from .pin_list_response import PinListResponse
+from .pin_request import PinRequest
+from .pin_response import PinResponse
+from .pin_response_status import PinResponseStatus
+from .pin_target import PinTarget
 from .predicate_shortfall_wire import PredicateShortfallWire
+from .primary_pod import PrimaryPod
+from .primary_pod_assign_request import PrimaryPodAssignRequest
+from .primary_pod_assign_response import PrimaryPodAssignResponse
+from .primary_pod_list_item import PrimaryPodListItem
+from .primary_pod_list_response import PrimaryPodListResponse
+from .primary_pod_lookup_response import PrimaryPodLookupResponse
+from .primary_pod_lookup_response_status import PrimaryPodLookupResponseStatus
+from .primary_pod_operator_error_response import PrimaryPodOperatorErrorResponse
+from .primary_pod_unassign_response import PrimaryPodUnassignResponse
 from .probe_response import ProbeResponse
+from .projection_route_metadata_explanation import ProjectionRouteMetadataExplanation
 from .proxima_record_input import ProximaRecordInput
 from .proxima_record_input_props_type_0 import ProximaRecordInputPropsType0
 from .quantization_config_input import QuantizationConfigInput
 from .quantization_config_output import QuantizationConfigOutput
-from .query_documents_response_200 import QueryDocumentsResponse200
 from .query_language import QueryLanguage
 from .query_logs_body import QueryLogsBody
 from .query_logs_response_200 import QueryLogsResponse200
 from .query_request import QueryRequest
 from .query_request_parameters_type_0_item import QueryRequestParametersType0Item
 from .query_response import QueryResponse
+from .rank_overrides import RankOverrides
+from .rank_phase_override import RankPhaseOverride
+from .rank_score_vector import RankScoreVector
+from .rank_scored_hit import RankScoredHit
+from .rank_scored_hit_match_features import RankScoredHitMatchFeatures
+from .rank_scored_hit_summary_features import RankScoredHitSummaryFeatures
+from .rank_search_request import RankSearchRequest
+from .rank_search_response import RankSearchResponse
 from .record_model_decision_mutation import RecordModelDecisionMutation
 from .record_model_decision_mutation_operation import (
     RecordModelDecisionMutationOperation,
@@ -184,21 +296,57 @@ from .scan_records_response import ScanRecordsResponse
 from .schema_change import SchemaChange
 from .schema_definition import SchemaDefinition
 from .schema_response import SchemaResponse
+from .score_component import ScoreComponent
 from .search_entities_request import SearchEntitiesRequest
 from .search_entities_request_filters import SearchEntitiesRequestFilters
 from .search_entities_response import SearchEntitiesResponse
+from .shortest_path_request import ShortestPathRequest
 from .sql_request import SqlRequest
 from .sql_response import SqlResponse
 from .sql_response_rows_item import SqlResponseRowsItem
+from .table_write_candidate_explanation import TableWriteCandidateExplanation
+from .table_write_cost_explanation import TableWriteCostExplanation
+from .table_write_data_movement_explanation import TableWriteDataMovementExplanation
+from .table_write_explain_request import TableWriteExplainRequest
+from .table_write_intent_explanation import TableWriteIntentExplanation
+from .table_write_rejected_lane_explanation import TableWriteRejectedLaneExplanation
+from .table_write_rejected_path_explanation import TableWriteRejectedPathExplanation
+from .table_write_route_explanation import TableWriteRouteExplanation
+from .table_write_route_metadata_explanation import TableWriteRouteMetadataExplanation
 from .text_field_input import TextFieldInput
 from .text_field_output import TextFieldOutput
 from .traverse_request import TraverseRequest
-from .traverse_response import TraverseResponse
+from .ts_aggregate_request import TsAggregateRequest
+from .ts_aggregate_response import TsAggregateResponse
+from .ts_collection_config import TsCollectionConfig
+from .ts_create_response import TsCreateResponse
+from .ts_delete_response import TsDeleteResponse
+from .ts_ingest_request import TsIngestRequest
+from .ts_ingest_response import TsIngestResponse
+from .ts_list_response import TsListResponse
+from .ts_point import TsPoint
+from .ts_point_tags import TsPointTags
+from .ts_point_values import TsPointValues
+from .ts_query_request import TsQueryRequest
+from .ts_query_response import TsQueryResponse
+from .ts_value_column import TsValueColumn
 from .typed_filter import TypedFilter
 from .typed_search_request import TypedSearchRequest
 from .typed_search_response import TypedSearchResponse
 from .typed_search_result import TypedSearchResult
 from .typed_search_result_props import TypedSearchResultProps
+from .unified_bare_error import UnifiedBareError
+from .unified_distributed_request import UnifiedDistributedRequest
+from .unified_execute_prepared_request import UnifiedExecutePreparedRequest
+from .unified_execute_request import UnifiedExecuteRequest
+from .unified_explain_request import UnifiedExplainRequest
+from .unified_federated_request import UnifiedFederatedRequest
+from .unified_prepare_request import UnifiedPrepareRequest
+from .unified_prepare_response import UnifiedPrepareResponse
+from .unified_prepared_stats_request import UnifiedPreparedStatsRequest
+from .unique_constraint_request import UniqueConstraintRequest
+from .update_graph_schema_request import UpdateGraphSchemaRequest
+from .update_graph_schema_request_schema import UpdateGraphSchemaRequestSchema
 from .update_schema_request import UpdateSchemaRequest
 from .update_schema_response import UpdateSchemaResponse
 from .upsert_entity_request import UpsertEntityRequest
@@ -208,19 +356,62 @@ from .upsert_model_deployment_mutation import UpsertModelDeploymentMutation
 from .upsert_model_deployment_mutation_operation import (
     UpsertModelDeploymentMutationOperation,
 )
+from .walk_request import WalkRequest
+from .walk_step_request import WalkStepRequest
 
 __all__ = (
+    "AbacAttributeBinding",
+    "AbacAttributeBindingAttrs",
+    "AbacAttributeBindingsResponse",
+    "AbacAttrValueType0",
+    "AbacAttrValueType1",
+    "AbacAttrValueType2",
+    "AbacAttrValueType3",
+    "AbacColumnScope",
+    "AbacComparisonOperator",
+    "AbacEffect",
+    "AbacFieldMask",
+    "AbacFilterExpression",
+    "AbacGrantAction",
+    "AbacGranteeType0",
+    "AbacGranteeType1",
+    "AbacGranteeUser",
+    "AbacGrantEnforcement",
+    "AbacGrantGranteeRequest",
+    "AbacGrantRecord",
+    "AbacOperatorErrorResponse",
+    "AbacPolicyBinding",
+    "AbacPolicyBindingsResponse",
+    "AbacPostAttributeBindingRequest",
+    "AbacPostAttributeBindingRequestAttrs",
+    "AbacPostGrantRequest",
+    "AbacPostGrantResponse",
+    "AbacPredicateObjectResponse",
+    "AbacPredicateObjectsResponse",
+    "AbacPutPolicyBindingRequest",
+    "AbacPutTenantPostureRequest",
+    "AbacScopeType0",
+    "AbacScopeType1",
+    "AbacScopeType2",
+    "AbacTenantSecurityPosture",
+    "AffinityDeleteResponse",
+    "AffinityDeleteResponseStatus",
+    "AffinityListItem",
+    "AffinityListResponse",
+    "AffinityResponse",
+    "AffinityResponseStatus",
     "AppendModelEvidenceMutation",
     "AppendModelEvidenceMutationOperation",
     "ApplyModelRegistryMutationRequest",
+    "AssignmentReason",
     "BatchCreateEdgesRequest",
     "BatchCreateNodesRequest",
-    "BatchEdgesResponse",
-    "BatchEdgesResponseData",
-    "BatchNodesResponse",
-    "BatchNodesResponseData",
     "BulkLogIngestRequest",
     "BulkMetricIngestRequest",
+    "CanonicalEdge",
+    "CanonicalEdgeProperties",
+    "CanonicalNode",
+    "CanonicalNodeProperties",
     "CapabilitiesResponse",
     "CapabilitiesResponseErrorEnvelope",
     "CapabilitiesResponseLimits",
@@ -242,6 +433,7 @@ __all__ = (
     "CatalogEmbeddingOutputContract",
     "CatalogEvaluationEvidence",
     "CatalogEvaluationEvidenceMetrics",
+    "CatalogIntrospectionResult",
     "CatalogLineageInput",
     "CatalogLineageInputKind",
     "CatalogModelAccess",
@@ -257,8 +449,7 @@ __all__ = (
     "CollectionV2Summary",
     "CreateCollectionV2Request",
     "CreateCollectionV2Response",
-    "CreateDocumentCollectionBody",
-    "CreateDocumentCollectionResponse200",
+    "CreateDocumentCollectionRequest",
     "CreateEdgeRequest",
     "CreateGraphRequest",
     "CreateModelRegistryRequest",
@@ -266,14 +457,25 @@ __all__ = (
     "CreateObservabilityNamespaceRequest",
     "CreateObservabilityNamespaceResponse",
     "DeleteCollectionV2Response",
-    "DeleteGraphResponse",
-    "DeleteNodeResponse",
     "DeleteRecordV2Response",
+    "DocAggregateRequest",
+    "DocAggregateResponse",
+    "DocBatchInsertRequest",
+    "DocBatchInsertResponse",
+    "DocCollectionListResponse",
+    "DocCreateCollectionResponse",
+    "DocDeleteAck",
+    "DocIndexDefinition",
+    "DocIndexListResponse",
+    "DocIndexListResponseIndexesItem",
+    "DocInsertRequest",
+    "DocOpenObject",
+    "DocQueryResponse",
+    "DocResponse",
+    "DocUpdateRequest",
+    "DocUpdateResponse",
     "EdgeInput",
     "EdgeInputProperties",
-    "EdgeResponse",
-    "EdgeResponsePropertiesType0",
-    "EmbeddingInput",
     "EntityDto",
     "EntityDtoFlexibleMetadata",
     "EntityEmbeddingInput",
@@ -290,8 +492,46 @@ __all__ = (
     "FusionSearchRequest",
     "FusionSearchResponse",
     "FusionStatsDto",
+    "GraphBatchEdgesResponse",
+    "GraphBatchNodesResponse",
+    "GraphCollectionListResponse",
+    "GraphCollectionListResponseDataItem",
     "GraphCollectionResponse",
+    "GraphCollectionResponseData",
+    "GraphComponentsData",
+    "GraphComponentsResponse",
+    "GraphCyclesData",
+    "GraphCyclesResponse",
+    "GraphDdlData",
+    "GraphDdlResponse",
+    "GraphEdgeBatchResults",
+    "GraphEdgeQuery",
+    "GraphEdgeQueryProperties",
+    "GraphEdgeQueryResponse",
+    "GraphEdgeQueryResults",
+    "GraphEdgeResponse",
+    "GraphEmbedding",
+    "GraphErrorBody",
+    "GraphErrorBodyCode",
+    "GraphErrorResponse",
+    "GraphNodeBatchResults",
+    "GraphNodeListResponse",
+    "GraphNodeQuery",
+    "GraphNodeQueryProperties",
+    "GraphNodeQueryResponse",
+    "GraphNodeQueryResults",
+    "GraphNodeResponse",
+    "GraphQueryData",
+    "GraphQueryRequest",
+    "GraphQueryResponse",
+    "GraphResponseMetadata",
+    "GraphShortestPathData",
+    "GraphShortestPathResponse",
+    "GraphStats",
     "GraphStatsResponse",
+    "GraphTraversalData",
+    "GraphTraversalResponse",
+    "GraphTraversalStats",
     "HealthResponse",
     "HnswConfigInput",
     "HnswConfigOutput",
@@ -312,16 +552,12 @@ __all__ = (
     "IngestedRecord",
     "IngestLogBody",
     "IngestLogResponse200",
-    "InsertDocumentBody",
-    "InsertDocumentResponse200",
     "InsertError",
     "InsertRecordsRequest",
     "InsertRecordsResponse",
     "IvfConfigInput",
     "IvfConfigOutput",
     "ListCollectionsV2Response",
-    "ListDocumentCollectionsResponse200",
-    "ListGraphsResponse",
     "ListModelRegistriesResponse",
     "LogEntryInput",
     "LogEntryInputFields",
@@ -337,23 +573,45 @@ __all__ = (
     "NlTranslateRequest",
     "NlTranslateResult",
     "NodeInput",
+    "NodeInputEmbedding",
     "NodeInputProperties",
-    "NodeResponse",
-    "NodeResponsePropertiesType0",
     "ObservabilityIngestResponse",
+    "PinListItem",
+    "PinListResponse",
+    "PinRequest",
+    "PinResponse",
+    "PinResponseStatus",
+    "PinTarget",
     "PredicateShortfallWire",
+    "PrimaryPod",
+    "PrimaryPodAssignRequest",
+    "PrimaryPodAssignResponse",
+    "PrimaryPodListItem",
+    "PrimaryPodListResponse",
+    "PrimaryPodLookupResponse",
+    "PrimaryPodLookupResponseStatus",
+    "PrimaryPodOperatorErrorResponse",
+    "PrimaryPodUnassignResponse",
     "ProbeResponse",
+    "ProjectionRouteMetadataExplanation",
     "ProximaRecordInput",
     "ProximaRecordInputPropsType0",
     "QuantizationConfigInput",
     "QuantizationConfigOutput",
-    "QueryDocumentsResponse200",
     "QueryLanguage",
     "QueryLogsBody",
     "QueryLogsResponse200",
     "QueryRequest",
     "QueryRequestParametersType0Item",
     "QueryResponse",
+    "RankOverrides",
+    "RankPhaseOverride",
+    "RankScoredHit",
+    "RankScoredHitMatchFeatures",
+    "RankScoredHitSummaryFeatures",
+    "RankScoreVector",
+    "RankSearchRequest",
+    "RankSearchResponse",
     "RecordModelDecisionMutation",
     "RecordModelDecisionMutationOperation",
     "RecordV2Response",
@@ -369,21 +627,57 @@ __all__ = (
     "SchemaChange",
     "SchemaDefinition",
     "SchemaResponse",
+    "ScoreComponent",
     "SearchEntitiesRequest",
     "SearchEntitiesRequestFilters",
     "SearchEntitiesResponse",
+    "ShortestPathRequest",
     "SqlRequest",
     "SqlResponse",
     "SqlResponseRowsItem",
+    "TableWriteCandidateExplanation",
+    "TableWriteCostExplanation",
+    "TableWriteDataMovementExplanation",
+    "TableWriteExplainRequest",
+    "TableWriteIntentExplanation",
+    "TableWriteRejectedLaneExplanation",
+    "TableWriteRejectedPathExplanation",
+    "TableWriteRouteExplanation",
+    "TableWriteRouteMetadataExplanation",
     "TextFieldInput",
     "TextFieldOutput",
     "TraverseRequest",
-    "TraverseResponse",
+    "TsAggregateRequest",
+    "TsAggregateResponse",
+    "TsCollectionConfig",
+    "TsCreateResponse",
+    "TsDeleteResponse",
+    "TsIngestRequest",
+    "TsIngestResponse",
+    "TsListResponse",
+    "TsPoint",
+    "TsPointTags",
+    "TsPointValues",
+    "TsQueryRequest",
+    "TsQueryResponse",
+    "TsValueColumn",
     "TypedFilter",
     "TypedSearchRequest",
     "TypedSearchResponse",
     "TypedSearchResult",
     "TypedSearchResultProps",
+    "UnifiedBareError",
+    "UnifiedDistributedRequest",
+    "UnifiedExecutePreparedRequest",
+    "UnifiedExecuteRequest",
+    "UnifiedExplainRequest",
+    "UnifiedFederatedRequest",
+    "UnifiedPreparedStatsRequest",
+    "UnifiedPrepareRequest",
+    "UnifiedPrepareResponse",
+    "UniqueConstraintRequest",
+    "UpdateGraphSchemaRequest",
+    "UpdateGraphSchemaRequestSchema",
     "UpdateSchemaRequest",
     "UpdateSchemaResponse",
     "UpsertEntityRequest",
@@ -391,4 +685,6 @@ __all__ = (
     "UpsertEntityResponse",
     "UpsertModelDeploymentMutation",
     "UpsertModelDeploymentMutationOperation",
+    "WalkRequest",
+    "WalkStepRequest",
 )

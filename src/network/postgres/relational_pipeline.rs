@@ -987,7 +987,7 @@ pub async fn try_run_select(
     // lazily per scan in `DmlTableReader::open`, with the executor's
     // projection/predicate/limit pushed into storage.
     let mut names = Vec::new();
-    collect_table_names(query, &mut names);
+    let cte_names = collect_table_names(query, &mut names);
     let mut tables: HashMap<String, PreparedTable> = HashMap::new();
     // P1: per-table Parquet location (object-store backed), populated only under the
     // `datafusion-integration` feature so the OLAP DataFusion route is never taken
@@ -1011,6 +1011,11 @@ pub async fn try_run_select(
     let mut pax_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw in &names {
         let key = normalize_table_key(raw);
+        // TD-185a: a WITH-defined name is resolved by the SQL engine, not the
+        // catalog — it must never fail snapshot preparation.
+        if cte_names.contains(&key) {
+            continue;
+        }
         if tables.contains_key(&key) {
             continue;
         }
@@ -1051,6 +1056,33 @@ pub async fn try_run_select(
         && tables.keys().all(|k| parquet_loc_by_key.contains_key(k));
     #[cfg(not(feature = "datafusion-integration"))]
     let parquet_backed = false;
+
+    // TD-USUB-2: every referenced table is a native relational table (no Parquet
+    // layout) that can be registered with the DataFusion destination directly. This
+    // is what makes CTEs / window functions / joins reachable without a manual
+    // `ALTER TABLE … MATERIALIZE` — the capability cliff ADR-094 records as defect (b).
+    //
+    // Mixed Parquet+native queries stay `false` (the Parquet arm already serves those,
+    // and cross-representation joins are a later phase).
+    //
+    // TD-USUB-3: a governed (ABAC-scoped) session IS admitted here, unlike the Parquet
+    // arm. That asymmetry is the whole point — every row this path registers comes from
+    // `scan_table_relational`, which resolves the ABAC row filter itself, so the rows
+    // handed to DataFusion are already governed. The Parquet arm reads files directly
+    // and cannot apply a row filter, which is why it stays excluded under ABAC.
+    //
+    // The one hole is a table-valued function: a UDTF never appears in `tables` and
+    // resolves through `vector_ops`/`graph_ops`, which do not apply the relational row
+    // filter. `query_has_table_function` is the fail-closed guard that keeps a governed
+    // query from mixing governed rows with an ungoverned source.
+    #[cfg(feature = "datafusion-integration")]
+    let native_registerable =
+        crate::query::execution::native_table_provider::native_table_provider_enabled()
+            && !tables.is_empty()
+            && tables.keys().all(|k| !parquet_loc_by_key.contains_key(k))
+            && (!relational_abac_required || !query_has_table_function(query));
+    #[cfg(not(feature = "datafusion-integration"))]
+    let native_registerable = false;
 
     // TD-OLAP-1 Test 2.1: compute the per-query PAX-backed signal from catalog
     // PAX format detection. A table is PAX-backed if it has ANY storage layout
@@ -1098,6 +1130,7 @@ pub async fn try_run_select(
         parquet_backed,
         // TD-OLAP-1 Test 2.1: Route flip from catalog signals (no longer hard-coded)
         pax_backed,
+        native_registerable,
         partition_fanout,
         cardinality,
         operation_class,
@@ -1146,8 +1179,16 @@ pub async fn try_run_select(
     // other `decision.backend` (never produced for a parquet-OLAP shape) falls
     // through to the Volcano path below — exactly as before.
     #[cfg(feature = "datafusion-integration")]
-    if !relational_abac_required
-        && parquet_backed
+    // TD-USUB-2 admits natively-registerable tables, so SQL capability stops depending
+    // on whether someone ran `ALTER TABLE … MATERIALIZE`.
+    //
+    // TD-USUB-3 splits the ABAC condition per arm rather than gating the whole block:
+    // the **Parquet** arm still requires `!relational_abac_required` (it reads files
+    // directly and cannot apply a row filter), while the **native** arm may serve a
+    // governed subject because its rows arrive pre-filtered by `scan_table_relational`.
+    // `native_registerable` already carries the no-UDTF guard, so it is safe to admit
+    // on its own here.
+    if ((!relational_abac_required && parquet_backed) || native_registerable)
         && matches!(
             decision.backend,
             crate::query::table_write_plan::ComputeBackend::DataFusionLocal
@@ -1160,9 +1201,16 @@ pub async fn try_run_select(
         // keyed by table_name (matching `parquet_tables`) and derived from
         // `parquet_trust_by_key` (keyed by the canonical table key). Drives adapter
         // elision gating.
+        // TD-USUB-2: `filter_map`, not index. A natively-registerable query has no
+        // Parquet location for its tables, and indexing would panic. When every table
+        // IS Parquet-backed this is byte-identical to the previous `map`.
         let parquet_tables: Vec<(String, String)> = tables
             .iter()
-            .map(|(k, t)| (t.table_name.clone(), parquet_loc_by_key[k].clone()))
+            .filter_map(|(k, t)| {
+                parquet_loc_by_key
+                    .get(k)
+                    .map(|loc| (t.table_name.clone(), loc.clone()))
+            })
             .collect();
         let parquet_table_trust: HashMap<String, StatsTrust> = tables
             .iter()
@@ -1319,6 +1367,24 @@ pub async fn try_run_select(
             // ADR-025: reconcile opted-in parquet-backed tables with their
             // post-snapshot WAL delta at scan time. `None` (no opted-in table)
             // keeps the legacy bare-Parquet read (default-OFF).
+            // TD-USUB-2: native relational tables registered as MemTables, so the
+            // DataFusion floor (and its `ctx.sql` fallback) can serve them. `None`
+            // whenever the gate is off or any table is Parquet-backed.
+            native_tables: if native_registerable {
+                Some(
+                    crate::query::execution::native_table_provider::NativeTableConfig {
+                        source: dml.clone(),
+                        tables: tables
+                            .iter()
+                            .map(|(k, t)| (k.clone(), t.table_name.clone()))
+                            .collect(),
+                        row_cap:
+                            crate::query::execution::native_table_provider::native_table_row_cap(),
+                    },
+                )
+            } else {
+                None
+            },
             olap_delta: if olap_delta_tables.is_empty() {
                 None
             } else {
@@ -2982,10 +3048,14 @@ async fn build_snapshot(
 ) -> Option<SnapshotCatalog> {
     let tenant = identity.tenant_id;
     let mut names = Vec::new();
-    collect_table_names(query, &mut names);
+    let cte_names = collect_table_names(query, &mut names);
     let mut tables: HashMap<String, PreparedTable> = HashMap::new();
     for raw in &names {
         let key = normalize_table_key(raw);
+        // TD-185a: WITH-defined names resolve by the SQL engine, not the catalog.
+        if cte_names.contains(&key) {
+            continue;
+        }
         if tables.contains_key(&key) {
             continue;
         }
@@ -3069,11 +3139,15 @@ async fn route_and_plan_select(
     #[cfg(feature = "datafusion-integration")]
     {
         let mut names = Vec::new();
-        collect_table_names(query, &mut names);
+        let cte_names = collect_table_names(query, &mut names);
         if !names.is_empty() {
             let mut all_parquet = true;
             let mut locations = Vec::with_capacity(names.len());
             for raw in &names {
+                // TD-185a: WITH-defined names resolve by the SQL engine.
+                if cte_names.contains(&normalize_table_key(raw)) {
+                    continue;
+                }
                 match dml.resolve_relational_schema(raw, tenant).await {
                     Ok(schema) => match catalog_table_is_parquet_backed(&schema) {
                         Some(location) => locations.push(location),
@@ -3502,11 +3576,16 @@ mod route_explain_tests {
 // =========================================================================
 
 /// True iff the query uses a feature the legacy single-table path can't serve
-/// (join / GROUP BY / HAVING / aggregate projection / set-op), so it should be
-/// routed to the algebra engine over real data. Simple single-table SELECTs
-/// return false and stay on the legacy path.
+/// (join / GROUP BY / HAVING / aggregate projection / set-op / WITH), so it
+/// should be routed to the algebra engine over real data. Simple single-table
+/// SELECTs return false and stay on the legacy path.
 fn query_engages_relational_engine(query: &SqlQuery) -> bool {
-    set_expr_engages(&query.body)
+    // TD-185a: a WITH (CTE) header is itself beyond the legacy single-table
+    // path — the CTE name is not a catalog table, so the legacy FROM-token
+    // walk can only misparse it. Engage the relational/OLAP route; the
+    // frontend's CTE decline then falls the query through to the DataFusion
+    // floor (which plans CTEs, recursive included, natively).
+    query.with.is_some() || set_expr_engages(&query.body)
 }
 
 /// TD-OLAP-4 operation dimension: classify the SELECT's OLAP operation from the AST
@@ -3558,6 +3637,62 @@ fn query_operation_class(query: &SqlQuery) -> crate::query::compute_scheduler::O
 /// signal — a `JOIN … GROUP BY` classifies as `Grouped` (the FROM clause is
 /// never inspected there) — hence a dedicated shape bit. Fail-closed: set-op /
 /// non-`SELECT` bodies count as join-bearing.
+/// TD-USUB-3: does the query reference a table-valued function anywhere?
+///
+/// **This is a security guard, not an optimization.** `collect_table_names` only
+/// gathers `TableFactor::Table { args: None, .. }` — plain catalog tables — so a
+/// UDTF (`vector_search(...)`, `graph_traverse(...)`, `timeseries_range(...)`,
+/// `documents(...)`) never appears in the prepared `tables` map. A UDTF resolves
+/// instead through its registered DataFusion table function, backed by
+/// `vector_ops`/`graph_ops`, which do **not** apply the relational ABAC row filter.
+///
+/// The native table provider (TD-USUB-2) is safe for a governed subject precisely
+/// because every row it registers came from `scan_table_relational`, which resolves
+/// the row filter itself. That argument covers catalog tables only. A query that
+/// also reaches a UDTF would mix governed rows with an ungoverned source, so under
+/// ABAC such a query must keep declining rather than be admitted to the DataFusion
+/// route.
+///
+/// Fail-closed by construction: anything that is not a plain
+/// `TableFactor::Table { args: None }` — including set-ops and non-`SELECT` bodies,
+/// via the wildcard arms — counts as carrying a table function.
+fn query_has_table_function(query: &SqlQuery) -> bool {
+    fn factor_has_tvf(factor: &TableFactor) -> bool {
+        match factor {
+            TableFactor::Table { args: Some(_), .. } => true,
+            TableFactor::Table { args: None, .. } => false,
+            TableFactor::Derived { subquery, .. } => query_has_table_function(subquery),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => twj_has_tvf(table_with_joins),
+            // Unknown/exotic factors are treated as carrying one — fail closed.
+            _ => true,
+        }
+    }
+    fn twj_has_tvf(twj: &TableWithJoins) -> bool {
+        factor_has_tvf(&twj.relation) || twj.joins.iter().any(|j| factor_has_tvf(&j.relation))
+    }
+    fn set_expr_has_tvf(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(select) => select.from.iter().any(twj_has_tvf),
+            SetExpr::Query(q) => query_has_table_function(q),
+            // A set operation is not decomposed here; treat it as carrying one.
+            SetExpr::SetOperation { .. } => true,
+            _ => true,
+        }
+    }
+    // A CTE body can hide the UDTF the outer query then scans.
+    if let Some(with) = &query.with
+        && with
+            .cte_tables
+            .iter()
+            .any(|cte| query_has_table_function(&cte.query))
+    {
+        return true;
+    }
+    set_expr_has_tvf(&query.body)
+}
+
 fn query_join_bearing(query: &SqlQuery) -> bool {
     // Generic expression traversal covers scalar/IN/EXISTS subqueries in
     // projection, WHERE, HAVING, GROUP BY, ORDER BY, and other query clauses.
@@ -3963,6 +4098,17 @@ fn set_expr_engages(body: &SetExpr) -> bool {
                 .from
                 .iter()
                 .any(|twj| matches!(&twj.relation, TableFactor::Table { args: Some(_), .. }));
+            // TD-187: a bare window function (`LAG`/`LEAD`/`ROW_NUMBER`/`RANK`/etc.)
+            // in the projection, with no GROUP BY/derived-table/aggregate-named
+            // wrapper to accidentally trip one of the checks above, previously fell
+            // through to the legacy single-table path — whose `extract_selected_column_names`
+            // has no expression parser and mis-extracts the first bare token of a
+            // computed projection as a literal column name (`usage_user - lag(usage_user)
+            // over (...) as delta` was read as requesting the plain `usage_user` column
+            // a second time), silently returning `delta == usage_user` instead of the
+            // real lagged difference. Engage the relational/OLAP route so ANY windowed
+            // projection reaches DataFusion's real window executor.
+            let has_window = select.projection.iter().any(select_item_has_window);
             has_join
                 || has_group_by
                 || select.having.is_some()
@@ -3972,6 +4118,7 @@ fn set_expr_engages(body: &SetExpr) -> bool {
                 || has_derived
                 || has_json_extract
                 || has_table_function
+                || has_window
         }
         _ => false,
     }
@@ -4077,28 +4224,64 @@ fn expr_has_aggregate(expr: &SqlExpr) -> bool {
     }
 }
 
-fn collect_table_names(query: &SqlQuery, out: &mut Vec<String>) {
-    collect_from_set_expr(&query.body, out);
+/// Collect every catalog table referenced by `query`, returning the set of
+/// CTE-local names declared by any (possibly nested) `WITH` clause.
+///
+/// TD-185a: base tables inside CTE bodies must resolve into the snapshot
+/// (the executor/DATAFusion floor needs their schemas), while a FROM
+/// reference to a CTE name must NOT be resolved as a catalog table — before
+/// this, the CTE name was collected as a table, schema resolution failed,
+/// and the whole WITH query silently bounced to the legacy single-table
+/// path (the recursive-CTE empty-result bug).
+fn collect_table_names(
+    query: &SqlQuery,
+    out: &mut Vec<String>,
+) -> std::collections::HashSet<String> {
+    let mut cte_names = std::collections::HashSet::new();
+    collect_query_tables(query, out, &mut cte_names);
+    cte_names
 }
 
-fn collect_from_set_expr(body: &SetExpr, out: &mut Vec<String>) {
+fn collect_query_tables(
+    query: &SqlQuery,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
+    // Nested WITH scopes add their CTE names to the shared set. SQL shadowing
+    // semantics would confine a CTE name to its own scope; the shared set is
+    // wider, and only in the pathological case of a real table shadowed by a
+    // same-named CTE outside its scope — acceptable for snapshot preparation.
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            cte_names.insert(normalize_table_key(&cte.alias.name.value));
+            collect_query_tables(&cte.query, out, cte_names);
+        }
+    }
+    collect_from_set_expr(&query.body, out, cte_names);
+}
+
+fn collect_from_set_expr(
+    body: &SetExpr,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
     match body {
         SetExpr::Select(select) => {
             for twj in &select.from {
-                collect_from_table_with_joins(twj, out);
+                collect_from_table_with_joins(twj, out, cte_names);
             }
             // Also descend into WHERE subqueries (IN/EXISTS lower to Semi/Anti joins
             // whose right side scans the subquery's tables) so those tables get
             // prepared in the snapshot — otherwise the subquery fails to lower and
             // the query silently falls through to the legacy path.
             if let Some(where_expr) = &select.selection {
-                collect_subquery_tables_in_expr(where_expr, out);
+                collect_subquery_tables_in_expr(where_expr, out, cte_names);
             }
         }
-        SetExpr::Query(q) => collect_table_names(q, out),
+        SetExpr::Query(q) => collect_query_tables(q, out, cte_names),
         SetExpr::SetOperation { left, right, .. } => {
-            collect_from_set_expr(left, out);
-            collect_from_set_expr(right, out);
+            collect_from_set_expr(left, out, cte_names);
+            collect_from_set_expr(right, out, cte_names);
         }
         _ => {}
     }
@@ -4106,18 +4289,22 @@ fn collect_from_set_expr(body: &SetExpr, out: &mut Vec<String>) {
 
 /// Collect table names referenced by subqueries inside a WHERE expression
 /// (`IN (…)`, `EXISTS`, scalar subqueries), recursing through boolean structure.
-fn collect_subquery_tables_in_expr(expr: &SqlExpr, out: &mut Vec<String>) {
+fn collect_subquery_tables_in_expr(
+    expr: &SqlExpr,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
     match expr {
         SqlExpr::InSubquery { subquery, .. } | SqlExpr::Exists { subquery, .. } => {
-            collect_table_names(subquery, out);
+            collect_query_tables(subquery, out, cte_names);
         }
-        SqlExpr::Subquery(q) => collect_table_names(q, out),
+        SqlExpr::Subquery(q) => collect_query_tables(q, out, cte_names),
         SqlExpr::BinaryOp { left, right, .. } => {
-            collect_subquery_tables_in_expr(left, out);
-            collect_subquery_tables_in_expr(right, out);
+            collect_subquery_tables_in_expr(left, out, cte_names);
+            collect_subquery_tables_in_expr(right, out, cte_names);
         }
         SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => {
-            collect_subquery_tables_in_expr(expr, out);
+            collect_subquery_tables_in_expr(expr, out, cte_names);
         }
         _ => {}
     }
@@ -4134,14 +4321,22 @@ fn table_with_joins_has_derived(twj: &TableWithJoins) -> bool {
             .any(|j| matches!(j.relation, TableFactor::Derived { .. }))
 }
 
-fn collect_from_table_with_joins(twj: &TableWithJoins, out: &mut Vec<String>) {
-    collect_from_table_factor(&twj.relation, out);
+fn collect_from_table_with_joins(
+    twj: &TableWithJoins,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
+    collect_from_table_factor(&twj.relation, out, cte_names);
     for join in &twj.joins {
-        collect_from_table_factor(&join.relation, out);
+        collect_from_table_factor(&join.relation, out, cte_names);
     }
 }
 
-fn collect_from_table_factor(factor: &TableFactor, out: &mut Vec<String>) {
+fn collect_from_table_factor(
+    factor: &TableFactor,
+    out: &mut Vec<String>,
+    cte_names: &mut std::collections::HashSet<String>,
+) {
     match factor {
         // A `FROM name(args)` item is a table-valued function (cross-modal source:
         // vector_search / timeseries_range / graph_traverse), NOT a catalog table.
@@ -4152,10 +4347,16 @@ fn collect_from_table_factor(factor: &TableFactor, out: &mut Vec<String>) {
         // table-valued function (cross-modal source: vector_search / timeseries_range /
         // graph_traverse) — it matches neither arm below, falls through to `_`, and is left for
         // the DataFusion `ctx.sql` fallback (where the UDTFs are registered) to resolve.
+        // TD-185a: a reference to a WITH-defined name resolves by the SQL
+        // engine, not the catalog — the match guard skips it so it can't fail
+        // snapshot preparation.
         TableFactor::Table {
             name, args: None, ..
-        } => out.push(name.to_string()),
-        TableFactor::Derived { subquery, .. } => collect_table_names(subquery, out),
+        } if !cte_names.contains(&normalize_table_key(&name.to_string())) => {
+            out.push(name.to_string());
+        }
+        TableFactor::Table { args: None, .. } => {}
+        TableFactor::Derived { subquery, .. } => collect_query_tables(subquery, out, cte_names),
         _ => {}
     }
 }
@@ -4409,6 +4610,37 @@ mod tests {
         // Default-safe: a plain single-table SELECT does NOT engage via this signal
         // (it has `args: None`) — it stays on the hardened legacy OLTP path.
         assert!(!gate("SELECT id, name FROM users WHERE id = 1"));
+    }
+
+    /// TD-187: a bare window function in the projection — with no GROUP BY,
+    /// derived-table wrapper, or aggregate-named function to accidentally trip
+    /// one of the other checks — must engage the relational/OLAP route. Before
+    /// this, `SELECT a, a - lag(a) OVER (...) AS delta FROM t` fell through to
+    /// the legacy single-table path, whose projection extractor has no
+    /// expression parser and silently mis-read the computed column as a second
+    /// request for the bare column `a`, returning `delta == a` for every row
+    /// (never NULL for the first row, never the true lagged difference).
+    #[test]
+    fn bare_window_function_engages() {
+        assert!(
+            gate(
+                "SELECT hostname, usage_user, usage_user - lag(usage_user) OVER (PARTITION BY hostname ORDER BY ts) AS delta FROM cpu"
+            ),
+            "a bare LAG in an arithmetic projection must engage"
+        );
+        assert!(
+            gate(
+                "SELECT hostname, rank() OVER (PARTITION BY hostname ORDER BY usage_user DESC) AS r FROM cpu"
+            ),
+            "RANK (not an aggregate name) must engage too"
+        );
+        assert!(
+            gate("SELECT hostname, lead(usage_user) OVER (ORDER BY ts) FROM cpu"),
+            "LEAD must engage"
+        );
+        // A plain single-table SELECT with no window function still does not
+        // engage via this signal (unchanged default-safe behavior).
+        assert!(!gate("SELECT hostname, usage_user FROM cpu"));
     }
 
     /// ADR-058 D5 / §9.A: the stats-trust derivation is the load-bearing security
@@ -4809,6 +5041,51 @@ mod tests {
         (**query).clone()
     }
 
+    /// TD-USUB-3: the UDTF guard is a **security** boundary — it is what keeps a
+    /// governed (ABAC) session from being admitted to the DataFusion route when the
+    /// query also reaches an ungoverned source. A false negative here leaks rows, so
+    /// the guard must see a table function at every nesting level, and must fail
+    /// closed on shapes it does not decompose.
+    #[test]
+    fn table_function_guard_sees_udtfs_at_every_nesting_level() {
+        // Plain catalog tables: no UDTF, so a governed session may use the native route.
+        assert!(!query_has_table_function(&parse_query(
+            "SELECT id FROM users WHERE id = 1"
+        )));
+        assert!(!query_has_table_function(&parse_query(
+            "SELECT u.id FROM users u JOIN orders o ON u.id = o.uid"
+        )));
+        assert!(!query_has_table_function(&parse_query(
+            "WITH hot AS (SELECT id FROM users) SELECT id FROM hot"
+        )));
+        assert!(!query_has_table_function(&parse_query(
+            "SELECT id, rank() OVER (ORDER BY id) FROM users"
+        )));
+
+        // Bare UDTF in FROM.
+        assert!(query_has_table_function(&parse_query(
+            "SELECT * FROM vector_search('c', '[0.1]', 5)"
+        )));
+        // UDTF on the right of a join — the mixed governed/ungoverned shape.
+        assert!(query_has_table_function(&parse_query(
+            "SELECT u.id FROM users u JOIN vector_search('c', '[0.1]', 5) v ON u.id = v.id"
+        )));
+        // UDTF inside a derived table.
+        assert!(query_has_table_function(&parse_query(
+            "SELECT * FROM (SELECT id FROM graph_traverse('g', 'n1', 'E', 2)) t"
+        )));
+        // UDTF hidden in a CTE body the outer query then scans — the case a
+        // FROM-clause-only check would miss.
+        assert!(query_has_table_function(&parse_query(
+            "WITH v AS (SELECT * FROM timeseries_range('c', 0, 100)) SELECT * FROM v"
+        )));
+
+        // Fail-closed: a set-op body is not decomposed, so it counts as carrying one.
+        assert!(query_has_table_function(&parse_query(
+            "SELECT id FROM users UNION ALL SELECT id FROM orders"
+        )));
+    }
+
     #[test]
     fn join_bearing_detects_joins_at_every_nesting_level() {
         // TD-ROUTE-1 follow-up (review of #923): the bit must see joins the
@@ -4919,6 +5196,48 @@ mod tests {
         // snapshot prepares `dept` (else the Semi-join subquery can't lower).
         assert!(keys.contains(&"emp".to_string()), "got {keys:?}");
         assert!(keys.contains(&"dept".to_string()), "got {keys:?}");
+    }
+
+    #[test]
+    fn collect_table_names_treats_cte_names_as_engine_local_not_catalog_tables() {
+        // TD-185a: the CTE name must not be collected as a catalog table (that
+        // resolution failure bounced WITH queries to the legacy path), while the
+        // base tables INSIDE the CTE body must be collected for the snapshot.
+        let query = parse_query(
+            "WITH reach(id) AS (SELECT 1 UNION SELECT k.k_person2 FROM knows k \
+             JOIN reach r ON k.k_person1 = r.id) \
+             SELECT count(distinct id) FROM reach",
+        );
+        let mut names = Vec::new();
+        let cte_names = collect_table_names(&query, &mut names);
+        let keys: Vec<String> = names.iter().map(|n| normalize_table_key(n)).collect();
+        assert!(
+            keys.contains(&"knows".to_string()),
+            "CTE body base table must be collected, got {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k == "reach"),
+            "CTE name must not be collected as a catalog table, got {keys:?}"
+        );
+        assert!(
+            cte_names.contains("reach"),
+            "got {cte_keys:?}",
+            cte_keys = cte_names
+        );
+    }
+
+    #[test]
+    fn with_header_always_engages_the_relational_engine() {
+        // TD-185a: a WITH header is beyond the legacy single-table path even
+        // when the outer body is a plain single-table scan over the CTE — the
+        // legacy FROM-token walk can only misparse the CTE name.
+        assert!(query_engages_relational_engine(&parse_query(
+            "WITH x AS (SELECT id FROM t) SELECT id FROM x"
+        )));
+        assert!(query_engages_relational_engine(&parse_query(
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 9) \
+             SELECT sum(n) FROM r"
+        )));
     }
 
     #[test]

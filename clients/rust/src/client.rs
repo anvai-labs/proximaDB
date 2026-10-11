@@ -336,8 +336,8 @@ impl ProximaClient {
     #[cfg(feature = "client")]
     pub async fn list_graphs(&self) -> Result<Vec<GraphInfo>> {
         let url = format!("{}/api/v2/graphs", self.inner.config.url);
-        let response: ListGraphsResponse = self.get(&url).await?;
-        Ok(response.graphs)
+        let envelope: GraphListEnvelope = self.get(&url).await?;
+        Ok(envelope.data.into_iter().map(GraphInfo::from).collect())
     }
 
     /// List all collections
@@ -619,9 +619,60 @@ pub struct GraphInfo {
     pub description: Option<String>,
 }
 
+/// The wave-6 envelope truth: `GET /api/v2/graphs` returns
+/// `{success, data: [...]}` (the old flat `{graphs: [...]}` shape never
+/// existed on the wire — the pre-wave-6 published spec was wrong).
 #[derive(Debug, Deserialize)]
-struct ListGraphsResponse {
-    graphs: Vec<GraphInfo>,
+struct GraphListEnvelope {
+    data: Vec<GraphRawInfo>,
+}
+
+/// One serialized graph-collection record (open field set; the facade
+/// lowers it best-effort into [`GraphInfo`]).
+#[derive(Debug, Deserialize)]
+struct GraphRawInfo {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    graph_id: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    node_count: Option<u64>,
+    #[serde(default)]
+    edge_count: Option<u64>,
+    #[serde(default)]
+    stats: Option<GraphRawStats>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphRawStats {
+    #[serde(default)]
+    total_nodes: Option<u64>,
+    #[serde(default)]
+    total_edges: Option<u64>,
+}
+
+impl From<GraphRawInfo> for GraphInfo {
+    fn from(raw: GraphRawInfo) -> Self {
+        let stats = raw.stats.as_ref();
+        Self {
+            name: raw
+                .name
+                .filter(|name| !name.trim().is_empty())
+                .or(raw.graph_id)
+                .unwrap_or_default(),
+            node_count: raw
+                .node_count
+                .or_else(|| stats.and_then(|value| value.total_nodes))
+                .unwrap_or(0),
+            edge_count: raw
+                .edge_count
+                .or_else(|| stats.and_then(|value| value.total_edges))
+                .unwrap_or(0),
+            description: raw.description,
+        }
+    }
 }
 
 /// Liveness / readiness probe payload.
@@ -1011,15 +1062,23 @@ mod tests {
         assert_eq!(collections.collections.len(), 1);
         assert_eq!(collections.collections[0].name, "items");
 
-        let graphs: ListGraphsResponse = serde_json::from_value(json!({
-            "graphs": [
-                {"name": "kg", "node_count": 2, "edge_count": 1}
+        let graphs: GraphListEnvelope = serde_json::from_value(json!({
+            "success": true,
+            "data": [
+                {
+                    "graph_id": "kg",
+                    "name": "",
+                    "description": "test graph",
+                    "stats": {"total_nodes": 2, "total_edges": 1}
+                }
             ]
         }))
         .unwrap();
-        assert_eq!(graphs.graphs.len(), 1);
-        assert_eq!(graphs.graphs[0].name, "kg");
-        assert_eq!(graphs.graphs[0].node_count, 2);
-        assert_eq!(graphs.graphs[0].edge_count, 1);
+        let lowered: Vec<GraphInfo> = graphs.data.into_iter().map(GraphInfo::from).collect();
+        assert_eq!(lowered.len(), 1);
+        assert_eq!(lowered[0].name, "kg");
+        assert_eq!(lowered[0].node_count, 2);
+        assert_eq!(lowered[0].edge_count, 1);
+        assert_eq!(lowered[0].description.as_deref(), Some("test graph"));
     }
 }

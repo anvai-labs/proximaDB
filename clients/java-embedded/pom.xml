@@ -6,7 +6,7 @@
 
     <groupId>com.proximadb</groupId>
     <artifactId>proximadb-embedded</artifactId>
-    <version>0.2.0</version>
+    <version>0.4.0</version>
     <packaging>jar</packaging>
 
     <name>ProximaDB Embedded</name>

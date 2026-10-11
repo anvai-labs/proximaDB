@@ -205,9 +205,7 @@ impl Default for PostgresServerConfig {
     fn default() -> Self {
         Self {
             port: 5433, // Use 5433 to avoid conflict with real PostgreSQL
-            bind_address: "0.0.0.0:5433"
-                .parse()
-                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 5433))),
+            bind_address: SocketAddr::from(([127, 0, 0, 1], 5433)),
             enable_postgres: true,
             max_connections: 100,
             idle_timeout_secs: 3600,
@@ -652,13 +650,95 @@ impl TLSConfig {
 
     /// Get bind address for given port
     pub fn bind_address(&self, port: u16) -> SocketAddr {
-        format!("{}:{}", self.bind_interface, port)
+        self.bind_interface
             .parse()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)))
+            .map(|ip| SocketAddr::new(ip, port))
+            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], port)))
     }
 }
 
+/// Admission for surfaces without request-bound credentials and permissions.
+/// TLS or a caller-supplied tenant assertion cannot substitute for those —
+/// UNLESS the listener enforces its own per-connection authentication
+/// (`listener_authenticated`, e.g. pgwire SCRAM, TD-PGWIRE-AUTH-1), in which
+/// case the single-tenant/loopback/no-coordinator restriction doesn't apply:
+/// the listener is no longer trust-only.
+pub fn validate_trust_only_listener(
+    surface: &str,
+    address: SocketAddr,
+    coordinator_present: bool,
+    listener_authenticated: bool,
+    mode: &proximadb_tenant::TenantDeploymentMode,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        listener_authenticated
+            || (!coordinator_present
+                && matches!(
+                    mode,
+                    proximadb_tenant::TenantDeploymentMode::SingleTenant { .. }
+                )
+                && address.ip().is_loopback()),
+        "{surface} currently supports only unauthenticated single-tenant loopback access \
+         unless the listener enforces its own per-connection authentication; \
+         disable this listener in authenticated, multi-tenant, or non-loopback deployments"
+    );
+    Ok(())
+}
+
 impl MultiServerConfig {
+    /// Validate the entire listener set before binding any of its sockets.
+    /// `pgwire_authenticated` is true when pgwire enforces its own
+    /// per-connection authentication (SCRAM, TD-PGWIRE-AUTH-1) — MCP has no
+    /// such capability and stays trust-only regardless.
+    pub fn validate_listener_security(
+        &self,
+        coordinator_present: bool,
+        pgwire_authenticated: bool,
+        mode: &proximadb_tenant::TenantDeploymentMode,
+    ) -> anyhow::Result<()> {
+        self.tls_config
+            .bind_interface
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| anyhow::anyhow!("invalid HTTP bind interface"))?;
+        if self.is_unified_mode() {
+            self.unified_bind_address
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| anyhow::anyhow!("invalid unified bind interface"))?;
+        }
+        anyhow::ensure!(
+            coordinator_present
+                || !matches!(mode, proximadb_tenant::TenantDeploymentMode::MultiTenant),
+            "multi-tenant network serving requires a security coordinator"
+        );
+        if self.postgres_config.enable_postgres {
+            anyhow::ensure!(
+                !self.is_uds_mode(),
+                "pgwire must be disabled in portless mode"
+            );
+            validate_trust_only_listener(
+                "pgwire",
+                self.postgres_config.active_bind_address(),
+                coordinator_present,
+                pgwire_authenticated,
+                mode,
+            )?;
+        }
+        if let Some(port) = self.api_config.as_ref().and_then(|api| api.mcp_port) {
+            anyhow::ensure!(
+                !self.is_uds_mode(),
+                "MCP TCP listener must be disabled in portless mode"
+            );
+            validate_trust_only_listener(
+                "MCP",
+                SocketAddr::new(self.http_bind_address().ip(), port),
+                coordinator_present,
+                false,
+                mode,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Get effective bind address for HTTP server
     pub fn http_bind_address(&self) -> SocketAddr {
         self.tls_config.bind_address(self.http_config.port)
@@ -671,13 +751,10 @@ impl MultiServerConfig {
 
     /// Get effective bind address for unified port mode
     pub fn unified_bind_address(&self) -> SocketAddr {
-        format!("{}:{}", self.unified_bind_address, self.unified_port)
+        self.unified_bind_address
             .parse()
-            .unwrap_or_else(|_| {
-                format!("0.0.0.0:{}", self.unified_port)
-                    .parse()
-                    .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], self.unified_port)))
-            })
+            .map(|ip| SocketAddr::new(ip, self.unified_port))
+            .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], self.unified_port)))
     }
 
     /// Resolve where the REST surface should listen. Returns a Unix-domain
@@ -742,6 +819,165 @@ pub struct ServerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_only_listener_rejects_shared_or_authenticated_deployment() {
+        let local = SocketAddr::from(([127, 0, 0, 1], 5433));
+        let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+        for surface in ["pgwire", "MCP"] {
+            assert!(validate_trust_only_listener(surface, local, false, false, &single).is_ok());
+            assert!(validate_trust_only_listener(surface, local, true, false, &single).is_err());
+            assert!(
+                validate_trust_only_listener(
+                    surface,
+                    local,
+                    false,
+                    false,
+                    &proximadb_tenant::TenantDeploymentMode::MultiTenant
+                )
+                .is_err()
+            );
+            for address in [
+                "0.0.0.0:5433",
+                "192.0.2.1:5433",
+                "[::]:5433",
+                "[::ffff:192.0.2.1]:5433",
+            ] {
+                assert!(
+                    validate_trust_only_listener(
+                        surface,
+                        address.parse().unwrap(),
+                        false,
+                        false,
+                        &single
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                validate_trust_only_listener(
+                    surface,
+                    "[::1]:5433".parse().unwrap(),
+                    false,
+                    false,
+                    &single
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    /// TD-PGWIRE-AUTH-1: a listener that enforces its own per-connection
+    /// authentication (SCRAM) is no longer trust-only — it's admitted with a
+    /// coordinator present, in multi-tenant mode, and on a non-loopback
+    /// address, none of which are individually sufficient without
+    /// `listener_authenticated`.
+    #[test]
+    fn trust_only_listener_admits_an_authenticated_listener_anywhere() {
+        assert!(
+            validate_trust_only_listener(
+                "pgwire",
+                "0.0.0.0:5433".parse().unwrap(),
+                true,
+                true,
+                &proximadb_tenant::TenantDeploymentMode::MultiTenant
+            )
+            .is_ok()
+        );
+        // Not authenticated: the exact same shared/multi-tenant/remote
+        // deployment is still rejected.
+        assert!(
+            validate_trust_only_listener(
+                "pgwire",
+                "0.0.0.0:5433".parse().unwrap(),
+                true,
+                false,
+                &proximadb_tenant::TenantDeploymentMode::MultiTenant
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn listener_preflight_checks_optional_surfaces_before_startup() {
+        let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+        let mut config = MultiServerConfig::default();
+        config.postgres_config.bind_address = SocketAddr::from(([127, 0, 0, 1], 5433));
+        assert!(
+            config
+                .validate_listener_security(true, false, &single)
+                .is_err()
+        );
+        config.postgres_config.enable_postgres = false;
+        assert!(
+            config
+                .validate_listener_security(true, false, &single)
+                .is_ok()
+        );
+        config.api_config = Some(proximadb_config::ApiConfig {
+            mcp_port: Some(5700),
+            ..Default::default()
+        });
+        assert!(
+            config
+                .validate_listener_security(true, false, &single)
+                .is_err()
+        );
+        config.api_config = None;
+        assert!(
+            config
+                .validate_listener_security(
+                    false,
+                    false,
+                    &proximadb_tenant::TenantDeploymentMode::MultiTenant
+                )
+                .is_err()
+        );
+    }
+
+    /// TD-PGWIRE-AUTH-1: an authenticated pgwire listener bypasses the
+    /// trust-only restriction the previous test exercises above — the
+    /// otherwise-identical shared-coordinator deployment now admits it.
+    #[test]
+    fn listener_preflight_admits_authenticated_pgwire_with_a_coordinator() {
+        let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+        let mut config = MultiServerConfig::default();
+        config.postgres_config.bind_address = SocketAddr::from(([127, 0, 0, 1], 5433));
+        assert!(
+            config
+                .validate_listener_security(true, true, &single)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn listener_preflight_preserves_local_mcp_but_not_portless_tcp() {
+        let single = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+        let mut config = MultiServerConfig::default();
+        config.postgres_config.enable_postgres = false;
+        config.tls_config.bind_interface = "127.0.0.1".into();
+        config.api_config = Some(proximadb_config::ApiConfig {
+            mcp_port: Some(5700),
+            ..Default::default()
+        });
+        assert!(
+            config
+                .validate_listener_security(false, false, &single)
+                .is_ok()
+        );
+        config.uds_socket_dir = Some(PathBuf::from("unused-test-sockets"));
+        assert!(
+            config
+                .validate_listener_security(false, false, &single)
+                .is_err()
+        );
+        config.api_config.as_mut().unwrap().mcp_port = None;
+        assert!(
+            config
+                .validate_listener_security(false, false, &single)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn test_server_config_defaults() {
@@ -934,5 +1170,123 @@ mod tests {
             tls_key_file: None,
         };
         assert!(!arrow_config.is_tls_enabled());
+    }
+}
+
+#[cfg(test)]
+mod container_bind_regression_tests {
+    //! The published image must start with `server.bind_address = 0.0.0.0`.
+    //!
+    //! `deploy/docker/entrypoint.sh` rewrites `bind_address` to `0.0.0.0`
+    //! because a loopback listener is unreachable through `docker run -p`. That
+    //! rewrite is not optional, so every listener the shipped config enables has
+    //! to survive `validate_listener_security` at `0.0.0.0` -- otherwise the
+    //! server fails closed before binding anything and the whole image is dead,
+    //! not merely missing a port.
+    //!
+    //! This regressed once and cost three promotion rounds. `[api] pg_port` was
+    //! set in the shipped config, which makes `src/database.rs` re-derive the
+    //! pgwire bind from `server.bind_address`; at `0.0.0.0` that is a
+    //! non-loopback trust-mode listener, which `validate_trust_only_listener`
+    //! refuses. It stayed hidden because the config was root-owned, so the
+    //! rewrite silently failed and the listener stayed on loopback.
+    use super::*;
+
+    /// The shape the shipped config actually produces. The pgwire bind is
+    /// DERIVED from `PostgresServerConfig::default()`, not supplied: an earlier
+    /// version passed "127.0.0.1:5433" as a literal, so flipping that default to
+    /// 0.0.0.0 -- one line, and exactly the class of change that caused this
+    /// outage -- left all 136 tests in this crate green while the published
+    /// image would again exit 1 at the listener preflight.
+    fn container_shaped_config(bind: &str) -> MultiServerConfig {
+        let mut config = MultiServerConfig {
+            unified_mode: true,
+            unified_bind_address: bind.to_string(),
+            ..Default::default()
+        };
+        config.tls_config.bind_interface = bind.to_string();
+        // `server_builder.rs` sets this from `api_config.enable_pgwire`, which
+        // the shipped config leaves true.
+        config.postgres_config.enable_postgres = true;
+        config
+    }
+
+    #[test]
+    fn the_pgwire_default_is_loopback() {
+        // The invariant the "starts" test below depends on. Pinned separately so
+        // a change to the default fails HERE, naming the cause, rather than
+        // silently making the other test vacuous.
+        let default = PostgresServerConfig::default();
+        assert!(
+            default.bind_address.ip().is_loopback(),
+            "PostgresServerConfig::default() binds {}, which is not loopback. With \
+             `[api] pg_port` unset the published image relies on this default to \
+             keep pgwire off 0.0.0.0; a non-loopback default makes the server fail \
+             closed at boot under trust-mode auth.",
+            default.bind_address
+        );
+    }
+
+    fn single_tenant() -> proximadb_tenant::TenantDeploymentMode {
+        proximadb_tenant::TenantDeploymentMode::SingleTenant {
+            default_tenant: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn container_bind_with_pgwire_left_on_loopback_starts() {
+        // What the image ships: the rewrite moves the unified surface to
+        // 0.0.0.0 while pgwire keeps the builder's loopback default, because
+        // `pg_port` is NOT set in config/config.toml.
+        let config = container_shaped_config("0.0.0.0");
+        config
+            .validate_listener_security(false, false, &single_tenant())
+            .expect("the published image must start after entrypoint.sh rewrites bind_address");
+    }
+
+    #[test]
+    fn container_bind_dragging_pgwire_off_loopback_fails_closed() {
+        // Setting `[api] pg_port` re-derives the pgwire bind from
+        // `server.bind_address`, which in a container is 0.0.0.0. This MUST
+        // fail: an unauthenticated trust-mode listener is loopback-only. The
+        // test pins the containment, so a future config change that reintroduces
+        // `pg_port` fails here instead of in a release.
+        let mut config = container_shaped_config("0.0.0.0");
+        config.postgres_config.bind_address = "0.0.0.0:5433"
+            .parse()
+            .expect("test literal is a valid socket address");
+        let err = config
+            .validate_listener_security(false, false, &single_tenant())
+            .expect_err("a non-loopback trust-mode pgwire listener must be refused");
+        assert!(
+            err.to_string().contains("loopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_config_does_not_set_pg_port() {
+        // The guard on the actual artifact: if this starts failing, the image
+        // will fail closed at boot on 0.0.0.0 and `Test Container Health` will
+        // go red with `Failed to start multi-server`.
+        // Both keys drag a trust-mode listener onto `server.bind_address`, which
+        // is 0.0.0.0 in a container: pg_port via the pgwire branch of
+        // `validate_listener_security`, mcp_port via the MCP branch. Either one
+        // makes the published image fail closed at boot.
+        let shipped = include_str!("../../../../config/config.toml");
+        for key in ["pg_port", "mcp_port"] {
+            for (lineno, line) in shipped.lines().enumerate() {
+                let trimmed = line.trim();
+                assert!(
+                    !(trimmed.starts_with(key) && trimmed.contains('=')),
+                    "config/config.toml:{} sets {}, which drags a trust-mode listener onto \
+                     server.bind_address (0.0.0.0 in a container) and makes the server fail \
+                     closed at boot. Reaching those surfaces needs per-connection auth \
+                     (TD-PGWIRE-AUTH-1), not this toggle.",
+                    lineno + 1,
+                    key
+                );
+            }
+        }
     }
 }

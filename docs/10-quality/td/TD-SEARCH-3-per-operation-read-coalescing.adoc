@@ -293,11 +293,25 @@ RSS to +6.2--6.4%. It also crosses the `<=20 GET/query` economic threshold.
 
 Repeated 4 MiB controls span 0.9835--0.9840 at top-10, so requiring exact
 aggregate equality across fresh processes would mistake repeatability noise for
-a quality regression. The promotion gate instead requires candidate recall to
-remain at least 0.98 and permits at most 0.0005 absolute loss versus the paired
-4 MiB control. On 1,000 top-10 queries that margin is five ground-truth hits out
-of 10,000 and equals the observed control envelope; it does not lower the
-quality ratchet. The 24 MiB point satisfies this aggregate gate.
+a quality regression. The promotion gate (as originally written) required
+candidate recall to remain at least 0.98 and permitted at most 0.0005 absolute
+loss versus the paired 4 MiB control. On 1,000 top-10 queries that margin is
+five ground-truth hits out of 10,000 and equals the observed control envelope.
+The 24 MiB point satisfies that aggregate gate.
+
+**Floor update (product decision 2026-09-03, TD-IOBUDGET-2 campaign):** the
+canonical recall floor drops **0.98 → 0.975** repo-wide (harness `--min-recall`
+default, `sift_pax_recall_ratchet_test` floor) so the economical default
+file:// geometry (k=122: bytes/q −51.1%, object-cold GETs −13.3%, recall 0.9794
+— `iobudget2_file_geometry_sift1m`) is shippable. The paired-delta remains
+reported as measured context; the gate is the absolute floor. Context: the 10M
+curve's best measured recall 0.9782 was already recorded as "0.98 explicitly
+unattained rather than lowered" — 0.975 makes that point attainable too.
+Historical numbers in this TD keep their original 0.98-era contexts. The
+offline sweep tools' `--target-recall` defaults deliberately remain 0.98
+(nprobe_sweep, cache_tier_sweep, range_cap_sweep, analyze_nprobe_geometry):
+sweeps then over-provision slightly relative to the 0.975 floor, which is the
+safe direction.
 
 Exact ordered result equality is diagnostic, not an acceptance requirement.
 The benchmark now records per-query ordered-ID, ID-set, recall-hit, and
@@ -752,6 +766,56 @@ as a validation schedule but did not predict a passing 10M point. See
 link:../../_internal/status/BIGANN_NPROBE_GEOMETRY_100K_10M_2026_08_04.adoc[the
 five-scale partial evidence artifact] for source hashes, coverage, fits, charts,
 and remaining measurement gates.
+
+=== S5b: complete same-binary five-scale nprobe evidence (2026-08-06)
+
+The missing 10M curve and same-binary rerun are complete. One release-server
+binary (`aed724fc5`, SHA-256 `62677fb41686015569f7de408fbe8c9758dd7a469de582cb33c8c9d17d1efdae`)
+served all five natural-cell BIGANN matrices: 100K/330K/1M/3.3M/10M rows,
+`k_c=3/10/30/100/305`, exact prefix-matched ground truth, 1,000 queries per
+point, top-10 and top-20, fresh process per point. Every matrix is complete,
+passes its measurement protocol, and has zero measurement failures.
+
+The minimum measured nprobe attaining recall 0.98 is top-10
+`3/5/6/16/22` and top-20 `3/5/7/16/26`. At 10M, top-10 nprobe 22 measured
+recall 0.9804 at 52.902 physical GET/query and 130.86 MB/query; top-20 nprobe
+26 measured 0.98285 at 64.340 GET/query and 163.39 MB/query. This closes the
+partial-result caveat above without pretending nprobe alone reaches the
+20-GET serving objective.
+
+The five-scale quality fits are top-10 `1.7202765*k_c^0.4466996` and top-20
+`1.6639694*k_c^0.4751678`. They are useful only inside the measured
+`k_c=3..305`, and only for top-k at most 20. In particular, the continuous fit
+under-predicts the measured `k_c=100` floor, so blindly replacing the shipped
+geometric default would violate the evidence.
+
+**Production-policy verdict: REFUTED.** A cell-count/top-k-only interpolation
+of these BIGANN anchors selects nprobe 15 at `k_c=90`. Existing 384-d and 768-d
+BGE evidence at the same cell count requires nprobe 25 for top-10 and about 30
+for top-20; even nprobe 20 measured below recall 0.98 (TD-IVF-3, "The sqrt-based
+nprobe policy is BIGANN-specific"). The segment selector is process-global and
+serves L2, cosine, and dot-product searches without collection, corpus family,
+dimension, projection width, seed, or calibration identity. An opt-in global
+BIGANN policy would therefore silently under-probe other collections in the
+same process.
+
+No production selector or TOML option is authorized by this result. The
+candidate evaluated during review was removed rather than lower the recall
+ratchet. The rejected PR head contained 433 commits absent from the measured
+revision, while the measured revision contained 2 commits absent from the PR
+head; no current-head Config→global-settings→real-PAX recall eval covered exact
+anchors, interpolation boundaries, top-k bucket boundaries, or supported
+metric/corpus classes. A successor must carry collection-scoped calibration
+identity, fail closed on an identity mismatch, and pass that production-route
+eval before it can expose a policy surface. The existing geometric behavior
+remains unchanged; that continuity is not a new cross-corpus recall claim.
+
+Full provenance, hashes, curves, and limitations:
+link:../../_internal/status/BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc[complete
+five-scale evidence] (ledger
+`bigann_nprobe_geometry_complete_same_binary_100k_10m`). A default flip still
+requires current-binary, provider-realistic paired evidence, collection-scoped
+policy plumbing, and the recall ratchet.
 
 === S3c: the k_c=90 eligible-cap repeat (2026-08-20) — 24 MiB is NOT eligible
 

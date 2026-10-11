@@ -135,6 +135,7 @@ jobs:
     needs: build
     if: ${{ github.repository == 'anvai-labs/proximaDB' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # manifest-list merge; no measured history, bounded conservatively
     # One merge per target → two manifest lists (runtime, runtime-full), each
     # carrying its own tag set (the -full suffix is applied in "Derive tags").
     strategy:
@@ -240,6 +241,7 @@ jobs:
     needs: merge
     if: ${{ github.repository == 'anvai-labs/proximaDB' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # registry prune; no measured history, bounded conservatively
     env:
       IMAGE_REPO: ${{ vars.DOCKERHUB_IMAGE || 'vjsingh1984/proximadb' }}
       KEEP: ${{ vars.DOCKERHUB_PRUNE_KEEP || '10' }}

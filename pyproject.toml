@@ -4,21 +4,20 @@ build-backend = "maturin"
 
 [project]
 name = "proximadb_embedded"
-version = "0.3.0"
+version = "0.4.0"
 description = "ProximaDB - High-performance vector database with embedded mode"
 authors = [
     {name = "Vijaykumar Singh", email = "vijay@anvaiops.com"}
 ]
 license = {text = "Apache-2.0"}
 readme = "README.adoc"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["vector", "database", "embedded", "similarity", "search", "ml", "ai", "embeddings"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Rust",
@@ -78,13 +77,13 @@ python_functions = ["test_*"]
 addopts = ["-v", "--tb=short"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 88
 select = ["E", "W", "F", "I", "B", "C4", "UP"]
 ignore = ["E501"]

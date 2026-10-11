@@ -21,13 +21,43 @@
 # DO NOT promote an entry to `measured` without real provenance. Numbers in
 # README/BENCHMARKS are claims, not evidence, until an artifact backs them.
 
-as_of_date = "2026-08-24"
+as_of_date = "2026-09-15"
 source_of_truth = "benches/ + checked-in dated artifacts"
 header_status = "ran the benches 2026-06-16 (docs/_internal/status/BENCH_RUN_2026_06_16.adoc): object_economy_e2e promoted to measured; the other e2e claims' benches measure COMPONENT kernels (fusion-merge µs, recall computation, quantization speed) or small-scale per-engine search, NOT the claimed end-to-end metric/scale — they stay unverified with corrected notes; real e2e benches are the follow-up"
 
 # ---------------------------------------------------------------------------
 # MEASURED — backed by a dated, checked-in artifact.
 # ---------------------------------------------------------------------------
+
+[[claims]]
+id = "pax_datafusion_read_depth_index_acquisition"
+claim = "On the DataFusion PAX lane (PaxSplitReader::load_ranged), index acquisition costs 3 STRICTLY DEPENDENT round trips on a cold read (header prefix + 2 tail-probe iterations for a v2 segment) and 0 on a warm read once the segment index is cached. Measured as range_gets 203 cold vs 200 warm on a 200-block fixture with range-coalescing gates UNSET; with PROXIMADB_FS_READ_RANGES_COALESCE_GAP/_MAX set the same test reports 4 cold vs 1 warm, because coalescing collapses the independent stripe reads. The claimed quantity is the DIFFERENCE (3), which is invariant across both configurations — the totals are not. Slice 0 additionally removed a HEAD by carrying the object size the planner already had from list(). The residual per-surviving-block stripe fetches depend on the index but NOT on each other, so they are a WIDTH concern, not depth: the 3/203 ratio is an artifact of this fixture's block count and must NOT be quoted as a percentage. Request counts only — no latency or throughput claim."
+metric = "dependent index-acquisition round trips per cold read (range_gets cold vs warm)"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-USUB-8-catalog-resident-serving-metadata-collapses-cold-read-depth.adoc",
+]
+bench_source = "src/datafusion/engine_adapters/pax_adapter.rs"
+bench_command = "cargo test -p proximadb --lib warm_read_skips_the_index_fetch -- --nocapture"
+artifact = "docs/_internal/status/PAX_DATAFUSION_READ_DEPTH_2026_09_27.adoc"
+hardware = "Hardware-independent: these are request counts, deterministic for a given segment. No timing is claimed, so no machine is cited."
+date = "2026-09-27"
+version = "proximadb 0.3.0 @ PR #1943 (feat/usub8-depth-measurement); the parent c1a3e7731 has no DEPTH line to print"
+
+[[claims]]
+id = "pax_residual_tail_write_amplification"
+claim = "Enabling the PAX residual PROPS tail (TD-USUB-6 slice 2b) cut block size on the RELATIONAL shredding path by 41.2% — 621,942 to 365,942 bytes over 2,000 rows, i.e. 310.97 to 182.97 bytes/row (256,000 bytes, 128 bytes/row saved) — by dropping each shredded prop from the msgpack tail wherever its typed stripe reproduces the value exactly. On the VECTOR/SST path the reduction is exactly 0.0% by construction, because that path declares only the coarse v1 FilterableDataType and so carries no exact ProximaType; the bench asserts that equality rather than assuming it. Byte counts only — no latency or throughput claim."
+metric = "block bytes and bytes/row, residual gate off vs on, measured separately per shredding path"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-USUB-6-typed-user-columns-authoritative-not-duplicated.adoc",
+]
+bench_source = "benches/pax_residual_tail_write_amplification.rs"
+bench_command = "cargo bench --bench pax_residual_tail_write_amplification"
+artifact = "docs/_internal/status/PAX_RESIDUAL_TAIL_WRITE_AMPLIFICATION_2026_09_24.adoc"
+hardware = "AMD Ryzen 9 7950X (16 cores), Linux 6.18 WSL2. Hardware is irrelevant to this result: the quantity is a deterministic byte count, reproducible to the byte on any machine."
+date = "2026-09-24"
+version = "proximadb 0.3.0 @ 37f9bf617"
 
 [[claims]]
 id = "hybrid_candidate_recall_selector_nfc_dev"
@@ -377,37 +407,38 @@ date = "2026-07-16"
 version = "develop @ 549b77fa6 (+ perf/coalesced-pr2-cache-geometry PR2 stack)"
 notes = "Full SIFT1M, single-file collection, 100 queries, top-10, Euclidean, provided GT. IVF OFF = sign-bit bootstrap = the production L0 flush path. Baseline IVF ON (PR2): recall 0.990, 36 GETs, 250 MB, ~47 min flush. The 0.985 recall / 40 GETs here are the production-representative numbers (no eval-only IVF opt-in). The bytes rise (250->430 MB) is the block dead weight Region B will remove via SQ8 density. NOTE: the PROXIMADB_SIFT_IVF_FLUSH=0 knob was added transiently to the eval (gates the set_var at line 486) for this measurement; landing it as a committed eval feature is a pending harness follow-up so the bench_command is reproducible as-is. Indicative dev-machine run, not an SLA."
 
+[[claims]]
+id = "vector_search_latency"
+claim = "SST ~4.4-5.3 ms avg / ~7.3 ms p99 search latency at 97% recall@10 (10K vectors, dim 128, top-10); NOVA ~18.7-23.3 ms avg at 100% recall@10 — re-scoped from the original unsubstantiated '~8ms avg, ~15ms p99 (HNSW, M=32)' 10M-vector claim, which stays unmeasured at that scale (ProximaDB does not build an HNSW graph index; SST/HELIX/NOVA are the storage-engine families)"
+metric = "search_latency_ms"
+status = "measured"
+asserted_in = ["docs/10-quality/benchmarks/BENCHMARKS.adoc:16"]
+bench_source = "tests/all_engines_50k_benchmark.rs"
+bench_command = "cargo test --release --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored"
+artifact = "docs/_internal/status/BENCH_RUN_2026_09_15.adoc"
+hardware = "AMD Ryzen 9 7950X, 16 cores, 125 GB RAM (shared dev machine — indicative, not an SLA)"
+date = "2026-09-15"
+version = "develop @ db6fa75b5 (TD-CONV-2 merged)"
+notes = "Ran 2026-09-15 (10K vectors, dim 128, top-10, 10 queries, brute-force ground truth): SST avg 4.44/5.34 ms across two runs (p99 7.29 ms, recall 97.0%), NOVA avg 18.70/23.28 ms (recall 100.0%). Genuinely measures per-engine search latency at this scale — promoted from unverified. Does NOT substantiate a 10M-vector/HNSW claim (different scale, different index architecture); the 10M headline in BENCHMARKS.adoc stays unmeasured. HELIX (2.0% recall) and SWIFT (3.0% recall, experimental) were also measured but EXCLUDED from this claim — near-random search results, filed as TD-HELIX-3. Indicative dev-machine run, not an SLA."
+
+[[claims]]
+id = "ingest_throughput"
+claim = "187K-334K vectors/sec single-batch insert across default engines (SST/NOVA) at 10K vectors, dim 128 — re-scoped from the original unsubstantiated '~125K vectors/sec (small-batch WAL path)' claim, which specified neither scale nor dimension"
+metric = "ingest_vectors_per_sec"
+status = "measured"
+asserted_in = ["docs/10-quality/benchmarks/BENCHMARKS.adoc:17"]
+bench_source = "tests/all_engines_50k_benchmark.rs"
+bench_command = "cargo test --release --test all_engines_50k_benchmark -- --nocapture --test-threads=1 --ignored"
+artifact = "docs/_internal/status/BENCH_RUN_2026_09_15.adoc"
+hardware = "AMD Ryzen 9 7950X, 16 cores, 125 GB RAM (shared dev machine — indicative, not an SLA)"
+date = "2026-09-15"
+version = "develop @ db6fa75b5 (TD-CONV-2 merged)"
+notes = "Ran 2026-09-15 (single 10,000-vector insert batch, dim 128): SST 186,551-212,848 vec/s, NOVA 285,747-333,507 vec/s across two runs (RAPTOR, experimental-only, 345,103 vec/s). Both default engines exceed the original ~125K/s claim at THIS scale/shape — genuinely measures the route's insert throughput, so promoted from unverified. Not evidence for a 10M-vector / streaming small-batch WAL claim (different workload shape); that framing stays unmeasured. HELIX/SWIFT insert numbers were also captured but excluded — see TD-HELIX-3 (their SEARCH correctness fails, not ingest, but neither is cited here to keep this claim tied only to engines whose numbers are trustworthy end-to-end). Indicative dev-machine run, not an SLA."
+
 # ---------------------------------------------------------------------------
 # UNVERIFIED — a bench exists, but no dated artifact backs the claimed number.
 # ---------------------------------------------------------------------------
 
-[[claims]]
-id = "vector_search_latency"
-claim = "~8 ms avg, ~15 ms p99 search latency (HNSW, M=32)"
-metric = "search_latency_ms"
-status = "unverified"
-asserted_in = ["docs/10-quality/benchmarks/BENCHMARKS.adoc:16"]
-bench_source = "benches/bench_04_storage_unified.rs"
-bench_command = "cargo bench --bench bench_04_storage_unified"
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "Ran 2026-06-16: bench_04 measures per-engine search at only 128 vectors (SST pure ~1.44 ms, filtered ~1.42 ms) — it does NOT measure the '~8 ms p99 over 10M-vector HNSW' claim (scale + engine differ). A real 10M-scale HNSW latency bench is needed. README carries a 'not an SLA / YMMV' caveat."
-
-[[claims]]
-id = "ingest_throughput"
-claim = "~125K vectors/sec ingest (small-batch WAL path)"
-metric = "ingest_vectors_per_sec"
-status = "unverified"
-asserted_in = ["docs/10-quality/benchmarks/BENCHMARKS.adoc:17"]
-bench_source = "benches/bench_08_quantization_sst.rs"
-bench_command = "cargo bench --bench bench_08_quantization_sst"
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "Ran 2026-06-16: bench_08 measures the quantization-speed kernel (dim 128 ~1.02 ms … dim 1536 ~10.74 ms) and progressive-search latency (1024 → ~6.6 µs), NOT an end-to-end '~125K vectors/sec' ingest throughput. A real ingest-throughput bench is needed."
 
 [[claims]]
 id = "recall_at_10"
@@ -509,7 +540,21 @@ artifact = "docs/_internal/status/SIFT1M_RECALL_RATCHET_2026_06_30.adoc"
 hardware = "local macOS arm64 (indicative; N=1M canonical = qa-gate `sift-pax-recall`, ubuntu-latest)"
 date = "2026-06-30"
 version = "v0.2"
-notes = """Real-dataset WS8 gate resolving the REPRESENTATIVENESS CAVEAT on the
+notes = """LAYOUT CAVEAT (added 2026-10-08, TD-SIFTCOMPACT-1): these figures
+describe an **L0-only, uncompacted** layout, not a compacted one -- and for these
+2026-06-30 figures compaction was UNREACHABLE, not merely rejected: nothing
+scheduled compaction from a flush until TD-WLP-7 (#1012) on 2026-07-15, before
+which the post-flush hook was a stub and `compaction_error` was hardcoded None.
+Re-run the same configuration today (meaning the 2026-06-30 tag set, before the
+helper pinned `compaction:off`) and the layout is still L0-only by a different
+route -- compaction becomes due at N >= 100 000 and then fails the
+catalog-object-id admission check, logged at `warn` and swallowed. Either way the
+arms measured a pre-compaction layout with nothing to signal it. That is now the STATED intent -- the shared collection
+helper pins `compaction:off`, which makes the layout deterministic rather than
+accidental -- but it means recall here is not evidence about the compacted
+product. See TD-SIFTCOMPACT-1 and TD-IVF2ENGAGE-1 (whose own headline finding was
+retracted after a compaction-quiescence barrier was added to the sibling test).
+Real-dataset WS8 gate resolving the REPRESENTATIVENESS CAVEAT on the
 synthetic pax_rabitq_sq8_recall_at_10 entry above. RESULT (2026-06-30, indicative):
 on REAL SIFT descriptors the PAX RaBitQ->SQ8 cascade holds recall@10 = 0.9905 at
 N=100k (200 queries, brute-force-L2 GT over the subset) -- well above the 0.90
@@ -874,6 +919,23 @@ hardware = "Local macOS arm64 Apple Silicon, 64 GiB RAM, serialized release-serv
 date = "2026-08-04"
 version = "10M source/binary revision 955990254988bbf68acbfd616d8b1d7e12aa27c1; lower four matrices retain the revisions recorded by bigann_nprobe_geometry_100k_3m3"
 notes = "The 10M result is deliberately partial and the five-point natural-knee fit is labeled provisional_partial_input (log R2 0.8828, LOOCV MAPE 47.6%). The complete four-scale quality fits are unchanged. Input checkpoint SHA-256 values and generated SVG hashes are recorded in the artifact. Azurite supports physical-operation and relative-latency conclusions, not Azure WAN latency."
+
+[[claims]]
+id = "bigann_nprobe_geometry_complete_same_binary_100k_10m"
+claim = "A complete same-release-binary five-scale BIGANN/PAX matrix (100K/330K/1M/3.3M/10M; natural k_c=3/10/30/100/305; 1000 queries/point; top-10/top-20; exact prefix-matched ground truth) measures recall>=0.98 floors of top-10 3/5/6/16/22 and top-20 3/5/7/16/26. At 10M the floor points are nprobe 22 at recall 0.9804, 52.902 physical GET/query, 130.86 MB/query, 416.76 ms p50 (top-10), and nprobe 26 at recall 0.98285, 64.340 GET/query, 163.39 MB/query, 511.19 ms p50 (top-20). The fitted curves are descriptive only: top-10 1.7202765*k_c^0.4466996 (LOOCV MAPE 16.89%) and top-20 1.6639694*k_c^0.4751678 (11.86%). They neither prove interpolation recall nor transfer across corpora: existing BGE evidence at k_c=90 requires materially more probes and refutes a process-global cell-count-only production policy."
+metric = "minimum recall>=0.98 nprobe + natural physical-GET knee + recall + physical GET/query + bytes/query + p50 across five natural cell geometries"
+status = "measured"
+asserted_in = [
+  "docs/_internal/status/BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc",
+  "docs/10-quality/td/TD-SEARCH-3-per-operation-read-coalescing.adoc",
+]
+bench_source = "scripts/bench/nprobe_sweep.py"
+bench_command = "Run five release/Azurite PAX v3 natural-cell matrices on one binary with 1000 queries/point, top-k 10/20, fresh process per point, --quality-policy report; analyze all complete matrices with analyze_nprobe_geometry.py"
+artifact = "docs/_internal/status/BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc"
+hardware = "Local macOS arm64 Apple Silicon, 64 GiB RAM, serialized release-server runs, Azurite localhost HTTP backend"
+date = "2026-08-06"
+version = "release-server source aed724fc533dac595e6ac31894ea3e505e1bcdfd; binary SHA-256 62677fb41686015569f7de408fbe8c9758dd7a469de582cb33c8c9d17d1efdae; harness revision e2d09165da3694942d9323b75392819a1a1f371f"
+notes = "All matrices status=pass with complete checkpoint coverage and zero measurement failures. Input SHA-256: 100K babe8b082330f192e2c07e50bed3dd2e2a13c1d7fcf0c9903f61cd5fdcb12dda; 330K 3bdf31e706c93b458662886df527117e85d31439ed310edca492682a02214e71; 1M 2b80cbec448f0af6d83e4c2a622cea07e0e3e26ff272e58ea7c40af8e872c577; 3.3M 3dc67e396dfd36fecdfb0935e4afa0ff7bf3295c4b1ad4cdf21f2966438effe5; 10M 306c149d44802c790953cff642c8be358127a88743758de282b241c199cf3019. Analysis JSON SHA-256 5af8d53b5b22165c01e0274b7e797f6bc05ddd097800d0315c368ddc0ac518e3. Checksum-verified raw artifacts: vsingh@dataserver2:/data/proximadb/proximadb-bench-data/. Azurite proves application operation shape and relative localhost latency, not Azure WAN latency. Cross-corpus review REFUTED a process-global policy: both BIGANN interpolations select nprobe 15 at k_c=90, while measured BGE floors are 25 for top-10 and about 30 for top-20. The rejected PR head contained 433 commits absent from the measured revision, while the measured revision contained 2 commits absent from the PR head; no current-head production-route recall eval existed. No production option is authorized; a successor requires collection-scoped, fail-closed calibration identity and representative recall evidence."
 
 [[claims]]
 id = "bge768_k30_range_cap_4mib_baseline"
@@ -1256,3 +1318,42 @@ hardware = "Same bed as rdstrat13_minio_s3_mechanisms"
 date = "2026-08-31"
 version = "Both arms PR perf/rdstrat13-coldpath binaries; the race reproduces on the base binary's beds too (b0_rtt100/b0_rtt150/b0_rtt50 all carried the overlap)"
 notes = "Follow-up TD to file: compaction input retirement (superseded-level deletion/retirement on publication). The settle gate's new compaction-quiescence check (same PR) cannot catch this — the overlap appears after a quiet window and persists indefinitely. Clean-bed acceptance re-run (~1 h, single b0/b4 pair) once the retirement fix lands. FIX (2026-09-01): bounded-retry retirement + durable retire-pending.json obligation ledger + reconciler + discovery filter landed (TD-COMPACT-13 Fixed); reproduction tests sst_compaction_retirement_fault_test RED(17 surviving segments)->GREEN(row-accounting converged)."
+
+# ---------------------------------------------------------------------------
+# TD-IOBUDGET-2 measurement campaign (dataserver2 SIFT-1M, 2026-09-03).
+# Artifact: docs/_internal/status/IOBUDGET2_CAMPAIGN_2026_09_03.adoc
+# ---------------------------------------------------------------------------
+
+[[claims]]
+id = "iobudget2_file_geometry_sift1m"
+claim = "On the dataserver2 file:// SIFT-1M bed, the TD-IVF-4 destination-derived writer geometry (k=122, LOCAL 1 MiB target) vs the old CLOUD-derived k=30 on the SAME binary cut object-cold bytes/query 58.53->28.62 MB (-51.1%) and GETs/query 21.95->19.02 (-13.3%), at object-cold recall@100 0.9794 vs 0.9835 (paired -0.0041). Against the previous 0.98 floor this failed (paired loss 8x the -0.0005 tolerance); the product owner accepted the trade on 2026-09-03 and the recall floor drops to 0.975 repo-wide (harness --min-recall, sift_pax_recall_ratchet_test), making this operating point shippable. Mechanism on record: default nprobe ceil(2*sqrt(k_c)) halves the probe fraction (37%->19%) on finer partitions."
+metric = "object-cold recall@100, GETs/query, bytes/query on file:// SIFT-1M with settled single-segment beds; per-arm settled coarse_cells 30 vs 122"
+status = "measured"
+asserted_in = [
+  "docs/_internal/status/IOBUDGET2_CAMPAIGN_2026_09_03.adoc",
+  "docs/10-quality/td/TD-IVF-4-cell-geometry-hardcodes-cloud-iop-target.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "Two arms on one release-server binary (develop 3a3960aa6, sha256 87684c3777a0aedd...): a30 with --ivf-k 30 (old CLOUD-derived geometry) vs a122 with no override (destination-derived, LOCAL 1 MiB); --rows 1000000 --queries 100 --top-k 100 --explicit-flush-every-rows 250000 --settle-timeout-secs 3600 --post-write-max-gets 5000 --max-p50-ms 60000; file:// beds under ~/proximadb-bench-data/iobudget2/geom_<arm>/"
+artifact = "docs/_internal/status/IOBUDGET2_CAMPAIGN_2026_09_03.adoc"
+hardware = "dataserver2 192.168.1.65 (32-core/125 GB, SAS-RAID /home), local file:// beds, no network in the measured path"
+date = "2026-09-03"
+version = "origin/develop 3a3960aa6 (binary sha256 87684c3777a0aedd...); harness 3a3960aa6 + global_manifest_url pin d0d28d264 (campaign-local)"
+notes = "REQUIRED gate from the TD-IVF-4 review: the default file:// deployment's writer geometry shifts k x4 and this campaign is its measurement. The recall FAIL at the old floor is exactly what the gate existed to surface; the floor change is a product decision recorded here and in TD-SEARCH-3's convention. Warm-phase GETs rose 9.10->11.48 with k=122, so --local-warm-max-gets recalibrates 10.0->12.5 in the same change. Cross-host byte-determinism: config-driven geometry is a pre-existing class (cf. PROXIMADB_IVF_K); k_c is per-segment self-describing metadata."
+
+[[claims]]
+id = "read_strategy_chooser_sift1m_minio"
+claim = "With engagement PROVEN (the fixed --adaptive-read-strategy wiring; '[chooser] ON arm engaged' x3 in the ON log, x0 in OFF — the exact signal the invalidated 2026-08-31 A/B lacked), the read-strategy chooser on dataserver2-local MinIO SIFT-1M cut object-cold GETs/query 21.95->12.82 (-41.6%), local-disk-warm (cache-present) GETs/query 9.10->6.43 (-29.3%), post-write GETs/query 9.39->6.84 (-27.2%), and p50 742.7->650.6 ms object-cold (-12.4%) / 526.6->370.4 ms post-write (-29.7%), with byte-identical recall and result identities in all three phases. The OFF arm fails the object-cold GET gate (21.95 > 20.00) and the ON arm passes every gate at the campaign's gate settings (recall gates at defaults; post-write/p50 latency gates at the loose 5000/60000 overrides — bed-class-dependent defaults); the warm-phase pair shows no cache-tier degradation, satisfying the promotion gate the estimator's ledger note names. Settled geometry coarse_cells 30 (the s3/CLOUD default profile the flip targets)."
+metric = "per-phase GETs/query, bytes/query, p50/p95 latency, recall@100 and ordered-identity parity, chooser engagement attestation"
+status = "measured"
+asserted_in = [
+  "docs/_internal/status/IOBUDGET2_CAMPAIGN_2026_09_03.adoc",
+  "docs/10-quality/td/TD-IOBUDGET-2-followup-verdicts-chooser-evidence-repair.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "Two arms on one binary (TD-RDSTRAT-13 2b release-server 462a437f0 stack, sha256 3e88c1245d06559a...): OFF with no flag vs ON with --adaptive-read-strategy; --rows 1000000 --queries 100 --top-k 100 --explicit-flush-every-rows 250000 --settle-timeout-secs 3600 --post-write-max-gets 5000 --max-p50-ms 60000 --read-ranges-inflight 8 --s3-endpoint http://localhost:9000 --storage-url s3://proximadb-rdstrat12-minio/chooser2-202609032031-<arm>; fresh per-arm S3 prefixes"
+artifact = "docs/_internal/status/IOBUDGET2_CAMPAIGN_2026_09_03.adoc"
+hardware = "dataserver2 192.168.1.65 (32-core/125 GB), server + MinIO co-located (localhost:9000, path-style, plain HTTP allowed); no external network in the measured path"
+date = "2026-09-03"
+version = "binary 462a437f0 stack (sha256 3e88c1245d06559a...); harness 3a3960aa6 + global_manifest_url pin d0d28d264"
+notes = "Replaces the INVALIDATED 2026-08-31 chooser A/B (its ON arm ran chooser-OFF: the harness popped the gate and no CLI wire existed; byte-identical GETs/q 20.05 across arms; zero pax.range_estimator observe lines). This run attests engagement by the wiring print and a -41.6% behavioral delta; the pax.range_estimator tracing target produced no lines at the info level on the 2b binary (logging-config follow-up, not an engagement question). bytes/query rises ~2-4% (larger merged ranges) — the economy claim is GET-round-trip-led per ADR-062. Flip checklist steps 1 and 3 are satisfied; steps 4-5 (re-tier to PROXIMADB_STORAGE_READ_STRATEGY_CHOOSER_DISABLE + alias, default-OFF assertion update) are the flip PR, gated on product review of this claim."

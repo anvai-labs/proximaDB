@@ -22,11 +22,9 @@ T = TypeVar("T", bound="CreateEdgeRequest")
 
 @_attrs_define
 class CreateEdgeRequest:
-    """Wrapped envelope: server expects `{"edge": EdgeInput}`.
-
+    """
     Attributes:
-        edge (EdgeInput): Edge payload nested inside `CreateEdgeRequest.edge`. Matches
-            `RestEdgeInput` in proximadb-api's graph handler.
+        edge (EdgeInput):
     """
 
     edge: EdgeInput

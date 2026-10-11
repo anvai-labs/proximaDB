@@ -53,6 +53,22 @@ impl QueryType {
             QueryType::QueryTypeAggregation => "QUERY_TYPE_AGGREGATION",
         }
     }
+    /// Creates an enum from the proto field names (round 8: the decode
+    /// direction was simply absent — JSON/enum-name decoding of explain
+    /// types never worked).
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "QUERY_TYPE_UNKNOWN" => Some(Self::QueryTypeUnknown),
+            "QUERY_TYPE_SQL" => Some(Self::QueryTypeSql),
+            "QUERY_TYPE_UQL" => Some(Self::QueryTypeUql),
+            "QUERY_TYPE_VECTOR_SEARCH" => Some(Self::QueryTypeVectorSearch),
+            "QUERY_TYPE_GRAPH_QUERY" => Some(Self::QueryTypeGraphQuery),
+            "QUERY_TYPE_DOCUMENT_QUERY" => Some(Self::QueryTypeDocumentQuery),
+            "QUERY_TYPE_HYBRID" => Some(Self::QueryTypeHybrid),
+            "QUERY_TYPE_AGGREGATION" => Some(Self::QueryTypeAggregation),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -150,6 +166,43 @@ impl NodeType {
             NodeType::NodeTypeCandidateSet => "NODE_TYPE_CANDIDATE_SET",
             NodeType::NodeTypeRerank => "NODE_TYPE_RERANK",
             NodeType::NodeTypeMock => "NODE_TYPE_MOCK",
+        }
+    }
+    /// Creates an enum from the proto field names (round 8: the decode
+    /// direction was simply absent — JSON/enum-name decoding of explain
+    /// types never worked).
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NODE_TYPE_UNKNOWN" => Some(Self::NodeTypeUnknown),
+            "NODE_TYPE_SCAN" => Some(Self::NodeTypeScan),
+            "NODE_TYPE_INDEX_SCAN" => Some(Self::NodeTypeIndexScan),
+            "NODE_TYPE_VECTOR_INDEX_SCAN" => Some(Self::NodeTypeVectorIndexScan),
+            "NODE_TYPE_GRAPH_SCAN" => Some(Self::NodeTypeGraphScan),
+            "NODE_TYPE_DOCUMENT_SCAN" => Some(Self::NodeTypeDocumentScan),
+            "NODE_TYPE_FILTER" => Some(Self::NodeTypeFilter),
+            "NODE_TYPE_PROJECT" => Some(Self::NodeTypeProject),
+            "NODE_TYPE_AGGREGATE" => Some(Self::NodeTypeAggregate),
+            "NODE_TYPE_SORT" => Some(Self::NodeTypeSort),
+            "NODE_TYPE_LIMIT" => Some(Self::NodeTypeLimit),
+            "NODE_TYPE_JOIN" => Some(Self::NodeTypeJoin),
+            "NODE_TYPE_UNION" => Some(Self::NodeTypeUnion),
+            "NODE_TYPE_DISTINCT" => Some(Self::NodeTypeDistinct),
+            "NODE_TYPE_VECTOR_SEARCH" => Some(Self::NodeTypeVectorSearch),
+            "NODE_TYPE_DISTANCE_COMPUTE" => Some(Self::NodeTypeDistanceCompute),
+            "NODE_TYPE_QUANTIZATION" => Some(Self::NodeTypeQuantization),
+            "NODE_TYPE_GRAPH_TRAVERSAL" => Some(Self::NodeTypeGraphTraversal),
+            "NODE_TYPE_PATTERN_MATCH" => Some(Self::NodeTypePatternMatch),
+            "NODE_TYPE_PATH_FINDING" => Some(Self::NodeTypePathFinding),
+            "NODE_TYPE_DISTRIBUTED_SCAN" => Some(Self::NodeTypeDistributedScan),
+            "NODE_TYPE_DISTRIBUTED_AGGREGATE" => Some(Self::NodeTypeDistributedAggregate),
+            "NODE_TYPE_SHUFFLE" => Some(Self::NodeTypeShuffle),
+            "NODE_TYPE_EXCHANGE" => Some(Self::NodeTypeExchange),
+            "NODE_TYPE_HYBRID_SEARCH" => Some(Self::NodeTypeHybridSearch),
+            "NODE_TYPE_FILTER_CONTRACT" => Some(Self::NodeTypeFilterContract),
+            "NODE_TYPE_CANDIDATE_SET" => Some(Self::NodeTypeCandidateSet),
+            "NODE_TYPE_RERANK" => Some(Self::NodeTypeRerank),
+            "NODE_TYPE_MOCK" => Some(Self::NodeTypeMock),
+            _ => None,
         }
     }
 }
@@ -546,6 +599,19 @@ impl ExplainFormat {
             ExplainFormat::ExplainFormatText => "EXPLAIN_FORMAT_TEXT",
             ExplainFormat::ExplainFormatGraphviz => "EXPLAIN_FORMAT_GRAPHVIZ",
             ExplainFormat::ExplainFormatProtobuf => "EXPLAIN_FORMAT_PROTOBUF",
+        }
+    }
+    /// Creates an enum from the proto field names (round 8: the decode
+    /// direction was simply absent — JSON/enum-name decoding of explain
+    /// types never worked).
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "EXPLAIN_FORMAT_UNKNOWN" => Some(Self::ExplainFormatUnknown),
+            "EXPLAIN_FORMAT_JSON" => Some(Self::ExplainFormatJson),
+            "EXPLAIN_FORMAT_TEXT" => Some(Self::ExplainFormatText),
+            "EXPLAIN_FORMAT_GRAPHVIZ" => Some(Self::ExplainFormatGraphviz),
+            "EXPLAIN_FORMAT_PROTOBUF" => Some(Self::ExplainFormatProtobuf),
+            _ => None,
         }
     }
 }

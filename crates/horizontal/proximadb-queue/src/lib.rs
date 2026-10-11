@@ -75,18 +75,14 @@ pub use topic::{PartitionId, partition_for};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::task::JoinHandle;
 use tracing::info;
-
-/// Process-unique counter for QueueClient `instance_id` generation.
-/// Combined with the OS PID it gives every QueueClient a distinct id
-/// across the cluster — the value cross-process partition leases use
-/// to determine ownership.
-static INSTANCE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::disk_tier::PartitionDiskWriter;
 use crate::fs::{LocalFs, QueueFs};
@@ -103,12 +99,15 @@ pub struct QueueClient {
     /// adapter case once `proximadb-filesystem` is extracted).
     root_path: PathBuf,
     fs: Arc<dyn QueueFs>,
+    archive_fs: Option<Arc<dyn QueueFs>>,
     /// Per-process unique identity used as the `holder_id` in partition
     /// lease files. Two `QueueClient::open` calls (in the same or
     /// different processes) get distinct values so the lease-conflict
     /// path can be exercised end-to-end.
     instance_id: String,
     topics: RwLock<HashMap<String, Arc<TopicState>>>,
+    closed: AtomicBool,
+    consumers: std::sync::Mutex<Vec<Weak<consumer::ConsumerInner>>>,
     /// Background-task handles spawned at open. `shutdown()` signals
     /// each one's oneshot and awaits their JoinHandle so a clean exit
     /// drains any in-flight uploads / reaps before returning.
@@ -162,19 +161,23 @@ impl QueueClient {
     ) -> Result<Arc<Self>> {
         let root_path = resolve_local_root(&config.root)?;
         let fs: Arc<dyn QueueFs> = fs_override.unwrap_or_else(LocalFs::new_arc);
+        if !fs.supports_conditional_replace() {
+            return Err(QueueError::Persistence(
+                "queue root backend does not support conditional ownership publication".into(),
+            ));
+        }
         fs.create_dir_all(&root_path).await?;
 
-        let instance_id = format!(
-            "inst-{}-{}",
-            std::process::id(),
-            INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
+        let instance_id = format!("inst-{}", uuid::Uuid::new_v4());
         let client = Arc::new(Self {
             config,
             root_path,
             fs,
+            archive_fs: archive_fs_override.clone(),
             instance_id,
             topics: RwLock::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            consumers: std::sync::Mutex::new(Vec::new()),
             background_tasks: Mutex::new(Vec::new()),
         });
 
@@ -245,22 +248,49 @@ impl QueueClient {
 
     /// Construct a `Consumer` handle within a consumer group. Lightweight.
     pub fn consumer(self: &Arc<Self>, group_id: impl Into<String>) -> Consumer {
-        Consumer::new(self.clone(), group_id.into())
+        let consumer = Consumer::new(self.clone(), group_id.into());
+        // No await while registering. Shutdown closes admission before its
+        // snapshot; racing constructors return a closed, unusable handle.
+        match self.consumers.lock() {
+            Ok(mut consumers) => {
+                consumers.retain(|c| c.strong_count() > 0);
+                consumers.push(Arc::downgrade(&consumer.inner));
+            }
+            Err(_) => self.closed.store(true, Ordering::Release),
+        }
+        consumer
     }
 
-    /// Graceful shutdown. Signals every background task (uploader, and
-    /// later: reaper, lease renewer) via its oneshot, then awaits the
-    /// JoinHandle so any in-flight upload completes before the function
-    /// returns. The group-commit drainer is dropped implicitly when
-    /// the QueueClient's Arc count hits zero.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Close consumer admission and await live consumer lease release, then
+    /// drain uploader/reaper tasks. Call this before dropping Consumer handles;
+    /// their Drop alone cannot await release. The group-commit drainer is dropped
+    /// implicitly when the QueueClient's Arc count hits zero.
     pub async fn shutdown(&self) -> Result<()> {
+        self.closed.store(true, Ordering::Release);
+        let consumers: Vec<_> = self
+            .consumers
+            .lock()
+            .map_err(|_| QueueError::Persistence("consumer registry poisoned".into()))?
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let mut error = None;
+        for inner in consumers {
+            if let Err(e) = (Consumer { inner }).shutdown().await {
+                error.get_or_insert(e);
+            }
+        }
         let mut tasks = self.background_tasks.lock().await;
         for (handle, tx) in tasks.drain(..) {
             let _ = tx.send(());
             let _ = handle.await;
         }
         info!("proximadb-queue shutdown");
-        Ok(())
+        error.map_or(Ok(()), Err)
     }
 
     pub(crate) fn config(&self) -> &QueueConfig {
@@ -269,6 +299,10 @@ impl QueueClient {
 
     pub(crate) fn fs(&self) -> &Arc<dyn QueueFs> {
         &self.fs
+    }
+
+    pub(crate) fn archive_fs(&self) -> &Arc<dyn QueueFs> {
+        self.archive_fs.as_ref().unwrap_or(&self.fs)
     }
 
     pub(crate) fn root_path(&self) -> &PathBuf {
@@ -295,10 +329,12 @@ impl QueueClient {
         topic: &str,
         cfg: TopicConfig,
     ) -> Result<Arc<TopicState>> {
+        crate::topic::validate_topic(topic)?;
         if let Some(existing) = self.topics.read().await.get(topic) {
             return Ok(existing.clone());
         }
 
+        crate::topic::ensure_exact_directory(&self.fs, &self.root_path.join(topic)).await?;
         let mut disk_writers = Vec::with_capacity(cfg.partition_count as usize);
         for p in 0..cfg.partition_count {
             let writer = PartitionDiskWriter::open(

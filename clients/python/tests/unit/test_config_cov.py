@@ -480,7 +480,10 @@ def test_load_config_file_yaml(tmp_path):
 
 
 def test_load_config_file_toml(tmp_path):
-    pytest.importorskip("tomli")
+    # No importorskip: `tomllib` is stdlib from 3.11, this package's floor. The
+    # guard used to be `importorskip("tomli")`, which would now skip forever
+    # (the backport is no longer a dependency) and silently retire the only
+    # coverage of the TOML branch.
     f = tmp_path / "c.toml"
     f.write_text('url = "http://h:5678"\ntimeout = 8.0\n')
     data = load_config_file(str(f))

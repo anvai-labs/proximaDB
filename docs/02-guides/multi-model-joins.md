@@ -386,7 +386,7 @@ METRICS(
 - [Vector Search](./vector-search.md) - Vector search deep dive
 - [Graph API](../03-api-reference/graph.adoc) - Graph patterns
 - [REST API](../03-api-reference/rest.adoc) - Document and JSON APIs
-- [API Reference](../03-api-reference/) - Full reference
+- [API Reference](../03-api-reference/index.md) - Full reference
 
 ---
 

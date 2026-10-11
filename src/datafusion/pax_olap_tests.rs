@@ -946,17 +946,27 @@ mod tests {
         );
     }
 
-    /// Test 2.8a: Route confirmation — a PAX-backed OLAP shape routes to
-    /// DataFusion (NOT Volcano) when `PROXIMADB_DF_PAX_READER=1`.
+    /// Test 2.8a (REWRITTEN by TD-USUB-9): a PAX-backed OLAP shape must stamp
+    /// the backend that ACTUALLY SERVES it — Volcano — even with the gate on.
     ///
-    /// Drives the REAL policy core (`ComputeScheduler::route_select`) with the
-    /// QueryShape the pgwire pipeline now computes from real catalog signals
-    /// (Test 2.1's predicate feeds this flag) — this is the "plan shows
-    /// DataFusion, not Volcano" half of the E2E confirmation at the decision
-    /// seam where it is deterministic; socket-level plan echo is out of unit
-    /// scope.
+    /// This test previously asserted the opposite: that the gate routes the
+    /// shape to `DataFusionLocal`. That assertion **encoded a defect**. The
+    /// scheduler did stamp DataFusion, but the pgwire dispatch gate is
+    /// `((!abac && parquet_backed) || native_registerable) && matches!(backend, …)`
+    /// (`relational_pipeline.rs`), and this shape is `parquet_backed: false`
+    /// with no native registration — so the DataFusion block was never entered
+    /// and **Volcano served the query**. The route-cost observer then recorded
+    /// Volcano's measured latency and I/O into DataFusion's cost cells.
+    ///
+    /// The scheduler arm was therefore deleted rather than repaired: a gate that
+    /// cannot make DataFusion execute was only ever mislabelling the executor.
+    /// Execution is unchanged by that deletion (Volcano before and after); only
+    /// the stamp became true — which is what this test now pins.
+    ///
+    /// The env var is deliberately still set: the property must hold with the
+    /// gate ON, because "gate on" is exactly when the old code lied.
     #[tokio::test]
-    async fn pax_backed_shape_routes_to_datafusion_under_gate() {
+    async fn pax_backed_shape_stamps_the_backend_that_actually_serves() {
         unsafe { std::env::set_var("PROXIMADB_DF_PAX_READER", "1") };
 
         use crate::query::compute_scheduler::{ComputeScheduler, QueryShape};
@@ -972,16 +982,23 @@ mod tests {
         let decision = scheduler.route_select(shape);
         assert_eq!(
             decision.backend,
-            ComputeBackend::DataFusionLocal,
-            "PAX-backed analytical shape + gate ON must route DataFusion, got: {}",
+            ComputeBackend::Native,
+            "PAX-backed-but-not-parquet-backed OLAP is dispatched to Volcano, so it \
+             must not be stamped DataFusion — that mis-attribution is what poisons \
+             the cost model. Got: {}",
             decision.reason
         );
     }
 
-    /// Test 2.8b: Route confirmation (control) — WITHOUT the PAX signal the
-    /// same OLAP shape stays on Volcano/Native even under the same process
-    /// gate, proving it is the catalog-derived `pax_backed` flag that flips
-    /// the route (not merely `engages_relational`).
+    /// Test 2.8b: control — a non-PAX OLAP shape stays on Volcano/Native under
+    /// the same process gate.
+    ///
+    /// TD-USUB-9 note: this used to be the control for "the `pax_backed` flag
+    /// flips the route". It no longer proves that, because nothing flips the
+    /// route any more — `pax_backed` is observed on the shape but selects no
+    /// backend (see 2.8a). It is retained as a plain regression guard that an
+    /// analytical shape on native storage stays on Volcano, which is still worth
+    /// holding.
     #[tokio::test]
     async fn non_pax_olap_shape_stays_volcano_despite_gate() {
         unsafe { std::env::set_var("PROXIMADB_DF_PAX_READER", "1") };

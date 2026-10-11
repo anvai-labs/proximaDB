@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "abac-policy")]
 use crate::core::search::{
-    FilterExpression, OptimizedSearchRecord, sql_value_filter::proxima_value_to_json,
+    FilterExpression, OptimizedSearchRecord, sql_value_filter::proxima_value_to_filter_literal,
 };
 #[cfg(feature = "abac-policy")]
 use crate::security::rls::filter_lattice::admits_with_security;
@@ -52,12 +52,12 @@ pub fn abac_scan_predicate(
 
     Some(Box::new(move |record: &ProximaRecord| {
         // Resolve each field the security expression references from the record's
-        // props. Using `proxima_value_to_json` (not the whole-tree map) avoids a
+        // props. Using `proxima_value_to_filter_literal` (not the whole-tree map) avoids a
         // per-row HashMap allocation — only the fields the expression actually
         // touches are extracted, lazily.
         let resolve = |field: &str| -> Option<serde_json::Value> {
             record.props.get(field).and_then(|node| match node {
-                ProximaTreeNode::Value(pv) => Some(proxima_value_to_json(pv)),
+                ProximaTreeNode::Value(pv) => Some(proxima_value_to_filter_literal(pv)),
                 _ => None,
             })
         };
@@ -426,7 +426,10 @@ pub fn post_filter_search_results(
         .into_iter()
         .filter(|record| {
             let resolve = |field: &str| -> Option<serde_json::Value> {
-                record.metadata.get(field).map(proxima_value_to_json)
+                record
+                    .metadata
+                    .get(field)
+                    .map(proxima_value_to_filter_literal)
             };
             admits_with_security(None, Some(security), &resolve)
         })

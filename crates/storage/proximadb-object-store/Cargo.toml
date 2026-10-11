@@ -32,5 +32,6 @@ azure = ["object_store/azure"]
 gcp = ["object_store/gcp"]
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }

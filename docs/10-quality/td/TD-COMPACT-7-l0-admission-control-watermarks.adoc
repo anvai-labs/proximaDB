@@ -49,6 +49,6 @@ bounding L0 for a collection that cannot compact it).
 
 == Related
 
-link:ADR-076-async-compaction-admission-control.adoc[ADR-076],
+link:../../12-design/adr/ADR-076-async-compaction-admission-control.adoc[ADR-076],
 link:TD-COMPACT-6-async-compaction.adoc[TD-COMPACT-6],
 link:TD-COMPACT-8-training-arm-debounce.adoc[TD-COMPACT-8].

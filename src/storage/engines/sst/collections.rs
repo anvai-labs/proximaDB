@@ -42,6 +42,7 @@ impl SstEngine {
 
         let config = CollectionConfig {
             name: collection_id.to_string(),
+            embedding_config: None,
             dimension: 1536,          // Default dimension
             distance_metric: Some(0), // Default metric
             storage_engine: Some(0),  // SST engine

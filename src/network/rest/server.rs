@@ -401,7 +401,10 @@ impl RestServer {
         // auth on.  Single-tenant production deployments that forget to wire
         // auth would otherwise silently accept unauthenticated requests; the
         // warning makes the foot-gun visible at server start.
-        if !security_config.development_mode && !security_config.auth.enabled {
+        if !security_config.development_mode
+            && !security_config.auth.enabled
+            && security_coordinator.is_none()
+        {
             tracing::warn!(
                 target: "proximadb::security",
                 bind_addr = %bind_addr,
@@ -535,9 +538,51 @@ impl RestServer {
         // `[server.admin_ui] enabled`. This legacy multi-port path never serves it.
 
         // Add V2 API router with ProximaRecord support
-        let v2_router = super::v2::create_v2_router().with_state(state_for_v2);
+        let v2_router = super::v2::create_v2_router().with_state(state_for_v2.clone());
         base_router = base_router.nest("/api/v2", v2_router);
         tracing::info!("✅ V2 API enabled at /api/v2 (ProximaRecord, typed schema)");
+
+        // TD-MLOPS-1 slice 2: MLflow-compatible tracking wire, default OFF.
+        if super::mlflow::enabled() {
+            let mlflow_state = super::mlflow::MlflowState::new(
+                std::sync::Arc::new(
+                    crate::services::mlflow_run_store::SubstrateRunStoreFactory::new(
+                        state.document_service.clone(),
+                    ),
+                ),
+                state.model_registry_service.clone(),
+                state.data_dir.clone(),
+            );
+            let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
+            base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
+            // TD-MLOPS-2: the traces v3 family mounts at /api/3.0/mlflow
+            // (same gate, same state, before the tenant/auth layers).
+            let traces_router =
+                super::mlflow::traces::traces_routes().with_state(mlflow_state.clone());
+            base_router = base_router.nest("/api/3.0/mlflow", traces_router);
+            let artifacts_router =
+                super::mlflow::artifacts_router().with_state(mlflow_state.clone());
+            // merge (not nest): the artifacts family carries its full
+            // absolute path and must combine with, not nest under, the base.
+            base_router = base_router.merge(artifacts_router);
+            // TD-MLOPS-3: the vendored stock MLflow UI at /mlflow-ui —
+            // statics + ajax-api aliases on the SAME base_router, BEFORE
+            // the tenant/auth layers, so a future OIDC middleware gates
+            // UI and API together (the mount-is-the-contract rule).
+            let ui_router = super::mlflow::ui::ui_mount_routes().with_state(mlflow_state);
+            base_router = base_router.nest("/mlflow-ui", ui_router);
+            // axum 0.8 nest: /mlflow-ui/ strips to "//" which neither the
+            // nested "/" route nor its fallback catches — serve index at
+            // the trailing-slash form directly.
+            base_router = base_router.route(
+                "/mlflow-ui/",
+                axum::routing::get(super::mlflow::ui::serve_index_route),
+            );
+            super::mlflow::ui::log_feature_status();
+            tracing::info!(
+                "✅ MLflow compatibility wire enabled at /api/2.0/mlflow (+ artifacts proxy)"
+            );
+        }
 
         // Unmatched routes (incl. the removed v1 surfaces) return the canonical
         // error envelope with a migration hint pointing at the v2 replacement.
@@ -564,7 +609,7 @@ impl RestServer {
         // CLOSED — the deny layer applied after the router is built rejects the
         // data plane with 503. (Computed before the coordinator is moved below.)
         let auth_misconfigured = security_config.auth.enabled && security_coordinator.is_none();
-        let auth_layer = if security_config.auth.enabled {
+        let auth_layer = if security_config.auth.enabled || security_coordinator.is_some() {
             if let Some(coordinator) = security_coordinator {
                 Some(middleware::from_fn_with_state(
                     coordinator,
@@ -801,10 +846,10 @@ impl RestServer {
         if let Some(gate) = recall_probe_gate {
             base_state = base_state.with_recall_probe_gate(gate);
         }
-        // R-7c.3 production wiring: share the rank-pipeline singleton + the
-        // durable rank-profile catalog so the REST `/api/v1/rank/search` route
-        // and the new `/api/v1/rank/profiles` install endpoints reach the same
-        // process-wide `RankServices` that pgwire SQL `RERANK(...)` uses.
+        // R-7c.3 production wiring: the REST `/api/v2/rank/search` route and
+        // pgwire SQL `RERANK(...)` share the process-wide rank pipeline. Keep
+        // the durable profile catalog in AppState for the profile dispatchers;
+        // those management routes are not mounted yet.
         if let Some(services) = rank_services {
             base_state = base_state.with_rank_services(services);
         }
@@ -911,9 +956,51 @@ impl RestServer {
         }
 
         // Add V2 API router with ProximaRecord support
-        let v2_router = super::v2::create_v2_router().with_state(state_for_v2);
+        let v2_router = super::v2::create_v2_router().with_state(state_for_v2.clone());
         base_router = base_router.nest("/api/v2", v2_router);
         tracing::info!("✅ V2 API enabled at /api/v2 (unified mode)");
+
+        // TD-MLOPS-1 slice 2: MLflow-compatible tracking wire, default OFF.
+        if super::mlflow::enabled() {
+            let mlflow_state = super::mlflow::MlflowState::new(
+                std::sync::Arc::new(
+                    crate::services::mlflow_run_store::SubstrateRunStoreFactory::new(
+                        state.document_service.clone(),
+                    ),
+                ),
+                state.model_registry_service.clone(),
+                state.data_dir.clone(),
+            );
+            let mlflow_router = super::mlflow::mlflow_routes().with_state(mlflow_state.clone());
+            base_router = base_router.nest("/api/2.0/mlflow", mlflow_router);
+            // TD-MLOPS-2: the traces v3 family mounts at /api/3.0/mlflow
+            // (same gate, same state, before the tenant/auth layers).
+            let traces_router =
+                super::mlflow::traces::traces_routes().with_state(mlflow_state.clone());
+            base_router = base_router.nest("/api/3.0/mlflow", traces_router);
+            let artifacts_router =
+                super::mlflow::artifacts_router().with_state(mlflow_state.clone());
+            // merge (not nest): the artifacts family carries its full
+            // absolute path and must combine with, not nest under, the base.
+            base_router = base_router.merge(artifacts_router);
+            // TD-MLOPS-3: the vendored stock MLflow UI at /mlflow-ui —
+            // statics + ajax-api aliases on the SAME base_router, BEFORE
+            // the tenant/auth layers, so a future OIDC middleware gates
+            // UI and API together (the mount-is-the-contract rule).
+            let ui_router = super::mlflow::ui::ui_mount_routes().with_state(mlflow_state);
+            base_router = base_router.nest("/mlflow-ui", ui_router);
+            // axum 0.8 nest: /mlflow-ui/ strips to "//" which neither the
+            // nested "/" route nor its fallback catches — serve index at
+            // the trailing-slash form directly.
+            base_router = base_router.route(
+                "/mlflow-ui/",
+                axum::routing::get(super::mlflow::ui::serve_index_route),
+            );
+            super::mlflow::ui::log_feature_status();
+            tracing::info!(
+                "✅ MLflow compatibility wire enabled at /api/2.0/mlflow (+ artifacts proxy)"
+            );
+        }
 
         // Unmatched routes (incl. removed v1 surfaces) → canonical 404 + hint.
         base_router = base_router.fallback(not_found_fallback);
@@ -1338,6 +1425,7 @@ mod tests {
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
                 api_keys,
+                scram_users: std::collections::HashMap::new(),
                 jwt: JwtConfig {
                     enabled: false,
                     secret: "dev-secret".to_string(),
@@ -1374,6 +1462,7 @@ mod tests {
             encryption: crate::security::EncryptionConfig::default(),
             key_store: crate::security::KeyStoreConfig::default(),
             tenant: Default::default(),
+            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
         }
     }
 

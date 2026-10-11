@@ -53,6 +53,32 @@ pub mod col_id {
     /// (the resolver's legacy version-1 sentinel), making this additive stripe
     /// mixed-read-safe.
     pub const RECORD_VERSION: i32 = 14;
+    /// Shred directory (ID 15) — the block's OWN record of which prop key each
+    /// `USER_BASE`+ stripe carries, as msgpack `Vec<(col_id, prop_key)>`
+    /// (TD-USUB-6 slice 2a).
+    ///
+    /// **Why the block must name its own columns.** `FlatRow::into_record`
+    /// otherwise names user columns from the CALLER's `user_column_keys`,
+    /// *positionally* — so a caller list that is short, stale or reordered
+    /// silently drops values. That is harmless while the msgpack `PROPS` tail is
+    /// complete (the tail already holds every value, so the typed stripes are
+    /// advisory). It becomes silent data loss the moment the tail is reduced to a
+    /// residual, which is the whole point of making declared columns
+    /// authoritative — and schema evolution is exactly when a caller's key list
+    /// and the block's stripes disagree.
+    ///
+    /// **This entry carries NO stripe** (`stripe_len == 0`). Its payload lives in
+    /// the footer-extras region, addressed by the `ColumnMeta` pointer pair
+    /// `bloom_offset`/`bloom_len` reused as a generic footer-payload pointer —
+    /// which is what lets the directory be **additive in v2** with no format
+    /// version bump, no footer growth, and no new `ColumnRole` byte (it declares
+    /// `ColumnRole::Props`, since the payload is opaque msgpack). Both the
+    /// 32-byte `BlockFooter` and the 64-byte `ColumnMeta` are fully consumed, so
+    /// there was no spare field to grow instead.
+    ///
+    /// Readers locate columns by `find(|m| m.column_id == X)`, so a reader that
+    /// does not know this id simply never asks for it.
+    pub const SHRED_DIRECTORY: i32 = 15;
     /// First column ID for embedding stripes (embedding_0, embedding_1, …).
     pub const EMBED_BASE: i32 = 20;
     /// First column ID for user-defined columns from CatalogTableSchema.
@@ -216,6 +242,14 @@ pub struct FlatRow {
     pub embeddings: Vec<Vec<f32>>,
     /// User-defined columns projected from props or other sources.
     pub user_columns: Vec<Option<proximadb_data_model::ProximaValue>>,
+    /// Shredded props rebuilt from typed stripes and NAMED by the block's own
+    /// shred directory (TD-USUB-6). Populated only by [`Self::from_block_reader`]
+    /// for blocks that carry a directory; empty otherwise.
+    ///
+    /// Kept separate from `user_columns` because these are named by the BLOCK,
+    /// not positionally by the caller — which is precisely what makes a residual
+    /// tail safe to read.
+    pub shredded: Vec<(String, proximadb_data_model::ProximaValue)>,
 }
 
 impl FlatRow {
@@ -229,6 +263,37 @@ impl FlatRow {
 
     /// Extract a `FlatRow` from a `ProximaRecord`, projecting specific keys from `props`
     /// into the `user_columns` list.
+    /// Build a row whose msgpack `PROPS` tail OMITS `residual_keys` (TD-USUB-6 2b).
+    ///
+    /// The caller has already established that each listed key's value is
+    /// reproducible EXACTLY from its typed stripe under the declared type, so
+    /// dropping it from the tail loses nothing — that removal is the
+    /// write-amplification win, since today every shredded value is stored twice.
+    ///
+    /// Unlike [`Self::from_record_with_user_columns`], this does NOT populate
+    /// `user_columns`: the PAX writer buffers shredded values separately, and the
+    /// reader rebuilds them from the block's own shred directory rather than from
+    /// a positional caller list.
+    pub fn from_record_with_residual(
+        record: &ProximaRecord,
+        residual_keys: &[&str],
+    ) -> anyhow::Result<Self> {
+        let mut flat = Self::from_record(record)?;
+        if residual_keys.is_empty() {
+            return Ok(flat);
+        }
+        let mut props = record.props.clone();
+        for key in residual_keys {
+            props.remove(*key);
+        }
+        flat.props_bytes = if props.is_empty() {
+            None
+        } else {
+            Some(rmp_serde::to_vec_named(&props)?)
+        };
+        Ok(flat)
+    }
+
     pub fn from_record_with_user_columns(
         record: &ProximaRecord,
         user_column_keys: &[String],
@@ -279,6 +344,7 @@ impl FlatRow {
             .collect();
 
         Ok(FlatRow {
+            shredded: Vec::new(),
             oid: record.oid.clone(),
             tenant_id: record.tenant_id.clone(),
             created_at_ns: record.created_at_ns,
@@ -339,6 +405,20 @@ impl FlatRow {
             {
                 props.insert(key.clone(), proximadb_records::ProximaTreeNode::Value(v));
             }
+        }
+
+        // TD-USUB-6: fill props the RESIDUAL tail no longer carries, from the
+        // typed stripes, named by the block's own directory.
+        //
+        // The tail WINS wherever it still has the key. That ordering is the
+        // safety property: the writer drops a value from the tail only when the
+        // stripe reproduces it exactly, so a key still present in the tail is one
+        // the stripe could NOT reproduce — and its (lossy) stripe value must
+        // never overwrite the true one.
+        for (key, value) in self.shredded {
+            props
+                .entry(key)
+                .or_insert(proximadb_records::ProximaTreeNode::Value(value));
         }
 
         let labels: LabelSet = match self.labels_bytes {
@@ -501,6 +581,7 @@ impl FlatRow {
                 .filter_map(|stripe| stripe.get(i).cloned().flatten())
                 .collect();
             rows.push(FlatRow {
+                shredded: Vec::new(),
                 oid: at(&oids, i).unwrap_or_default(),
                 tenant_id: at(&tenants, i).unwrap_or_default(),
                 created_at_ns: created.get(i).copied().flatten().unwrap_or(0),
@@ -519,6 +600,45 @@ impl FlatRow {
                 embeddings,
                 user_columns: Vec::new(),
             });
+        }
+
+        // TD-USUB-6: rebuild shredded props from the typed stripes, named and
+        // typed by the block's OWN directory. Only columns with an EXACT declared
+        // type are rebuilt — for an undeclared column the stripe holds one of
+        // three physical classes with no way to know which variant to restore,
+        // and its tail is complete anyway, so it is deliberately skipped.
+        if let Some(dir) = reader.shred_directory() {
+            for entry in dir {
+                let Some(declared) = entry.declared_type.as_ref() else {
+                    continue;
+                };
+                let Some(class) = crate::writer::declared_shred_class_pub(declared) else {
+                    continue;
+                };
+                let (ints, floats, strs) = match class {
+                    crate::writer::ShredClassPub::Int => {
+                        (reader.decode_i64_stripe(entry.column_id), None, None)
+                    }
+                    crate::writer::ShredClassPub::Float => {
+                        (None, reader.decode_f64_stripe(entry.column_id), None)
+                    }
+                    crate::writer::ShredClassPub::Str => {
+                        (None, None, reader.decode_str_stripe(entry.column_id))
+                    }
+                };
+                for (i, row) in rows.iter_mut().enumerate() {
+                    let value = crate::writer::reconstruct_declared_pub(
+                        class,
+                        ints.as_ref().and_then(|v| v.get(i).copied().flatten()),
+                        floats.as_ref().and_then(|v| v.get(i).copied().flatten()),
+                        strs.as_ref().and_then(|v| v.get(i).cloned().flatten()),
+                        declared,
+                    );
+                    if let Some(v) = value {
+                        row.shredded.push((entry.key.clone(), v));
+                    }
+                }
+            }
         }
         Ok(rows)
     }

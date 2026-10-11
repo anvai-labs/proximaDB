@@ -114,6 +114,11 @@ pub struct ApiConfig {
     #[serde(default)]
     pub pg_port: Option<u16>,
 
+    /// Enable the local trust-auth pgwire listener. Disable in authenticated
+    /// or multi-tenant deployments until pgwire supports credential binding.
+    #[serde(default = "default_true")]
+    pub enable_pgwire: bool,
+
     /// Optional override for the unified-mode internal multiplexer upstream
     /// port (the loopback gRPC + Arrow Flight listener the TCP multiplexer
     /// forwards HTTP/2 to). When `None` (the default), the port is resolved
@@ -202,6 +207,7 @@ impl Default for ApiConfig {
             http2_max_concurrent_streams: 1000,
             max_connections: 10000,
             pg_port: None,
+            enable_pgwire: true,
             internal_mux_port: None,
             mcp_port: None,
             transport: default_transport(),

@@ -123,7 +123,6 @@ pub use arrow_conversion::{
     record_batch_to_vector_batch,
     record_batch_to_vector_records,
     sql_value_to_arrow_type,
-    sql_value_to_json,
     // Conversions
     vector_batch_to_record_batch,
     vector_records_to_record_batch,
@@ -157,9 +156,6 @@ pub use open::{
     DeltaLakeConfig,
     // Delta Lake
     DeltaLakeFormat,
-    IcebergConfig,
-    // Iceberg
-    IcebergFormat,
     // Common types
     StorageOptions,
     TableMetadata,
@@ -173,15 +169,16 @@ pub use adapters::{
     NovaFormatAdapter,
     // Engine-specific type aliases
     SstFormatAdapter,
-    SwiftFormatAdapter,
     ViperFormatAdapter,
     create_helix_adapter,
     create_nova_adapter,
     // Factory functions
     create_sst_adapter,
-    create_swift_adapter,
     create_viper_adapter,
 };
+// SWIFT adapters are `experimental-engines`-gated (TD-152 deprecation; same as RAPTOR).
+#[cfg(feature = "experimental-engines")]
+pub use adapters::{SwiftFormatAdapter, create_swift_adapter};
 // RAPTOR adapters are `experimental-engines`-gated (RAPTOR needs AXIS clustering).
 #[cfg(feature = "experimental-engines")]
 pub use adapters::{RaptorFormatAdapter, create_raptor_adapter};

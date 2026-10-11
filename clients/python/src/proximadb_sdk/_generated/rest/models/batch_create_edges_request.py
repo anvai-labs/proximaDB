@@ -22,8 +22,7 @@ T = TypeVar("T", bound="BatchCreateEdgesRequest")
 
 @_attrs_define
 class BatchCreateEdgesRequest:
-    """Body for `POST /api/v2/graphs/{id}/edges/batch`.
-
+    """
     Attributes:
         edges (list[EdgeInput]):
     """

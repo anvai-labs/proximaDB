@@ -1,0 +1,109 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-13: A delete concurrent with a spill flush resurrects the row — no truncation required
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **FIXED 2026-10-05.** Filed 2026-10-04, found by adversarial review while verifying TD-USUB-1's LSN plumbing; pre-existing in slice 2a, not introduced by the LSN work. Fixed by serializing `flush` against `delete_record` and `purge_durable_objects` on one `tokio::sync::Mutex` — option 3 below, chosen over the finer-grained alternative for the reason recorded there. Pinned by `delete_during_a_flush_does_not_resurrect_the_row`, **mutation-tested**: removing the guard reproduces the resurrection (`deleted row resurrected via get_record from the segment flush published`).
+| Priority | **HIGH once the spill path is wired** — it is a silent wrong answer (mandate #1) of the resurrection class (mandate #16a), and it needs no WAL truncation to fire. Until wiring it is unreachable, which is the only reason this is not a live incident.
+| Component | `src/services/record_spill.rs` (`flush`, `delete_record`)
+| Relates to | TD-USUB-1 (slice 2a introduced the flush path; its 2b safety argument depends on reads never resurrecting), TD-USUB-11 (tombstone round-trip), mandate #16a
+| Blocked by | Nothing. **No longer blocks slice 2b** as of the fix above; the remaining 2b prerequisites are on TD-USUB-1.
+|===
+
+== The race
+
+`flush()` publishes in three separate steps with **no lock spanning them**:
+
+. snapshot the memtable (`self.memtable.iter().map(clone).collect()`);
+. encode Parquet and `write_if_absent` — **async I/O, nothing held**;
+. `self.segments.write().push(path)`, then evict the flushed oids.
+
+`delete_record()` decides whether to record a tombstone from `!self.segments.read().is_empty()`.
+
+So on a partition's **first** flush, with a delete interleaved between steps 1 and 3:
+
+[source]
+----
+flush:   snapshot {x}            ──────────────► write ──────► segments.push(seg)
+delete:            memtable.remove(x)
+                   has_segments = false   ← segments is still EMPTY
+                   ⇒ no tombstone
+                   returns Ok(true)  "deleted"
+----
+
+End state: no tombstone, `x` absent from the memtable, and **`x` live in the segment** that flush
+just published from its pre-delete snapshot. `get_record(x)` and `merged_records` both return the
+row. The caller was told the delete succeeded.
+
+Not restricted to the first flush: the same window exists whenever the delete lands before the
+`segments.push` of a flush whose snapshot already contains the row. The empty-list case is simply
+the one where the `has_segments` guard also fails, turning a *stale-copy* problem into a
+*no-tombstone* problem.
+
+Reachability: `partition()` hands out a shared `Arc<dyn RecordStorage>` and `write_mutations` holds
+no partition-wide lock across its per-record loop, so two pgwire connections writing the same table
+suffice. No artificial timing is needed beyond the duration of one object write.
+
+== Why the obvious fix is wrong
+
+**"Always insert the tombstone, drop the `has_segments` gate."** The existing comment even says a
+redundant tombstone is harmless. It is not harmless any more: TD-USUB-1's `min_unflushed_lsn`
+**fails closed while any tombstone exists** (because an in-memory tombstone is the only durable
+evidence of a post-flush delete). Always-tombstone would therefore mean a partition that has ever
+deleted anything can never report a truncation point — trading a correctness bug for a permanent
+liveness one.
+
+That interaction is the reason this is its own TD rather than a one-line change: the fix has to
+satisfy both invariants at once.
+
+== Shape of a real fix
+
+The predicate is wrong, not the gate. `has_segments` asks "does a segment exist *now*", when the
+question is "could this row be in a segment, **including one currently being written**". Options,
+in rough order of preference:
+
+. **Publish intent before the I/O.** Reserve the segment (push its path, or a pending marker) at
+  snapshot time rather than after the write, so `has_segments` is true for the whole window. Needs
+  the read path to tolerate a segment that is not yet readable — which the TD-COMPACT-13 retirement
+  ledger already does for the mirror-image case (a path recorded as pending is filtered out of
+  discovery), so there is precedent to follow rather than invent.
+. **Snapshot-scoped suppression.** Have `flush()` publish the oid set it is writing, and have
+  `delete_record` consult it: a delete of an oid in an in-flight snapshot records a tombstone
+  regardless of `has_segments`.
+. **Serialize flush against delete** on a per-partition lock. Simplest and most obviously correct,
+  and the one to prefer unless the contention is shown to matter — the flush holds it across an
+  object write, which is exactly the kind of thing to measure rather than assume (mandate #6).
+  **✅ This is what landed**, for a reason beyond simplicity: option 2 admits a tombstone for a row
+  whose flush then *fails*, and under TD-USUB-1's rule a spurious tombstone pins WAL truncation
+  **forever** (`min_unflushed_lsn` fails closed on any tombstone). Serializing introduces no such
+  state. The spill path still has no production caller, so the contention it costs is currently
+  zero — measure before trading correctness obviousness for it.
++
+`purge_durable_objects` takes the same guard, which this TD originally did not mention: it lists
+the prefix and deletes what it finds, so a concurrent flush could publish a segment *after* the
+listing and leave an object the purge was meant to remove — orphaned, with the partition about to
+be dropped and nothing left to reference it.
++
+The guard is `tokio::sync::Mutex`, not `parking_lot`: the critical section spans an `await` on the
+object write, and a blocking mutex held across an await stalls the runtime thread.
+
+Whichever is chosen, the tombstone-vs-truncation tension above has to be resolved in the same
+change, most likely by making tombstones durable (already TD-USUB-1's own open item) so that
+`min_unflushed_lsn` no longer has to fail closed on them.
+
+== Why this blocks 2b
+
+Slice 2b's entire safety argument is that a segment is a faithful durable representation of rows
+the WAL already committed, so the WAL may be truncated below what segments cover. A read path that
+can resurrect a deleted row breaks that premise *before* truncation is involved: the segment is
+not faithful. Truncating on top of it would make the resurrection permanent rather than
+repairable by replay.
+
+== Evidence gate
+
+A test that fails before the fix and passes after, driving a delete concurrently with a flush on
+one partition (the window is an object write, so it is reproducible without timing hacks — e.g. a
+filesystem whose `write_if_absent` blocks on a channel until the delete has run). Asserting the
+*observable* property: after both complete, `get_record` and a scan must agree the row is gone.

@@ -1,0 +1,160 @@
+= TD-MLOPS-2: MLflow 3.x Traces + LoggedModel surfaces
+:status: Delivered (PR pending)
+:dim: D2
+:pillar: OE
+
+== Problem
+
+The MLflow adapter (TD-MLOPS-1) served only the 2.x tracking/registry/
+artifacts wire. MLflow 3.x GenAI users got nothing: `MlflowClient.
+start_trace()` failed, `create_logged_model` failed, and the vendored
+UI's Traces / logged-model tabs 404-degraded. The TD-MLOPS-2 "opening"
+attempt introduced cross-layer query and artifact ports that were later
+reverted. This implementation keeps filtering in the compatibility wire and
+uses the existing capability-safe artifact backend instead.
+
+== Implemented in this change
+
+Both surfaces behind the SAME opt-in gate (`PROXIMADB_MLFLOW_COMPAT_ENABLE`,
+default OFF — unchanged), mounted before the tenant/auth layers
+at BOTH server.rs mount sites, and aliased under the UI's `/mlflow-ui/
+ajax-api` nest.
+
+=== Traces v3 (`/api/3.0/mlflow/traces*`, new `traces.rs`)
+
+POST `/traces` (StartTraceV3 — sent by the client at root-span end),
+GET `/traces/get`, GET `/traces/{trace_id}` (the UI's form), GET
+`/traces/batchGet`, POST `/traces/batchGetInfos`, POST `/traces/search`,
+assessment CRUD at `/traces/{tid}/assessments[/{aid}]` (PATCH honors
+`update_mask.paths`; absent mask = full replace). Two stragglers the
+client hard-codes to the 2.0 router live in `mlflow_routes()`:
+POST `/api/2.0/mlflow/traces/delete-traces` and PATCH/DELETE
+`/api/2.0/mlflow/traces/{trace_id}/tags`.
+
+Load-bearing client contracts (each verified against the pinned 3.16.0
+client source):
+
+* The StartTraceV3 response tag `mlflow.artifactLocation` =
+  `mlflow-artifacts:/{exp}/traces/{trace_id}/artifacts` — the client
+  builds its trace artifact repo from this tag and raises
+  `MlflowTraceDataCorrupted` when absent. The wire derives the canonical URI
+  on every response and reserves the tag from PATCH/DELETE, so stored or
+  caller-supplied tags cannot redirect artifact access.
+* We deliberately serve NO `/version` and NO OTLP `/v1/traces`. The
+  client then permanently uses its artifact-upload fallback: spans ride
+  `PUT /api/2.0/mlflow-artifacts/.../traces/{id}/artifacts/traces.json`
+  through the EXISTING artifacts proxy, and the client downloads them
+  itself on `get_trace`. Server Trace responses carry `spans: []`
+  always — the server never interprets span payloads.
+* Proto3-JSON Timestamps are RFC3339 strings and Durations "1.5s"
+  strings (ms precision, both directions); enums travel as NAME strings
+  (OK/ERROR/IN_PROGRESS; the location `MLFLOW_EXPERIMENT` accepted as
+  name or number).
+* Our trace-404 message is deliberately NOT the reference server's
+  "Trace with ID 'x' not found" — the client pattern-matches that exact
+  literal on `/traces/get` and converts it to NotImplemented.
+* Trace ids are client-generated (`tr-<32hex>`); the port validates a
+  conservative charset (`^[A-Za-z0-9._~-]+$`) because the id lands in
+  document ids AND artifact path segments.
+
+=== LoggedModel (`/api/2.0/mlflow/logged-models*`, new `logged_models.rs`)
+
+The client dispatches every logged-model RPC through the v2 map — the
+`/api/3.0`-annotated duplicates in the proto have no OSS client path.
+POST `/logged-models` (server-minted `m-<32hex>` id + artifact_uri
+`mlflow-artifacts:/{exp}/models/{id}/artifacts`), `POST /search`,
+`GET|PATCH|DELETE /logged-models/{id}`, `POST /{id}/params` (run-param
+immutability semantics), `PATCH /{id}/tags`, `DELETE /{id}/tags/{key}`
+(absent tag = typed 404, reference semantics), `GET /{id}/artifacts/
+directories` (a capability-safe tenant-relative listing under the model
+path).
+Statuses travel as the proto NAME strings `LOGGED_MODEL_PENDING` /
+`LOGGED_MODEL_READY` / `LOGGED_MODEL_UPLOAD_FAILED` (NOT the bare
+words). Finalize transitions status + last_updated and does NOT freeze
+params (reference semantics); deletes are soft (hidden from search and
+default get, visible with `allow_deleted`).
+
+=== Run-shape extensions
+
+`runs/log-metric` gains `model_id`/`dataset_name`/`dataset_digest` —
+model-owned metrics NEVER touch the run projection or the finished-run
+freeze (owner-explicit port methods; `MetricPoint` itself is untouched).
+`POST /runs/outputs` (run→model links; unknown models are a typed 404,
+never a silent orphan), `POST /runs/log-inputs` (datasets lower to the
+existing collection, models to the run's model_inputs), `POST
+/runs/log-model` (legacy memento appended to the `mlflow.logModel.
+history` tag as a JSON array element). `runs/get` and `runs/search`
+embed `inputs`/`outputs`; dataset inputs are embedded ONLY in runs/get
+(a per-run N+1 in search is documented here as not-taken).
+
+== Port + substrate (the adapter laws)
+
+`RunStore` (crates/control/proximadb-catalog/src/run_store.rs) grew the
+traces family (start/get/list/delete_traces, trace tags,
+assessment upsert/get/delete), the logged-model family (create/get/
+list/finalize/delete/params/tags + `log_model_metric`/
+`model_metric_history`/`model_metrics`), and run links (`log_run_
+outputs`, `log_run_model_inputs`). Search grammar and predicate evaluation
+remain wire-owned and operate over the per-experiment list ports; the storage
+port exposes persistence laws, not REST query syntax. The ONE
+`port_conformance` battery gained appended sections (trace lifecycle,
+tag-rewrite-preserves-assessments, assessment oneof echo, logged-model lifecycle,
+model-metric counter preservation across tag rewrites, run link
+round-trip, and list/delete visibility). Wire tests carry the positive and
+negative search-filter controls. `InMemoryRunStore` is the reference; the
+substrate battery re-runs unchanged.
+
+Substrate doc kinds (src/services/mlflow_run_store.rs): `trc-{trace_id}`
+(assessments embedded, RMW under the per-collection mutation lock),
+`lm-{model_id}` (durable `ctr_m_<key>` metric counters on the model
+doc), `mtrm-{model_id}-{counter_key}-{seq}` and
+`mtr-{run_id}-{counter_key}-{seq}` (metric samples; the encoded key
+contains no `-`, so the id parses unambiguously from the right). Metric
+seq counters are PER KEY — two keys both start at seq 1 — so the doc id
+MUST embed the key: a key-less id silently overwrote the other key's
+sample via the id-keyed upsert (review MAJOR-2; the run side carried the
+same latent bug and is fixed here too; the battery now asserts two-key
+isolation on both sides). The `mtr-` (run) and `mtrm-` (model) id spaces
+stay disjoint at byte 3 for ALL id values. Readers locate history docs by
+indexed fields, never by parsing ids, so pre-existing `mtr-{run}-{seq}`
+docs remain readable.
+
+Known limitation (review MINOR-3): wire-level read-modify-write cycles
+that span TWO port calls (`assessments_update` get→mask→upsert;
+`runs_log_model` history-tag append) are atomic per store call but not
+across the handler — concurrent writers can lose one update
+(last-writer-wins). Tracing/registry traffic is low-frequency
+control-plane; a port-level compare-and-swap lands if contention is ever
+observed.
+
+== Conformance
+
+Dual-generation ratchets split per client generation:
+`mlflow_conformance_steps_2x.txt` (18, frozen) and
+`mlflow_conformance_steps_3x.txt` (30 = 18 + 12 new gen-3 steps:
+logged-model create/params/tags/metric/search/finalize, run outputs,
+start_trace, get_trace — which PROVES span upload+download through the
+artifacts proxy — search_traces, trace tags, assessments, delete_
+traces). `step(name, fn, gen=2)` keeps the 2-arg contract (the harness
+unit test pins it); 2.x clients SKIP gen-3 steps. Counts only go up.
+
+== Deferred (honest 404s, degrade as before)
+
+`traces/metrics`, `traces/calculate-filter-correlation`,
+`get-trace-artifact`, OTLP `/v1/traces` ingest, `/version`, and
+prompts. Prompts need a design pass: MLflow prompts ARE
+registered-models + model-versions carrying `mlflow.prompt.*` tags —
+implementing them means relaxing the "registry is read-only from
+MLflow" law (xCatalog versions are typed immutable contracts). Dataset
+input tags are accepted on the wire but not surfaced.
+
+== Key files
+
+* `crates/control/proximadb-catalog/src/run_store.rs` — port + battery
+* `src/services/mlflow_run_store.rs` — substrate doc kinds
+* `src/network/rest/mlflow/traces.rs` — v3 router + DTOs (NEW)
+* `src/network/rest/mlflow/logged_models.rs` — 2.0 family (NEW)
+* `src/network/rest/mlflow/{mod,dto,filter,error,artifacts,ui}.rs`
+* `src/network/rest/server.rs` — both mount sites in lockstep
+* `clients/python/tests/mlflow_conformance.py` + ratchet files
+* `.github/workflows/ci.yml` — per-generation ratchet + v3 smoke

@@ -489,6 +489,7 @@ impl MetadataStoreInterface for MetadataStore {
             if let Some(versioned) = self.write_buffer_manager.collection(collection_id).await? {
                 let config = CollectionConfig {
                     name: versioned.name.clone(),
+                    embedding_config: None,
                     dimension: versioned.dimension as u32,
                     distance_metric: Some(
                         crate::proto::proximadb_v1::DistanceMetric::Cosine as i32,
@@ -606,6 +607,7 @@ impl MetadataStoreInterface for MetadataStore {
                 .map(|versioned| {
                     let config = CollectionConfig {
                         name: versioned.name.clone(),
+                        embedding_config: None,
                         dimension: versioned.dimension as u32,
                         distance_metric: Some(
                             crate::proto::proximadb_v1::DistanceMetric::Cosine as i32,

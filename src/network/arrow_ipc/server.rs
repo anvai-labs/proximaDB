@@ -98,12 +98,15 @@ impl ArrowFlightServer {
             "Starting Arrow Flight server"
         );
 
-        // Apply the outer-wrapper options (security/catalog) onto the injected
-        // Flight service (built from ports at the wiring layer).
-        let mut flight_service = self
-            .flight_service
-            .with_security_coordinator(self.security_coordinator.clone())
-            .with_catalog_manager(self.catalog_manager.clone());
+        // An absent wrapper option must preserve the injected service's
+        // configuration, especially an already-installed auth coordinator.
+        let mut flight_service = self.flight_service;
+        if let Some(coordinator) = self.security_coordinator {
+            flight_service = flight_service.with_security_coordinator(Some(coordinator));
+        }
+        if let Some(catalog) = self.catalog_manager {
+            flight_service = flight_service.with_catalog_manager(Some(catalog));
+        }
 
         // Slice 6.2: only wire the gate when BOTH the registry and
         // the pod identity are present. Partial wiring would silently

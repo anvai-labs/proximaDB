@@ -22,16 +22,14 @@ T = TypeVar("T", bound="EdgeInput")
 
 @_attrs_define
 class EdgeInput:
-    """Edge payload nested inside `CreateEdgeRequest.edge`. Matches
-    `RestEdgeInput` in proximadb-api's graph handler.
-
-        Attributes:
-            id (str):
-            from_node_id (str):
-            to_node_id (str):
-            edge_type (str):
-            properties (EdgeInputProperties | Unset):
-            weight (float | None | Unset):
+    """
+    Attributes:
+        id (str):
+        from_node_id (str):
+        to_node_id (str):
+        edge_type (str):
+        properties (EdgeInputProperties | Unset):
+        weight (float | Unset):
     """
 
     id: str
@@ -39,7 +37,7 @@ class EdgeInput:
     to_node_id: str
     edge_type: str
     properties: EdgeInputProperties | Unset = UNSET
-    weight: float | None | Unset = UNSET
+    weight: float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,11 +55,7 @@ class EdgeInput:
         if not isinstance(self.properties, Unset):
             properties = self.properties.to_dict()
 
-        weight: float | None | Unset
-        if isinstance(self.weight, Unset):
-            weight = UNSET
-        else:
-            weight = self.weight
+        weight = self.weight
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -100,14 +94,7 @@ class EdgeInput:
         else:
             properties = EdgeInputProperties.from_dict(_properties)
 
-        def _parse_weight(data: object) -> float | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(float | None | Unset, data)
-
-        weight = _parse_weight(d.pop("weight", UNSET))
+        weight = d.pop("weight", UNSET)
 
         edge_input = cls(
             id=id,

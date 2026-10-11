@@ -114,6 +114,7 @@ mod tests {
             id: collection_id.to_string(),
             config: Some(CollectionConfig {
                 name: collection_id.to_string(),
+                embedding_config: None,
                 dimension: 128,           // Match actual test vector dimension
                 distance_metric: Some(0), // Cosine
                 storage_engine: Some(0),  // VIPER

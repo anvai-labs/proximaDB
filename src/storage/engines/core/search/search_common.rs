@@ -6,7 +6,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::search::OptimizedSearchRecord;
@@ -434,73 +433,72 @@ impl UniversalSearchPipeline {
                 distance_metric,
             );
 
-            // Convert metadata from Vec<MetadataItem> to HashMap<String, Value>
-            let metadata_map = record
-                .metadata
-                .into_iter()
-                .filter_map(|(key, value)| {
-                    value.value.map(|v| {
-                        let json_value = match v {
-                            crate::proto::proximadb_v1::sql_value::Value::StringValue(s) => {
-                                serde_json::Value::String(s)
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::NumberValue(f) => {
-                                serde_json::Value::Number(
-                                    serde_json::Number::from_f64(f)
-                                        .unwrap_or(serde_json::Number::from(0)),
-                                )
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::BoolValue(b) => {
-                                serde_json::Value::Bool(b)
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::Int64Value(i) => {
-                                serde_json::Value::Number(serde_json::Number::from(i))
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::BytesValue(_) => {
-                                serde_json::Value::String("[binary data]".to_string())
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::NullValue(_) => {
-                                serde_json::Value::Null
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::ArrayValue(_) => {
-                                serde_json::Value::String("[array]".to_string())
-                            }
-                            crate::proto::proximadb_v1::sql_value::Value::ObjectValue(_) => {
-                                serde_json::Value::String("[object]".to_string())
-                            }
-                        };
-                        (key, json_value)
-                    })
-                })
-                .collect::<HashMap<String, serde_json::Value>>();
-
-            // Convert metadata_map (HashMap<String, serde_json::Value>) to TypedMetadata
+            // Convert metadata directly to the typed map — no serde_json
+            // round-trip (the JSON detour decoded JSONB per candidate only to
+            // drop object/array payloads on the floor at the back-conversion).
+            // Non-JSON legacy shapes keep their pre-existing placeholders and
+            // unset-oneof keys stay absent. One deliberate delta vs the old
+            // detour: Int64Value passes through as Int64Value (the detour
+            // coerced it to NumberValue(f64), losing precision above 2^53) —
+            // closer to the stored truth. NumberValue passes through
+            // UNCHANGED (round 6 corrected an earlier claim here); non-finite
+            // floats render as null only later, at the serde/JSON boundary —
+            // pre-existing serde behavior, not this rewrite's.
+            // NOTE: this pipeline currently has no live constructor, so the
+            // delta is latent until it is wired.
             let mut typed_metadata_map = std::collections::HashMap::new();
-            for (key, value) in metadata_map {
+            for (key, value) in record.metadata {
                 use crate::proto::proximadb_v1::{self as proximadb_v1};
-                let sql_value = match value {
-                    serde_json::Value::String(s) => proximadb_v1::SqlValue {
-                        value: Some(crate::proto::proximadb_v1::sql_value::Value::StringValue(s)),
-                    },
-                    serde_json::Value::Number(n) => {
-                        if let Some(f) = n.as_f64() {
-                            proximadb_v1::SqlValue {
-                                value: Some(
-                                    crate::proto::proximadb_v1::sql_value::Value::NumberValue(f),
-                                ),
-                            }
-                        } else {
-                            proximadb_v1::SqlValue { value: None }
+                let sql_value = match value.value {
+                    Some(proximadb_v1::sql_value::Value::StringValue(s)) => {
+                        proximadb_v1::SqlValue {
+                            value: Some(proximadb_v1::sql_value::Value::StringValue(s)),
                         }
                     }
-                    serde_json::Value::Bool(b) => proximadb_v1::SqlValue {
-                        value: Some(crate::proto::proximadb_v1::sql_value::Value::BoolValue(b)),
+                    Some(proximadb_v1::sql_value::Value::NumberValue(f)) => {
+                        proximadb_v1::SqlValue {
+                            value: Some(proximadb_v1::sql_value::Value::NumberValue(f)),
+                        }
+                    }
+                    Some(proximadb_v1::sql_value::Value::BoolValue(b)) => proximadb_v1::SqlValue {
+                        value: Some(proximadb_v1::sql_value::Value::BoolValue(b)),
                     },
-                    _ => proximadb_v1::SqlValue { value: None },
+                    Some(proximadb_v1::sql_value::Value::Int64Value(i)) => proximadb_v1::SqlValue {
+                        value: Some(proximadb_v1::sql_value::Value::Int64Value(i)),
+                    },
+                    // TD-PROTO-2: pass the declared variant through untouched.
+                    Some(proximadb_v1::sql_value::Value::JsonbValue(bytes)) => {
+                        proximadb_v1::SqlValue {
+                            value: Some(proximadb_v1::sql_value::Value::JsonbValue(bytes)),
+                        }
+                    }
+                    Some(proximadb_v1::sql_value::Value::BytesValue(_)) => proximadb_v1::SqlValue {
+                        value: Some(proximadb_v1::sql_value::Value::StringValue(
+                            "[binary data]".to_string(),
+                        )),
+                    },
+                    Some(proximadb_v1::sql_value::Value::ArrayValue(_)) => proximadb_v1::SqlValue {
+                        value: Some(proximadb_v1::sql_value::Value::StringValue(
+                            "[array]".to_string(),
+                        )),
+                    },
+                    Some(proximadb_v1::sql_value::Value::ObjectValue(_)) => {
+                        proximadb_v1::SqlValue {
+                            value: Some(proximadb_v1::sql_value::Value::StringValue(
+                                "[object]".to_string(),
+                            )),
+                        }
+                    }
+                    // NullValue and unset oneof: the legacy path kept the key
+                    // with an unset oneof for NullValue, and dropped keys
+                    // whose oneof was entirely unset.
+                    Some(proximadb_v1::sql_value::Value::NullValue(_)) => {
+                        proximadb_v1::SqlValue { value: None }
+                    }
+                    None => continue,
                 };
                 typed_metadata_map.insert(key, sql_value);
             }
-
             results.push(
                 OptimizedSearchRecord::new(record.id.clone(), similarity_result.normalized_score)
                     .with_similarity(similarity_result.normalized_score)

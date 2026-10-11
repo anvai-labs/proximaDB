@@ -2841,6 +2841,9 @@ impl RaptorWriter {
                     Some(proximadb_proto::proximadb_v1::sql_value::Value::BytesValue(b)) => {
                         b.clone()
                     }
+                    Some(proximadb_proto::proximadb_v1::sql_value::Value::JsonbValue(b)) => {
+                        b.clone()
+                    }
                     Some(proximadb_proto::proximadb_v1::sql_value::Value::NullValue(_)) => {
                         Vec::new()
                     }

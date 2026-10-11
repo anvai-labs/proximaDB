@@ -1,0 +1,147 @@
+# ProximaDB user-facing documentation site.
+#
+# SCOPE IS DELIBERATE. Most of `docs/` is internal: `docs/10-quality` and
+# `docs/12-design` alone hold more than half the corpus as TDs, ADRs and design
+# records written for engineers working in this repo, not for users. Publishing
+# those would make the site a changelog of internal debt. This site covers the
+# user-facing tree only: 01-quick-start, 02-guides, 03-api-reference,
+# 04-operations, 05-concepts, release-notes. (release-notes is in scope but
+# publishes nothing yet: both its files are AsciiDoc, hence excluded, and it has
+# no nav entry — see TD-DOCSITE-1.)
+#
+# Deliberately no exact file counts here: they change with almost every PR, so a
+# number in this comment is stale debt. The one count that IS maintained is the
+# guard's, in `docs/.site-coverage-baseline.json`, because CI fails when it drifts.
+#
+# FORMAT CAVEAT (TD-DOCSITE-1): the corpus is overwhelmingly AsciiDoc and mkdocs
+# is Markdown-native. The nav below lists the Markdown pages that render today;
+# the user-facing .adoc files are tracked for conversion and frozen by
+# `scripts/check_docs_site_coverage.py`.
+# `asciidoctor` is NOT a build dependency — rather than bolt on a fragile
+# plugin, the user-facing .adoc files get converted to Markdown incrementally.
+site_name: ProximaDB
+site_description: Cloud-native vector and graph database for RAG and knowledge graphs
+repo_url: https://github.com/anvai-labs/proximaDB
+edit_uri: edit/develop/
+docs_dir: docs
+
+# Everything that is NOT the user-facing site. mkdocs walks the whole docs_dir,
+# so without this it pulls in every internal TD/ADR file plus the archive — and
+# strict mode then fails on their stale cross-links, which is noise from pages
+# that were never meant to be published. `*.adoc` is excluded wholesale because
+# mkdocs cannot render AsciiDoc at all (TD-DOCSITE-1 tracks converting the
+# user-facing ones).
+exclude_docs: |
+  _archive/
+  _internal/
+  06-internals/
+  09-roadmap/
+  10-quality/
+  12-design/
+  agent-rules/
+  architecture-diagrams/
+  11-usecases/
+  # Internal product material, not user documentation: PRD, VISION,
+  # COMPETITIVE_LANDSCAPE, the MVP scorecards. It also held the one non-Markdown
+  # leak worth naming — mkdocs copies ANY non-excluded, non-.md file into the
+  # site verbatim, so `00-product/MVP_TRUST_CORRIDOR.toml` (tier claims, graduation
+  # gate) was being served publicly. `scripts/check_docs_site_coverage.py` now
+  # guards that whole class, not just .adoc.
+  00-product/
+  # Internal RFC drafts and templates.
+  rfcs/
+  # The site's own entry point is docs/index.md; INDEX.adoc is the repo-tree index.
+  INDEX.adoc
+  # The coverage guard's baseline is build input, not a page.
+  .site-coverage-baseline.json
+  # assets/ itself stays published — the images are referenced by real pages —
+  # but its readme is an asset-directory note, not a user page.
+  assets/readme.adoc
+  openapi/
+  *.adoc
+  README.md
+
+# `--strict` only escalates WARNINGs, and mkdocs ships link/nav checks at INFO by
+# default — so without this block a strict build happily publishes broken links
+# and silently unpublished pages. Raise them so CI fails instead.
+#
+# NOT coverable here: a link to a file matched by `exclude_docs` is reported at
+# INFO unconditionally, with no validation category to raise (verified against
+# mkdocs 1.6.1 by setting every category to `warn`). That is the dominant case
+# for us — the excluded `*.adoc` corpus — so it is enforced out-of-band by
+# `scripts/check_docs_site_coverage.py`. See TD-DOCSITE-1.
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  # Mermaid via superfences rather than the mermaid2 plugin: the diagrams in
+  # these pages are ```mermaid fences, and Material renders them natively this
+  # way with no extra runtime dependency.
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Quick Start:
+      - Overview: 01-quick-start/index.md
+      - Install: 01-quick-start/install.md
+      - First Query: 01-quick-start/first-query.md
+      - Architecture Basics: 01-quick-start/architecture-basics.md
+  - Guides:
+      - Overview: 02-guides/index.md
+      - Vector Search: 02-guides/vector-search.md
+      - Vector Index Selection & Benchmarking: 02-guides/vector-index-selection-and-benchmarking.md
+      - Multi-Model Joins: 02-guides/multi-model-joins.md
+      - API Surface & Performance: 02-guides/api-surface-performance-guide.md
+      - Platform Packages: 02-guides/platform-packages.md
+  - Concepts:
+      - Overview: 05-concepts/index.md
+      - Quantization: 05-concepts/quantization.md
+      - Query Planner: 05-concepts/query-planner.md
+      - Unified WAL: 05-concepts/unified-wal.md
+  - API Reference: 03-api-reference/index.md
+  - Operations:
+      - Overview: 04-operations/index.md
+      - "Release: v0.2.1 macOS": 04-operations/release/v0.2.1-macos-support.md

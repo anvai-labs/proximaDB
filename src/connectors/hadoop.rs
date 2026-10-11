@@ -188,6 +188,7 @@ impl ProximaInputFormat {
             },
             statistics: SplitStatistics::default(),
             locality: crate::storage::formats::SplitLocality::default(),
+            object_size: None,
         };
 
         vec![HadoopInputSplit::from_file_split(file_split)]
@@ -941,6 +942,7 @@ mod tests {
                 preferred_hosts: vec!["host1".to_string()],
                 ..Default::default()
             },
+            object_size: None,
         };
 
         let split = HadoopInputSplit::from_file_split(file_split);

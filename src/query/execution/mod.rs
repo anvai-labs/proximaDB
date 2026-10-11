@@ -20,6 +20,7 @@ pub mod native_ops;
 pub mod native_parquet_scan;
 pub mod native_scan;
 pub mod native_shadow;
+pub mod native_table_provider;
 pub mod olap_delta_merge;
 pub mod plan_cache;
 pub mod planner;

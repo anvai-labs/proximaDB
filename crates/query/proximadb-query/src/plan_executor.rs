@@ -424,11 +424,9 @@ impl PlanExecutor {
     }
 
     fn field_value<'a>(row: &'a Value, field: &str) -> Option<&'a Value> {
-        let mut current = row;
-        for part in field.split('.') {
-            current = current.get(part)?;
-        }
-        Some(current)
+        // TD-PROTO-2 follow-up: delegate to the shared object-only dot-path
+        // walker; identical semantics.
+        proximadb_search_types::sql_value_filter::json_get_path(row, field.split('.'))
     }
 
     fn compare_value(
@@ -821,6 +819,22 @@ mod tests {
         assert_eq!(result.rows[0]["id"], "v1");
         assert_eq!(result.operator_stats[1].rows_in, 3);
         assert_eq!(result.operator_stats[1].rows_out, 1);
+    }
+
+    #[test]
+    fn dot_path_lookup_remains_object_only() {
+        let row = serde_json::json!({
+            "payload": {"kind": "checkpoint"},
+            "items": [{"kind": "must-not-resolve"}],
+            "scalar": "value"
+        });
+
+        assert_eq!(
+            PlanExecutor::field_value(&row, "payload.kind").and_then(Value::as_str),
+            Some("checkpoint")
+        );
+        assert!(PlanExecutor::field_value(&row, "items.0.kind").is_none());
+        assert!(PlanExecutor::field_value(&row, "scalar.child").is_none());
     }
 
     #[test]

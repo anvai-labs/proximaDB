@@ -11,7 +11,7 @@ Agent runtimes that only support the singular root filename may read
 `AGENT.md`; it is a short compatibility alias for this `AGENTS.md` index and the
 model-specific guides above.
 
-**Filing a TD or ADR:** follow the canonical, collision-free convention in `docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc` (one file per entry; prefer a topic-scoped id like `TD-CAT-1`; never reuse a number already on `develop`; the `td-adr-unique` CI guard backstops). That in-repo doc is the single source of truth — these per-agent rule files only point to it, so concurrent sessions/machines never drift.
+**Filing a TD or ADR:** follow the canonical, collision-free convention in `docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc` (one file per entry; prefer a topic-scoped id like `TD-CAT-1`; never reuse a number already on `develop`; the `td-adr-unique` CI guard backstops). **Implementing one: verify its load-bearing premises against current source FIRST** — does what it cites still exist, does the mechanism it says to *build* already exist (grep it, count callers: zero or one is the common case), is the quantity it cites still true — and **correct the document in the same PR when a premise is wrong**, including the parent ADR. That in-repo doc is the single source of truth — these per-agent rule files only point to it, so concurrent sessions/machines never drift.
 
 ## Mandatory Worktree Workflow
 
@@ -27,6 +27,10 @@ Required flow:
 6. After the PR merges, remove the worktree with `scripts/worktree.sh rm <type/topic>`. Periodically reclaim landed worktrees with `scripts/worktree.sh clean --dry-run` then `scripts/worktree.sh clean`; use `scripts/worktree.sh gc` for incremental-cache bloat in kept worktrees.
 
 When continuing "next steps", first identify the active worktree/branch, confirm it is based on current `origin/develop`, and continue there. If no appropriate worktree exists, create one before editing.
+
+## Pull-request Branch Targets
+
+Ordinary feature, fix, debug, chore, and dependency PRs target `develop`. The only PR allowed to target `qa` is the exact same-repository `develop` -> `qa` promotion; the only PR allowed to target `main` is the exact same-repository `qa` -> `main` promotion. Snapshot, release, fork, and topic branches must not target `qa` or `main`.
 
 ## PR Verification Regime (before any merge)
 

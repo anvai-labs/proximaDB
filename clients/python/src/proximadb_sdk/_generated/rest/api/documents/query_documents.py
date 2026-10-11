@@ -11,24 +11,39 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.query_documents_response_200 import QueryDocumentsResponse200
+from ...models.doc_query_response import DocQueryResponse
+from ...models.error_response import ErrorResponse
 from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     collection: str,
     *,
+    filter_: str | Unset = UNSET,
+    projection: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_tenant_id: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
     if not isinstance(x_tenant_id, Unset):
         headers["X-Tenant-ID"] = x_tenant_id
 
+    params: dict[str, Any] = {}
+
+    params["filter"] = filter_
+
+    params["projection"] = projection
+
+    params["limit"] = limit
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+
     _kwargs: dict[str, Any] = {
         "method": "get",
         "url": "/api/v2/document-collections/{collection}/documents".format(
             collection=quote(str(collection), safe=""),
         ),
+        "params": params,
     }
 
     _kwargs["headers"] = headers
@@ -37,11 +52,21 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> QueryDocumentsResponse200 | None:
+) -> DocQueryResponse | ErrorResponse | None:
     if response.status_code == 200:
-        response_200 = QueryDocumentsResponse200.from_dict(response.json())
+        response_200 = DocQueryResponse.from_dict(response.json())
 
         return response_200
+
+    if response.status_code == 400:
+        response_400 = ErrorResponse.from_dict(response.json())
+
+        return response_400
+
+    if response.status_code == 500:
+        response_500 = ErrorResponse.from_dict(response.json())
+
+        return response_500
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -51,7 +76,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[QueryDocumentsResponse200]:
+) -> Response[DocQueryResponse | ErrorResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -64,12 +89,18 @@ def sync_detailed(
     collection: str,
     *,
     client: AuthenticatedClient | Client,
+    filter_: str | Unset = UNSET,
+    projection: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[QueryDocumentsResponse200]:
-    """Query documents.
+) -> Response[DocQueryResponse | ErrorResponse]:
+    """Query documents (filter/projection/limit).
 
     Args:
         collection (str):
+        filter_ (str | Unset):
+        projection (str | Unset):
+        limit (int | Unset):
         x_tenant_id (str | Unset):
 
     Raises:
@@ -77,11 +108,14 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[QueryDocumentsResponse200]
+        Response[DocQueryResponse | ErrorResponse]
     """
 
     kwargs = _get_kwargs(
         collection=collection,
+        filter_=filter_,
+        projection=projection,
+        limit=limit,
         x_tenant_id=x_tenant_id,
     )
 
@@ -96,12 +130,18 @@ def sync(
     collection: str,
     *,
     client: AuthenticatedClient | Client,
+    filter_: str | Unset = UNSET,
+    projection: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_tenant_id: str | Unset = UNSET,
-) -> QueryDocumentsResponse200 | None:
-    """Query documents.
+) -> DocQueryResponse | ErrorResponse | None:
+    """Query documents (filter/projection/limit).
 
     Args:
         collection (str):
+        filter_ (str | Unset):
+        projection (str | Unset):
+        limit (int | Unset):
         x_tenant_id (str | Unset):
 
     Raises:
@@ -109,12 +149,15 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        QueryDocumentsResponse200
+        DocQueryResponse | ErrorResponse
     """
 
     return sync_detailed(
         collection=collection,
         client=client,
+        filter_=filter_,
+        projection=projection,
+        limit=limit,
         x_tenant_id=x_tenant_id,
     ).parsed
 
@@ -123,12 +166,18 @@ async def asyncio_detailed(
     collection: str,
     *,
     client: AuthenticatedClient | Client,
+    filter_: str | Unset = UNSET,
+    projection: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[QueryDocumentsResponse200]:
-    """Query documents.
+) -> Response[DocQueryResponse | ErrorResponse]:
+    """Query documents (filter/projection/limit).
 
     Args:
         collection (str):
+        filter_ (str | Unset):
+        projection (str | Unset):
+        limit (int | Unset):
         x_tenant_id (str | Unset):
 
     Raises:
@@ -136,11 +185,14 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[QueryDocumentsResponse200]
+        Response[DocQueryResponse | ErrorResponse]
     """
 
     kwargs = _get_kwargs(
         collection=collection,
+        filter_=filter_,
+        projection=projection,
+        limit=limit,
         x_tenant_id=x_tenant_id,
     )
 
@@ -153,12 +205,18 @@ async def asyncio(
     collection: str,
     *,
     client: AuthenticatedClient | Client,
+    filter_: str | Unset = UNSET,
+    projection: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
     x_tenant_id: str | Unset = UNSET,
-) -> QueryDocumentsResponse200 | None:
-    """Query documents.
+) -> DocQueryResponse | ErrorResponse | None:
+    """Query documents (filter/projection/limit).
 
     Args:
         collection (str):
+        filter_ (str | Unset):
+        projection (str | Unset):
+        limit (int | Unset):
         x_tenant_id (str | Unset):
 
     Raises:
@@ -166,13 +224,16 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        QueryDocumentsResponse200
+        DocQueryResponse | ErrorResponse
     """
 
     return (
         await asyncio_detailed(
             collection=collection,
             client=client,
+            filter_=filter_,
+            projection=projection,
+            limit=limit,
             x_tenant_id=x_tenant_id,
         )
     ).parsed

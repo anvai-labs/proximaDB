@@ -4,8 +4,8 @@ This guide covers installing ProximaDB v0.2.0 using native platform packages on 
 
 ## Table of Contents
 
-- [Linux RPM Package (RHEL/CentOS/Fedora)](#linux-rpm-package)
-- [Linux DEB Package (Debian/Ubuntu)](#linux-deb-package)
+- [Linux RPM Package (RHEL/CentOS/Fedora)](#linux-rpm-package-rhelcentosfedora)
+- [Linux DEB Package (Debian/Ubuntu)](#linux-deb-package-debianubuntu)
 - [Windows MSI Installer](#windows-msi-installer)
 - [Post-Installation](#post-installation)
 - [Service Management](#service-management)

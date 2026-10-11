@@ -1,0 +1,54 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CI-5: The `feature-matrix` CI job has no `timeout-minutes`, so a hang holds a runner for 6 hours
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-07 after a `Feature Matrix (cloud-full+onnx)` leg hung for 121 minutes on PR #1956, blocking the `CI Success` aggregator with 74 of 75 jobs already green.
+| Priority | **MEDIUM.** It does not produce wrong results, but it converts a transient runner problem into a multi-hour block on a shared, finite resource — and `ci-success` depends on `feature-matrix`, so the PR cannot merge while it hangs.
+| Component | `.github/workflows/ci.yml` (the `feature-matrix` job)
+| Relates to | Mandate #7 (CI runners are a shared finite resource)
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`feature-matrix` declares `runs-on`, `needs`, `if` and a 14-entry `strategy.matrix`, but **no
+`timeout-minutes`**. It therefore inherits GitHub Actions' default of **360 minutes**.
+
+That is out of line with the workflow's own practice, and the contrast is explicit: `rust-test`
+carries
+
+[source,yaml]
+----
+timeout-minutes: 90
+# Fail fast instead of the 360-min default if a hang sneaks in; the healthy
+# job finishes in ~30-45 min (compile-bound at CARGO_BUILD_JOBS=1).
+----
+
+So the workflow already identifies "a hang sneaks in" as the risk a timeout exists to bound — and
+the protection is missing from a **14-leg** matrix job, one of whose legs (`cloud-full+onnx`) builds
+heavy native dependencies and is the slowest in the set.
+
+== Observed
+
+On PR #1956 the `cloud-full+onnx` leg sat `in_progress` for 121 minutes with 74/75 jobs complete.
+Cancelling the run and re-running **only** the cancelled job completed normally, which is what
+establishes it as a transient runner/infra problem rather than a repo-code problem — the same
+commit had already passed `cargo check -p proximadb-server` locally and the same leg had passed on
+the three preceding PRs.
+
+Left alone it would have held a runner for roughly four more hours.
+
+== How to apply
+
+1. Add `timeout-minutes` to `feature-matrix`, sized from observed healthy duration with headroom —
+   the other legs finish well inside the normal CI window, so something in the 45-60 range bounds a
+   hang without flagging a slow-but-healthy ONNX build. Measure before picking the number rather
+   than guessing.
+2. **Audit every job in the workflow for a missing timeout**, not just this one. The bug class is
+   "the default is 6 hours and nobody noticed", so the fix is only durable if applied across the
+   file; a grep of `runs-on:` against `timeout-minutes:` gives the gap list.
+3. Consider whether a repo- or workflow-level default is expressible, so a newly added job inherits
+   a bound instead of the 360-minute default.

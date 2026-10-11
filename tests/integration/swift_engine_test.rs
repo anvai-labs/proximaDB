@@ -1,5 +1,8 @@
 //! Integration tests for the Swift storage engine.
 
+// SWIFT is compiled only under `experimental-engines` (TD-152 deprecation gate).
+#![cfg(feature = "experimental-engines")]
+
 use std::sync::Arc;
 use tempfile::TempDir;
 

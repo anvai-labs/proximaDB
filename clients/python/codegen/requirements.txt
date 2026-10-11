@@ -7,7 +7,7 @@
 openapi-python-client==0.28.4
 # openapi-python-client's Typer CLI breaks on click >= 8.2 ("Secondary flag is
 # not valid for non-boolean flag"); pin below that boundary.
-click<8.5
+click<8.6
 # openapi-python-client 0.24.x's own internal models fail to build under
 # pydantic >= 2.11 ("`Parameter` is not fully defined"); pin below that.
 pydantic<2.14

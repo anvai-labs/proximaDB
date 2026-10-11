@@ -36,6 +36,7 @@ the generated Go client's drift gate regenerates through this same transform, so
 the generated artifact stays pinned to the published spec.
 """
 
+import re
 import sys
 
 try:
@@ -46,6 +47,37 @@ except ImportError:  # pragma: no cover - environment guard
         "/Users/vijaysingh/code/.venv/bin/python)\n"
     )
     sys.exit(2)
+
+
+class _Yaml12CoreBoolLoader(yaml.SafeLoader):
+    """SafeLoader restricted to YAML 1.2 core-schema booleans.
+
+    PyYAML resolves scalars per YAML 1.1, where bare ``Off``/``On``/``Yes``/
+    ``No`` (and ``y``/``n``) are BOOLEANS. The published spec is emitted by
+    serde_yaml, which follows YAML 1.2 — there those are plain strings — so
+    an enum value of ``Off`` is written unquoted and a plain ``safe_load``
+    round-trips it as ``False``. That silently corrupts the down-converted
+    spec: oapi-codegen emitted ``False AbacGrantEnforcement = "false"`` and
+    progenitor hard-errored ("type error unexpected value type"). Narrow the
+    implicit bool resolver to the YAML 1.2 core set so ``Off`` stays the
+    string "Off" while ``true``/``false`` keep parsing as booleans.
+    """
+
+    pass
+
+
+_Yaml12CoreBoolLoader.yaml_implicit_resolvers = {
+    first_char: [
+        (
+            tag,
+            re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+            if tag == "tag:yaml.org,2002:bool"
+            else regexp,
+        )
+        for tag, regexp in resolvers
+    ]
+    for first_char, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
 
 
 def _normalize_type(node: dict) -> None:
@@ -128,7 +160,7 @@ def main() -> int:
         return 2
     src, dst = sys.argv[1], sys.argv[2]
     with open(src, "r", encoding="utf-8") as fh:
-        doc = yaml.safe_load(fh)
+        doc = yaml.load(fh, Loader=_Yaml12CoreBoolLoader)
 
     version = doc.get("openapi", "")
     if isinstance(version, str) and version.startswith("3.1"):

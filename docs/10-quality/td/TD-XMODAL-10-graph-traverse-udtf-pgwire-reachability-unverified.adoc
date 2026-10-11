@@ -1,0 +1,75 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-XMODAL-10: `graph_traverse(...)` UDTF's pgwire reachability is unverified — both bare and JOIN-shaped calls hit the same generic decline
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Discovered 2026-09-15 while scoping the gap-closure program's PR-G moat-convergence slice 1 (RERANK contract); TD-GRAPH-PGWIRE-1 (this session's slice 2) cited this UDTF's non-reachability without having verified the JOIN-shaped case — this filing corrects and grounds that gap.
+| Priority | Medium — `graph_traverse` is real, registered infrastructure (`src/datafusion/mod.rs::register_udtf("graph_traverse", ...)`, live `graph_ops` wiring from pgwire) that nobody can currently reach; no correctness risk (both shapes decline cleanly, never silently wrong), but real capability sits unused.
+| Component | `src/network/postgres/relational_pipeline.rs::try_run_select` (the `require_engagement` gate + `lower_table_factor`'s UDTF decline-and-fallback), `src/datafusion/mod.rs` (F6 `graph_traverse` registration), `src/network/postgres/protocol.rs::legacy_unsupported_from_shape` (the fallback guard both probe shapes ultimately hit).
+| Relates to | TD-XMODAL-4 (the SAME class of gap, already fixed for `vector_search` — direct precedent for how to close this one); TD-XMODAL-6/7/8 (the resolved follow-on bugs `vector_search`'s fix surfaced — likely candidates once `graph_traverse` reachability is fixed too); TD-GRAPH-PGWIRE-1 (this session's slice-2 filing, corrected by this one); TD-RERANK-PGWIRE-1 (sibling finding, RERANK has zero wiring at all vs. graph_traverse having real-but-unreachable wiring); TD-REL-LOWER-1 (Resolved — the fallback error message's citation is stale, see below).
+|===
+
+== The finding
+
+`src/datafusion/mod.rs` registers `graph_traverse(graph_id, start_id, edge_type, max_depth)` as a
+real DataFusion UDTF, live-backed by the connection's `graph_ops` (threaded from pgwire's
+`self.graph_service` through `try_run_relational_select_pipeline` → `try_run_select` →
+`QueryExecutionContext.graph_ops` → `datafusion_engine.rs`). This is genuine, wired
+infrastructure — not a stub.
+
+Two shapes were probed against a real, freshly-created graph collection (throwaway e2e, not
+committed):
+
+1. **Bare**: `SELECT * FROM graph_traverse('g', 'n1', 'EDGE', 3)`
+2. **JOIN'd**: `SELECT * FROM probe_rel JOIN graph_traverse('g', 'n1', 'EDGE', 3) AS gt ON probe_rel.id = gt.depth`
+
+**Both** produced the identical error:
+
+----
+[0A000] SELECT with a comma-separated table list in FROM is not supported on the legacy
+single-table path; the relational engine declined to lower this query (TD-REL-LOWER-1).
+----
+
+This means `try_run_select` returned `None` for BOTH shapes — including the JOIN'd one, which
+should satisfy the `require_engagement` gate's stated criterion ("only joins/GROUP
+BY/aggregates/set-ops engage the real-data relational engine"). The actual decline reason inside
+the pipeline was not captured: the probe harness never initialized a `tracing` subscriber, so
+`RUST_LOG=proximadb=debug` produced no output despite the error message's own suggestion to use
+it. **This TD does NOT claim to know why the JOIN case also declined** — that is exactly the gap
+a focused session needs to close with real instrumentation, not another guess.
+
+Also stale: the fallback error cites `TD-REL-LOWER-1`, which is **Resolved** and was about
+genuine multi-table `FROM a, b, c` lists (#953) — unrelated to a single function call's own
+argument-list commas tripping `legacy_unsupported_from_shape`'s paren-blind `contains(',')`
+check. The citation misdirects a debugging developer.
+
+== Why `vector_search` works and `graph_traverse` might not
+
+TD-XMODAL-4 explicitly documents `vector_search(collection, query, k)` as "live-backed and
+pgwire-reachable" today (fact, not aspiration — TD-XMODAL-6/7/8 are its resolved follow-on bug
+fixes, proving it is genuinely exercised in production). `graph_traverse` shares the same
+registration mechanism (`register_udtf`), the same pgwire threading path, and the same
+`require_engagement` gate — but nothing in this codebase demonstrates it ever reaching real
+execution. The most likely explanation, unverified: `vector_search`'s specific SQL shape
+(pgvector `ORDER BY <-> LIMIT k` operator lowering, or a form the relational frontend's parser
+accepts more readily) took a different, working code path that `graph_traverse`'s bare/JOIN
+function-call syntax does not exercise identically. This asymmetry is exactly what needs
+root-causing.
+
+== How to apply
+
+1. Reproduce with a proper tracing subscriber initialized in the test harness (`RUST_LOG=proximadb=debug`
+   genuinely wired to stderr — the throwaway probe used here did not do this) to see the actual
+   `try_run_select` / `lower_table_factor` decline reason for both shapes.
+2. Compare against `vector_search`'s working path step-by-step (parser AST, `require_engagement`
+   evaluation, `lower_table_factor` dispatch) to find where `graph_traverse` diverges.
+3. Once fixed, add the missing pgwire integration test TD-XMODAL-4's own slice gate calls for
+   (cross-surface parity: `graph_traverse(...)` over pgwire returns the same result as the
+   equivalent gRPC `ProximaGraphService` traversal) — none exists for graph today, only for
+   vector.
+4. Separately (not blocking): fix `legacy_unsupported_from_shape`'s paren-blind comma check and
+   its stale TD-REL-LOWER-1 citation — small, shared-code cleanup that improves the error for
+   every function-call-shaped FROM clause that hits this fallback (`graph_traverse`, `RERANK`,
+   `timeseries_range`, `documents`, and any future UDTF), independent of the reachability fix.

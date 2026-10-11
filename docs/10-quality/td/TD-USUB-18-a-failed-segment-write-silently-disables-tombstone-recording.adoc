@@ -1,0 +1,123 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-18: A failed segment write leaves an orphan that silently disables tombstone recording, so truncation would discard a DELETE
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Mitigated fail-closed, root cause open.** Filed 2026-10-08 by adversarial review of the tombstone-persistence slice, which found the one direction of the `min_unflushed_lsn` biconditional the slice had not examined.
+| Priority | **HIGH for slice 2b, zero today.** Nothing truncates yet, which is the only reason this is not already a live data-resurrection bug. It must not be what slice 2b rests on.
+| Component | `src/services/record_spill.rs` (`flush`'s `write_if_absent` failure path, `ensure_discovered`, `delete_record`'s `has_segments` gate, `min_unflushed_lsn`)
+| Relates to | TD-USUB-1 (slice 2b), TD-USUB-14, ADR-062 (fresh-name discipline), mandate #1, mandate #16a
+| Blocked by | Nothing. The fail-closed mitigation has landed; the reconciliation is the open part.
+|===
+
+== The finding
+
+Three correct-in-isolation decisions compose into a silent hole:
+
+1. `write_if_absent` can fail **after the object landed** — a retried PUT, a timeout after the
+   server committed. `flush` takes its sequence number *before* the write, so the name is never
+   reused and the failure cannot wedge a retry; the acknowledged cost (documented at the call site)
+   is an **orphan**: a durable, canonically-named object that is not in `segments`.
+2. `ensure_discovered` is a `tokio::sync::OnceCell`. On success it never re-lists, so an orphan
+   created *after* discovery is invisible for the life of the store.
+3. `delete_record` records a tombstone only when `!segments.is_empty()`, because with no segments
+   there is nothing for a tombstone to suppress.
+
+So after a failed first flush: `segments` is empty, discovery will not re-run, and a `DELETE` of a
+row the orphan holds records **no tombstone** — while `memtable.remove` succeeds, so the delete
+reports `true` and `resident_lsns.remove` drops the row's WAL association. `min_unflushed_lsn` then
+sees an empty memtable and an empty tombstone set and answers **`Ok(None)` — "no constraint"**.
+
+Under slice 2b that discards the DELETE's WAL entry. On restart, discovery lists the prefix, finds
+the orphan (a perfectly parseable name), and it holds the row **live**. The deleted row resurrects,
+permanently. Mandate #16a.
+
+This is the direction the slice's analysis missed. Its reasoning, and TD-USUB-14's, covered only
+"durable but still in the set" — over-retention, conservative, safe. The dangerous direction is
+"absent from the set while NOT durable", and it is reachable.
+
+Note what does *not* catch it: `ensure_discovered`'s fail-closed arm refuses on *unparseable*
+segment-shaped names, and its comment even names this hazard ("a DELETE of such a row would record
+no tombstone"). An orphan from a failed PUT has a perfectly canonical name. It is invisible only
+because discovery already ran.
+
+== What has landed (the mitigation)
+
+An `unresolved_segment_writes: AtomicU64`, raised BEFORE the PUT is issued and lowered only on the
+success path, which makes `min_unflushed_lsn` **refuse** (mandate #1) rather than answer from state
+it cannot trust. It is zeroed only by `purge_durable_objects`, which deletes the whole prefix —
+re-listing cannot clear it, because the `OnceCell` will not re-run. Pinned by
+`a_failed_write_fails_truncation_closed_until_purge`.
+
+Two details are load-bearing, both found by the round-4 review of the first attempt:
+
+* **Raised before the write, not on its error.** The first version set a flag when
+  `write_if_absent` returned `Err`. But the flush future can be **dropped** mid-PUT — a cancelled
+  request task, a `tokio::time::timeout` wrapper, an aborted `JoinHandle` — in which case no error
+  is returned and no code after the `await` runs at all. The object may still have landed. So the
+  error path alone cannot see the case, and raising first is what makes cancellation safe by
+  construction.
+* **A counter, not a bool.** A bool cleared on success would discard the suspicion raised by an
+  earlier cancelled or failed write; a later successful flush does not reconcile a previous orphan.
+  `saturating_add`/`saturating_sub` via `fetch_update` rather than `fetch_add`, because atomics
+  bypass `overflow-checks` and a wrap from `MAX` to 0 would silently clear the refusal — the same
+  hazard as TD-GCOLD-1's write-site defect.
+
+== A residual the counter does NOT cover (round-5 review)
+
+`purge_durable_objects` is documented above as the one sound clearing path, and for an ordinary
+failed flush it is: `flush` holds `flush_guard` across raise -> PUT -> lower, so a purge cannot
+interleave inside that window.
+
+**But the one mechanism this counter exists for breaks that.** A flush future dropped mid-PUT drops
+its `MutexGuard` too, releasing `flush_guard` with the counter raised while the server-side PUT may
+still be landing. A purge (or the orphan reaper the purge path contemplates) can then list, delete,
+and zero the counter BEFORE the object becomes visible — leaving exactly this TD's orphan with the
+mitigation disarmed, on a store that stays in service. `ensure_discovered`'s `OnceCell` will never
+re-list it.
+
+Two candidate responses, neither taken here:
+
+1. Refuse `purge_durable_objects` while the counter is nonzero. Rejected for now: purge backs DROP,
+   and a DROP that refuses because of an in-flight PUT is its own availability problem.
+2. Record the obligation. The positive-evidence orphan-deletion design already merged for this TD
+   family records the EXACT path before the PUT, so the obligation names what to delete without
+   re-listing a prefix. That mechanism is the right home for this residual, and is the reason
+   option 1 is not needed: the orphan becomes a tracked obligation rather than something a listing
+   has to catch.
+
+Related, same window, on the local backend: `write_if_absent` is `create_new(true)`, so a cancelled
+write can leave a **partial** object under a canonical, parseable name. `ensure_discovered` accepts
+the name (only *unparseable* segment-shaped names fail closed), after which every `read_segment` of
+it fails to decode — the partition refuses to serve with a decode error rather than a "corrupt
+segment, purge this" one. Worth a specific error at the read boundary when the obligation ledger is
+wired.
+
+== What is still open
+
+The flag is a refusal, not a reconciliation. A partition that ever failed a write can never compute
+a truncation point again short of a purge or a restart — the TD-GCOLD-3 shape (fail-closed is right,
+but the closed state has no exit). Options, in increasing cost:
+
+1. **Re-discoverable state.** Replace the `OnceCell` with something that can be invalidated, and
+   clear the flag by re-listing the prefix and reconciling `segments` against it. This is the real
+   fix and also removes decision 2 as a hazard class.
+2. **Positive-evidence orphan deletion.** Reuse the obligation ledger from the orphan-deletion
+   design already merged for this TD family (record the EXACT path before the PUT; on failure the
+   obligation names what to delete, so the prefix is never re-listed). That design exists precisely
+   for this failure mode and should be the first thing checked before writing anything new.
+3. Leave the refusal and document it as an operational step (purge the partition).
+
+Option 2 is the one to try first: the mechanism is already specified and merged for this TD family,
+so this is likely a wiring job rather than a design one.
+
+== Why it is filed rather than fully fixed here
+
+The slice that found it is a tombstone-persistence change; replacing the discovery cell or wiring the
+obligation ledger is a separate, larger change with its own tests. Shipping the fail-closed flag
+makes the slice's own safety claim TRUE, which is the part that could not wait — slice 2b must not be
+built on an analysis that covered one direction.
+
+**Slice 2b is gated on this TD** alongside TD-USUB-15.

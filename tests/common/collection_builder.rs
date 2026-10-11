@@ -165,6 +165,7 @@ impl TestCollectionBuilder {
             id,
             config: Some(CollectionConfig {
                 name,
+                embedding_config: None,
                 dimension: self.dimension,
                 distance_metric: Some(self.distance_metric as i32),
                 storage_engine: self.storage_engine.map(|e| e as i32),
@@ -224,6 +225,7 @@ impl TestCollectionBuilder {
             id,
             config: Some(CollectionConfig {
                 name,
+                embedding_config: None,
                 dimension: self.dimension,
                 distance_metric: Some(self.distance_metric as i32),
                 storage_engine: self.storage_engine.map(|e| e as i32),

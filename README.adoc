@@ -91,7 +91,7 @@ treat as headroom indicators, not a published SLA.*
 |===
 |Metric|Reference (10M vectors, 768-d, single-node, internal arm64 macOS bench)
 
-|Recall@10|~97% (HNSW, M=32; not an SLA — see SUPPORTED_SURFACE)
+|Recall@10|~97% (historical internal HNSW reference; not an SLA — see SUPPORTED_SURFACE)
 |Memory efficiency|~1.2 GB for 10M vectors (PQ-quantised path)
 |===
 

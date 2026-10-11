@@ -146,6 +146,28 @@ impl PartitionDiskWriter {
         self.next_offset.load(Ordering::Relaxed)
     }
 
+    /// Recovery may replay an archive while local bootstrap files are empty.
+    /// Future writes must use a new segment ID, never create a partial local
+    /// replacement that shadows the archived segment on the next restart.
+    pub(crate) async fn advance_past_recovered_segment(&self, recovered: u64) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.active_segment_id > recovered {
+            return Ok(());
+        }
+        let id = recovered
+            .checked_add(1)
+            .ok_or_else(|| QueueError::Persistence("recovered segment ID exhausted".into()))?;
+        let path = segment_path(
+            &self.root.join(&self.topic).join(self.partition.to_string()),
+            id,
+        );
+        self.fs.append(&path, &[]).await?;
+        state.active_segment_id = id;
+        state.active_segment_path = path;
+        state.active_segment_size = 0;
+        Ok(())
+    }
+
     /// The currently-active (still-growing) segment id. Object-tier
     /// upload skips this one and only mirrors sealed segments (those
     /// with id strictly less than this).
@@ -161,7 +183,12 @@ impl PartitionDiskWriter {
     /// offset is durably colocated with the message so recovery can
     /// reconstruct it without a side-channel.
     pub async fn append(self: &Arc<Self>, message: &Message) -> Result<AppendOutcome> {
-        let offset = self.next_offset.fetch_add(1, Ordering::Relaxed);
+        let offset = self
+            .next_offset
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| QueueError::Persistence("queue disk offset exhausted".into()))?;
         let bytes = bincode::serialize(message)
             .map_err(|e| QueueError::Persistence(format!("serialize: {e}")))?;
         let mut framed = Vec::with_capacity(4 + 8 + bytes.len());
@@ -298,6 +325,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_offset_does_not_write_or_wrap() {
+        let fs = LocalFs::new_arc();
+        let root = tempfile::tempdir().unwrap();
+        let writer = PartitionDiskWriter::open(
+            "orders".into(),
+            0,
+            root.path().into(),
+            fs.clone(),
+            rotating_config(),
+        )
+        .await
+        .unwrap();
+        writer.set_next_offset(u64::MAX);
+        let path = writer.segments().await.unwrap()[0].path.clone();
+        let before = fs.read(&path).await.unwrap();
+        assert!(
+            writer
+                .append(&Message::new("orders", "tenant", vec![1]))
+                .await
+                .is_err()
+        );
+        assert_eq!(writer.current_next_offset(), u64::MAX);
+        assert_eq!(fs.read(&path).await.unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn append_frames_messages_and_rotates_when_threshold_is_exceeded() {
         let fs = LocalFs::new_arc();
         let root = tempfile::tempdir().unwrap();
@@ -332,13 +385,16 @@ mod tests {
         assert_eq!(frame_offset, first.offset);
         assert_eq!(frame_offset, 0, "first message gets offset 0");
 
-        let segment_ids: Vec<u64> = writer
+        let mut segment_ids: Vec<u64> = writer
             .segments()
             .await
             .unwrap()
             .into_iter()
             .map(|segment| segment.segment_id)
             .collect();
+        // Directory iteration order is backend/platform dependent; this test
+        // verifies the rotated segment inventory, not an ordering contract.
+        segment_ids.sort_unstable();
         assert_eq!(segment_ids, vec![0, 1]);
     }
 }

@@ -339,7 +339,7 @@ Routes that select TurboQuant MUST surface the choice in `RoutedExecutionPlan` v
 * `link:../TURBOQUANT_HLD_2026_05_30.adoc[TURBOQUANT_HLD_2026_05_30]` — high-level design.
 * `link:../TURBOQUANT_LLD_2026_05_30.adoc[TURBOQUANT_LLD_2026_05_30]` — low-level design (byte layouts, implementation phases, status table).
 * `link:./ADR-004-unified-explain-contract.adoc[ADR-004]` — EXPLAIN contract this ADR extends.
-* `link:./ADR-011-filtered-ann-routing.adoc[ADR-011]` — filtered-ANN routing policy this ADR's mask integrates with.
+* `ADR-011` — filtered-ANN routing policy this ADR's mask integrates with.
 * `link:../EMBEDDING_PRECISION_LLD_2026_05_22.adoc[EMBEDDING_PRECISION_LLD_2026_05_22]` — Q12 (codebook lifecycle on epoch bump), Q14 (hardware caps registry).
 * `link:../COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20.adoc[COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20]` — `ExecutionRoute` cataloging mandate.
 * `link:../../../roadmap/MULTIMODAL_OVERHAUL_SPEC_2026_05_08.adoc[MULTIMODAL_OVERHAUL_SPEC_2026_05_08]` — `ProximaRecord` authority model this ADR preserves.

@@ -14,13 +14,13 @@
 //!
 //! Routes:
 //!
-//! * `PATCH /api/v1/collections/:collection_id/pin` — set or clear a
+//! * `PATCH /api/v2/collections/:collection_id/pin` — set or clear a
 //!   pin. Body: `{ "pinned": true, "target": "nvme_ssd", "replicas": 1 }`
 //!   or `{ "pinned": false }`.
-//! * `GET /api/v1/collections/:collection_id/pin` — read current pin
+//! * `GET /api/v2/collections/:collection_id/pin` — read current pin
 //!   state. 200 with state when pinned; 200 with `{"status":"unpinned"}`
 //!   when not pinned.
-//! * `GET /api/v1/collections/pinning` — list all pinned collections.
+//! * `GET /api/v2/collections/pinning` — list all pinned collections.
 
 use axum::{
     Json,
@@ -78,7 +78,7 @@ impl PinResponse {
     }
 }
 
-/// `PATCH /api/v1/collections/:collection_id/pin`
+/// `PATCH /api/v2/collections/:collection_id/pin`
 pub async fn patch_pin(
     State(state): State<AppState>,
     Path(collection_id): Path<String>,
@@ -111,7 +111,7 @@ pub async fn patch_pin(
     }
 }
 
-/// `GET /api/v1/collections/:collection_id/pin`
+/// `GET /api/v2/collections/:collection_id/pin`
 pub async fn get_pin(
     State(state): State<AppState>,
     Path(collection_id): Path<String>,
@@ -141,7 +141,7 @@ pub struct PinListResponse {
     pub items: Vec<PinListItem>,
 }
 
-/// `GET /api/v1/collections/pinning` — operator-dashboard view of
+/// `GET /api/v2/collections/pinning` — operator-dashboard view of
 /// every currently pinned collection.
 pub async fn list_pins(
     State(state): State<AppState>,

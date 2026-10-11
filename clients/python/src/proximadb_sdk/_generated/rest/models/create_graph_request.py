@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, BinaryIO, Generator, TextIO, TypeVar, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Generator, TextIO, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -20,30 +20,22 @@ T = TypeVar("T", bound="CreateGraphRequest")
 class CreateGraphRequest:
     """
     Attributes:
-        graph_id (str): Unique identifier for the new graph collection.
-        name (None | str | Unset): Optional human-readable name (defaults to graph_id).
-        description (None | str | Unset):
+        graph_id (str):
+        name (str | Unset):
+        description (str | Unset):
     """
 
     graph_id: str
-    name: None | str | Unset = UNSET
-    description: None | str | Unset = UNSET
+    name: str | Unset = UNSET
+    description: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         graph_id = self.graph_id
 
-        name: None | str | Unset
-        if isinstance(self.name, Unset):
-            name = UNSET
-        else:
-            name = self.name
+        name = self.name
 
-        description: None | str | Unset
-        if isinstance(self.description, Unset):
-            description = UNSET
-        else:
-            description = self.description
+        description = self.description
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -64,23 +56,9 @@ class CreateGraphRequest:
         d = dict(src_dict)
         graph_id = d.pop("graph_id")
 
-        def _parse_name(data: object) -> None | str | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(None | str | Unset, data)
+        name = d.pop("name", UNSET)
 
-        name = _parse_name(d.pop("name", UNSET))
-
-        def _parse_description(data: object) -> None | str | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(None | str | Unset, data)
-
-        description = _parse_description(d.pop("description", UNSET))
+        description = d.pop("description", UNSET)
 
         create_graph_request = cls(
             graph_id=graph_id,

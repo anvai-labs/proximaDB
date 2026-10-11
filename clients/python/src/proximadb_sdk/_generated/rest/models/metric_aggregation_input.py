@@ -27,7 +27,8 @@ class MetricAggregationInput:
         metric_name (str):
         start_time_ns (int):
         end_time_ns (int):
-        aggregation (str | Unset): min, max, avg, sum, or count. Default: 'avg'.
+        aggregation (str | Unset): Canonical: min, max, avg, sum, count. Percentile/rate forms also accepted: p50, p90,
+            p95, p99, rate. Unknown values fall back to avg. Default: 'avg'.
         step_seconds (int | Unset):  Default: 60.
         group_by (list[str] | Unset):
         labels (MetricAggregationInputLabels | Unset):

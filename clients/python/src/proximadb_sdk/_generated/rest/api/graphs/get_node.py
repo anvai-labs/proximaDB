@@ -11,8 +11,8 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.error_response import ErrorResponse
-from ...models.node_response import NodeResponse
+from ...models.graph_error_response import GraphErrorResponse
+from ...models.graph_node_response import GraphNodeResponse
 from ...types import UNSET, Response, Unset
 
 
@@ -40,16 +40,21 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ErrorResponse | NodeResponse | None:
+) -> GraphErrorResponse | GraphNodeResponse | None:
     if response.status_code == 200:
-        response_200 = NodeResponse.from_dict(response.json())
+        response_200 = GraphNodeResponse.from_dict(response.json())
 
         return response_200
 
     if response.status_code == 404:
-        response_404 = ErrorResponse.from_dict(response.json())
+        response_404 = GraphErrorResponse.from_dict(response.json())
 
         return response_404
+
+    if response.status_code == 500:
+        response_500 = GraphErrorResponse.from_dict(response.json())
+
+        return response_500
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -59,7 +64,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ErrorResponse | NodeResponse]:
+) -> Response[GraphErrorResponse | GraphNodeResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -74,7 +79,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[ErrorResponse | NodeResponse]:
+) -> Response[GraphErrorResponse | GraphNodeResponse]:
     """Get a node by id.
 
     Args:
@@ -87,7 +92,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ErrorResponse | NodeResponse]
+        Response[GraphErrorResponse | GraphNodeResponse]
     """
 
     kwargs = _get_kwargs(
@@ -109,7 +114,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
-) -> ErrorResponse | NodeResponse | None:
+) -> GraphErrorResponse | GraphNodeResponse | None:
     """Get a node by id.
 
     Args:
@@ -122,7 +127,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ErrorResponse | NodeResponse
+        GraphErrorResponse | GraphNodeResponse
     """
 
     return sync_detailed(
@@ -139,7 +144,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[ErrorResponse | NodeResponse]:
+) -> Response[GraphErrorResponse | GraphNodeResponse]:
     """Get a node by id.
 
     Args:
@@ -152,7 +157,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ErrorResponse | NodeResponse]
+        Response[GraphErrorResponse | GraphNodeResponse]
     """
 
     kwargs = _get_kwargs(
@@ -172,7 +177,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
-) -> ErrorResponse | NodeResponse | None:
+) -> GraphErrorResponse | GraphNodeResponse | None:
     """Get a node by id.
 
     Args:
@@ -185,7 +190,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ErrorResponse | NodeResponse
+        GraphErrorResponse | GraphNodeResponse
     """
 
     return (

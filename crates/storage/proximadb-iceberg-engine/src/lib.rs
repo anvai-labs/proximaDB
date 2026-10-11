@@ -56,7 +56,7 @@ use proximadb_kernel::error::StorageError;
 use proximadb_object_store::ProximaObjectStore;
 use proximadb_records::ProximaRecord;
 use proximadb_storage_common::object_store_bridge::{CommitOutcome, ObjectStoreBridge};
-use proximadb_storage_common::proxima_arrow::infer_proxima_schema;
+use proximadb_storage_common::proxima_arrow::infer_proxima_schema_strict;
 use proximadb_storage_common::proxima_parquet::proxima_records_to_parquet_bytes;
 use proximadb_storage_common::proxima_schema::ProximaSchema;
 
@@ -325,7 +325,15 @@ impl ObjectStoreBridge for IcebergObjectStoreBridge {
         // Schema-less entry point: infer the schema from the records, then
         // delegate to the schema-explicit writer so both paths share one
         // implementation. The tenant flows through to the single I/O boundary.
-        let schema = infer_proxima_schema(records);
+        //
+        // TD-USCHEMA-1: inference is a *union schema* (U-Schema, arXiv:2105.06494
+        // §2.3) and collapsing structural variations is defined-lossy — a key
+        // seen with two types keeps the first and NULLs the rest. On THIS path
+        // there is no msgpack PROPS tail, so the typed column is the only copy
+        // and such a value would be silently dropped into a well-formed Parquet
+        // file. Fail closed instead; the error names the key, both types, and a
+        // diverging record.
+        let schema = infer_proxima_schema_strict(records)?;
         self.write_records_to_parquet_with_schema(path, records, &schema, tenant_id)
             .await
     }

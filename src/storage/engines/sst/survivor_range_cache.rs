@@ -521,6 +521,33 @@ impl SurvivorRangeCache {
         self.inner.peek_memory(&key).await
     }
 
+    /// TD-IOBUDGET-2 review: exact-key residency probe WITH the L2 step —
+    /// `Some(bytes)` iff a subsequent [`Self::get_or_fetch`] with these exact
+    /// coordinates would be served WITHOUT running its loader, from DRAM
+    /// (pinned/L1) OR from the persistent exact-key L2. Mirrors
+    /// [`Self::peek_parent_residency`]'s steps 1+4: without the L2 probe a
+    /// RAM-only peek classifies L1-evicted-but-L2-resident ranges as cold and
+    /// re-GETs them from the object store (a warm-phase billing regression) —
+    /// the wave GET's bytes are then dropped at the consume call because
+    /// `get_or_fetch` serves the range from L2. Probed through the RAW
+    /// `PersistentByteStore` (never the traced wrapper) so no io_trace or l2
+    /// counters move; the only effect is an LRU recency tick plus a local-disk
+    /// read attempt (~ms, gated-only).
+    pub async fn peek_exact_residency(
+        &self,
+        kind: CacheKind,
+        path: &str,
+        off: u64,
+        len: u64,
+    ) -> Option<Arc<[u8]>> {
+        let scope = request_cache_scope();
+        let key = CacheKey::with_scope(scope, kind, format!("{path}:{off}:{len}"));
+        if let Some(bytes) = self.inner.peek_memory(&key).await {
+            return Some(bytes);
+        }
+        self.peek_exact_l2(&key, len).await
+    }
+
     /// TD-RDSTRAT-12 §3 (round 4): the [`Self::get_or_fetch_in_parent`] mirror
     /// of [`Self::peek_memory_exact`] — `Some(bytes)` iff a subsequent
     /// `get_or_fetch_in_parent(kind, path, off, len, parent_off, parent_len)`

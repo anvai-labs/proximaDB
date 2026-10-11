@@ -3063,20 +3063,44 @@ async fn materialize_table_writes_parquet_and_flips_catalog_layout() {
     }
     assert_eq!(total, 3, "all rows materialized into the snapshot");
 
-    // The catalog layout is now a published Parquet projection at the location.
+    // TD-USUB-4: publication is ADDITIVE. A freshly created table already carries one
+    // `InternalCanonical`/`ProximaBlock` layout, and publication previously *replaced*
+    // it — so the catalog forgot the table was natively backed at all. The table now
+    // records BOTH its native landing layout and the published Parquet projection,
+    // which is what makes multi-representation — and therefore cost-based routing —
+    // expressible (ADR-094 Decision 2).
     let (catalog, id) = manager.resolve_table("inv").await.expect("resolve");
     let schema = catalog.get_table(&id).await.expect("get table");
-    assert_eq!(schema.storage_layouts.len(), 1);
-    let layout = &schema.storage_layouts[0];
+    assert_eq!(
+        schema.storage_layouts.len(),
+        2,
+        "publication must ADD the projection, not replace the native layout"
+    );
+    assert!(
+        schema.storage_layouts.iter().any(|l| matches!(
+            l.physical_format,
+            proximadb_catalog::CatalogPhysicalFormat::ProximaBlock
+        )),
+        "the native ProximaBlock layout must survive publication"
+    );
+
+    // The published Parquet projection is present at the location — this is what
+    // `catalog_table_is_parquet_backed` finds, so OLAP routing is unaffected.
+    let published = schema
+        .storage_layouts
+        .iter()
+        .find(|l| {
+            matches!(
+                l.physical_format,
+                proximadb_catalog::CatalogPhysicalFormat::Parquet
+            )
+        })
+        .expect("a published Parquet layout must exist");
     assert!(matches!(
-        layout.physical_format,
-        proximadb_catalog::CatalogPhysicalFormat::Parquet
-    ));
-    assert!(matches!(
-        layout.authority,
+        published.authority,
         proximadb_catalog::CatalogAuthorityMode::ProjectionPublication
     ));
-    assert_eq!(layout.location.as_deref(), Some(location.as_str()));
+    assert_eq!(published.location.as_deref(), Some(location.as_str()));
 }
 
 /// P3.3: `ALTER TABLE … MATERIALIZE` routed through DdlService + a wired
@@ -3146,17 +3170,32 @@ async fn alter_table_materialize_via_ddl_flips_catalog_layout() {
         .await
         .expect("materialize via DDL");
 
-    // The catalog layout is now a published Parquet projection.
+    // TD-USUB-4: the published Parquet projection is ADDED alongside the table's
+    // native landing layout, not substituted for it — so this looks the projection up
+    // by format rather than assuming it is the only (or first) entry.
     let (catalog, id) = manager.resolve_table("inv").await.expect("resolve");
     let schema = catalog.get_table(&id).await.expect("get table");
+    let published = schema
+        .storage_layouts
+        .iter()
+        .find(|l| {
+            matches!(
+                l.physical_format,
+                proximadb_catalog::CatalogPhysicalFormat::Parquet
+            )
+        })
+        .expect("a published Parquet layout must exist after MATERIALIZE");
     assert!(matches!(
-        schema.storage_layouts[0].physical_format,
-        proximadb_catalog::CatalogPhysicalFormat::Parquet
-    ));
-    assert!(matches!(
-        schema.storage_layouts[0].authority,
+        published.authority,
         proximadb_catalog::CatalogAuthorityMode::ProjectionPublication
     ));
+    assert!(
+        schema.storage_layouts.iter().any(|l| matches!(
+            l.physical_format,
+            proximadb_catalog::CatalogPhysicalFormat::ProximaBlock
+        )),
+        "the native ProximaBlock layout must survive publication"
+    );
 
     // A DdlService WITHOUT a materializer rejects the statement cleanly.
     let ddl_bare = DdlService::new(manager.clone());
@@ -6369,4 +6408,69 @@ mod abac_relational_enforcement_tests {
                 .contains("identity/storage tenant mismatch")
         );
     }
+}
+
+/// TD-USUB-4: publication must be **additive**. `MATERIALIZE` previously wrote
+/// `set_storage_layouts(&id, vec![layout])`, discarding every other representation a
+/// table had — which is what made cost-based routing across representations
+/// inexpressible, since the catalog had no way to record an alternative.
+#[test]
+fn upsert_storage_layout_is_additive_and_idempotent() {
+    fn layout(
+        name: &str,
+        format: proximadb_catalog::CatalogPhysicalFormat,
+    ) -> CatalogStorageLayout {
+        CatalogStorageLayout {
+            name: name.to_string(),
+            physical_format: format,
+            location: Some(format!("file:///{name}")),
+            ..Default::default()
+        }
+    }
+
+    // A genuinely new layout is APPENDED, not substituted for what is there. This is
+    // the whole point: a table can now hold a native landing layout AND a published
+    // Parquet projection at the same time.
+    let native = layout(
+        "proxima-native",
+        proximadb_catalog::CatalogPhysicalFormat::ProximaBlock,
+    );
+    let parquet = layout(
+        "parquet-snapshot",
+        proximadb_catalog::CatalogPhysicalFormat::Parquet,
+    );
+    let merged = upsert_storage_layout(vec![native.clone()], parquet.clone());
+    assert_eq!(merged.len(), 2, "a new layout must be added, not replace");
+    assert_eq!(merged[0].name, "proxima-native", "existing layout survives");
+    assert_eq!(merged[1].name, "parquet-snapshot");
+
+    // Re-publishing the SAME layout name replaces in place — no duplicate rows from a
+    // repeated MATERIALIZE, and the updated location/properties win.
+    let mut republished = parquet.clone();
+    republished.location = Some("file:///new-location".to_string());
+    republished
+        .properties
+        .insert("snapshot_lsn".to_string(), "42".to_string());
+    let merged = upsert_storage_layout(merged, republished);
+    assert_eq!(merged.len(), 2, "re-publishing must not duplicate");
+    assert_eq!(
+        merged[1].location.as_deref(),
+        Some("file:///new-location"),
+        "the re-published layout's fields must win"
+    );
+    assert_eq!(
+        merged[1].properties.get("snapshot_lsn").map(String::as_str),
+        Some("42"),
+        "per-layout freshness must be carried by the upsert"
+    );
+
+    // Order is stable across republication: the replaced layout keeps its position, so
+    // a reader treating the first match as the default sees no churn.
+    assert_eq!(merged[0].name, "proxima-native");
+
+    // Degenerate case: an empty starting list behaves like a plain insert (the
+    // pre-TD-USUB-4 shape, so a first publication is unchanged).
+    let fresh = upsert_storage_layout(Vec::new(), parquet.clone());
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].name, "parquet-snapshot");
 }

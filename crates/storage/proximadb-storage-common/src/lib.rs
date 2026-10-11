@@ -54,6 +54,7 @@ pub mod proxima_schema;
 pub mod query_metrics;
 pub mod ranged_segment;
 pub mod segment_layout;
+pub mod segment_reader;
 pub mod smart_io_metrics;
 pub mod spatial_encoding;
 pub mod spill_regions;

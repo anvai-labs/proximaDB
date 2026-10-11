@@ -1,0 +1,171 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CI-6: The pinned MinIO emulator image is no longer anonymously pullable, so the object-store tier job fails for every PR that touches ci.yml
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved 2026-10-08** — the S3 emulator is now LocalStack, pinned by multi-arch digest. Found when PR #1957, which touches no object-store code, failed this job.
+| Priority | **HIGH, merge-blocking.** `object-store-emulator-tests` is in `ci-success`'s `needs`, and `CI Success` is the required check. Any PR matching the job's path filter cannot go green until this is fixed.
+| Component | `scripts/run_cloud_emulator_tests.sh` (`MINIO_IMAGE`), `.github/workflows/ci.yml` (`object-store-emulator-tests`)
+| Relates to | TD-CI-5 (the other merge-blocking CI infra defect found the same week)
+| Blocked by | Nothing, but it needs a decision on which emulator to adopt.
+|===
+
+== The finding
+
+The job dies before running a single test:
+
+[source]
+----
+Unable to find image 'quay.io/minio/minio@sha256:14cea493...' locally
+docker: Error response from daemon: unauthorized: access to the requested resource is not authorized
+Process completed with exit code 125
+----
+
+`scripts/run_cloud_emulator_tests.sh:56` pins:
+
+[source,bash]
+----
+MINIO_IMAGE="quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+----
+
+The comment above it already records one migration: "Docker Hub's minio/minio repository stopped
+serving pulls after the OSS project was archived. This is the last official AGPL container image,
+pulled from MinIO's Quay repository and pinned to its multi-architecture manifest digest."
+
+**Quay has now closed the same door.** Verified by anonymous registry query rather than inferred from
+the CI log — both registries refuse an unauthenticated manifest fetch:
+
+[source]
+----
+GET https://quay.io/v2/minio/minio/manifests/sha256:14cea493...
+  {"errors":[{"code":"UNAUTHORIZED","message":"access to the requested resource is not authorized"}]}
+GET https://quay.io/v2/minio/minio/manifests/latest            -> 401
+GET https://quay.io/v2/minio/minio/tags/list                   -> 401
+GET https://registry-1.docker.io/v2/minio/minio/manifests/latest (with anon pull token) -> 401
+----
+
+So this is **deterministic, not a flake**: re-running the job cannot fix it, and no pin of this
+repository will work from an unauthenticated runner.
+
+== Why it hits PRs with no object-store changes
+
+The job's gate is `needs.changes.outputs.object_store_cloud_changes == 'true'`, and that filter is:
+
+[source,yaml]
+----
+- 'crates/storage/proximadb-object-store/**'
+- 'src/graph/cold_payload_store.rs'
+- 'scripts/run_cloud_emulator_tests.sh'
+- '.github/workflows/ci.yml'
+----
+
+Including `ci.yml` is correct — a workflow change should re-run broadly — but it means **any** PR that
+adds a CI step inherits this failure. PR #1957 added one guard step and nothing else touching
+storage, and was blocked by it.
+
+== Candidate fixes (decision needed)
+
+Both of these are anonymously pullable today, verified by the same manifest query (HTTP 200):
+
+1. **`adobe/s3mock`** — purpose-built lightweight S3 mock.
+2. **`localstack/localstack`** — full S3 implementation; heavier image, slower start, closer to real
+   S3 semantics.
+
+Two further options worth weighing:
+
+3. **Authenticate the pull.** Add registry credentials as a secret and `docker login` before the
+   run. Keeps MinIO exactly as-is, but adds a credential dependency to CI for an AGPL image whose
+   availability has already moved twice — and mandate #9 forbids committing secrets, so this means a
+   managed org secret, not a repo change.
+4. **Vendor the image** into the org's own registry (the OSS/commercial boundary memo already
+   distinguishes `docker.io` for OSS from the commercial ACR), pinned by digest. Most durable, most
+   setup.
+
+Chosen: **(2) LocalStack `4.0.3`**, pinned to its multi-arch manifest digest
+(`sha256:17c2f79c…`, amd64 + arm64, verified against the registry).
+
+The VERSION is load-bearing, not incidental. LocalStack's current date-based releases —
+`2026.09.1` among them — are **licensed**: the image pulls, then exits 55 with "License
+activation failed" unless `LOCALSTACK_AUTH_TOKEN` is set. The first attempt here pinned
+`2026.09.1` for being newest and failed in CI for that reason. `4.0.3` is the newest
+release verified to start with no credentials, so this pin guards against an upgrade, not
+merely against drift.
+
+**Correcting this TD's own first draft:** it argued that a mock ignoring `x-amz-storage-class` would
+make the tier assertions "pass vacuously". That overstated the case, and the repo already said so —
+`docs/10-quality/TECHNICAL_DEBT.adoc` records that MinIO never persisted storage class either, and
+that the authoritative tier read-back is done out-of-band on Azurite (`az … --query blobTier`). What
+the S3 test actually pins is the production `from_url` + env path plus acceptance and round-trip, and
+it best-effort-skips `InvalidStorageClass` precisely because default MinIO rejected `STANDARD_IA`.
+So storage-class persistence was never the deciding factor. LocalStack is chosen for being a full S3
+implementation that is anonymously pullable — and it may accept `STANDARD_IA` where MinIO did not,
+in which case the test stops skipping and starts asserting the round-trip, which is a gain rather
+than the regression the first draft feared.
+
+== What was done
+
+1. `MINIO_IMAGE` -> `S3_EMULATOR_IMAGE`, pinned to LocalStack `4.0.3` by digest, with the
+   three-source history AND the licence trap recorded in a comment, so the next migration starts
+   from it instead of rediscovering both.
+2. **Readiness is an actual S3 call** (`wait_s3`, polling `s3api list-buckets`), not a health URL.
+   Measured: `/_localstack/health` can answer 200 while S3 still returns `NoSuchBucket` for a
+   bucket just created, and in one run S3 was serving before that endpoint answered at all. Gating
+   on it reproduced exactly the flake a readiness check exists to prevent. (An earlier draft of this
+   list described switching to `/_localstack/health` — that was the design this change REJECTED, and
+   the contract test now asserts against it.)
+3. **Startup failures are diagnosable.** `wait_port` reported only "did not come up", which cannot
+   distinguish "still booting" from "exited on startup" — and the licence failure was the latter.
+   `diagnose()` now dumps `docker logs --tail 80` plus `state=/exit=/oom=`. That is what turned the
+   second CI failure into a one-line root cause.
+4. Endpoint 9000 -> 4566; `minio_aws`/`create_minio_bucket` -> `s3_aws`/`create_s3_bucket`;
+   credentials via `S3_ACCESS_KEY`/`S3_SECRET_KEY`. Nothing outside that block is emulator-specific,
+   because the S3 surface is reached only through standard AWS env vars and the `aws` CLI.
+   `SERVICES=s3` is documented as the ALLOW-LIST it is (a service left out is refused, not lazily
+   started), not as a startup-cost tweak.
+5. `put_with_tier_accepted_by_minio` -> `put_with_tier_accepted_by_s3_emulator`, doc made
+   emulator-agnostic: the name tracked a vendor that has changed twice, while what the test pins is
+   the production `from_url` + env path.
+6. **The S3 tier test is now STRICT, and the tier is read back.** LocalStack persists
+   `x-amz-storage-class` (verified: `head-object` returns `STANDARD_IA`), which MinIO never did — so
+   the test's best-effort `InvalidStorageClass` skip became unreachable-by-design, and leaving it
+   would mean a future emulator that silently swallows the header prints "skip" while the gate stays
+   green. The skip is gone, and the harness now reads the resident class back out-of-band and
+   **hard-fails** if it is not `STANDARD_IA`, mirroring the Azurite `blobTier` arm. The S3 probe is
+   no longer deleted by the test, because that read-back needs it — the same deliberate choice the
+   Azurite probe already documented.
+7. **The image contract test was rewritten around properties, not a vendor.** It asserted
+   `^quay\.io/minio/minio@sha256:…`, so a necessary migration FAILED the guard instead of being
+   checked by it. It now asserts: digest-pinned and not a mutable tag; every `docker run` binding
+   loopback-qualified (all five `-p`/`--publish` forms, comments excluded, expected count derived
+   from `--name` rather than hard-coded); readiness gated on a real S3 call; startup failures
+   diagnosable in every wait helper the harness defines; bucket creation idempotent; no stale vendor
+   wiring in CODE (comments excluded, since the migration history lives there); and — the one that
+   matters most — **that each of the tier gate's three positional `cargo test` filters names a test
+   that exists.**
+8. The dead `wait_http` helper was deleted rather than pinned in place by the guard.
+
+=== Why item 7's last clause is the important one
+
+The gate's whole payload is three positional `cargo test` filters, and **a filter that matches
+nothing is not an error**:
+
+[source]
+----
+$ cargo test -p proximadb-object-store --features aws,azure,gcp -- --ignored put_with_tier_accepted_by_minio
+test result: ok. 0 passed; 0 failed; 16 filtered out
+exit 0
+----
+
+So any rename, typo, or `#[cfg]`/feature change that stops matching turns that arm into a silent
+no-op: the job stays green having run nothing, and `ci-success` only sees the exit code. This change
+RENAMES one of those three filters, which is precisely the edit that triggers it. A green run and a
+vacuous run differ only by `3 passed` versus `0 passed` in a log nobody reads — so the filters are
+now pinned by the guard, and the mutation (restoring the old name) is verified to fail it.
+
+== What is deliberately NOT done
+
+No `continue-on-error`, and no narrowing of the job's path filter to dodge the failure. A tier job
+that silently stops running is the failure mode mandate #1 exists to prevent — and narrowing the
+filter would have been the cheap way to unblock the PR that found this.

@@ -1,0 +1,17 @@
+= Vendored MLflow UI — provenance
+
+|===
+| Field | Value
+| Upstream | https://github.com/mlflow/mlflow (Apache-2.0)
+| Version | 3.16.0
+| Wheel | mlflow-3.16.0-py3-none-any.whl
+| Wheel SHA-256 | c4ac5e8634aacad1a3d7d5a1a31be9279593ebd48b84272843682db11970cf71
+| Extracted | mlflow/server/js/build/ -> build/ (unmodified)
+| Vendored on | 2026-09-11
+| License | Apache-2.0 (upstream; see LICENSE below)
+|===
+
+The MLflow project is Apache-2.0. The full upstream LICENSE text is
+available at https://github.com/mlflow/mlflow/blob/3.16.0/LICENSE;
+per-file webpack license notices are preserved inside build/static/js/*.js.LICENSE.txt.
+Re-extract or bump via: scripts/vendor_mlflow_ui.sh

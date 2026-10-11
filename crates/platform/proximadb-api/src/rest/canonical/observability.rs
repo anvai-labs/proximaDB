@@ -511,11 +511,13 @@ async fn query_promql(
     Json(request): Json<PromQLRequest>,
 ) -> RestResult<JsonResponse<PromQLResponse>> {
     debug!("PromQL query in namespace {}: {}", namespace, request.query);
-    // Full PromQL wiring comes with the CHRONO engine; return empty for now.
-    Ok(JsonResponse(PromQLResponse {
-        result_type: "vector".to_string(),
-        result: Vec::new(),
-    }))
+    // No PromQL engine yet (arrives with CHRONO). Fail honestly with 501
+    // rather than returning an empty vector — an always-empty result is
+    // indistinguishable from "no data" and silently misleads pollers/dashboards
+    // (the silent-Ok anti-pattern; TD-SPECRAT-1 wave 2).
+    Err(RestError::NotImplemented(
+        "PromQL queries arrive with the CHRONO engine (TD-SPECRAT-1 follow-up)".to_string(),
+    ))
 }
 
 async fn ingest_traces(
@@ -528,12 +530,16 @@ async fn ingest_traces(
         request.spans.len(),
         namespace
     );
-    let total = request.spans.len() as u64;
-    Ok(JsonResponse(IngestResponse {
-        ingested: total,
-        failed: 0,
-        success: true,
-    }))
+    // The PORT already carries trace ingest (backed by storage and served
+    // over gRPC today) — what is missing is this REST adapter's JSON-span →
+    // proto TraceData mapping. Previously this handler fabricated success
+    // (ingested=total) without persisting anything (the silent-Ok
+    // anti-pattern). Fail honestly with 501 until the adapter mapping lands
+    // (TD-SPECRAT-1 wave 2).
+    Err(RestError::NotImplemented(
+        "Trace ingest REST adapter is not mapped to the port yet (TD-SPECRAT-1 follow-up)"
+            .to_string(),
+    ))
 }
 
 async fn query_traces(
@@ -545,10 +551,14 @@ async fn query_traces(
         "Querying traces in namespace: {} (trace_id={:?}, service={:?}, range={}..{})",
         namespace, request.trace_id, request.service, request.start_ns, request.end_ns
     );
-    Ok(JsonResponse(TraceResponse {
-        spans: Vec::new(),
-        total: 0,
-    }))
+    // The PORT's query_traces is backed by storage (gRPC serves it); this
+    // REST adapter is not mapped yet. Returning an empty result set would
+    // read as "no matching spans" instead of "capability absent" — fail
+    // honestly with 501 (TD-SPECRAT-1 wave 2).
+    Err(RestError::NotImplemented(
+        "Trace query REST adapter is not mapped to the port yet (TD-SPECRAT-1 follow-up)"
+            .to_string(),
+    ))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -591,19 +601,11 @@ fn convert_log_request(req: &LogEntryRequest) -> RestResult<LogEntry> {
 }
 
 fn convert_log_to_response(entry: LogEntry) -> LogEntryResponse {
-    use proximadb_proto::v1::sql_value::Value as SV;
-
     let fields: HashMap<String, serde_json::Value> = entry
         .fields
         .into_iter()
         .map(|(k, v)| {
-            let json_val = match v.value {
-                Some(SV::StringValue(s)) => serde_json::Value::String(s),
-                Some(SV::Int64Value(i)) => serde_json::json!(i),
-                Some(SV::NumberValue(f)) => serde_json::json!(f),
-                Some(SV::BoolValue(b)) => serde_json::Value::Bool(b),
-                _ => serde_json::Value::Null,
-            };
+            let json_val = proximadb_records::conversions::sql_value_to_json(&v);
             (k, json_val)
         })
         .collect();
@@ -892,7 +894,7 @@ mod tests {
         fields.insert("ratio".to_string(), serde_json::json!(1.5));
         fields.insert("nested".to_string(), serde_json::json!({"k": "v"}));
 
-        let entry = convert_log_request(&LogEntryRequest {
+        let mut entry = convert_log_request(&LogEntryRequest {
             timestamp_ns: Some(123),
             message: "hello".to_string(),
             severity: "error".to_string(),
@@ -905,10 +907,22 @@ mod tests {
         assert_eq!(entry.severity, Severity::Error as i32);
         assert_eq!(entry.fields.len(), 5);
 
+        let jsonb = serde_json::json!({"trace": {"sampled": true}});
+        entry.fields.insert(
+            "jsonb".to_string(),
+            SqlValue {
+                value: Some(proximadb_proto::v1::sql_value::Value::JsonbValue(
+                    proximadb_data_model::ProximaValue::to_jsonb_vec(&jsonb)
+                        .expect("encode JSONB test value"),
+                )),
+            },
+        );
+
         let response = convert_log_to_response(entry);
         assert_eq!(response.severity, "error");
         assert_eq!(response.fields["text"], serde_json::json!("value"));
         assert_eq!(response.fields["count"], serde_json::json!(3));
+        assert_eq!(response.fields["jsonb"], jsonb);
 
         let mut labels = HashMap::new();
         labels.insert("service".to_string(), "api".to_string());
@@ -1041,8 +1055,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_placeholder_handlers_return_empty_successful_shapes() {
-        let JsonResponse(promql) = query_promql(
+    async fn unwired_capabilities_fail_501_not_fabricated_success() {
+        // TD-SPECRAT-1 wave 2: promql + traces are not wired to storage.
+        // They MUST fail with NotImplemented (501) — an empty/successful
+        // shape is indistinguishable from "no data" and misleads callers
+        // (the silent-Ok anti-pattern this test pins against regressing).
+        let promql = query_promql(
             state(),
             Path("ops".to_string()),
             Json(PromQLRequest {
@@ -1053,11 +1071,10 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
-        assert_eq!(promql.result_type, "vector");
-        assert!(promql.result.is_empty());
+        .unwrap_err();
+        assert!(matches!(promql, RestError::NotImplemented(_)));
 
-        let JsonResponse(traces) = ingest_traces(
+        let traces = ingest_traces(
             state(),
             Path("ops".to_string()),
             Json(TraceIngestRequest {
@@ -1065,10 +1082,10 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
-        assert_eq!(traces.ingested, 1);
+        .unwrap_err();
+        assert!(matches!(traces, RestError::NotImplemented(_)));
 
-        let JsonResponse(query) = query_traces(
+        let query = query_traces(
             state(),
             Path("ops".to_string()),
             Json(TraceQueryRequest {
@@ -1080,8 +1097,8 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
-        assert_eq!(query.total, 0);
+        .unwrap_err();
+        assert!(matches!(query, RestError::NotImplemented(_)));
 
         let _router = create_observability_router();
         let _logs = LogsHandler;

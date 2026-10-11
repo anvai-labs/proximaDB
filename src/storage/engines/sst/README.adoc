@@ -422,13 +422,13 @@ bloom_filter_fp_rate = 0.001  # Lower false positive rate (larger bloom filter)
 
 == References
 
-* link:../../../../docs/storage/sst-engine-deep-dive.adoc[SST Engine Deep Dive]
-* link:../../../../docs/storage/sst_engine_modularization_summary.adoc[Modularization Summary]
-* link:../../../../docs/technical/platform_architecture.adoc[Platform Architecture]
+* SST Engine Deep Dive
+* Modularization Summary
+* link:../../../../docs/_internal/archive/technical/platform_architecture.adoc[Platform Architecture]
 
 == See Also
 
-* Parent Module: link:../README.adoc[Storage Engines]
+* Parent Module: Storage Engines
 * VIPER Engine: link:../viper/README.adoc[VIPER README]
 * NOVA Engine: link:../nova/README.adoc[NOVA README]
-* Main Documentation: link:../../../../docs/README.adoc[ProximaDB Docs]
+* Main Documentation: ProximaDB Docs

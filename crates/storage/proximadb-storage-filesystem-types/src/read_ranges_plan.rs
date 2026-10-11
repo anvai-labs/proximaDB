@@ -232,12 +232,14 @@ mod tests {
     #[allow(clippy::reversed_empty_ranges)]
     #[test]
     fn inverted_range_fails_closed() {
-        let err = coalesce_ranges_with_mapping(&[40..10], policy(64, 4096))
+        let inverted = 40..10;
+        let ranges = std::slice::from_ref(&inverted);
+        let err = coalesce_ranges_with_mapping(ranges, policy(64, 4096))
             .expect_err("inverted must be rejected");
         assert!(matches!(err, FilesystemError::InvalidOperation(_)));
         // ...and also when the policy is absent, so the identity path cannot
         // underflow either.
-        assert!(coalesce_ranges_with_mapping(&[40..10], None).is_err());
+        assert!(coalesce_ranges_with_mapping(ranges, None).is_err());
     }
 
     #[test]

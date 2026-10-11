@@ -49,6 +49,7 @@ use proximadb_data_model::ProximaValue;
 use proximadb_document::{DOCUMENT_COLLECTION_PROP, DOCUMENT_TYPE_PROP};
 use proximadb_records::{ProximaRecord, ProximaTree, ProximaTreeNode, is_record_dead};
 use proximadb_runtime::{PaxColumnDesc, PaxScanInputs, RecordRoutePort};
+use proximadb_storage_common::proxima_arrow::arrow_cell_to_proxima_value;
 
 use crate::datafusion::engine_adapters::pax_adapter::PaxSplitReader;
 use crate::datafusion::engine_adapters::pax_segment_locator::discover_pax_segments;
@@ -213,6 +214,7 @@ impl DocumentPaxPushdownProvider {
                     updated_idx,
                     valid_to_idx,
                     props_idx,
+                    &self.shredded,
                     &mut rows,
                 )?;
             }
@@ -371,6 +373,7 @@ fn collect_flushed_rows(
     updated_idx: usize,
     valid_to_idx: usize,
     props_idx: usize,
+    shredded: &[PaxColumnDesc],
     out: &mut Vec<FlushedRow>,
 ) -> DFResult<()> {
     let ids = batch
@@ -404,6 +407,27 @@ fn collect_flushed_rows(
             // A row whose msgpack fails to parse yields an empty tree (defensive; never panics).
             rmp_serde::from_slice::<ProximaTree>(props.value(i)).unwrap_or_default()
         };
+        // TD-USUB-6 2b: the msgpack tail may be a RESIDUAL — a shredded prop whose
+        // typed stripe reproduces it exactly is no longer stored there. This
+        // column is the document BODY, so a missing key is a missing field, not
+        // a missing optimisation. Fill from the typed columns the batch already
+        // carries.
+        //
+        // `or_insert`-style: the tail WINS wherever it still has the key, mirroring
+        // `FlatRow::into_record`. A key still in the tail is one the stripe could
+        // not reproduce, so its (lossy) stripe value must never overwrite it.
+        for col in shredded {
+            if tree.contains_key(&col.sql_name) {
+                continue;
+            }
+            let Ok(idx) = batch.schema().index_of(&col.sql_name) else {
+                continue;
+            };
+            if let Some(value) = arrow_cell_to_proxima_value(batch.column(idx), i) {
+                tree.insert(col.sql_name.clone(), ProximaTreeNode::Value(value));
+            }
+        }
+
         // Match the MemTable path: the document body is props minus the reserved facade keys.
         tree.remove(DOCUMENT_COLLECTION_PROP);
         tree.remove(DOCUMENT_TYPE_PROP);
@@ -1098,6 +1122,118 @@ mod tests {
     /// and read materially FEWER bytes than the whole segment (blocks pruned off the wire), and
     /// (b) return exactly the matching rows (the residual `FilterExec` guarantees exactness). Run
     /// under nextest so the `PROXIMADB_DF_PAX_RANGED` OnceLock is process-isolated.
+    /// TD-USUB-6 2b: with the residual tail ON, a shredded prop is no longer in
+    /// the msgpack `PROPS` blob — and this provider decodes that blob as the
+    /// DOCUMENT BODY. Without reinstating the typed columns, `SELECT props`
+    /// would silently return documents missing those fields.
+    ///
+    /// This is the flip precondition recorded in TD-USUB-6, exercised end to end
+    /// through SQL rather than asserted at the block layer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn residual_tail_props_projection_still_returns_the_whole_document() {
+        use proximadb_block_format::{BlockCompression, BlockMode, ShredColumn};
+        use proximadb_data_model::ProximaType;
+        use proximadb_storage_common::pax_block::PaxSegmentWriter;
+
+        // SAFETY (edition 2024): under nextest each test owns its process, so this
+        // env mutation is single-threaded and read before any other
+        // `residual_tail_enabled()` call in-process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_RESIDUAL_TAIL", "1") };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).expect("segments dir");
+        let seg_path = seg_dir.join("data.pax");
+
+        let mut writer = PaxSegmentWriter::new(
+            &seg_path,
+            BlockMode::Pax,
+            BlockCompression::None,
+            "docs",
+            0,
+            1,
+            None,
+        )
+        // EXACT declared type — the only shape for which anything is dropped
+        // from the tail.
+        .with_shred_columns(vec![ShredColumn::typed(
+            "amount",
+            col_id::USER_BASE,
+            ProximaType::Int64,
+        )]);
+
+        for i in 0..8usize {
+            let mut props: ProximaTree = HashMap::new();
+            props.insert(
+                "amount".to_string(),
+                ProximaTreeNode::Value(ProximaValue::Int64(i as i64 * 10)),
+            );
+            // A second, undeclared prop that stays in the tail either way — so the
+            // test distinguishes "tail present" from "tail complete".
+            props.insert(
+                "note".to_string(),
+                ProximaTreeNode::Value(ProximaValue::String(format!("n{i}"))),
+            );
+            let ts = 1_700_000_000_000_000_000 + i as i64;
+            writer
+                .add_record(&ProximaRecord {
+                    oid: format!("d{i}"),
+                    tenant_id: "t".into(),
+                    created_at_ns: ts,
+                    updated_at_ns: ts,
+                    valid_to_ns: Some(i64::MAX),
+                    props,
+                    ..Default::default()
+                })
+                .expect("add record");
+        }
+        writer.finish().expect("finish segment");
+
+        let base = format!("file://{}/", dir.path().display());
+        let ff = crate::storage::persistence::filesystem::FilesystemFactory::create_default_arc()
+            .await
+            .expect("filesystem factory");
+        let columns = vec![PaxColumnDesc {
+            sql_name: "amount".into(),
+            col_id: col_id::USER_BASE,
+            data_type: ProximaType::Int64,
+        }];
+        let route: Arc<dyn RecordRoutePort> = Arc::new(FakeRoute {
+            base: base.clone(),
+            columns: columns.clone(),
+            unflushed: Vec::new(),
+        });
+        let provider = DocumentPaxPushdownProvider::new(
+            route,
+            ff,
+            None,
+            "docs",
+            PaxScanInputs {
+                base_path: base,
+                columns,
+            },
+        );
+
+        let got = id_props(Arc::new(provider)).await;
+        assert_eq!(got.len(), 8, "all rows must come back");
+        for (id, props) in &got {
+            assert!(
+                props.contains("\"amount\""),
+                "document {id} lost its shredded prop under the residual tail: {props}"
+            );
+            assert!(
+                props.contains("\"note\""),
+                "document {id} lost its residual-tail prop: {props}"
+            );
+        }
+        // Spot-check a value, not just key presence.
+        let (_, first) = got.first().expect("a row");
+        assert!(
+            first.contains("\"amount\":0") || first.contains("\"amount\": 0"),
+            "amount value must survive reconstruction: {first}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ranged_pushdown_prunes_bytes_and_matches() {
         use proximadb_block_format::{BlockCompression, BlockMode};

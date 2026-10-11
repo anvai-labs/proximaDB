@@ -24,7 +24,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{
-    Attribute, Attributes, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
+    Attribute, Attributes, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutResult,
 };
 use proximadb_kernel::error::StorageError;
 use proximadb_storage_filesystem_types::ObjectAccessTier;
@@ -230,11 +230,51 @@ impl ProximaObjectStore {
 
     /// Write `bytes` to `path` (atomic for stores that support it). Overwrites.
     pub async fn put(&self, path: &Path, bytes: Bytes) -> Result<(), StorageError> {
-        self.store
-            .put(&self.full_path(path), bytes.into())
+        self.put_opts(path, bytes, PutOptions::default())
             .await
             .map(|_| ())
             .map_err(|e| os_err("put", e))
+    }
+
+    /// Write through the existing backend with its native preconditions and
+    /// return its opaque revision. Paths remain relative to this handle's base.
+    ///
+    /// Unlike the compatibility helpers returning [`StorageError`], this method
+    /// preserves upstream `AlreadyExists`, `Precondition`, `NotImplemented` and
+    /// transport errors. It adds no retries and never substitutes an unconditional
+    /// write. The backend's transport may retry internally: even a returned
+    /// `Precondition`/`AlreadyExists` can follow an earlier committed attempt whose
+    /// response was lost. Callers must reconcile their durable operation identity
+    /// before treating an error as proof that nothing changed.
+    ///
+    /// `Update` must carry a nonempty validator. Preserve BOTH ETag and version
+    /// from a previous PUT or [`Self::get_with_meta`]; which fields are used is
+    /// backend-specific. An ETag is not an ownership generation or permission.
+    /// Content-derived ETags can repeat: authority records must carry a non-reused
+    /// revision/incarnation, and must not be deleted/recreated as a CAS shortcut.
+    /// Local files currently reject Update; no rename-based emulation is used.
+    pub async fn put_opts(
+        &self,
+        path: &Path,
+        bytes: Bytes,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if let PutMode::Update(expected) = &options.mode
+            && ((expected.e_tag.is_none() && expected.version.is_none())
+                || expected.e_tag.as_deref() == Some("")
+                || expected.version.as_deref() == Some(""))
+        {
+            return Err(object_store::Error::Generic {
+                store: "ProximaObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "conditional update requires nonempty version/ETag validators",
+                )),
+            });
+        }
+        self.store
+            .put_opts(&self.full_path(path), bytes.into(), options)
+            .await
     }
 
     /// Write `bytes` to `path` at a per-object **access tier** — the object-storage
@@ -267,8 +307,7 @@ impl ProximaObjectStore {
             attributes,
             ..Default::default()
         };
-        self.store
-            .put_opts(&self.full_path(path), bytes.into(), opts)
+        self.put_opts(path, bytes, opts)
             .await
             .map(|_| ())
             .map_err(|e| os_err("put_with_tier", e))
@@ -282,16 +321,13 @@ impl ProximaObjectStore {
     /// commits (the warehouse base tier): a committer writes a new
     /// manifest/metadata object under a fresh name with create-only semantics,
     /// so two concurrent committers cannot clobber each other's commit — the
-    /// loser gets `AlreadyExists` and retries against the winner's snapshot.
+    /// a collision returns `AlreadyExists`. Backend retries can also return
+    /// that error after this caller's earlier attempt committed; reconcile the
+    /// operation before retrying (see [`Self::put_opts`]).
     /// (Supported by the `memory` and local-file backends; cloud backends need
     /// conditional-put support.)
     pub async fn put_if_absent(&self, path: &Path, bytes: Bytes) -> Result<(), StorageError> {
-        self.store
-            .put_opts(
-                &self.full_path(path),
-                bytes.into(),
-                PutOptions::from(PutMode::Create),
-            )
+        self.put_opts(path, bytes, PutOptions::from(PutMode::Create))
             .await
             .map(|_| ())
             .map_err(|e| os_err("put_if_absent", e))
@@ -312,8 +348,7 @@ impl ProximaObjectStore {
             opts.attributes
                 .insert(Attribute::StorageClass, native.into());
         }
-        self.store
-            .put_opts(&self.full_path(path), bytes.into(), opts)
+        self.put_opts(path, bytes, opts)
             .await
             .map(|_| ())
             .map_err(|e| os_err("put_if_absent_with_tier", e))
@@ -321,16 +356,28 @@ impl ProximaObjectStore {
 
     /// Read the whole object at `path`.
     pub async fn get(&self, path: &Path) -> Result<Bytes, StorageError> {
-        let result = self
-            .store
-            .get(&self.full_path(path))
+        self.get_with_meta(path)
             .await
-            .map_err(|e| os_err("get", e))?;
-        let bytes = result.bytes().await.map_err(|e| os_err("get(bytes)", e))?;
+            .map(|(bytes, _)| bytes)
+            .map_err(|e| os_err("get", e))
+    }
+
+    /// Read body and metadata from the SAME backend GET, retaining both opaque
+    /// revision fields for conditional publication. A separate HEAD then GET is
+    /// not a consistent basis for a read/modify/conditional-write transition.
+    ///
+    /// Preserves upstream read errors. Successful bytes are opaque: schema and
+    /// integrity validation belong to the caller. Like [`Self::get`], records
+    /// one full read only after the body is successfully consumed. Metadata locations retain
+    /// upstream semantics; use the original caller-relative path for updates.
+    pub async fn get_with_meta(&self, path: &Path) -> object_store::Result<(Bytes, ObjectMeta)> {
+        let result = self.store.get(&self.full_path(path)).await?;
+        let meta = result.meta.clone();
+        let bytes = result.bytes().await?;
         if let Some(recorder) = io_recorder() {
             recorder.record_full_read(bytes.len() as u64);
         }
-        Ok(bytes)
+        Ok((bytes, meta))
     }
 
     /// Read a byte range of the object at `path` (the warehouse footer/row-group read path).
@@ -644,7 +691,7 @@ mod tests {
     //
     // The memory-degrade unit test cannot catch a native-class mapping regression
     // (an invalid storage-class string a real cloud API would 4xx). These run the
-    // tier path against emulators — Azurite (Azure), MinIO (S3), fake-gcs (GCP) —
+    // tier path against emulators — Azurite (Azure), LocalStack (S3), fake-gcs (GCP) —
     // so the `x-ms-access-tier` / `x-amz-storage-class` / `x-goog-storage-class`
     // header is exercised end-to-end. Azure + S3 go through the PRODUCTION
     // `store_for_url` + forwarded-env path (highest fidelity); GCS uses the builder
@@ -691,49 +738,46 @@ mod tests {
         // Cool-tier proof object_store cannot surface. The emulator is ephemeral.
     }
 
-    /// AWS S3 (MinIO) via the production `from_url` + env path. Default MinIO
-    /// *rejects* `x-amz-storage-class: STANDARD_IA` (InvalidStorageClass) unless
-    /// object tiering/ILM is configured — impractical for a CI emulator — so this
-    /// best-effort-skips on that rejection (real AWS S3 accepts it; the header
-    /// mapping is unit-tested via `native_tier`). It still hard-fails on a
-    /// non-storage-class error. Set by CI: `AWS_ENDPOINT`, `AWS_ALLOW_HTTP=true`,
-    /// `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false`, `AWS_ACCESS_KEY_ID/SECRET/REGION`.
+    /// AWS S3 emulator via the production `from_url` + env path.
+    ///
+    /// Emulator-agnostic on purpose. The named emulator has changed twice
+    /// (MinIO on Docker Hub, then MinIO on Quay, now LocalStack — TD-CI-6), and
+    /// what this test actually pins is the production path, not a vendor: open
+    /// via `from_url`, `put_with_tier(Cool)`, round-trip the bytes.
+    ///
+    /// STRICT, as of the LocalStack migration (TD-CI-6). It used to
+    /// best-effort-skip `InvalidStorageClass`, because default MinIO rejected
+    /// `x-amz-storage-class: STANDARD_IA` without object tiering/ILM configured.
+    /// LocalStack 4.0.3 both accepts it and PERSISTS it (verified: `head-object`
+    /// returns `STANDARD_IA`), so that skip arm is now unreachable-by-design —
+    /// and leaving it in would mean a future emulator that silently ignores the
+    /// header prints "skip" and the tier gate stays green, which is exactly the
+    /// vacuity this job exists to prevent. Set by CI: `AWS_ENDPOINT`,
+    /// `AWS_ALLOW_HTTP=true`, `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false`,
+    /// `AWS_ACCESS_KEY_ID/SECRET/REGION`.
     #[cfg(feature = "aws")]
     #[tokio::test]
-    #[ignore = "needs MinIO/S3 — set AWS_ENDPOINT with the emulator running"]
-    async fn put_with_tier_accepted_by_minio() {
+    #[ignore = "needs an S3 emulator — set AWS_ENDPOINT with it running"]
+    async fn put_with_tier_accepted_by_s3_emulator() {
         if std::env::var("AWS_ENDPOINT").is_err() && std::env::var("AWS_ENDPOINT_URL").is_err() {
-            eprintln!("skip: set AWS_ENDPOINT to the MinIO/S3 emulator");
+            eprintln!("skip: set AWS_ENDPOINT to the S3 emulator");
             return;
         }
         let os = ProximaObjectStore::from_url("s3://proximadb-test/cold/probe-s3.bin")
             .or_else(|_| ProximaObjectStore::from_url("s3://proximadb-test"))
-            .expect("open MinIO/S3 store via from_url");
+            .expect("open the S3 emulator store via from_url");
         assert_eq!(os.backend(), ObjectBackendKind::S3);
         let p = Path::from("cold/probe-s3.bin");
-        // Best-effort: skip on the emulator's STANDARD_IA rejection (mirrors the
-        // GCS pattern); fail on other errors. The header mapping itself is
-        // unit-tested (`native_tier(ObjectAccessTier::Cool) == "STANDARD_IA"`).
-        match os
-            .put_with_tier(&p, Bytes::from_static(b"cool-s3"), ObjectAccessTier::Cool)
+        os.put_with_tier(&p, Bytes::from_static(b"cool-s3"), ObjectAccessTier::Cool)
             .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                let msg = format!("{e:?}");
-                if msg.contains("InvalidStorageClass") {
-                    eprintln!(
-                        "skip (best-effort): MinIO emulator rejected STANDARD_IA \
-                         (InvalidStorageClass) — real AWS S3 accepts it; the \
-                         put_with_tier mapping is unit-tested separately. err: {msg}"
-                    );
-                    return;
-                }
-                panic!("MinIO/S3 put_with_tier failed (non-storage-class error): {msg}");
-            }
-        }
+            .expect("the S3 emulator must ACCEPT a tiered PUT (see the doc above)");
         assert_eq!(&os.get(&p).await.expect("get")[..], b"cool-s3");
-        let _ = os.delete(&p).await;
+        // NOTE: intentionally NOT deleted — the harness reads this object's
+        // resident StorageClass back out-of-band (`head-object --query
+        // StorageClass`) to prove the tier was APPLIED and not just accepted,
+        // which `object_store` 0.13 cannot surface on read. Same deliberate
+        // choice as the Azurite probe above; deleting it here makes that
+        // read-back silently unverifiable.
     }
 
     /// GCP (fake-gcs-server) via the builder (`object_store` has no emulator env key
@@ -844,6 +888,30 @@ mod io_recorder_tests {
 
         store.get(&path).await.expect("whole-object read");
         assert_eq!(spy.full_reads.load(Ordering::Relaxed), 1);
+
+        let (body, meta) = store
+            .get_with_meta(&path)
+            .await
+            .expect("body plus revision");
+        assert_eq!(body.len() as u64, meta.size);
+        assert_eq!(
+            spy.full_reads.load(Ordering::Relaxed),
+            2,
+            "one read, not HEAD plus GET or double accounting"
+        );
+        assert_eq!(spy.bytes.load(Ordering::Relaxed), 1024);
+
+        assert!(
+            store
+                .get_with_meta(&object_store::path::Path::from("absent"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            spy.full_reads.load(Ordering::Relaxed),
+            2,
+            "failed reads do not report successful body reads"
+        );
 
         store.get_range(&path, 0..64).await.expect("ranged read");
         assert_eq!(spy.range_reads.load(Ordering::Relaxed), 1);

@@ -401,7 +401,7 @@ if results[0].score > 0.8:
 - [Storage Engines](../05-concepts/storage-engines.adoc) - Engine internals
 - [Multi-Model Joins](./multi-model-joins.md) - Combine vectors + documents
 - [Graph API](../03-api-reference/graph.adoc) - Add relationships
-- [API Reference](../03-api-reference/) - Complete API docs
+- [API Reference](../03-api-reference/index.md) - Complete API docs
 
 ---
 

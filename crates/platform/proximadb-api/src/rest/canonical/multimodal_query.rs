@@ -7,35 +7,31 @@
 //!
 //! | Endpoint | Method | Description |
 //! |----------|--------|-------------|
-//! | `/api/v1/unified/execute`        | POST   | Unified SQL-like query |
-//! | `/api/v1/unified/multi-model`    | POST   | Structured multi-model query |
-//! | `/api/v1/unified/federated`      | POST   | Federated SQL with extensions |
-//! | `/api/v1/unified/distributed`    | POST   | Distributed cross-shard query |
-//! | `/api/v1/unified/explain`        | POST   | Explain query plan |
-//! | `/api/v1/unified/prepare`        | POST   | Cache a prepared statement |
-//! | `/api/v1/unified/execute/{id}`   | POST   | Execute a prepared statement |
-//! | `/api/v1/unified/prepared/{id}`  | DELETE | Delete a prepared statement |
-//! | `/api/v1/unified/prepared/stats` | POST   | Prepared-statement statistics |
+//! | `/api/v2/unified/execute`        | POST   | Unified SQL-like query |
+//! | `/api/v2/unified/multi-model`    | POST   | Structured multi-model query |
+//! | `/api/v2/unified/federated`      | POST   | Federated SQL with extensions |
+//! | `/api/v2/unified/distributed`    | POST   | Distributed cross-shard query |
+//! | `/api/v2/unified/explain`        | POST   | Explain query plan |
+//! | `/api/v2/unified/prepare`        | POST   | Cache a prepared statement |
+//! | `/api/v2/unified/execute/{id}`   | POST   | Execute a prepared statement |
+//! | `/api/v2/unified/prepared/{id}`  | DELETE | Delete a prepared statement |
+//! | `/api/v2/unified/prepared/stats` | POST   | Prepared-statement statistics |
 //!
-//! ## Phase 9.9 Status
-//!
-//! The root-crate implementation of `UnifiedQueryPort` is blocked on extracting
-//! `CollectionService`, `DocumentService`, `ObservabilityService`, and
-//! `QueryFacadeAdapter` from the root crate into `proximadb-runtime` (Phase 9.10).
-//! All handlers currently return `501 Not Implemented` when invoked through the
-//! platform API; use the root-crate server endpoints in the meantime.
+//! The default server wires the root-crate `UnifiedQueryPort` implementation.
+//! A 501 remains possible only for alternate constructions whose port reports
+//! that an operation is not implemented.
 
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, post},
 };
 use proximadb_data_model::ProximaValue;
-use proximadb_runtime::UnifiedQueryPort;
+use proximadb_runtime::{InvalidQueryInput, UnifiedQueryPort};
 use serde::Deserialize;
 use tracing::{error, info};
 
@@ -135,12 +131,27 @@ fn not_implemented(description: &str) -> impl IntoResponse {
     )
 }
 
+fn extract_json<T>(
+    body: Result<Json<T>, JsonRejection>,
+) -> Result<T, (StatusCode, Json<serde_json::Value>)> {
+    body.map(|Json(value)| value).map_err(|rejection| {
+        (
+            rejection.status(),
+            Json(serde_json::json!({ "error": rejection.body_text() })),
+        )
+    })
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn execute_query(
     State(s): State<UnifiedQueryRestState>,
-    Json(req): Json<ExecuteQueryRequest>,
+    body: Result<Json<ExecuteQueryRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match extract_json(body) {
+        Ok(req) => req,
+        Err(response) => return response.into_response(),
+    };
     if req.query.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -179,12 +190,26 @@ async fn execute_query(
 
 async fn execute_multi_model_query(
     State(s): State<UnifiedQueryRestState>,
-    Json(req): Json<serde_json::Value>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match extract_json(body) {
+        Ok(req) => req,
+        Err(response) => return response.into_response(),
+    };
     match s.unified_query_port.execute_multi_model_query(req).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
+            // Downcast FIRST: InvalidQueryInput embeds user-controlled
+            // component_type text — a client error containing the words
+            // 'not implemented' misrouted to 501.
+            if e.downcast_ref::<InvalidQueryInput>().is_some() {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            } else if e.to_string().contains("not implemented")
+                || e.to_string().contains("UNIMPLEMENTED")
             {
                 not_implemented("execute_multi_model_query").into_response()
             } else {
@@ -201,8 +226,12 @@ async fn execute_multi_model_query(
 
 async fn execute_federated_query(
     State(s): State<UnifiedQueryRestState>,
-    Json(req): Json<ExecuteFederatedRequest>,
+    body: Result<Json<ExecuteFederatedRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match extract_json(body) {
+        Ok(req) => req,
+        Err(response) => return response.into_response(),
+    };
     if req.query.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -236,8 +265,12 @@ async fn execute_federated_query(
 
 async fn execute_distributed_query(
     State(s): State<UnifiedQueryRestState>,
-    Json(req): Json<serde_json::Value>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match extract_json(body) {
+        Ok(req) => req,
+        Err(response) => return response.into_response(),
+    };
     match s.unified_query_port.execute_distributed_query(req).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => {
@@ -258,8 +291,12 @@ async fn execute_distributed_query(
 
 async fn explain_query(
     State(s): State<UnifiedQueryRestState>,
-    Json(req): Json<ExplainQueryRequest>,
+    body: Result<Json<ExplainQueryRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match extract_json(body) {
+        Ok(req) => req,
+        Err(response) => return response.into_response(),
+    };
     match s
         .unified_query_port
         .explain_unified_query(req.query, req.collection)
@@ -284,8 +321,12 @@ async fn explain_query(
 
 async fn prepare_statement(
     State(s): State<UnifiedQueryRestState>,
-    Json(req): Json<PrepareStatementRequest>,
+    body: Result<Json<PrepareStatementRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match extract_json(body) {
+        Ok(req) => req,
+        Err(response) => return response.into_response(),
+    };
     match s
         .unified_query_port
         .prepare_statement(req.name, req.query, req.cache_results, req.ttl_seconds)
@@ -315,8 +356,12 @@ async fn prepare_statement(
 async fn execute_prepared_statement(
     State(s): State<UnifiedQueryRestState>,
     Path(statement_id): Path<String>,
-    Json(req): Json<ExecutePreparedRequest>,
+    body: Result<Json<ExecutePreparedRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match extract_json(body) {
+        Ok(req) => req,
+        Err(response) => return response.into_response(),
+    };
     let params = json_to_proxima_values(req.parameters);
     match s
         .unified_query_port
@@ -364,8 +409,12 @@ async fn delete_prepared_statement(
 
 async fn get_prepared_stats(
     State(s): State<UnifiedQueryRestState>,
-    Json(req): Json<PreparedStatsRequest>,
+    body: Result<Json<PreparedStatsRequest>, JsonRejection>,
 ) -> impl IntoResponse {
+    let req = match extract_json(body) {
+        Ok(req) => req,
+        Err(response) => return response.into_response(),
+    };
     match s
         .unified_query_port
         .get_prepared_stats(req.statement_ids)
@@ -423,11 +472,17 @@ mod tests {
     use super::*;
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, header::CONTENT_TYPE},
+    };
+    use tower::ServiceExt;
 
     #[derive(Clone, Copy)]
     enum MockMode {
         Ok,
         NotImplemented,
+        InvalidInput,
         Internal,
     }
 
@@ -446,6 +501,13 @@ mod tests {
             match self.mode {
                 MockMode::Ok => Ok(serde_json::json!({ "op": op })),
                 MockMode::NotImplemented => Err(anyhow!("{op} not implemented")),
+                // Kept (the handler lacks the InvalidQueryInput downcast —
+                // these endpoints surface client errors as 500 today).
+                MockMode::InvalidInput => {
+                    // Collision control: client text must not outrank the
+                    // typed error class and become a false 501.
+                    Err(InvalidQueryInput(format!("{op} not implemented")).into())
+                }
                 MockMode::Internal => Err(anyhow!("{op} failed")),
             }
         }
@@ -503,6 +565,9 @@ mod tests {
             match self.mode {
                 MockMode::Ok => Ok("stmt-1".to_string()),
                 MockMode::NotImplemented => Err(anyhow!("prepare_statement not implemented")),
+                MockMode::InvalidInput => {
+                    Err(InvalidQueryInput("prepare_statement input is invalid".to_string()).into())
+                }
                 MockMode::Internal => Err(anyhow!("prepare_statement failed")),
             }
         }
@@ -520,6 +585,9 @@ mod tests {
             match self.mode {
                 MockMode::Ok => Ok(()),
                 MockMode::NotImplemented => Err(anyhow!("delete_prepared not implemented")),
+                MockMode::InvalidInput => {
+                    Err(InvalidQueryInput("delete_prepared input is invalid".to_string()).into())
+                }
                 MockMode::Internal => Err(anyhow!("delete_prepared failed")),
             }
         }
@@ -565,12 +633,12 @@ mod tests {
     async fn handlers_validate_empty_queries_before_delegating() {
         let execute = execute_query(
             MockUnifiedQueryPort::state(MockMode::Ok),
-            Json(ExecuteQueryRequest {
+            Ok(Json(ExecuteQueryRequest {
                 query: " ".to_string(),
                 parameters: None,
                 collection: None,
                 limit: None,
-            }),
+            })),
         )
         .await
         .into_response();
@@ -578,10 +646,10 @@ mod tests {
 
         let federated = execute_federated_query(
             MockUnifiedQueryPort::state(MockMode::Ok),
-            Json(ExecuteFederatedRequest {
+            Ok(Json(ExecuteFederatedRequest {
                 query: "\n".to_string(),
                 parameters: None,
-            }),
+            })),
         )
         .await
         .into_response();
@@ -595,12 +663,12 @@ mod tests {
         assert_eq!(
             execute_query(
                 state.clone(),
-                Json(ExecuteQueryRequest {
+                Ok(Json(ExecuteQueryRequest {
                     query: "select * from docs".to_string(),
                     parameters: Some(vec![serde_json::json!("p1")]),
                     collection: Some("docs".to_string()),
                     limit: Some(10),
-                }),
+                })),
             )
             .await
             .into_response()
@@ -608,7 +676,7 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            execute_multi_model_query(state.clone(), Json(serde_json::json!({"vector": {}})))
+            execute_multi_model_query(state.clone(), Ok(Json(serde_json::json!({"vector": {}}))),)
                 .await
                 .into_response()
                 .status(),
@@ -617,10 +685,10 @@ mod tests {
         assert_eq!(
             execute_federated_query(
                 state.clone(),
-                Json(ExecuteFederatedRequest {
+                Ok(Json(ExecuteFederatedRequest {
                     query: "select * from docs".to_string(),
                     parameters: Some(vec![serde_json::json!(1)]),
-                }),
+                })),
             )
             .await
             .into_response()
@@ -628,7 +696,7 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(
-            execute_distributed_query(state.clone(), Json(serde_json::json!({"shards": []})))
+            execute_distributed_query(state.clone(), Ok(Json(serde_json::json!({"shards": []}))),)
                 .await
                 .into_response()
                 .status(),
@@ -637,10 +705,10 @@ mod tests {
         assert_eq!(
             explain_query(
                 state.clone(),
-                Json(ExplainQueryRequest {
+                Ok(Json(ExplainQueryRequest {
                     query: "select * from docs".to_string(),
                     collection: Some("docs".to_string()),
-                }),
+                })),
             )
             .await
             .into_response()
@@ -650,12 +718,12 @@ mod tests {
         assert_eq!(
             prepare_statement(
                 state.clone(),
-                Json(PrepareStatementRequest {
+                Ok(Json(PrepareStatementRequest {
                     query: "select * from docs".to_string(),
                     name: Some("q1".to_string()),
                     cache_results: true,
                     ttl_seconds: Some(60),
-                }),
+                })),
             )
             .await
             .into_response()
@@ -666,10 +734,10 @@ mod tests {
             execute_prepared_statement(
                 state.clone(),
                 Path("stmt-1".to_string()),
-                Json(ExecutePreparedRequest {
+                Ok(Json(ExecutePreparedRequest {
                     parameters: Some(vec![serde_json::json!(true)]),
                     collection: Some("docs".to_string()),
-                }),
+                })),
             )
             .await
             .into_response()
@@ -686,9 +754,9 @@ mod tests {
         assert_eq!(
             get_prepared_stats(
                 state,
-                Json(PreparedStatsRequest {
+                Ok(Json(PreparedStatsRequest {
                     statement_ids: vec!["stmt-1".to_string()],
-                }),
+                })),
             )
             .await
             .into_response()
@@ -701,19 +769,72 @@ mod tests {
     async fn handlers_map_not_implemented_and_internal_errors_to_expected_statuses() {
         let not_implemented = execute_multi_model_query(
             MockUnifiedQueryPort::state(MockMode::NotImplemented),
-            Json(serde_json::json!({})),
+            Ok(Json(serde_json::json!({}))),
         )
         .await
         .into_response();
         assert_eq!(not_implemented.status(), StatusCode::NOT_IMPLEMENTED);
 
+        let invalid_input = execute_multi_model_query(
+            MockUnifiedQueryPort::state(MockMode::InvalidInput),
+            Ok(Json(serde_json::json!({}))),
+        )
+        .await
+        .into_response();
+        assert_eq!(invalid_input.status(), StatusCode::BAD_REQUEST);
+
         let internal = execute_distributed_query(
             MockUnifiedQueryPort::state(MockMode::Internal),
-            Json(serde_json::json!({})),
+            Ok(Json(serde_json::json!({}))),
         )
         .await
         .into_response();
         assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn json_rejections_use_bare_error_envelope() {
+        let router =
+            create_multimodal_router().with_state(MockUnifiedQueryPort::state(MockMode::Ok).0);
+        let cases = [
+            ("application/json", "{\"query\":", StatusCode::BAD_REQUEST),
+            (
+                "text/plain",
+                "{\"query\":\"select 1\"}",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            ("application/json", "{}", StatusCode::UNPROCESSABLE_ENTITY),
+        ];
+
+        for (content_type, body, expected_status) in cases {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/execute")
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from(body))
+                        .expect("build request"),
+                )
+                .await
+                .expect("execute request");
+
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json")
+            );
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("decode response JSON");
+            assert!(body.get("error").and_then(|value| value.as_str()).is_some());
+        }
     }
 
     #[test]

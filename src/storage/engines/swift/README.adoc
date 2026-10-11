@@ -731,10 +731,10 @@ println!("Cache hit rate: {:.2}%", stats.cache_hit_rate * 100.0);
 
 == References
 
-* link:../../../../docs/storage/swift-engine-deep-dive.adoc[SWIFT Engine Deep Dive] (to be created)
-* link:../README.adoc[Storage Engines Overview]
+* SWIFT Engine Deep Dive (to be created)
+* Storage Engines Overview
 * link:../../../../docs/09-roadmap/implementation/[Implementation Guides]
-* link:../../../../docs/performance/[Performance Documentation]
+* Performance Documentation
 
 ---
 _Last updated: December 2025 (v0.2.0)_

@@ -1,0 +1,106 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-11: Parquet Layer A cannot round-trip a canonical record — tombstones, identity and tenant are dropped
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved 2026-09-22.** Filed and closed the same day — found while starting TD-USUB-1 slice 2, which it blocks. Encoding landed; adoption by the spill store is TD-USUB-1 slice 2.
+| Priority | **HIGH** — a hard prerequisite for ADR-094 Decision 1. Not a live defect today (see Severity), but building slice 2 without it would have introduced a silent-wrong-answer bug.
+| Component | `crates/storage/proximadb-storage-common/src/proxima_arrow.rs`
+| Relates to | ADR-094 (Decision 1 "relational tables land in Parquet-encoded Layer A"), ADR-045 (Layer A/B), TD-USUB-1 (slice 2, blocked by this), TD-USUB-5 (the reader seam), mandate #16a (dead-record predicate), mandate #8 (mixed-read-safe)
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`proxima_records_to_record_batch` materializes **only declared schema columns**, reading
+each value out of `props` (`proxima_arrow.rs`, the `for col in schema.columns` loop). Every
+field that lives on `ProximaRecord` itself rather than in `props` is therefore absent from
+the Parquet copy:
+
+[cols="1,1,2", options="header"]
+|===
+| Field | Persisted? | Consequence
+| `oid` | No | Identity is *guessed* on read-back by `reconstruct_oid` (`record_store.rs:420`) from the declared primary key — which exists only because of this gap, and yields an empty string when the PK is absent or non-scalar.
+| `tenant_id` | No | Returns empty. Isolation is structural (path/partition) so this is fidelity, not an enforcement hole — but the record read back is not the record written.
+| `valid_to_ns` | **No** | **The load-bearing one.** This is the tombstone/TTL field the canonical dead-record predicate reads (`ProximaRecord::is_dead`, mandate #16a). A deleted or expired row reads back **live**.
+| `created_at_ns` / `updated_at_ns` / `valid_from_ns` / `variation_id` | No | Lifecycle and provenance lost.
+|===
+
+== Severity — a prerequisite, not a live bug
+
+Stated precisely, because the distinction matters and the obvious reading overstates it.
+
+Today the relational memtable **hard-deletes**: `MemtableRecordStorage::delete_record` is
+`records.remove(&key.oid)` (`record_memtable.rs`). Nothing on the relational path depends on
+`valid_to_ns` tombstones, and Parquet is only ever an *export* of rows already filtered live.
+So nothing is currently wrong.
+
+The moment Parquet becomes a **landing** format (ADR-094 Decision 1), that changes:
+
+* A landed segment is **immutable**. Deleting a row already written to one cannot remove it.
+* So deletion *necessarily* becomes a `valid_to_ns` tombstone.
+* A tombstone that does not round-trip is a **resurrected row** — a silently wrong answer
+  (mandate #1), and a direct violation of mandate #16a.
+
+TD-USUB-1 slice 2 (durable relational store) therefore could not be built correctly on the
+existing encoder. Discovering this *before* writing the spill path is the whole value of the
+finding: the alternative was to build the resurrection bug in and then hunt it.
+
+== The decision
+
+Add **reserved system columns**, opt-in and additive, rather than either (a) spilling
+relational data in PAX because PAX already round-trips a full `ProximaRecord`, or (b) making
+the existing encoder always emit them.
+
+* **(a) was rejected** because it contradicts ADR-094's accepted "format follows modality":
+  relational-only tables land in Parquet. The right fix is to make Parquet Layer A faithful,
+  not to route around the decision.
+* **(b) was rejected** because it would change every existing Parquet object, including
+  `ALTER TABLE … MATERIALIZE` output and the Iceberg interop copy. Mandate #8 wants additive
+  and mixed-read-safe.
+
+Reserved names follow the `__proxima_…` convention already present in the tree
+(`__proxima_created_at_ns` in `catalog-schema`, `__proxima_functions__` in `function_store`):
+`__proxima_oid`, `__proxima_tenant_id`, `__proxima_variation_id`, `__proxima_created_at_ns`,
+`__proxima_updated_at_ns`, `__proxima_valid_from_ns`, `__proxima_valid_to_ns`.
+
+This is convergent with how the ecosystem solves the same problem — Iceberg v3 row lineage
+and Delta's metadata columns both carry identity/lifecycle beside user columns — so it also
+keeps the interop story coherent.
+
+=== Mixed-read safety (mandate #8)
+
+**Presence of the column IS the version marker** — no version byte, no flag day:
+
+* The legacy writer is untouched and still emits only declared user columns.
+* `record_batch_to_proxima_records` lifts a system column onto the record field **only when
+  present**, and otherwise behaves exactly as before (identity not inferred).
+* Old objects and new objects coexist and are read by the same reader.
+
+A user column declared with a reserved name **fails closed** and names the offender, because
+two same-named Arrow fields in one batch would make read-back ambiguous.
+
+== Evidence
+
+* `tombstone_survives_the_round_trip_and_is_lost_without_system_columns` — the load-bearing
+  test. Asserts the tombstone survives WITH the system columns *and* is lost WITHOUT them, so
+  the defect is pinned and cannot silently reappear.
+* `system_columns_restore_identity_and_stay_out_of_props` — identity and lifecycle all
+  restored, and no reserved name leaks into `props` as a user-visible column.
+* `legacy_batches_decode_unchanged` — a batch with no system columns decodes exactly as
+  before (mixed-read safety).
+* `legacy_encoder_output_is_unchanged_by_the_new_variant` — the legacy encoder still emits
+  only declared user columns, so `MATERIALIZE` output is unperturbed.
+* `reserved_name_collision_fails_closed` — collision rejected, offender named.
+
+== Not done here
+
+* **No caller adopts the new encoder yet.** This TD supplies the capability; TD-USUB-1 slice 2
+  is its first consumer. `MATERIALIZE` deliberately keeps the legacy encoder — its published
+  Parquet is an export of already-filtered live rows and is also the Iceberg interop copy,
+  where reserved columns would leak into an external contract.
+* **Projection hygiene.** `is_system_column` is exported so user-visible column lists
+  (`SELECT *`, schema introspection) can exclude reserved names. Wiring that into the SQL
+  surface belongs with the first consumer that can actually surface them.

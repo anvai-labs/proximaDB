@@ -2,7 +2,7 @@
 :toc: left
 :toclevels: 3
 :icons: font
-:last-updated: 2026-05-01
+:last-updated: 2026-09-04
 
 == Status
 
@@ -308,81 +308,66 @@ One week in production with:
 * No user complaints
 * Metrics stable
 
-== Current Production Status
+== Current Product Status
 
-=== Production Ready Features
+[IMPORTANT]
+====
+This status summary is subordinate to
+link:../SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`], the canonical
+product support contract. A compiled feature, protocol, SDK, or integration
+does not acquire a support tier merely by appearing in the repository.
+====
 
-==== Storage Engines
+=== Supported Default
 
-* **SST** - ✅ Production Ready (recommended for write-heavy workloads)
-* **VIPER** - ✅ Production Ready (recommended for analytics)
-* **HELIX** - ✅ Production Ready (spatial locality workloads)
-* **NOVA** - ✅ Production Ready (mixed workloads)
+* **SST** - ✅ Supported default storage engine for the canonical single-node vector path.
+* **Canonical REST `/api/v2` vector CRUD/search** - ✅ Supported. Other
+  query languages and modality projections retain their own tiers below.
 
-==== Graph Engines
+=== Beta
 
-* **ORION** - ✅ Production Ready (recommended for all graph workloads)
+* **HELIX / NOVA** - 🟡 Beta alternate vector engines.
+* **ORION graph operations** - 🟡 Beta; ORION is a rebuildable projection,
+  and graph creation/DDL is REST-only.
+* **Federated SQL** - 🟡 Beta; full PostgreSQL/OLTP/HTAP parity is not
+  supported.
+* **Document CRUD/query/aggregation** - 🟡 Beta; canonical record
+  storage is not yet the default authority across all server wiring.
+* **Graph query** - 🟡 Beta for the documented openCypher subset.
+* **Security runtime** - 🟡 Beta; authentication mechanisms exist, but
+  admin/status APIs, stronger online revocation, and pgwire credential binding
+  remain incomplete.
+* **PostgreSQL wire protocol** - 🟡 Beta on port 5433 (autocommit SQL
+  subset).
+* **Hybrid retrieval, time-series, and event foundations** - 🟡 Beta.
 
-==== Query Capabilities
+=== Transport Modes
 
-* **Vector Search** - ✅ Production Ready (HNSW, IVF, filtered ANN)
-* **SQL Query** - ✅ Production Ready (full SQL with extensions)
-* **Document Query** - ✅ Production Ready (JSON path queries)
-* **Graph Query** - ✅ Production Ready (Cypher-compatible)
+* **REST `/api/v2`** is the canonical customer surface on port 5678.
+* The shipped `config/config.toml` and Docker image enable `unified_mode`, so
+  port 5678 multiplexes REST, gRPC, and Arrow Flight. **Arrow Flight / gRPC
+  multiplexing as a customer-facing transport remains Experimental.**
+* The shipped Kubernetes/Helm manifests omit `unified_mode` and therefore use
+  legacy multi-port mode: REST 5678, gRPC 5679, and Arrow Flight 5680. A port
+  choice does not promote the protocol or operation behind it.
 
-==== Network Protocols
+=== Experimental, Deprecated, And Retired
 
-* **REST API** - ✅ Production Ready (port 5678)
-* **gRPC API** - ✅ Production Ready (port 5679)
-* **PostgreSQL Wire** - ✅ Production Ready (port 5433, pgvector compatible)
-* **Arrow Flight** - ✅ Production Ready (port 5680)
+* **Distributed cluster execution** - ⚠️ Experimental; transport and
+  remote execution remain partial. Multi-region operation is not Beta.
+* **SWIFT / RAPTOR** - ⚠️ Experimental, feature-gated engines; neither is
+  a supported migration target.
+* **VIPER** - ⚠️ Deprecated per ADR-093; existing collections remain
+  readable while migration proceeds, but new deployments should use SST.
+* **PULSAR / QUASAR** - ❌ Retired names, not experimental engines. Use ORION.
+* **Full SQL parity, LLM joins, and AVX512 paths** - ⚠️ Experimental or
+  unsupported as scoped by the canonical matrix.
 
-==== Security
+=== SDK And Framework Integrations
 
-* **JWT Authentication** - ✅ Production Ready
-* **API Key Authentication** - ✅ Production Ready
-* **RBAC** - ✅ Production Ready
-* **mTLS** - ✅ Production Ready
-* **Encryption at Rest** - ✅ Production Ready
-
-==== Framework Integrations
-
-* **LangChain** - ✅ Production Ready
-* **LlamaIndex** - ✅ Production Ready
-* **Haystack** - ✅ Production Ready
-* **CrewAI** - ✅ Production Ready
-* **DSPy** - ✅ Production Ready
-* **AutoGen** - ✅ Production Ready
-
-=== Beta Features
-
-==== SDKs
-
-* **Go SDK** - ⚠️ Beta (basic functionality complete, advanced features in progress)
-* **Java SDK** - ⚠️ Beta (JNI bindings complete, testing ongoing)
-* **Node.js SDK** - ⚠️ Beta (NAPI-RS bindings complete, testing ongoing)
-
-==== Distributed Features
-
-* **Cluster Mode** - ⚠️ Beta (Raft consensus complete, production validation ongoing)
-* **Multi-Region** - ⚠️ Beta (LocalQuorum complete, full multi-region in progress)
-
-=== Experimental Features
-
-==== Graph Engines
-
-* **PULSAR** - ❌ Experimental (cross-shard traversal incomplete, no distributed WAL)
-* **QUASAR** - ❌ Experimental (tiered storage incomplete, no WAL for cold tier)
-
-==== Storage Engines
-
-* **SWIFT** - ❌ Deprecated (archived, use SST or NOVA instead)
-* **RAPTOR** - ❌ Deprecated (archived, use SST or VIPER instead)
-
-==== Experimental Features
-
-* **LLM Joins** - ⚠️ Experimental (block-batched joins in development)
-* **AVX512 SIMD** - ❌ Experimental (requires nightly Rust, disabled by default)
+SDK packages and framework adapters are not blanket Production Ready features.
+Use their own conformance evidence and the canonical matrix for the specific
+operation being invoked; repository presence alone is not a support claim.
 
 == Exception Process
 

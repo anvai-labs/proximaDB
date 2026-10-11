@@ -236,6 +236,14 @@ def test_sql_value_to_python_unknown_kind(client):
     assert client._sql_value_to_python(sv) is None
 
 
+def test_sql_value_to_python_jsonb_preserves_wire_bytes(client):
+    """The legacy SqlValue adapter must not silently drop tag-9 JSONB."""
+    sv = v1_types.SqlValue()
+    sv.jsonb_value = b"\x81\xa1x\x01"
+
+    assert client._sql_value_to_python(sv) == b"\x81\xa1x\x01"
+
+
 # --------------------------------------------------------------------------- #
 # v2 TypedValue encode/decode
 # --------------------------------------------------------------------------- #

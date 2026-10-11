@@ -109,18 +109,16 @@ async fn offset_commit_is_atomic() {
         h.await.unwrap().expect("ack");
     }
 
-    // After the storm settles, offset.meta must be parseable and the
-    // committed_offset must be a reachable value (≤ 99). The exact
-    // value depends on scheduling — what matters is that we never
-    // observe a corrupted file.
+    // Every delivery was ACKed successfully. Scheduling cannot change the
+    // final contiguous watermark: it must reach 99, not merely be parseable.
     let meta_path = root.join("t").join("0").join("g").join("offset.meta");
     assert!(meta_path.exists(), "offset.meta should exist");
     let body = std::fs::read_to_string(&meta_path).expect("read meta");
     let parsed: Value = serde_json::from_str(&body).expect("parse json (no corruption)");
     let committed = parsed["committed_offset"].as_u64().expect("u64");
-    assert!(
-        committed <= 99,
-        "committed_offset {committed} must be within range 0..=99"
+    assert_eq!(
+        committed, 99,
+        "all successful ACKs must reach the final offset"
     );
     assert_eq!(parsed["group"], "g");
 }

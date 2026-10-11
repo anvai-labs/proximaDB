@@ -993,12 +993,31 @@ impl NovaEngine {
                             anyhow!("Failed to downcast metadata builder to StringBuilder")
                         })?;
                         if let Some(value) = metadata_value {
-                            if let Some(s) = value.value.as_ref().and_then(|v| match v {
-                                crate::proto::proximadb_v1::sql_value::Value::StringValue(s) => {
-                                    Some(s.as_str())
+                            // TD-PROTO-2: JSONB decodes to compact JSON text
+                            // instead of being dropped by the `_` wildcard.
+                            // The decoded String needs an owned binding before
+                            // it can be borrowed as &str below.
+                            let jsonb_text = value.value.as_ref().and_then(|v| match v {
+                                crate::proto::proximadb_v1::sql_value::Value::JsonbValue(b) => {
+                                    // The string-only seam (round 6: was the
+                                    // one bypass among string-only consumers).
+                                    Some(
+                                        proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(
+                                            b,
+                                        ),
+                                    )
                                 }
                                 _ => None,
-                            }) {
+                            });
+                            let borrowed = jsonb_text.as_deref().or_else(|| {
+                                value.value.as_ref().and_then(|v| match v {
+                                    crate::proto::proximadb_v1::sql_value::Value::StringValue(
+                                        s,
+                                    ) => Some(s.as_str()),
+                                    _ => None,
+                                })
+                            });
+                            if let Some(s) = borrowed {
                                 string_builder.append_value(s);
                             } else {
                                 string_builder.append_null();

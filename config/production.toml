@@ -79,6 +79,8 @@ enable_object_store_atomic = true  # Enable for cloud storage
 cleanup_temp_on_startup = true
 
 [api]
+# Trust-only pgwire is not admitted with security enabled.
+enable_pgwire = false
 grpc_port = 5679
 rest_port = 5678
 max_request_size_mb = 256  # Higher limit for production

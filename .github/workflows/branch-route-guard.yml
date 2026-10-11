@@ -1,0 +1,66 @@
+name: Branch Route Guard
+
+# This workflow intentionally uses pull_request_target so the workflow body is
+# loaded from the trusted default branch, not from the pull request merge commit.
+# It must remain metadata-only: never check out, download, or execute PR content.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+# The guard reads only event metadata and needs no repository or token access.
+permissions: {}
+
+concurrency:
+  group: branch-route-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  branch-route-policy:
+    name: Branch Route Policy
+    runs-on: ubuntu-latest
+    env:
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Require topic -> develop -> qa -> main
+        shell: bash
+        run: |
+          # branch-route-policy:start
+          set -euo pipefail
+
+          fail() {
+            printf '::error::%s\n' "$1"
+            exit 1
+          }
+
+          if [[ -z "$BASE_REF" || -z "$HEAD_REF" || -z "$HEAD_REPOSITORY" || -z "$REPOSITORY" ]]; then
+            fail "branch-policy inputs must all be non-empty"
+          fi
+
+          case "$BASE_REF" in
+            develop)
+              case "$HEAD_REF" in
+                develop|qa|main)
+                  fail "ordinary pull requests targeting develop must use a topic branch (got reserved source '$HEAD_REF')"
+                  ;;
+              esac
+              ;;
+            qa)
+              if [[ "$HEAD_REF" != "develop" || "$HEAD_REPOSITORY" != "$REPOSITORY" ]]; then
+                fail "qa accepts only the exact same-repository develop -> qa promotion (got $HEAD_REPOSITORY:$HEAD_REF -> $BASE_REF)"
+              fi
+              ;;
+            main)
+              if [[ "$HEAD_REF" != "qa" || "$HEAD_REPOSITORY" != "$REPOSITORY" ]]; then
+                fail "main accepts only the exact same-repository qa -> main promotion (got $HEAD_REPOSITORY:$HEAD_REF -> $BASE_REF)"
+              fi
+              ;;
+            *)
+              fail "ordinary pull requests must target develop; only promotions may target qa or main (got base '$BASE_REF')"
+              ;;
+          esac
+
+          printf 'ok: allowed pull-request route %s:%s -> %s\n' "$HEAD_REPOSITORY" "$HEAD_REF" "$BASE_REF"
+          # branch-route-policy:end

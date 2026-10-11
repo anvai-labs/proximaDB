@@ -5,18 +5,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
-import sys
+import tomllib
 from argparse import Namespace
 from pathlib import Path
-
-# tomllib is stdlib 3.11+; the pyproject declares the tomli backport for
-# 3.10 (dev extra) — without this shim the module failed COLLECTION on the
-# 3.10 CI lane (ModuleNotFoundError), latent on develop because the Python
-# suite is path-filtered there and no proto/python-touching PR ran it.
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    import tomli as tomllib
 
 import pytest
 

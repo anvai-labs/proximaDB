@@ -724,6 +724,7 @@ impl MultiServerBuilder {
             self.grpc_builder = self.grpc_builder.enable_grpc(api_config.enable_grpc);
         }
 
+        let bind_interface = self.http_builder.bind_address.ip().to_string();
         let http_config = self
             .http_builder
             .build_with_validation()
@@ -741,14 +742,20 @@ impl MultiServerBuilder {
             http_config,
             grpc_config,
             arrow_ipc_config,
-            postgres_config: crate::network::multi_server::PostgresServerConfig::default(),
-            tls_config: crate::network::multi_server::TLSConfig::default(),
+            postgres_config: crate::network::multi_server::PostgresServerConfig {
+                enable_postgres: self.api_config.as_ref().is_none_or(|c| c.enable_pgwire),
+                ..Default::default()
+            },
+            tls_config: crate::network::multi_server::TLSConfig {
+                bind_interface: bind_interface.clone(),
+                ..Default::default()
+            },
             api_config: self.api_config.clone(),
             data_dir: self.data_dir.clone(),
             // Unified port mode defaults (Phase 14)
             unified_mode: self.api_config.as_ref().is_some_and(|c| c.unified_mode),
             unified_port: self.api_config.as_ref().map_or(5678, |c| c.unified_port),
-            unified_bind_address: "0.0.0.0".to_string(),
+            unified_bind_address: bind_interface,
             // Portless (UDS) transport is wired post-build in database.rs from
             // `[api].transport`/`socket_dir`; the builder always starts in TCP mode.
             uds_socket_dir: None,
@@ -827,6 +834,30 @@ impl MultiServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_bind_preserves_ipv6_loopback_and_pgwire_disable() {
+        let config = MultiServerBuilder::custom()
+            .http(|http| http.bind_address("[::1]:5678".parse::<SocketAddr>().unwrap()))
+            .with_api_config(crate::core::config::ApiConfig {
+                enable_pgwire: false,
+                unified_mode: true,
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+        for address in [
+            config.http_bind_address(),
+            config.grpc_bind_address(),
+            config.unified_bind_address(),
+        ] {
+            assert_eq!(
+                address.ip(),
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            );
+        }
+        assert!(!config.postgres_config.enable_postgres);
+    }
 
     #[test]
     fn test_http_server_builder() {

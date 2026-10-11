@@ -148,9 +148,24 @@ fn ids_from_search_body(body: &Value) -> Vec<String> {
 ///
 /// Tracked in `docs/10-quality/TECHNICAL_DEBT.adoc` TD-073 (per-collection
 /// AnnFilteringPolicy catalog plumbing). Unignore as part of that work.
+/// Runs on an explicit 8 MiB worker stack: the in-process server's
+/// record-ops → legacy → factory → SST-init await chain builds debug-mode
+/// async state machines deep enough to sit just under tokio's 2 MiB default
+/// worker stack (a 16-byte growth of `CollectionConfig` tipped it over —
+/// found by TD-PROTO-2's `embedding_config` field).
 #[ignore = "ADR-011 filtered-ANN recall is Beta in v0.2; see TD-073"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn filtered_ann_recall_across_selectivity_bands() {
+#[test]
+fn filtered_ann_recall_across_selectivity_bands() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("multi-thread test runtime")
+        .block_on(filtered_ann_recall_across_selectivity_bands_impl())
+}
+
+async fn filtered_ann_recall_across_selectivity_bands_impl() {
     let server = RecallBandsServer::start().await.expect("server start");
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -351,8 +366,20 @@ async fn filtered_ann_recall_across_selectivity_bands() {
 ///
 /// This is deliberately NOT `#[ignore]`d: the assertion depends only on `<top_k`
 /// match semantics + field presence, not on ADR-011 recall quality.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn filtered_search_under_top_k_surfaces_predicate_shortfall() {
+/// Same explicit 8 MiB worker stack as the recall test above — the shortfall
+/// assertions run the same deep in-process-server await chain.
+#[test]
+fn filtered_search_under_top_k_surfaces_predicate_shortfall() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("multi-thread test runtime")
+        .block_on(filtered_search_under_top_k_surfaces_predicate_shortfall_impl())
+}
+
+async fn filtered_search_under_top_k_surfaces_predicate_shortfall_impl() {
     let server = RecallBandsServer::start().await.expect("server start");
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))

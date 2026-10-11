@@ -1920,6 +1920,7 @@ impl FlightService for ProximaFlightService {
 
                 let config = crate::proto::proximadb_v1::CollectionConfig {
                     name: name.to_string(),
+                    embedding_config: None,
                     dimension,
                     distance_metric: Some(distance_metric_enum as i32),
                     storage_engine: Some(storage_engine as i32),

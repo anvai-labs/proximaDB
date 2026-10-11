@@ -13,6 +13,12 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
+if TYPE_CHECKING:
+    from ..models.graph_error_body import GraphErrorBody
+    from ..models.graph_response_metadata import GraphResponseMetadata
+    from ..models.graph_stats import GraphStats
+
+
 T = TypeVar("T", bound="GraphStatsResponse")
 
 
@@ -20,59 +26,88 @@ T = TypeVar("T", bound="GraphStatsResponse")
 class GraphStatsResponse:
     """
     Attributes:
-        node_count (int | Unset):
-        edge_count (int | Unset):
-        density (float | None | Unset):
+        success (bool):
+        data (GraphStats | Unset):
+        error (GraphErrorBody | Unset):
+        metadata (GraphResponseMetadata | Unset):
     """
 
-    node_count: int | Unset = UNSET
-    edge_count: int | Unset = UNSET
-    density: float | None | Unset = UNSET
+    success: bool
+    data: GraphStats | Unset = UNSET
+    error: GraphErrorBody | Unset = UNSET
+    metadata: GraphResponseMetadata | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        node_count = self.node_count
+        from ..models.graph_error_body import GraphErrorBody
+        from ..models.graph_response_metadata import GraphResponseMetadata
+        from ..models.graph_stats import GraphStats
 
-        edge_count = self.edge_count
+        success = self.success
 
-        density: float | None | Unset
-        if isinstance(self.density, Unset):
-            density = UNSET
-        else:
-            density = self.density
+        data: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.data, Unset):
+            data = self.data.to_dict()
+
+        error: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.error, Unset):
+            error = self.error.to_dict()
+
+        metadata: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metadata, Unset):
+            metadata = self.metadata.to_dict()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
-        if node_count is not UNSET:
-            field_dict["node_count"] = node_count
-        if edge_count is not UNSET:
-            field_dict["edge_count"] = edge_count
-        if density is not UNSET:
-            field_dict["density"] = density
+        field_dict.update(
+            {
+                "success": success,
+            }
+        )
+        if data is not UNSET:
+            field_dict["data"] = data
+        if error is not UNSET:
+            field_dict["error"] = error
+        if metadata is not UNSET:
+            field_dict["metadata"] = metadata
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_error_body import GraphErrorBody
+        from ..models.graph_response_metadata import GraphResponseMetadata
+        from ..models.graph_stats import GraphStats
+
         d = dict(src_dict)
-        node_count = d.pop("node_count", UNSET)
+        success = d.pop("success")
 
-        edge_count = d.pop("edge_count", UNSET)
+        _data = d.pop("data", UNSET)
+        data: GraphStats | Unset
+        if isinstance(_data, Unset):
+            data = UNSET
+        else:
+            data = GraphStats.from_dict(_data)
 
-        def _parse_density(data: object) -> float | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(float | None | Unset, data)
+        _error = d.pop("error", UNSET)
+        error: GraphErrorBody | Unset
+        if isinstance(_error, Unset):
+            error = UNSET
+        else:
+            error = GraphErrorBody.from_dict(_error)
 
-        density = _parse_density(d.pop("density", UNSET))
+        _metadata = d.pop("metadata", UNSET)
+        metadata: GraphResponseMetadata | Unset
+        if isinstance(_metadata, Unset):
+            metadata = UNSET
+        else:
+            metadata = GraphResponseMetadata.from_dict(_metadata)
 
         graph_stats_response = cls(
-            node_count=node_count,
-            edge_count=edge_count,
-            density=density,
+            success=success,
+            data=data,
+            error=error,
+            metadata=metadata,
         )
 
         graph_stats_response.additional_properties = d

@@ -263,6 +263,12 @@ impl From<&proximadb_proto::proximadb_v1::SqlValue> for MetadataValue {
             Some(Value::NullValue(_)) => MetadataValue::Null,
             Some(Value::ArrayValue(_)) => MetadataValue::String(Arc::from("[array]")),
             Some(Value::ObjectValue(_)) => MetadataValue::String(Arc::from("[object]")),
+            // TD-PROTO-2: MetadataValue feeds equality/comparison — a
+            // placeholder made structured comparisons always miss; decode
+            // to the canonical JSON text instead.
+            Some(Value::JsonbValue(b)) => MetadataValue::String(Arc::from(
+                crate::ProximaValue::jsonb_to_json_string_lossy(b),
+            )),
             None => MetadataValue::Null,
         }
     }

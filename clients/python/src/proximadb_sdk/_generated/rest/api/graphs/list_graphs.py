@@ -11,7 +11,8 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.list_graphs_response import ListGraphsResponse
+from ...models.graph_collection_list_response import GraphCollectionListResponse
+from ...models.graph_error_response import GraphErrorResponse
 from ...types import UNSET, Response, Unset
 
 
@@ -34,11 +35,16 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ListGraphsResponse | None:
+) -> GraphCollectionListResponse | GraphErrorResponse | None:
     if response.status_code == 200:
-        response_200 = ListGraphsResponse.from_dict(response.json())
+        response_200 = GraphCollectionListResponse.from_dict(response.json())
 
         return response_200
+
+    if response.status_code == 500:
+        response_500 = GraphErrorResponse.from_dict(response.json())
+
+        return response_500
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -48,7 +54,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ListGraphsResponse]:
+) -> Response[GraphCollectionListResponse | GraphErrorResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -61,7 +67,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[ListGraphsResponse]:
+) -> Response[GraphCollectionListResponse | GraphErrorResponse]:
     """List graph collections.
 
     Args:
@@ -72,7 +78,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ListGraphsResponse]
+        Response[GraphCollectionListResponse | GraphErrorResponse]
     """
 
     kwargs = _get_kwargs(
@@ -90,7 +96,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
-) -> ListGraphsResponse | None:
+) -> GraphCollectionListResponse | GraphErrorResponse | None:
     """List graph collections.
 
     Args:
@@ -101,7 +107,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ListGraphsResponse
+        GraphCollectionListResponse | GraphErrorResponse
     """
 
     return sync_detailed(
@@ -114,7 +120,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[ListGraphsResponse]:
+) -> Response[GraphCollectionListResponse | GraphErrorResponse]:
     """List graph collections.
 
     Args:
@@ -125,7 +131,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ListGraphsResponse]
+        Response[GraphCollectionListResponse | GraphErrorResponse]
     """
 
     kwargs = _get_kwargs(
@@ -141,7 +147,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
-) -> ListGraphsResponse | None:
+) -> GraphCollectionListResponse | GraphErrorResponse | None:
     """List graph collections.
 
     Args:
@@ -152,7 +158,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ListGraphsResponse
+        GraphCollectionListResponse | GraphErrorResponse
     """
 
     return (

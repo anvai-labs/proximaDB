@@ -14,8 +14,20 @@ set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# Reads [package].version STRUCTURALLY. The old form was
+# `grep '^version = ' Cargo.toml | head -1`, which slides down to
+# [workspace.package] when [package] has no version line -- so deleting
+# Cargo.toml's own version line left `get` reporting the workspace version and
+# `check` comparing it against itself, while cargo reported proximadb = 0.0.0.
+# Consequence, stated correctly (an earlier revision had the causality
+# backwards): release.yml does NOT pick the tag from `version-sync.sh get` -- it
+# derives VERSION from the pushed tag ref. `get` is consumed by prerelease-ci.yml,
+# which is the gate that would have reported 0.4.0 while cargo built 0.0.0.
 get_cargo_version() {
-  grep '^version = ' "$REPO_ROOT/Cargo.toml" | head -1 | sed 's/version = "\(.*\)"/\1/'
+  python3 -c 'import sys,tomllib
+with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
+v=(d.get("package") or {}).get("version")
+print(v if isinstance(v,str) else "")' "$REPO_ROOT/Cargo.toml" 2>/dev/null
 }
 
 extract_version_from_file() {
@@ -27,29 +39,207 @@ extract_version_from_file() {
     return
   fi
 
+  # Every extractor below returns a `<MISSING-...>` sentinel when the file is
+  # present but the field is absent, because an EMPTY return reads as `[SKIP]`
+  # and `[SKIP]` passes. That fail-open was found in NINE places — deleting the
+  # version from the root pyproject, the SDK pyproject, clients/rust/Cargo.toml,
+  # ui/package.json, either Chart.yaml key, either __init__.py, or the root
+  # [package] version all made `check` PASS. A deleted field is exactly as much
+  # a release defect as a wrong one. (A missing FILE still skips; that is
+  # deliberate, since not every checkout has every client.)
+  local out
   case "$type" in
+    # Structural, for the reason in get_cargo_version: a line-oriented
+    # `head -1` cannot tell [package].version from [workspace.package].version,
+    # and the root manifest has both. `version.workspace = true` (a member
+    # inheriting) is reported as a distinct sentinel rather than missing, since
+    # it is a legitimate shape that this gate simply does not own.
     cargo)
-      grep '^version = ' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/'
+      out=$(python3 -c 'import sys,tomllib
+with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
+v=(d.get("package") or {}).get("version")
+if isinstance(v,dict) and v.get("workspace") is True: print("<SKIP:inherits-workspace>")
+elif isinstance(v,str): print(v)
+else: print("")' "$file" 2>/dev/null || echo "<UNPARSEABLE-$file>")
       ;;
     pyproject)
-      grep '^version = ' "$file" | sed 's/.*"\(.*\)".*/\1/'
+      out=$(grep '^version = ' "$file" | sed 's/.*"\(.*\)".*/\1/')
       ;;
     python_init)
-      grep '__version__' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/'
+      out=$(grep '__version__' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/')
       ;;
+    # `tr -d '\r'` is load-bearing: `.*` captures to end of line, so on a CRLF
+    # file the value carried a trailing CR and a CORRECT version read as a
+    # mismatch against the expected one. (`set` normalises line endings, so it
+    # self-healed — but a false [FAIL] on an untouched tree is still a gate that
+    # cries wolf.)
     yaml_version)
-      grep '^version:' "$file" | sed 's/.*: *\(.*\)/\1/'
+      out=$(grep '^version:' "$file" | sed 's/.*: *\(.*\)/\1/' | tr -d '\r')
       ;;
     yaml_appversion)
-      grep '^appVersion:' "$file" | sed 's/.*"\(.*\)".*/\1/' | head -1
+      out=$(grep '^appVersion:' "$file" | sed 's/.*"\(.*\)".*/\1/' | head -1 | tr -d '\r')
       ;;
     package_json)
-      grep '"version"' "$file" | head -1 | sed 's/.*: *"\(.*\)".*/\1/'
+      # The TOP-LEVEL "version", read structurally. Must not be "the first
+      # `\"version\"` line": in a lockfile that is the top-level field, and if it
+      # is deleted the scan falls through to packages[""] and prints a confident
+      # [OK]. An earlier form anchored it to `^  "version"` — exactly two spaces
+      # — which made the gate depend on indentation: re-formatting the file to
+      # 4-space indent reported <MISSING> on a perfectly valid manifest, and
+      # `set` could not repair it because `set` rewrites it fine. Parsing the
+      # document has neither failure mode.
+      out=$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+v=d.get("version")
+print(v if isinstance(v,str) else "")' "$file" 2>/dev/null || echo "<UNPARSEABLE-$file>")
+      ;;
+    # `cargo` takes the FIRST `^version = ` line, which is [package]. The
+    # [workspace.package] version is further down the file and was therefore
+    # invisible to this gate — the reason a "0.4.0" release shipped 150 crates
+    # (and the server binary) still reporting 0.2.0.
+    # Parsed with tomllib, not a regex. A hand-rolled awk walk failed OPEN on
+    # four valid TOML spellings of the field it exists to watch — `[ workspace.
+    # package ]`, an indented `version`, a single-quoted value, and a DELETED
+    # version line (empty extraction reads as [SKIP], which does not fail) — and
+    # it leaked a later table's version when `[workspace.package]` had none,
+    # because the section flag was never reset at the next header.
+    cargo_workspace)
+      out=$(python3 -c 'import sys,tomllib
+with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
+v=d.get("workspace",{}).get("package",{}).get("version")
+print(v if v else "<MISSING-workspace.package.version>")' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>")
+      ;;
+    # M2: intra-workspace path dependencies carry an explicit version
+    # requirement that MUST track [workspace.package] — cargo fails with
+    # "failed to select a version for the requirement" otherwise, a hard build
+    # break the release gate was blind to. Reports the first mismatching pin so
+    # the comparison fails with a useful value.
+    cargo_path_dep_pins)
+      out=$(python3 -c 'import sys,tomllib
+with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
+pins={}
+def walk(tbl, prefix=""):
+    for name,spec in (tbl or {}).items():
+        if isinstance(spec,dict) and "path" in spec and "version" in spec:
+            pins[prefix+name]=spec["version"]
+for table in ("dependencies","dev-dependencies","build-dependencies"):
+    walk(d.get(table))
+# `set` rewrites every `version = "X", path =` line file-wide, and the root
+# manifest keeps its ~107 intra-workspace path deps HERE, under
+# [workspace.dependencies] -- the table this walk originally skipped, which is
+# where such pins most naturally live.
+walk((d.get("workspace") or {}).get("dependencies"), prefix="workspace.")
+# `set` rewrites every `version = "X", path =` line in the file, so a pin under
+# [target.(cfg).dependencies] is written but was not read here. The root manifest
+# already has a target table for macos/aarch64, so this was one line from live.
+for cfg,tbl in (d.get("target") or {}).items():
+    for table in ("dependencies","dev-dependencies","build-dependencies"):
+        walk(tbl.get(table), prefix=f"target.{cfg}.")
+vals=set(pins.values())
+if not pins: print("<NO-PATH-DEP-PINS>")
+elif len(vals)==1: print(next(iter(vals)))
+else: print("<MIXED:"+",".join(f"{k}={v}" for k,v in sorted(pins.items()))+">")' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>")
+      ;;
+    # M2: the `embedded` extra pins the wheel this release builds. Its own upper
+    # bound once excluded that wheel, making `pip install proximadb[embedded]`
+    # unsatisfiable. Reports the LOWER bound so a stale pin fails.
+    python_extra_lower_bound)
+      out=$(python3 -c 'import re,sys
+def key(v): return tuple(int(x) for x in re.findall(r"\d+", v))
+s=open(sys.argv[1]).read()
+m=re.search(r"proximadb_embedded>=([0-9][^,\"]*),<([0-9][^,\"]*)", s)
+# The int-tuple key cannot order a PEP 440 prerelease against its release
+# (0.4.0-beta.1 vs 0.4.0 both key to (0,4,0,1) vs (0,4,0)), so emptiness is only
+# claimed when BOTH bounds are plain releases. That keeps the one direction that
+# matters -- never a FALSE failure on a non-empty range -- at the cost of missing
+# an empty range that straddles a prerelease, which `set` cannot produce anyway.
+plain=lambda v: re.fullmatch(r"\d+(\.\d+)*", v) is not None
+if not m: print("<NO-EMBEDDED-EXTRA-BOUND>")
+elif plain(m.group(1)) and plain(m.group(2)) and key(m.group(1)) >= key(m.group(2)):
+    # The one defect this step exists to prevent: an upper bound at or below the
+    # lower bound is an EMPTY set, so `pip install proximadb[embedded]` is
+    # unsatisfiable. Reporting only the lower bound could never see it.
+    print(f"<EMPTY-EXTRA-RANGE:>={m.group(1)},<{m.group(2)}>")
+else: print(m.group(1))' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>")
+      ;;
+    # A package-lock.json records the package's own version TWICE: top-level and
+    # packages[""]. `package_json` above only sees the first, so the second could
+    # drift unnoticed — which is half of what `set` writes.
+    # The `|| echo` is load-bearing, not decoration: without it a non-zero python
+    # exit propagates out of the command substitution and `set -e` terminates
+    # `check` with an EMPTY stderr, mid-list, before the remaining entries run —
+    # so the gate dies with no diagnostics on exactly the field it was added to
+    # watch. Verified by deleting `packages[""]["version"]`.
+    # F1: the lockfile was outside the gate entirely, so `set` produced a tree
+    # that `check` PASSED and `cargo metadata --locked` (ci.yml, merge-blocking)
+    # REJECTED -- the gate's own remediation message handed you a red PR. Reports
+    # every in-workspace `proximadb*` package version, so a stale lock fails.
+    cargo_lock_members)
+      out=$(python3 -c 'import sys,tomllib
+with open(sys.argv[1],"rb") as fh: d=tomllib.load(fh)
+vals={}
+for pkg in d.get("package") or []:
+    name=pkg.get("name","")
+    # In-workspace members have no `source`; a registry crate that merely starts
+    # with "proximadb" would otherwise be swept in and compared.
+    if name.startswith("proximadb") and "source" not in pkg:
+        vals.setdefault(pkg.get("version",""), []).append(name)
+if not vals: print("<NO-WORKSPACE-PACKAGES-IN-LOCK>")
+elif len(vals)==1: print(next(iter(vals)))
+else: print("<MIXED-LOCK:"+",".join(f"{v}={len(n)} crate(s)" for v,n in sorted(vals.items()))+">")' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>")
+      ;;
+    # F9: a maven client manifest. Was stale at 0.2.0 and invisible, while the
+    # script's header claimed "all version strings across the codebase".
+    #
+    # XML-STRUCTURAL, and it has to be. A positional read ("the first <version>
+    # after </parent>") is WRONG, not merely fragile: <project>'s children are an
+    # xs:all, so a project that declares <version> after <dependencies> makes the
+    # first post-parent <version> a DEPENDENCY's. Reproduced on a parent+deps pom:
+    # the positional form reported the junit-jupiter version, and `set` rewrote
+    # that dependency while `check` then printed [OK] over the corruption. That is
+    # confident-wrong, which is worse than the fail-opens this gate was written
+    # for. Reads /project/version only.
+    maven_pom)
+      out=$(python3 -c 'import sys,xml.etree.ElementTree as ET
+try: root=ET.parse(sys.argv[1]).getroot()
+except Exception as exc: print(f"<UNPARSEABLE-pom:{exc}>"); raise SystemExit(0)
+tag=root.tag
+ns=tag[:tag.index("}")+1] if tag.startswith("{") else ""
+if tag != ns+"project": print("<NOT-A-POM>"); raise SystemExit(0)
+# A direct child only: find() on the root never descends into <dependencies>.
+el=root.find(ns+"version")
+has_parent=root.find(ns+"parent") is not None
+if el is not None and (el.text or "").strip():
+    print(el.text.strip())
+elif el is None and has_parent:
+    # The ONLY legitimate absence: inherited from <parent>. Not this gate'"'"'s to own.
+    print("<SKIP:pom-inherits-parent>")
+else:
+    # No version AND no parent is an invalid Maven project; a present-but-empty
+    # <version> is invalid too. An earlier revision printed the SKIP sentinel
+    # without ever looking for <parent>, so deleting this pom'"'"'s version line made
+    # `check` PASS while reporting a reason that was false of the file -- the
+    # tenth instance of the fail-open class the comment above says was closed.
+    print("<MISSING-project-version-in-pom>")' "$file" 2>/dev/null || echo "<UNPARSEABLE-$file>")
+      ;;
+    package_lock_own)
+      out=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packages"][""]["version"])' "$file" 2>/dev/null \
+        || echo "<UNPARSEABLE-$file>")
       ;;
     *)
       echo ""
+      return
       ;;
   esac
+  if [ -z "$out" ]; then
+    echo "<MISSING-$type-in-$file>"
+  else
+    echo "$out"
+  fi
 }
 
 cmd_get() {
@@ -58,20 +248,38 @@ cmd_get() {
 
 cmd_check() {
   local expected
-  expected=$(get_cargo_version)
+  # `set -e` + a command substitution that exits non-zero killed `check` with
+  # NO output at all -- not even its own header -- on an unparseable root
+  # Cargo.toml. Fails closed, but a red step with an empty log on the one file
+  # that matters. Same guard the lock extractor already carries.
+  expected=$(get_cargo_version || true)
+  if [ -z "$expected" ]; then
+    echo "Error: could not read [package].version from Cargo.toml." >&2
+    echo "       Either it is absent, it is \`version.workspace = true\`, or the" >&2
+    echo "       manifest does not parse as TOML. Nothing was checked." >&2
+    exit 1
+  fi
   echo "Checking all version files match: $expected"
   echo ""
 
   local failed=0
   local actual
   local file
+  local reason
 
   # Define files to check: file_path:type
   declare -a files=(
     "Cargo.toml:cargo"
+    "Cargo.toml:cargo_workspace"
     "pyproject.toml:pyproject"
     "clients/python/pyproject.toml:pyproject"
-    "clients/python-embedded/pyproject.toml:pyproject"
+    # NOT clients/python-embedded/pyproject.toml: it carries no version by
+    # design. #1675 made it non-buildable (the canonical proximadb_embedded
+    # wheel builds from the REPO-ROOT pyproject.toml via maturin manifest-path),
+    # so it holds only dev-tool config. `check` reported it as [SKIP], which was
+    # correct but read like a gap; `set` ran a no-op substitution against it and
+    # printed "[SET] ... -> <version>", which was a false claim. The version that
+    # ships for that package is the root pyproject.toml's, already checked above.
     "clients/python/src/proximadb_sdk/__init__.py:python_init"
     "clients/python-embedded/src/proximadb_embedded/__init__.py:python_init"
     "clients/rust/Cargo.toml:cargo"
@@ -79,6 +287,37 @@ cmd_check() {
     "deploy/helm/proximadb/Chart.yaml:yaml_appversion"
     "ui/package.json:package_json"
     "clients/nodejs-embedded/package.json:package_json"
+    # The npm lockfiles record the package's OWN version (top-level and
+    # packages[""]), and `npm ci` hard-fails when it disagrees with
+    # package.json: "npm error `npm ci` can only install packages when your
+    # package.json and package-lock.json are in sync". `set` used to bump only
+    # package.json, so a release left the Admin UI build broken. The
+    # `package_json` extractor reads the FIRST "version" key, which in a lockfile
+    # is the package's own, so it works unchanged here.
+    "ui/package-lock.json:package_json"
+    "ui/package-lock.json:package_lock_own"
+    "clients/nodejs-embedded/package-lock.json:package_json"
+    "clients/nodejs-embedded/package-lock.json:package_lock_own"
+    "Cargo.toml:cargo_path_dep_pins"
+    "clients/python/pyproject.toml:python_extra_lower_bound"
+    # `cargo metadata --locked` runs on every PR (ci.yml) and rejects a lock that
+    # disagrees with the manifests, so the lock is part of the release contract.
+    "Cargo.lock:cargo_lock_members"
+    # F9: these two were stale at 0.2.0 and unwatched. python-queue-embedded is a
+    # maturin-built [project] WITH a version (unlike python-embedded, which has
+    # none by design and is excluded above with its reason).
+    #
+    # DELIBERATELY NOT HERE: deploy/infrastructure/helm/proximadb/{Chart,values}.yaml
+    # and the three terraform helm-values `image.tag` pins, all still at 0.2.0.
+    # That chart cannot render -- its template `include`s
+    # "proximadb.imageConfiguration", which is defined nowhere in the repo -- so
+    # adding it would make this gate pass over something that deploys nothing,
+    # and five plausible diffs would hide that. The canonical chart
+    # (deploy/helm/proximadb) needs no per-release edit anyway: `tag: ""` plus
+    # `default .Chart.AppVersion`, and its Chart.yaml IS in the list above.
+    # Filed as TD-HELMDUP-1.
+    "clients/python-queue-embedded/pyproject.toml:pyproject"
+    "clients/java-embedded/pom.xml:maven_pom"
   )
 
   for entry in "${files[@]}"; do
@@ -87,7 +326,43 @@ cmd_check() {
 
     actual=$(extract_version_from_file "$REPO_ROOT/$file" "$type")
 
-    if [ -z "$actual" ]; then
+    # A `<...>` sentinel means the extractor ran and found the field missing or
+    # malformed. That is a FAILURE, not a skip: an empty extraction reading as
+    # [SKIP] is how a deleted [workspace.package] version passed this gate.
+    # A `<SKIP:reason>` sentinel means the extractor ran and found a shape this
+    # gate deliberately does not own -- a crate inheriting `version.workspace =
+    # true`, or a pom inheriting from <parent>. Treating those as FAIL made the
+    # gate reject the idiomatic spelling used by 151 of 152 workspace members,
+    # with `set` unable to repair it (it exits 0 and changes nothing), so `check`
+    # stayed red forever. The value is already covered by the corresponding
+    # workspace/parent entry. Any OTHER `<...>` is still a hard failure.
+    # Only the two extractors that can legitimately report an inherited version
+    # may yield a SKIP. Honouring the sentinel for any type made the VALUE
+    # channel carry control information, so a literal `"version": "<SKIP:x>"` in
+    # a manifest passed the gate. Now that is a `<...>` like any other: a FAIL.
+    # The reason must be one of the two literals the extractors emit. Narrowing
+    # to the two whitelisted TYPES was not enough: the value channel still
+    # carried control information, so `version = "<SKIP:anything>"` in
+    # clients/rust/Cargo.toml (valid TOML) or `<version>&lt;SKIP:x&gt;</version>`
+    # in the pom (valid XML) still passed the gate.
+    #
+    # This narrows that channel but does not close it: a manifest whose version
+    # is literally `<SKIP:inherits-workspace>` (cargo) or
+    # `<SKIP:pom-inherits-parent>` (maven_pom) still skips. Both near misses are
+    # rejected -- any other reason text, and the right literal under the wrong
+    # extractor -- so what remains is one exact string per type. Left as is
+    # deliberately: cargo and maven both reject a non-semver version downstream,
+    # no tool emits the shape, and closing it means touching the extractors,
+    # which is where five successive hardening rounds each introduced a
+    # regression. Fix it with the deferred work, not alongside a release bump.
+    if { [ "$actual" = "<SKIP:inherits-workspace>" ] && [ "$type" = "cargo" ]; } \
+       || { [ "$actual" = "<SKIP:pom-inherits-parent>" ] && [ "$type" = "maven_pom" ]; }; then
+      reason="${actual#<SKIP:}"
+      echo "  [SKIP] $file ($type): ${reason%>}"
+    elif [ "${actual#<}" != "$actual" ]; then
+      echo "  [FAIL] $file ($type): $actual"
+      ((failed++)) || true
+    elif [ -z "$actual" ]; then
       echo "  [SKIP] $file (file not found or no version extracted)"
     elif [ "$actual" != "$expected" ]; then
       echo "  [FAIL] $file: found $actual, expected $expected"
@@ -120,90 +395,592 @@ cmd_set() {
   echo ""
 
   # Use perl for cross-platform compatibility (supports -i)
-  if command -v perl >/dev/null 2>&1; then
-    # 1. Cargo.toml (root, first occurrence only)
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/ if 1..m/^version = / && /^version = /' "$REPO_ROOT/Cargo.toml"
-    echo "  [SET]  Cargo.toml -> $version"
+  # perl and python3 are REQUIRED, checked before any write.
+  #
+  # There used to be a `sed` fallback here. It was a second, divergent
+  # implementation of the same substitutions: it still patched
+  # clients/python-embedded/pyproject.toml (which has no version), never touched
+  # the npm lockfiles, and finished by printing "[SET] All files updated" — a
+  # blanket false success, the very category of defect this script was being
+  # fixed for. #1675 recorded the same lesson about two configs with one
+  # correct. Requiring the tools is strictly safer than maintaining a path
+  # nobody exercises; perl ships with macOS and every CI image we use.
+  local missing=""
+  command -v perl >/dev/null 2>&1 || missing="$missing perl"
+  command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+  # cargo too: the Cargo.lock refresh is the LAST step, so an absent cargo used
+  # to be discovered after every manifest was already bumped -- and that step
+  # now exits 1, so the tree was left inconsistent. It is as pre-flightable as
+  # the other two.
+  command -v cargo >/dev/null 2>&1 || missing="$missing cargo"
+  if [ -n "$missing" ]; then
+    echo "Error: version-sync.sh set requires:$missing" >&2
+    echo "       Nothing was modified." >&2
+    exit 1
+  fi
 
-    # 2. pyproject.toml (root)
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/pyproject.toml"
-    echo "  [SET]  pyproject.toml -> $version"
+  # Pre-flight every ASSERTING step's precondition before the first write.
+  # Tool presence alone was not enough: steps 2, 3 and 5 abort on a shape they
+  # cannot edit, and they run AFTER step 1's perl has already written. Removing
+  # [workspace.package] from Cargo.toml left root [package] bumped and the rest
+  # of the tree behind, with a message ("no [workspace.package] table — not
+  # modified") that was true of the one edit and false of the tree.
+  python3 - "$REPO_ROOT" <<'PYEOF' || exit 1
+import os
+import re
+import sys
 
-    # 3. clients/python/pyproject.toml
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
-    echo "  [SET]  clients/python/pyproject.toml -> $version"
+root = sys.argv[1]
+problems = []
 
-    # 4. clients/python-embedded/pyproject.toml
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/pyproject.toml"
-    echo "  [SET]  clients/python-embedded/pyproject.toml -> $version"
+cargo = os.path.join(root, "Cargo.toml")
+if os.path.isfile(cargo):
+    text = open(cargo).read()
+    m = re.search(r"^\[workspace\.package\]\s*$", text, re.M)
+    if not m:
+        problems.append("Cargo.toml: no [workspace.package] table")
+    else:
+        start = m.end()
+        nxt = re.search(r"^\[", text[start:], re.M)
+        end = start + (nxt.start() if nxt else len(text) - start)
+        # The EXACT regex step 2's writer uses, with its count, against the same
+        # table slice. Probing only for an OPENING quote was a parallel
+        # predicate and it diverged: `version = """0.2.0"""` is valid TOML
+        # (tomllib reads 0.2.0, so `check` reports a clean mismatch) and matched
+        # the probe, but the writer needs a MATCHED single-line pair -- its
+        # substitution then produced `version = "0.4.0""0.2.0"""`, invalid
+        # TOML, with n == 1 so no abort and a FALSE [SET] printed. `set` went on
+        # to bump 13 more files over an unparseable root manifest and failed at
+        # the end blaming the lock refresh, leaving the gate permanently red and
+        # `set` permanently unable to repair it.
+        # NO trailing `\s*$`: the writer's regex has none, and adding it made
+        # the pre-flight refuse a shape the writer handles perfectly --
+        # `version = "0.2.0"  # comment` is one single-line matched-delimiter
+        # entry, the writer rewrites it correctly, and the pre-flight rejected it
+        # with a message that was false of the file.
+        if len(re.findall(
+            r'(?m)^(\s*version\s*=\s*)["\'][^"\']*["\']', text[start:end]
+        )) != 1:
+            problems.append(
+                "Cargo.toml: [workspace.package] needs exactly one single-line "
+                "version = \"x.y.z\" entry with matched quote delimiters for `set` "
+                "to rewrite"
+            )
+    # A pin whose requirement is not a bare x.y.z (e.g. "0.4" or "^0.4.0") is
+    # READ by check and SKIPPED by set's regex, so set would report success and
+    # leave check failing forever. Refuse up front instead.
+    # `set`'s writers match only SINGLE-LINE inline tables. A dep spelled as a
+    # sub-table ([workspace.dependencies.foo] with version/path on their own
+    # lines) is READ by check's tomllib walk and never written -- `set` exits 0,
+    # changes nothing, and check stays red forever. Same shape as the defect the
+    # pre-flight exists for, through the one spelling it did not scan.
+    try:
+        import tomllib
 
-    # 5. clients/python/src/proximadb_sdk/__init__.py
-    perl -i -pe 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python/src/proximadb_sdk/__init__.py"
-    echo "  [SET]  clients/python/src/proximadb_sdk/__init__.py -> $version"
+        with open(cargo, "rb") as fh:
+            doc = tomllib.load(fh)
+    except Exception:
+        doc = {}
 
-    # 6. clients/python-embedded/src/proximadb_embedded/__init__.py
-    perl -i -pe 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/src/proximadb_embedded/__init__.py"
-    echo "  [SET]  clients/python-embedded/src/proximadb_embedded/__init__.py -> $version"
+    def subtable_pins(tbl, prefix=""):
+        for name, spec in (tbl or {}).items():
+            if not isinstance(spec, dict) or "path" not in spec or "version" not in spec:
+                continue
+            # Is it written inline on one line? If so `set` handles it.
+            inline = re.search(
+                r"^\s*" + re.escape(name) + r"\s*=\s*\{[^{}\n]*\}\s*$", text, re.M
+            )
+            if not inline:
+                yield prefix + name, spec["version"]
 
-    # 7. clients/rust/Cargo.toml (first occurrence only)
-    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/ if 1..m/^version = / && /^version = /' "$REPO_ROOT/clients/rust/Cargo.toml"
-    echo "  [SET]  clients/rust/Cargo.toml -> $version"
+    for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+        for name, ver in subtable_pins(doc.get(table)):
+            problems.append(
+                f"Cargo.toml: path dep {name!r} is spelled as a sub-table, which "
+                "`set` cannot rewrite (use a single-line inline table)"
+            )
+    for name, ver in subtable_pins((doc.get("workspace") or {}).get("dependencies"),
+                                   prefix="workspace."):
+        problems.append(
+            f"Cargo.toml: path dep {name!r} is spelled as a sub-table, which "
+            "`set` cannot rewrite (use a single-line inline table)"
+        )
 
-    # 8+9. deploy/helm/proximadb/Chart.yaml
-    perl -i -pe 's/^version: .*/version: '"$version"'/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
-    perl -i -pe 's/^appVersion: .*/appVersion: "'"$version"'"/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
-    echo "  [SET]  deploy/helm/proximadb/Chart.yaml -> $version"
+    # HIGH 5: step 1's writer is "the first `^version = ` line", which slides
+    # down to [workspace.package] when [package] has no version -- so `set`
+    # printed "[SET] Cargo.toml [package]" while retargeting the workspace
+    # table. The READERS were made structural in round 5; this refuses the shape
+    # the writer still cannot address.
+    # Must be a literal STRING. `version.workspace = true` parses to the dict
+    # {"workspace": True}, which is TRUTHY -- so an earlier revision let it past,
+    # and step 1's perl then retargeted [workspace.package] while printing
+    # "[SET] Cargo.toml [package]", with `set` exiting 0 and `get` returning
+    # empty. That false [SET] is the exact defect the pre-flight was added to
+    # refuse.
+    if not isinstance((doc.get("package") or {}).get("version"), str):
+        problems.append(
+            "Cargo.toml: [package] has no literal version string (a "
+            "`version.workspace = true` root package is not supported here), so "
+            "`set` would mis-target [workspace.package] while reporting [package]"
+        )
 
-    # 10. ui/package.json (first version field)
-    perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if $. <= 10 && /"version"/' "$REPO_ROOT/ui/package.json"
-    echo "  [SET]  ui/package.json -> $version"
+    for pin in re.finditer(r"\{[^{}\n]*path\s*=[^{}\n]*\}", text):
+        body = pin.group(0)
+        v = re.search(r'version\s*=\s*["\']([^"\']*)["\']', body)
+        if v and not re.fullmatch(r"\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?", v.group(1)):
+            problems.append(
+                f"Cargo.toml: path-dep pin version {v.group(1)!r} is not a bare "
+                "x.y.z, so `set` cannot rewrite it (spell it x.y.z)"
+            )
 
-    # 11. clients/nodejs-embedded/package.json (first version field)
-    perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if $. <= 10 && /"version"/' "$REPO_ROOT/clients/nodejs-embedded/package.json"
-    echo "  [SET]  clients/nodejs-embedded/package.json -> $version"
-  else
-    # Fallback: use gsed if available (macOS coreutils)
-    if command -v gsed >/dev/null 2>&1; then
-      local SED="gsed"
+# NOTE: the embedded-extra bound and the pom are pre-flighted by DRY-RUNNING
+# their real editors (EXTRA_EDIT_PY / POM_EDIT_PY below), not by a parallel
+# predicate here -- an earlier revision tried that for the extra and the two
+# still diverged on the TOML string delimiter, which is the whole reason the
+# lockfile editor is a single mode=check/mode=write program.
+
+if problems:
+    for pr in problems:
+        print(f"Error: {pr}", file=sys.stderr)
+    print("       Nothing was modified.", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+  # ONE implementation of the embedded-extra bound rewrite, run twice:
+  # mode=check as a dry run during pre-flight, mode=write for real. An earlier
+  # revision pre-flighted it with a PARALLEL regex and the two still diverged:
+  # the pre-flight let a single quote terminate the match while the writer
+  # required double quotes, so a literal single-quoted TOML string (valid, and
+  # `check` printed [OK] for it) passed the pre-flight and then aborted the
+  # writer with three files already bumped.
+  local EXTRA_EDIT_PY
+  EXTRA_EDIT_PY=$(cat <<'PYEOF'
+import re
+import sys
+
+path, version, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+# `[\d.]+` could not match a PRERELEASE lower bound, so once `set 0.4.1-beta.1`
+# wrote ">=0.4.1-beta.1,<0.5.0" no later `set` could repair it: perl matched
+# nothing, wrote nothing, and the caller's echo still claimed success. At 0.5.0
+# that bound excludes the very wheel the release builds -- the defect this step
+# exists to prevent, made permanent. Match any bound, and ASSERT the rewrite
+# applied rather than trusting it.
+base = version.split("-", 1)[0]
+major, minor, _ = base.split(".")
+upper = f"{major}.{int(minor) + 1}.0"
+with open(path, encoding="utf-8", newline="") as fh:
+    text = fh.read()
+# Accept EITHER TOML string delimiter. A literal single-quoted string is valid
+# TOML and `check` reads it happily, so refusing to WRITE it was a half-bumped
+# tree waiting to happen. The backreference pins the closing delimiter to the
+# opening one, so a mixed pair cannot match.
+pattern = re.compile(r"([\"'])proximadb_embedded>=[^,\"']+,<[^\"']+\1")
+new, n = pattern.subn(
+    lambda m: m.group(1) + f"proximadb_embedded>={version},<{upper}" + m.group(1), text
+)
+if n != 1:
+    sys.exit(
+        f"{path}: expected exactly 1 proximadb_embedded bound to rewrite, found {n} "
+        "-- not modified"
+    )
+if mode == "write":
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(new)
+PYEOF
+)
+
+  # ONE implementation of the pom edit, run twice: mode=check as a dry run
+  # during pre-flight, mode=write for real. It shipped as an inline writer
+  # with NO pre-flight, so a pom the READER accepts or skips but the WRITER
+  # refuses aborted `set` with ten files already bumped.
+  local POM_EDIT_PY
+  POM_EDIT_PY=$(cat <<'PYEOF'
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+path, version, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+# newline="" on BOTH read and write: default text mode translates CRLF to LF
+# throughout, so a CRLF pom had all of its lines rewritten -- contradicting this
+# writer's own "keeps formatting intact". The lockfile editor in the same script
+# already does this; the pom writer did not inherit it.
+try:
+    with open(path, encoding="utf-8", newline="") as fh:
+        src = fh.read()
+except UnicodeDecodeError as exc:
+    # A pom may legally declare a non-UTF-8 encoding, and ET.parse honours that
+    # declaration -- so `check` reads such a file fine while this read threw a
+    # raw traceback out of the pre-flight.
+    sys.exit(f"{path}: not readable as UTF-8 ({exc}); this writer edits only "
+             "UTF-8 poms — not modified")
+
+# Locate /project/version by DEPTH, not by position relative to </parent>.
+# <project>'s children are an xs:all, so a project declaring <version> after
+# <dependencies> makes the first post-parent <version> a DEPENDENCY's -- an
+# earlier revision of this writer did exactly that and rewrote junit-jupiter's
+# version while `check` reported [OK] over it. Editing a span of the original
+# text (rather than ET.write) keeps comments, entities and formatting intact.
+depth = 0
+span = None
+# Attribute values may contain `>` -- AttValue forbids only `<` and `&` -- so a
+# naive `[^>]*?>` terminates inside `cond="a>b"` and never sees the real `/>`,
+# leaving a permanent +1 depth drift that made the writer refuse a valid pom.
+# Consume quoted attribute values explicitly instead.
+TAG = re.compile(
+    r"<\?.*?\?>"                                   # processing instruction
+    r"|<!--.*?-->"                                  # comment
+    r"|<!\[CDATA\[.*?\]\]>"                        # CDATA
+    r"|<!.*?>"                                      # doctype
+    r"|</([A-Za-z_][\w.:-]*)\s*>"                   # end tag        -> group 1
+    r"|<([A-Za-z_][\w.:-]*)"                        # start tag name -> group 2
+    r"((?:\s+[\w.:-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'))*)"  # attributes (quoted)
+    r"\s*(/?)>",                                    # self-close     -> group 4
+    re.S,
+)
+for m in TAG.finditer(src):
+    end_name, start_name, selfclose = m.group(1), m.group(2), m.group(4)
+    if end_name is not None:
+        depth -= 1
+        continue
+    if start_name is None:    # PI, comment, CDATA or doctype
+        continue
+    if selfclose == "/":
+        continue
+    depth += 1
+    # depth 1 == <project>; depth 2 == its direct children.
+    if depth == 2 and start_name.split(":")[-1] == "version":
+        close = src.find("</", m.end())
+        if close != -1:
+            span = (m.end(), close)
+        break
+
+if span is None:
+    # Agree with the READER: a pom with a real <parent> and no own <version>
+    # legitimately inherits it, and `check` reports [SKIP] for exactly that
+    # shape. An earlier revision made the writer refuse, so the gate said "run
+    # `set`" and `set` then declined to bump ANYTHING -- the reader-writer
+    # dead-end this script documents elsewhere.
+    try:
+        import xml.etree.ElementTree as _ET
+
+        _root = _ET.fromstring(src)
+        _ns = _root.tag[: _root.tag.index("}") + 1] if _root.tag.startswith("{") else ""
+        if _root.find(_ns + "parent") is not None:
+            if mode == "write":
+                print("  [SKIP] clients/java-embedded/pom.xml: version inherited from <parent>")
+            raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    sys.exit(f"{path}: no /project/version element and no <parent> — not modified")
+
+staged = src[:span[0]] + version + src[span[1]:]
+
+# Stage, verify by PARSING, then replace. The verify is namespace-aware and
+# checks the project version specifically, so an edit that landed on the wrong
+# element cannot pass -- which is the failure the previous revision had.
+tmp = path + ".version-sync.tmp"
+try:
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(staged)
+    try:
+        root = ET.parse(tmp).getroot()
+    except ET.ParseError as exc:
+        # Every other failure here is a `sys.exit(msg)`; an invalid-XML pom used
+        # to escape as a raw traceback from the PRE-FLIGHT, which is the mirror
+        # image of the zero-output diagnostics defect fixed for `check`.
+        sys.exit(f"{path}: staged edit is not valid XML ({exc}) — not modified")
+    ns = root.tag[: root.tag.index("}") + 1] if root.tag.startswith("{") else ""
+    el = root.find(ns + "version")
+    if el is None or (el.text or "").strip() != version:
+        sys.exit(f"{path}: staged edit did not land on /project/version — not modified")
+    with open(tmp, encoding="utf-8", newline="") as fh:
+        back = fh.read()
+    # And nothing else moved -- compared against the ORIGINAL BYTES ON DISK.
+    # Two earlier forms of this guard were both dead code: comparing lengths is
+    # tautological for `staged = src[:a] + version + src[b:]`, and so is
+    # comparing the staged text against the in-memory `src` it was built from.
+    # Proven by mutation: with either form, dropping `newline=""` from the source
+    # read stripped all 147 CRs from a CRLF pom and the guard did not fire. Only
+    # a byte comparison against the file as it was read can detect that, because
+    # newline translation happens at read time.
+    # `span` comes from a regex over the DECODED text, so lo/hi are CHARACTER
+    # offsets. An earlier revision sliced the raw bytes with them, which
+    # desynchronises by one position per extra UTF-8 byte before the span: a
+    # single non-ASCII character (or a BOM) anywhere above /project/version made
+    # this guard fire on a file where nothing was wrong, and `set` then refused
+    # the WHOLE tree with a message false of the file. Converting through the
+    # same decoding fixes that and still catches read-time newline translation,
+    # because that makes `src` disagree with the bytes on disk.
+    lo, hi = span
+    raw_before = open(path, "rb").read()
+    lo_b = len(src[:lo].encode("utf-8"))
+    hi_b = len(src[:hi].encode("utf-8"))
+    want = raw_before[:lo_b] + version.encode("utf-8") + raw_before[hi_b:]
+    if back.encode("utf-8") != want:
+        sys.exit(f"{path}: bytes outside the version span changed — not modified")
+    if mode == "write":
+        os.replace(tmp, path)
+        # Printed by the writer, not by the caller: an unconditional echo in the
+        # shell printed "[SET] ... -> <version>" two lines after this program's
+        # own [SKIP] on an inheriting pom, which is a false claim of the exact
+        # kind this script's other comments cite twice.
+        print(f"  [SET]  clients/java-embedded/pom.xml -> {version}")
+    else:
+        os.unlink(tmp)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
+PYEOF
+)
+  # ONE implementation of the npm-lockfile edit, run twice: mode=check as a dry
+  # run during pre-flight, mode=write for real. Previously the pre-flight was a
+  # SECOND, slightly different line scan, and a lockfile whose first `packages`
+  # entry is a workspace rather than "" (valid npm-workspaces shape, hand-ordered)
+  # satisfied the pre-flight and then mis-targeted in the writer -- leaving eleven
+  # files bumped and the lock untouched, which is the half-bumped tree the
+  # pre-flight exists to prevent. A dry run of the real thing cannot disagree
+  # with the real thing.
+  local LOCK_EDIT_PY
+  LOCK_EDIT_PY=$(cat <<'PYEOF'
+import json
+import os
+import re
+import sys
+
+path, version, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as fh:
+        doc = json.load(fh)
+except (OSError, json.JSONDecodeError) as exc:
+    sys.exit(f"{path}: not readable as JSON ({exc})")
+if "version" not in doc:
+    sys.exit(f'{path}: no top-level "version" key')
+if "version" not in doc.get("packages", {}).get("", {}):
+    sys.exit(f'{path}: no packages[""]["version"] key (lockfileVersion 1?)')
+
+old_top = doc["version"]
+old_own = doc["packages"][""]["version"]
+
+# Edit by line so indentation and key order survive byte-for-byte, but take the
+# TARGETS from the parsed document rather than from position. newline="" on BOTH
+# read and write: text mode would translate CRLF to LF throughout, rewriting
+# every line of a CRLF lockfile and contradicting the byte-faithful intent.
+with open(path, newline="") as fh:
+    lines = fh.readlines()
+
+done_top = done_own = False
+for i, line in enumerate(lines):
+    if '"node_modules/' in line:
+        break
+    if not done_top and re.fullmatch(
+        r'\s*"version":\s*"' + re.escape(old_top) + r'",?\s*[\r\n]*', line
+    ):
+        lines[i] = line.replace(f'"{old_top}"', f'"{version}"', 1)
+        done_top = True
+        continue
+    if done_top and not done_own and re.fullmatch(
+        r'\s*"version":\s*"' + re.escape(old_own) + r'",?\s*[\r\n]*', line
+    ):
+        lines[i] = line.replace(f'"{old_own}"', f'"{version}"', 1)
+        done_own = True
+
+if not (done_top and done_own):
+    sys.exit(f"{path}: could not locate both own-version lines "
+             f"(top={done_top}, packages[''] ={done_own}) — not modified")
+
+# Stage, verify, THEN replace. Verifying after an in-place write left a damaged
+# file on disk whenever the line scan mis-targeted. os.replace is atomic within a
+# filesystem. In mode=check the staged file is verified and discarded, so the
+# pre-flight exercises exactly this path without touching the tree.
+tmp = path + ".version-sync.tmp"
+try:
+    with open(tmp, "w", newline="") as fh:
+        fh.writelines(lines)
+    with open(tmp) as fh:
+        after = json.load(fh)
+    if after["version"] != version or after["packages"][""]["version"] != version:
+        sys.exit(f"{path}: staged edit did not land structurally — not modified")
+    if mode == "write":
+        os.replace(tmp, path)
+    else:
+        os.unlink(tmp)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
+PYEOF
+)
+
+  # Pre-flight the npm lockfiles: a DRY RUN of the real editor (mode=check),
+  # so the predicate cannot drift from the writer's.
+  local lock
+  for lock in "ui/package-lock.json" "clients/nodejs-embedded/package-lock.json"; do
+    [ -f "$REPO_ROOT/$lock" ] || continue
+    python3 -c "$LOCK_EDIT_PY" "$REPO_ROOT/$lock" "$version" check || exit 1
+  done
+
+  # Dry-run the embedded-extra editor too, same reason.
+  if [ -f "$REPO_ROOT/clients/python/pyproject.toml" ]; then
+    python3 -c "$EXTRA_EDIT_PY" "$REPO_ROOT/clients/python/pyproject.toml" "$version" check || exit 1
+  fi
+
+  # And the pom editor.
+  if [ -f "$REPO_ROOT/clients/java-embedded/pom.xml" ]; then
+    python3 -c "$POM_EDIT_PY" "$REPO_ROOT/clients/java-embedded/pom.xml" "$version" check || exit 1
+  fi
+
+  # 1. Cargo.toml [package] version (root, first occurrence only)
+  perl -i -pe 's/^version = ".*"/version = "'"$version"'"/ if 1..m/^version = / && /^version = /' "$REPO_ROOT/Cargo.toml"
+  echo "  [SET]  Cargo.toml [package] -> $version"
+
+  # 2. Cargo.toml [workspace.package] version — this is what the OTHER 150
+  #    workspace crates inherit via `version.workspace = true`, including
+  #    apps/proximadb-server (whose startup banner and runtime-state report
+  #    env!("CARGO_PKG_VERSION")) and the proximadb-embedded binding (which sets
+  #    the Python package's __version__). Missing it meant a "0.4.0" release
+  #    whose server said 0.2.0 while its own /health said 0.4.0.
+  #    Steps 2 and 3 are python with ASSERTIONS rather than bare perl, because
+  #    both failed silently: step 2's regex required `version` to be the FIRST
+  #    key after the header (move `edition` above it and the substitution matched
+  #    nothing while `[SET]` printed anyway), and step 3's required `version`
+  #    BEFORE `path` — so a pin written `{ path = "...", version = "..." }` was
+  #    READ by check and never written by set, leaving a gate its own remediation
+  #    could not fix.
+  python3 - "$REPO_ROOT/Cargo.toml" "$version" <<'PYEOF' || exit 1
+import re
+import sys
+
+path, version = sys.argv[1], sys.argv[2]
+text = open(path).read()
+
+# [workspace.package] version, wherever it sits inside that table.
+m = re.search(r"^\[workspace\.package\]\s*$", text, re.M)
+if not m:
+    sys.exit(f"{path}: no [workspace.package] table — not modified")
+start = m.end()
+nxt = re.search(r"^\[", text[start:], re.M)
+end = start + (nxt.start() if nxt else len(text) - start)
+table = text[start:end]
+table_new, n = re.subn(
+    r'(?m)^(\s*version\s*=\s*)["\'][^"\']*["\']', r'\g<1>"' + version + '"', table, count=1
+)
+if n != 1:
+    sys.exit(f"{path}: [workspace.package] has no version key — not modified")
+text = text[:start] + table_new + text[end:]
+
+# Intra-workspace path-dep pins, in EITHER key order.
+pin = re.compile(
+    r'(\{[^{}\n]*?)version\s*=\s*["\']\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?["\']'
+    r'([^{}\n]*?path\s*=)'
+)
+text, a = pin.subn(r'\g<1>version = "' + version + r'"\g<2>', text)
+pin_rev = re.compile(
+    r'(\{[^{}\n]*?path\s*=[^{}\n]*?)version\s*=\s*["\']\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?["\']'
+)
+text, b = pin_rev.subn(r'\g<1>version = "' + version + '"', text)
+open(path, "w").write(text)
+print(f"  [SET]  Cargo.toml [workspace.package] + {a + b} path-dep pin(s) -> {version}")
+PYEOF
+
+  # 4. pyproject.toml (root) — this is the canonical proximadb_embedded wheel.
+  perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/pyproject.toml"
+  echo "  [SET]  pyproject.toml -> $version"
+
+  # 5. clients/python/pyproject.toml, including the self-referential `embedded`
+  #    extra: its own upper bound would otherwise exclude the wheel this release
+  #    builds, making `pip install 'proximadb[embedded]'` unsatisfiable.
+  perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
+  python3 -c "$EXTRA_EDIT_PY" "$REPO_ROOT/clients/python/pyproject.toml" "$version" write || exit 1
+  echo "  [SET]  clients/python/pyproject.toml (+ embedded extra) -> $version"
+
+  # (no clients/python-embedded/pyproject.toml step — see the note in
+  # check_versions(): that file has no version field, so the substitution
+  # matched nothing while the echo claimed success.)
+
+  # 6. clients/python/src/proximadb_sdk/__init__.py
+  perl -i -pe 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python/src/proximadb_sdk/__init__.py"
+  echo "  [SET]  clients/python/src/proximadb_sdk/__init__.py -> $version"
+
+  # 7. clients/python-embedded/src/proximadb_embedded/__init__.py
+  perl -i -pe 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/src/proximadb_embedded/__init__.py"
+  echo "  [SET]  clients/python-embedded/src/proximadb_embedded/__init__.py -> $version"
+
+  # 8. clients/rust/Cargo.toml (first occurrence only)
+  perl -i -pe 's/^version = ".*"/version = "'"$version"'"/ if 1..m/^version = / && /^version = /' "$REPO_ROOT/clients/rust/Cargo.toml"
+  echo "  [SET]  clients/rust/Cargo.toml -> $version"
+
+  # 9+10. deploy/helm/proximadb/Chart.yaml
+  perl -i -pe 's/^version: .*/version: '"$version"'/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
+  perl -i -pe 's/^appVersion: .*/appVersion: "'"$version"'"/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
+  echo "  [SET]  deploy/helm/proximadb/Chart.yaml -> $version"
+
+  # 11. ui/package.json (first version field)
+  perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if 1..m/"version":/ && /"version":/' "$REPO_ROOT/ui/package.json"
+  echo "  [SET]  ui/package.json -> $version"
+
+  # 12. clients/nodejs-embedded/package.json (first version field)
+  perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if 1..m/"version":/ && /"version":/' "$REPO_ROOT/clients/nodejs-embedded/package.json"
+  echo "  [SET]  clients/nodejs-embedded/package.json -> $version"
+
+  # 13. The npm lockfiles' own version fields. These used to be LAST; the pom
+  #     write now sits after them (and before the lock refresh), so "last" is no
+  #     longer accurate. What holds is narrower than an earlier revision of this
+  #     comment claimed: every abort-capable step from here on EXCEPT the final
+  #     `cargo update` is pre-flighted by a dry run of itself. The lock refresh is
+  #     not -- only `command -v cargo` is checked -- so a lock that cannot resolve
+  #     offline (a registry dep missing from Cargo.lock, say) still aborts AFTER
+  #     every manifest is bumped. That path exits 1 saying the tree is
+  #     inconsistent, which is honest, but it is not prevented. Identified STRUCTURALLY (doc["version"] and
+  #     doc["packages"][""]["version"]), not positionally: a positional "first
+  #     two version lines before node_modules/" walk silently corrupted a
+  #     dependency pin on a lockfileVersion-1 lockfile (no `packages` object, no
+  #     node_modules/ key) and reported success. Pre-flighted above.
+  #
+  #     12b first: the two manifests F9 found stale at 0.2.0 and unwatched.
+  if [ -f "$REPO_ROOT/clients/python-queue-embedded/pyproject.toml" ]; then
+    perl -i -pe 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python-queue-embedded/pyproject.toml"
+    echo "  [SET]  clients/python-queue-embedded/pyproject.toml -> $version"
+  fi
+
+  for lock in "ui/package-lock.json" "clients/nodejs-embedded/package-lock.json"; do
+    [ -f "$REPO_ROOT/$lock" ] || continue
+    python3 -c "$LOCK_EDIT_PY" "$REPO_ROOT/$lock" "$version" write || exit 1
+    echo "  [SET]  $lock -> $version"
+  done
+
+
+  # Pom with the lockfiles, not between the package.jsons and them: an abort
+  # here previously skipped BOTH lockfiles, defeating the "lockfiles LAST so an
+  # abort cannot skip a package.json above" ordering stated for them.
+  if [ -f "$REPO_ROOT/clients/java-embedded/pom.xml" ]; then
+    python3 -c "$POM_EDIT_PY" "$REPO_ROOT/clients/java-embedded/pom.xml" "$version" write || exit 1
+  fi
+
+  # 14. Cargo.lock LAST, because it is derived from every manifest edited above.
+  #     Without this, `set` produced a tree that `check` PASSED and
+  #     `cargo metadata --locked` (ci.yml, merge-blocking) REJECTED with
+  #     "cannot update the lock file ... because --locked was passed" -- so the
+  #     remediation message `check` prints handed you a red PR. Offline, so it
+  #     cannot reach the network mid-release: every workspace member is a path
+  #     dep, so re-resolving their versions needs no registry access.
+  if command -v cargo >/dev/null 2>&1; then
+    if cargo update --workspace --offline --manifest-path "$REPO_ROOT/Cargo.toml" >/dev/null 2>&1; then
+      echo "  [SET]  Cargo.lock (cargo update -w --offline) -> $version"
     else
-      local SED="sed"
+      echo "Error: Cargo.lock NOT refreshed (cargo update -w --offline failed)." >&2
+      echo "       Every manifest above is bumped, so the tree is INCONSISTENT:" >&2
+      echo "       cargo metadata --locked is merge-blocking and will reject it." >&2
+      echo "       Re-run cargo update -w yourself, then version-sync.sh check." >&2
+      exit 1
     fi
-
-    # Note: This fallback may not work on all systems due to -i incompatibilities
-    echo "  [WARN] perl not found, using sed (may fail on macOS)"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/Cargo.toml"
-    rm -f "$REPO_ROOT/Cargo.toml.bak"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/pyproject.toml"
-    rm -f "$REPO_ROOT/pyproject.toml.bak"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python/pyproject.toml"
-    rm -f "$REPO_ROOT/clients/python/pyproject.toml.bak"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/pyproject.toml"
-    rm -f "$REPO_ROOT/clients/python-embedded/pyproject.toml.bak"
-
-    $SED -i.bak 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python/src/proximadb_sdk/__init__.py"
-    rm -f "$REPO_ROOT/clients/python/src/proximadb_sdk/__init__.py.bak"
-
-    $SED -i.bak 's/__version__ = ".*"/__version__ = "'"$version"'"/' "$REPO_ROOT/clients/python-embedded/src/proximadb_embedded/__init__.py"
-    rm -f "$REPO_ROOT/clients/python-embedded/src/proximadb_embedded/__init__.py.bak"
-
-    $SED -i.bak 's/^version = ".*"/version = "'"$version"'"/' "$REPO_ROOT/clients/rust/Cargo.toml"
-    rm -f "$REPO_ROOT/clients/rust/Cargo.toml.bak"
-
-    $SED -i.bak 's/^version: .*/version: '"$version"'/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
-    $SED -i.bak 's/^appVersion: .*/appVersion: "'"$version"'"/' "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml"
-    rm -f "$REPO_ROOT/deploy/helm/proximadb/Chart.yaml.bak"
-
-    $SED -i.bak 's/"version": ".*"/"version": "'"$version"'"/' "$REPO_ROOT/ui/package.json"
-    rm -f "$REPO_ROOT/ui/package.json.bak"
-
-    $SED -i.bak 's/"version": ".*"/"version": "'"$version"'"/' "$REPO_ROOT/clients/nodejs-embedded/package.json"
-    rm -f "$REPO_ROOT/clients/nodejs-embedded/package.json.bak"
-
-    echo "  [SET]  All files updated (using sed fallback)"
+  else
+    echo "Error: cargo not on PATH, so Cargo.lock was NOT refreshed." >&2
+    echo "       The manifests above are bumped and the lock is stale." >&2
+    exit 1
   fi
 
   echo ""

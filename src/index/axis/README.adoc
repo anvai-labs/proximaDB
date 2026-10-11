@@ -1520,9 +1520,9 @@ let status = migration_engine.get_migration_status(collection_id).await?;
 
 **AXIS Documentation**:
 
-* link:../../../docs/index/axis-deep-dive.adoc[AXIS Deep Dive] (to be created)
-* link:../../../docs/index/index-selection-guide.adoc[Index Selection Guide] (to be created)
-* link:../../../docs/index/migration-guide.adoc[Migration Guide] (to be created)
+* AXIS Deep Dive (to be created)
+* Index Selection Guide (to be created)
+* Migration Guide (to be created)
 
 **Algorithm Papers**:
 
@@ -1534,8 +1534,8 @@ let status = migration_engine.get_migration_status(collection_id).await?;
 
 **ProximaDB Architecture**:
 
-* link:../../../docs/architecture/overview.adoc[Architecture Overview]
-* link:../../../docs/storage/engines/[Storage Engines Documentation]
+* Architecture Overview
+* Storage Engines Documentation
 * link:../../../docs/09-roadmap/[Development Roadmap]
 
 **External Resources**:

@@ -52,8 +52,9 @@ class CreateCollectionV2Request:
             dimension (int): Vector dimension (required)
             engine (None | str | Unset): Storage engine selection
 
-                Options: "auto", "sst", "helix", "viper", "swift", "nova", "raptor", "tst"
+                Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
                 Default: "auto" (system selects optimal engine)
+                ("viper" is no longer accepted — deprecated by ADR-093)
             schema (None | SchemaDefinition | Unset):
             enable_proxima_record (bool | None | Unset): Enable ProximaRecord support for this collection
 

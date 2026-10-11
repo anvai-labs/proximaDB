@@ -5,7 +5,7 @@ performed. time/sleep are never invoked by this module (retry lives in urllib3,
 which we never reach because the session is faked).
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import requests
@@ -86,13 +86,13 @@ def test_authresult_not_expired_when_none():
 
 
 def test_authresult_expired_true():
-    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    past = datetime.now(UTC) - timedelta(hours=1)
     r = AuthResult(user_id="u", token_expires_at=past)
     assert r.is_expired() is True
 
 
 def test_authresult_expired_false_future():
-    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    future = datetime.now(UTC) + timedelta(hours=1)
     r = AuthResult(user_id="u", token_expires_at=future)
     assert r.is_expired() is False
 
@@ -454,7 +454,7 @@ def test_headers_jwt_bearer():
 def test_headers_triggers_refresh_when_near_expiry():
     sess = FakeSession()
     # validate returns near-expiry token, refresh returns new token
-    near = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    near = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
     calls = {"n": 0}
 
     def handler(url, kw):
@@ -469,9 +469,7 @@ def test_headers_triggers_refresh_when_near_expiry():
                 {
                     "access_token": "newtok",
                     "refresh_token": "newref",
-                    "expires_at": (
-                        datetime.now(timezone.utc) + timedelta(hours=2)
-                    ).isoformat(),
+                    "expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
                 },
             )
         return FakeResponse(200, {})
@@ -497,7 +495,7 @@ def test_headers_triggers_refresh_when_near_expiry():
 
 def test_should_refresh_disabled():
     a = make_auth(AuthConfig(enabled=True, auto_refresh_jwt=False))
-    a.auth_result = AuthResult(user_id="u", token_expires_at=datetime.now(timezone.utc))
+    a.auth_result = AuthResult(user_id="u", token_expires_at=datetime.now(UTC))
     assert a._should_refresh_token() is False
 
 
@@ -519,7 +517,7 @@ def test_should_refresh_true_near_expiry():
     )
     a.auth_result = AuthResult(
         user_id="u",
-        token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=2),
+        token_expires_at=datetime.now(UTC) + timedelta(minutes=2),
     )
     assert a._should_refresh_token() is True
 
@@ -530,7 +528,7 @@ def test_should_refresh_false_far_expiry():
     )
     a.auth_result = AuthResult(
         user_id="u",
-        token_expires_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        token_expires_at=datetime.now(UTC) + timedelta(hours=2),
     )
     assert a._should_refresh_token() is False
 
@@ -729,7 +727,7 @@ def test_get_user_info_none():
 
 def test_get_user_info_with_expiry():
     a = make_auth(AuthConfig(enabled=True))
-    exp = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    exp = datetime(2030, 1, 1, tzinfo=UTC)
     a.auth_result = AuthResult(
         user_id="u",
         tenant_id="t",

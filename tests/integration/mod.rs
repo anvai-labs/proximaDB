@@ -83,6 +83,7 @@ pub mod comprehensive_filter_test;
 pub mod sst_comprehensive_filter_test;
 
 // SWIFT engine comprehensive filter tests
+#[cfg(feature = "experimental-engines")]
 pub mod swift_comprehensive_filter_test;
 
 // Write Buffer optimization integration tests - NEW optimized Write Buffer writer
@@ -99,6 +100,7 @@ pub mod nova_engine_test;
 // pub mod helix_engine_test;
 
 // Swift engine integration tests
+#[cfg(feature = "experimental-engines")]
 pub mod swift_engine_test;
 
 // Raptor engine integration tests

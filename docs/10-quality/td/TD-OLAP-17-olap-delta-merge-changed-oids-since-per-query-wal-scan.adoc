@@ -10,7 +10,7 @@
 | Severity | Critical — the perceived 100-700× "join gap" (ADR-052, TD-OLAP-15) misdirected months of optimization toward the join, when the join is 8-23 ms (<1% of wall) even at SF=0.1.
 | Component | `src/services/dml/mod.rs::DmlService::changed_oids_since` (line ~830, the `OlapDeltaSource` impl), `src/query/execution/datafusion_engine.rs::register_merged_olap_table` (line ~637), `src/network/postgres/relational_pipeline.rs::olap_delta_merge_enabled` (default ON, line ~1303).
 | Governs | ADR-025 (the OLAP read-merge), ADR-052 (the analytics-competitiveness thesis — the dominant cost was per-query setup, NOT execution), the co-design mandate §2 (trace before you tune — this is the measured per-query trace that re-roots the cost term).
-| Relates to | link:TD-OLAP-2-statistics-fed-cbo-cardinality.adoc[TD-OLAP-2] (A2 NDV — correct but addresses the 8-23 ms join, a non-bottleneck), link:TD-OLAP-4-parquet-footer-stats-cbo.adoc[TD-OLAP-4] (table_open_cache — does not help, different path), link:TD-OLAP-15-native-engine-measured-posture-sf001.adoc[TD-OLAP-15] (the measured posture — re-interpreted), link:../../12-design/adr/ADR-025-relational-cold-path-wal-read-merge.adoc[ADR-025].
+| Relates to | link:TD-OLAP-2-statistics-fed-cbo-cardinality.adoc[TD-OLAP-2] (A2 NDV — correct but addresses the 8-23 ms join, a non-bottleneck), TD-OLAP-4 (table_open_cache — does not help, different path), link:TD-OLAP-15-native-engine-measured-posture-sf001.adoc[TD-OLAP-15] (the measured posture — re-interpreted), ADR-025.
 |===
 
 == The measured finding (TPC perf ledger, local-tempdir, release+duckdb)

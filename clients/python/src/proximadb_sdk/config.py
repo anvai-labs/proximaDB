@@ -436,12 +436,11 @@ def load_config_file(file_path: str) -> dict:
             raise ImportError("PyYAML is required to load YAML configuration files")
 
     elif file_path.endswith(".toml"):
-        try:
-            import tomli
+        # stdlib since 3.11, which is this package's floor — the `tomli` backport
+        # it used to import unconditionally is no longer a dependency.
+        import tomllib
 
-            return tomli.loads(content)
-        except ImportError:
-            raise ImportError("tomli is required to load TOML configuration files")
+        return tomllib.loads(content)
 
     else:  # JSON
         return json.loads(content)

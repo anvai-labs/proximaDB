@@ -1,0 +1,59 @@
+= TD-HELIX-2: HELIX storage-inclusive dedup scan returns zero records
+:status: Open
+:dim: D2
+:pillar: REL
+
+== Problem
+
+The discovery dedup job's storage-inclusive scan
+(`list_all_records_with_tenant_context` — WAL + flushed storage) sees **zero
+records for HELIX collections after a flush**: the job completes
+successfully with a non-trivial pinned snapshot range
+(`snapshot_to_lsn > 0`, `collection_write_lsn` consistent) but reports
+`input_record_count=0`, `removed_count=0`, and
+`quality_metrics.dedup_input = 0.0`.
+
+Empirically established (2026-09-14):
+
+* Deterministic, not a timing flake — reproduced across three consecutive
+  runs on the PR branch and again on **pristine develop** (`12b5af927`).
+* SST and NOVA pass the identical scenario (5 records, 2 exact duplicates →
+  `removed_count=2`); only HELIX sees an empty scan.
+* Isolation-verified: the HELIX iteration fails identically when run alone
+  (loop trimmed to a single engine), so it is not an intra-test interaction.
+* The failure signature is invariant: `input_record_count=0`,
+  `snapshot_from_lsn=0`, `snapshot_to_lsn=6`, `collection_write_lsn=5`.
+
+Location: the HELIX leg of the storage-inclusive record enumeration behind
+`list_all_records_with_tenant_context` (read path shared with the discovery
+executor; `src/services/discovery/` + the HELIX `read_all_records` override
+in `src/storage/engines/helix/`). SST/NOVA override the same port
+correctly, which localizes the defect to HELIX's flushed-segment
+enumeration (records land in engine storage but the scan never sees them).
+
+== Blast radius
+
+Any caller of the storage-inclusive read over a HELIX collection observes
+an empty record set post-flush — dedup is the discovered case, but
+anything enumerating flushed HELIX records through this port is blind to
+them.
+
+== Current containment
+
+`tests/discovery_job_republish_test.rs` excludes HELIX from its dedup
+engine loop with a comment pointing here (landed with the ADR-093 S2 test
+repairs in the engine-hygiene PR). Re-add `"helix"` to the loop when this
+is fixed — that is the acceptance test.
+
+== Next action
+
+1. Reproduce with a single HELIX collection: create → insert → force
+   flush → drive the storage-inclusive scan directly (no discovery job)
+   and inspect what the HELIX reader returns vs. what the flush
+   materialized on disk.
+2. Compare HELIX's `read_all_records` override against SST's/NOVA's for
+   the tenant-context and segment-enumeration contract.
+3. Fix + restore `"helix"` in the dedup loop + assert `removed_count >= 2`.
+
+Deps: none. Discovered by the ADR-093 S2 adversarial review (engine
+hygiene PR, 2026-09-14).

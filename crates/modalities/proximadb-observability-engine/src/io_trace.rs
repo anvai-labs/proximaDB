@@ -200,6 +200,19 @@ pub struct IoTrace {
     /// (TD-RDSTRAT-13 C2) — the user-visible Compute term of the
     /// waves-not-sums model `T ≈ Σ rounds×RTT + bytes/BW + Compute`.
     ivf_probe_rank_us: AtomicU64,
+    /// TD-RDSTRAT-13 PR-B tail attribution: the four uninstrumented segments
+    /// of the cold cascade, measured so the ~300 ms disk-p50 tail is bounded
+    /// by data before any optimization. All additive (multi-segment sums).
+    /// Region-B survivor fetch + SQ8 rerank wall (both branches).
+    region_b_rerank_us: AtomicU64,
+    /// Region-D top-k OID ranged fetch + decode wall (v4-chunk + legacy arms).
+    region_d_fetch_decode_us: AtomicU64,
+    /// Top-k rehydration (`read_records_by_positions`) wall — the second
+    /// Region-D pass (metadata + header/footer + block fetches + decode).
+    rehydrate_us: AtomicU64,
+    /// Whole-cascade umbrella wall (`try_pax_cascade` entry to exit) — the
+    /// residual after the other timers names the unattributed remainder.
+    cascade_total_us: AtomicU64,
     /// Runtime-filter wait outcomes (ADR-056 AQE-S11): how often the probe scan's
     /// `wait_complete()` rendezvous resolved with the filter arrived (pruning
     /// enabled) vs timed out (filterless, conservative), plus the wall ms spent
@@ -749,6 +762,31 @@ impl IoTrace {
         self.ivf_probe_rank_us.fetch_add(us, Ordering::Relaxed);
     }
 
+    /// Record the Region-B survivor fetch+rerank wall in microseconds
+    /// (TD-RDSTRAT-13 PR-B tail attribution). Additive across segments.
+    pub fn record_region_b_rerank_us(&self, us: u64) {
+        self.region_b_rerank_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Record the Region-D top-k OID fetch+decode wall in microseconds
+    /// (TD-RDSTRAT-13 PR-B tail attribution). Additive across segments.
+    pub fn record_region_d_fetch_decode_us(&self, us: u64) {
+        self.region_d_fetch_decode_us
+            .fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Record the top-k rehydration wall in microseconds (TD-RDSTRAT-13 PR-B).
+    /// Additive across segments.
+    pub fn record_rehydrate_us(&self, us: u64) {
+        self.rehydrate_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Record the whole-cascade umbrella wall in microseconds
+    /// (TD-RDSTRAT-13 PR-B).
+    pub fn record_cascade_total_us(&self, us: u64) {
+        self.cascade_total_us.fetch_add(us, Ordering::Relaxed);
+    }
+
     /// Record a runtime-filter wait outcome (ADR-056 AQE-S11): `arrived` = the
     /// filter completed within the wait budget (pruning enabled); otherwise it
     /// timed out (splits read filterless, conservative). `waited_ms` = the wall
@@ -957,6 +995,10 @@ impl IoTrace {
             tier_get_bytes: std::array::from_fn(|i| self.tier_get_bytes[i].load(Ordering::Relaxed)),
             metadata_ops: self.metadata_ops.load(Ordering::Relaxed),
             ivf_probe_rank_us: self.ivf_probe_rank_us.load(Ordering::Relaxed),
+            region_b_rerank_us: self.region_b_rerank_us.load(Ordering::Relaxed),
+            region_d_fetch_decode_us: self.region_d_fetch_decode_us.load(Ordering::Relaxed),
+            rehydrate_us: self.rehydrate_us.load(Ordering::Relaxed),
+            cascade_total_us: self.cascade_total_us.load(Ordering::Relaxed),
             runtime_filter_arrived: self.runtime_filter_arrived.load(Ordering::Relaxed),
             runtime_filter_timed_out: self.runtime_filter_timed_out.load(Ordering::Relaxed),
             runtime_filter_wait_ms: self.runtime_filter_wait_ms.load(Ordering::Relaxed),
@@ -1089,6 +1131,15 @@ pub struct IoTraceSnapshot {
     /// Coarse-probe rank wall microseconds incl. morsel join (C2).
     #[serde(default)]
     pub ivf_probe_rank_us: u64,
+    /// TD-RDSTRAT-13 PR-B tail attribution (all additive, micros).
+    #[serde(default)]
+    pub region_b_rerank_us: u64,
+    #[serde(default)]
+    pub region_d_fetch_decode_us: u64,
+    #[serde(default)]
+    pub rehydrate_us: u64,
+    #[serde(default)]
+    pub cascade_total_us: u64,
     #[serde(default)]
     pub read_ranges_max_inflight: u64,
     /// Runtime-filter wait outcomes (ADR-056 AQE-S11): arrived vs timed-out +
@@ -1421,6 +1472,30 @@ pub fn record_metadata_op() {
 /// query (TD-RDSTRAT-13 C2). No-ops outside a query scope.
 pub fn record_ivf_probe_rank_us(us: u64) {
     let _ = IO_TRACE.try_with(|t| t.record_ivf_probe_rank_us(us));
+}
+
+/// Record the Region-B survivor fetch+rerank wall for the active query
+/// (TD-RDSTRAT-13 PR-B). No-ops outside a query scope.
+pub fn record_region_b_rerank_us(us: u64) {
+    let _ = IO_TRACE.try_with(|t| t.record_region_b_rerank_us(us));
+}
+
+/// Record the Region-D top-k OID fetch+decode wall for the active query
+/// (TD-RDSTRAT-13 PR-B). No-ops outside a query scope.
+pub fn record_region_d_fetch_decode_us(us: u64) {
+    let _ = IO_TRACE.try_with(|t| t.record_region_d_fetch_decode_us(us));
+}
+
+/// Record the top-k rehydration wall for the active query (TD-RDSTRAT-13
+/// PR-B). No-ops outside a query scope.
+pub fn record_rehydrate_us(us: u64) {
+    let _ = IO_TRACE.try_with(|t| t.record_rehydrate_us(us));
+}
+
+/// Record the whole-cascade umbrella wall for the active query
+/// (TD-RDSTRAT-13 PR-B). No-ops outside a query scope.
+pub fn record_cascade_total_us(us: u64) {
+    let _ = IO_TRACE.try_with(|t| t.record_cascade_total_us(us));
 }
 
 /// Drain general bounded-concurrent `read_ranges` metrics from the storage layer

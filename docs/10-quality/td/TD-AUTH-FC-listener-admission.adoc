@@ -1,0 +1,39 @@
+= TD-AUTH-FC: Authentication composition and trust-only listener admission
+:status: In progress
+
+== Contract
+
+Coordinator presence requires credentials on REST, gRPC and Flight, including
+public REST constructors whose legacy auth flag is false. Auth-required with a
+missing coordinator is an error, not an unauthenticated fallback.
+
+MCP and pgwire cannot be promoted to authenticated shared surfaces by adding a
+credential check alone. Request-bound tenant identity and permissions must reach
+all backend operations. Until then, permit them only on single-tenant loopback
+without a security coordinator. Validate the entire listener set before binding;
+the direct MCP and pgwire entrypoints also validate their local boundary.
+Authenticated deployments explicitly disable `[api] enable_pgwire` and leave
+`mcp_port` unset. Default pgwire bind is loopback. Portless mode cannot open MCP TCP.
+
+== Verification and remaining work
+
+* Runtime admission matrix: authenticated / absent coordinator, single / multi
+  tenant, IPv4 / IPv6 loopback / wildcard / non-loopback, disabled listeners.
+* Real-server regression suite: credential-required and development REST controls;
+  configured unsupported listeners fail before any transport binds. Missing,
+  invalid and valid credentials cross REST/gRPC/Flight in legacy and unified
+  modes. A direct Flight wrapper must retain its injected service's coordinator.
+* A missing REST coordinator denies non-API aliases and future routes too;
+  only explicit GET/HEAD liveness paths remain open.
+* Authenticated cluster startup is refused until inter-node clients can propagate
+  credentials. This is containment, not an authenticated-cluster implementation.
+* Execute this suite in the authz CI lane alongside relational authorization.
+* Pending: credential/permission-bound MCP tool port, full pgwire authentication
+  and authorization conformance, and cross-protocol shared-deployment graduation.
+  Existing SCRAM work must satisfy these contracts before relaxing admission.
+* Pending: authenticated relational catalog introspection. The authorization
+  transport fixture discovers stable object IDs by canonical read-only replay
+  of its fresh local catalog WAL; this is not a production policy-tooling API.
+
+This change is admission containment. It does not close the pending shared-service
+capability work or certify multi-tenant behavior across every data operation.

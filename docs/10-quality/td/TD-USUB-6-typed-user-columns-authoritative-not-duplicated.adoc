@@ -1,0 +1,375 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-6: Typed user columns are a duplicated advisory index — make declared columns authoritative
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 3. **Evolves legacy TD-162a-2.** Slice 1 (version dispatch), slice 2a (shred directory), the declared-type plumbing, and **slice 2b (residual tail, default-OFF) all landed 2026-09-22/23**. Remaining: measure write-amplification per path into `BENCHMARK_EVIDENCE.toml` and decide the default flip; converge with the segment-level `shred_field_map`.
+| Priority | MEDIUM — every shredded value is currently written twice; and typed columns cannot be trusted for correctness, only for pruning.
+| Component | `crates/storage/proximadb-block-format/src/writer.rs`, `.../stripe.rs`, `.../reader.rs`
+| Relates to | ADR-094 (spec §2.1), ADR-055 (P-Shred), ADR-033 / ADR-034 (which rank this work's scan value < 2×), Iceberg v3 Variant shredding
+| Blocked by | ADR-027 `Accepted` — **gate lifted by ADR-094**. Sequenced after TD-USUB-5.
+|===
+
+== The finding
+
+P-Shred (ADR-055) writes typed user-column stripes, but they are explicitly **not
+authoritative**:
+
+[quote, 'crates/storage/proximadb-block-format/src/writer.rs:209-213']
+____
+These columns are a DUPLICATED pruning/projection index; the msgpack `PROPS` tail stays the
+source of truth (the reader reconstructs from the tail and ignores `USER_BASE+` columns), so
+this is additive and mixed-read-safe with no format-version bump.
+____
+
+That was the right call for an additive, no-version-bump change. Its costs are now the
+blockers:
+
+* **Every shredded value is written twice** — once in the typed stripe, once in the msgpack
+  tail (`writer.rs:470-476` buffers by clone, deliberately never `remove`).
+* **Typed columns are advisory only.** `build_shred_stripe` (`writer.rs:1250-1262`) infers
+  the physical type from the *first non-null value* and coerces any value that does not fit
+  to `None`. That is explicitly safe "because the msgpack `PROPS` tail is the source of truth
+  for reconstruction" — so projection and pruning are best-effort by construction.
+
+== How to apply
+
+For columns **declared in `CatalogTableSchema`** (as distinct from schemaless props):
+
+. The typed `ColumnRole::UserDefined` stripe **is** the value; readers read it directly.
+. The msgpack `PROPS` tail carries only the **residual** — undeclared props.
+. Column type comes from the catalog schema, not from first-value inference. A value that
+  does not conform is a **write error**, not a silent `None` — the fallback that made
+  coercion safe no longer exists.
+. Requires the PAX v3 version byte (spec §2), and is mixed-read-safe: v2 blocks keep
+  decoding via the existing tail-reconstruction path.
+
+**Align the semantics with Iceberg v3 Variant shredding** (shredded fields authoritative,
+residual blob for the rest). ProximaDB arrived at this design independently, which both
+validates it and makes the §6 export mapping near-mechanical.
+
+== Reconciliation and the ROI caveat
+
+Legacy **TD-162a-2** describes the typed stripe + per-column zone maps and remains `Open`;
+this TD evolves it (ADR-055 has since landed the *duplicated* form) and should supersede that
+row.
+
+Record honestly: **ADR-034 deliberately ranks TD-162a-2 last**, because typed columns buy
+< 2× on scans. This TD does **not** overturn that ranking. It is justified on the grounds
+ADR-033 already recast the work to — one unified store, a real second cost arm for the
+router, uniform projection/pruning — plus the write-amplification removal above. It must not
+be re-argued as a scan-throughput win.
+
+== Evidence gate (mandate #6)
+
+* **Losslessness ratchet:** declared columns + residual reconstruct the original
+  `ProximaRecord` exactly, including nulls, type edge cases, and props whose declared type
+  changed via schema evolution.
+* Write-amplification delta (bytes written per row, before vs after) recorded in
+  `BENCHMARK_EVIDENCE.toml`.
+* Mixed-read test: a v2 segment and a v3 segment in the same collection both read correctly.
+* Recall ratchet (recall@10 ≥ 0.93) stays green.
+
+== Slicing (2026-09-22) — two prerequisites found while starting the work
+
+=== Slice 1 (LANDED): the block header could not express v3 at all
+
+"How to apply" step 4 says the change "requires the PAX v3 version byte". That byte could not
+have worked as written, for two reasons found in `header.rs`:
+
+. **`from_bytes` equality-rejected** anything that was not exactly `FORMAT_VERSION`
+  (`if buf[4] != FORMAT_VERSION { bail!(...) }`). A v3 block would have been refused outright
+  — the precise flag-day the module's own doc comment forbids ("any future `v3` MUST be
+  mixed-read-safe — readers dispatch on the byte and keep decoding v2").
+. **`BlockHeader` discarded the version.** Even had v3 been accepted, the struct carried no
+  `format_version` field, so no decode path could branch on it. The information was validated
+  and thrown away.
+
+Also latent: `to_bytes` stamped the `FORMAT_VERSION` constant unconditionally, so any
+read-modify-write of a v3 header would have silently **relabelled it v2**.
+
+Slice 1 fixes all three — `SUPPORTED_FORMAT_VERSIONS` dispatch, a retained `format_version`
+field with `is_v3()`, and `to_bytes` serializing the header's own version. It introduces **no
+v3 semantics and no writer emits v3**, so it cannot change any byte on disk or any behaviour;
+it only makes v3 expressible. Pinned by five tests including unknown-version fail-closed and
+the no-relabel property. The recall@10 harness stays green (90/90 in the crate).
+
+=== Slice 2 (OPEN, newly blocked): the block is not self-describing about shredded keys
+
+**This is the finding that matters, and it changes the shape of the remaining work.**
+
+Under today's duplicated form, the msgpack `PROPS` tail is complete, so the typed stripes are
+advisory and the reader can ignore them. `FlatRow::into_record` takes the promoted
+user-column keys from the **caller's schema, positionally** — and that is harmless precisely
+because nothing depends on it: a wrong or stale key list costs nothing when the tail already
+has every value.
+
+Making declared columns authoritative removes that safety net. The value then lives **only**
+in the typed stripe, and the only thing naming that stripe is a caller-supplied, positional
+key list. A key list that drifts from what was written — reordered, truncated, or evolved —
+would **silently drop props**, with no checksum or structural error to catch it.
+
+The TD's own losslessness gate names the exact scenario that breaks it: *"props whose declared
+type changed via schema evolution"*. Schema evolution is precisely when the caller's key list
+and the block's stripes disagree.
+
+**Therefore: before the tail can become a residual, the block must record its own shred
+directory** — the `(col_id, prop_key)` pairs actually written — so reconstruction is driven by
+the block, not by what a caller believes the schema to be. That directory is additive and can
+land in v2 blocks harmlessly (a new stripe/footer section), which also means it can be written
+and verified *before* any v3 block exists.
+
+Revised order for the remaining work:
+
+. **Slice 2a (LANDED 2026-09-22)** — self-describing shred directory in the block; see below.
+. **Slice 2b** — v3 writer: residual tail + authoritative stripes, stamping `FORMAT_VERSION_V3`,
+  default-OFF; v3 reader merging stripes + residual via the directory.
+. **Slice 2c** — write-amplification measurement (bytes/row v2 vs v3) into
+  `BENCHMARK_EVIDENCE.toml`, plus the mixed-read test (a v2 and a v3 segment in one
+  collection) and the recall ratchet.
+
+Doing 2b without 2a would ship a data-loss hazard whose trigger is routine schema evolution.
+
+=== Slice 2a as landed (2026-09-22) — and a correction to how it had to be done
+
+`col_id::SHRED_DIRECTORY = 15` carries msgpack `Vec<(col_id, prop_key)>`: the block's own
+record of which prop key each `USER_BASE`+ stripe holds. Written whenever a shred spec is
+present; read back via `PaxBlockReader::shred_directory()`.
+
+**Correction to the plan above.** The earlier note assumed the directory could simply be
+"additive in v2", and separately that a v3 footer would carry it. Investigating showed
+neither was straightforward: **the PAX block format has no extensibility headroom left.**
+Both fixed structures are fully consumed — the 32-byte `BlockFooter` (whose last 12 reserved
+bytes were already reclaimed by `vparam_*`/`rgdir_offset`) and the 64-byte `ColumnMeta`
+(bytes 0..64 all assigned). There was no spare field to grow.
+
+The way through avoids growing anything: the directory is a `ColumnMeta` entry that carries
+**no stripe** (`stripe_len == 0`) and borrows the existing `bloom_offset`/`bloom_len` pointer
+pair to address its payload in the footer-extras region. That makes it additive **in v2** —
+no format version bump, no footer growth — and invisible to existing readers, which locate
+columns by `find(|m| m.column_id == X)` and so never ask for id 15. It declares
+`ColumnRole::Props` rather than a new role byte, deliberately: an older build's
+`ColumnRole::from_u8` rejects unknown roles, so a new role would have broken mixed reads of
+**v2** blocks — the one thing this must not do. `has_bloom` is left false so the entry does
+not claim to be something it is not.
+
+So slice 2a did **not** need the v3 header after all. Slice 1 is still a genuine prerequisite
+for 2b (the residual tail does need the version byte), but the ordering dependency between 2a
+and the version bump was wrong in the note above.
+
+**Evidence:** `block_carries_its_own_shred_directory` (directory mirrors the spec exactly, and
+naming is answerable with no caller key list — the property that makes a residual tail safe);
+`no_shred_spec_means_no_directory_and_no_error` (clean `None`, so the caller-key fallback stays
+reachable for every v2 block on disk); `shred_directory_is_additive_and_disturbs_nothing`
+(format version unchanged, full props tail still byte-identical, entry claims no stripe and no
+bloom). 93/93 in the crate including the rabitq recall@10 ratchet.
+
+**Not done here:** nothing consumes the directory yet. `FlatRow::from_block_reader` does not
+populate `user_columns` at all today (documented as a follow-up in its own doc comment), so
+there is nothing to name until the residual reader exists. Consuming it — preferring the
+block's directory over caller keys, falling back when absent — is slice 2b's first step.
+
+=== Slice 2b design correction (2026-09-23): the residual tail needs the DECLARED type
+
+Starting 2b surfaced that "How to apply" step 3 — *"column type comes from the catalog schema,
+not from first-value inference"* — is not a refinement. It is **load-bearing**, and the
+current writer cannot satisfy it. Three verified facts:
+
+. **Stripe typing is inferred from the first non-null value.** `build_shred_stripe` is
+  `match vals.iter().flatten().next().map(shred_class)`, and every other row is then coerced
+  with `.and_then(pv_to_i64 | pv_to_f64 | pv_to_str)` — a non-conforming value becomes
+  **`None`**. Harmless while the tail is complete; under a residual tail that value is simply
+  **gone**.
+. **Even a SUCCESSFUL coercion loses the variant.** `shred_class` folds every integer-like and
+  temporal value into one i64 class, so `Int32` reconstructs as `Int64`. The round trip is
+  type-lossy even on the happy path.
+. **A variant tag in the directory is not enough.** `ProximaValue` has ~25 variants and several
+  carry extra state — `Time(i64, TimeUnit)`, `Timestamp`, `TimestampTz` — which no physical
+  class preserves. A one-byte tag cannot reconstruct them.
+
+So type fidelity, unlike **naming**, cannot be solved by making the block self-describing.
+Slice 2a could record what it wrote because the writer knew the key. It does not know the
+declared type: `with_shred_spec` takes `Vec<(String, i32)>` — name and column id only.
+
+==== Consequent prerequisite for 2b
+
+**Plumb the declared `ProximaType` from `CatalogTableSchema` into the shred spec**, through
+`with_shred_spec` and its production callers (`src/services/record_store.rs`,
+`src/storage/engines/sst/segment_format.rs`, and the `pax_block.rs` wrapper), and record it in
+the shred directory alongside the key. Reconstruction then rebuilds the declared variant
+rather than whichever physical class the value was coerced into.
+
+==== And a better rule than the filed one
+
+Step 3 says a non-conforming value should be **a write error**. That is the wrong trade for a
+schemaless `props` tree: it turns a legal heterogeneous prop set into a failed write.
+
+Prefer: **the residual carries exactly what the stripe did not take losslessly.** Per row, per
+key — if the value round-trips exactly under the declared type, drop it from the tail;
+otherwise keep it. Losslessness then holds **by construction** rather than by type discipline,
+heterogeneous keys degrade gracefully instead of failing, and the losslessness ratchet becomes
+a property of the encoding rather than a hope about the data.
+
+==== Status
+
+2b is **not** implemented. The directory (2a) and the version dispatch (slice 1) are in place;
+the declared-type plumbing above is the remaining prerequisite. Implementing 2b without it
+would silently change column types on read — which the TD's own losslessness gate forbids, and
+which no existing test would catch, because nothing reconstructs user columns today.
+
+=== Declared-type plumbing landed (2026-09-23) — and a NARROWING of the end-state
+
+The prerequisite from the previous section is done: `ShredColumn { key, column_id,
+declared_type: Option<ProximaType> }` replaces the bare `(String, i32)` pair, and the shred
+directory records the declared type beside the key.
+
+**The `Option` is the finding, not an implementation convenience.** The two production paths
+that shred are not equally informed:
+
+[cols="1,2,1", options="header"]
+|===
+| Path | Declared type available | Exact reconstruction
+| Relational (`record_store.rs`) | full `ProximaType` from `CatalogColumn`, already resolved at the call site | **possible**
+| Vector/SST flush (`flush/mod.rs`) | only the v1 `FilterableDataType` from `filterable_columns` | **impossible**
+|===
+
+`FilterableDataType` is **coarse**: `FilterableInteger` carries no width and
+`FilterableDatetime` no `TimeUnit`, so it cannot distinguish `Int32` from `Int64`, or
+`Timestamp(Millis)` from `Timestamp(Micros)`. A typed stripe stores one of three physical
+classes (i64/f64/string), so without an exact declared type there is nothing that says which
+variant to rebuild.
+
+==== Consequence: "declared columns authoritative" cannot be uniform
+
+ADR-094 spec §2.1 and this TD's headline both read as a global property. They cannot be. The
+end-state is narrower, and the narrowing is structural rather than a matter of sequencing:
+
+**Declared columns may become authoritative ONLY for columns carrying an exact declared type.
+Everywhere else the typed stripe stays an advisory pruning index and the msgpack `PROPS` tail
+stays complete — indefinitely, not "until a later slice".**
+
+Which also means the write-amplification win this TD is justified on applies to the relational
+arm, and *not* to the SST/vector arm, unless that arm later gains an exact per-column type.
+That should be measured per-path rather than claimed globally.
+
+This is recorded in the code too: `with_shred_spec` is retained as a shim that produces
+`declared_type: None`, so a path that cannot declare exactly cannot accidentally be treated as
+one that can. `untyped_shim_records_no_declared_type` pins that.
+
+**Evidence:** `directory_records_the_declared_type_when_the_caller_has_one` (exact type
+round-trips; absence is recorded rather than guessed) and `untyped_shim_records_no_declared_type`.
+95/95 in the crate including the rabitq recall@10 ratchet.
+
+==== Noted overlap, for whoever does 2b
+
+A **segment-level** `shred_field_map` already exists in the PAX segment footer (TD-FPRUNE-1
+P2), mapping field name → col-id for filtered reads. It overlaps in content with the
+**block-level** shred directory added in slice 2a, but differs in scope and guarantee: the
+footer map is gated behind `footer_stats_enabled()` and lives once per segment, whereas the
+block directory is ungated and self-contained, which is what reconstruction requires. Worth a
+deliberate decision in 2b whether the two should converge; they should not both grow
+independently.
+
+== Slice 2b as landed (2026-09-23) — the residual tail
+
+Gated by `PROXIMADB_PAX_RESIDUAL_TAIL`, default OFF.
+
+**Write.** Per row, per shred column: if the column has an exact declared type AND the typed
+stripe reproduces that value *identically* (`shreds_losslessly`), the key is dropped from the
+msgpack `PROPS` tail. Everything else stays. The removal is the write-amplification win — today
+every shredded value is stored twice.
+
+**Stripe class comes from the declared type**, not from the first non-null value, for any
+column that declares one. That removes the row-order dependency the old inference had, and it
+is what makes the per-row residual decision answerable at `add_record` time rather than only
+after every row is buffered.
+
+**Read.** `FlatRow::from_block_reader` rebuilds shredded props from the typed stripes, named
+AND typed by the block's own directory (slice 2a), into a new `FlatRow::shredded` field.
+`into_record` merges them with `entry().or_insert()` — **the tail wins wherever it still has
+the key**. That ordering is the safety property: the writer drops a value only when the stripe
+can reproduce it exactly, so a key still in the tail is one the stripe could *not* reproduce,
+and its lossy stripe value must never overwrite the true one.
+
+**Version.** A block whose tail actually became a residual stamps `FORMAT_VERSION_V3`, because
+a v2 reader would return records missing those props. Blocks with the gate off, or with
+nothing droppable, stay v2 — so the stamp describes the block rather than the build.
+
+=== Why not the filed "write error" rule
+
+Step 3 proposed failing the write on a non-conforming value. That is the wrong trade for a
+schemaless `props` tree: it turns a legal heterogeneous prop set into a failed write. The
+implemented rule instead keeps such values in the tail, so **losslessness is a property of the
+encoding rather than a requirement on the data**, and heterogeneous keys degrade instead of
+failing.
+
+=== Evidence
+
+* `residual_tail_round_trips_every_prop_exactly` — the ratchet. Covers an exactly-typed value
+  dropped and rebuilt (`Int32` returns as `Int32`, not `Int64`), a value whose variant does not
+  match its declared type (stays in the tail, never silently coerced), and an untyped column
+  (never authoritative). Also asserts the block declares v3.
+* `residual_tail_is_smaller_than_the_complete_tail` — the write-amplification win, measured as
+  block bytes with the gate off vs on.
+* `residual_gate_off_keeps_a_complete_v2_tail` — the shipped default is unchanged and still v2.
+
+98/98 in the crate including `rabitq_cold_recall_harness_n100000_recall_at_10`.
+
+=== Remaining
+
+* **Write-amplification measured 2026-09-24** — `pax_residual_tail_write_amplification` in the
+  evidence ledger, artifact
+  `docs/_internal/status/PAX_RESIDUAL_TAIL_WRITE_AMPLIFICATION_2026_09_24.adoc`.
+  **Relational: 41.2% smaller blocks** (310.97 → 182.97 bytes/row over 2,000 rows).
+  **Vector/SST: 0.0%, by construction** — and the bench *asserts* that rather than assuming it,
+  because an arm with no exact declared types must never drop anything from its tail.
++
+The measurement also caught a real bug: the first run reported **0.1%**, because
+`residual_tail_enabled()` reads the gate through a process-wide `OnceLock`, so toggling the env
+var inside one process measured the same mode twice. The unit tests had missed it by setting the
+private field directly, exercising the mechanism but never the configuration path. Fixed with
+`PaxBlockWriter::with_residual_tail(bool)`. Same shape as the TD-USUB-9 route stamp: the
+configured thing and the effective thing diverging with no signal.
+* Decide whether the block directory and the segment-level `shred_field_map` (TD-FPRUNE-1 P2)
+  converge.
+
+=== Known consequence — the raw `props` blob changes meaning under the gate
+
+Full-record reconstruction is safe: the canonical read-side inverse
+(`PaxSegmentScanner::read_records`) goes through `FlatRow::from_block_reader` + `into_record`,
+so shredded props are rebuilt from the typed stripes.
+
+But **a consumer that reads the msgpack `PROPS` stripe as an opaque blob, rather than
+reconstructing, sees the residual.** `src/datafusion/document_pax_provider.rs` exposes exactly
+such a column: it projects `props` as raw `DataType::Binary` alongside the shredded columns
+(which it reads from their own stripes, and which are therefore unaffected).
+
+With the gate OFF — the shipped default — nothing changes: the tail stays complete. With it
+ON, `SELECT props` over that provider would return a blob missing the shredded keys, while the
+shredded columns themselves remain correct and full-record reads remain correct.
+
+**This is a precondition on the default flip, not just a measurement question.** Before
+flipping, either the raw-blob projection must reconstruct (merge the typed stripes back in), or
+it must be documented that `props` is a residual and callers must read the typed columns. The
+first is the honest fix; the second silently changes a column's meaning.
+
+==== CLOSED 2026-09-24 — the projection now reconstructs
+
+`collect_flushed_rows` reinstates shredded props into the decoded `ProximaTree` from the typed
+columns the batch already carries, under the SAME tail-wins rule as `FlatRow::into_record`: a
+key still present in the tail is one the stripe could not reproduce, so its lossy stripe value
+must never overwrite it. Using one rule in both reconstruction paths is what stops them
+drifting.
+
+Pinned by `residual_tail_props_projection_still_returns_the_whole_document`, which drives a
+real residual-tail segment through **SQL** (`SELECT id, props`) rather than asserting at the
+block layer, and checks both the reconstructed prop and an undeclared one that stays in the
+tail — so it distinguishes "tail present" from "tail complete".
+
+**Verified non-vacuous:** with only the merge loop disabled the test fails with
+`document d0 lost its shredded prop under the residual tail: {"note":"n0"}` — the document
+returns as valid JSON with the field simply gone, which is exactly the silent loss at issue.
+
+Remaining before a flip: recall/round-trip gating on real corpora.

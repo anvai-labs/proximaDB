@@ -704,9 +704,11 @@ class RestProtocolAdapter(BaseProtocolAdapter):
         """
         from .._generated.rest.api.documents.insert_document import sync_detailed
         from .._generated.rest.client import Client as GeneratedClient
-        from .._generated.rest.models.insert_document_body import InsertDocumentBody
+        from .._generated.rest.models.doc_insert_request import DocInsertRequest
 
-        body = InsertDocumentBody.from_dict({"id": id, "document": document})
+        # Wave-9 typed the previously free-form request body
+        # (InsertDocumentBody) into DocInsertRequest {id?, document}.
+        body = DocInsertRequest.from_dict({"id": id, "document": document})
         client = GeneratedClient(base_url=self._url, raise_on_unexpected_status=False)
         response = sync_detailed(collection=collection_name, client=client, body=body)
         if response.status_code in (200, 201, 202):

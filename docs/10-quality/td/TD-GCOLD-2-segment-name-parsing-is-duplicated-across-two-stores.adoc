@@ -1,0 +1,39 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GCOLD-2: Sequence-bearing segment-name parsing is duplicated in two stores, and the copy already drifted
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-07 by adversarial review of TD-GCOLD-1, which created the second identical copy.
+| Priority | **LOW**, but with empirical evidence of the risk: the two copies have already diverged once, and the divergence was a real defect that took a review round to find.
+| Component | `src/graph/cold_segment_store.rs` (`parse_seg_seq`), `src/services/record_spill.rs` (`parse_spill_seq`)
+| Relates to | TD-GCOLD-1, TD-USUB-1, mandate #12
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+After TD-GCOLD-1, `parse_seg_seq` and `parse_spill_seq` are **logic-identical** — fixed width 16,
+the same `is_ascii_digit() || (b'a'..=b'f')` alphabet gate, the same `from_str_radix` — differing
+only in their prefix/suffix constants. Both live in the same crate (`proximadb`). The reasoning for
+*why* the gate must require the allowed alphabet rather than reject classes is now argued at length
+in two doc comments.
+
+That is mandate-#12 duplication of a primitive rather than per-module naming, and the risk is not
+theoretical: **the copies already drifted.** `parse_spill_seq` shipped first with an
+uppercase-rejection half-fix, which still admitted a leading `+` (`from_str_radix` accepts one), so
+two names claimed one sequence. It took a review round to find and a second commit to correct. The
+graph copy was then written correctly only because that lesson was fresh.
+
+== How to apply
+
+1. Extract one helper, e.g. `parse_padded_hex_seq(name, prefix, suffix) -> Option<u64>`, carrying
+   the width constant, the alphabet gate and the single doc explaining both.
+2. Both call sites pass their own prefix/suffix; keep each module's own name as a thin wrapper if
+   that reads better locally.
+3. Move the property test with it — the one that asserts injectivity and lexicographic-equals-numeric
+   order and kills all four half-fixes — so one test guards both callers. Today each store has its
+   own, and only the graph one covers the `+` case by construction.
+4. Check for a third copy before extracting: any future segment store with a sequence-bearing name
+   will want the same primitive.

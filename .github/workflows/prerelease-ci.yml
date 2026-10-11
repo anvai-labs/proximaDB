@@ -9,7 +9,7 @@
 #
 # TRIGGERS:
 #   1. Push to main branch
-#   2. Push to development branch
+#   2. Push to `qa` (or `main`) — see the `on.push.branches` note below
 #   3. Manual dispatch with optional version input
 #
 # WORKFLOW STAGES:
@@ -45,7 +45,14 @@ on:
   push:
     branches:
       - main
-      - development
+      # `qa`, not `development`: there is no `development` branch in this repo
+      # (the promotion flow is feat -> develop -> qa -> main), so this trigger
+      # matched nothing and the Check Version Consistency gate below ran ONLY on
+      # main -- i.e. after the release had already been promoted. `qa` is the
+      # MEDIUM tier, which is where a version-consistency failure is still cheap
+      # to fix. Deliberately NOT `develop`: this workflow is heavy and mandate #7
+      # keeps runner cycles off every feature merge.
+      - qa
   workflow_dispatch:
     inputs:
       version:
@@ -68,13 +75,14 @@ concurrency:
   # Dedup push+PR of the same branch into one group; cancel superseded
   # runs on feature/PR branches, but let protected-branch runs finish.
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.ref_name != 'main' && github.ref_name != 'develop' }}
+  cancel-in-progress: ${{ github.ref_name != 'main' && github.ref_name != 'qa' && github.ref_name != 'develop' }}
 
 jobs:
   # ============================================================================
   # VERSION CHECK - Validate version consistency across codebase
   # ============================================================================
   version-check:
+    timeout-minutes: 30
     name: Check Version Consistency
     runs-on: ubuntu-latest
     outputs:
@@ -116,8 +124,17 @@ jobs:
   # PREPARE - Set up build parameters
   # ============================================================================
   prepare:
+    timeout-minutes: 30
     name: Prepare Build
     needs: version-check
+    # On an automatic push to `qa` we want the version gate ONLY. This job is
+    # the fan-out point -- build-binaries, build-sdist and validate-artifacts all
+    # need it -- and that chain measured 3h25m and 4h13m on its last two main
+    # runs. Paying that on every develop->qa promotion to get a one-minute
+    # version check is the wrong trade (mandate #7). A push to main still runs
+    # the full matrix, and so does an explicit workflow_dispatch against `qa`,
+    # which is how you validate a release candidate on purpose.
+    if: ${{ !(github.event_name == 'push' && github.ref_name == 'qa') }}
     runs-on: ubuntu-latest
     outputs:
       version: ${{ needs.version-check.outputs.version }}
@@ -132,6 +149,7 @@ jobs:
   # BUILD RUST BINARIES - Cross-platform binary builds
   # ============================================================================
   build-binaries:
+    timeout-minutes: 150
     name: Build ${{ matrix.target }}
     needs: prepare
     runs-on: ${{ matrix.os }}
@@ -143,7 +161,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
-            features: ""
+            features: "cloud-full"
 
           # Linux x86_64 (musl - static) - DISABLED for v0.2.0
           # Target installation issue - requires manual musl target setup
@@ -173,7 +191,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             archive: zip
-            features: ""
+            features: "cloud-full"
 
     steps:
       - name: Checkout
@@ -382,6 +400,7 @@ jobs:
   # BUILD SOURCE DISTRIBUTION
   # ============================================================================
   build-sdist:
+    timeout-minutes: 45
     name: Build Source Distribution
     needs: prepare
     runs-on: ubuntu-22.04
@@ -422,6 +441,7 @@ jobs:
   # VALIDATE ARTIFACTS - Pre-release validation gate
   # ============================================================================
   validate-artifacts:
+    timeout-minutes: 30
     name: Validate Artifacts
     needs: [prepare, build-binaries, build-sdist]
     runs-on: ubuntu-latest
@@ -730,10 +750,14 @@ jobs:
   # PRE-RELEASE SUMMARY - Generate release-ready.json
   # ============================================================================
   prerelease-summary:
+    timeout-minutes: 30
     name: Pre-Release Summary
     needs: [prepare, validate-artifacts]
     runs-on: ubuntu-latest
-    if: always()
+    # `always()` so it still reports when a build leg fails -- but not on an
+    # automatic `qa` push, where `prepare` is skipped on purpose and there is
+    # nothing to summarise.
+    if: ${{ always() && !(github.event_name == 'push' && github.ref_name == 'qa') }}
     steps:
       - name: Download All Artifacts
         uses: actions/download-artifact@v8
@@ -811,10 +835,13 @@ jobs:
   # CLEANUP
   # ============================================================================
   cleanup:
+    timeout-minutes: 30
     name: Cleanup Artifacts
     needs: [prepare, validate-artifacts, prerelease-summary]
     runs-on: ubuntu-latest
-    if: always()
+    # Nothing is uploaded on an automatic `qa` push, so there is nothing to
+    # delete.
+    if: ${{ always() && !(github.event_name == 'push' && github.ref_name == 'qa') }}
     steps:
       - name: Delete Workflow Artifacts
         uses: geekyeggo/delete-artifact@v6

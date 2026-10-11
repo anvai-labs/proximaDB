@@ -22,8 +22,7 @@ T = TypeVar("T", bound="BatchCreateNodesRequest")
 
 @_attrs_define
 class BatchCreateNodesRequest:
-    """Body for `POST /api/v2/graphs/{id}/nodes/batch`.
-
+    """
     Attributes:
         nodes (list[NodeInput]):
     """

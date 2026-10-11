@@ -403,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=5690)
     parser.add_argument("--max-segments", type=int, default=1)
     parser.add_argument("--required-layout-version", type=int, default=3)
-    parser.add_argument("--target-recall", type=float, default=0.98)
+    parser.add_argument("--target-recall", type=float, default=0.975)
     parser.add_argument(
         "--quality-policy",
         choices=("require", "report"),

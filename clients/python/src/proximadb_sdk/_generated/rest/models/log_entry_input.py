@@ -28,7 +28,9 @@ class LogEntryInput:
         Attributes:
             message (str):
             timestamp_ns (int | None | Unset):
-            severity (str | Unset): One of: trace, debug, info, warn, error, fatal (case-insensitive). Default: 'info'.
+            severity (str | Unset): Canonical: trace, debug, info, warn, error, fatal. Aliases accepted (case-insensitive):
+                verbose->trace, information->info, warning->warn, err->error, critical->fatal. Unknown values fall back to info.
+                Default: 'info'.
             source (None | str | Unset):
             service (None | str | Unset):
             fields (LogEntryInputFields | Unset):

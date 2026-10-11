@@ -35,6 +35,26 @@ pub mod optimizer;
 use anyhow::Result;
 use futures::future::join_all;
 
+/// TD-RDSTRAT-13 PR-B: records the cascade umbrella wall on drop, so every
+/// exit path (returns, `?`) attributes. Pairs with the four stage timers.
+struct UmbrellaTimer {
+    started: std::time::Instant,
+}
+
+impl UmbrellaTimer {
+    fn new(started: std::time::Instant) -> Self {
+        Self { started }
+    }
+}
+
+impl Drop for UmbrellaTimer {
+    fn drop(&mut self) {
+        let us = self.started.elapsed().as_micros() as u64;
+        crate::observability::io_trace::record_cascade_total_us(us);
+        crate::storage::engines::sst::metrics::record_cascade_total_us(us);
+    }
+}
+
 /// TD-RDSTRAT-13 C3: a discovered segment plus the size the listing already
 /// reported. `size_bytes` lets the read path skip the per-segment HEAD (one
 /// billed metadata op per segment per query); `None` means the backend did
@@ -405,6 +425,11 @@ impl SstEngine {
         snapshot_lsn: u64,
         known_size: Option<u64>,
     ) -> anyhow::Result<Option<Vec<OptimizedSearchRecord>>> {
+        // TD-RDSTRAT-13 PR-B: umbrella wall over the whole cascade — the four
+        // stage timers (probe rank, Region-B, Region-D, rehydrate) decompose
+        // this span; their sum vs this value names any unattributed remainder.
+        let cascade_started = std::time::Instant::now();
+        let _cascade_umbrella = UmbrellaTimer::new(cascade_started);
         use proximadb_block_format::RankMetric;
         // Map the query metric to a cascade rank metric. Euclidean + Cosine
         // carry the SIFT-ratchet recall validation; DotProduct is also routed
@@ -529,6 +554,7 @@ impl SstEngine {
                             &[],
                             &[],
                             None,
+                            self.segment_invariants_cache.as_deref(),
                         )
                         .await
                         .unwrap_or_else(|e| {

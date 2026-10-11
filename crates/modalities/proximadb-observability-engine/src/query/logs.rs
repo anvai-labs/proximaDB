@@ -490,18 +490,21 @@ impl LogAggregator {
 
     /// Convert SqlValue to string for grouping
     fn sql_value_to_string(value: &SqlValue) -> String {
+        // Group-by keys keep THIS site's distinct null/unset/bytes bucket
+        // spellings (a null dimension counts separately from an explicitly
+        // empty one — collapsing them changed bucket counts); scalars +
+        // Jsonb render through the ONE shared crate fn.
         use crate::proto::proximadb_v1::sql_value::Value;
-
         match &value.value {
             Some(Value::NullValue(_)) => "<null>".to_string(),
-            Some(Value::BoolValue(b)) => b.to_string(),
-            Some(Value::Int64Value(i)) => i.to_string(),
-            Some(Value::NumberValue(f)) => f.to_string(),
-            Some(Value::StringValue(s)) => s.clone(),
             Some(Value::BytesValue(b)) => format!("<bytes:{}>", b.len()),
             Some(Value::ArrayValue(arr)) => format!("<array:{}>", arr.values.len()),
             Some(Value::ObjectValue(obj)) => format!("<object:{}>", obj.fields.len()),
             None => "<empty>".to_string(),
+            // Only the scalar/Jsonb variants remain, all of which the shared
+            // fn covers — unwrap_or_default keeps the match total without
+            // aliasing a bucket spelling.
+            _ => super::sql_scalar_to_string(value).unwrap_or_default(),
         }
     }
 }
@@ -895,6 +898,75 @@ mod tests {
         assert_eq!(result.buckets[0].count, 2);
         assert_eq!(result.buckets[1].key, "500");
         assert_eq!(result.buckets[1].count, 1);
+    }
+
+    #[test]
+    fn aggregation_keeps_null_distinct_from_empty_string() {
+        use crate::proto::proximadb_v1::sql_value::Value;
+
+        let null_fields = [(
+            "status".to_string(),
+            SqlValue {
+                value: Some(Value::NullValue(0)),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let empty_fields = [(
+            "status".to_string(),
+            SqlValue {
+                value: Some(Value::StringValue(String::new())),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let logs = vec![
+            make_log_with_fields("null", Severity::Info, "api", 0, null_fields),
+            make_log_with_fields("empty", Severity::Info, "api", 0, empty_fields),
+        ];
+
+        let result =
+            LogAggregator::aggregate(&logs, &LogAggregation::GroupBy("status".to_string()));
+        let keys: std::collections::BTreeSet<_> = result
+            .buckets
+            .iter()
+            .map(|bucket| bucket.key.as_str())
+            .collect();
+
+        assert_eq!(keys, ["", "<null>"].into_iter().collect());
+    }
+
+    #[test]
+    fn aggregation_groups_jsonb_by_document_not_byte_length() {
+        use crate::proto::proximadb_v1::sql_value::Value;
+
+        let make_fields = |region: &str| {
+            let document = serde_json::json!({"region": region});
+            [(
+                "context".to_string(),
+                SqlValue {
+                    value: Some(Value::JsonbValue(
+                        proximadb_data_model::ProximaValue::to_jsonb_vec(&document)
+                            .expect("encode JSONB test value"),
+                    )),
+                },
+            )]
+            .into_iter()
+            .collect()
+        };
+        let logs = vec![
+            make_log_with_fields("east", Severity::Info, "api", 0, make_fields("east")),
+            make_log_with_fields("west", Severity::Info, "api", 0, make_fields("west")),
+        ];
+
+        let result =
+            LogAggregator::aggregate(&logs, &LogAggregation::GroupBy("context".to_string()));
+        let keys: std::collections::BTreeSet<_> =
+            result.buckets.iter().map(|bucket| &bucket.key).collect();
+
+        assert_eq!(result.buckets.len(), 2);
+        assert!(keys.contains(&serde_json::json!({"region": "east"}).to_string()));
+        assert!(keys.contains(&serde_json::json!({"region": "west"}).to_string()));
     }
 
     #[test]

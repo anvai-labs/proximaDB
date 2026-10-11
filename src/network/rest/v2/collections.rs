@@ -145,8 +145,9 @@ pub struct CreateCollectionV2Request {
     pub dimension: u32,
     /// Storage engine selection
     ///
-    /// Options: "auto", "sst", "helix", "viper", "swift", "nova", "raptor", "tst"
+    /// Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
     /// Default: "auto" (system selects optimal engine)
+    /// ("viper" is no longer accepted — deprecated by ADR-093)
     pub engine: Option<String>,
     /// Schema definition with column types
     pub schema: Option<SchemaDefinition>,
@@ -590,12 +591,19 @@ pub async fn create_collection_v2(
 
     // Validate engine if specified
     let engine = request.engine.as_deref().unwrap_or("auto");
-    let valid_engines = [
-        "auto", "sst", "helix", "viper", "swift", "nova", "raptor", "tst",
-    ];
+    // "viper" deliberately excluded (TD-VIPER-1 S2 / ADR-093): it's no
+    // longer selectable for new collections. Reject it here with a proper
+    // 400 rather than letting it fall through to CollectionService's
+    // generic 500 (ApiError::Internal) three layers down.
+    let valid_engines = ["auto", "sst", "helix", "swift", "nova", "raptor", "tst"];
     if !valid_engines.contains(&engine) {
+        let hint = if engine == "viper" {
+            " (VIPER is deprecated, ADR-093 — use sst/nova/helix instead)"
+        } else {
+            ""
+        };
         return Err(ApiError::InvalidArgument(format!(
-            "Invalid storage engine '{}'. Valid engines: {:?}",
+            "Invalid storage engine '{}'{hint}. Valid engines: {:?}",
             engine, valid_engines
         )));
     }

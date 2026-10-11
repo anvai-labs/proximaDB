@@ -54,9 +54,7 @@ pub use observability::ObservabilityRestState;
 pub use analytics::create_analytics_router;
 pub use document::create_document_router;
 pub use graph::create_graph_router;
-pub use hybrid::{
-    create_health_router, create_hybrid_search_router, execute_sql, sql_value_to_json,
-};
+pub use hybrid::{create_health_router, create_hybrid_search_router, execute_sql};
 pub use multimodal_query::create_multimodal_router;
 pub use observability::create_observability_router;
 

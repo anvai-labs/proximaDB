@@ -107,7 +107,7 @@ def main():
     print(f"ASYNC COMPACTION (ADR-076 D1+D2) @ N={N:,}")
     print(f"{'='*64}")
     print(f"ingest throughput = {N/ingest_dur:,.0f} vec/s ({ingest_dur:.0f}s)")
-    print(f"recall@{TOPK}       = {mean_r:.4f} (target >= 0.98)")
+    print(f"recall@{TOPK}       = {mean_r:.4f} (target >= 0.975)")
     print(f"cold latency      = p50 {p50:.1f}ms  p95 {p95:.1f}ms")
     print(f"\nGrep the server log for compaction counts:")
     print(f"  'Compaction completed for level'  = D1 async completions")

@@ -62,7 +62,7 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import (
     Any,
@@ -552,12 +552,12 @@ class TimeSeriesRepository:
                 raw = raw[:-1] + "+00:00"
             dt = datetime.fromisoformat(raw)
         if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            dt = dt.astimezone(UTC).replace(tzinfo=None)
         return dt
 
     @staticmethod
     def _format_timestamp(value: datetime) -> str:
-        return value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        return value.replace(tzinfo=UTC).isoformat().replace("+00:00", "Z")
 
     @staticmethod
     def _normalize_aggregation(
@@ -746,11 +746,9 @@ class TimeSeriesRepository:
     def _bucket_start(self, timestamp: datetime, bucket_ms: int | None) -> datetime:
         if not bucket_ms:
             return timestamp
-        epoch_ms = int(timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        epoch_ms = int(timestamp.replace(tzinfo=UTC).timestamp() * 1000)
         rounded_ms = epoch_ms - (epoch_ms % bucket_ms)
-        return datetime.fromtimestamp(rounded_ms / 1000, tz=timezone.utc).replace(
-            tzinfo=None
-        )
+        return datetime.fromtimestamp(rounded_ms / 1000, tz=UTC).replace(tzinfo=None)
 
     def _aggregate_value(self, values: list[Any], aggregation: AggregationType) -> Any:
         if aggregation == AggregationType.COUNT:

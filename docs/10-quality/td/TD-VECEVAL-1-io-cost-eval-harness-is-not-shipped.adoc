@@ -1,0 +1,169 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-VECEVAL-1: The recall+I/O-cost harness is a repo test, so users cannot evaluate on their own data
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-08 while documenting PAX-IVF vs AXIS-IVF selection; the guide can tell users what to measure but not give them a tool they can run.
+| Priority | **MEDIUM.** No defect; a packaging gap that blocks the "evaluate before you adopt" motion and keeps our own cost evidence un-reproducible outside the repo.
+| Component | `tests/sift_pax_recall_ratchet_test.rs`, `apps/proximadb-ann-bench`, `docs/02-guides/vector-index-selection-and-benchmarking.md`
+| Relates to | ADR-033 (cost spine), TD-087 / TD-088 (cold-path + point-read cost), TD-SEARCH-3 (Azure budget evidence), mandate #6 (measure, don't assert)
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+The instrument that measures what actually matters on object storage — **recall@k
+AND GETs/query AND bytes/query in the same run** — exists and works, but lives in
+`tests/sift_pax_recall_ratchet_test.rs`. Consequences:
+
+* A user cannot run it. It needs the repo, the toolchain, `--features io-trace`,
+  and `cargo test`; it is not in any released artifact.
+* It is `#[test]`-shaped, so it reports via `--nocapture` prose rather than a
+  machine-readable artifact a user could diff across configurations.
+* The shipped benchmark binary, `apps/proximadb-ann-bench`, is the *classic*
+  ann-benchmarks shape — recall vs QPS across algorithms on standardized
+  datasets. It does **not** report the I/O-cost dimension, which is the term our
+  own cost spine ranks first (DEPTH ≫ WIDTH ≫ BYTES ≫ CPU).
+
+So we publish a guide telling users the decision rests on GETs/query, and ship no
+tool that prints GETs/query.
+
+== What is already right (do not rebuild it)
+
+* **Dataset contract is already user-generic:** plain-binary TEXMEX
+  `.fvecs`/`.ivecs`, parsed with std only (no HDF5 dependency), and when ground
+  truth is absent or a subset is inserted it computes a **brute-force oracle over
+  the inserted rows**. So arbitrary customer corpora already work.
+* **The measurement is implemented:** per-query GET / ranged-GET / bytes /
+  compute-ms, via the **`io_trace` records**, plus recall against the oracle.
++
+  The seam matters for item 1 below, so be precise about it:
+  `record_physical_full_read` is **always-on query evidence** --
+  `src/storage/persistence/filesystem/mod.rs` says so in terms, and adds that
+  `PROXIMADB_COUNT_FS_IO` "controls only the separate process-global benchmark
+  counters". An earlier revision of this bullet credited
+  `PROXIMADB_COUNT_FS_IO` + the `CountingFileSystem` wrapper, which is the wrong
+  one: the documented run never sets that var (only the two `#[ignore]`d evals
+  do), and the guide tells readers **not** to, because the check is
+  `var_os(...).is_some()` so even `=0` wraps the filesystem and changes the stack
+  the latency numbers come from.
++
+  Nor is there a bytes/query budget assertion in the documented run. Its
+  *aggregate* asserts are `measured > 0`, the paired-sample minimum and
+  `recall >= floor`; it also asserts per pair (exact-vs-ground-truth equality,
+  non-zero GETs and bytes, and the single-vector-access equalities), so that is
+  the aggregate list rather than the whole set. The byte
+  budget (`PROXIMADB_SIFT_COALESCED_BYTE_BUDGET`) is read only inside the
+  `#[ignore]`d `sift_coalesced_rabitq_scan_rerank_eval`.
+* **Cloud budgets are reachable** through `PROXIMADB_OBJECT_STORE_URL`, which is
+  how the **local 1 MiB vs `s3://` 8 MiB** budget difference was measured.
+  (An earlier revision said "4 MiB-vs-8 MiB". That is the same provenance error
+  the guide page corrected and this TD republished: `IopsBudget::LOCAL.target` is
+  1 MiB and `S3.target` is 8 MiB; 4 MiB is the AZURE/CLOUD profile, and no
+  Azure-budget arm is measured anywhere in this work.)
+
+== How to apply
+
+1. **Add a subcommand to the existing `proximadb-ann-bench`** (do not create a
+   third benchmark vehicle) — e.g. `proximadb-ann-bench io-cost` — that reuses
+   the test's `.fvecs`/`.ivecs` parser, brute-force oracle, and **`io_trace`
+   snapshotting** -- not the `CountingFileSystem` counters, per the seam note
+   above; wiring the user tool to a different counter set than the gate uses is
+   exactly the drift item 3 exists to prevent. Extract those three into a small lib module both callers share,
+   rather than copying them.
+2. **Emit a machine-readable artifact** (JSON/CSV: `corpus_n`, `dim`, `top_k`,
+   `nprobe`, `budget_target_bytes`, `recall_at_k`, `gets_per_query`,
+   `bytes_per_query`, `bytes_per_get`) so a user can sweep and diff. Prose
+   `eprintln!` is why our own numbers are hard to compare run-to-run.
+3. **Keep the ratchet test as the gate.** It should call the same shared module,
+   so the thing CI gates on and the thing users run cannot drift apart — the
+   failure mode this TD family keeps hitting.
+4. Document the subcommand in
+   `docs/02-guides/vector-index-selection-and-benchmarking.md`, replacing that
+   guide's `cargo test` instructions once the binary exists.
+
+== Adjacent defect found while filing this
+
+`sift_ivf2_coarse_probe_recall_ratchet` **failed a precondition and could not
+run** when this TD was filed. **FIXED** in the same change that files
+TD-IVF2ENGAGE-1 and TD-SIFTCOMPACT-1 — TD-SIFTCOMPACT-1 is where the minting
+decision is recorded, TD-IVF2ENGAGE-1 where the barrier is. It mints
+`next_object_id()` at that call site and adds a compaction-quiescence barrier, so
+the arm runs and is now the worked example the guide points at. The rest of this
+section is kept because it is the diagnosis, not the current state. The error
+was:
+
+[source]
+----
+compaction admission requires a catalog-resolved collection object id for
+"sift_ivf2_gate": flush collection_id must be a decimal catalog object id,
+got "sift_ivf2_gate": invalid digit found in string
+----
+
+It passed a collection *name* where a decimal catalog object id is now required.
+Because the test is `#[ignore]`d, CI never ran it, so the drift was invisible —
+the same ungated-rot pattern as the stale `rg_layout` "default OFF" comments.
+That `#[ignore]` is unchanged, so the arm is still outside every CI tier; what
+changed is that it can now be run by hand and produces measurements
+(TD-IVF2ENGAGE-1 records them).
+
+Note why the *other* SIFT ratchets in the same file are unaffected: the decimal-id
+requirement is enforced at the **flush/compaction-admission** boundary
+(`FlushParams::get_collection_object_id` and its compaction twin, in
+`crates/storage/proximadb-storage-traits/src/types.rs`), which only this test
+**asserts on** — it is the one that drives v3 through the production compaction
+trigger and fails loudly when admission declines.
+
+CORRECTION (round 6): an earlier revision said "the others set `id` to a name too
+and never hit that boundary, so the pattern looks fine by inspection and is not."
+They DID hit it, in the window between TD-WLP-7 (#1012, 2026-07-15 -- the first
+change to schedule compaction from a flush at all) and TD-SIFTCOMPACT-1. In that
+window `collection()` set no tags, so `resolve_compaction_armed(&[])` was true by
+default; at `PROXIMADB_SIFT_N=100000` with `BATCH_SIZE = 20_000` the fifth flush
+reached `L0_COMPACTION_THRESHOLD = 5`, compaction became due, and the same
+admission error fired. The difference was only that those arms never asserted on
+it: it landed in `compaction_error`, was logged at `warn`, and the flush
+succeeded. So the defect was broader than filed, and the sentence that
+congratulated itself for not trusting inspection was itself an inspection error
+-- see TD-SIFTCOMPACT-1.
+
+It no longer fires, in either direction. TD-SIFTCOMPACT-1 made `collection()` set
+`tags: vec!["compaction:off"]`, and `should_trigger_compaction` returns `Ok(None)`
+on `!resolve_compaction_armed(tags)` before the threshold or the object id is ever
+reached (`src/storage/engines/sst/flush/mod.rs`) -- so these arms are now off by
+decision rather than by a swallowed admission error.
+
+**The fix is two lines, and the canonical precedent is already in the repo.**
+`tests/sst_ivf2_compaction_route_proof_test.rs` mints an id for exactly this
+reason:
+
+[source,rust]
+----
+/// The SST flush / compaction-admission path is fail-closed on a decimal id
+/// (`FlushParams::get_collection_object_id`), so a bare-engine test must supply
+/// one — the human name lives in `CollectionConfig.name`.
+fn next_object_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed).to_string()
+}
+----
+
+So `sift_ivf2_coarse_probe_recall_ratchet` needs `id: next_object_id()` with
+`config.name: "sift_ivf2_gate"` — do not hash the name at the storage boundary,
+which `get_collection_object_id`'s own doc comment warns against ("a second,
+collision-prone identity domain that cannot be joined reliably with catalog,
+MVCC, deletion-vector, or compaction state").
+
+Fixing it did not change CI, since the test stays `#[ignore]`d — the value is
+that the clustered-arm eval became runnable at all, which is what this TD needs
+in order to ship a harness whose arms are not vacuous. Worth folding into item 3:
+a gate that cannot run is not a gate.
+
+An earlier revision of this paragraph said the clustered arm "must be exercised
+through `sift_ivf2_probe_release_bakeoff_eval` until it is fixed". Both halves are
+now wrong: it is fixed, and the bakeoff eval is not a general substitute — it
+hard-asserts a full 1M corpus and exactly 100 queries and requires precomputed
+ground truth, reading neither `PROXIMADB_SIFT_N` nor `PROXIMADB_SIFT_QUERIES`.

@@ -1859,6 +1859,9 @@ impl PartitionLeaseStore {
             self.store.clone(),
             format!("{}/{tenant_id}/{collection_id}/_manifests", self.prefix),
         )
+        .with_legacy_encoding(
+            proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+        )
     }
 
     /// Read the current lease for a partition with its pointer version + fencing
@@ -1950,7 +1953,11 @@ impl PartitionLeaseStore {
         }
 
         let path = format!("{}/{}", self.prefix, key.to_path());
-        Ok(ManifestCommitter::new(self.store.clone(), path))
+        Ok(
+            ManifestCommitter::new(self.store.clone(), path).with_legacy_encoding(
+                proximadb_iceberg_engine::manifest::LegacyEncoding::GenerationPrefixed,
+            ),
+        )
     }
 
     /// Read the current lease for a resource by its ResourceKey.
@@ -2650,6 +2657,8 @@ impl PartitionLeaseManager {
     /// a log visited twice in one pass (a collection acquired via both the legacy and
     /// `ResourceKey` APIs shares one manifest log) is a harmless no-op the second time.
     /// See [`ManifestCommitter::prune_retention`] for the safety invariants.
+    /// Unmigrated legacy logs are rejected without deletion and logged; migration
+    /// is an explicit operator action, never performed by this maintenance loop.
     pub async fn prune_held(&self, keep_k: usize, min_age: std::time::Duration) -> Result<usize> {
         let mut total = 0usize;
 
@@ -2707,19 +2716,18 @@ impl PartitionLeaseManager {
     /// manifest log this pod owns, every `interval`. Drop the returned [`JoinHandle`]
     /// as a temporary so the task runs detached — matches [`spawn_renew_loop`].
     ///
-    /// Capping the manifest count per log is *itself* the read-path fix: every
-    /// `latest_version()` (a full `list`) stays cheap once `n` is bounded, instead of
-    /// growing O(n) per lease op and O(n²) over a pod's lifetime (the observed failure
-    /// was ~48k manifests/collection pinning a CPU core). See
-    /// [`ManifestCommitter::prune_retention`] for the safety invariants.
+    /// Only explicitly migrated versioned logs can prune. Their current lookup
+    /// uses the authoritative head, independent of history count. Legacy history
+    /// continues growing until migration; this loop must not reopen legacy slots.
+    /// See [`ManifestCommitter::prune_retention`] for the safety invariants.
     ///
     /// **Scope / safety.** Only logs for resources this pod owns are pruned
     /// (`binding.pod == self_pod_id`, same gate as [`renew_held`]); the held set is
     /// re-read fresh each tick, so a key lost between ticks is not pruned again.
-    /// `prune_retention` is fence-safe by construction (it never deletes the tip — the
-    /// only object the generation fence reads), so even a displaced owner that prunes
-    /// for one extra tick before the renew loop steps it down can only delete non-tip
-    /// history, never break the fence. Detached, like the renew loop: process exit
+    /// Versioned pruning deletes only archives below the observed head, never its
+    /// authority or current payload. Merely preserving the maximum legacy slot
+    /// would NOT fence delayed writers; legacy pruning is therefore disabled.
+    /// Detached, like the renew loop: process exit
     /// tears the runtime down and aborts the task; a graceful SIGTERM flush races only
     /// idempotent manifest deletes.
     pub fn spawn_prune_loop(
@@ -3475,6 +3483,34 @@ mod tests {
             "generation must stay monotonic (tombstone@2 → acquire@3), not reset to 1"
         );
         assert!(!lease.released);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partition_serving_handles_continue_after_explicit_manifest_migration() -> Result<()> {
+        let backing = shared_backing();
+        let serving = store(&backing);
+        let key = ResourceKey::table("t1", "public", "migration_test");
+        assert!(matches!(
+            serving.acquire_with_key(&key, "A", 0, 10_000).await?,
+            LeaseOutcome::Acquired(_)
+        ));
+        // Explicit cutover while all source writers/pruners are quiescent.
+        serving
+            .committer_for_key(&key)?
+            .migrate_versioned(0)
+            .await?;
+        let (_, before) = serving.read_key(&key).await?.expect("migrated lease");
+        assert_eq!(before.holder_pod, "A");
+        serving.release_with_key(&key, "A", 100).await?;
+        let reopened = store(&backing);
+        let LeaseOutcome::Acquired(after) =
+            reopened.acquire_with_key(&key, "B", 200, 10_000).await?
+        else {
+            panic!("successor must acquire released versioned lease");
+        };
+        assert_eq!(after.holder_pod, "B");
+        assert_eq!(after.generation, 3);
         Ok(())
     }
 

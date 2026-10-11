@@ -129,7 +129,7 @@ Pinecone ($350).
 
 == Related
 
-link:ADR-080-vector-search-compaction-tuning.adoc[ADR-080],
-link:ADR-076-async-compaction-admission-control.adoc[ADR-076],
+link:../../12-design/adr/ADR-080-vector-search-compaction-tuning.adoc[ADR-080],
+link:../../12-design/adr/ADR-076-async-compaction-admission-control.adoc[ADR-076],
 link:TD-COMPACT-1-slow-recluster-compaction.adoc[TD-COMPACT-1],
 link:TD-COMPACT-6-async-compaction.adoc[TD-COMPACT-6].

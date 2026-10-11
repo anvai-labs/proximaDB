@@ -8,7 +8,7 @@
 use axum::{
     extract::{Extension, Json, Path, Query, State},
     http::StatusCode,
-    response::Json as JsonResponse,
+    response::{IntoResponse, Json as JsonResponse, Response},
 };
 use proximadb_api::rest::deprecation::add_rest_v1_deprecation_headers;
 use proximadb_graph_query::service::GraphExecutionService;
@@ -245,16 +245,18 @@ pub struct AppState {
     pub queue_client: Option<Arc<proximadb_queue::QueueClient>>,
     /// Optional ranking framework services (R-7c). When `Some`, the
     /// `/api/v2/rank/search` route routes through the multi-phase
-    /// pipeline; when `None`, the route returns 503. See
+    /// pipeline; when `None`, the route returns 501 Not Implemented
+    /// (the DEFAULT server always wires this — 501 is reachable only in
+    /// non-default/embedded constructions). See
     /// `src/network/rest/canonical/rank.rs` and
     /// `roadmap/RANKING_FRAMEWORK_SPEC_2026_05_23.md`.
     pub rank_services: Option<Arc<crate::network::rest::canonical::rank::RankServices>>,
 
     /// Optional durable rank-profile catalog (R-7c.3 production wiring).
-    /// When `Some`, the `/api/v2/rank/profiles` REST routes can install,
-    /// fetch, and remove profiles end-to-end. When `None`, those routes
-    /// return 503. Should always be wired alongside `rank_services` so
-    /// installs reach both the catalog and the live registry.
+    /// NOTE: the `/api/v2/rank/profiles` REST routes referenced below are
+    /// BUILT (rank_profile.rs dispatchers) but NOT MOUNTED anywhere —
+    /// profile management is TOML-file/pgwire-only until they are
+    /// registered (round-1 review finding, TD-SPECRAT-1 wave 8).
     pub rank_profile_store: Option<Arc<dyn crate::services::RankProfileStore>>,
 
     /// Optional recall-probe gate (TD-064 / LLD §5). When `Some`, the v2
@@ -845,6 +847,9 @@ fn filter_canonical_wal_for_collection(
             proximadb_storage_common::CanonicalOperation::RecordDelete {
                 collection_id, ..
             } => collection_id == collection,
+            proximadb_storage_common::CanonicalOperation::RecordPartitionDrop { collection_id } => {
+                collection_id == collection
+            }
             proximadb_storage_common::CanonicalOperation::Checkpoint(_)
             | proximadb_storage_common::CanonicalOperation::CdcBarrier { .. }
             | proximadb_storage_common::CanonicalOperation::CatalogMutation { .. } => false,
@@ -1316,38 +1321,7 @@ fn parse_distribution_mode(
     }
 }
 
-/// Helper: convert proto SqlValue to serde_json::Value (temporary until full internal refactor)
-fn sql_value_to_json(v: &proximadb_v1::SqlValue) -> serde_json::Value {
-    use proximadb_v1::sql_value::Value as V;
-    match v.value.as_ref() {
-        Some(V::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(V::NumberValue(n)) => serde_json::Value::Number(
-            serde_json::Number::from_f64(*n).unwrap_or(serde_json::Number::from(0)),
-        ),
-        Some(V::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(V::Int64Value(i)) => serde_json::Value::Number((*i).into()),
-        Some(V::BytesValue(b)) => {
-            // Represent bytes as JSON array of integers
-            serde_json::Value::Array(
-                b.iter()
-                    .map(|x| serde_json::Value::Number((*x as u64).into()))
-                    .collect(),
-            )
-        }
-        Some(V::NullValue(_)) => serde_json::Value::Null,
-        Some(V::ArrayValue(arr)) => {
-            serde_json::Value::Array(arr.values.iter().map(sql_value_to_json).collect())
-        }
-        Some(V::ObjectValue(obj)) => {
-            let mut map = serde_json::Map::new();
-            for (k, sv) in &obj.fields {
-                map.insert(k.clone(), sql_value_to_json(sv));
-            }
-            serde_json::Value::Object(map)
-        }
-        None => serde_json::Value::Null,
-    }
-}
+use proximadb_records::conversions::sql_value_to_json;
 
 // =============================================================================
 // Hybrid Search (BM25 + Vector with RRF Fusion)
@@ -1517,6 +1491,25 @@ pub type FullTextIndexMap = Arc<
 /// deprecation-header layers as every other route (no behaviour change vs. the
 /// prior inline registration). Keeping them in one named builder is the
 /// "single source of truth" for which `/api/v2` routes are non-SDK.
+fn rank_json_rejection_response(status: StatusCode, message: String) -> Response {
+    let error_type = match status {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+        StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_body",
+        _ => "invalid_json",
+    };
+    (
+        status,
+        JsonResponse(serde_json::json!({
+            "error": {
+                "type": error_type,
+                "message": message,
+                "code": status.as_u16()
+            }
+        })),
+    )
+        .into_response()
+}
+
 fn operator_and_control_v2_routes() -> axum::Router<AppState> {
     use axum::routing::{get, post};
 
@@ -1544,16 +1537,35 @@ fn operator_and_control_v2_routes() -> axum::Router<AppState> {
         // runtime, blocked previously by `bumpalo::Bump` being `!Sync`.
         // The route returns:
         //   200 — successful rank pipeline result
+        //   400/415/422 — canonical JSON errors for request extraction
         //   404 — named profile not found
         //   501 — RankServices not injected at startup
         //   500 — pipeline failure (model load, expression compile, …)
         .route(
             "/api/v2/rank/search",
-            post(|State(state): State<AppState>, Json(req): Json<crate::network::rest::canonical::rank::RankSearchRequest>| async move {
-                crate::network::rest::canonical::rank::rank_search_dispatch(state, req)
-                    .await
-                    .map(Json)
-            }),
+            post(
+                |State(state): State<AppState>,
+                 payload: Result<
+                    Json<crate::network::rest::canonical::rank::RankSearchRequest>,
+                    axum::extract::rejection::JsonRejection,
+                >| async move {
+                    match payload {
+                        Ok(Json(req)) => {
+                            match crate::network::rest::canonical::rank::rank_search_dispatch(
+                                state, req,
+                            )
+                            .await
+                            {
+                                Ok(response) => Json(response).into_response(),
+                                Err(error) => error.into_response(),
+                            }
+                        }
+                        Err(rejection) => {
+                            rank_json_rejection_response(rejection.status(), rejection.body_text())
+                        }
+                    }
+                },
+            ),
         )
         // Phase 6: per-collection pinning control surface.
         // Operators PATCH a collection's pin state; the AxisTieringManager
@@ -2622,6 +2634,29 @@ mod tests {
         assert!(response.error.is_some());
     }
 
+    #[tokio::test]
+    async fn rank_json_rejections_use_canonical_error_envelope() {
+        for (status, expected_type) in [
+            (StatusCode::BAD_REQUEST, "invalid_json"),
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type"),
+            (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request_body"),
+        ] {
+            let response = rank_json_rejection_response(status, "invalid rank request".into());
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(axum::http::header::CONTENT_TYPE),
+                Some(&axum::http::HeaderValue::from_static("application/json"))
+            );
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], expected_type);
+            assert_eq!(body["error"]["message"], "invalid rank request");
+            assert_eq!(body["error"]["code"], status.as_u16());
+        }
+    }
+
     #[test]
     fn test_hybrid_search_request_deserialization() {
         let json = serde_json::json!({
@@ -2972,7 +3007,8 @@ mod tests {
             value: Some(proximadb_v1::sql_value::Value::BytesValue(vec![0, 1, 255])),
         };
         let json = sql_value_to_json(&val);
-        assert_eq!(json, serde_json::json!([0, 1, 255]));
+        // Round 15: delegated to the shared converter — bytes render base64.
+        assert_eq!(json, serde_json::json!("AAH/"));
     }
 
     #[test]
@@ -3042,8 +3078,8 @@ mod tests {
             value: Some(proximadb_v1::sql_value::Value::NumberValue(f64::NAN)),
         };
         let json = sql_value_to_json(&val);
-        // NaN cannot be represented in JSON, falls back to 0
-        assert_eq!(json, serde_json::json!(0));
+        // Round 15: the shared converter renders non-finite floats as null.
+        assert_eq!(json, serde_json::json!(null));
     }
 
     // ============================================================

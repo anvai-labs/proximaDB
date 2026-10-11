@@ -1,5 +1,31 @@
 = SIFT1M PAX RaBitQ→SQ8 Recall Ratchet — WS8 Real-Dataset Run 2026-06-30
 
+[IMPORTANT]
+====
+**LAYOUT CAVEAT (added 2026-10-09, TD-SIFTCOMPACT-1).** The figures below describe
+an **L0-only, uncompacted** layout, not a compacted one -- and for these figures
+compaction was not merely rejected, it was **unreachable**. This run is dated
+2026-06-30; nothing scheduled compaction from a flush until TD-WLP-7 (#1012) on
+2026-07-15, before which the post-flush hook was a stub and `compaction_error` was
+hardcoded `None`. So no admission check ran and there was no `warn!`.
+
+Re-run the same configuration today -- meaning the 2026-06-30 tag set, before
+the helper pinned `compaction:off` -- and the layout is still L0-only, by a
+different route: compaction becomes due at N >= 100 000 and then fails the
+catalog-object-id admission check, with the error recorded on the flush result and
+logged at `warn!`. Either way the arms measured a pre-compaction layout with
+nothing to signal it. That is now the **stated** intent -- the shared collection
+helper pins `compaction:off`, making the layout deterministic rather than
+accidental -- but it means the recall here is not evidence about the compacted
+product.
+
+`BENCHMARK_EVIDENCE.toml`'s `pax_rabitq_sq8_sift1m_recall_at_10` entry carries the
+same caveat; this document is the other half of that pair, and TD-SIFTCOMPACT-1
+names both as needing re-baselining against a compacted layout. See also
+TD-IVF2ENGAGE-1, whose own headline finding was retracted once a
+compaction-quiescence barrier was added to the sibling IVF2 test.
+====
+
 == Run provenance
 - **Date:** 2026-06-30
 - **Hardware:** local macOS arm64 (shared dev machine — indicative, *not* an SLA)

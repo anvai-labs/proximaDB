@@ -97,7 +97,15 @@ impl PartitionMemory {
         self: &Arc<Self>,
         message: Message,
     ) -> std::result::Result<(MessageEntry, Option<BackpressureHint>), Message> {
-        let offset = self.next_offset.fetch_add(1, Ordering::Relaxed);
+        let offset =
+            match self
+                .next_offset
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    next.checked_add(1)
+                }) {
+                Ok(offset) => offset,
+                Err(_) => return Err(message),
+            };
         self.enqueue_at(message, offset).await
     }
 
@@ -110,18 +118,10 @@ impl PartitionMemory {
         message: Message,
         offset: u64,
     ) -> std::result::Result<(MessageEntry, Option<BackpressureHint>), Message> {
-        let mut current = self.next_offset.load(Ordering::Relaxed);
-        while offset + 1 > current {
-            match self.next_offset.compare_exchange_weak(
-                current,
-                offset + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        let Some(next) = offset.checked_add(1) else {
+            return Err(message);
+        };
+        self.next_offset.fetch_max(next, Ordering::Relaxed);
         self.enqueue_at(message, offset).await
     }
 
@@ -172,10 +172,8 @@ impl PartitionMemory {
         let mut expected: Option<u64> = None;
         for (&off, entry) in buf.entries.range(cursor..) {
             match expected {
-                None => {
-                    // First available key — clamp a lagging cursor up to it.
-                    expected = Some(off);
-                }
+                // First available key — clamp a lagging cursor up to it.
+                None => {}
                 Some(exp) if off == exp => {}
                 Some(_) => break, // gap — stop at the contiguous prefix boundary
             }
@@ -183,7 +181,10 @@ impl PartitionMemory {
                 break;
             }
             out.push(entry.clone());
-            expected = Some(expected.unwrap() + 1);
+            expected = off.checked_add(1);
+            if expected.is_none() {
+                break;
+            }
         }
         out
     }

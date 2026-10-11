@@ -275,7 +275,7 @@ LIMIT 5;
 - [Vector Search Guide](../02-guides/vector-search.md) - Advanced filtering, hybrid search
 - [Graph API](../03-api-reference/graph.adoc) - Add relationships to your data
 - [Multi-Model Joins](../02-guides/multi-model-joins.md) - Combine vectors, documents, graphs
-- [API Reference](../03-api-reference/) - Complete API documentation
+- [API Reference](../03-api-reference/index.md) - Complete API documentation
 
 ---
 

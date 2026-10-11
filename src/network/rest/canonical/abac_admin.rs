@@ -1143,7 +1143,8 @@ pub async fn delete_grant(
 
 #[derive(Debug, Deserialize)]
 pub struct PutPostureRequest {
-    /// `off` | `audit` | `enforce`.
+    /// `Off` | `Audit` | `Enforce` (externally tagged, PascalCase on the wire —
+    /// lowercase values are a serde parse error, not an alias).
     pub grant_enforcement: proximadb_catalog::tenant_posture::GrantEnforcement,
 }
 

@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -647,10 +648,10 @@ func TestVectorRecordJSON(t *testing.T) {
 // TestBatchInsert tests batch insert operations.
 func TestBatchInsert(t *testing.T) {
 	// Create mock server that tracks insert counts
-	insertCount := 0
+	var insertCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v2/collections/test_collection/records/batch" {
-			insertCount++
+			insertCount.Add(1)
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"success_count": 100,
@@ -691,6 +692,10 @@ func TestBatchInsert(t *testing.T) {
 
 	if result.TotalProcessed != 250 {
 		t.Errorf("expected 250 processed, got %d", result.TotalProcessed)
+	}
+
+	if got := insertCount.Load(); got != 3 {
+		t.Errorf("expected 3 batch requests, got %d", got)
 	}
 }
 

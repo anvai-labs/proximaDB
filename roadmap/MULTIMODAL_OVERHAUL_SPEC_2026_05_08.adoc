@@ -77,7 +77,7 @@ backward compatibility through the existing transitional facade pattern.
   refactor plan]: this doc says _what_ the modality runtimes contain; the workspace plan
   says _how_ they decompose into crates.
 * **Updates** link:../docs/00-product/VISION.adoc[Vision], link:../docs/00-product/PRD.adoc[PRD],
-  link:../docs/concepts/architecture.adoc[architecture.adoc], and
+  link:../docs/05-concepts/architecture.adoc[architecture.adoc], and
   link:../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] by extension; see
   Section 15 for the cross-reference table.
 
@@ -1922,7 +1922,7 @@ Each ADR is a sticky decision; new turns should not relitigate without explicit 
 | link:../docs/00-product/PRD.adoc[PRD.adoc]
 | Add P0 entries: "Type System Unification", "Unified Record Envelope", "Engine-Level RLS", "Predicate-Aware Vector Search". Update non-functional metrics with the targets from Section 14.
 
-| link:../docs/concepts/architecture.adoc[architecture.adoc]
+| link:../docs/05-concepts/architecture.adoc[architecture.adoc]
 | Replace "Target 8-Model Architecture" table with the per-modality projection table (Section 3.3). Add "Three-Layer Storage Model" diagram (Section 5.1). Reference this spec.
 
 | link:../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP.adoc]
@@ -1934,10 +1934,10 @@ Each ADR is a sticky decision; new turns should not relitigate without explicit 
 | link:techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc]
 | Add `proximadb-records`, `proximadb-types`, `proximadb-buffer-pool` to the new-foundation-crates list. Add `proximadb-relational` to the modality-runtime list. Confirm the cleanup items in §10.4 of this spec.
 
-| link:../docs/SOLID_VECTOR_FRAMEWORK_REDESIGN.md[SOLID_VECTOR_FRAMEWORK_REDESIGN.md]
+| link:../docs/_archive/reviews/SOLID_VECTOR_FRAMEWORK_REDESIGN.md[SOLID_VECTOR_FRAMEWORK_REDESIGN.md]
 | Already aligned. Reference Section 6.1 of this spec; bind the redesign to Phase F (workspace extraction of `proximadb-vector`).
 
-| link:../docs/MULTI_MODEL_ARCHITECTURE_REVIEW.md[MULTI_MODEL_ARCHITECTURE_REVIEW.md]
+| link:../docs/_archive/reviews/MULTI_MODEL_ARCHITECTURE_REVIEW.md[MULTI_MODEL_ARCHITECTURE_REVIEW.md]
 | Mark superseded by this spec for the architectural recommendations; the gap analysis in §1.2 of this spec carries the conclusions forward.
 |===
 

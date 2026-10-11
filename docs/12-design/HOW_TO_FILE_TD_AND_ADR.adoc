@@ -60,6 +60,64 @@ textual merge conflict. The convention below removes both failure modes.
 6. **Index new ADRs** in `docs/12-design/adr/README.adoc`. (The guard *warns* on an
    unindexed ADR; keeping the index current is expected hygiene.)
 
+7. **Verify the premise before acting on it — then correct the record.** A TD or ADR
+   is a *claim about the code at the time it was written*, not an instruction to be
+   executed. Before implementing one, check its load-bearing assertions against
+   current source. When one is wrong, **fix the document in the same PR** as the
+   work, stating what was claimed, what is actually true, and how you verified it.
+   See "Premise verification" below — this is a rule, not a nicety.
+
+== Premise verification (required before implementing a TD or ADR)
+
+A filed entry ages the moment it is written: the code moves, adjacent work lands,
+and the author's mental model was a snapshot. Treating a TD as a work order rather
+than a hypothesis is how a plan's stale detail becomes a shipped defect.
+
+=== The check, before you write code
+
+For each assertion the plan *depends on* — not every sentence, the load-bearing ones:
+
+* **Does the thing it names still exist, at the path/line it cites?** Line numbers
+  drift; identifiers get renamed or deleted.
+* **Does the mechanism it says to BUILD already exist?** Grep for it and count its
+  callers. A capability with **zero or one caller** is the common case: the machinery
+  is present and simply unwired, and the work collapses from "architect X" to "call X".
+* **Is the quantity it cites still the quantity?** Counts, depths, sizes and ratios
+  are the first things to rot, and they are usually the justification.
+* **Does the fix it proposes hold for every path, or only the one the author had in
+  mind?** A rule that is correct for one modality is often unachievable for another.
+
+=== When a premise is wrong
+
+Do **not** quietly implement around it, and do **not** silently follow it.
+
+1. **Stop before writing the code the stale premise implies.** A plan whose premise
+   fails will not produce a correct change by being followed harder.
+2. **Correct the document in the same PR as the work** — or as a docs-only PR when the
+   correction changes what the work should be. A TD nobody fixed will send the next
+   person down the same path.
+3. **State the correction concretely:** what was claimed, what is true, how you
+   verified it (command, test, file:line), and what it changes about the plan.
+4. **Amend the parent ADR too** when the premise came from one. A TD note does not
+   reach someone reading the ADR.
+5. **Record a negative result.** "I implemented this, it worked, and it was wrong"
+   is worth more than silence — it stops the idea being re-attempted. Reverting and
+   documenting beats shipping something you have stopped believing in.
+
+=== Why this is a rule
+
+It is the highest-yield step in the whole filing convention, measured on this repo.
+Across the ADR-094 unified-substrate programme, nearly every filed TD named a real
+goal while containing a detail that would have broken it — and several of those would
+have shipped *silent* wrong answers (a dropped tombstone, lost props, mis-attributed
+cost cells, rows unioned across generations). None was visible from the plan. Each
+surfaced only from checking the premise before building.
+
+A corollary worth internalising: **an existing test that fails your change is
+evidence, not an obstacle.** Determine whether it pins an intended invariant or
+encodes a defect, and say which. Both happen. Deleting or relaxing it to get green is
+how a real invariant is lost.
+
 == Legacy entries (do NOT migrate ad hoc)
 
 The ~100 existing TDs in `docs/10-quality/TECHNICAL_DEBT.adoc` stay in that table —
@@ -78,6 +136,7 @@ is a separate, batched, post-merge effort — not something to do incidentally.
 | File a standalone numbered TD | scan `docs/10-quality/td/` + the legacy table for the highest `TD-NNN`, use +1, heading `= TD-NNN: …`
 | File an ADR | scan `docs/12-design/adr/` for the highest `ADR-NNN`, use +1; `ADR-NNN-<slug>.adoc`, heading `= ADR-NNN: …`; add a row to `adr/README.adoc`
 | Check before pushing | `python3 scripts/check_td_adr_unique.py` (exit 0 = unique)
+| **Implement an existing TD/ADR** | **verify its load-bearing premises against current source FIRST; grep whether the thing it says to build already exists and count callers; correct the document in the same PR when a premise is wrong** (see "Premise verification")
 |===
 
 == Verification

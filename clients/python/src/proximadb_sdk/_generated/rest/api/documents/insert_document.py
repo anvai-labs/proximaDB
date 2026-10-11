@@ -11,16 +11,16 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.doc_insert_request import DocInsertRequest
+from ...models.doc_response import DocResponse
 from ...models.error_response import ErrorResponse
-from ...models.insert_document_body import InsertDocumentBody
-from ...models.insert_document_response_200 import InsertDocumentResponse200
 from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     collection: str,
     *,
-    body: InsertDocumentBody,
+    body: DocInsertRequest,
     x_tenant_id: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
@@ -44,16 +44,21 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> ErrorResponse | InsertDocumentResponse200 | None:
+) -> DocResponse | ErrorResponse | None:
     if response.status_code == 200:
-        response_200 = InsertDocumentResponse200.from_dict(response.json())
+        response_200 = DocResponse.from_dict(response.json())
 
         return response_200
 
-    if response.status_code == 404:
-        response_404 = ErrorResponse.from_dict(response.json())
+    if response.status_code == 400:
+        response_400 = ErrorResponse.from_dict(response.json())
 
-        return response_404
+        return response_400
+
+    if response.status_code == 500:
+        response_500 = ErrorResponse.from_dict(response.json())
+
+        return response_500
 
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
@@ -63,7 +68,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[ErrorResponse | InsertDocumentResponse200]:
+) -> Response[DocResponse | ErrorResponse]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -76,22 +81,22 @@ def sync_detailed(
     collection: str,
     *,
     client: AuthenticatedClient | Client,
-    body: InsertDocumentBody,
+    body: DocInsertRequest,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[ErrorResponse | InsertDocumentResponse200]:
-    """Insert a document.
+) -> Response[DocResponse | ErrorResponse]:
+    """Insert one document.
 
     Args:
         collection (str):
         x_tenant_id (str | Unset):
-        body (InsertDocumentBody):
+        body (DocInsertRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ErrorResponse | InsertDocumentResponse200]
+        Response[DocResponse | ErrorResponse]
     """
 
     kwargs = _get_kwargs(
@@ -111,22 +116,22 @@ def sync(
     collection: str,
     *,
     client: AuthenticatedClient | Client,
-    body: InsertDocumentBody,
+    body: DocInsertRequest,
     x_tenant_id: str | Unset = UNSET,
-) -> ErrorResponse | InsertDocumentResponse200 | None:
-    """Insert a document.
+) -> DocResponse | ErrorResponse | None:
+    """Insert one document.
 
     Args:
         collection (str):
         x_tenant_id (str | Unset):
-        body (InsertDocumentBody):
+        body (DocInsertRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ErrorResponse | InsertDocumentResponse200
+        DocResponse | ErrorResponse
     """
 
     return sync_detailed(
@@ -141,22 +146,22 @@ async def asyncio_detailed(
     collection: str,
     *,
     client: AuthenticatedClient | Client,
-    body: InsertDocumentBody,
+    body: DocInsertRequest,
     x_tenant_id: str | Unset = UNSET,
-) -> Response[ErrorResponse | InsertDocumentResponse200]:
-    """Insert a document.
+) -> Response[DocResponse | ErrorResponse]:
+    """Insert one document.
 
     Args:
         collection (str):
         x_tenant_id (str | Unset):
-        body (InsertDocumentBody):
+        body (DocInsertRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[ErrorResponse | InsertDocumentResponse200]
+        Response[DocResponse | ErrorResponse]
     """
 
     kwargs = _get_kwargs(
@@ -174,22 +179,22 @@ async def asyncio(
     collection: str,
     *,
     client: AuthenticatedClient | Client,
-    body: InsertDocumentBody,
+    body: DocInsertRequest,
     x_tenant_id: str | Unset = UNSET,
-) -> ErrorResponse | InsertDocumentResponse200 | None:
-    """Insert a document.
+) -> DocResponse | ErrorResponse | None:
+    """Insert one document.
 
     Args:
         collection (str):
         x_tenant_id (str | Unset):
-        body (InsertDocumentBody):
+        body (DocInsertRequest):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        ErrorResponse | InsertDocumentResponse200
+        DocResponse | ErrorResponse
     """
 
     return (

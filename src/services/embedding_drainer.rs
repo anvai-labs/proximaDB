@@ -43,8 +43,9 @@
 //!   says async should bulk-load SST segments directly. The
 //!   [`DrainerInsertSink`] trait makes this swap-in-place when the
 //!   storage-engine refactor lands.
-//! - **DLQ on max_attempts**: failed batches are currently logged and
-//!   re-queued via nack; no explicit DLQ promotion yet.
+//! - **DLQ on max_attempts**: a failed batch terminates the drainer and
+//!   releases its consumer lease so a supervisor-created replacement can
+//!   replay from durable progress; no explicit DLQ promotion yet.
 //! - **Multi-replica partition assignment**: this drainer subscribes
 //!   to ALL partitions by default. Cross-process leases (Phase 2E)
 //!   prevent two replicas from competing; assignment via partition
@@ -62,7 +63,7 @@ use proximadb_queue::QueueClient;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Default topic name for text-only ingest events the drainer
 /// processes. Aligned with the README's topic naming convention.
@@ -230,14 +231,20 @@ impl EmbeddingDrainer {
     }
 
     /// Spawn the drainer onto the current tokio runtime. Returns the
-    /// JoinHandle plus a shutdown oneshot. Drop the sender (or send
-    /// `()`) to stop the loop after the current iteration.
+    /// result-bearing JoinHandle plus a shutdown oneshot. Drop the sender (or
+    /// send `()`) to stop the loop after the current iteration. Subscription,
+    /// polling, batch-processing, and queue-publication failures are terminal
+    /// and surface through the handle; a supervisor decides whether and when
+    /// to construct a new consumer.
     ///
     /// `partitions` declares which partitions this drainer owns —
     /// typically all of them for a single-replica deployment. With
     /// multi-replica scaleout, each replica passes a disjoint subset
     /// and the cross-process lease (Phase 2E) enforces ownership.
-    pub fn start(self, partitions: Vec<u32>) -> (JoinHandle<()>, oneshot::Sender<()>) {
+    pub fn start(
+        self,
+        partitions: Vec<u32>,
+    ) -> (JoinHandle<anyhow::Result<()>>, oneshot::Sender<()>) {
         let (tx, mut rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             info!(
@@ -248,33 +255,48 @@ impl EmbeddingDrainer {
                 "embedding drainer started"
             );
             let consumer = self.queue.consumer(self.config.group_id.clone());
-            if let Err(e) = consumer.subscribe(&self.config.topic, &partitions).await {
-                warn!(error = %e, "drainer subscribe failed; exiting");
-                return;
-            }
-            loop {
-                tokio::select! {
-                    _ = &mut rx => {
-                        info!("embedding drainer received shutdown signal");
-                        break;
-                    }
-                    poll_result = consumer.poll(self.config.batch_size, self.config.poll_wait) => {
-                        match poll_result {
-                            Ok(messages) if messages.is_empty() => continue,
-                            Ok(messages) => {
-                                if let Err(e) = self.process_batch(&consumer, messages).await {
-                                    warn!(error = %e, "drainer batch failed; messages re-enter via lease expiry");
+            let outcome = match consumer.subscribe(&self.config.topic, &partitions).await {
+                Err(error) => Err(anyhow::anyhow!("drainer subscribe failed: {error}")),
+                Ok(()) => loop {
+                    tokio::select! {
+                        _ = &mut rx => {
+                            info!("embedding drainer received shutdown signal");
+                            break Ok(());
+                        }
+                        poll_result = consumer.poll(self.config.batch_size, self.config.poll_wait) => {
+                            match poll_result {
+                                Ok(messages) if messages.is_empty() => continue,
+                                Ok(messages) => {
+                                    if let Err(error) = self.process_batch(&consumer, messages).await {
+                                        break Err(anyhow::anyhow!("drainer batch failed: {error:#}"));
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "drainer poll failed");
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                Err(error) => {
+                                    break Err(anyhow::anyhow!("drainer poll failed: {error}"));
+                                }
                             }
                         }
                     }
-                }
+                },
+            };
+            if let Err(task_error) = &outcome {
+                error!(error = %task_error, "embedding drainer task failed; releasing consumer ownership");
+            }
+            let shutdown_result = consumer.shutdown().await;
+            if let Err(shutdown_error) = &shutdown_result {
+                error!(error = %shutdown_error, "embedding drainer consumer shutdown failed");
             }
             info!("embedding drainer stopped");
+            match (outcome, shutdown_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Err(shutdown)) => Err(anyhow::anyhow!(
+                    "drainer consumer shutdown failed: {shutdown}"
+                )),
+                (Err(error), Err(shutdown)) => Err(anyhow::anyhow!(
+                    "drainer failed: {error:#}; consumer shutdown also failed: {shutdown}"
+                )),
+            }
         });
         (handle, tx)
     }
@@ -384,7 +406,7 @@ impl EmbeddingDrainer {
             consumer
                 .ack(&delivery_ids)
                 .await
-                .map_err(|e| anyhow::anyhow!("drainer ack failed: {e}"))?;
+                .map_err(anyhow::Error::new)?;
             debug!(count = delivery_ids.len(), "drainer batch ack'd");
         }
         Ok(())
@@ -683,6 +705,20 @@ mod tests {
         }
     }
 
+    struct FailingSink;
+
+    #[async_trait]
+    impl DrainerInsertSink for FailingSink {
+        async fn insert(
+            &self,
+            _target_collection: &str,
+            _tenant_id: &str,
+            _records: Vec<EmbeddedRecord>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("injected sink failure")
+        }
+    }
+
     fn ensure_embedding_singleton() {
         if proximadb_embedding::EmbeddingService::try_global().is_some() {
             return;
@@ -850,7 +886,10 @@ mod tests {
         drop(calls);
 
         let _ = shutdown.send(());
-        let _ = handle.await;
+        handle
+            .await
+            .expect("drainer task join")
+            .expect("clean drainer shutdown");
         queue.shutdown().await.expect("queue shutdown");
     }
 
@@ -887,13 +926,191 @@ mod tests {
         // Run for ~300ms — enough for several poll cycles.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let _ = shutdown.send(());
-        let _ = handle.await;
+        handle
+            .await
+            .expect("drainer task join")
+            .expect("clean drainer shutdown");
 
         assert!(
             sink.calls.lock().await.is_empty(),
             "malformed payload must NOT invoke sink",
         );
         queue.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_consumer_failure_is_surfaced_to_the_supervisor() {
+        ensure_embedding_singleton();
+        let tmp = TempDir::new().expect("tempdir");
+        let queue = QueueClient::open(queue_cfg(tmp.path()))
+            .await
+            .expect("queue open");
+        let sink: Arc<dyn DrainerInsertSink> = Arc::new(RecordingSink::default());
+        let drainer = EmbeddingDrainer::new(
+            queue.clone(),
+            proximadb_embedding::EmbeddingService::global(),
+            sink,
+            EmbeddingDrainerConfig {
+                poll_wait: Duration::from_millis(10),
+                ..Default::default()
+            },
+        );
+        let (handle, shutdown) = drainer.start(vec![0]);
+        let lease_path = tmp
+            .path()
+            .join(EMBED_INGEST_TOPIC)
+            .join("0/embed-drainer/lease.meta");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !lease_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let lease_bytes = std::fs::read(&lease_path).expect("drainer acquired lease");
+        let mut lease: proximadb_queue::leases::LeaseMeta =
+            serde_json::from_slice(&lease_bytes).expect("lease metadata");
+        lease.expires_at_unix_nanos = 0;
+        let replacement_path = lease_path.with_extension("replacement");
+        std::fs::write(
+            &replacement_path,
+            serde_json::to_vec(&lease).expect("encode expired lease"),
+        )
+        .expect("write expired lease");
+        std::fs::rename(replacement_path, &lease_path).expect("publish expired lease");
+
+        let task_result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("terminal consumer must not remain in a poll-error loop")
+            .expect("drainer task join");
+        let error = task_result.expect_err("terminal ownership failure must reach supervisor");
+        assert!(
+            error.to_string().contains("drainer poll failed"),
+            "unexpected terminal error: {error:#}"
+        );
+        drop(shutdown);
+        queue.shutdown().await.expect("queue shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sink_failure_is_surfaced_to_the_supervisor() {
+        ensure_embedding_singleton();
+        let tmp = TempDir::new().expect("tempdir");
+        let queue = QueueClient::open(queue_cfg(tmp.path()))
+            .await
+            .expect("queue open");
+        let embed_service = proximadb_embedding::EmbeddingService::global();
+        let route = EmbedRoute::Byo {
+            url: start_byo_test_endpoint(vec![vec![0.1, 0.2, 0.3]]),
+            auth: ByoAuth::None,
+            declared_dim: 3,
+            declared_precision: proximadb_records::EmbeddingScalarType::Fp32,
+            batch_size: 8,
+            timeout_ms: 1_000,
+        };
+        embed_service.update_tenant_route("tenant-sink-failure", route.clone());
+        let payload = EmbedIngestPayload {
+            target_collection: "sink-failure-target".to_string(),
+            tenant_id: "tenant-sink-failure".to_string(),
+            embedding_route_identity: (&route).into(),
+            expected_dimension: 3,
+            records: vec![EmbedIngestRecord {
+                oid: "doc-1".to_string(),
+                text: "must remain recoverable".to_string(),
+                metadata: HashMap::new(),
+            }],
+        };
+        let receipt = queue
+            .producer()
+            .send(Message::new(
+                EMBED_INGEST_TOPIC,
+                "tenant-sink-failure",
+                serde_json::to_vec(&payload).expect("serialize payload"),
+            ))
+            .await
+            .expect("send");
+        let drainer = EmbeddingDrainer::new(
+            queue.clone(),
+            embed_service,
+            Arc::new(FailingSink),
+            EmbeddingDrainerConfig {
+                poll_wait: Duration::from_millis(10),
+                ..Default::default()
+            },
+        );
+        let (handle, shutdown) = drainer.start(vec![receipt.partition]);
+
+        let task_result = tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("sink failure must not leave a live consumer renewing its lease")
+            .expect("drainer task join");
+        let failure = task_result.expect_err("sink failure must reach supervisor");
+        assert!(
+            failure.to_string().contains("injected sink failure"),
+            "unexpected terminal error: {failure:#}"
+        );
+        drop(shutdown);
+        queue.shutdown().await.expect("queue shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ack_ownership_failure_preserves_queue_error() {
+        ensure_embedding_singleton();
+        let tmp = TempDir::new().expect("tempdir");
+        let queue = QueueClient::open(queue_cfg(tmp.path()))
+            .await
+            .expect("queue open");
+        let receipt = queue
+            .producer()
+            .send(Message::new(
+                EMBED_INGEST_TOPIC,
+                "tenant-a",
+                b"not-json".to_vec(),
+            ))
+            .await
+            .expect("send malformed payload");
+        let consumer = queue.consumer("embed-drainer");
+        consumer
+            .subscribe(EMBED_INGEST_TOPIC, &[receipt.partition])
+            .await
+            .expect("subscribe");
+        let deliveries = consumer
+            .poll(1, Duration::ZERO)
+            .await
+            .expect("poll malformed payload");
+
+        let lease_path = tmp
+            .path()
+            .join(EMBED_INGEST_TOPIC)
+            .join(receipt.partition.to_string())
+            .join("embed-drainer/lease.meta");
+        let lease_bytes = std::fs::read(&lease_path).expect("consumer acquired lease");
+        let mut lease: proximadb_queue::leases::LeaseMeta =
+            serde_json::from_slice(&lease_bytes).expect("lease metadata");
+        lease.expires_at_unix_nanos = 0;
+        let replacement_path = lease_path.with_extension("replacement");
+        std::fs::write(
+            &replacement_path,
+            serde_json::to_vec(&lease).expect("encode expired lease"),
+        )
+        .expect("write expired lease");
+        std::fs::rename(replacement_path, &lease_path).expect("publish expired lease");
+
+        let drainer = EmbeddingDrainer::new(
+            queue.clone(),
+            proximadb_embedding::EmbeddingService::global(),
+            Arc::new(RecordingSink::default()),
+            EmbeddingDrainerConfig::default(),
+        );
+        let error = drainer
+            .process_batch(&consumer, deliveries)
+            .await
+            .expect_err("ACK without ownership must fail");
+        assert!(
+            error
+                .downcast_ref::<proximadb_queue::QueueError>()
+                .is_some(),
+            "queue error type must survive anyhow propagation: {error:#}"
+        );
+        consumer.shutdown().await.expect("consumer shutdown");
+        queue.shutdown().await.expect("queue shutdown");
     }
 
     #[test]
@@ -1148,7 +1365,10 @@ mod tests {
         drop(calls);
 
         let _ = shutdown.send(());
-        let _ = handle.await;
+        handle
+            .await
+            .expect("drainer task join")
+            .expect("clean drainer shutdown");
         queue.shutdown().await.expect("queue shutdown");
     }
 
@@ -1261,7 +1481,10 @@ mod tests {
         drop(calls);
 
         let _ = shutdown.send(());
-        let _ = handle.await;
+        handle
+            .await
+            .expect("drainer task join")
+            .expect("clean drainer shutdown");
         queue.shutdown().await.expect("queue shutdown");
     }
 }

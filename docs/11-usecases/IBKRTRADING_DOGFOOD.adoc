@@ -495,7 +495,7 @@ WHERE ts.current_drawdown > 0.05;
 * link:USECASE_CATALOG.adoc[Use Case Catalog]
 * link:../00-product/VISION.adoc[Vision Document]
 * link:../00-product/PRD.adoc[Product Requirements Document]
-* link:../10-quality/proximadb-strategic-analysis.adoc[Strategic Analysis (Section 4: ibkrtrading)]
+* Strategic Analysis (Section 4: ibkrtrading)
 
 '''
 

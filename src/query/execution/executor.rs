@@ -10,7 +10,6 @@ use crate::query::execution::{
 use crate::services::operations::vectors::VectorOperationsService;
 use crate::storage::cache::orchestrator::CrossCacheOrchestrator;
 use anyhow::{Result, anyhow};
-use proximadb_data_model::ProximaValue;
 use proximadb_graph_query::service::GraphExecutionService;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -867,29 +866,8 @@ impl MultiModalQueryExecutor {
 
                     // Add metadata fields with "metadata." prefix
                     for (key, sql_value) in &record.metadata {
-                        let json_value = match &sql_value.value {
-                            Some(crate::proto::proximadb_v1::sql_value::Value::StringValue(s)) => {
-                                serde_json::Value::String(s.clone())
-                            }
-                            Some(crate::proto::proximadb_v1::sql_value::Value::NumberValue(n)) => {
-                                serde_json::json!(n)
-                            }
-                            Some(crate::proto::proximadb_v1::sql_value::Value::BoolValue(b)) => {
-                                serde_json::Value::Bool(*b)
-                            }
-                            Some(crate::proto::proximadb_v1::sql_value::Value::Int64Value(i)) => {
-                                serde_json::Value::Number(serde_json::Number::from(*i))
-                            }
-                            Some(crate::proto::proximadb_v1::sql_value::Value::BytesValue(b)) => {
-                                serde_json::Value::String(
-                                    proximadb_kernel::encoding::base64_encode(b),
-                                )
-                            }
-                            Some(crate::proto::proximadb_v1::sql_value::Value::NullValue(_)) => {
-                                serde_json::Value::Null
-                            }
-                            _ => serde_json::Value::Null,
-                        };
+                        let json_value =
+                            proximadb_records::conversions::sql_value_to_json(sql_value);
                         // Prefix with "metadata." for SQL projection compatibility
                         fields.insert(format!("metadata.{}", key), json_value);
                     }
@@ -1614,23 +1592,6 @@ impl MultiModalQueryExecutor {
         }
     }
 
-    /// Convert canonical metadata to a field map for result formatting.
-    #[allow(dead_code)]
-    fn convert_metadata_to_fields(
-        &self,
-        metadata: &std::collections::HashMap<String, ProximaValue>,
-    ) -> std::collections::HashMap<String, serde_json::Value> {
-        metadata
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    crate::core::search::sql_value_filter::proxima_value_to_json(value),
-                )
-            })
-            .collect()
-    }
-
     /// Extract result ID for fusion algorithms
     fn extract_result_id(&self, row: &QueryRow) -> String {
         row.fields
@@ -1650,6 +1611,23 @@ mod executor_tests {
         CsrRelationsStore, InMemoryProvenanceRegistry, ProximaEntityStore,
     };
     use async_trait::async_trait;
+    use proximadb_data_model::ProximaValue;
+
+    #[test]
+    fn query_rows_preserve_jsonb_metadata_as_json() {
+        let document = serde_json::json!({"memory": {"type": "fact"}});
+        let bytes = ProximaValue::to_jsonb_vec(&document).expect("encode JSONB test value");
+        let value = crate::proto::proximadb_v1::SqlValue {
+            value: Some(crate::proto::proximadb_v1::sql_value::Value::JsonbValue(
+                bytes,
+            )),
+        };
+
+        assert_eq!(
+            proximadb_records::conversions::sql_value_to_json(&value),
+            document
+        );
+    }
 
     #[test]
     fn test_apply_limit_offset_slices_rows() {
@@ -2368,6 +2346,7 @@ mod executor_tests {
         use crate::proto::proximadb_v1::{CollectionConfig, DistanceMetric, StorageEngine};
         let config = CollectionConfig {
             name: "test_collection".to_string(),
+            embedding_config: None,
             dimension: 3, // Match the test vector dimensions
             distance_metric: Some(DistanceMetric::Cosine as i32),
             storage_engine: Some(StorageEngine::Sst as i32),

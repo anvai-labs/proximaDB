@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: Apache-2.0
+= TD-DEMOIMG-1: the repo-root Dockerfile has no working consumer, and the demo compose that names it cannot build
+
+[cols="1,3"]
+|===
+| Status | **Open.** Filed 2026-10-09 while scoping the v0.4.0 release-build fix, after the
+guard for shipped image features had to decide which Dockerfile it was guarding.
+| Severity | Low. Nothing in CI or the release path depends on either file; the cost is a demo
+that fails for anyone who follows it, and a tracked file that reads as production.
+| Owner | unassigned
+|===
+
+== What
+
+`Dockerfile` at the repository root is referenced by exactly one tracked file,
+`demo/config/docker-compose.yml`, in two services:
+
+[source,yaml]
+----
+  proximadb-unified:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+----
+
+Docker Compose resolves `dockerfile` **relative to `context`**, not to the compose file.
+`context: ..` from `demo/config/` is `demo/`, so both services look for `demo/Dockerfile`.
+That file does not exist:
+
+[source,console]
+----
+$ git ls-tree -r --name-only origin/develop -- demo/ | grep -i dockerfile
+(no output)
+----
+
+So the compose build fails, and the root `Dockerfile` has **no** working consumer. It is not
+the published image either -- `publish-image.yml` and `ci.yml` both name
+`deploy/docker/Dockerfile` in their `file:` input.
+
+== Why it is worth recording rather than fixing here
+
+The release-build-features guard (`scripts/check_release_build_features.py`) deliberately
+guards `deploy/docker/Dockerfile` and the other `deploy/docker/Dockerfile*` variants, and
+deliberately does **not** guard the root one. Without this note that omission reads as an
+oversight, and the next person to find the root `Dockerfile` has to re-derive that it ships
+nothing. An earlier revision of that work did treat the root file as the published image and
+asserted it had been fixed -- which was wrong in both directions: the published image already
+built with `cloud-full`, and the root file reaches no user.
+
+== Options
+
+. **Point the compose services at the file that exists.** Either `dockerfile: ../Dockerfile`
+  (resolving back to the root) or, better, `context: ../..` + `dockerfile: deploy/docker/Dockerfile`
+  so the demo uses the same image definition as production. The second is preferable: a demo
+  that builds a different image from the one operators run teaches the wrong thing.
+. **Delete the root `Dockerfile`** and have the demo use `deploy/docker/Dockerfile`, removing
+  a near-duplicate build definition.
+
+Either option needs the demo compose path actually exercised once, which is why this is not
+folded into a release-workflow change.
+
+== Verification
+
+Whichever option is taken, `docker compose -f demo/config/docker-compose.yml build` must
+succeed, and if the root `Dockerfile` survives it should be added to the
+`release-build-features` guard's scope (or to its documented exemptions, with the reason).

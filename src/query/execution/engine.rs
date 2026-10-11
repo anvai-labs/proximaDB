@@ -193,6 +193,12 @@ pub struct QueryExecutionContext {
     /// Parquet reads (the merge is default-ON; the kill-switch
     /// `PROXIMADB_OLAP_DELTA_MERGE=0` forces this). See [`super::olap_delta_merge`].
     pub olap_delta: Option<super::olap_delta_merge::OlapDeltaConfig>,
+    /// TD-USUB-2: native (non-Parquet) relational tables to register with the
+    /// DataFusion destination, so SQL capability stops depending on storage format.
+    /// `None` ⇒ only Parquet-backed tables are registered (the pre-TD-USUB-2
+    /// behaviour). Default-OFF behind `PROXIMADB_NATIVE_TABLE_PROVIDER`.
+    /// See [`super::native_table_provider`].
+    pub native_tables: Option<super::native_table_provider::NativeTableConfig>,
     /// Escape hatch for SQL dialect gaps while the shared relational lowering
     /// catches up. Keep false for production routes that require one logical
     /// plane across Volcano and DataFusion.
