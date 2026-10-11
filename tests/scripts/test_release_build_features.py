@@ -34,9 +34,12 @@ COPY = (
     # The PUBLISHED image (publish-image.yml `file:`), not the repo-root
     # Dockerfile -- that one is the demo-compose image and is not guarded.
     "deploy/docker/Dockerfile",
-    # In TIMED_WORKFLOWS. These MUST be copied: the guard `continue`s past a
-    # workflow that does not exist, so omitting them here would make every
-    # pipeline-timeout assertion below vacuously green.
+    # In TIMED_WORKFLOWS. These MUST be copied, though not for the reason an
+    # earlier comment here claimed: the mutating tests read the tree copy
+    # BEFORE invoking the guard, so dropping these yields a loud
+    # `FileNotFoundError`, not a vacuous pass. The real hazard is the guard's
+    # own `if not path.exists(): continue` -- a non-mutating assertion against
+    # an absent workflow would pass for the wrong reason.
     ".github/workflows/ci.yml",
     ".github/workflows/qa-gate.yml",
 )
@@ -124,6 +127,73 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("has no `timeout-minutes`", result.stdout)
                 self.assertIn(rel, result.stdout)
+
+    def test_a_job_key_with_a_trailing_comment_cannot_evade(self) -> None:
+        """The confirmed evasion: a comment on the job KEY hid a missing cap.
+
+        `JOB_RE` ended in `\\s*$`, so `rust-clippy:  # the lint gate` did not
+        match and the entire job body was absorbed into the previous job --
+        whose own cap then satisfied the check for both. The guard exited 0
+        with `rust-clippy` carrying no `timeout-minutes` at all. GitHub accepts
+        the comment: it is valid YAML and the job runs.
+        """
+        p = self.tree / ".github/workflows/ci.yml"
+        lines = p.read_text(encoding="utf-8").splitlines()
+        out, killed = [], False
+        for line in lines:
+            if line == "  rust-clippy:":
+                out.append("  rust-clippy:  # the lint gate")
+                continue
+            if not killed and line.strip().startswith("timeout-minutes:") and out and out[-1].startswith("    runs-on:"):
+                if any(l == "  rust-clippy:  # the lint gate" for l in out):
+                    killed = True
+                    continue
+            out.append(line)
+        self.assertTrue(killed, "mutation did not remove rust-clippy's cap")
+        p.write_text("\n".join(out) + "\n", encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("rust-clippy", result.stdout)
+
+    def test_an_expression_valued_timeout_is_not_a_missing_one(self) -> None:
+        """`${{ }}` is legal on jobs.<id>.timeout-minutes; rejecting it is a
+        false positive on a workflow GitHub would happily run."""
+        p = self.tree / ".github/workflows/ci.yml"
+        text = p.read_text(encoding="utf-8")
+        for spelling in (
+            "    timeout-minutes: ${{ fromJSON(vars.CLIPPY_CAP) }}",
+            "    timeout-minutes: 30.5",
+        ):
+            with self.subTest(spelling=spelling):
+                p.write_text(
+                    text.replace(
+                        "    timeout-minutes: 30  # measured max 13 min",
+                        spelling,
+                        1,
+                    ),
+                    encoding="utf-8",
+                )
+                result = _run(self.tree)
+                self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_a_reusable_workflow_job_is_exempt(self) -> None:
+        """GitHub REJECTS job-level `timeout-minutes` on a `uses:` job, so
+        demanding one there would make the guard unsatisfiable."""
+        p = self.tree / ".github/workflows/ci.yml"
+        text = p.read_text(encoding="utf-8")
+        p.write_text(
+            text.replace(
+                "jobs:",
+                "jobs:\n"
+                "  called-elsewhere:\n"
+                "    uses: ./.github/workflows/qa-gate.yml\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("called-elsewhere", result.stdout)
 
     def test_catches_the_published_image_built_without_cloud(self) -> None:
         p = self.tree / "deploy/docker/Dockerfile"

@@ -63,7 +63,19 @@ CARGO_FEATURES_RE = re.compile(r"--features[= ]+(?P<value>[^\s]+)")
 # earlier revision of this guard passed every one of them while the target
 # shipped with no features at all.
 FEATURES_RE = re.compile(r"^\s+features:(?P<rest>.*)$")
-JOB_RE = re.compile(r"^  (?P<job>[A-Za-z][A-Za-z0-9_-]*):\s*$")
+# A job-level `timeout-minutes`. `${{ ... }}` is accepted because GitHub allows
+# an expression there (github/needs/vars/inputs/matrix contexts), and a bare
+# `\d+` match rejected it as missing -- a false positive on legal YAML. A float
+# is likewise legal per the schema.
+TIMEOUT_VALUE_RE = re.compile(
+    r"^    timeout-minutes:\s*(?:\d+(?:\.\d+)?|\$\{\{.*\}\})\s*(?:#.*)?$"
+)
+# `(#.*)?` is load-bearing, not tidiness: without it a job key written
+# `rust-clippy:  # the lint gate` does not match, so the whole job body is
+# absorbed into the PREVIOUS job's body. That job's own `timeout-minutes` then
+# satisfies the check for both and the commented job is never even named --
+# verified: the guard exited 0 with `rust-clippy` carrying no cap at all.
+JOB_RE = re.compile(r"^  (?P<job>[A-Za-z][A-Za-z0-9_-]*):\s*(#.*)?$")
 
 
 def _scalar(rest: str) -> str:
@@ -135,9 +147,9 @@ def check_workflow_timeouts(msgs: list[str]) -> None:
             if m is None:
                 body.append(line)
                 continue
-            if job is not None and not any(
-                re.match(r"^    timeout-minutes:\s*\d+\s*(#.*)?$", b) for b in body
-            ):
+            reusable = any(re.match(r"^    uses:", b) for b in body)
+            bounded = any(TIMEOUT_VALUE_RE.match(b) for b in body)
+            if job is not None and not bounded and not reusable:
                 _fail(
                     msgs,
                     f"{rel}: job `{job}` has no `timeout-minutes` -- a hung "

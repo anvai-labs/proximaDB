@@ -74,7 +74,9 @@ run's wall time in this TD), not an assertion.
 
 Read from the Actions API across the last twelve `qa-gate.yml` runs, so these are
 observations, not estimates. `min` is a floor of the job's
-`completed_at - started_at`.
+`completed_at - started_at`, which **includes queue time** — see the second
+correction below — so each figure is an upper bound on execution and the derived
+headroom is understated, never overstated.
 
 [cols="3,1,2,1,2", options="header"]
 |===
@@ -82,9 +84,9 @@ observations, not estimates. `min` is a floor of the job's
 
 | `objstore-restart-qa-tier`
 | 120
-| 66, 73, 72, 72, 70, 73
-| 73
-| 1.6×
+| 66, 73, 72, 72, 70, 73 — plus **81 pre-split** (run `37935965003`, green)
+| 81
+| 1.48×
 
 | `cloud-emulator-object-store`
 | 90
@@ -102,14 +104,30 @@ observations, not estimates. `min` is a floor of the job's
 Two conclusions, both of which correct an earlier reading:
 
 **The 90-minute cap was never the defect.** One pre-split run completed the QA
-tier *successfully* in 81 min under the 90 cap. The four failures in that window
-(54, 76, 77 min, plus one cancelled at 95) were the 16 GB memory cliff, not time:
-`ubuntu-latest` ships **no swap**, so a peak above 16 GB evicts the runner rather
-than degrading it, and the failure renders as `The runner has received a shutdown
-signal` — not a timeout message. The fix was the 12 G `/mnt` swapfile plus
-`CARGO_PROFILE_TEST_DEBUG=0`, and splitting the MLflow `--lib` test into its own
-job. Raising 90→120 was precautionary and is not what turned the job green; the
-evidence is that it now lands at 66–73, comfortably inside the old 90.
+tier *successfully* in **81 min** under the 90 cap (run `37935965003`). The three
+real failures in that window (54.9, 76.2, 77.2 min) were the memory cliff, not
+time: the failure renders as `The runner has received a shutdown signal` — not a
+timeout message, which reads `exceeded the maximum execution time`. The fix was
+the 12 G `/mnt` swapfile plus `CARGO_PROFILE_TEST_DEBUG=0`, and splitting the
+MLflow `--lib` test into its own job. Raising 90→120 was precautionary and is not
+what turned the job green; the evidence is that it now lands at 66–73,
+comfortably inside the old 90.
+
+Two corrections to how that window is read, both found in review:
+
+* `ubuntu-latest` ships **only ~2 GiB of swap**, not none. Measured from the live
+  logs of runs `38110183099` (ubuntu-latest) and `38110183172` (ubuntu-24.04):
+  each adds a 12 GiB swapfile and `free -h` then reports `Swap: 14Gi`, so ~2 GiB
+  pre-existed. The repo comments said "NO swap" and this TD repeated it; both are
+  corrected. The conclusion is unchanged in direction — 2 GiB does not absorb a
+  16 GiB overshoot — but the eviction threshold is ~18 GiB, not 16.
+* A fourth run in that window (`37977449315`) shows a 95-minute job wall but its
+  steps span only **2 minutes**: it sat queued ~93 min and was cancelled when the
+  sibling `push` run failed. It is not a 95-minute execution and is **not**
+  evidence of a memory cliff. It is also why the wall times in the table above
+  are upper bounds: a job's `started_at` can precede execution, while
+  `timeout-minutes` clocks execution only. Caps derived from these figures are
+  therefore conservative, never tight.
 
 **`mlflow-s3-artifact-seam` was the one genuinely thin cap.** At 60 it carried
 only 1.2× over its measured 49-min cold-cache peak. Raised to 75 here. This is
