@@ -1,0 +1,491 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SECSCAN-1: v0.4.0 security-alert triage — two real defects behind 63 alerts of mostly test-code noise
+:toc: macro
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Triaged — 5 criticals dismissed with evidence; 2 real defects OPEN and unfixed
+| Severity | High — `rust/path-injection` is an unauthenticated arbitrary-host-path read that also bypasses `DrPathBuilder`; `rust/uncontrolled-allocation-size` is an unbounded `top_k` allocation on every non-REST search surface
+| Component | `src/services/external_collection/source_reader.rs`, `crates/foundation/proximadb-search-types/src/bounded_queue.rs`, `src/deployment/discovery/environment_detector.rs`, `.github/workflows/codeql.yml`
+| Pillar | SECURITY / CORRECTNESS
+| Scanned refs | `refs/pull/1970/merge` (the v0.4.0 qa→main promotion) and `refs/heads/main`
+| Triage date | 2026-10-11
+|===
+
+toc::[]
+
+== Why this exists
+
+The v0.4.0 promotion PR (#1970) carried **5 critical / 58 high / 6 medium** open
+code-scanning alerts against `refs/heads/main`'s 54 high / 4 medium / 0 critical.
+CodeQL is non-blocking here (`.github/workflows/codeql.yml` says so; branch
+protection on `main` requires only `CI Success`), so nothing forced a read of
+those alerts before promotion. This TD is that read.
+
+The headline count is misleading in both directions. **61 of the 63 code-scanning
+findings are test code, vendored-macro expansion, or cloud-metadata endpoints that
+have no TLS variant** — and **two classes are genuinely real and are still
+unfixed**. Counting alerts would have produced the wrong priority order; reading
+them produced the right one.
+
+== Verdict summary
+
+[cols="1,1,3", options="header"]
+|===
+| Class | Verdict | One-line basis
+
+| `rust/hard-coded-cryptographic-value` (5 critical)
+| FALSE POSITIVE / TEST — all 5 dismissed
+| 4 inside `#[cfg(test)] mod tests`; 1 is a zero-init buffer overwritten by `ring::SystemRandom`
+
+| `rust/cleartext-logging` (37 high)
+| FALSE POSITIVE — systemic, test-only
+| 37/37 are `assert!`/`panic!` format strings inside `#[cfg(test)]`; none logs a credential
+
+| `py/clear-text-logging-sensitive-data` (2 high)
+| FALSE POSITIVE
+| `print()` of a hardcoded synthetic clinical-text fixture in an example script
+
+| `rust/non-https-url` (7 high)
+| FALSE POSITIVE, with a real hardening gap alongside
+| All 7 are cloud IMDS endpoints, which are HTTP-only by design — but one call site still uses IMDSv1
+
+| `rust/uncontrolled-allocation-size` (4 high)
+| **MIXED — 1 REAL, 3 false positive**
+| 3 are `with_capacity(already_materialised_vec.len())`; the 4th points at a genuinely unbounded `top_k` sink
+
+| `rust/path-injection` (2 high)
+| **REAL — both**
+| `POST /api/v2/external-collections` passes an unvalidated request-body path to `fs::metadata`/`read_dir`
+
+| `rust/access-invalid-pointer` (1 high)
+| FALSE POSITIVE
+| The flagged span is a `#[napi]`-expanded struct name, not hand-written `unsafe`
+
+| `py/redos` (1 high)
+| REAL PATTERN, NON-EXPLOITABLE
+| Exponential-backtracking regex in a CI guard script whose only input is a repo-local workflow file
+
+| 4 CVE supply-chain alerts
+| NOT IN SHIPPED ARTIFACTS
+| 3 are SDK-generator build toolchains; 1 maps to the Go SDK's `go` directive
+|===
+
+== 1. The 5 criticals — all dismissed, with the mechanism named
+
+All five are `rust/hard-coded-cryptographic-value` in
+`src/network/postgres/scram.rs`. `#[cfg(test)] mod tests` opens at **line 343**
+of that 519-line file.
+
+[cols="1,1,3", options="header"]
+|===
+| Alert | Site | Why benign
+
+| 168 | `scram.rs:363` | `ScramVerifier::from_password("pencil", …)`. `"pencil"` is the RFC 7677 §3 sample password; the test asserts the state machine reproduces the RFC's own `server-first`/`server-final` strings. Line 363 > 343 ⇒ inside `mod tests`.
+| 169 | `scram.rs:384` | `"pencil!"` — the RFC vector plus one character, so `wrong_password_fails_client_final` can assert `ScramError::AuthenticationFailed`. Inside `mod tests`.
+| 170 | `scram.rs:455` | `"pw"`, a throwaway literal in `gs2_y_flag_and_binding_echo_are_accepted`. Inside `mod tests`.
+| 171 | `scram.rs:455` | `b"0123456789abcdef"`, a fixed 16-byte salt making that same test deterministic. Inside `mod tests`. (Two alerts share line 455 because the call passes both a password and a salt literal.)
+| 172 | `scram.rs:57` | `let mut salt = [0u8; 16];` is a **zero-initialised buffer, not a salt value**: line 58 is `rng.fill(&mut salt).map_err(\|_\| ScramError::Rng)?`, which overwrites all 16 bytes from `ring::rand::SystemRandom` and fails closed. The literal never reaches PBKDF2.
+|===
+
+Dismissal reasons: `used in tests` for 168–171, `false positive` for 172. Each
+dismissal comment names the file:line and the mechanism.
+
+**No production hardcoded cryptographic value was found.** Nothing here is
+release-relevant.
+
+== 2. `rust/cleartext-logging` (37 high) — systemic false positive, test-only
+
+Every one of the 37 sites is an assertion-failure format string inside a
+`#[cfg(test)]` module. The `#[cfg(test)]` line number precedes every flagged
+line in every file:
+
+[cols="2,1,1", options="header"]
+|===
+| File | `#[cfg(test)]` at | Flagged lines
+
+| `src/network/auth/middleware.rs` | 980 | 1473, 1480
+| `src/security/auth_service.rs` | 1517 | 1656, 1667
+| `src/storage/engines/sst/warming.rs` | 248 | 270, 274, 278, 281, 326, 330
+| `src/storage/trait_components/path_resolver.rs` | 1192 | 1751, 1755, 1759, 1879
+| `src/storage/metadata/single_index.rs` | 452 | 650
+| `src/network/rest/v2/collections.rs` | 3459 | 4076
+| `src/services/snapshot/branch_ref.rs` | 87 | 150
+| `crates/foundation/proximadb-kernel/src/stable_id.rs` | 138 | 199
+| `src/datafusion/pax_olap_tests.rs` | gated at `src/datafusion/mod.rs:456` | 164, 169, 174
+| `src/network/arrow_ipc/service_tests.rs` | gated at `src/network/arrow_ipc/service.rs:3470` | 388, 403, 418, 431
+| `src/storage/engines/sst/tests/cold_cascade_merge_test.rs` + 9 files under `tests/` | integration-test targets | 11 sites
+|===
+
+The two files that would matter — the auth ones — were read in full:
+
+* `src/network/auth/middleware.rs:1473` is
+  `panic!("expected Jwt, got ApiKey({})", k)` inside
+  `mod port_credential_parsing`, whose inputs are the literals
+  `"Bearer abc.def.ghi"` and `"API-Key secret123"`.
+* `src/security/auth_service.rs:1656` is
+  `assert!(result.success, "err: {:?}", result.error_message)`; `:1667` is
+  `assert!(ctx.user_id.starts_with("oidc:"), "got {}", ctx.user_id)` — a locally
+  minted test JWT's derived identity.
+
+**No production log statement emits a credential, token, password, API key or
+tenant secret.** The rule is matching on identifier names (`key`, `token`,
+`user_id`, `secret123`) inside test assertions.
+
+Action: **no engineering work on the code**, and — see the process finding
+below — no `paths-ignore` fix either, because 25 of these 37 sit in inline
+`#[cfg(test)]` blocks inside production files that a path filter cannot reach
+without excluding the production code beside them. This class has to be triaged
+by rule. 37 alerts of pure noise is why the real `path-injection` finding sat
+unread.
+
+== 3. `py/clear-text-logging-sensitive-data` (2 high) — false positive
+
+`clients/python/examples/domain_specific_embeddings.py:230` and `:231`:
+
+[source,python]
+----
+print(f"  {i}. [{doc['type']} - {doc['specialty']}]")
+print(f"     {doc['text'][:100]}...")
+----
+
+`doc` iterates a hardcoded literal list of synthetic clinical sentences defined
+20 lines above in the same function. CodeQL's "sensitive data (private)"
+heuristic fires on the health-adjacent wording ("patients", "medication",
+"Cardiology"). There is no credential, no PII, and no runtime input — this is a
+demo script printing its own fixture. Not shipped in any v0.4.0 artifact.
+
+== 4. `rust/non-https-url` (7 high) — false positive, plus one real hardening gap
+
+All seven are cloud **instance metadata service** endpoints:
+
+* `src/storage/engines/sst/warming.rs:441, 451, 460, 469`
+* `src/deployment/discovery/environment_detector.rs:536, 568, 601`
+
+These are `http://169.254.169.254/...` (AWS/Azure link-local) and
+`http://metadata.google.internal/...`. **No cloud provider serves IMDS over
+TLS** — there is no `https://` form to migrate to, and the address is
+link-local and non-routable. The alerts are unfixable as written.
+
+**However**, reading them surfaced a genuine inconsistency the rule did not
+flag. `warming.rs` uses hardened **IMDSv2**:
+
+[source,rust]
+----
+let token = client.put("http://169.254.169.254/latest/api/token")
+    .header("X-aws-ec2-metadata-token-ttl-seconds", "300") // ... then
+client.get("http://169.254.169.254/latest/meta-data/spot/instance-action")
+    .header("X-aws-ec2-metadata-token", token.trim())
+----
+
+while `environment_detector.rs:536` issues a bare **IMDSv1** GET with no token:
+
+[source,rust]
+----
+client.get("http://169.254.169.254/latest/meta-data/instance-id").send()
+----
+
+IMDSv1 is the SSRF-reachable variant AWS recommends disabling. This is a
+low-severity hardening item (it reads only `instance-id`, for environment
+detection), but the two call sites should agree. **Open.**
+
+== 5. `rust/uncontrolled-allocation-size` (4 high) — MIXED, and the one real hit is real
+
+=== False positive (3 of 4)
+
+* `src/network/rest/v2/records.rs:1155` — `Vec::with_capacity(total_records)`
+* `src/network/rest/v2/records.rs:1157` — `Vec::with_capacity(total_records)`
+* `src/network/rest/v2/documents.rs:203` — `Vec::with_capacity(request.records.len())`
+
+In all three the capacity is the length of a `Vec` that **already exists in
+memory**: the deserialised request body. `with_capacity` cannot allocate more
+than the request has already cost, and the upstream bound is the axum body limit
+(`max_request_size`, default 64 MiB — `src/network/mod.rs:283`), paid at
+deserialisation. Removing `with_capacity` would make these *slower*, not safer.
+
+=== REAL (1 of 4) — `crates/foundation/proximadb-search-types/src/bounded_queue.rs:163`
+
+[source,rust]
+----
+pub fn with_capacity(k: usize) -> Self {
+    Self { capacity: k.max(1), inner: BinaryHeap::with_capacity(k) }
+}
+----
+
+The doc comment on this very function says `k` comes from `top_k` query
+parameters. `BinaryHeap::with_capacity(k)` allocates `k * size_of::<Reverse<E>>()`
+**eagerly**, before a single candidate is scored. Production callers pass `top_k`
+straight through:
+
+* `src/index/axis/management/manager.rs:4501` — `TopKHeap::with_capacity(query.top_k)`
+* `src/index/axis/indexes/dual_store_ivf.rs:1739` — `TopKHeap::with_capacity(k)`
+
+A `top_k` cap exists — but at **exactly one entry point**:
+
+[source,rust]
+----
+// src/network/rest/v2/records.rs:1579
+let max_top_k: usize = std::env::var("PROXIMADB_SEARCH_MAX_TOP_K")
+    .ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+if request.top_k > max_top_k { return Err(ApiError::InvalidArgument(..)); }
+----
+
+`git grep PROXIMADB_SEARCH_MAX_TOP_K` returns that handler and the env registry
+and nothing else. Arrow Flight declares `top_k: Option<u32>` in its
+`app_metadata` control message (`src/network/arrow_ipc/service.rs:78`, defaulted
+to 10 at `:3278`) with **no cap**; gRPC and the pgwire/UDTF vector path are
+likewise uncapped. A Flight client sending `top_k = u32::MAX` requests a
+~4.3e9-element heap allocation — tens to hundreds of GB — aborting the server
+process.
+
+The defence is in the wrong place: it is a per-handler check in one REST handler
+instead of a clamp at the shared sink. **Open. This is the highest-value fix in
+this TD and it is small**: clamp inside `TopKHeap::with_capacity` (e.g.
+`BinaryHeap::with_capacity(k.min(CAP))`, growing on demand), which fixes every
+surface at once, and additionally reject over-cap `top_k` at the Flight and gRPC
+boundaries so clients get an error rather than a truncated result.
+
+== 6. `rust/path-injection` (2 high) — REAL, both, and this is the serious one
+
+`src/services/external_collection/source_reader.rs:175` and `:179`:
+
+[source,rust]
+----
+fn list_parquet_files(location: &str) -> Result<Vec<std::path::PathBuf>> {
+    let path = std::path::Path::new(location);
+    let meta = std::fs::metadata(path)                      // :175
+        .with_context(|| format!("external location '{location}' is not accessible"))?;
+    let mut files = Vec::new();
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)                // :179
+        // ... keeps only *.parquet
+    } else {
+        files.push(path.to_path_buf());                     // <- NO extension check
+    }
+----
+
+`location` arrives from the network with **no validation beyond non-emptiness**:
+
+[source,rust]
+----
+// src/network/rest/v2/external_collection.rs:132 — POST /api/v2/external-collections
+if req.name.is_empty() || req.location.is_empty() {
+    return Err(ApiError::InvalidArgument("name and location are required".to_string()));
+}
+let spec = ExternalCollectionSpec { name: req.name, location: req.location, .. };
+let collection = service(&state)?.register(spec).await
+----
+
+`register` calls `snapshot_fingerprint(&spec.location)` → `list_parquet_files`
+(`src/services/external_collection/service.rs:138`). The route is mounted
+unconditionally in the v2 router (`src/network/rest/v2/mod.rs:233`) and the
+service is wired in `src/network/multi_server.rs:935`.
+
+Consequences:
+
+1. **Arbitrary host-path traversal.** `location` may be any absolute path, any
+   `../` sequence, any symlink. `git grep -iE 'allowlist|canonicalize'` over
+   `src/services/external_collection/` returns **nothing** — there is no root
+   confinement, no canonicalisation, no extension check on the single-file
+   branch, so *any* file on the host is pushed into the read set and handed to
+   the Parquet reader.
+2. **Filesystem oracle.** The error string
+   `"external location '{location}' is not accessible"` is returned to the
+   caller, distinguishing existing from non-existing paths across the whole host
+   filesystem, plus directory listings via the `read_dir` path.
+3. **Mandate violation.** This read path never touches `DrPathBuilder` and
+   carries no tenant prefix, so it sits entirely outside
+   `data/{tenant_id}/{namespace_id}/…`. Per the Path Isolation mandate,
+   isolation here is a *per-request string*, which is exactly the
+   "per-query predicate" the co-design mandate forbids; and nothing stops tenant
+   A registering a location under tenant B's prefix.
+
+This class is **real, unfixed, and the only finding in this triage that is a
+genuine security defect reachable from the network.** It is not a v0.4.0
+regression (the endpoint predates the promotion and the same alerts are on
+`main`), so it does not block v0.4.0 — but it should be fixed before the external
+-collection surface is documented as supported. Fix shape: resolve `location`
+through `DrPathBuilder` under the caller's `TenantContext`, canonicalise, and
+reject anything escaping the resulting root; keep the `.parquet` filter on both
+branches; make the not-accessible error generic.
+
+== 7. `rust/access-invalid-pointer` (1 high) — false positive
+
+`crates/binding/proximadb-embedded/src/nodejs.rs:85`, columns 12–21. That span
+is the identifier `ProximaDB` in `pub struct ProximaDB` — the line above is
+`#[napi]`. The raw-pointer dereference CodeQL sees is in **napi-rs's
+proc-macro expansion** (`FromNapiRef`, which does `&*(ptr as *const Self)`),
+inherent to napi-rs's object model. There is no hand-written `unsafe` here. The
+finding belongs upstream.
+
+Noted because this crate backs `clients/nodejs-embedded`, which **is**
+npm-published — so it deserved a named decision rather than silence. Decision:
+accept, upstream's model, no local change.
+
+== 8. `py/redos` (1 high) — real pattern, non-exploitable context
+
+`scripts/check_mvp_trust_corridor.py:191` uses
+`([a-zA-Z0-9_-]+(?:-[a-zA-Z0-9_-]+)+)`, which does backtrack exponentially on
+`--`-heavy input. The input is `release_notes`, a slice of the repo's own
+`.github/workflows/release.yml` read from disk by a CI guard. Not attacker-
+controlled, not shipped, worst case a hung CI job on a self-inflicted edit.
+Low-priority hygiene; the regex should be rewritten anyway.
+
+== 9. Dependency reachability — does any advisory affect what v0.4.0 publishes?
+
+**Answer: no advisory is exploitable in a published v0.4.0 artifact.** Two
+vulnerable crate versions are *present* in the release tarball binaries but their
+vulnerable code paths are unreachable; everything else is build- or dev-only.
+
+=== What v0.4.0 actually publishes
+
+[cols="2,3", options="header"]
+|===
+| Artifact | Build
+| Release tarball binaries | `cargo build --release --target <t> --features cloud-full` (`.github/workflows/release.yml:214,244,295`)
+| Container image | `deploy/docker/Dockerfile` target `runtime`/`runtime-full` (`.github/workflows/publish-image.yml:106`), built `--features cloud-full` (`:30,:43`) and `cloud-full,onnx` for the full target (`:79`). The runtime stage copies only the binary, `config/config.toml` and the embed models — no `ui/`, no `third_party/`.
+| `clients/rust` (`proximadb-sdk` 0.4.0, cargo) | `reqwest` + `progenitor-client`; no advisory-bearing dep
+| `clients/nodejs-embedded` (npm) | native crate + generated JS
+|===
+
+NOTE: the root `Dockerfile` is a separate demo image (it copies `demo/` and
+`demo/config/docker-config.toml`) and is **not** what `publish-image.yml`
+publishes. Only `deploy/docker/Dockerfile` matters for this assessment.
+
+=== The 9 high Dependabot advisories
+
+[cols="1,2,1,3", options="header"]
+|===
+| # | Package | Scope | Reachability
+
+| 43, 56, 57, 58, 68, 69 | `serialize-javascript`, `svgo` ×2, `postcss` ×2, `fast-uri` | **development**, `ui/package-lock.json` | **NOT SHIPPED.** `ui/` is never built by `deploy/docker/Dockerfile` or `release.yml`, and the runtime stage copies no web assets at all. The only UI embeddable in the binary is the prebuilt `third_party/mlflow-ui/3.16.0/build` bundle (`src/network/rest/mlflow/ui.rs:26`), behind the non-default `mlflow-ui` feature, which neither `default` (`Cargo.toml:825`) nor `cloud-full = ["aws","azure","gcp"]` enables.
+| 66 | `js-yaml` | **development**, `clients/nodejs-embedded` | Not in the npm-published runtime tree.
+| 63 | `google.golang.org/grpc` (< 1.82.2, xDS-server DoS) | runtime, `clients/go/go.mod` | **STALE ALERT.** Opened 2026-09-09; `origin/qa` pins `v1.84.0` and `origin/main` pins `v1.83.1` — both patched. Also `git grep xds clients/go/` is empty, so the xDS-server path never existed here. Dependabot simply has not closed it.
+| 6 | `rustls-webpki` (GHSA-82j2-j2ch-gfr8, < 0.103.13, DoS panic on malformed CRL `BIT STRING`) | runtime, `Cargo.lock` | **PRESENT in the shipped binaries and the published image; vulnerable path unreachable.** See below.
+|===
+
+=== `rustls-webpki` — present, unreachable
+
+`origin/qa:Cargo.lock` carries **two** copies: `0.103.15` (patched) and
+`0.101.7` (in range). `cargo tree -i 'rustls-webpki@0.101.7' --features cloud-full`
+gives the only chain:
+
+----
+rustls-webpki 0.101.7 <- rustls 0.21.12 <- aws-smithy-http-client 1.1.13
+  <- aws-smithy-runtime <- aws-config / aws-sdk-glue <- proximadb-catalog <- proximadb
+----
+
+It enters only via `aws` (`proximadb-catalog/Cargo.toml:25`), hence only in a
+`cloud-full` build — i.e. **both** the release tarballs and the published
+container image, and **not** a default-feature build. The
+vulnerable function is CRL parsing, reached only by building a
+`WebPkiClientVerifier` with CRLs. That type is constructed in exactly two places
+(`crates/horizontal/proximadb-tls/src/lib.rs:191`,
+`src/network/rest/server.rs:1182`), both on **rustls 0.23 → rustls-webpki
+0.103.15 (patched)**, and both call `.build()` with **no** `.with_crls(…)`. The
+`aws-smithy` copy is an outbound TLS *client* only — no client-cert verifier, no
+CRL. Verdict: **not exploitable; remediate by bumping the AWS SDK so the
+duplicate `rustls 0.21` disappears.**
+
+=== `jsonwebtoken` (medium, but in the auth path, so checked)
+
+`origin/qa:Cargo.lock` carries `11.0.0` (patched) and `9.3.1`
+(GHSA type confusion → authorization bypass, `< 10.3.0`). Our own code pins
+`jsonwebtoken = { version = "10", … }` (`Cargo.toml:725`) and resolves to the
+patched copy. `9.3.1` arrives only via `gcp`:
+
+----
+jsonwebtoken 9.3.1 <- google-cloud-auth 0.13.2 <- google-cloud-storage 0.15.0 <- proximadb
+----
+
+`google-cloud-auth`'s only `decode` call is
+`token_source/mod.rs:70-74`, which sets
+`validation.insecure_disable_signature_validation()` and a
+`DecodingKey::from_secret(b"")` purely to read the `exp` claim off a token
+Google *just issued to us*. No authorization decision is taken from it, so the
+type confusion has nothing to confuse. Verdict: **not exploitable; remediate by
+bumping `google-cloud-storage`.**
+
+=== The 4 CVE code-scanning alerts
+
+CodeQL reports these with paths relative to the scanned sub-tree:
+
+[cols="1,2,3", options="header"]
+|===
+| Alert | Reported path → actual | Verdict
+
+| 161 (CVE-2026-105801) | `codegen/requirements.txt` → `clients/python/codegen/requirements.txt` | `openapi-python-client`, arbitrary code generation from a malicious OpenAPI document. **Build-time SDK generator**; its only input is our own `utoipa`-emitted spec. Not shipped.
+| 92, 93 (CVE-2026-56864/56865) | `codegen/go.mod` → `clients/go/codegen/go.mod` | `golang.org/x/mod/sumdb` integrity bypass, pulled in by `oapi-codegen v2.8.0`. That module exists *precisely* to keep the generator toolchain out of the published SDK module (its own header says so). Not shipped.
+| 167 (CVE-2026-78669) | `go.mod` → `clients/go/go.mod` | HTTP/2 SETTINGS-frame CPU exhaustion. `clients/go` resolves `golang.org/x/net v0.58.0` **indirect**, and no `x/net` advisory with this id exists in GitHub's Go DB — the alert tracks the Go **stdlib/toolchain** advisory via the `go 1.25.0` directive, so the remediation is a toolchain bump by whoever compiles the SDK. The ProximaDB server is Rust (hyper/h2) and is untouched.
+|===
+
+=== 22 moderate/low
+
+17 moderate + 5 low. **17 of the 22 are `ui/package-lock.json`** —
+`webpack-dev-server` ×6, `dompurify` ×4, `postcss` ×3, and one each of `svgo`,
+`uuid`, `serialize-javascript`, `@tootallnate/once` — not shipped, as above. The
+four `dompurify` alerts are marked `runtime` scope, but that scope is relative to
+the `ui/` package, which no ProximaDB artifact contains.
+
+The remaining 5 are all already analysed above: `rustls-webpki` ×2 (low
+variants of the same duplicate 0.101.7), `jsonwebtoken` ×1 (medium), and
+`vitest` + `@vitest/mocker` ×2 (`clients/nodejs-embedded` **development**
+scope, absent from the npm-published runtime tree).
+
+== Process finding: CodeQL's signal-to-noise is why this went unread
+
+63 code-scanning findings, 2 real. The 37-alert `rust/cleartext-logging` class
+alone is 59% of the volume and 0% real, and it is the reason a network-reachable
+path-traversal in `external_collection` sat at the bottom of an unread list
+through a release promotion.
+
+Recommended, in priority order:
+
+1. **Fix the two real classes** — clamp `TopKHeap::with_capacity` and cap
+   `top_k` at the Flight/gRPC boundaries (§5); confine
+   `external_collection` `location` under `DrPathBuilder` + `TenantContext`
+   (§6).
+2. **Do not reach for a `paths-ignore` fix — it does not work here.** The
+   obvious response is "exclude test code from the scan", and this TD
+   deliberately does **not** ship that change, because it would not help:
+   * There is no CodeQL config file in this repo
+     (`.github/codeql*` does not exist) and `codeql.yml` passes only
+     `languages` / `build-mode`.
+   * `paths-ignore` filters **files**. 25 of the 37 `cleartext-logging` alerts
+     and 4 of the 5 criticals live in inline `#[cfg(test)] mod tests` blocks
+     **inside production files** (`src/security/auth_service.rs`,
+     `src/network/postgres/scram.rs`, …). No path filter can reach them without
+     excluding the production code in the same file.
+   * A `query-filters` exclusion by rule id would suppress
+     `rust/cleartext-logging` and `rust/hard-coded-cryptographic-value`
+     everywhere, production included — trading 37 false positives for blindness
+     to the first real one.
+   The honest position is that this noise is **not currently filterable** and
+   the repo should keep triaging these two rules **by class, as this TD does**,
+   rather than per alert. Note also that dismissals do not survive new instances
+   on new refs — which is why the same five benign criticals reappeared on
+   `refs/pull/1970/merge`. Revisit if CodeQL's Rust extractor gains a
+   `cfg(test)`-aware exclusion.
+3. **Fix the IMDSv1 call site** (§4) and the ReDoS regex (§8).
+4. **Decide whether CodeQL stays non-blocking.** It need not gate `CI Success`,
+   but "5 critical alerts on the promotion PR" should at minimum be a
+   promotion-checklist read rather than something nobody is required to look at.
+5. **Close the scanning blind spot**: `third_party/mlflow-ui/3.16.0/build` is a
+   vendored, minified third-party JS bundle `include_dir!`-embedded into the
+   server binary with no `package.json`, so no Dependabot ecosystem covers it.
+   Harmless for v0.4.0 (the `mlflow-ui` feature is off by default and
+   `cloud-full` does not enable it), but it should not stay invisible if that
+   feature is ever turned on.
+
+== Release verdict for v0.4.0
+
+Nothing found here blocks the v0.4.0 promotion:
+
+* The 5 criticals are test vectors and a CSPRNG-filled buffer — dismissed with
+  evidence.
+* No published artifact carries an exploitable dependency advisory.
+* The two real defects (§5, §6) are **pre-existing** — the same alerts are open
+  on `refs/heads/main` — so they are not promotion regressions. They are real,
+  they are unfixed, and they are tracked here.
