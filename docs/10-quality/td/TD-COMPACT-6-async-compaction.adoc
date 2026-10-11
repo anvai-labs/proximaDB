@@ -72,7 +72,7 @@ producer/consumer rate-control loop (ADR-076 D1). Concretely:
 
 == Related
 
-link:ADR-076-async-compaction-admission-control.adoc[ADR-076],
+link:../../12-design/adr/ADR-076-async-compaction-admission-control.adoc[ADR-076],
 link:TD-COMPACT-5-training-compaction-trigger.adoc[TD-COMPACT-5],
 link:TD-COMPACT-7-l0-admission-control-watermarks.adoc[TD-COMPACT-7],
 link:TD-COMPACT-8-training-arm-debounce.adoc[TD-COMPACT-8].

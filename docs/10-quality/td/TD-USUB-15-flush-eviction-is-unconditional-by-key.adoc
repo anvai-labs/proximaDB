@@ -1,0 +1,69 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-15: The spill flush evicts by KEY, so a value written during the PUT window is lost
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-07 by adversarial review of the tombstone-persistence change, which closed the identical hazard for synthesised tombstones and left this half open.
+| Priority | **HIGH as a prerequisite of slice 2b**, LOW before it. Today WAL replay recovers the lost value on restart. Once truncation acts on `min_unflushed_lsn`, it does not — and the loss becomes permanent and silent.
+| Component | `src/services/record_spill.rs` (`flush`'s post-commit eviction loop, `upsert_record`)
+| Relates to | TD-USUB-1 slice 2b (WAL truncation) — **this is a gate on it**; TD-USUB-13 (the flush/delete serialization that does NOT cover upsert)
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`flush`'s post-commit loop evicts by key, unconditionally:
+
+[source,rust]
+----
+for record in &residents {
+    self.memtable.remove(&record.oid);
+    self.resident_lsns.remove(&record.oid);
+}
+----
+
+That is sound only if the value at the key is still the one this flush made durable. `upsert_record`
+does **not** take `flush_guard` (only `flush`, `delete_record` and `purge_durable_objects` do), and
+the window is the whole `write_if_absent` — a real object-store PUT, so milliseconds to hundreds of
+milliseconds, not a few instructions.
+
+Sequence (threshold unset, tenant set):
+
+1. `upsert_record_at_lsn(record("a","v1"), 10)`.
+2. `flush()` snapshots `residents = [a:v1]` and parks in `write_if_absent`.
+3. `upsert_record(record("a","v2"))` — no guard, proceeds → `memtable["a"] = v2`.
+4. PUT completes. The loop runs: `memtable.remove("a")` discards **v2**, `resident_lsns.remove("a")`
+   drops its LSN association.
+5. `get_record("a")` → memtable empty → segment 0 → **`a:v1`**. v2 is gone.
+6. `min_unflushed_lsn()` → nothing resident → `Ok(None)`, "no constraint".
+
+**Why 2b is the line.** Step 6 is only a stale read today: the WAL still holds v2 and replay
+re-inserts it on restart. Once slice 2b truncates on that `Ok(None)`, v2's WAL entry is discarded
+and the row is permanently v1. So this must be closed before 2b, not after.
+
+== Why the tombstone half was closed and this was not
+
+The tombstone-persistence change split `residents` (evicted) from `written` (persisted) precisely
+because appending synthesised tombstones to the eviction list would have evicted a re-inserted row.
+That reasoning applies verbatim to a resident oid whose *value* changed — the split fixes which
+KEYS are evicted, not whether the VALUE at a key is still the flushed one.
+
+`an_upsert_of_a_tombstoned_oid_after_the_snapshot_is_not_evicted` covers the tombstoned oid only,
+and its doc now says so explicitly; the earlier name
+(`an_upsert_after_the_snapshot_is_not_evicted_by_the_flush`) asserted the general property, which is
+false.
+
+== How to apply
+
+1. Make the eviction conditional on the value still being the flushed one — `DashMap::remove_if`
+   comparing a version or `updated_at_ns`, not a full-record equality (`ProximaRecord` is large and
+   may not derive `PartialEq` usefully). Whatever discriminator is chosen must be monotonic per oid;
+   verify that `upsert_record` actually advances it, rather than assuming.
+2. The alternative — having `upsert_record` take `flush_guard` — is NOT a drop-in: `upsert_record`
+   triggers `flush` internally when the threshold is crossed, so taking the guard first would
+   self-deadlock. Any such change must restructure that call.
+3. Test with the existing `BarrierFs`: park a flush mid-write, upsert a NEW VALUE for a resident
+   oid, release, and assert the new value survives — the resident mirror of the tombstone test.
+4. Mutation-test it: an unconditional `remove` must fail that test.

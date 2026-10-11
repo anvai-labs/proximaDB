@@ -556,13 +556,13 @@ if self.get_total_vectors() < 100_000 {
 
 ## References
 
-* link:../../../../docs/storage/nova-engine-deep-dive.adoc[NOVA Engine Deep Dive]
-* link:../../../../docs/storage/nova-engine-operations.adoc[NOVA Operations Guide]
-* link:../../../../docs/technical/unified-quantization-guide.adoc[Quantization Guide]
+* NOVA Engine Deep Dive
+* NOVA Operations Guide
+* link:../../../../docs/_internal/archive/technical/unified-quantization-guide.adoc[Quantization Guide]
 
 == See Also
 
-* Parent Module: link:../README.adoc[Storage Engines]
+* Parent Module: Storage Engines
 * SST Engine: link:../sst/README.adoc[SST README]
 * VIPER Engine: link:../viper/README.adoc[VIPER README]
-* Main Documentation: link:../../../../docs/README.adoc[ProximaDB Docs]
+* Main Documentation: ProximaDB Docs

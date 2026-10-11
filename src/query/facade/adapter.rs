@@ -595,8 +595,16 @@ impl QueryFacadeAdapter {
         sql_upper.contains("VECTOR_SEARCH")
             || sql_upper.contains("GRAPH_QUERY")
             || sql_upper.contains("DOCUMENT_QUERY")
-            // R-7c.4c: RERANK() routes through the same federated path
-            // so pgwire clients can `SELECT * FROM RERANK(...)`.
+            // R-7c.4c: RERANK() routes through this federated path when the
+            // caller is `QueryFacadeAdapter` — gRPC's
+            // `proximadb.v2.ProximaRecordService.ExecuteQuery` (and the
+            // graph-service RPCs it backs). NOT reachable over pgwire: this
+            // adapter is never constructed from `src/network/postgres/`, and
+            // pgwire has zero RERANK dispatch anywhere (verified 2026-09-15,
+            // TD-RERANK-PGWIRE-1) — a bare `SELECT * FROM RERANK(...)` over
+            // pgwire declines with a generic "comma-separated table list"
+            // error from an unrelated legacy-path guard, not real RERANK
+            // support. This comment previously claimed the opposite.
             || sql_upper.contains("RERANK(")
             || sql_upper.contains("LOGS(")
             || sql_upper.contains("METRICS(")

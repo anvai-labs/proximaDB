@@ -449,7 +449,7 @@ pub struct SharedServices {
     ///
     /// REST, gRPC, and Arrow Flight all pull the same `Arc<RankServices>`
     /// from here via `AppState::with_rank_services` / equivalent, so SQL
-    /// `RERANK(...)`, the REST `/api/v1/rank/search` route, and the
+    /// `RERANK(...)`, the REST `/api/v2/rank/search` route, and the
     /// `rank_features_export` Arrow Flight action share the same profile
     /// registry, candidate provider, scorer registry, and metric handles.
     /// Built around `ProductionHybridBackend` so retrieval lights up
@@ -1811,6 +1811,7 @@ impl SharedServices {
                 // Convert storage metadata to proto collection format
                 let collection_config = crate::proto::proximadb_v1::CollectionConfig {
                     name: metadata.name.clone(),
+                    embedding_config: None,
                     dimension: metadata.dimension as u32,
                     distance_metric: Some(
                         crate::proto::proximadb_v1::DistanceMetric::Cosine as i32,
@@ -2729,6 +2730,7 @@ impl SharedServices {
         // PartitionLeaseManager the DML write-gate uses (`lease_manager_for_writes`),
         // so DDL and DML share one ownership view.
         let mut ddl = crate::services::DdlService::new(catalog_manager.clone())
+            .with_record_store(dml_service_for_grpc.record_store())
             .with_primary_pod_registry(primary_pod_registry.clone())
             .with_self_pod_id(crate::cluster::primary_pod_registry::resolve_self_pod_id(
                 None,

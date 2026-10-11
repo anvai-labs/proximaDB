@@ -1065,7 +1065,7 @@ def write_pareto_svg(analysis: dict, destination: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--matrix", action="append", type=Path, required=True)
-    parser.add_argument("--target-recall", type=float, default=0.98)
+    parser.add_argument("--target-recall", type=float, default=0.975)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-svg", type=Path, required=True)
     parser.add_argument("--output-dual-svg", type=Path)

@@ -367,28 +367,72 @@ fn tree_node_to_property_value(node: &ProximaTreeNode) -> PropertyValue {
     }
 }
 
-fn proxima_value_to_property_value(value: &ProximaValue) -> PropertyValue {
+pub(crate) fn proxima_value_to_property_value(value: &ProximaValue) -> PropertyValue {
     use property_value::Value;
-    // Inverse of `property_value_to_proxima`. Graph properties only ever serialize
-    // the variants handled below; any other `ProximaValue` is not part of the graph
-    // property shape, so it maps defensively to an empty value rather than panicking.
+    // The neutral graph object type does not distinguish ProximaValue::Map from
+    // ProximaValue::Struct. Both retain their fields and lower to ObjectValue.
     let inner = match value {
-        ProximaValue::String(v) => Some(Value::StringValue(v.clone())),
+        ProximaValue::String(v) | ProximaValue::Symbol(v) | ProximaValue::Decimal(v) => {
+            Some(Value::StringValue(v.clone()))
+        }
+        ProximaValue::Int8(v) => Some(Value::IntValue(i64::from(*v))),
+        ProximaValue::Int16(v) => Some(Value::IntValue(i64::from(*v))),
+        ProximaValue::Int32(v) => Some(Value::IntValue(i64::from(*v))),
         ProximaValue::Int64(v) => Some(Value::IntValue(*v)),
+        ProximaValue::UInt8(v) => Some(Value::IntValue(i64::from(*v))),
+        ProximaValue::UInt16(v) => Some(Value::IntValue(i64::from(*v))),
+        ProximaValue::UInt32(v) => Some(Value::IntValue(i64::from(*v))),
+        ProximaValue::UInt64(v) => match i64::try_from(*v) {
+            Ok(value) => Some(Value::IntValue(value)),
+            Err(_) => Some(Value::StringValue(v.to_string())),
+        },
+        ProximaValue::Float16(v) | ProximaValue::Float32(v) => {
+            Some(Value::DoubleValue(f64::from(*v)))
+        }
         ProximaValue::Float64(v) => Some(Value::DoubleValue(*v)),
         ProximaValue::Boolean(v) => Some(Value::BoolValue(*v)),
-        ProximaValue::Binary(v) => Some(Value::BytesValue(v.clone())),
+        ProximaValue::Binary(v) | ProximaValue::BinaryVector(v) => {
+            Some(Value::BytesValue(v.clone()))
+        }
+        ProximaValue::Date(v) => Some(Value::IntValue(i64::from(*v))),
+        ProximaValue::Time(v, _)
+        | ProximaValue::Timestamp(v, _)
+        | ProximaValue::TimestampTz(v, _) => Some(Value::IntValue(*v)),
+        ProximaValue::Uuid(v) | ProximaValue::ULID(v) => Some(Value::BytesValue(v.to_vec())),
         ProximaValue::Array(items) => Some(Value::ArrayValue(PropertyArray {
             values: items.iter().map(proxima_value_to_property_value).collect(),
         })),
-        ProximaValue::Struct(fields) => Some(Value::ObjectValue(PropertyObject {
-            fields: fields
-                .iter()
-                .map(|(key, child)| (key.clone(), proxima_value_to_property_value(child)))
-                .collect(),
-        })),
+        ProximaValue::Struct(fields) | ProximaValue::Map(fields) => {
+            Some(Value::ObjectValue(PropertyObject {
+                fields: fields
+                    .iter()
+                    .map(|(key, child)| (key.clone(), proxima_value_to_property_value(child)))
+                    .collect(),
+            }))
+        }
         ProximaValue::DenseVector(v) => Some(Value::VectorValue(v.clone())),
-        _ => None,
+        // Round 8: JSON(B) maps to canonical JSON text — the wildcard silently
+        // dropped it at this live projection seam (the round-7 fix landed in
+        // the dead sql_value_to_property_value twin).
+        ProximaValue::Json(v) | ProximaValue::Jsonb(v) => match v {
+            // A JSON null stays the property model's null form — rendering it
+            // as the string "null" would flip null-equality to string
+            // equality at graph filters (round 12).
+            serde_json::Value::Null => None,
+            // Sorted-key canonical text — unsorted varies with
+            // preserve_order/insertion order across write seams (round 18).
+            other => Some(Value::StringValue(
+                crate::storage::entity_store::graph_schema::canonical_json_string(other),
+            )),
+        },
+        ProximaValue::SparseVector { .. } => Some(Value::StringValue(
+            // Same canonical-text contract as the JSON(B) arm (round 18):
+            // unsorted keys vary with preserve_order across write seams.
+            crate::storage::entity_store::graph_schema::canonical_json_string(
+                &proximadb_records::conversions::proxima_to_json(value),
+            ),
+        )),
+        ProximaValue::Null => None,
     };
     PropertyValue { value: inner }
 }
@@ -415,7 +459,7 @@ fn property_value_to_tree_node(value: &PropertyValue) -> ProximaTreeNode {
     }
 }
 
-fn property_value_to_proxima(value: &PropertyValue) -> ProximaValue {
+pub(crate) fn property_value_to_proxima(value: &PropertyValue) -> ProximaValue {
     match &value.value {
         Some(property_value::Value::StringValue(value)) => ProximaValue::String(value.clone()),
         Some(property_value::Value::IntValue(value)) => ProximaValue::Int64(*value),
@@ -657,6 +701,51 @@ mod tests {
         let record = node_to_canonical_record("g1", &node);
         let restored = node_from_canonical_record(&record).expect("node record");
         assert_eq!(restored, node);
+    }
+
+    #[test]
+    fn canonical_map_and_json_properties_project_without_loss() {
+        let document = serde_json::json!({"memory": {"type": "fact"}, "rank": 7});
+        let properties = ProximaTree::from([
+            (
+                "profile".to_string(),
+                ProximaTreeNode::Value(ProximaValue::Jsonb(document.clone())),
+            ),
+            (
+                "deleted_value".to_string(),
+                ProximaTreeNode::Value(ProximaValue::Jsonb(serde_json::Value::Null)),
+            ),
+            (
+                "attributes".to_string(),
+                ProximaTreeNode::Value(ProximaValue::Map(HashMap::from([(
+                    "rank".to_string(),
+                    ProximaValue::Int64(7),
+                )]))),
+            ),
+        ]);
+        let record = CanonicalNode::new("g1", "n1", "Person", properties).into_proxima_record();
+
+        let restored = node_from_canonical_record(&record).expect("canonical node record");
+
+        assert_eq!(
+            restored.properties.get("profile"),
+            Some(&PropertyValue {
+                value: Some(property_value::Value::StringValue(document.to_string())),
+            })
+        );
+        assert_eq!(
+            restored.properties.get("attributes"),
+            Some(&PropertyValue {
+                value: Some(property_value::Value::ObjectValue(PropertyObject {
+                    fields: HashMap::from([("rank".to_string(), prop_int(7))]),
+                })),
+            })
+        );
+        assert_eq!(
+            restored.properties.get("deleted_value"),
+            Some(&PropertyValue { value: None }),
+            "JSON null must remain the graph property model's null form"
+        );
     }
 
     #[test]

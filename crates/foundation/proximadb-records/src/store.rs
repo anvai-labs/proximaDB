@@ -166,6 +166,54 @@ impl RecordScanOptions {
 pub trait RecordStore: Send + Sync {
     async fn upsert_record(&self, record: ProximaRecord) -> RecordStoreResult<ProximaRecord>;
 
+    /// Upsert a record whose durable WAL sequence number (LSN) is known.
+    ///
+    /// The default **ignores the LSN** and delegates to [`Self::upsert_record`],
+    /// so no existing implementor is affected. Only a store that must reason
+    /// about WAL retention needs to override it.
+    ///
+    /// # Why this exists, and why it is not a watermark
+    ///
+    /// ADR-094's WAL truncation rule permits truncation only below the minimum
+    /// LSN durably committed in a referenced segment. Computing that requires
+    /// knowing which LSN each *resident* record came from — not a single
+    /// high-water mark. A high-water taken at flush time is **unsafe**: the WAL
+    /// append covers a whole batch and completes before the per-record inserts
+    /// run, so a flush triggered partway through a multi-row statement produces
+    /// a segment that excludes later rows whose LSNs are already committed.
+    /// Truncating below such a mark would discard the only durable copy. See
+    /// TD-USUB-1.
+    ///
+    /// Passing an LSN therefore records an association, not a bound: the store
+    /// keeps `oid → lsn` for rows it still holds, and the safe truncation point
+    /// is the minimum over that set.
+    ///
+    /// The caller must only pass an LSN whose WAL entry is already **durable**.
+    /// `TableWalAppender::append_operations` returns its entries after
+    /// `sync_data()`, so sequence numbers taken from its result satisfy that.
+    async fn upsert_record_at_lsn(
+        &self,
+        record: ProximaRecord,
+        lsn: u64,
+    ) -> RecordStoreResult<ProximaRecord> {
+        let _ = lsn;
+        self.upsert_record(record).await
+    }
+
+    /// The lowest WAL LSN this store still needs retained — i.e. the minimum LSN
+    /// among records it holds that are **not** yet in a durable segment.
+    ///
+    /// `None` means "nothing to retain on my account", which is the default for
+    /// every store that does not track LSNs. A caller computing a truncation
+    /// point must treat `None` as *no constraint from this store* and must still
+    /// respect every other store's answer.
+    ///
+    /// Deliberately not called `flushed_up_to`: this is a minimum over an
+    /// unordered resident set, not a contiguous prefix.
+    async fn min_unflushed_lsn(&self) -> RecordStoreResult<Option<u64>> {
+        Ok(None)
+    }
+
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>>;
 
     /// Batch point-lookup: fetch many records by key in one logical operation,
@@ -214,6 +262,24 @@ pub trait RecordStore: Send + Sync {
     /// checkpoint / graceful-shutdown boundary — otherwise an unflushed buffer is
     /// lost on crash. Called from the graph checkpoint/shutdown path (`flush_wal`).
     async fn flush(&self) -> RecordStoreResult<()> {
+        Ok(())
+    }
+
+    /// Permanently delete the durable objects this store owns, for a DROP of the
+    /// partition it backs. The default is a no-op: an in-memory store owns no
+    /// objects, so releasing its handle already is complete deletion.
+    ///
+    /// A store that writes objects MUST override this, because releasing the
+    /// in-memory handle does **not** delete them. Without it a `DROP TABLE`
+    /// leaves every written object in the bucket with nothing referencing it —
+    /// billable storage the tenant can neither see nor reach, under a statement
+    /// whose whole contract is deletion.
+    ///
+    /// Must be **idempotent** (re-dropping, or dropping a partition that never
+    /// wrote anything, is not an error) and must **propagate real I/O failures**
+    /// rather than reporting success — silently failing here leaves undeletable
+    /// data.
+    async fn purge_durable_objects(&self) -> RecordStoreResult<()> {
         Ok(())
     }
 }

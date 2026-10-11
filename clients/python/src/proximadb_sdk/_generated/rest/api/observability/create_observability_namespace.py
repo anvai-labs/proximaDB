@@ -61,6 +61,11 @@ def _parse_response(
 
         return response_401
 
+    if response.status_code == 500:
+        response_500 = ErrorResponse.from_dict(response.json())
+
+        return response_500
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -89,6 +94,13 @@ def sync_detailed(
      Creates a namespace for log/metric/trace data with tiered retention.
     Retention days default to hot=1, warm=7, cold=30; archive is fixed at
     365 days server-side.
+
+    Scope: the path namespace IS the isolation boundary — it maps 1:1 onto
+    the storage tenant key. The request's X-Tenant-ID header is not
+    consulted by this surface (TD-SPECRAT-2 tracks multi-tenant namespace
+    ownership). Availability: mounted unconditionally on the unified
+    server (the default, port 5678); legacy multi-port mode mounts it only
+    with gRPC enabled; cluster-mode REST does not mount it.
 
     Args:
         x_tenant_id (str | Unset):
@@ -128,6 +140,13 @@ def sync(
     Retention days default to hot=1, warm=7, cold=30; archive is fixed at
     365 days server-side.
 
+    Scope: the path namespace IS the isolation boundary — it maps 1:1 onto
+    the storage tenant key. The request's X-Tenant-ID header is not
+    consulted by this surface (TD-SPECRAT-2 tracks multi-tenant namespace
+    ownership). Availability: mounted unconditionally on the unified
+    server (the default, port 5678); legacy multi-port mode mounts it only
+    with gRPC enabled; cluster-mode REST does not mount it.
+
     Args:
         x_tenant_id (str | Unset):
         body (CreateObservabilityNamespaceRequest): Body for `POST
@@ -160,6 +179,13 @@ async def asyncio_detailed(
      Creates a namespace for log/metric/trace data with tiered retention.
     Retention days default to hot=1, warm=7, cold=30; archive is fixed at
     365 days server-side.
+
+    Scope: the path namespace IS the isolation boundary — it maps 1:1 onto
+    the storage tenant key. The request's X-Tenant-ID header is not
+    consulted by this surface (TD-SPECRAT-2 tracks multi-tenant namespace
+    ownership). Availability: mounted unconditionally on the unified
+    server (the default, port 5678); legacy multi-port mode mounts it only
+    with gRPC enabled; cluster-mode REST does not mount it.
 
     Args:
         x_tenant_id (str | Unset):
@@ -196,6 +222,13 @@ async def asyncio(
      Creates a namespace for log/metric/trace data with tiered retention.
     Retention days default to hot=1, warm=7, cold=30; archive is fixed at
     365 days server-side.
+
+    Scope: the path namespace IS the isolation boundary — it maps 1:1 onto
+    the storage tenant key. The request's X-Tenant-ID header is not
+    consulted by this surface (TD-SPECRAT-2 tracks multi-tenant namespace
+    ownership). Availability: mounted unconditionally on the unified
+    server (the default, port 5678); legacy multi-port mode mounts it only
+    with gRPC enabled; cluster-mode REST does not mount it.
 
     Args:
         x_tenant_id (str | Unset):

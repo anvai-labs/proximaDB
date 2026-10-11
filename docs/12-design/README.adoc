@@ -161,6 +161,10 @@ Read these in order for future-shaping architecture work:
    real `TenantContext` for DML locks, enforced hierarchy, guard-owned renewal/release, and
    storage-visible fencing. Read before changing `src/cluster/partition_lease.rs` or wiring locks
    into `DmlService`/protocol handlers.
+   Implementation companion:
+   link:LEASE_INFRASTRUCTURE_CONSOLIDATION_HLD.md[lease infrastructure consolidation: interface index,
+   ownership/publication/progress semantics, reuse boundaries and adversarial TDD gates]
+   (TD-LEASE-INFRA-1; no new public lease authority).
 
 23. `SEARCH_SURFACE_CONTRACT_2026_06_24.adoc` +
    Surface-level companion to #22: pins the *endpoint* contract on top of the seam. One retrieval

@@ -355,6 +355,6 @@ cargo test --test integration -- events
 == See Also
 
 * link:../../index/axis/eventlog/README.adoc[AXIS EventLog] - Core coordination logic
-* link:../collection/README.adoc[Collection Service] - Similar service pattern
-* link:../operations/README.adoc[Vector Operations Service] - Another service example
-* link:../../storage/engines/README.adoc[Storage Engines] - Event producers
+* Collection Service - Similar service pattern
+* Vector Operations Service - Another service example
+* Storage Engines - Event producers

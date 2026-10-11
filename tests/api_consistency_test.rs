@@ -171,6 +171,7 @@ mod api_consistency_tests {
             collection_id: Some(collection_id.clone()),
             collection_config: Some(CollectionConfig {
                 name: collection_id.clone(),
+                embedding_config: None,
                 dimension: 128,
                 distance_metric: Some(DistanceMetric::Euclidean as i32),
                 storage_engine: Some(StorageEngine::Viper as i32),

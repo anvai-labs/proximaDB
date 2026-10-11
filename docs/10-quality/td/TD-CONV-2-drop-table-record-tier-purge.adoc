@@ -1,0 +1,62 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CONV-2: DROP TABLE left the record tier populated — a recreated table collided with (or served) the dropped rows
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (this filing).** `DROP TABLE` now purges the table's record partition and appends a `RecordPartitionDrop` WAL marker so replay after a restart voids the partition too.
+| Priority | **HIGH** at discovery — a recreated table's first re-INSERT failed with a false `INSERT_CONFLICT`, and scans could silently serve the dropped table's rows (wrong-data reads, not just errors).
+| Component | `src/services/record_store.rs` (DirectWal record tier), `src/services/ddl/mod.rs` (DROP TABLE), `crates/storage/proximadb-storage-common/src/wal_entry.rs` (new canonical op).
+| Relates to | TD-CONV-1 (same flake family — shared CWD catalog WAL), ADR-031 O2/O3 (oid-path cutover; a flipped gate masks this bug by giving recreated tables fresh partition keys), TD-064 (tenant-scoped partitions).
+|===
+
+== The bug
+
+SQL-row record oids are the PK text **by design** (`DmlService` change-feed: "the canonical
+record oid (= PK text)"), and the DirectWal record partition is keyed
+`(tenant, collection_id)` where the legacy key is the **bare table name**. `DROP TABLE` only
+dropped the catalog entry: the dropped table's rows stayed resident in the name-keyed
+partition, so `DROP` → `CREATE` (same name) → `INSERT` hit
+`[42P01] Record '0' already exists in table 'region'` on a **fresh server**, and scans of the
+recreated table could silently return the dropped rows.
+
+Discovered via `tpch_pgwire_e2e`'s accuracy phase (DROPs + re-CREATEs the TPC-H schema after
+the conformance phase seeded it): deterministic `INSERT failed: Insert failed: Record '0'
+already exists in table 'region'` on the first `INSERT INTO region …` — the two-phase shape
+made the latent bug observable on every run.
+
+== The fix
+
+* `CanonicalOperation::RecordPartitionDrop { collection_id }` — new canonical WAL op. Live
+  stores purge the partition when appending it; replay voids the partition when folding it.
+  The marker is appended **before** the live purge, so a crash between marker and purge
+  replays in the fail-safe direction (partition resets).
+* `TableRecordStore::drop_table_records` (trait method): DirectWal implementation purges the
+  `(tenant, collection_id)` partition + the legacy cutover alias + lazily built
+  UNIQUE/secondary index state; `CatalogRoutingTableRecordStore` routes it; the trait default
+  warns (stores without drop support say so rather than silently keeping dropped rows).
+* `DdlService::drop_table` snapshots the schema before the catalog drop, then calls the purge
+  best-effort (the catalog drop already committed). DdlService shares DML's record-store
+  instance via `with_record_store` at every construction site (pgwire both modes,
+  `shared_services` for REST/gRPC, the rank-pipeline rebuild).
+* Shared-storage mode (`DirectWalTableRecordStore::new`) cannot scope a purge (one backing Arc
+  for all keys) — detected via a factory probe and skipped with a warning; that shape is
+  documented non-isolated (unit tests only). Production is `new_partitioned`.
+
+== Verification
+
+* `tpch_pgwire_e2e` 3/3 (deterministic failure before the fix); `tpcds_pgwire_e2e` green
+  (with its stale `cte` KNOWN-BAD anchor flipped — TD-185a was closed by #1860).
+* New unit test: purge empties the partition, the marker is appended, and replaying
+  `[upsert, drop-marker]` into a fresh store leaves the partition void (no resurrection).
+* `record_store` 37/37, `ddl` 34/34 unit tests; pgwire transaction + insert-props e2e green;
+  fmt + clippy `-D warnings` clean.
+
+== Residual
+
+* The new canonical op is an on-disk WAL format addition (serde-tagged enum variant). Per the
+  pre-GA directive (internals replaced in place) no dual-format reader is shipped; old
+  binaries reading NEW logs after a DROP will fail deserialization.
+* Object-store/Iceberg-backed tables route the drop through the trait default (warn) until
+  the Iceberg writer implements partition purge.

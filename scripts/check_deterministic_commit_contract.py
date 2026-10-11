@@ -5,8 +5,9 @@ This is a fast static guard for the repo's "safe to commit" contract. It does
 not replace the expensive build/test gates; it verifies that those gates still
 point at deterministic policies:
 
-* unit tests use the zero-retry nextest profile
+* unit tests use the bounded-retry nextest profile and report survivors as flaky
 * CI and Makefile still invoke that profile
+* the main CI workflow uses its qualified, explicit Ubuntu image label
 * architecture docs still separate code presence from support level
 * tenant/path mandates remain visible in the system map
 * Arrow Flight exports bind client paths to the selected collection
@@ -56,6 +57,9 @@ CACHE_INPUT_RE = re.compile(
     r"^\s+(?P<name>prefix-key|shared-key):\s*(?P<value>.*?)\s*$"
 )
 MATRIX_REF_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*}}")
+RUST_TOOLCHAIN_RE = re.compile(
+    r"^(?P<indent>\s*)uses:\s*actions-rust-lang/setup-rust-toolchain@v2\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -98,11 +102,55 @@ def check_nextest_contract(findings: list[Finding]) -> None:
     unit = profiles.get("unit", {})
     integration = profiles.get("integration", {})
 
-    # NOTE: the zero-retry contract (profile.default/unit.retries must be 0, and
-    # no retry overrides) was intentionally removed. A small retry budget absorbs
-    # load-induced flakes on constrained CI runners; nextest still surfaces any
-    # survivor distinctly as FLAKY, so genuine breakage (which exhausts all
-    # retries) still fails the run.
+    # A fixed, small retry budget absorbs load-induced flakes on constrained CI
+    # runners. It is part of the contract: increasing it can hide defects, while
+    # removing flaky reporting makes retry survivors invisible.
+    if profiles.get("default", {}).get("retries") != 2:
+        findings.append(
+            Finding(
+                "nextest",
+                ".config/nextest.toml profile.default.retries must stay at 2",
+            )
+        )
+    if unit.get("retries") != 2:
+        findings.append(
+            Finding(
+                "nextest",
+                ".config/nextest.toml profile.unit.retries must stay at 2",
+            )
+        )
+    if profiles.get("default", {}).get("final-status-level") != "flaky":
+        findings.append(
+            Finding(
+                "nextest",
+                '.config/nextest.toml profile.default.final-status-level must be "flaky"',
+            )
+        )
+    unit_final_status = unit.get("final-status-level")
+    if unit_final_status is not None and unit_final_status != "flaky":
+        findings.append(
+            Finding(
+                "nextest",
+                '.config/nextest.toml profile.unit.final-status-level override must be "flaky"',
+            )
+        )
+    integration_final_status = integration.get("final-status-level")
+    if integration_final_status is not None and integration_final_status != "flaky":
+        findings.append(
+            Finding(
+                "nextest",
+                '.config/nextest.toml profile.integration.final-status-level override must be "flaky"',
+            )
+        )
+    for profile_name in ("default", "unit", "integration"):
+        for override in profiles.get(profile_name, {}).get("overrides", []):
+            if "retries" in override:
+                findings.append(
+                    Finding(
+                        "nextest",
+                        f".config/nextest.toml profile.{profile_name}.overrides must not set retries",
+                    )
+                )
     if unit.get("test-threads", 0) < 2:
         findings.append(
             Finding(
@@ -117,16 +165,61 @@ def check_nextest_contract(findings: list[Finding]) -> None:
                 '.config/nextest.toml profile.unit.failure-output must be "immediate-final"',
             )
         )
-    if integration.get("retries", 0) > 1:
+    if integration.get("retries") != 1:
         findings.append(
             Finding(
                 "nextest",
-                ".config/nextest.toml profile.integration.retries must not exceed 1",
+                ".config/nextest.toml profile.integration.retries must stay at 1",
             )
         )
 
 
+def check_ci_runner_contract(findings: list[Finding]) -> None:
+    """Guard this workflow's explicit block-style routing, without a YAML dependency."""
+    path = ".github/workflows/ci.yml"
+    selections = 0
+    key = r'''(?:runs-on|'runs-on'|"runs-on")'''
+    for line_number, line in enumerate(read_text(path).splitlines(), start=1):
+        if line.lstrip().startswith("#"):
+            continue
+        if re.search(rf"[{{,]\s*{key}\s*:", line):
+            findings.append(
+                Finding(
+                    "ci-runner",
+                    f"{path}:{line_number} must use block-style runner selection",
+                )
+            )
+            continue
+        match = re.match(rf"^\s*{key}\s*:\s*(.*?)\s*$", line)
+        if match is None:
+            continue
+        selections += 1
+        label = re.split(r"\s+#", match.group(1), maxsplit=1)[0].strip()
+        if label not in ("ubuntu-24.04", "'ubuntu-24.04'", '"ubuntu-24.04"'):
+            findings.append(
+                Finding(
+                    "ci-runner",
+                    f"{path}:{line_number} must use explicit ubuntu-24.04; "
+                    "ubuntu-latest aliases unqualified overflow runners",
+                )
+            )
+    if selections == 0:
+        findings.append(Finding("ci-runner", f"{path} has no runner selections"))
+
+
 def check_gate_wiring(findings: list[Finding]) -> None:
+    require_contains(
+        findings,
+        "gate-wiring",
+        ".github/workflows/ci.yml",
+        "- name: Verify Cargo.lock is reproducible",
+    )
+    require_contains(
+        findings,
+        "gate-wiring",
+        ".github/workflows/ci.yml",
+        "run: cargo metadata --locked --format-version 1 >/dev/null",
+    )
     require_contains(
         findings,
         "gate-wiring",
@@ -248,7 +341,7 @@ def check_architecture_contract(findings: list[Finding]) -> None:
         findings,
         "architecture",
         "docs/06-internals/workflows/TDD_GUIDE.md",
-        "zero-retry unit contract",
+        "retry-budgeted unit contract",
     )
     require_contains(
         findings,
@@ -406,6 +499,42 @@ def check_rust_cache_keys(findings: list[Finding]) -> None:
                             )
 
 
+def check_tdd_rust_warning_contract(findings: list[Finding]) -> None:
+    """Keep the TDD workflow's intentional warning policy across action upgrades."""
+
+    path = ROOT / ".github/workflows/tdd.yml"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        action = RUST_TOOLCHAIN_RE.match(line)
+        if action is None:
+            continue
+
+        action_indent = len(action.group("indent"))
+        cursor = index + 1
+        step: list[str] = []
+        while cursor < len(lines):
+            stripped = lines[cursor].lstrip()
+            indent = len(lines[cursor]) - len(stripped)
+            if indent < action_indent or (
+                indent == action_indent - 2 and stripped.startswith("- ")
+            ):
+                break
+            step.append(lines[cursor])
+            cursor += 1
+
+        if not any(
+            re.match(r'^\s+build-warnings:\s*["\']{2}\s*(?:#.*)?$', item)
+            for item in step
+        ):
+            findings.append(
+                Finding(
+                    "tdd-rust-warning-policy",
+                    f"{rel(path)}:{index + 1} setup-rust-toolchain@v2 must set "
+                    'build-warnings: "" to preserve the workflow warning policy',
+                )
+            )
+
+
 def tracked_files() -> list[Path]:
     try:
         output = subprocess.check_output(
@@ -449,19 +578,22 @@ def main() -> int:
     findings: list[Finding] = []
 
     check_nextest_contract(findings)
+    check_ci_runner_contract(findings)
     check_gate_wiring(findings)
     check_architecture_contract(findings)
     check_flight_export_authority(findings)
     check_query_conformance_authority(findings)
     check_object_store_proof_authority(findings)
     check_rust_cache_keys(findings)
+    check_tdd_rust_warning_contract(findings)
     check_conflict_markers(findings)
 
     print("Deterministic commit contract")
     if not findings:
         print(
-            "OK: nextest, CI/Makefile wiring, architecture guards, Flight/query/object-store "
-            "authorities, rust-cache keys, and conflict-marker checks pass."
+            "OK: nextest, CI runner/Makefile wiring, architecture guards, Flight/query/object-store "
+            "authorities, rust-cache keys, TDD Rust warning policy, and conflict-marker "
+            "checks pass."
         )
         return 0
 

@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
@@ -170,8 +170,16 @@ pub trait TableWalAppender: Send + Sync {
 /// Physical writer route selected from xCatalog table metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableRecordStoreRoute {
-    /// Modern analytics target: Parquet files managed by Iceberg over Object Storage.
-    ParquetIcebergStorage,
+    /// The general relational/HTAP/OLAP route.
+    ///
+    /// TD-USUB-9 renamed this from `ParquetIcebergStorage`, which asserted a
+    /// behaviour that does not happen: the slot is a plain
+    /// `Arc<dyn TableRecordStore>`, and the pgwire wiring fills it with the
+    /// **canonical WAL store** — no Parquet is written on INSERT, and no Iceberg
+    /// manifest is involved. Parquet/Iceberg publication is a separate, explicit
+    /// `ALTER TABLE … MATERIALIZE` step. The route selects a *destination slot*,
+    /// not a physical format, so the name now says only that.
+    RelationalStorage,
     /// Specialized target: PAX block format for high-performance Vector Search / ANN.
     PaxVectorStorage,
     /// Temporary compatibility route through the old vector operations facade.
@@ -193,7 +201,7 @@ impl TableRecordStoreRoute {
             (_, CatalogStorageSpecialization::LsmWriteOptimized) => Self::LegacyVectorCompatibility,
             _ => {
                 // Default for relational, HTAP, and OLAP workloads
-                Self::ParquetIcebergStorage
+                Self::RelationalStorage
             }
         }
     }
@@ -548,6 +556,30 @@ pub trait TableRecordStore: Send + Sync {
         mutations: Vec<TableRecordMutation>,
         tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult>;
+
+    /// Drop ALL record state for the table (the record-tier half of
+    /// `DROP TABLE`; the catalog entry is the caller's concern).
+    ///
+    /// SQL semantics: a table recreated after a drop starts EMPTY. SQL-row
+    /// record oids are the PK text by design, so without this purge a
+    /// recreated table would collide with (or silently serve) the dropped
+    /// rows on its first re-INSERT/scan. Restart-safety contract: an
+    /// implementation that appends record operations to the canonical WAL
+    /// must also append the `RecordPartitionDrop` marker so replay voids the
+    /// partition too. Default: warn-and-continue — stores without drop
+    /// support say so rather than silently keeping dropped rows.
+    async fn drop_table_records(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<()> {
+        let _ = tenant_context;
+        tracing::warn!(
+            table = %table_schema.name,
+            "record store does not support drop_table_records; a table recreated with the same name may see the dropped rows"
+        );
+        Ok(())
+    }
 
     /// Get the current visible record for a key.
     ///
@@ -1081,7 +1113,7 @@ impl CatalogRoutingTableRecordStore {
 
     fn store_for_schema(&self, schema: &CatalogTableSchema) -> &Arc<dyn TableRecordStore> {
         match TableRecordStoreRoute::for_schema(schema) {
-            TableRecordStoreRoute::ParquetIcebergStorage => &self.iceberg_store,
+            TableRecordStoreRoute::RelationalStorage => &self.iceberg_store,
             TableRecordStoreRoute::PaxVectorStorage => &self.vector_store,
             TableRecordStoreRoute::LegacyVectorCompatibility => &self.legacy_vector_store,
         }
@@ -1090,6 +1122,16 @@ impl CatalogRoutingTableRecordStore {
 
 #[async_trait]
 impl TableRecordStore for CatalogRoutingTableRecordStore {
+    async fn drop_table_records(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<()> {
+        self.store_for_schema(table_schema)
+            .drop_table_records(table_schema, tenant_context)
+            .await
+    }
+
     async fn write_mutations(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1650,8 +1692,23 @@ pub struct DirectWalTableRecordStore {
     /// The empty tenant id (`""`) is just one more tenant key (single-tenant).
     partitions:
         parking_lot::RwLock<std::collections::HashMap<(String, String), Arc<dyn RecordStorage>>>,
-    /// Factory for a fresh per-partition record store (default: in-memory memtable).
-    storage_factory: Arc<dyn Fn() -> Arc<dyn RecordStorage> + Send + Sync>,
+    /// Factory for a fresh per-partition record store (default: in-memory
+    /// memtable), given the partition's `(tenant_id, collection)` identity.
+    ///
+    /// TD-USUB-1 slice 2a: a DURABLE partition store must derive its own object
+    /// path, and `DrPathBuilder` needs the partition identity to do that — which
+    /// [`Self::partition`] has in hand and used to discard. Passing it is the
+    /// stated prerequisite for wiring `SpillRecordStorage`.
+    storage_factory: Arc<dyn Fn(&str, &str) -> Arc<dyn RecordStorage> + Send + Sync>,
+    /// True when every partition key routes to ONE shared backing store
+    /// ([`Self::new`]) rather than a per-partition one ([`Self::new_partitioned`]).
+    ///
+    /// Recorded at construction instead of probed. The previous check called the
+    /// factory purely to `Arc::ptr_eq` its product against a stored partition —
+    /// which only worked because every factory was side-effect-free. A factory
+    /// that builds a durable store performs I/O and claims a path, so calling it
+    /// speculatively to throw the result away is no longer merely wasteful.
+    shared_storage: bool,
     wal_appender: Arc<dyn TableWalAppender>,
     /// TD-110 Slice C: UNIQUE/PK index keyed by `(tenant_id, collection)` so a
     /// table's UNIQUE/PK enforcement is per-tenant. Presence of a key == "index
@@ -1673,7 +1730,11 @@ impl DirectWalTableRecordStore {
     /// single-tenant unit tests and callers that intentionally share one store;
     /// production multi-tenant paths use [`Self::new_partitioned`].
     pub fn new(storage: Arc<dyn RecordStorage>, wal_appender: Arc<dyn TableWalAppender>) -> Self {
-        Self::with_storage_factory(wal_appender, Arc::new(move || storage.clone()))
+        Self::with_storage_factory_inner(
+            wal_appender,
+            Arc::new(move |_tenant_id, _collection| storage.clone()),
+            true,
+        )
     }
 
     /// Create a direct writer with per-(tenant, collection) partitions backed by
@@ -1681,20 +1742,130 @@ impl DirectWalTableRecordStore {
     pub fn new_partitioned(wal_appender: Arc<dyn TableWalAppender>) -> Self {
         Self::with_storage_factory(
             wal_appender,
-            Arc::new(|| {
+            Arc::new(|_tenant_id, _collection| {
                 Arc::new(crate::services::MemtableRecordStorage::new()) as Arc<dyn RecordStorage>
             }),
         )
     }
 
-    /// Create a direct writer with a custom per-partition storage factory.
+    /// Create a direct writer with per-(tenant, collection) partitions that spill
+    /// to durable Parquet segments once resident rows exceed the configured bound
+    /// (TD-USUB-1 slice 2a).
+    ///
+    /// **Default-OFF by construction, and off means the legacy TYPE.** With
+    /// `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` unset this builds
+    /// [`MemtableRecordStorage`] — the same store [`Self::new_partitioned`] builds —
+    /// rather than a spill store configured never to flush. Mandate #8: with the
+    /// marker absent, the shipped path is byte-identical to the legacy one, not
+    /// merely equivalent-looking.
+    ///
+    /// `segment_base` maps a partition's `(tenant_id, collection)` to the object
+    /// prefix its segments are written under. Callers build it with
+    /// `DrPathBuilder`; this store never constructs a raw path
+    /// (`object_store_write_base_path` is the relational precedent).
+    ///
+    /// **The derived path is within-run only.** `SpillRecordStorage` tracks its
+    /// segment list in memory, and WAL replay — which is what repopulates a
+    /// partition after a restart — reaches [`Self::partition`] carrying only the
+    /// WAL entry's `tenant_id` and `collection_id`. `CanonicalWalEntry` has no
+    /// namespace field, so recovery **cannot** re-derive a namespace-scoped
+    /// prefix. That is why slice 2b (WAL truncation) requires catalog-registered
+    /// segments first: truncation may only reference a segment whose location is
+    /// recorded somewhere recovery can read it. See TD-USUB-1.
+    pub fn new_spilling(
+        wal_appender: Arc<dyn TableWalAppender>,
+        filesystem: Arc<dyn crate::storage::persistence::filesystem::FileSystem>,
+        segment_base: Arc<dyn Fn(&str, &str) -> String + Send + Sync>,
+    ) -> Self {
+        Self::with_storage_factory(
+            wal_appender,
+            Arc::new(move |tenant_id, collection| {
+                match crate::services::record_spill::configured_flush_threshold() {
+                    // An EMPTY tenant is not a spillable partition. `tenant_key`
+                    // and the replay path are both `unwrap_or_default()`, so `""`
+                    // is a real input here — and a spill store that cannot stamp a
+                    // tenant cannot persist a tombstone, so its `tombstones` set
+                    // would grow monotonically (nothing but a purge clears it) and
+                    // `min_unflushed_lsn` would refuse FOREVER. That is a worse
+                    // failure than having no heap bound: unbounded state *plus*
+                    // permanently unachievable truncation.
+                    //
+                    // So the unusable shape is made unconstructible instead of
+                    // tolerated. The untenanted partition keeps today's behaviour
+                    // (an unbounded memtable — the defect TD-USUB-1 exists to fix,
+                    // unchanged for this case and recorded there as an open item).
+                    Some(_) if tenant_id.is_empty() => {
+                        // Say so. The in-store arm at least `warn!`s; a silent
+                        // fallback here would mean an operator who set the spill
+                        // gate to bound the heap gets no spill partitions and no
+                        // signal — and `""` is the NORMAL key for a single-tenant
+                        // server today, not an edge case (pgwire auth is still an
+                        // open item, and the relational pipeline maps an empty
+                        // tenant to `None`).
+                        tracing::warn!(
+                            collection = %collection,
+                            "spill gate is set but this partition has no tenant, so it \
+                             falls back to an unbounded memtable: a spill store cannot \
+                             stamp a tombstone without a tenant. See TD-USUB-1."
+                        );
+                        Arc::new(crate::services::MemtableRecordStorage::new())
+                            as Arc<dyn RecordStorage>
+                    }
+                    Some(threshold) => {
+                        Arc::new(
+                            crate::services::SpillRecordStorage::with_flush_threshold(
+                                filesystem.clone(),
+                                segment_base(tenant_id, collection),
+                                Some(threshold),
+                            )
+                            // Required for a tombstone-only flush to stamp its
+                            // synthesised record; the store refuses to persist a
+                            // tombstone without it.
+                            .with_tenant(tenant_id),
+                        ) as Arc<dyn RecordStorage>
+                    }
+                    None => Arc::new(crate::services::MemtableRecordStorage::new())
+                        as Arc<dyn RecordStorage>,
+                }
+            }),
+        )
+    }
+
+    /// Create a direct writer with a custom per-partition storage factory. The
+    /// factory receives the partition's `(tenant_id, collection)` identity so a
+    /// durable store can derive its own path.
+    ///
+    /// # Invariant the caller must uphold
+    ///
+    /// **The factory MUST return a distinct store per `(tenant_id, collection)`.**
+    /// A factory that hands back one shared `Arc` for every partition — what
+    /// [`Self::new`] does internally — breaks `drop_table_records`: it would take
+    /// the purge branch, append a `RecordPartitionDrop` WAL marker, evict the map
+    /// entry, and then the next access would hand back that same shared store
+    /// with every "dropped" row still in it. Silently, and the useless marker
+    /// replays on every restart.
+    ///
+    /// [`Self::new`] is the supported way to share one store; it records that
+    /// shape so `drop_table_records` can decline the purge and warn instead. This
+    /// constructor cannot detect it — the old `Arc::ptr_eq` probe could, but only
+    /// by calling the factory speculatively, which a durable factory must not be
+    /// subjected to (it performs I/O and claims an object path).
     pub fn with_storage_factory(
         wal_appender: Arc<dyn TableWalAppender>,
-        storage_factory: Arc<dyn Fn() -> Arc<dyn RecordStorage> + Send + Sync>,
+        storage_factory: Arc<dyn Fn(&str, &str) -> Arc<dyn RecordStorage> + Send + Sync>,
+    ) -> Self {
+        Self::with_storage_factory_inner(wal_appender, storage_factory, false)
+    }
+
+    fn with_storage_factory_inner(
+        wal_appender: Arc<dyn TableWalAppender>,
+        storage_factory: Arc<dyn Fn(&str, &str) -> Arc<dyn RecordStorage> + Send + Sync>,
+        shared_storage: bool,
     ) -> Self {
         Self {
             partitions: parking_lot::RwLock::new(std::collections::HashMap::new()),
             storage_factory,
+            shared_storage,
             wal_appender,
             unique_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             secondary_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -1717,8 +1888,21 @@ impl DirectWalTableRecordStore {
         self.partitions
             .write()
             .entry(key)
-            .or_insert_with(|| (self.storage_factory)())
+            .or_insert_with(|| (self.storage_factory)(tenant_id, collection))
             .clone()
+    }
+
+    /// Remove ALL in-RAM state for one `(tenant, collection)` partition: the
+    /// partition itself (recreated empty on demand) and any lazily built
+    /// UNIQUE/secondary index for it. The WAL marker that keeps this
+    /// restart-safe is appended by [`Self::drop_table_records`].
+    fn drop_partition_state(&self, tenant_id: &str, collection_id: &str) {
+        self.partitions
+            .write()
+            .remove(&(tenant_id.to_string(), collection_id.to_string()));
+        let index_key = (tenant_id.to_string(), collection_id.to_string());
+        self.unique_index.write().remove(&index_key);
+        self.secondary_index.write().remove(&index_key);
     }
 
     /// ADR-031 O3: the primary record partition for a table, plus — during an oid
@@ -1754,6 +1938,13 @@ impl DirectWalTableRecordStore {
         let mut summary = proximadb_records::RecordRecoverySummary::default();
         for entry in entries {
             let tenant_id = entry.tenant_id.clone().unwrap_or_default();
+            // The replayed entry carries its own LSN, and it is the SAME LSN the
+            // live write path recorded. Passing it keeps a spill-backed partition
+            // able to compute a truncation point after a restart — replay through
+            // plain `upsert_record` would leave every recovered row resident but
+            // untracked, so `min_unflushed_lsn` would fail closed forever and 2b
+            // could never make progress on a restarted node.
+            let lsn = entry.sequence_number;
             match entry.operation {
                 CanonicalOperation::RecordUpsert {
                     collection_id,
@@ -1761,7 +1952,7 @@ impl DirectWalTableRecordStore {
                     ..
                 } => {
                     self.partition(&tenant_id, &collection_id)
-                        .upsert_record(*record)
+                        .upsert_record_at_lsn(*record, lsn)
                         .await?;
                     summary.upserts_replayed += 1;
                 }
@@ -1772,6 +1963,12 @@ impl DirectWalTableRecordStore {
                         .delete_record(&RecordKey::new(oid))
                         .await?;
                     summary.deletes_replayed += 1;
+                }
+                CanonicalOperation::RecordPartitionDrop { collection_id } => {
+                    // DROP TABLE: void the partition (+ its lazily built index
+                    // state). Upserts replayed after this entry re-seed the
+                    // partition — a table recreated post-drop starts empty.
+                    self.drop_partition_state(&tenant_id, &collection_id);
                 }
                 // Checkpoints, CDC barriers, and system-catalog mutations carry
                 // no record state for this partitioned store to replay.
@@ -1913,6 +2110,102 @@ impl DirectWalTableRecordStore {
 
 #[async_trait]
 impl TableRecordStore for DirectWalTableRecordStore {
+    /// Record-tier DROP TABLE: purge the table's `(tenant, collection)`
+    /// partition (+ legacy cutover alias, + lazily built index state) and
+    /// append the `RecordPartitionDrop` WAL marker FIRST so replay after a
+    /// restart voids the partition too (crash between marker and purge is
+    /// the fail-safe direction: the marker replays, the partition resets).
+    async fn drop_table_records(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<()> {
+        let tenant_scope = Self::tenant_key(tenant_context);
+        let (collection_id, legacy_key) = memtable_partition_keys(table_schema);
+
+        // Shared-storage mode (`new`): every partition key routes to ONE
+        // backing Arc, so a partition-scoped purge is impossible. Fail soft (the
+        // catalog drop already happened); that shape is documented non-isolated
+        // (unit tests only).
+        //
+        // Read from the flag recorded at construction, not by calling the factory
+        // for an `Arc::ptr_eq` comparison: a factory that builds a DURABLE store
+        // does I/O and claims an object path, so probing it would create a
+        // partition store on every DROP TABLE purely to discard it.
+        if self.shared_storage {
+            tracing::warn!(
+                table = %table_schema.name,
+                "DirectWalTableRecordStore in shared-storage mode cannot purge one table's records; a table recreated with the same name may see the dropped rows"
+            );
+            return Ok(());
+        }
+
+        // Restart-safety first: the marker must be durable before the live
+        // purge, or a crash in between replays the dropped rows back.
+        let tenant_id = tenant_context.map(|tenant| tenant.tenant_id.clone());
+        let mut operations = vec![CanonicalOperation::RecordPartitionDrop {
+            collection_id: collection_id.clone(),
+        }];
+        if let Some(legacy) = &legacy_key {
+            operations.push(CanonicalOperation::RecordPartitionDrop {
+                collection_id: legacy.clone(),
+            });
+        }
+        self.wal_appender
+            .append_operations(operations, tenant_id)
+            .await?;
+
+        // Delete the partition's durable objects BEFORE releasing the in-memory
+        // handle, and surface a failure rather than logging it.
+        //
+        // Order matters: `drop_partition_state` removes the map entry, and for a
+        // store that owns objects that is NOT deletion — it is losing the handle
+        // to data that stays in the bucket. Purging first means a failure leaves
+        // the partition addressable, so a retried DROP can finish the job.
+        //
+        // A no-op for the in-memory default (nothing to own). The purge is
+        // idempotent, so a partition created on demand here purely to be dropped
+        // is harmless.
+        //
+        // The error is returned, but do NOT read that as "a failed purge fails the
+        // DROP": the caller cannot make it fatal. `DropTable::execute` commits the
+        // CATALOG drop before calling this, so by the time a purge failure is
+        // known the table is already gone — failing the statement would report
+        // failure for a table that really is dropped. It therefore records the
+        // failure loudly (`error!` + `proximadb_record_tier_purge_failures_total`)
+        // and continues. Returning the error here is still right: it is the
+        // caller's decision to make, and the context travels with it.
+        //
+        // The consequence is that a purge failure orphans objects permanently
+        // (nothing references them afterwards, so nothing retries). That gap needs
+        // an orphan reaper and is the first Open item on TD-USUB-1 — it is not
+        // closed by this change.
+        //
+        // `partitions_for` already drops a legacy partition that is the same `Arc`
+        // as the primary, so a shared-storage store is not purged twice.
+        let (primary_partition, legacy_partition) =
+            self.partitions_for(&tenant_scope, table_schema);
+        for partition in std::iter::once(primary_partition).chain(legacy_partition) {
+            partition.purge_durable_objects().await.with_context(|| {
+                format!(
+                    "dropping table '{}': purging durable objects for partition '{collection_id}'",
+                    table_schema.name
+                )
+            })?;
+        }
+
+        self.drop_partition_state(&tenant_scope, &collection_id);
+        if let Some(legacy) = &legacy_key {
+            self.drop_partition_state(&tenant_scope, legacy);
+        }
+        tracing::info!(
+            table = %table_schema.name,
+            collection = %collection_id,
+            "🗑️ dropped record partition (+ WAL marker) for table"
+        );
+        Ok(())
+    }
+
     /// CDC change-feed over the canonical WAL: surface every RecordUpsert/RecordDelete for
     /// `collection_id` (the table name) with sequence number > `since_lsn`, oldest first.
     /// Tenant-agnostic (all tenants) — see [`read_changes_since_scoped`] for the
@@ -2076,9 +2369,31 @@ impl TableRecordStore for DirectWalTableRecordStore {
         }
 
         let tenant_id = tenant_context.map(|tenant| tenant.tenant_id.clone());
-        self.wal_appender
+        // Bind the result: each entry's `sequence_number` is the durable WAL LSN
+        // of the corresponding operation, and until TD-USUB-1's 2b work it was
+        // discarded here. `operations` and `storage_actions` are pushed in
+        // lockstep below, and `append_operations` returns its entries in input
+        // order (built by `map`/`collect` over the input, after `sync_data`), so
+        // index i of this vec is the LSN for `storage_actions[i]`.
+        let wal_entries = self
+            .wal_appender
             .append_operations(operations, tenant_id)
             .await?;
+        // Defensive, not decorative: a future appender that reorders or coalesces
+        // would make the positional mapping silently wrong — and a wrong LSN here
+        // becomes a wrong truncation point later, i.e. data loss. Mismatched
+        // lengths therefore disable LSN tracking rather than guess.
+        let lsns: Option<Vec<u64>> = if wal_entries.len() == storage_actions.len() {
+            Some(wal_entries.iter().map(|e| e.sequence_number).collect())
+        } else {
+            tracing::warn!(
+                entries = wal_entries.len(),
+                actions = storage_actions.len(),
+                "WAL entry count does not match storage actions; skipping LSN association \
+                 (truncation will fail closed rather than use a guessed mapping)"
+            );
+            None
+        };
 
         // TD-110 Slice C: maintain the UNIQUE/PK index incrementally — but only
         // once it has been built (first `check_unique_conflict`). Until then the
@@ -2096,14 +2411,23 @@ impl TableRecordStore for DirectWalTableRecordStore {
         let maintain_any = maintain_index || maintain_secondary;
 
         let mut record_ids = Vec::with_capacity(storage_actions.len());
-        for (kind, record) in storage_actions {
+        for (idx, (kind, record)) in storage_actions.into_iter().enumerate() {
+            // `None` when the positional mapping could not be trusted (above), in
+            // which case the store gets no LSN and reports "cannot truncate"
+            // rather than a minimum derived from a partial set.
+            let lsn = lsns.as_ref().and_then(|v| v.get(idx).copied());
             let key = RecordKey::from(&record);
             match kind {
                 TableRecordMutationKind::Insert
                 | TableRecordMutationKind::Upsert
                 | TableRecordMutationKind::Update => {
                     if maintain_any {
-                        let written = partition.upsert_record(record.clone()).await?;
+                        let written = match lsn {
+                            Some(lsn) => {
+                                partition.upsert_record_at_lsn(record.clone(), lsn).await?
+                            }
+                            None => partition.upsert_record(record.clone()).await?,
+                        };
                         record_ids.push(written.oid);
                         if maintain_index
                             && let Some(index) = self.unique_index.write().get_mut(&index_key)
@@ -2116,7 +2440,10 @@ impl TableRecordStore for DirectWalTableRecordStore {
                             index.upsert(&record);
                         }
                     } else {
-                        let written = partition.upsert_record(record).await?;
+                        let written = match lsn {
+                            Some(lsn) => partition.upsert_record_at_lsn(record, lsn).await?,
+                            None => partition.upsert_record(record).await?,
+                        };
                         record_ids.push(written.oid);
                     }
                     // ADR-031 O3 migrate-on-write: drain any pre-flip copy from the
@@ -2691,8 +3018,8 @@ mod tests {
                 .with_storage_specialization(spec);
             assert_eq!(
                 TableRecordStoreRoute::for_schema(&schema),
-                TableRecordStoreRoute::ParquetIcebergStorage,
-                "{label} must route to ParquetIcebergStorage"
+                TableRecordStoreRoute::RelationalStorage,
+                "{label} must route to RelationalStorage"
             );
         }
 
@@ -2943,6 +3270,80 @@ mod tests {
             oids,
             vec!["keep-1".to_string(), "keep-2".to_string()],
             "only rows that belong to the table AND match the predicate"
+        );
+    }
+
+    /// TD-CONV-2: DROP TABLE must purge the record tier so a table recreated
+    /// with the same name starts EMPTY. SQL-row record oids are the PK text, so
+    /// without the purge the recreated table's first re-INSERT hits
+    /// INSERT_CONFLICT against the dropped rows (or scans silently serve them).
+    /// Restart-safety: the appended `RecordPartitionDrop` marker must void the
+    /// partition on replay too.
+    #[tokio::test]
+    async fn drop_table_records_purges_partition_and_wal_marker_replays_the_drop() {
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::new_partitioned(wal.clone());
+        let schema = CatalogTableSchema::new("region");
+        let insert = |oid: &str| {
+            TableRecordMutation::new(
+                TableRecordMutationKind::Insert,
+                ProximaRecord {
+                    oid: oid.to_string(),
+                    local_id: Some(oid.to_string()),
+                    variation_id: Some("region".to_string()),
+                    ..Default::default()
+                },
+            )
+        };
+
+        // First insert of PK '0' succeeds.
+        let first = store
+            .write_mutations(&schema, vec![insert("0")], None)
+            .await
+            .unwrap();
+        assert!(first.success);
+
+        // DROP TABLE purges the record tier…
+        store.drop_table_records(&schema, None).await.unwrap();
+
+        // …the drop marker is durable in the WAL…
+        let entries = wal
+            .entries
+            .lock()
+            .expect("recording WAL append lock")
+            .clone();
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.operation,
+                CanonicalOperation::RecordPartitionDrop { collection_id } if collection_id == "region"
+            )),
+            "drop marker must be appended"
+        );
+
+        // …the recreated table's first re-INSERT of the same PK succeeds…
+        let reinsert = store
+            .write_mutations(&schema, vec![insert("0")], None)
+            .await
+            .unwrap();
+        assert!(
+            reinsert.success,
+            "recreated table must not see the dropped rows: {:?}",
+            reinsert.error_code
+        );
+
+        // …and replaying [upsert, drop] into a FRESH store leaves the
+        // partition void (restart-safe: no resurrection).
+        let replay_wal = Arc::new(RecordingWalAppender::default());
+        let replayed = DirectWalTableRecordStore::new_partitioned(replay_wal);
+        replayed.replay_wal_entries(entries).await.unwrap();
+        let resurrect = replayed
+            .write_mutations(&schema, vec![insert("0")], None)
+            .await
+            .unwrap();
+        assert!(
+            resurrect.success,
+            "replayed drop must void the partition: {:?}",
+            resurrect.error_code
         );
     }
 
@@ -4290,6 +4691,447 @@ mod tests {
         );
     }
 
+    /// TD-USUB-1 slice 2a wiring: the factory must RECEIVE the partition
+    /// identity. `partition()` always had `(tenant_id, collection)` in hand and
+    /// discarded it, which is exactly why a durable partition store — which must
+    /// derive its own `DrPathBuilder` prefix — could not be wired at all.
+    ///
+    /// Asserts the identity that actually arrives, not merely that the factory
+    /// ran: a factory called with the wrong scope would still produce a working
+    /// store, and would silently co-mingle two tenants' segments under one path.
+    #[tokio::test]
+    async fn storage_factory_receives_the_partition_identity() {
+        let seen: Arc<parking_lot::Mutex<Vec<(String, String)>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::with_storage_factory(
+            wal,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                recorder
+                    .lock()
+                    .push((tenant_id.to_string(), collection.to_string()));
+                Arc::new(crate::services::MemtableRecordStorage::new()) as Arc<dyn RecordStorage>
+            }),
+        );
+
+        // Seed through WAL replay deliberately: recovery is the path that reaches
+        // `partition()` carrying ONLY the entry's tenant_id + collection_id, and
+        // it is the path a durable store's identity has to survive.
+        store
+            .replay_wal_entries(vec![CanonicalWalEntry::new(
+                1,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: "r1".to_string(),
+                        variation_id: Some("orders".to_string()),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                Some("tenant-a".to_string()),
+            )])
+            .await
+            .expect("replay");
+
+        let calls = seen.lock().clone();
+        assert!(
+            calls.contains(&("tenant-a".to_string(), "orders".to_string())),
+            "the factory must be handed the partition's (tenant, collection); got {calls:?}"
+        );
+    }
+
+    /// Mandate #8: with the gate unset the shipped path must be the LEGACY one.
+    ///
+    /// The observable form of that claim is that nothing is written to object
+    /// storage at all — not that a spill store was constructed with flushing
+    /// disabled. `new_spilling` builds a `MemtableRecordStorage` when the gate is
+    /// absent precisely so the default path runs the same code it always did,
+    /// rather than different code that currently behaves the same.
+    #[tokio::test]
+    async fn spilling_store_writes_no_segments_when_the_gate_is_unset() {
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::new_spilling(
+            wal,
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+
+        let entries: Vec<CanonicalWalEntry> = (0..32)
+            .map(|i| {
+                CanonicalWalEntry::new(
+                    i + 1,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: "orders".to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{i}"),
+                            variation_id: Some("orders".to_string()),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some("tenant-a".to_string()),
+                )
+            })
+            .collect();
+        store.replay_wal_entries(entries).await.expect("replay");
+
+        // `expect`, not `unwrap_or(false)`: an unreadable root must fail the test,
+        // not read as "wrote nothing" and pass it.
+        let wrote_anything = std::fs::read_dir(&root)
+            .expect("read spill root")
+            .next()
+            .is_some();
+        assert!(
+            !wrote_anything,
+            "gate unset must write no segments; found entries under {}",
+            root.display()
+        );
+    }
+
+    /// An EMPTY tenant must NOT get a spill partition, even with the gate on.
+    ///
+    /// `tenant_key` and the replay path are both `unwrap_or_default()`, so `""`
+    /// reaches the factory. A spill store with no tenant cannot persist a
+    /// tombstone, and nothing but a purge clears one — so its `tombstones` set
+    /// would grow monotonically while `min_unflushed_lsn` refused forever.
+    /// Unbounded state plus permanently unachievable truncation is strictly worse
+    /// than the unbounded memtable this slice is trying to replace, so the shape
+    /// is made unconstructible.
+    ///
+    /// Asserted by OBSERVABLE effect: with the gate on and well past the
+    /// threshold, an untenanted partition writes no segment anywhere under the
+    /// root — and still serves its rows.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn an_empty_tenant_gets_no_spill_partition() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::new_spilling(
+            wal,
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+
+        // No tenant context at all — this is what `tenant_key(None)` produces.
+        let partition = store.partition("", "orders");
+        for i in 0..8 {
+            partition
+                .upsert_record(ProximaRecord {
+                    oid: format!("o{i}"),
+                    tenant_id: String::new(),
+                    ..Default::default()
+                })
+                .await
+                .expect("upsert must succeed for an untenanted partition");
+        }
+
+        // Same shape as the gate-unset test above, including `expect` rather
+        // than `unwrap_or(false)`: an unreadable root must FAIL the test, not read
+        // as "wrote nothing" and pass it.
+        let wrote_anything = std::fs::read_dir(&root)
+            .expect("read spill root")
+            .next()
+            .is_some();
+        assert!(
+            !wrote_anything,
+            "an untenanted partition must not spill; found entries under {}",
+            root.display()
+        );
+        assert_eq!(
+            RecordScan::scan_records(partition.as_ref(), 100)
+                .await
+                .expect("scan")
+                .len(),
+            8,
+            "and it must still serve every row"
+        );
+
+        unsafe {
+            std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV);
+        }
+    }
+
+    /// The PRODUCTION wiring of the tenant is exercised, not just the store's own
+    /// unit tests.
+    ///
+    /// Persisting a tombstone refuses without a non-empty tenant, and the only
+    /// thing that satisfies that in production is `.with_tenant(tenant_id)` in
+    /// `new_spilling`'s factory closure. Remove that one call and every
+    /// `record_spill` unit test still passes — they construct the store directly
+    /// — while the first post-flush DELETE would make every subsequent flush
+    /// error, and (because `upsert_record` flushes at the threshold) every
+    /// subsequent upsert with it.
+    ///
+    /// This is the class this module's own comments already name: a wiring line
+    /// whose absence no test notices. So it is asserted THROUGH `new_spilling`.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn spilling_partition_persists_a_tombstone_through_the_production_wiring() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::new_spilling(
+            wal,
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+
+        let upsert = |i: u64| {
+            CanonicalWalEntry::new(
+                i + 1,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: format!("r{i}"),
+                        variation_id: Some("orders".to_string()),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                Some("tenant-a".to_string()),
+            )
+        };
+
+        // Eight upserts at threshold 4 flush at least once, so segments exist and
+        // the DELETE below records a tombstone rather than a plain removal.
+        let mut entries: Vec<CanonicalWalEntry> = (0..8).map(upsert).collect();
+        entries.push(CanonicalWalEntry::new(
+            9,
+            CanonicalOperation::RecordDelete {
+                collection_id: "orders".to_string(),
+                oid: "r0".to_string(),
+                projections: vec![],
+            },
+            Some("tenant-a".to_string()),
+        ));
+        // More upserts, so a flush runs WITH that tombstone pending — the flush
+        // that refuses if the tenant was never plumbed.
+        entries.extend((10..18).map(upsert));
+
+        store
+            .replay_wal_entries(entries)
+            .await
+            .expect("replay must succeed");
+
+        // THE wiring assertion, and it has to be this one.
+        //
+        // Neither "replay succeeded" nor "r0 is absent" distinguishes a plumbed
+        // tenant from an unplumbed one, because `flush` does not fail without a
+        // tenant — it warns, drops the tombstones from its snapshot, writes the
+        // residents and returns Ok, and the un-persisted tombstone still
+        // suppresses `r0` from memory. (Round 2 added this test when the flush DID
+        // return `Err`; round 3 changed that response for good reasons and
+        // silently invalidated the evidence, which went unnoticed for two rounds.)
+        //
+        // What does distinguish them is DURABILITY: with the tenant, the tombstone
+        // reaches the segment and is cleared post-commit, so this is `Ok(None)` —
+        // no constraint, nothing unflushed. Without it the tombstone is still in
+        // memory and this is `Err`. Asserted by VALUE rather than `is_ok()` so a
+        // different refusal arm cannot silently stand in for the right answer.
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(store.partition("tenant-a", "orders").as_ref())
+                .await
+                .ok(),
+            Some(None),
+            "the tombstone must be DURABLE — i.e. the production factory supplied a tenant"
+        );
+
+        // And the deleted row stays gone through the read-merge.
+        let schema = CatalogTableSchema::new("orders");
+        let scanned = store
+            .scan_records(
+                &schema,
+                TableRecordScanRequest {
+                    filter: None,
+                    table_id: "orders".to_string(),
+                    limit: None,
+                    include_vector: false,
+                    include_props: true,
+                },
+                Some(&TenantContext::for_tenant_id("tenant-a")),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+            )
+            .await
+            .expect("scan");
+        assert!(
+            !scanned.iter().any(|r| r.oid == "r0"),
+            "the deleted row must not come back after its tombstone was persisted"
+        );
+
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    /// The wiring proof: with the gate ON, a partition really is spill-backed —
+    /// it flushes to a durable segment AND still serves every row through the
+    /// ordinary `TableRecordStore` read path.
+    ///
+    /// Asserted as the OBSERVABLE effect (a segment exists on disk, and the scan
+    /// still returns all rows) rather than by inspecting the partition's type.
+    /// Both halves matter: a flush that loses rows and a "flush" that never
+    /// happened would each pass one half alone.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn spilling_partition_flushes_and_still_serves_every_row() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+
+        let wal = Arc::new(RecordingWalAppender::default());
+        let store = DirectWalTableRecordStore::new_spilling(
+            wal,
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+
+        const ROWS: u64 = 20;
+        let entries: Vec<CanonicalWalEntry> = (0..ROWS)
+            .map(|i| {
+                CanonicalWalEntry::new(
+                    i + 1,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: "orders".to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{i}"),
+                            variation_id: Some("orders".to_string()),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some("tenant-a".to_string()),
+                )
+            })
+            .collect();
+        store.replay_wal_entries(entries).await.expect("replay");
+
+        // Half 1: rows above the threshold actually left memory for a segment.
+        let segment_count = walkdir_files(&root);
+        assert!(
+            segment_count > 0,
+            "threshold 4 with {ROWS} rows must have flushed at least one segment under {}",
+            root.display()
+        );
+
+        // Half 2: the read-merge serves flushed + resident rows as one set.
+        let schema = CatalogTableSchema::new("orders");
+        let scanned = store
+            .scan_records(
+                &schema,
+                TableRecordScanRequest {
+                    filter: None,
+                    table_id: "orders".to_string(),
+                    limit: None,
+                    include_vector: false,
+                    include_props: true,
+                },
+                Some(&TenantContext::for_tenant_id("tenant-a")),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+            )
+            .await
+            .expect("scan");
+        assert_eq!(
+            scanned.len() as u64,
+            ROWS,
+            "spilled rows must stay visible through the read-merge; segments={segment_count}"
+        );
+
+        // Remove the gate, matching this file's existing precedent
+        // (`memtable_oid_cutover_…`). nextest isolates by process, but under
+        // plain `cargo test` a leaked gate races the sibling gate-unset test in
+        // this same module and would make it flush.
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    /// Count regular files under a directory tree (segments land in per-partition
+    /// subdirectories, so a flat `read_dir` would miss them).
+    fn walkdir_files(root: &std::path::Path) -> usize {
+        let mut count = 0;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Phase D: the recovered `oid` byte-matches the catalog's canonical
     /// composite-key encoding (`CatalogRow::primary_key_string`), not a divergent
     /// local join — so a read-back record carries the same oid the write path
@@ -4530,6 +5372,16 @@ pub fn segment_cache_tenant_stats() -> Vec<proximadb_cache::TenantCacheStat> {
         .get()
         .map(|(fc, _)| fc.tenant_stats())
         .unwrap_or_default()
+}
+
+/// The global segment-index cache, if initialised (TD-USUB-8 slice 1).
+///
+/// Exposed so the DataFusion PAX lane can skip its index reads too — it built
+/// its own read sequence and never used `RangedSegmentReader::open_with_cache`,
+/// so the cache existed but served exactly one caller.
+pub fn segment_index_cache()
+-> Option<Arc<proximadb_storage_common::ranged_segment::SegmentIndexCache>> {
+    segment_caches().1
 }
 
 fn segment_caches() -> (
@@ -4839,7 +5691,7 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
         // policy — each promoted prop key maps to a typed user-column (by name → id). Sorted by
         // column id for deterministic stripe layout. Empty ⇒ no shredding (byte-for-byte today's
         // output). The msgpack PROPS tail stays authoritative; these columns are a pruning index.
-        let mut shred_spec: Vec<(String, i32)> = schema
+        let mut shred_spec: Vec<proximadb_block_format::ShredColumn> = schema
             .props_auto_promotion
             .promoted_keys
             .iter()
@@ -4848,10 +5700,21 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
                     .columns
                     .iter()
                     .find(|c| &c.name == col_name)
-                    .map(|c| (prop_key.clone(), c.id))
+                    // TD-USUB-6: carry the EXACT declared type, not just the id.
+                    // This path resolves against `CatalogTableSchema`, so it knows
+                    // `Int32` from `Int64` and `Timestamp(Micros)` from
+                    // `Timestamp(Millis)` — the only paths that do can ever make a
+                    // typed stripe authoritative.
+                    .map(|c| {
+                        proximadb_block_format::ShredColumn::typed(
+                            prop_key.clone(),
+                            c.id,
+                            c.data_type.clone(),
+                        )
+                    })
             })
             .collect();
-        shred_spec.sort_by_key(|(_, id)| *id);
+        shred_spec.sort_by_key(|c| c.column_id);
         let mut writer = PaxSegmentWriter::new(
             &local_path,
             BlockMode::Pax,
@@ -4861,7 +5724,7 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
             embedding_count_for_records(&records),
             None,
         )
-        .with_shred_spec(shred_spec);
+        .with_shred_columns(shred_spec);
         for record in &records {
             writer.add_record(record).map_err(|err| {
                 anyhow!(

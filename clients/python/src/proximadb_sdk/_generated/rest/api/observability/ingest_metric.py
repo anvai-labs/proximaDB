@@ -60,6 +60,11 @@ def _parse_response(
 
         return response_401
 
+    if response.status_code == 500:
+        response_500 = ErrorResponse.from_dict(response.json())
+
+        return response_500
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -85,6 +90,12 @@ def sync_detailed(
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[ErrorResponse | ObservabilityIngestResponse]:
     """Ingest a single metric sample.
+
+     Scope: path-namespace = isolation boundary (storage tenant key);
+    X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+    unconditionally on the unified server (the default, port 5678);
+    legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+    REST does not mount it.
 
     Args:
         namespace (str):
@@ -121,6 +132,12 @@ def sync(
 ) -> ErrorResponse | ObservabilityIngestResponse | None:
     """Ingest a single metric sample.
 
+     Scope: path-namespace = isolation boundary (storage tenant key);
+    X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+    unconditionally on the unified server (the default, port 5678);
+    legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+    REST does not mount it.
+
     Args:
         namespace (str):
         x_tenant_id (str | Unset):
@@ -150,6 +167,12 @@ async def asyncio_detailed(
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[ErrorResponse | ObservabilityIngestResponse]:
     """Ingest a single metric sample.
+
+     Scope: path-namespace = isolation boundary (storage tenant key);
+    X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+    unconditionally on the unified server (the default, port 5678);
+    legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+    REST does not mount it.
 
     Args:
         namespace (str):
@@ -183,6 +206,12 @@ async def asyncio(
     x_tenant_id: str | Unset = UNSET,
 ) -> ErrorResponse | ObservabilityIngestResponse | None:
     """Ingest a single metric sample.
+
+     Scope: path-namespace = isolation boundary (storage tenant key);
+    X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+    unconditionally on the unified server (the default, port 5678);
+    legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+    REST does not mount it.
 
     Args:
         namespace (str):

@@ -4662,7 +4662,7 @@ class ProximaDBClient:
 
         Example:
             >>> graphs = client.list_graphs()
-            >>> for graph in graphs.get("graphs", []):
+            >>> for graph in graphs.get("data", []):
             ...     print(graph["graph_id"])
         """
         return self._client.list_graphs()

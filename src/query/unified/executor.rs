@@ -1123,16 +1123,7 @@ mod tests {
     fn test_sql_value_to_json_primitives() {
         use crate::proto::proximadb_v1::{SqlValue, sql_value::Value};
 
-        fn sql_value_to_json(val: &SqlValue) -> serde_json::Value {
-            match &val.value {
-                Some(Value::StringValue(s)) => serde_json::Value::String(s.clone()),
-                Some(Value::NumberValue(n)) => serde_json::json!(n),
-                Some(Value::Int64Value(i)) => serde_json::json!(i),
-                Some(Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-                Some(Value::NullValue(_)) => serde_json::Value::Null,
-                _ => serde_json::Value::Null,
-            }
-        }
+        use proximadb_records::conversions::sql_value_to_json;
 
         // Test null
         let null_val = SqlValue {

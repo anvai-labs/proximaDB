@@ -16,15 +16,15 @@
 //!
 //! Routes:
 //!
-//! * `GET /api/v1/collections/:collection_id/affinity` — read one
+//! * `GET /api/v2/collections/:collection_id/affinity` — read one
 //!   entry. Returns `{"status":"affinitized", ...}` when the entry
 //!   is present, regardless of TTL freshness (operator dashboards
 //!   want to see stale entries too — `stale` field flags them).
 //!   Returns `{"status":"not_affinitized", ...}` when the collection
 //!   has no entry at all.
-//! * `DELETE /api/v1/collections/:collection_id/affinity` — drop the
+//! * `DELETE /api/v2/collections/:collection_id/affinity` — drop the
 //!   entry for a collection. 200 with `dropped: true|false`.
-//! * `GET /api/v1/collections/affinity` — list every entry on this
+//! * `GET /api/v2/collections/affinity` — list every entry on this
 //!   node, sorted by collection_id. Includes stale entries so
 //!   operators can see which collections went cold.
 
@@ -105,7 +105,7 @@ fn entry_to_item(
     }
 }
 
-/// `GET /api/v1/collections/:collection_id/affinity`
+/// `GET /api/v2/collections/:collection_id/affinity`
 pub async fn get_affinity(
     State(state): State<AppState>,
     Path(collection_id): Path<String>,
@@ -132,7 +132,7 @@ pub async fn get_affinity(
     }
 }
 
-/// `DELETE /api/v1/collections/:collection_id/affinity`
+/// `DELETE /api/v2/collections/:collection_id/affinity`
 pub async fn delete_affinity(
     State(state): State<AppState>,
     Path(collection_id): Path<String>,
@@ -145,7 +145,7 @@ pub async fn delete_affinity(
     }))
 }
 
-/// `GET /api/v1/collections/affinity` — operator dashboard list.
+/// `GET /api/v2/collections/affinity` — operator dashboard list.
 pub async fn list_affinity(
     State(state): State<AppState>,
 ) -> Result<Json<AffinityListResponse>, (StatusCode, String)> {

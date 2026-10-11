@@ -36,6 +36,18 @@ fn grpc_roundtrip_sqlvalue_prost() {
                 }),
             },
             v1::SqlRowField {
+                key: "jsonb".into(),
+                value: Some(v1::SqlValue {
+                    // Canonical MessagePack JSONB payload (types.proto tag 9).
+                    value: Some(v1::sql_value::Value::JsonbValue(
+                        proximadb_data_model::ProximaValue::to_jsonb_vec(
+                            &serde_json::json!({"jsonb": true, "n": 1}),
+                        )
+                        .unwrap(),
+                    )),
+                }),
+            },
+            v1::SqlRowField {
                 key: "null".into(),
                 value: Some(v1::SqlValue {
                     value: Some(v1::sql_value::Value::NullValue(0)),
@@ -89,7 +101,16 @@ fn grpc_roundtrip_sqlvalue_prost() {
     resp.encode(&mut buf).unwrap();
     let decoded = v1::ExecuteQueryResponse::decode(&*buf).unwrap();
     assert_eq!(decoded.rows.len(), 1);
-    assert_eq!(decoded.rows[0].fields.len(), 8);
+    assert_eq!(decoded.rows[0].fields.len(), 9);
+    // The JSONB variant must survive the binary wire (TD-PROTO-2: it decoded
+    // to None before the mirror gained the tag-9 arm).
+    assert!(
+        matches!(
+            decoded.rows[0].fields[5].value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(v1::sql_value::Value::JsonbValue(b)) if !b.is_empty()
+        ),
+        "jsonb field must round-trip as tag-9 bytes"
+    );
 }
 
 #[test]
@@ -119,6 +140,14 @@ fn rest_roundtrip_sqlvalue_json() {
                     })),
                 }),
             },
+            v1::SqlRowField {
+                key: "jsonb".into(),
+                value: Some(v1::SqlValue {
+                    value: Some(v1::sql_value::Value::JsonbValue(vec![
+                        0x81, 0xA1, b'j', 0x01,
+                    ])),
+                }),
+            },
         ],
         similarity: None,
     };
@@ -145,4 +174,18 @@ fn rest_roundtrip_sqlvalue_json() {
     let back: Wrapper = serde_json::from_str(&json).unwrap();
     assert_eq!(back.data.rows.len(), 1);
     assert_eq!(back.data.rows[0].fields[0].key, "n");
+    // The JSONB variant must survive the custom serde (base64 `jsonb_value`
+    // key both ways) — a representation change here breaks persisted payloads
+    // and SDKs, so this is the format gate (mandate #8).
+    assert!(
+        matches!(
+            back.data.rows[0].fields[2].value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(v1::sql_value::Value::JsonbValue(b)) if b == &[0x81, 0xA1, b'j', 0x01]
+        ),
+        "jsonb field must round-trip through the REST/serde representation"
+    );
+    assert!(
+        json.contains("\"jsonb_value\""),
+        "serde wire key for the JSONB variant is pinned: {json}"
+    );
 }

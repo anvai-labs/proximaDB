@@ -1,9 +1,10 @@
-//! REST endpoints for the durable rank-profile catalog (commit 5/5 of the
-//! R-7c production wiring).
+//! Dispatchers for the durable rank-profile catalog (commit 5/5 of the R-7c
+//! production wiring). These intended v2 routes are not mounted yet and are
+//! therefore not part of the live REST surface.
 //!
-//! `POST /api/v1/rank/profiles` — install or replace a profile.
-//! `GET  /api/v1/rank/profiles/{name}` — fetch a profile by name.
-//! `DELETE /api/v1/rank/profiles/{name}` — remove a profile.
+//! `POST /api/v2/rank/profiles` — install or replace a profile.
+//! `GET  /api/v2/rank/profiles/{name}` — fetch a profile by name.
+//! `DELETE /api/v2/rank/profiles/{name}` — remove a profile.
 //!
 //! The dispatchers are plain async functions (no axum extractors) so the
 //! REST router glue is decoupled from the axum version in the dep graph —
@@ -13,7 +14,7 @@ use crate::errors::{ApiError, ApiResult};
 use crate::network::rest::canonical::handlers::AppState;
 use serde::{Deserialize, Serialize};
 
-/// Body of `POST /api/v1/rank/profiles`. The `spec` field carries the raw
+/// Body of the intended `POST /api/v2/rank/profiles` route. The `spec` field carries the raw
 /// TOML body that `RankProfileStore::install` persists and the live
 /// `RankServices` registry compiles via `parse_single` + `CompiledRankProfile`.
 #[derive(Debug, Clone, Deserialize)]

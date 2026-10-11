@@ -286,6 +286,6 @@ Current filesystem-based approach is designed for easy migration:
 
 == See Also
 
-* link:../integration/README.adoc[AXIS Integration Layer] - How indexers consume events
+* AXIS Integration Layer - How indexers consume events
 * link:../../../services/events/README.adoc[Event Services] - Service-level wrappers
-* link:../../../storage/engines/README.adoc[Storage Engines] - How engines emit events
+* Storage Engines - How engines emit events

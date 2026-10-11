@@ -9,7 +9,7 @@
 | Severity | Historical — retained as cost-model provenance, not active implementation work.
 | Component | PAX/SST read path (`sst_io_layer.rs`, `sst_query_engine.rs`); the route cost model (`src/query/.../route_metrics` / cost loop); `io_trace` (`TD-IOTRACE-1`, always-on).
 | Governs | link:../../12-design/adr/ADR-050-statistics-fed-datafusion-route-selection.adoc[ADR-050] (cost-based routing) + link:../../12-design/adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (bytes-scanned thesis) + link:../../12-design/adr/ADR-011-filtered-ann-routing-modes.adoc[ADR-011] (selectivity routing).
-| Relates | TD-151 slice 1 baseline (#780 — always-coalesce); link:TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-IOTRACE-1/2] (io_trace); link:../../12-design/adr/ADR-034-objectstore-access-path-codesign.adoc[ADR-034] (object-store access path); link:TECHNICAL_DEBT.adoc[TD-159] (adaptive engine consumes io_trace).
+| Relates | TD-151 slice 1 baseline (#780 — always-coalesce); link:TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-IOTRACE-1/2] (io_trace); link:../../12-design/adr/ADR-034-objectstore-access-path-codesign.adoc[ADR-034] (object-store access path); link:../TECHNICAL_DEBT.adoc[TD-159] (adaptive engine consumes io_trace).
 | Surfaced by | The architecture-review follow-up question: "should the read action differ by CBO selectivity (30/50/70%) and by cached-NVMe vs cold-object-store?" Researched against real-world cloud-native query systems.
 |===
 

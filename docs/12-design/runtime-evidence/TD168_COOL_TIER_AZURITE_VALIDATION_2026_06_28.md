@@ -1,5 +1,13 @@
 # TD-168 — Object-store Cool-tier validation against real cloud APIs (emulators)
 
+> **Superseded in part (2026-10-08, TD-CI-6):** the S3 emulator is no longer MinIO on port
+> 9000 — it is **LocalStack on 4566**, pinned by digest, and the S3 tier test is now named
+> `put_with_tier_accepted_by_s3_emulator`. MinIO's image stopped being anonymously pullable
+> from both Docker Hub and Quay. Everything below about the AZURITE arm and the out-of-band
+> `blobTier` read-back still holds; treat MinIO/9000/`..._by_minio` references as history.
+> `scripts/run_cloud_emulator_tests.sh` is the source of truth for connection details.
+
+
 **Date:** 2026-06-28 · **Scope:** TD-168 Phase 2 / TD-173 (per-object access tier)
 
 ## Why this exists

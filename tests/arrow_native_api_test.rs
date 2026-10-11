@@ -489,6 +489,7 @@ mod trino_tests {
                 preferred_hosts: vec!["node1".to_string()],
                 ..Default::default()
             },
+            object_size: None,
         };
 
         let trino_split = TrinoSplit::from_file_split(
@@ -624,6 +625,7 @@ mod duckdb_tests {
             },
             statistics: SplitStatistics::default(),
             locality: SplitLocality::default(),
+            object_size: None,
         }];
 
         let init_data = DuckDBInitData::new(splits);
@@ -646,6 +648,7 @@ mod duckdb_tests {
                 },
                 statistics: SplitStatistics::default(),
                 locality: SplitLocality::default(),
+                object_size: None,
             },
             FileSplit {
                 split_id: "s1".to_string(),
@@ -657,6 +660,7 @@ mod duckdb_tests {
                 },
                 statistics: SplitStatistics::default(),
                 locality: SplitLocality::default(),
+                object_size: None,
             },
         ];
 
@@ -717,6 +721,7 @@ mod hadoop_tests {
                 preferred_hosts: vec!["node1.cluster".to_string()],
                 ..Default::default()
             },
+            object_size: None,
         };
 
         let hadoop_split = HadoopInputSplit::from_file_split(file_split);

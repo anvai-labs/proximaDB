@@ -54,6 +54,9 @@ impl PgServer {
         }];
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}/wal", tmp.path().display());
+        // TD-CONV-1: anchor the system catalog in this server's temp dir, not the
+        // shared CWD-relative `file://./metadata` default (cross-run DDL replay).
+        config.storage.metadata_url = format!("file://{}", tmp.path().join("metadata").display());
         let mut db = ProximaDB::new(config).await?;
         db.start().await?;
         let http = reqwest::Client::builder()

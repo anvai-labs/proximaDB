@@ -27,8 +27,6 @@ pub mod memory;
 pub mod multimodal_query;
 /// REST handlers for Natural Language query translation (AV-SQL)
 pub mod nl;
-/// REST handlers for observability queries (logs, metrics, traces)
-pub mod observability;
 /// Phase 6: per-collection pinning control surface (turbopuffer
 /// `/v1/namespaces/:ns/metadata`-style operator API).
 pub mod pinning;

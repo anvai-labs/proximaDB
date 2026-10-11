@@ -99,7 +99,11 @@ impl ProgressivePipelineFactory {
             ProgressiveEngineType::SST => self.create_sst_pipeline(stages, hamming_threshold),
             ProgressiveEngineType::HELIX => self.create_helix_pipeline(stages, hamming_threshold),
             ProgressiveEngineType::VIPER => self.create_viper_pipeline(stages, hamming_threshold),
+            #[cfg(feature = "experimental-engines")]
             ProgressiveEngineType::SWIFT => self.create_swift_pipeline(stages, hamming_threshold),
+            // SWIFT requires `experimental-engines`; empty pipeline without it.
+            #[cfg(not(feature = "experimental-engines"))]
+            ProgressiveEngineType::SWIFT => ProgressiveSearchCoordinator::new(),
             ProgressiveEngineType::NOVA => self.create_nova_pipeline(stages, hamming_threshold),
             #[cfg(feature = "experimental-engines")]
             ProgressiveEngineType::RAPTOR => self.create_raptor_pipeline(stages, hamming_threshold),
@@ -223,6 +227,7 @@ impl ProgressivePipelineFactory {
         coordinator
     }
 
+    #[cfg(feature = "experimental-engines")]
     fn create_swift_pipeline(
         &self,
         stages: &[PipelineStage],
@@ -334,11 +339,14 @@ mod tests {
             ProgressiveEngineType::SST,
             ProgressiveEngineType::HELIX,
             ProgressiveEngineType::VIPER,
-            ProgressiveEngineType::SWIFT,
             ProgressiveEngineType::NOVA,
         ];
-        // RAPTOR's pipeline is `experimental-engines`-gated (it needs AXIS clustering);
-        // only assert its 3-stage default when that feature is on.
+        // SWIFT and RAPTOR's pipelines are `experimental-engines`-gated (SWIFT's
+        // factory arm returns an empty coordinator without the feature; RAPTOR
+        // needs AXIS clustering) — only assert their 3-stage default when the
+        // feature is on.
+        #[cfg(feature = "experimental-engines")]
+        engines.push(ProgressiveEngineType::SWIFT);
         #[cfg(feature = "experimental-engines")]
         engines.push(ProgressiveEngineType::RAPTOR);
 

@@ -565,6 +565,16 @@ async fn create_configured_catalog(
                 "this catalog type is constructed programmatically, not through this endpoint",
             ));
         }
+        // TD-CAT-10: the sqlx-backed OLTP catalog adapter is retired (opt-in
+        // `oltp-catalog` feature, not maintained — it does not even compile
+        // feature-on). The wire shape (field 17) exists so binary configs
+        // decode losslessly; construction is refused loudly here.
+        Some(Config::Oltp(_)) => {
+            return Err(unsupported(
+                "the OLTP catalog backend is retired (TD-CAT-10) and is not constructible \
+                 through this endpoint",
+            ));
+        }
         None => {
             return Err(ApiError::InvalidArgument(
                 "no catalog config was supplied".into(),

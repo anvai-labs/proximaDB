@@ -1,0 +1,46 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SPECRAT-3: REST table-routing filter must be structured, not interpolated SQL text
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Filed (surfaced by TD-SPECRAT-1 wave-5 adversarial review)
+| Severity | Medium — wrong-view 200s from a published SDK route; no privilege escalation
+| Component | `src/network/rest/canonical/handlers.rs::get_catalog_table_routing`; `crates/binding/proximadb-catalog-introspection/src/lib.rs::CatalogIntrospectionService`
+| Relates to | [[TD-SPECRAT-1]] (wave 5 exposed this route to every SDK)
+|===
+
+== The defect
+
+`get_catalog_table_routing` interpolates the `table_name` query param
+into SQL text (escaping `'` by doubling) and hands the string to
+`CatalogIntrospectionService::execute_select`, which dispatches on
+`normalized.contains(" from <view>")` **over the whole SQL string —
+including the interpolated literal** — and extracts the filter lexically
+up to the first quote.
+
+Consequences, all reachable over REST (now SDK-published):
+
+. `?table_name=x from xcatalog.namespaces` — the literal contains the
+  ` from xcatalog.namespaces` marker, which the dispatcher checks BEFORE
+  `table_routing`, so the endpoint returns the **namespaces listing**
+  (different columns) with 200. The same trick reaches the
+  `information_schema.tables`, `columns`, and `pg_class` branches.
+. Name matching is `eq_ignore_ascii_case`, not exact.
+. A name containing `'` truncates the filter at the quote (the doubled
+  escape is extracted as the prefix only).
+
+Same auth scope on every branch (cluster-scope introspection), so this
+is not privilege escalation — but the published contract ("serves
+table_routing") is violable and consumers can receive silently wrong
+data.
+
+== The fix
+
+Pass a structured filter (view enum + filter value) to the
+introspection service instead of composing SQL text at the REST layer;
+the lexical contains-dispatch then has no attacker-controlled surface.
+Wave 5 documents the current behavior honestly in the spec (lexical
+dispatch, case-insensitive, quote-truncation) so SDK consumers are not
+misled until the fix lands.

@@ -7,11 +7,11 @@
 //! topic's `PartitionMemory` ring buffer, skipping any message whose offset
 //! is `<=` the per-partition committed offset (`offset_store`) so already-
 //! acked work is not redelivered (pinned by `restart_skips_already_acked_
-//! messages`). Today recovery reads the single default-group offset; once
-//! offsets are keyed per consumer group (ADR-079 §Semantics), it will resume
-//! each group's cursor independently.
+//! messages`). Recovery uses the minimum across discovered groups; a lease-only
+//! group with no ACK blocks skipping. Each subscription resumes at its own
+//! inclusive committed offset plus one.
 //!
-//! Crash-safety: each message frame is `[4 BE: payload_len][bincode bytes]`.
+//! Crash-safety: each message frame is `[4 BE: payload_len][8 BE: offset][bincode bytes]`.
 //! A truncated final frame (process killed mid-fsync before
 //! group_commit completed) is detected and silently skipped — the
 //! producer never received an ack for that message, so it's safe to drop.
@@ -20,7 +20,8 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use bincode::Options;
+use tracing::{debug, info};
 
 use crate::QueueClient;
 use crate::error::QueueError;
@@ -79,6 +80,7 @@ pub async fn recover(client: &QueueClient) -> crate::Result<usize> {
                 .map(|root| root.join(&topic).join(partition_id.to_string()));
             let count = replay_partition(
                 client.fs(),
+                client.archive_fs(),
                 &partition_dir,
                 archive_partition_dir.as_deref(),
                 &topic,
@@ -96,6 +98,7 @@ pub async fn recover(client: &QueueClient) -> crate::Result<usize> {
 
 async fn replay_partition(
     fs: &Arc<dyn QueueFs>,
+    archive_fs: &Arc<dyn QueueFs>,
     partition_dir: &Path,
     archive_partition_dir: Option<&Path>,
     topic: &str,
@@ -103,36 +106,34 @@ async fn replay_partition(
     state: &crate::TopicState,
 ) -> crate::Result<usize> {
     // Merge segments from local disk + (optionally) the archive. For
-    // each segment_id, prefer the local disk copy (faster); fall back
-    // to the archive only when the disk copy is missing. This is the
+    // each segment_id, prefer a nonempty local disk copy; fall back to
+    // the archive when the disk copy is missing or an empty bootstrap
+    // placeholder. A failed local read is never evidence of absence. This is the
     // fresh-node-rebuild path: ECS pod reschedules onto a new node
     // with empty NVMe; recovery loads segments straight from the
     // archive.
-    let mut segments: std::collections::BTreeMap<u64, std::path::PathBuf> =
-        std::collections::BTreeMap::new();
-    let local_entries = fs.list(partition_dir).await.unwrap_or_default();
+    let mut segments: std::collections::BTreeMap<
+        u64,
+        (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
+    > = std::collections::BTreeMap::new();
+    let local_entries = fs.list(partition_dir).await?;
     for path in local_entries {
         if let Some((id, p)) = parse_segment_entry(path) {
-            segments.insert(id, p);
+            segments.entry(id).or_default().0 = Some(p);
         }
     }
     if let Some(archive_dir) = archive_partition_dir {
-        let archive_entries = fs.list(archive_dir).await.unwrap_or_default();
+        let archive_entries = match archive_fs.list(archive_dir).await {
+            Ok(entries) => entries,
+            Err(QueueError::NotFound(_)) => Vec::new(),
+            Err(error) => return Err(error),
+        };
         for path in archive_entries {
             if let Some((id, p)) = parse_segment_entry(path) {
-                // Archive is the fallback — only insert if disk had nothing.
-                segments.entry(id).or_insert(p);
+                segments.entry(id).or_default().1 = Some(p);
             }
         }
     }
-    // BTreeMap iterator is already sorted by segment_id ascending,
-    // which is the order replay needs (lower offsets first).
-    let segments: Vec<(u64, std::path::PathBuf)> = segments.into_iter().collect();
-
-    if segments.is_empty() {
-        return Ok(0);
-    }
-
     let mem = state
         .memory
         .get(partition as usize)
@@ -166,18 +167,48 @@ async fn replay_partition(
             ))
         })?;
     let groups = crate::offset_store::read_all_groups(fs, root_path, topic, partition).await?;
-    let committed = groups.iter().map(|(_, o)| *o).min();
+    let committed = groups.iter().map(|(_, o)| *o).min().flatten();
 
     let mut replayed = 0usize;
     let mut skipped = 0usize;
-    let mut max_offset: Option<u64> = None;
-    for (segment_id, path) in segments {
-        let bytes = match fs.read(&path).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(?path, error = %e, "recovery: failed to read segment, skipping");
-                continue;
+    // Reaping can remove every frame while leaving durable group progress.
+    // Never reuse those offsets: producer allocation uses the MAX acknowledged
+    // offset as a floor, whereas replay skipping above deliberately uses MIN.
+    // Reuse the existing progress authority rather than add another checkpoint.
+    let mut max_next_offset = groups
+        .iter()
+        .filter_map(|(_, offset)| *offset)
+        .max()
+        .map(|offset| {
+            offset.checked_add(1).ok_or_else(|| {
+                QueueError::Persistence(format!(
+                    "recovery: durable progress exhausted offsets for topic={topic} partition={partition}"
+                ))
+            })
+        })
+        .transpose()?;
+    let mut max_recovered_segment = None;
+    // BTreeMap orders the replay by ascending segment ID.
+    for (segment_id, (local_path, archive_path)) in segments {
+        let (path, bytes) = if let Some(path) = local_path {
+            let bytes = fs.read(&path).await?;
+            if bytes.is_empty() {
+                if let Some(archive_path) = archive_path {
+                    let archived = archive_fs.read(&archive_path).await?;
+                    (archive_path, archived)
+                } else {
+                    (path, bytes)
+                }
+            } else {
+                (path, bytes)
             }
+        } else if let Some(path) = archive_path {
+            let bytes = archive_fs.read(&path).await?;
+            (path, bytes)
+        } else {
+            return Err(QueueError::Persistence(format!(
+                "recovery: segment {segment_id} has no local or archive path"
+            )));
         };
         if bytes.is_empty() {
             continue;
@@ -217,18 +248,27 @@ async fn replay_partition(
             if cursor.read_exact(&mut payload).is_err() {
                 break;
             }
-            let message: Message = match bincode::deserialize(&payload) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(?path, error = %e, "recovery: failed to deserialize message, skipping");
-                    continue;
-                }
-            };
+            // Match the writer's fixed-width bincode encoding, while rejecting
+            // trailing payload bytes and allocation claims beyond the frame.
+            let message: Message = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .with_limit(len as u64)
+                .reject_trailing_bytes()
+                .deserialize(&payload)
+                .map_err(|error| QueueError::Persistence(format!(
+                    "recovery: malformed complete frame in {path:?} at offset {frame_offset}: {error}"
+                )))?;
+            let next_offset = frame_offset.checked_add(1).ok_or_else(|| {
+                QueueError::Persistence(format!(
+                    "recovery: offset overflow in {path:?} at offset {frame_offset}"
+                ))
+            })?;
 
             // Track the max frame_offset across ALL replayed frames
             // (including skipped ones) so the disk writer's next_offset
             // resumes past every previously-assigned offset.
-            max_offset = Some(max_offset.map_or(frame_offset, |m| m.max(frame_offset)));
+            max_next_offset = Some(max_next_offset.map_or(next_offset, |m| m.max(next_offset)));
+            max_recovered_segment = Some(segment_id);
 
             // Skip if already acked by the consumer group.
             if let Some(c) = committed
@@ -256,8 +296,15 @@ async fn replay_partition(
 
     // Bump the disk writer past the highest observed offset so newly-
     // appended messages don't collide with recovered ones.
-    if let Some(max) = max_offset {
-        disk_writer.set_next_offset(max + 1);
+    // Also leave recovered segment IDs immutable: a fresh-node append must not
+    // create a partial local copy that shadows the corresponding archive.
+    if let Some(segment_id) = max_recovered_segment {
+        disk_writer
+            .advance_past_recovered_segment(segment_id)
+            .await?;
+    }
+    if let Some(next) = max_next_offset {
+        disk_writer.set_next_offset(next);
     }
 
     if replayed > 0 || skipped > 0 {
@@ -320,17 +367,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_partition_returns_zero_for_missing_partition_dir() {
+    async fn replay_partition_rejects_missing_partition_dir() {
         let fs = LocalFs::new_arc();
         let root = tempfile::tempdir().unwrap();
         let state = topic_state(4, root.path()).await;
 
-        let replayed =
-            replay_partition(&fs, &root.path().join("missing"), None, "orders", 0, &state)
-                .await
-                .unwrap();
+        let result = replay_partition(
+            &fs,
+            &fs,
+            &root.path().join("missing"),
+            None,
+            "orders",
+            0,
+            &state,
+        )
+        .await;
 
-        assert_eq!(replayed, 0);
+        assert!(result.is_err());
         assert_eq!(state.memory[0].depth().await, 0);
     }
 
@@ -356,7 +409,7 @@ mod tests {
             .unwrap();
         let state = topic_state(4, root.path()).await;
 
-        let replayed = replay_partition(&fs, &partition_dir, None, "orders", 0, &state)
+        let replayed = replay_partition(&fs, &fs, &partition_dir, None, "orders", 0, &state)
             .await
             .unwrap();
 
@@ -384,7 +437,7 @@ mod tests {
             .unwrap();
         let state = topic_state(1, root.path()).await;
 
-        let error = replay_partition(&fs, &partition_dir, None, "orders", 0, &state)
+        let error = replay_partition(&fs, &fs, &partition_dir, None, "orders", 0, &state)
             .await
             .unwrap_err();
 

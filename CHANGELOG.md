@@ -2,6 +2,110 @@
 
 All notable changes to ProximaDB will be documented in this file.
 
+## [0.4.0] - unreleased
+
+Storage-substrate release: **172** commits since the `v0.3.0` tag, counted at
+this release branch's merge-base; 174 on `develop` at the time of writing, and
+what finally ships is whatever `develop` holds at promotion — the two extra
+commits include the spill-tombstone-persistence work credited below, so treat
+172 as the anchored figure rather than the shipped one.
+
+The anchor is `refs/tags/v0.3.0` **as it exists on origin** — a lightweight tag
+on `9e19fc2a3`, dated 2026-09-04 — because that is what a clone resolves and
+therefore the only anchor under which these numbers reproduce. A reviewer caught
+an earlier revision of this entry quoting 415 commits, 35 OpenAPI paths and three
+new ADRs: all of those were computed against a *stale local* `v0.3.0`, an
+annotated tag at `b1ed7817` (2026-08-15, an ancestor of origin's). `git fetch
+--tags` does not correct it — the update is rejected as "would clobber existing
+tag" — so anyone recomputing these figures should verify
+`git rev-parse v0.3.0` against `git ls-remote --tags origin v0.3.0` first.
+
+The 0.3.0 entry below is dated 2026-08-05, when `chore(release): prepare v0.3.0`
+landed; origin's tag was cut at the 2026-09-04 promotion. Both dates are real and
+mean different things — the prepare commit and the promotion that shipped it.
+
+Headline: ADR-094 unified the three
+divergent storage substrates behind one compute seam, and the I/O-cost work that followed made
+round-trip count — not bytes, not CPU — the term the engine measures and the operator can tune.
+Full notes follow in their own change: a release-notes page must ship together
+with its nav entry, or `mkdocs build --strict` fails on an unpublished page.
+
+### Storage substrate (ADR-094)
+- Durable relational spill store with read-merge, bounded memtable, segment discovery with
+  order-recoverable names, purge-on-DROP, and spill tombstone persistence (TD-USUB-1).
+- Native relational tables register with DataFusion, closing the capability cliff with no format
+  change (TD-USUB-2); publication is additive rather than clobbering (TD-USUB-4).
+- One `RecordReader` seam + Parquet `PAR1` detect arm (TD-USUB-5).
+- Typed shredded columns with a residual PROPS tail — measured 41.2% smaller relational blocks
+  (TD-USUB-6).
+- Faithful canonical-record round trip for Parquet Layer A; Parquet had been dropping
+  `valid_to_ns`, which resurrected tombstoned records (TD-USUB-11).
+- Index-acquisition round trips 3 -> 0 on a **warm** read (`range_gets` 203 -> 200),
+  measured and ratcheted at `cold - warm == 3` (TD-USUB-8 slices 0-2). The
+  catalog-resident Layer B that would move the **cold** path is still open, and
+  TD-USUB-8 is explicit that it must now be argued on cold start, cross-node
+  sharing and planner-time pruning rather than on a depth number a read-side
+  cache already delivers.
+
+### I/O cost and read geometry
+- Operator-configurable per-location `io_budget` ranged-GET geometry (TD-IOBUDGET-1).
+- Bounded-concurrent `read_ranges` with `fetch_rounds`/`max_inflight` metrics (TD-RDSTRAT-12).
+- Footer-resident pruning: self-describing footer field map, footer block stats, tag-aware
+  two-level compaction layout default-ON per collection with a kill-switch (TD-FPRUNE-1).
+
+### SQL / pgwire
+- Real transaction control — `BEGIN`/`COMMIT`/`ROLLBACK` per ADR-018 P2.D (TD-076).
+- SCRAM-SHA-256 authentication (TD-PGWIRE-AUTH-1).
+- Identifier case-folding: unquoted folds, quoted stays case-exact (TD-OLAP-18).
+- TPC-H/TPC-DS anchored accuracy ratchets (TD-182 P1).
+
+### MLOps
+- MLflow-compatible tracking, registry and artifacts over the existing substrate, with a
+  tracked-S3 artifact backend behind an `ArtifactBackend` seam and a vendored UI at `/mlflow-ui`.
+  Default OFF (TD-MLOPS-1..4).
+
+### Security & governance
+- Generic OIDC provider with multi-IdP portability; legacy SSO removed (TD-SSO-1).
+- API-key gateway roles (TD-TENANT-1 follow-up); subject-parameterized row predicates
+  (ADR-090 L2.1); trust-gated tier entitlement (TD-TENANT-3); REST request limiter,
+  default-off (TD-RATE-1).
+- v1 residue removed — sunset middleware deleted, Flight alias honoring removed
+  (TD-V1SUNSET-1).
+
+### SDK & spec surface
+- TD-SPECRAT-1 took the generated OpenAPI surface from 45 paths at the v0.3.0 tag
+  to 94, exposing the ABAC control
+  plane, collections-admin, graph, time-series, rank search, CRUD and unified query to every
+  generated SDK. Node SDK published to npm as `@anvailabs/proximadb-client`.
+
+### Breaking
+- **Minimum supported Python is now 3.11** (`requires-python = ">=3.11"`); the published
+  wheels' abi3 tag moves `cp310` -> `cp311`, so 3.10 installs are refused by metadata rather
+  than failing at import. 3.10 reached upstream end-of-life on 2026-10-01. This also fixes a
+  real defect: `load_config_file()` for `*.toml` raised `ImportError: tomli is required` in
+  every normal install, because `tomli` was declared only in the `dev`/`test` extras behind
+  `python_version < '3.11'` markers and never in `[project].dependencies`. It now uses the
+  stdlib `tomllib`.
+
+### Deprecations
+- VIPER engine deprecated (ADR-093); Hive proto arm retired (TD-CAT-8); `OltpCatalog` gated
+  behind the `oltp-catalog` feature (TD-CAT-7.4).
+
+### Known gaps
+- The vector I/O-cost harness is a repo integration test, not a shipped tool (TD-VECEVAL-1).
+- 30 user-facing AsciiDoc pages do not render on the docs site (TD-DOCSITE-1).
+- Four breaking dependency upgrades deferred with named gates, incl. pgwire 0.21 -> 0.41
+  (TD-DEPS-2).
+- The published OpenAPI contract still reports `info.version: 0.2.0`; it is hardcoded rather than
+  derived from the crate version.
+- 75 e2e test harnesses pick their server port with a bind-read-drop TOCTOU, which turns CI red
+  at random on PRs that did not cause it (TD-TESTPORT-1).
+- A duplicate Helm chart under `deploy/infrastructure/helm/proximadb` cannot render (its template
+  `include`s a helper defined nowhere), so the dev-deploy script and two deployment guides point
+  at a broken path. Its stale version pins (chart 0.1.0, appVersion and image tags 0.2.0) were
+  deliberately NOT bumped for this release
+  (TD-HELMDUP-1).
+
 ## [0.3.0] - 2026-08-05
 
 Major feature release (802 commits since 0.2.2). Headlines: a Postgres-wire query surface for

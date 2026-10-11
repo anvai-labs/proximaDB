@@ -189,6 +189,8 @@ pub mod external_collection;
 pub mod function_store;
 pub mod fusion_service;
 pub mod graph_collection;
+pub mod mlflow_artifact_s3;
+pub mod mlflow_run_store;
 pub mod operations;
 pub mod queue_fs_adapter;
 pub mod rank_profile_store;
@@ -197,6 +199,7 @@ pub mod recall_drift_sweeper;
 #[cfg(feature = "axis")]
 pub mod recall_observer;
 pub mod record_memtable;
+pub mod record_spill;
 pub mod record_store;
 pub use proximadb_scan_cursor::scan_cursor;
 pub mod schema;
@@ -237,6 +240,7 @@ pub use rank_profile_store::{
     CanonicalWalRankProfileStore, RANK_PROFILES_COLLECTION_ID, RankProfileStore, StoredRankProfile,
 };
 pub use record_memtable::MemtableRecordStorage;
+pub use record_spill::SpillRecordStorage;
 pub use record_store::{
     CatalogRoutingTableRecordStore, DirectWalTableRecordStore, RecordStorageTableRecordStore,
     TableRecordGetRequest, TableRecordGetResponse, TableRecordMutation, TableRecordMutationKind,

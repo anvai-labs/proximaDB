@@ -134,7 +134,7 @@ LIMIT 5;
 - **Learn installation options**: [Installation Guide](./install.md)
 - **Build your first app**: [First Query Tutorial](./first-query.md)
 - **Understand the architecture**: [Architecture Basics](./architecture-basics.md)
-- **Explore features**: [Guides](../02-guides/)
+- **Explore features**: [Guides](../02-guides/index.md)
 
 ---
 

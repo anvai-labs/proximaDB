@@ -461,36 +461,6 @@ pub struct VIPERCacheStats {
     pub estimated_memory_bytes: usize,
 }
 
-/// Evaluate metadata filter with filterable column awareness
-pub async fn evaluate_metadata_filter_with_config(
-    record: &crate::proto::proximadb_v1::VectorRecord,
-    filter: &FilterExpression,
-    filterable_columns: &[crate::proto::proximadb_v1::FilterableColumnSpec],
-) -> bool {
-    // Convert filterable columns to string vector for common helper
-    let filterable_column_names: Vec<String> = filterable_columns
-        .iter()
-        .map(|col| col.name.clone())
-        .collect();
-
-    // Convert SqlValue metadata to serde_json::Value
-    let metadata_json =
-        crate::core::proto_metadata_helper::sqlvalue_metadata_to_json(&record.metadata);
-
-    // Extract extra_meta if present (for non-filterable fields)
-    // Note: This would need to be extracted from the record's metadata
-    // For now, we'll use None as Map extraction needs implementation
-    let extra_meta: Option<std::collections::HashMap<String, String>> = None;
-
-    // Use common filter evaluation function
-    crate::storage::engines::core::filter_evaluator::evaluate_filter_with_config(
-        filter,
-        &metadata_json,
-        extra_meta.as_ref(),
-        &filterable_column_names,
-    )
-}
-
 /// Selective vector reader that uses qualifying indices
 pub struct VIPERSelectiveReader {
     dimension: Option<usize>,

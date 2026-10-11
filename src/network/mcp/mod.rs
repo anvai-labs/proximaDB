@@ -22,12 +22,21 @@ use proximadb_mcp::{JsonRpcRequest, handle_request};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-/// Build the MCP HTTP router over the given backend (`POST /` and `POST /mcp`).
-pub fn router(backend: Arc<EngineBackend>) -> Router {
-    Router::new()
+/// Build the local-only MCP router. Authenticated deployments are refused
+/// until the tool port consumes request-bound tenant identity and permissions.
+fn router(
+    backend: Arc<EngineBackend>,
+    security_coordinator: Option<std::sync::Arc<crate::security::SecurityCoordinator>>,
+) -> anyhow::Result<Router> {
+    anyhow::ensure!(
+        security_coordinator.is_none(),
+        "MCP has no request-bound authorization; disable api.mcp_port when security is enabled"
+    );
+    let router = Router::new()
         .route("/", post(rpc))
         .route("/mcp", post(rpc))
-        .with_state(backend)
+        .with_state(backend);
+    Ok(router)
 }
 
 async fn rpc(State(backend): State<Arc<EngineBackend>>, body: String) -> Json<Value> {
@@ -52,12 +61,24 @@ async fn rpc(State(backend): State<Arc<EngineBackend>>, body: String) -> Json<Va
 
 /// Serve the MCP transport on `addr` until shutdown. Call only when an MCP port
 /// is configured.
-pub async fn serve(addr: std::net::SocketAddr, backend: Arc<EngineBackend>) -> anyhow::Result<()> {
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    backend: Arc<EngineBackend>,
+    security_coordinator: Option<std::sync::Arc<crate::security::SecurityCoordinator>>,
+) -> anyhow::Result<()> {
+    proximadb_runtime::bootstrap_config::validate_trust_only_listener(
+        "MCP",
+        addr,
+        security_coordinator.is_some(),
+        false,
+        &proximadb_tenant::TenantDeploymentMode::single_tenant_default(),
+    )?;
+    let router = router(backend, security_coordinator)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
-        "MCP reference surface listening on {addr} (MCP {})",
-        proximadb_mcp::MCP_PROTOCOL_VERSION
+        "MCP local reference surface listening on {addr} (MCP {})",
+        proximadb_mcp::MCP_PROTOCOL_VERSION,
     );
-    axum::serve(listener, router(backend)).await?;
+    axum::serve(listener, router).await?;
     Ok(())
 }

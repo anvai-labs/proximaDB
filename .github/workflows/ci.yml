@@ -63,12 +63,16 @@ permissions:
   contents: read
 
 jobs:
+  # Keep the Linux image explicit: org overflow containers also advertise
+  # ubuntu-latest but lack this workflow's Python/compiler/swap capabilities.
+  # Self-hosted runners must not reuse this label without equivalent image/VM
+  # qualification. The deterministic commit contract guards routing drift.
   # ============================================================================
   # CHANGES DETECTION - Determine what to build/test
   # ============================================================================
   changes:
     name: Detect Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       # Three-tier CI (feat -> develop -> qa -> main):
       #   * feat -> develop runs the LIGHT jobs (compile + fmt/clippy + layering
@@ -99,6 +103,8 @@ jobs:
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
       docs: ${{ steps.filter.outputs.docs }}
+      docs_site: ${{ steps.filter.outputs.docs_site }}
+      td_citations: ${{ steps.filter.outputs.td_citations }}
       proto: ${{ steps.filter.outputs.proto }}
       panic_policy: ${{ steps.filter.outputs.panic_policy }}
       v1_proto_usage: ${{ steps.filter.outputs.v1_proto_usage }}
@@ -135,6 +141,8 @@ jobs:
           # Full history so dorny/paths-filter can reach the merge-base across a
           # large develop→main gap (shallow --deepen fails: "shallow file has changed").
           fetch-depth: 0
+      - name: Verify Cargo.lock is reproducible
+        run: cargo metadata --locked --format-version 1 >/dev/null
       - name: Validate rust-cache key inputs before fan-out
         run: python3 scripts/check_deterministic_commit_contract.py
       - uses: dorny/paths-filter@v4
@@ -142,6 +150,11 @@ jobs:
         with:
           filters: |
             rust:
+              # TD-PROTO-2 review: the v1-mirror drift guard (a #[cfg(test)]
+              # in proximadb-proto) runs ONLY in the rust lane — a proto-only
+              # change that forgets the hand-maintained v1 mirror must re-run
+              # it, so proto edits are rust-lane-visible.
+              - 'proto/**'
               - 'src/**'
               # Workspace members that `cargo` compiles, lints, and tests but that
               # the filter previously omitted — a crate-only or app-only change
@@ -190,9 +203,23 @@ jobs:
               - 'clients/python/**'
               - 'clients/python-embedded/**'
               - 'proto/**'
+              # The three below were missing, so this filter could not see
+              # changes to its own inputs -- the same defect class the `rust:`
+              # filter's comment names. Root `pyproject.toml` is the maturin
+              # package that declares `requires-python` AND the ruff/mypy
+              # targets; `python-queue-embedded` is a third Python package with
+              # its own `requires-python`; and a change to ci.yml itself (e.g.
+              # editing the interpreter matrix) triggered neither python job.
+              # A PR raising the floor in the root package alone would have run
+              # no Python CI at all.
+              - 'pyproject.toml'
+              - 'clients/python-queue-embedded/**'
+              - '.github/workflows/ci.yml'
             ui:
               - 'ui/**'
               - '.github/workflows/ci.yml'
+              - third_party/mlflow-ui/**
+
             docker:
               - 'Dockerfile*'
               - 'docker-compose*.yml'
@@ -201,6 +228,27 @@ jobs:
               - 'docs/**'
               - '*.adoc'
               - '*.md'
+            # Separate from `docs`, for the reason the next comment gives: three
+            # other jobs (docs-authority, risk-coverage, capability-matrix) are
+            # gated on `docs`, so adding mkdocs.yml to it would have changed
+            # their triggers too. TD-DOCSITE-1.
+            docs_site:
+              - 'docs/**'
+              - 'mkdocs.yml'
+              - 'scripts/check_docs_site_coverage.py'
+            # Separate from `docs` on purpose: three other jobs are gated on
+            # `docs`, and widening it would silently change their triggers too.
+            # This one exists because a TD citation is invalidated by a RENAME in
+            # the Rust sources, not by a doc edit -- so a guard that only runs on
+            # doc changes never sees the change that breaks it, and fires later
+            # on an unrelated docs-only PR, blaming the wrong author.
+            td_citations:
+              - 'docs/10-quality/td/**'
+              - 'scripts/check_td_cited_tests.py'
+              - 'src/**'
+              - 'crates/**'
+              - 'apps/**'
+              - 'tests/**'
             proto:
               - 'proto/**'
             panic_policy:
@@ -218,6 +266,9 @@ jobs:
             query_changes:
               - 'src/query/**'
               - 'tests/*query*'
+              # TD-SPECRAT-1: the AV-SQL translate eval gates the /api/v2/nl
+              # surface (engine: src/query/nl) — explicit so eval edits run it.
+              - 'tests/nl_translate_eval.rs'
               - 'tests/*federated*'
               # TD-SELECTOR-1: the selector/answer-quality gates are #[path]-included
               # modules of this test file; editing the harness is editing the test.
@@ -293,6 +344,11 @@ jobs:
             # the #1430 lesson, where a recall lane skipped on the very PR that
             # broke recall because the changed path matched no filter.
             authz_changes:
+              - 'src/database.rs'
+              - 'src/network/**'
+              - 'crates/foundation/proximadb-config/**'
+              - 'crates/platform/proximadb-runtime/**'
+              - 'tests/auth_failclosed_e2e.rs'
               - 'src/security/**'
               - 'src/services/operations/vectors/**'
               - 'crates/control/proximadb-abac/**'
@@ -312,9 +368,13 @@ jobs:
               - 'src/services/dml/**'
               - 'src/core/**'
               - 'tests/*pgwire*'
+              - 'tests/rel_*'
+              - 'tests/native_route_pgwire_e2e.rs'
+              - 'tests/native_join_pgwire_e2e.rs'
               - 'tests/document_json*'
               - 'tests/events_tsbs*'
               - 'tests/sql_value_roundtrip.rs'
+              - 'tests/native_tpch_q18_q20_e2e.rs'
               - '.github/workflows/ci.yml'
             # SDK filters
             go_sdk:
@@ -353,7 +413,7 @@ jobs:
   # ============================================================================
   hygiene-check:
     name: Hygiene Guardrails
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -370,16 +430,29 @@ jobs:
 
   deterministic-commit-contract:
     name: Deterministic Commit Contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     needs: changes
     steps:
       - uses: actions/checkout@v7
       - name: Validate deterministic guard wiring
         run: python3 scripts/check_deterministic_commit_contract.py
+      - name: Test deterministic guard negative controls
+        run: python3 -m unittest discover -s tests/scripts -p 'test_deterministic_commit_contract.py'
+      - name: Test cloud-emulator image contract
+        run: python3 -m unittest discover -s tests/scripts -p 'test_cloud_emulator_harness.py'
+      - name: Test trusted branch-route workflow contract
+        run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
+      - name: Validate release build features (cloud-full + job timeouts)
+        run: python3 scripts/check_release_build_features.py
+      - name: Check for unreachable .rs files (TD-ORPHAN-1)
+        run: python3 scripts/check_orphan_rust_files.py
+      - name: Test release-build-features negative controls
+        run: python3 -m unittest discover -s tests/scripts -p 'test_release_build_features.py'
 
   repository-identity:
     name: Canonical Repository Identity
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -388,7 +461,7 @@ jobs:
 
   docs-authority:
     name: Docs Authority (no retired/engine drift)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.docs == 'true'
     steps:
@@ -400,7 +473,7 @@ jobs:
 
   risk-coverage:
     name: Risk-Coverage Contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.docs == 'true'
     steps:
@@ -410,7 +483,7 @@ jobs:
 
   oss-docs-decontamination:
     name: OSS Docs Decontamination
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -421,7 +494,7 @@ jobs:
 
   rust-format:
     name: Rust Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -437,7 +510,7 @@ jobs:
 
   capability-matrix:
     name: Capability Matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     # Run on rust changes (evidence refs point at source) AND on docs changes:
     # the validator now also guards the maturity-contract reconciliation in
@@ -475,7 +548,7 @@ jobs:
   # drift from `git`.
   proto-compat:
     name: Proto Compatibility (T4.2)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.proto == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     steps:
@@ -526,7 +599,7 @@ jobs:
   #   UPDATE_OPENAPI_SPEC=1 cargo test -p proximadb --test openapi_spec_gen
   openapi-spec-drift:
     name: OpenAPI Spec From Code (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -554,7 +627,7 @@ jobs:
   # Regenerate locally with: make gen-go-sdk
   go-sdk-codegen-drift:
     name: Go SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.go_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -586,7 +659,7 @@ jobs:
   # make gen-ts-sdk
   ts-sdk-codegen-drift:
     name: TS SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.nodejs_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -613,7 +686,7 @@ jobs:
   # openapi-spec-drift / proto-sync. Regenerate locally with: make gen-rust-sdk
   rust-sdk-codegen-drift:
     name: Rust SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -663,7 +736,7 @@ jobs:
   # / openapi-spec-drift. Regenerate locally with: make gen-python-sdk
   python-sdk-codegen-drift:
     name: Python SDK Codegen Drift (TD-126)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -695,7 +768,7 @@ jobs:
   # without it.
   python-sdk-round-trip:
     name: Python SDK round-trip (ADR-068 D5)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -737,7 +810,7 @@ jobs:
 
   panic-policy-report:
     name: Panic Policy Report (WS-2 Stage 1)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -759,7 +832,7 @@ jobs:
 
   panic-policy-no-regression:
     name: Panic Policy No Regression (WS-2 Stage 2)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, panic-policy-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -775,7 +848,7 @@ jobs:
 
   panic-policy-module-guard:
     name: Panic Policy Critical Modules (WS-2 Stage 3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, panic-policy-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -795,7 +868,7 @@ jobs:
   # INCREASE so the migration only moves one direction. Pure-python (no compile).
   v1-proto-usage-report:
     name: v1 Proto Usage Report (TD-123)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.v1_proto_usage == 'true'
     steps:
@@ -817,7 +890,7 @@ jobs:
 
   v1-proto-usage-no-regression:
     name: v1 Proto Usage No Regression (TD-123)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, v1-proto-usage-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.v1_proto_usage == 'true'
     steps:
@@ -833,7 +906,7 @@ jobs:
 
   rust-clippy:
     name: Rust Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -884,7 +957,7 @@ jobs:
   # combos pass with `--tests` (and with `--all-targets`) as of TD-CAT-8.
   feature-matrix:
     name: Feature Matrix (${{ matrix.label }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true'
     strategy:
@@ -924,6 +997,9 @@ jobs:
           # crate compiles against root at every tier. Python-feature + wheel build
           # is a qa→main (FULL) concern (heavy pyo3/numpy deps).
           - { label: "embedded",             pkg: proximadb-embedded, args: "" }
+          # Node.js is optional and invisible to the default embedded build. Keep the
+          # runtime and derive-macro API families aligned by compiling that surface alone.
+          - { label: "embedded-nodejs",      pkg: proximadb-embedded, args: "--no-default-features --features nodejs" }
           # Small extracted crates batched into one runner (each compiles in <1min;
           # the per-runner overhead — checkout + toolchain + apt + cache — dominates).
           # Space-separate additional small crates here as they are extracted; the
@@ -979,7 +1055,7 @@ jobs:
 
   rust-security:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -993,7 +1069,7 @@ jobs:
 
   python-lint:
     name: Python Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.proto == 'true'
     steps:
@@ -1030,7 +1106,7 @@ jobs:
 
   go-lint:
     name: Go SDK Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.go_sdk == 'true'
     steps:
@@ -1052,7 +1128,7 @@ jobs:
 
   nodejs-lint:
     name: Node.js SDK Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.nodejs_sdk == 'true'
     steps:
@@ -1069,7 +1145,7 @@ jobs:
 
   ui-build:
     name: Admin UI Install + Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     steps:
@@ -1088,7 +1164,7 @@ jobs:
 
   rust-sdk-lint:
     name: Rust SDK Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true'
     steps:
@@ -1120,7 +1196,7 @@ jobs:
   # ===========================================================================
   sdk-contract-gates:
     name: SDK OpenAPI Contract Gate (${{ matrix.sdk }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1199,7 +1275,7 @@ jobs:
   # ===========================================================================
   connectors-contract-gates:
     name: Connectors Contract Gate (${{ matrix.kind }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1247,7 +1323,7 @@ jobs:
   # ===========================================================================
   spark-jni-smoke:
     name: Spark Connector JNI Smoke (TD-097)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.spark_jni == 'true'
     steps:
@@ -1272,7 +1348,7 @@ jobs:
 
   sdk-security-scan:
     name: SDK Security Scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: |
       needs.changes.outputs.python == 'true' ||
@@ -1356,9 +1432,9 @@ jobs:
 
   docs-validation:
     name: Docs Validation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
-    if: needs.changes.outputs.docs == 'true'
+    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true' || needs.changes.outputs.docs_site == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -1374,6 +1450,20 @@ jobs:
         run: python3 scripts/check_design_status_index.py
       - name: Check resolved TD status/body consistency
         run: python3 scripts/check_td_status_consistency.py
+      # A TD that names a test which no longer exists sends the next engineer
+      # looking for evidence that is not there. On #1957 one TD cited a renamed
+      # test three times across six review rounds, each caught only by someone
+      # reading carefully. Narrowly scoped so it stays quiet: Tests sections
+      # only, snake_case identifiers only, and lines marking a name as
+      # historical are skipped.
+      - name: Check TD-cited test names resolve
+        run: python3 scripts/check_td_cited_tests.py
+      # Blocking because this job IS in ci-success's needs, unlike the
+      # `Build docs (strict)` job in docs-site.yml — a separate workflow cannot
+      # appear in `needs`, so that one is advisory. Stdlib-only on purpose, so it
+      # costs no toolchain here. TD-DOCSITE-1.
+      - name: Check no user-facing page is silently unpublished
+        run: python3 scripts/check_docs_site_coverage.py
       - name: Check documentation links
         run: |
           echo "Checking for broken links in documentation..."
@@ -1405,7 +1495,7 @@ jobs:
   # excluded (separate rot).
   rust-compile:
     name: Rust Compile (${{ matrix.shape }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: changes
     if: needs.changes.outputs.compile == 'true'
     # CARGO_BUILD_JOBS=1: serial compilation keeps peak memory bounded. The
@@ -1460,7 +1550,7 @@ jobs:
   # time per feat→develop PR.
   rust-compile-benches:
     name: Rust Compile (benches)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.compile == 'true' && needs.changes.outputs.medium_tier == 'true'
     env:
@@ -1500,7 +1590,7 @@ jobs:
   # ============================================================================
   rust-build:
     name: Rust Build (${{ matrix.profile }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.rust == 'true' && !inputs.skip_tests
     strategy:
@@ -1557,6 +1647,14 @@ jobs:
             -p proximadb-bench \
             -p proximadb-migrate
 
+      - name: Verify critical drainer lifecycle (real server)
+        if: matrix.profile == 'dev'
+        env:
+          RUST_MIN_STACK: "8388608"
+        # Subprocess isolation is owned by this suite. Reuse the dev server
+        # build; serialize its process fixtures on memory-constrained runners.
+        run: cargo test -p proximadb-server --test drainer_lifecycle_integration_test -- --test-threads=1
+
       - name: Upload Server Binary
         if: matrix.profile == 'release' && needs.changes.outputs.medium_tier == 'true'
         uses: actions/upload-artifact@v7
@@ -1567,7 +1665,7 @@ jobs:
 
   rust-test:
     name: Rust Tests (${{ matrix.test-type }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Fail fast instead of the 360-min default if a hang sneaks in; the healthy
     # job finishes in ~30-45 min (compile-bound at CARGO_BUILD_JOBS=1).
     timeout-minutes: 90
@@ -1589,6 +1687,12 @@ jobs:
           - test-type: doc
             args: "--doc"
             threads: 4
+    env:
+      # TD-PROTO-2: the v1-mirror conformance guard runs in this job (unit
+      # lane). Requiring protoc keeps a skip distinguishable from a pass —
+      # if the protobuf-compiler install ever quietly fails, the gate FAILS
+      # instead of disarming to green.
+      REQUIRE_PROTOC: "1"
     steps:
       - name: Reclaim disk space
         # ubuntu-latest ships ~25 GB of preinstalled toolchains this build never
@@ -1698,7 +1802,7 @@ jobs:
     name: Rust touched-crate fast check (advisory)
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true        # advisory — never a merge gate (also not in ci-success.needs)
     # 10m is a CANARY, not a budget: with the selection fixed this lane is a
     # cheap leaf compile plus fast unit tests. Production-scale ratchets stay in
@@ -1772,10 +1876,10 @@ jobs:
   # path: the same put_with_tier_* validation that runs at develop→qa now also runs
   # on the introducing feat→develop PR. Path-gated (skipped otherwise) and in
   # ci-success.needs so it gates when it runs (skipped ⇒ pass). Requires Docker
-  # (Azurite/MinIO/fake-gcs), preinstalled on ubuntu-latest.
+  # (Azurite/LocalStack/fake-gcs), preinstalled on ubuntu-latest.
   object-store-emulator-tests:
     name: Object-store Cool tier (emulators)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [changes]
     if: |
@@ -1792,6 +1896,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-cloud-emulator-fast"
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Run object-store tier tests against emulators (--fast)
         # docker + aws/az CLIs are preinstalled on ubuntu-latest runners.
         run: bash scripts/run_cloud_emulator_tests.sh --fast
@@ -1808,7 +1930,7 @@ jobs:
   # (skipped otherwise) and in ci-success.needs so it gates when it runs.
   object-store-restart-recovery:
     name: Object-store restart recovery (Azurite)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The `--restart` scope (scripts/run_cloud_emulator_tests.sh) builds 3 test
     # targets across distinct cloud feature sets (azure; aws,azure,gcp) at
     # CARGO_BUILD_JOBS=1 (OOM-safe on the 16GB runner). No other CI job builds
@@ -1880,6 +2002,24 @@ jobs:
           path: /home/runner/.cache/sccache
           key: sccache-restart-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: sccache-restart-${{ runner.os }}-
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Prove full-server restart recovery over Azurite (adls://)
         # docker + aws/az CLIs preinstalled on ubuntu-latest; the script starts
         # Azurite and runs catalog_wal_and_sst_survive_fresh_local_disks.
@@ -1888,7 +2028,7 @@ jobs:
   # Targeted integration tests based on changed components
   rust-integration-test-storage:
     name: Rust Integration Tests (storage)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -1911,7 +2051,7 @@ jobs:
       - name: Run Storage Integration Tests
         run: |
           # Run only explicitly named storage test files (avoids compiling all tests)
-          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs; do
+          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/mlflow_run_store_test.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
@@ -1919,10 +2059,120 @@ jobs:
             fi
           done
 
+  # TD-MLOPS-1 slice 2: real-client MLflow conformance ratchet. Builds the
+  # server, spawns it with PROXIMADB_MLFLOW_COMPAT_ENABLE=1, and drives the
+  # canonical workflow through the REAL mlflow client (mlflow-skinny, PINNED
+  # — unpinned latest would make the counts-only-up ratchet drift upstream).
+  # Generation-specific ratchets live in mlflow_conformance_steps_2x.txt and
+  # mlflow_conformance_steps_3x.txt.
+  mlflow-conformance:
+    name: MLflow conformance (real client)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: changes
+    if: |
+      !inputs.skip_tests &&
+      needs.changes.outputs.test_tier == 'true' &&
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true')
+    env:
+      PROXIMADB_MLFLOW_COMPAT_ENABLE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-nightly-dev"
+          shared-key: "build"
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+      - name: Build server binary (with MLflow UI feature)
+        run: cargo build -p proximadb-server --features mlflow-ui
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install pinned mlflow clients (2.x floor + 3.x forward)
+        run: |
+          python -m pip install "mlflow-skinny==2.14.3" requests
+          python -m venv /tmp/mlflow3env
+          /tmp/mlflow3env/bin/pip install --quiet --upgrade pip
+          /tmp/mlflow3env/bin/pip install "mlflow-skinny==3.16.0" requests
+      - name: Validate conformance harness
+        working-directory: clients/python
+        run: python tests/test_mlflow_conformance_harness.py
+      - name: Spawn server and run conformance workflow
+        run: |
+          set -euo pipefail
+          DATA_DIR="$(mktemp -d)"
+          # The unified server binds its configured port (5678 by default);
+          # `-p` does not override it — probe the port it actually serves.
+          # config.toml carries explicit storage URLs under /tmp/proximadb
+          # that `-d` never rebases — rewrite them into DATA_DIR so runs
+          # (and the set-once global WAL manifest) cannot cross-contaminate.
+          PORT=5678
+          sed "s|/tmp/proximadb|$DATA_DIR|g" config/config.toml > "$DATA_DIR/config.toml"
+          ./target/debug/proximadb-server -c "$DATA_DIR/config.toml" -d "$DATA_DIR" &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:$PORT/health/live" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf "http://127.0.0.1:$PORT/health/live" > /dev/null
+          cd clients/python
+          # Each client generation runs the FULL workflow; both must clear
+          # the ratchet floor (the 3.x client appends tag-filter clauses to
+          # registry searches — absent-value semantics keep it green).
+          python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" 2x | tee /tmp/conformance-2x.log
+          /tmp/mlflow3env/bin/python tests/mlflow_conformance.py "http://127.0.0.1:$PORT" 3x | tee /tmp/conformance-3x.log
+
+          # UI smoke (same step so PORT is set and the server is alive)
+          INDEX=$(curl -sf "http://127.0.0.1:$PORT/mlflow-ui/")
+          echo "$INDEX" | grep -q 'id="root"' || (echo "::error::UI index.html missing root div" && exit 1)
+          JS_PATH=$(echo "$INDEX" | grep -oE 'static-files/static/js/main\.[a-f0-9]+\.js' | head -1)
+          [ -n "$JS_PATH" ] || (echo "::error::no JS ref in index.html" && exit 1)
+          curl -sf -o /dev/null "http://127.0.0.1:$PORT/mlflow-ui/$JS_PATH" || (echo "::error::JS bundle not serving" && exit 1)
+          curl -sf -X POST "http://127.0.0.1:$PORT/mlflow-ui/ajax-api/2.0/mlflow/experiments/search" \
+            -H 'content-type: application/json' -d '{}' \
+            | grep -q '"experiments"' || (echo "::error::ajax-api search failed" && exit 1)
+          curl -sf -o /dev/null "http://127.0.0.1:$PORT/mlflow-ui" || (echo "::error::no-slash form failed" && exit 1)
+          # TD-MLOPS-2: the v3 traces family serves both at the API mount
+          # and through the UI's ajax-api alias (name-string location enum).
+          curl -sf -X POST "http://127.0.0.1:$PORT/api/3.0/mlflow/traces/search" \
+            -H 'content-type: application/json' \
+            -d '{"locations":[{"type":"MLFLOW_EXPERIMENT","mlflow_experiment":{"experiment_id":"0"}}]}' \
+            | grep -q '"traces"' || (echo "::error::v3 traces search failed" && exit 1)
+          curl -sf -X POST "http://127.0.0.1:$PORT/mlflow-ui/ajax-api/3.0/mlflow/traces/search" \
+            -H 'content-type: application/json' \
+            -d '{"locations":[{"type":"MLFLOW_EXPERIMENT","mlflow_experiment":{"experiment_id":"0"}}]}' \
+            | grep -q '"traces"' || (echo "::error::UI-alias v3 traces search failed" && exit 1)
+          echo "UI smoke: all checks passed"
+      - name: Ratchet — passing steps only go up (per client generation)
+        if: always()
+        run: |
+          set -eu
+          RATCHET2=$(cat clients/python/tests/mlflow_conformance_steps_2x.txt)
+          RATCHET3=$(cat clients/python/tests/mlflow_conformance_steps_3x.txt)
+          PASSED=$(grep -c '^PASS ' /tmp/conformance-2x.log || true)
+          PASSED3=$(grep -c '^PASS ' /tmp/conformance-3x.log || true)
+          echo "passed-2x=$PASSED (floor $RATCHET2) passed-3x=$PASSED3 (floor $RATCHET3)"
+          if [ "$PASSED" -lt "$RATCHET2" ]; then
+            echo "::error::MLflow 2.x conformance regressed: $PASSED < $RATCHET2 steps."
+            exit 1
+          fi
+          if [ "$PASSED3" -lt "$RATCHET3" ]; then
+            echo "::error::MLflow 3.x conformance regressed: $PASSED3 < $RATCHET3 steps."
+            exit 1
+          fi
+
   rust-integration-test-authz:
     name: Rust Integration Tests (authz e2e)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      RUST_MIN_STACK: "8388608"
     # `needs: [changes]` ONLY — deliberately not `rust-build`. `rust-build` is
     # itself gated on the `rust` filter (src/**, crates/**, apps/**, Cargo*),
     # so depending on it makes this lane inherit that gate transitively and skip
@@ -1964,7 +2214,7 @@ jobs:
           # is swallowed and the job reports red with no diagnostic — which is
           # exactly what happened on the first run of this lane.
           status=0
-          output=$(cargo test --features abac-policy --test abac_relational_transport_e2e -- --test-threads=1 --nocapture 2>&1) || status=$?
+          output=$(cargo test --features abac-policy --test abac_relational_transport_e2e --test auth_failclosed_e2e -- --test-threads=1 --nocapture 2>&1) || status=$?
           echo "$output"
           if echo "$output" | grep -qE "running 0 tests"; then
             echo "::error::the authz e2e suite compiled to ZERO tests - the abac-policy feature is not enabled, so this job verified nothing."
@@ -1974,7 +2224,7 @@ jobs:
 
   rust-integration-test-query:
     name: Rust Integration Tests (query)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -1983,6 +2233,11 @@ jobs:
       needs.changes.outputs.rust == 'true' &&
       (needs.changes.outputs.query_changes == 'true' ||
        needs.changes.outputs.core_changes == 'true')
+    env:
+      # Match the QA recall lane and the hardened server runtime: the
+      # delete/flush ANN recall path has a deep-but-finite async call chain
+      # that overflows tokio's default ~2 MiB worker stack on Linux.
+      RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -1996,7 +2251,7 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - name: Run Query Integration Tests
         run: |
-          for test_file in tests/*query*.rs tests/*federated*.rs tests/*cache*.rs tests/filtered_ann_recall_bands.rs tests/query_cache_test.rs tests/vector_ann_recall_e2e.rs tests/retrieval_quality_gates.rs; do
+          for test_file in tests/*query*.rs tests/*federated*.rs tests/*cache*.rs tests/filtered_ann_recall_bands.rs tests/query_cache_test.rs tests/vector_ann_recall_e2e.rs tests/retrieval_quality_gates.rs tests/nl_translate_eval.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
@@ -2006,7 +2261,7 @@ jobs:
 
   rust-integration-test-pgwire-accuracy:
     name: Rust Integration Tests (pgwire accuracy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes]
     if: |
@@ -2047,7 +2302,14 @@ jobs:
           # once the recursion itself is fixed (see TD-STACK-1).
           RUST_MIN_STACK: "16777216"
         run: |
+          # native_tpch_q18_q20_e2e joined this list when TD-CONV-1 closed: the
+          # "already exists on a fresh server" failure was never a #1852 converter
+          # regression — the harnesses shared the CWD-relative default catalog WAL
+          # (file://./metadata), so a previous run's DDL replayed at boot. All
+          # literal-TPC-H-name harnesses now anchor metadata_url into their tempdir.
           for test_name in \
+            pgwire_scram_auth_e2e \
+            pgwire_transaction_e2e \
             pgwire_fk_referential_actions_e2e \
             pgwire_relational_engine_e2e \
             pgwire_olap_delta_merge_e2e \
@@ -2057,7 +2319,27 @@ jobs:
             pgwire_select_or_predicate_e2e \
             sql_value_roundtrip \
             fp16_pgwire_e2e \
-            mem0_pgwire_filter_e2e; do
+            mem0_pgwire_filter_e2e \
+            pgwire_crossmodal_join_e2e \
+            pgwire_extended_param_e2e \
+            pgwire_insert_props_e2e \
+            pgwire_psql_introspection_e2e \
+            pgwire_cancel_e2e \
+            pgwire_relational_native_read_after_write_e2e \
+            pgwire_td064_write_tenant_isolation_e2e \
+            native_route_pgwire_e2e \
+            native_join_pgwire_e2e \
+            rel_agg_arith_projection_e2e \
+            rel_correlated_scalar_arith_e2e \
+            rel_correlated_scalar_multitable_e2e \
+            rel_crossjoin_or_factor_e2e \
+            rel_exec_1_selfjoin_e2e \
+            rel_having_aggregate_e2e \
+            rel_join_reorder_e2e \
+            rel_lower_3_orderby_e2e \
+            rel_lower_native_join_e2e \
+            rel_two_key_correlated_scalar_e2e \
+            native_tpch_q18_q20_e2e; do
             echo "Running $test_name..."
             # pgwire_fk_referential_actions_e2e also contains the TD-110 S1 recursive-cascade
             # + concurrency/cycle test (pgwire_cascade_recurses_and_rejects_cycles_depth_and_concurrency),
@@ -2073,7 +2355,7 @@ jobs:
 
   rust-integration-test-graph:
     name: Rust Integration Tests (graph)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -2105,7 +2387,7 @@ jobs:
 
   rust-integration-test-cluster:
     name: Rust Integration Tests (cluster)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -2148,7 +2430,7 @@ jobs:
   # `cdc_*` tests — a deliberate, narrower scope.)
   rust-integration-test-api:
     name: Rust Integration Tests (api surface)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [changes, rust-build]
     if: |
@@ -2182,16 +2464,43 @@ jobs:
 
   rust-coverage:
     name: Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # FULL tier only (qa -> main). rust-test runs at the MEDIUM tier (qa), but
     # coverage is expensive, so gate it to the main-promotion gate explicitly.
     needs: [changes, rust-test]
     if: needs.changes.outputs.extensive == 'true'
     continue-on-error: true
+    # 83 minutes then evicted mid-`Generate Coverage` with no logs uploaded on the
+    # v0.4.0 qa->main promotion -- the runner-OOM signature, not a coverage result.
+    # `cargo tarpaulin --lib` builds the `proximadb` lib-test target: cfg(test)
+    # over ~779k LOC and ~7,100 inline tests, which #1971 identified as the
+    # largest codegen unit in the workspace and fixed for three other jobs with
+    # exactly these three settings. ubuntu-latest ships NO swap, so a peak above
+    # 16GB kills the runner instead of slowing down; debug info is the other
+    # dominant term in rustc peak memory, and nothing here reads a backtrace
+    # symbol. An earlier revision of this change instead removed the job from
+    # `ci-success.needs`, which was wrong twice over: the tiering comment at the
+    # top of this file names coverage as part of the FULL qa->main gate, and
+    # whether `continue-on-error` even lets the aggregator see a `failure` is
+    # unsettled -- so de-gating may have fixed nothing while quietly ensuring the
+    # job can never gate again. Fix the eviction, keep the gate.
+    timeout-minutes: 120
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
+      # ubuntu-latest ships NO swap, so a residual peak above 16GB kills the
+      # runner rather than slowing down. 12G on the big ephemeral /mnt disk,
+      # mirroring the three jobs #1971 fixed and the two that already had it.
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
@@ -2246,7 +2555,7 @@ jobs:
   # ============================================================================
   python-test:
     name: Python SDK Tests (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Defense-in-depth: the suite runs in ~9min (measured, TD-CI-2; the "~5min"
     # this comment used to claim was stale). If a future test leaks a
     # non-daemon thread / unshutdown pool, the interpreter's atexit join can hang
@@ -2255,17 +2564,26 @@ jobs:
     needs: changes
     strategy:
       matrix:
-        # 3.9 dropped: the package declares requires-python ">=3.10".
+        # Floor is 3.11 (`requires-python = ">=3.11"`). One criterion, applied
+        # consistently: do not drop an interpreter upstream still supports.
+        # 3.9 went when the floor was 3.10; 3.10 went when it reached upstream
+        # EOL on 2026-10-01. 3.11 stays because upstream supports it until
+        # October 2027 -- not because of any distro's packaging: current Debian
+        # stable (13 "trixie", since 2025-08-09) ships 3.13, so a distro test
+        # would argue for a HIGHER floor, and the oldest LTS still in support
+        # (Ubuntu 22.04, 3.10, to 2027) would argue for a lower one. Upstream
+        # support is the only self-consistent rule.
         #
         # The matrix WIDTH is the cost dial (TD-CI-2). At promotion the full
-        # three-interpreter sweep runs; on feat->develop only 3.12 does, because
+        # interpreter sweep runs; on feat->develop only 3.12 does, because
         # the failure this lane exists to catch is almost never version-specific
         # -- a broken test breaks on every interpreter -- while the width is
-        # what costs runner time. Measured: 8.89 min mean per job-run, so three
-        # versions is 26.7 runner-minutes per PR and one is 8.9.
+        # what costs runner time. Measured: 8.89 min mean per job-run, so the
+        # two-version sweep is 17.8 runner-minutes per promotion and the
+        # single-version PR lane is 8.9 (it was 26.7 at three versions).
         python-version: >-
           ${{ (needs.changes.outputs.medium_tier == 'true'
-               && fromJSON('["3.10", "3.11", "3.12"]'))
+               && fromJSON('["3.11", "3.12"]'))
               || fromJSON('["3.12"]') }}
     # Runs at promotion (medium_tier) AND on any feat->develop PR that actually
     # touches Python (TD-CI-2). Before this, the suite was medium_tier-only, so
@@ -2356,7 +2674,7 @@ jobs:
   # coverage, not pass/fail (the python-test matrix owns per-file correctness).
   sdk-coverage-ratchet:
     name: SDK Coverage Ratchet
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     needs: changes
     if: ${{ !inputs.skip_tests && needs.changes.outputs.python == 'true' }}
@@ -2411,7 +2729,7 @@ jobs:
   # it to the whole directory is a step in TD-CG2, not here.
   chunking-conformance:
     name: Chunking Conformance + Quality Evals (TD-CHUNK-1/3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: changes
     if: ${{ !inputs.skip_tests && needs.changes.outputs.python == 'true' }}
@@ -2451,7 +2769,7 @@ jobs:
   # ============================================================================
   integration-test:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [changes, rust-build, python-test]
     if: ${{ !inputs.skip_tests && needs.changes.outputs.extensive == 'true' }}
@@ -2573,7 +2891,7 @@ jobs:
   # ============================================================================
   docker-build:
     name: Docker Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: changes
     if: (needs.changes.outputs.docker == 'true' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.extensive == 'true'
@@ -2623,7 +2941,7 @@ jobs:
   # ============================================================================
   benchmarks:
     name: Benchmarks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build]
     if: |
       inputs.run_benchmarks ||
@@ -2662,7 +2980,7 @@ jobs:
   # ============================================================================
   tpc-perf-ledger:
     name: TPC Perf Evidence Ledger (advisory)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build]
     continue-on-error: true
     timeout-minutes: 60
@@ -2704,17 +3022,13 @@ jobs:
   # PROMOTION FRESHNESS GATE
   # ============================================================================
   # A develop->qa (or qa->main) promotion PR must contain the LATEST commits of
-  # its source branch. Promotion PRs deliberately use a fixed `release/...` head
-  # (so incoming feat->develop merges can't synchronize/cancel the run), but that
-  # means develop can advance *after* the PR is opened, leaving the PR snapshot
-  # stale — merging it would DROP the newer commits (the #992 failure, where 47
-  # paths / #983/#984/#988/#990 were omitted). This gate fails if the source
-  # branch has commits not in the PR head, blocking the merge until the PR is
-  # refreshed. Skips on non-promotion PRs (and push events); ci-success treats a
-  # `skipped` result as pass.
+  # its exact source branch. The source guard rejects snapshot/release branches;
+  # this freshness check remains defense in depth against a stale or unexpected
+  # promotion ref. Skips on non-promotion PRs (and push events); ci-success treats
+  # a `skipped` result as pass.
   promotion-freshness:
     name: Promotion Freshness (head must contain source branch)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request' && contains(fromJson('["qa", "main"]'), github.base_ref)
     steps:
       - uses: actions/checkout@v7
@@ -2751,7 +3065,7 @@ jobs:
   sift-recall-ratchet:
     name: SIFT PAX recall ratchet (N=10k)
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Release-mode compile of the recall test binary (pulls the full root crate) +
     # 10k-vector ingest measured 30m17s on 2026-08-09 (#1552) — right at the prior
     # 30m cap, so it tipped to CANCELLED under normal runner variance and blocked
@@ -2813,7 +3127,7 @@ jobs:
   # ============================================================================
   ci-success:
     name: CI Success
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - deterministic-commit-contract
       - rust-format
@@ -2831,6 +3145,7 @@ jobs:
       - rust-security
       - rust-build
       - rust-test
+      - rust-coverage
       - rust-integration-test-storage
       - rust-integration-test-authz
       - rust-integration-test-query
@@ -2840,7 +3155,6 @@ jobs:
       - rust-integration-test-api
       - object-store-emulator-tests
       - object-store-restart-recovery
-      - rust-coverage
       - python-lint
       - python-test
       - sdk-coverage-ratchet
@@ -2874,10 +3188,9 @@ jobs:
     if: always()
     steps:
       # HARD GATE — a promotion PR must contain the latest source-branch commits.
-      # Promotion PRs use a fixed `release/...` head (churn-immune), so the source
-      # branch can advance after the PR opens and leave it stale — merging would
-      # DROP commits (#992). `promotion-freshness` skips on non-promotion PRs, so
-      # block only on failure/cancelled and treat skipped as pass.
+      # Exact-source promotion PRs synchronize as their source advances. Keep the
+      # freshness result as defense in depth; block on failure/cancelled and treat
+      # skipped as pass for ordinary PRs.
       - name: Require promotion freshness
         if: ${{ needs.promotion-freshness.result == 'failure' || needs.promotion-freshness.result == 'cancelled' }}
         run: |

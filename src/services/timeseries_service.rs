@@ -312,6 +312,14 @@ fn record_to_point(record: VectorRecord) -> TsPoint {
             Some(sql_value::Value::StringValue(s)) => {
                 tags.insert(k, s);
             }
+            // TD-PROTO-2: JSONB becomes a compact-JSON tag instead of being
+            // silently dropped by the `_`.
+            Some(sql_value::Value::JsonbValue(b)) => {
+                tags.insert(
+                    k,
+                    proximadb_data_model::ProximaValue::jsonb_to_json_string_lossy(&b),
+                );
+            }
             _ => {}
         }
     }

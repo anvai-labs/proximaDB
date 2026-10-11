@@ -904,6 +904,34 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
         )))
     }
 
+    /// Whether this adapter explicitly implements conditional replacement.
+    /// Transforming/caching decorators must qualify the full contract to opt in.
+    fn supports_conditional_replace(&self) -> bool {
+        false
+    }
+
+    /// Exact byte-conditioned durable replacement of a small coordination file.
+    /// None means absent, not empty; false means mismatch or lock contention.
+    /// All writers must cooperate and domain records must prevent ABA themselves.
+    /// Errors may follow publication. No read/overwrite emulation is permitted.
+    /// Caching/transforming adapters must explicitly implement compatible semantics
+    /// or retain this fail-closed default; ordinary write_atomic is not a substitute.
+    /// Read-only guards must share the target parent directory and be compared
+    /// under the same serialization boundary as the target replacement.
+    async fn compare_exchange(
+        &self,
+        path: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        guards: &[(&str, Option<&[u8]>)],
+    ) -> FsResult<bool> {
+        let _ = (expected, replacement, guards);
+        Err(FilesystemError::InvalidOperation(format!(
+            "{} does not support conditional replacement for {path}",
+            self.filesystem_type()
+        )))
+    }
+
     /// Sync file data to disk (fsync/fdatasync)
     /// Ensures data durability after write operations
     /// Returns Ok(()) if sync is not supported by the filesystem
@@ -1308,12 +1336,11 @@ mod read_ranges_prefetch_tests {
     //! Tests for `FileSystem::read_ranges_prefetch` (TD-RDSTRAT-12 INFLIGHT cap).
     use super::{
         DirEntry, FileOptions, FileSystem, FilesystemError, FsFileMetadata, FsResult,
-        RangeCoalescePolicy, drain_read_ranges_metrics,
+        RangeCoalescePolicy,
     };
     use std::ops::Range;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::task::Poll;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Simple mock FileSystem for testing prefetch behavior.
     #[derive(Debug)]

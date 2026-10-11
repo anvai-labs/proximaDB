@@ -1,8 +1,6 @@
 # ProximaDB Docker Compose Configuration
 # For local development and single-node deployments
 
-version: '3.8'
-
 services:
   proximadb:
     build:
@@ -12,13 +10,12 @@ services:
     container_name: proximadb
     restart: unless-stopped
     ports:
-      - "5678:5678"  # REST API
-      - "5679:5679"  # gRPC API
-      - "5680:5680"  # Arrow IPC
+      - "5678:5678"  # Unified REST + gRPC + Arrow Flight
+      - "5433:5433"  # PostgreSQL wire protocol
       - "9090:9090"  # Prometheus metrics
     volumes:
       - proximadb-data:/data/proximadb
-      - ./config:/config:ro
+      - ../../config/config.toml:/config/config.toml:ro
     environment:
       - RUST_LOG=info
       - PROXIMADB_DATA_DIR=/data/proximadb

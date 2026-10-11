@@ -43,8 +43,26 @@ jobs:
             build-mode: none
           - language: javascript-typescript
             build-mode: none
+          # `manual`, not `autobuild` and NOT `none`.
+          #
+          # `autobuild` is what broke: there is no `go.mod` at the repository root
+          # (the modules are `clients/go`, `clients/go/codegen` and
+          # `clients/go-embedded` — 21 .go files in total), so autobuild found no
+          # Go build, fell back to the build system it *did* detect, and compiled
+          # the whole 1.6M-LOC Rust workspace to analyse those 21 files. On a 16GB
+          # runner that is evicted mid-compile — the job failed with
+          # "runner has received a shutdown signal" while emitting *Rust* compiler
+          # warnings, which is how this was found.
+          #
+          # `none` was the first attempt and is invalid: CodeQL rejects it outright
+          # with "Go does not support the none build mode. Please try using one of
+          # the following build modes instead: autobuild, manual." So the four
+          # buildless languages below cannot be matched here.
+          #
+          # `manual` + the explicit per-module `go build` step below extracts the
+          # Go code without ever invoking cargo.
           - language: go
-            build-mode: autobuild
+            build-mode: manual
           - language: actions
             build-mode: none
     steps:
@@ -56,6 +74,42 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
+
+      # Only for `build-mode: manual` (Go). Builds each Go module in place so the
+      # extractor sees real compilations, and never invokes cargo -- which is the
+      # whole point. There is no `go.work`, so each module is built on its own.
+      #
+      # A module that cannot build WARNS rather than failing the step: of the
+      # three, only `clients/go` is proven in CI (`Go SDK Lint` runs
+      # `go vet ./...` there), while `clients/go/codegen` is a deliberately
+      # isolated generator module nothing else builds. Failing the step on it
+      # would put this job straight back to red, which is what it is here to fix.
+      # But a step where NOTHING built would hand the extractor an empty database,
+      # so zero successes is a hard failure -- resilient, not vacuous.
+      - name: Build Go modules (manual build-mode)
+        if: matrix.build-mode == 'manual'
+        run: |
+          set -uo pipefail
+          built=0
+          for mod in clients/go clients/go/codegen clients/go-embedded; do
+            if [ ! -f "$mod/go.mod" ]; then
+              echo "::warning::$mod/go.mod not found; skipping"
+              continue
+            fi
+            echo "::group::go build $mod"
+            if (cd "$mod" && go build ./... ); then
+              built=$((built + 1))
+              echo "built $mod"
+            else
+              echo "::warning::$mod failed to build; CodeQL will extract whatever compiled"
+            fi
+            echo "::endgroup::"
+          done
+          echo "go modules built: $built"
+          if [ "$built" -eq 0 ]; then
+            echo "::error::no Go module built, so the CodeQL database would be empty"
+            exit 1
+          fi
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4

@@ -1,0 +1,82 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RERANK-PGWIRE-1: `RERANK(...)` has no SQL surface over pgwire despite a comment claiming otherwise
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Discovered/verified 2026-09-15 while scoping the gap-closure program's PR-G (moat convergence) slice 1 ("RERANK() SQL contract: document + pgwire e2e for the federated-path SRF").
+| Priority | Medium — a stale comment claimed working pgwire support that does not exist; a client attempting `SELECT * FROM RERANK(...)` over pgwire gets a confusing, unrelated error rather than an honest "not supported here" decline.
+| Component | `src/query/facade/adapter.rs` (`should_use_federated_request` — the only place `RERANK(` is recognized anywhere in the codebase).
+| Relates to | TD-XMODAL-4 (unified vector-SQL routing / pgwire UDTF reachability gap — the SAME class of gap, already tracked, evidenced further by this session against `graph_traverse`; see the note added there); `docs/12-design/adr/ADR-053-cross-modal-query-fabric.adoc` (cross-modal query fabric: "no new DSL; reuse SQL + table functions" — RERANK is the one modality this principle was never extended to over pgwire).
+|===
+
+== The finding
+
+`should_use_federated_request` in `src/query/facade/adapter.rs` carried this comment against its
+`RERANK(` branch:
+
+[source,rust]
+----
+// R-7c.4c: RERANK() routes through the same federated path
+// so pgwire clients can `SELECT * FROM RERANK(...)`.
+|| sql_upper.contains("RERANK(")
+----
+
+This is false as written. `should_use_federated_request` is a private helper called only from
+two sites inside `adapter.rs` itself; `QueryFacadeAdapter` (the type it belongs to) is
+constructed only from `src/network/grpc/graph_service.rs` and
+`src/network/grpc/v2/graph_service.rs` — never from `src/network/postgres/`. An exhaustive
+search of every pgwire-reachable file
+(`src/network/postgres/protocol.rs`, `src/network/postgres/relational_pipeline.rs`,
+`crates/query/proximadb-relational-frontend/`, and every `register_udtf` call in
+`src/datafusion/mod.rs`) turns up **zero** references to RERANK anywhere. The only other
+`RERANK`/`GRAPH_TRAVERSE`/`GRAPH_CONNECTED`-shaped text in the codebase is in
+`crates/query/proximadb-uql` — a separate query language's `WHERE`-clause condition parser, not
+callable SQL.
+
+Empirically verified (probe e2e, not committed — throwaway): `SELECT * FROM RERANK('coll',
+'[1,2,3]', 10)` over pgwire does **not** reach any RERANK-aware code. It falls through the
+relational pipeline (declines — not "relational-engaging" per `require_engagement`, the same
+gate TD-XMODAL-4 tracks) to the legacy single-table path's `legacy_unsupported_from_shape`
+guard, which naively `contains(',')`-checks the FROM clause with no parenthesis awareness — the
+function call's own argument commas trip it. The client gets:
+
+----
+[0A000] SELECT with a comma-separated table list in FROM is not supported on the legacy
+single-table path; the relational engine declined to lower this query (TD-REL-LOWER-1).
+----
+
+**This citation is itself stale**: `TD-REL-LOWER-1` is Resolved and was about genuine
+multi-table `FROM a, b, c` lists (fixed by #953); it has nothing to do with a single function
+call's argument list. The message is accurate in effect (RERANK is declined, not silently
+served wrong data — no correctness violation) but misleading in stated cause, and would send a
+debugging developer to the wrong TD.
+
+== Why this is filed, not fixed, in the gap-closure program's PR-G
+
+Building a real `RERANK(...)` pgwire SQL surface means either (a) a new `register_udtf("rerank",
+...)` DataFusion table function backed by the reranking service, mirroring `vector_search` /
+`graph_traverse` / `documents`, or (b) wiring pgwire into `QueryFacadeAdapter`'s federated path
+directly. Both are real feature work — materially larger than a docs/moat-convergence PR, and
+blocked on the SAME reachability-gap root cause TD-XMODAL-4 is already tracking for the other
+UDTFs (fix that first; RERANK's wiring becomes the same shape of change once it lands).
+
+== What this PR does instead
+
+* Corrects the false comment (this is the actual code change).
+* Files this TD as the accurate record: RERANK is gRPC/federated-only today, by design gap not
+  by working design.
+* Adds a new e2e test asserting the REAL, current, safe behavior — pgwire declines
+  `RERANK(...)` rather than silently returning wrong data — so a future fix to
+  `legacy_unsupported_from_shape` or the UDTF-reachability gap doesn't accidentally regress this
+  into a silent-wrong-answer path without a test noticing.
+
+== Residual
+
+* A real pgwire SQL surface for RERANK remains unbuilt. Natural sequencing: land TD-XMODAL-4's
+  UDTF-reachability fix first (benefits all four existing UDTFs), then register `rerank` as a
+  fifth cross-modal DataFusion table function.
+* `legacy_unsupported_from_shape`'s paren-blind comma check and its stale `TD-REL-LOWER-1`
+  citation are real, small, separately-scoped cleanup — not attempted here (shared code, wider
+  blast radius, belongs with the TD-XMODAL-4 fix or its own follow-up).

@@ -48,6 +48,10 @@ pub use manager::{CatalogFilesystemResolver, CatalogManager, TableOpLockRegistry
 pub mod mlops;
 /// Tenant-scoped model-registry lifecycle application service shared by API adapters.
 pub mod model_registry_service;
+/// MLflow-compatible tracking store port (TD-MLOPS-1) — experiments, runs,
+/// params, metrics, tags; substrate-backed implementations live beside their
+/// wiring, not here.
+pub mod run_store;
 // Catalog federation (Slice 3) — unified view across internal + external
 // catalogs, moved from root src/catalog/federation (now that CatalogManager is
 // in this crate).

@@ -338,10 +338,15 @@ impl FederatedParser {
         if parts.len() < 3 {
             return None;
         }
-        let collection = Self::unquote_sql_string(&parts[0]).to_string();
-        let query_text = Self::unquote_sql_string(&parts[1]).to_string();
+        let collection = Self::unquote_sql_string(&parts[0]);
+        let query_text = Self::unquote_sql_string(&parts[1]);
         let query_vector = self.parse_vector_argument(&parts[2])?;
-        let k = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+        // Present-but-unparseable k rejects the extension (silent-default
+        // class — see VECTOR_SEARCH's top_k).
+        let k = match parts.get(3) {
+            Some(s) => s.parse().ok()?,
+            None => 10,
+        };
         // Empty rank_profile string → None (retrieval-only path); a
         // non-empty string → Some(name). Mirrors the REST DTO
         // `rank_profile: Option<String>` contract.
@@ -350,7 +355,7 @@ impl FederatedParser {
             if unquoted.is_empty() {
                 None
             } else {
-                Some(unquoted.to_string())
+                Some(unquoted)
             }
         });
         Some(SqlExtension::RerankSearch {
@@ -369,9 +374,18 @@ impl FederatedParser {
             return None;
         }
 
-        let collection = Self::unquote_sql_string(&parts[0]).to_string();
+        let collection = Self::unquote_sql_string(&parts[0]);
         let query_vector = self.parse_vector_argument(&parts[1])?;
-        let top_k = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+        // A present-but-unparseable top_k REJECTS the extension (the
+        // silent default-to-10 class the JSON twins eliminated — a user
+        // asking for 50 got 10 with no signal).
+        let top_k = match parts.get(2) {
+            Some(s) => s
+                .parse()
+                .map_err(|_| ()) // caller turns Err into None
+                .ok()?,
+            None => 10,
+        };
 
         Some(SqlExtension::VectorSearch {
             collection,
@@ -382,35 +396,33 @@ impl FederatedParser {
 
     /// Parse GRAPH_QUERY('cypher')
     fn parse_graph_query_args(&self, args: &str) -> Option<SqlExtension> {
-        let cypher = Self::unquote_sql_string(args).to_string();
+        let cypher = Self::unquote_sql_string(args);
         Some(SqlExtension::GraphQuery { cypher })
     }
 
     /// Parse DOCUMENT_QUERY(collection, filter)
     fn parse_document_query_args(&self, args: &str) -> Option<SqlExtension> {
         let parts = self.split_function_args(args);
-        let collection = Self::unquote_sql_string(parts.first()?).to_string();
-        let filter = parts
-            .get(1)
-            .map(|s| Self::unquote_sql_string(s).to_string());
+        let collection = Self::unquote_sql_string(parts.first()?);
+        let filter = parts.get(1).map(|s| Self::unquote_sql_string(s));
         Some(SqlExtension::DocumentQuery { collection, filter })
     }
 
     /// Parse LOGS(namespace)
     fn parse_logs_query_args(&self, args: &str) -> Option<SqlExtension> {
-        let namespace = Self::unquote_sql_string(args).to_string();
+        let namespace = Self::unquote_sql_string(args);
         Some(SqlExtension::Logs { namespace })
     }
 
     /// Parse METRICS(namespace)
     fn parse_metrics_query_args(&self, args: &str) -> Option<SqlExtension> {
-        let namespace = Self::unquote_sql_string(args).to_string();
+        let namespace = Self::unquote_sql_string(args);
         Some(SqlExtension::Metrics { namespace })
     }
 
     /// Parse TRACES(namespace)
     fn parse_traces_query_args(&self, args: &str) -> Option<SqlExtension> {
-        let namespace = Self::unquote_sql_string(args).to_string();
+        let namespace = Self::unquote_sql_string(args);
         Some(SqlExtension::Traces { namespace })
     }
 
@@ -433,8 +445,9 @@ impl FederatedParser {
                 .unwrap_or("embedding")
                 .to_string();
 
-            let right_literal =
-                Self::parse_vector_distance_rhs(after).unwrap_or_else(|| "[]".to_string());
+            // A missing/unparseable RHS is an ERROR, not a silent empty
+            // vector (a 0-dimension query dispatched to the kernels).
+            let right_literal = Self::parse_vector_distance_rhs(after)?;
 
             return Some((
                 SqlExtension::VectorDistance {
@@ -454,9 +467,21 @@ impl FederatedParser {
         }
 
         if let Some(rest) = trimmed.strip_prefix('\'') {
-            let mut escaped = false;
+            let mut in_doubled_pair = false;
             for (idx, ch) in rest.char_indices() {
-                if ch == '\'' && !escaped {
+                if in_doubled_pair {
+                    // second char of a doubled close-quote — the pair is
+                    // literal content, NOT the close.
+                    in_doubled_pair = false;
+                    continue;
+                }
+                // POSTGRES dialect: a DOUBLED close-quote is an escaped
+                // quote inside the literal; backslash is a literal.
+                if ch == '\'' && rest[(idx + ch.len_utf8())..].starts_with('\'') {
+                    in_doubled_pair = true;
+                    continue;
+                }
+                if ch == '\'' {
                     let literal_end = 1 + idx + ch.len_utf8();
                     let mut end = literal_end;
                     let suffix = trimmed[literal_end..].trim_start();
@@ -468,7 +493,6 @@ impl FederatedParser {
                     }
                     return Some(trimmed[..end].trim().to_string());
                 }
-                escaped = ch == '\\' && !escaped;
             }
             return None;
         }
@@ -616,15 +640,22 @@ impl FederatedParser {
         let mut paren_depth = 0;
         let mut bracket_depth = 0;
         let mut in_quote = None;
-        let mut escaped = false;
 
-        for c in s.chars() {
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
             if let Some(quote) = in_quote {
                 current.push(c);
-                if c == quote && !escaped {
+                // POSTGRES dialect (standard_conforming_strings=on): the
+                // only in-literal escape is a DOUBLED close-quote (both
+                // chars stay); backslash is a LITERAL character.
+                if c == quote {
+                    if chars.peek() == Some(&quote) {
+                        chars.next();
+                        current.push(quote);
+                        continue;
+                    }
                     in_quote = None;
                 }
-                escaped = c == '\\' && !escaped;
                 continue;
             }
 
@@ -657,8 +688,6 @@ impl FederatedParser {
                 }
                 _ => current.push(c),
             }
-
-            escaped = false;
         }
 
         if !current.trim().is_empty() {
@@ -677,14 +706,24 @@ impl FederatedParser {
         let content = &sql[start + function_name.len() + 1..];
         let mut depth = 1;
         let mut in_quote = None;
-        let mut escaped = false;
 
+        let mut in_doubled_pair = false;
         for (i, c) in content.char_indices() {
             if let Some(quote) = in_quote {
-                if c == quote && !escaped {
+                if in_doubled_pair {
+                    // second char of a doubled close-quote — literal content
+                    in_doubled_pair = false;
+                    continue;
+                }
+                // POSTGRES dialect: doubled close-quote stays in-quote;
+                // backslash is a literal.
+                if c == quote {
+                    if content[(i + c.len_utf8())..].starts_with(quote) {
+                        in_doubled_pair = true;
+                        continue;
+                    }
                     in_quote = None;
                 }
-                escaped = c == '\\' && !escaped;
                 continue;
             }
 
@@ -700,23 +739,24 @@ impl FederatedParser {
                 }
                 _ => {}
             }
-
-            escaped = false;
         }
 
         None
     }
 
-    fn unquote_sql_string(s: &str) -> &str {
+    fn unquote_sql_string(s: &str) -> String {
         let trimmed = s.trim();
         if trimmed.len() >= 2 {
             let first = trimmed.as_bytes()[0];
             let last = trimmed.as_bytes()[trimmed.len() - 1];
             if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-                return &trimmed[1..trimmed.len() - 1];
+                let inner = &trimmed[1..trimmed.len() - 1];
+                let escaped = if first == b'\'' { "''" } else { "\"\"" };
+                let quote = if first == b'\'' { "'" } else { "\"" };
+                return inner.replace(escaped, quote);
             }
         }
-        trimmed
+        trimmed.to_string()
     }
 
     fn parse_extension_alias(&self, sql: &str, mut position: usize) -> Option<String> {
@@ -820,17 +860,30 @@ impl FederatedParser {
 
         let inner = &unquoted[1..unquoted.len() - 1];
         if inner.trim().is_empty() {
-            return Some(Vec::new());
+            // An empty vector is not a queryable literal (the optimizer twin
+            // and the JSON twins reject it — do not dispatch a 0-dimension query).
+            return None;
         }
 
         inner
             .split(',')
-            .map(|value| value.trim().parse::<f32>().ok())
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|component| component.is_finite())
+            })
             .collect()
     }
 
     fn strip_vector_cast(value: &str) -> &str {
         let trimmed = value.trim();
+        // Cheap gate (the lowercase scan allocated a full copy of large
+        // literals per parse — see the optimizer sibling).
+        if !trimmed.contains("::") {
+            return trimmed;
+        }
         let lower = trimmed.to_ascii_lowercase();
         let Some(cast_start) = lower.rfind("::vector") else {
             return trimmed;
@@ -1047,6 +1100,87 @@ mod tests {
             }
             _ => panic!("Expected GraphQuery extension"),
         }
+    }
+
+    #[test]
+    fn postgres_string_dialect_is_pinned() {
+        // The ONLY in-literal escape is quote-doubling; backslash is a
+        // LITERAL (standard_conforming_strings=on). A trailing backslash
+        // does not escape the close-quote (rounds 23/24/28 churned this).
+        let parser = FederatedParser::new();
+        let path_arg = parser.parse("SELECT * FROM LOGS('C:\\dir\\') ORDER BY ts LIMIT 5");
+        // The extension is recognized and the namespace keeps the
+        // backslashes (no phantom literal swallowing ORDER BY/LIMIT).
+        let query = path_arg.expect("trailing backslash does not break parsing");
+        assert!(
+            matches!(&query.extensions[0], SqlExtension::Logs { namespace }
+                if namespace == "C:\\dir\\"),
+            "namespace must keep the backslashes exactly: {:?}",
+            query.extensions[0]
+        );
+
+        // Doubled quotes stay INSIDE the literal (one arg, decoded).
+        let doubled = parser
+            .parse("SELECT * FROM LOGS('team''s-prod')")
+            .expect("doubled quote is one literal");
+        assert!(
+            matches!(&doubled.extensions[0], SqlExtension::Logs { namespace }
+                if namespace == "team's-prod")
+        );
+
+        assert_eq!(
+            FederatedParser::parse_vector_distance_rhs("'[0.1]''tag'::vector LIMIT 1"),
+            Some("'[0.1]''tag'::vector".to_string()),
+            "a doubled quote pair must not close the RHS literal early"
+        );
+    }
+
+    #[test]
+    fn sql_string_escapes_are_decoded_for_extension_arguments() {
+        let parser = FederatedParser::new();
+
+        let vector = parser
+            .parse("SELECT * FROM VECTOR_SEARCH('team''s-vectors', '[0.1]', 1)")
+            .unwrap();
+        assert!(matches!(
+            &vector.extensions[0],
+            SqlExtension::VectorSearch { collection, .. } if collection == "team's-vectors"
+        ));
+
+        let document = parser
+            .parse("SELECT * FROM DOCUMENT_QUERY('team''s-docs', 'owner = \"O''Brien\"')")
+            .unwrap();
+        assert!(matches!(
+            &document.extensions[0],
+            SqlExtension::DocumentQuery {
+                collection,
+                filter: Some(filter),
+            } if collection == "team's-docs" && filter == "owner = \"O'Brien\""
+        ));
+
+        let graph = parser
+            .parse("SELECT * FROM GRAPH_QUERY('MATCH (n) RETURN ''label''')")
+            .unwrap();
+        assert!(matches!(
+            &graph.extensions[0],
+            SqlExtension::GraphQuery { cypher } if cypher == "MATCH (n) RETURN 'label'"
+        ));
+
+        let logs = parser
+            .parse("SELECT * FROM LOGS('team''s-production')")
+            .unwrap();
+        assert!(matches!(
+            &logs.extensions[0],
+            SqlExtension::Logs { namespace } if namespace == "team's-production"
+        ));
+    }
+
+    #[test]
+    fn vector_literals_reject_non_finite_components() {
+        assert!(FederatedParser::parse_vector_literal("'[NaN]'").is_none());
+        assert!(FederatedParser::parse_vector_literal("'[inf]'").is_none());
+        assert!(FederatedParser::parse_vector_literal("'[-inf]'").is_none());
+        assert!(FederatedParser::parse_vector_literal("'[1e300]'").is_none());
     }
 
     #[test]

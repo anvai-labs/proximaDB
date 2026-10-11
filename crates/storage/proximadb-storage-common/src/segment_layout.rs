@@ -37,6 +37,18 @@ use proximadb_block_format::BLOCK_MAGIC;
 /// coalesced segment starts with `PXH1`.
 pub const SEG_HEADER_MAGIC: &[u8; 4] = b"PXH1";
 
+/// Apache Parquet file magic (`PAR1`), present at BOTH ends of a Parquet file
+/// (offset 0 and the last four bytes, after the footer length). Disjoint from
+/// `PBLK`, `PXH1` and the legacy version/compression byte range `0x01..=0x0E`,
+/// so the four recognised heads never collide.
+///
+/// TD-USUB-5: before this arm existed, a Parquet object reaching
+/// [`SegmentFormat::detect`] fell through to the legacy `ProximaBlocks` default
+/// and was handed to a decoder that cannot read it — the exact class of
+/// silently-wrong routing mandate #1 forbids. Naming the format makes the
+/// outcome honest: either it decodes as Parquet, or it errors as Parquet.
+pub const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
+
 /// Header layout version — THE coalesced segment layout (TD-PAXRG-1 collapse,
 /// 2026-08): one version, region presence declared by the serialized extents.
 ///
@@ -81,16 +93,33 @@ pub enum SegmentFormat {
     ProximaBlocks,
     /// Columnar PAX segment (carries SQ8 / RaBitQ codes; enables quantized ANN).
     Pax,
+    /// Apache Parquet file — the relational/warehouse landing format under
+    /// ADR-094 "format follows modality", and the Iceberg interop seam.
+    /// Recognised by `PAR1` at both ends (TD-USUB-5).
+    Parquet,
 }
 
 impl SegmentFormat {
     /// Detect a persisted segment's format from its raw bytes, mixed-read-safe.
     ///
-    /// Returns [`SegmentFormat::ProximaBlocks`] for anything not recognisably a PAX
-    /// segment, so the legacy path is never mis-routed on truncated or unknown input.
+    /// Precedence is PAX → Parquet → legacy, and the three recognisers are
+    /// **disjoint by construction**: PAX requires a `PBLK`/`PXH1` head AND a
+    /// `PAXSEG01` tail; Parquet requires a `PAR1` head AND a `PAR1` tail; the
+    /// legacy format starts with the version/compression byte `0x01..=0x0E`.
+    /// Because each recogniser constrains the head, order cannot change any
+    /// verdict — the ordering below is documentation, not logic.
+    ///
+    /// Returns [`SegmentFormat::ProximaBlocks`] for anything not recognisably PAX
+    /// or Parquet, so the legacy path is never mis-routed on truncated or unknown
+    /// input. Note this default is a *routing* choice, not a claim of validity: a
+    /// hybrid such as a PAX head with a `PAR1` tail satisfies neither recogniser
+    /// and reaches the legacy decoder, which rejects it (the head is not a legal
+    /// version byte) — an honest error rather than a decode of the wrong format.
     pub fn detect(bytes: &[u8]) -> Self {
         if is_pax_segment(bytes) {
             SegmentFormat::Pax
+        } else if is_parquet_file(bytes) {
+            SegmentFormat::Parquet
         } else {
             SegmentFormat::ProximaBlocks
         }
@@ -106,6 +135,19 @@ fn is_pax_segment(bytes: &[u8]) -> bool {
     bytes.len() >= BLOCK_MAGIC.len() + SEGMENT_MAGIC.len()
         && (bytes.starts_with(&BLOCK_MAGIC) || is_coalesced_segment(bytes))
         && bytes.ends_with(SEGMENT_MAGIC)
+}
+
+/// True iff `bytes` is an Apache Parquet file: `PAR1` at offset 0 AND `PAR1` as
+/// the trailing four bytes. Both ends are required, and the length bound rejects
+/// a lone four-byte `PAR1` (which would otherwise satisfy `starts_with` and
+/// `ends_with` simultaneously) — the same trap [`is_pax_segment`] guards.
+///
+/// Detection is not validation: a file passing this check may still be truncated
+/// or corrupt, and the Parquet reader reports that as a Parquet error.
+pub fn is_parquet_file(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 * PARQUET_MAGIC.len()
+        && bytes.starts_with(PARQUET_MAGIC)
+        && bytes.ends_with(PARQUET_MAGIC)
 }
 
 /// The fixed header-prefix at offset 0 (88 B, single form). The RaBitQ scan
@@ -1317,6 +1359,78 @@ mod tests {
 
         // Default (e.g. a manifest entry predating the format field) is legacy.
         assert_eq!(SegmentFormat::default(), SegmentFormat::ProximaBlocks);
+    }
+
+    /// TD-USUB-5 detect precedence across ALL FOUR recognised heads — `PBLK`,
+    /// `PXH1`, `PAR1`, and the legacy version byte — including the adversarial
+    /// hybrids where one format's head coexists with another's tail. The
+    /// property under test is that the four recognisers are **disjoint**: each
+    /// constrains the head, so no ordering of the `detect` arms can change a
+    /// verdict, and every hybrid falls to the legacy default rather than
+    /// decoding as the wrong format.
+    #[test]
+    fn segment_format_detect_precedence_all_four_magics() {
+        let pax_tail = SEGMENT_MAGIC;
+
+        // --- The four heads, each with its own correct tail. ---
+        let mut pblk = BLOCK_MAGIC.to_vec();
+        pblk.extend_from_slice(pax_tail);
+        assert_eq!(SegmentFormat::detect(&pblk), SegmentFormat::Pax);
+
+        let mut pxh1 = SEG_HEADER_MAGIC.to_vec();
+        pxh1.extend_from_slice(pax_tail);
+        assert_eq!(SegmentFormat::detect(&pxh1), SegmentFormat::Pax);
+
+        let mut par1 = PARQUET_MAGIC.to_vec();
+        par1.extend_from_slice(&[0u8; 4]); // footer length
+        par1.extend_from_slice(PARQUET_MAGIC);
+        assert_eq!(SegmentFormat::detect(&par1), SegmentFormat::Parquet);
+
+        for version_byte in 0x01u8..=0x0E {
+            assert_eq!(
+                SegmentFormat::detect(&[version_byte, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                SegmentFormat::ProximaBlocks,
+                "legacy version byte {version_byte:#04x} must stay legacy"
+            );
+        }
+
+        // --- Adversarial: a PAR1 tail coexisting with a PAX head. Neither
+        // recogniser is satisfied (PAX wants its own tail; Parquet wants its own
+        // head), so this must NOT be claimed as either format. ---
+        for head in [&BLOCK_MAGIC[..], &SEG_HEADER_MAGIC[..]] {
+            let mut hybrid = head.to_vec();
+            hybrid.extend_from_slice(&[0u8; 4]);
+            hybrid.extend_from_slice(PARQUET_MAGIC);
+            assert_eq!(
+                SegmentFormat::detect(&hybrid),
+                SegmentFormat::ProximaBlocks,
+                "PAX head + PAR1 tail must not be claimed as Pax or Parquet"
+            );
+        }
+
+        // --- Adversarial: a PAR1 head with a PAX segment tail. Same reasoning
+        // from the other side. ---
+        let mut hybrid = PARQUET_MAGIC.to_vec();
+        hybrid.extend_from_slice(pax_tail);
+        assert_eq!(
+            SegmentFormat::detect(&hybrid),
+            SegmentFormat::ProximaBlocks,
+            "PAR1 head + PAXSEG01 tail must not be claimed as Parquet or Pax"
+        );
+
+        // --- A lone four-byte PAR1 satisfies starts_with AND ends_with; the
+        // length bound must reject it. ---
+        assert_eq!(
+            SegmentFormat::detect(&PARQUET_MAGIC[..]),
+            SegmentFormat::ProximaBlocks
+        );
+        assert!(!is_parquet_file(&PARQUET_MAGIC[..]));
+
+        // --- Disjointness of the head magics themselves, stated directly: this
+        // is the invariant that makes arm ordering irrelevant. ---
+        assert_ne!(&BLOCK_MAGIC[..], &PARQUET_MAGIC[..]);
+        assert_ne!(&SEG_HEADER_MAGIC[..], &PARQUET_MAGIC[..]);
+        assert!(!(0x01u8..=0x0E).contains(&PARQUET_MAGIC[0]));
     }
 
     fn sample_footer() -> SegmentFooterIndex {

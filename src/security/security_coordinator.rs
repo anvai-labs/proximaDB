@@ -41,6 +41,25 @@ pub struct SecurityConfig {
     /// Tenant-identity trust configuration (`[security.tenant]`, TD-TENANT-1).
     #[serde(default)]
     pub tenant: TenantTrustConfig,
+    /// pgwire authentication posture (`[security.pgwire]`, TD-PGWIRE-AUTH-1).
+    #[serde(default)]
+    pub pgwire: PgwireSecurityConfig,
+}
+
+/// `[security.pgwire]` — the pgwire authentication knob (TD-PGWIRE-AUTH-1).
+/// Sibling of `[security.tenant]`, NOT a reuse of `authentication.enabled`:
+/// that flag already means "REST/gRPC/Flight credentials required" and is the
+/// *forcing* condition; this knob can RAISE pgwire above the global default
+/// (require SCRAM while REST auth is off) but can never LOWER it (an env value
+/// of `trust` while `authentication.enabled=true` is warn-ignored).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct PgwireSecurityConfig {
+    /// `"trust"` (default when absent) | `"password"` (SCRAM-SHA-256
+    /// required). The `PROXIMADB_PGWIRE_AUTH` env override wins over the
+    /// config value; the effective mode is resolved once at startup in
+    /// `database.rs`.
+    #[serde(default)]
+    pub auth: Option<String>,
 }
 
 /// `[security.tenant]` — tenant-identity trust knobs (TD-TENANT-1).
@@ -386,6 +405,23 @@ impl SecurityCoordinator {
         Ok(user_context)
     }
 
+    /// The SCRAM verifier for `username`, if configured (TD-PGWIRE-AUTH-1).
+    /// The pgwire protocol layer runs the SASL exchange against it BEFORE any
+    /// identity exists; resolution then flows through
+    /// [`Self::authenticate_request`] with
+    /// `AuthenticationData::ScramAuthenticated`.
+    pub fn scram_verifier(
+        &self,
+        username: &str,
+    ) -> Option<crate::network::postgres::scram::ScramVerifier> {
+        self.auth_service.scram_verifier(username)
+    }
+
+    /// True when any pgwire SCRAM identity is configured.
+    pub fn has_scram_users(&self) -> bool {
+        self.auth_service.has_scram_users()
+    }
+
     /// Check if user has permission for operation
     pub async fn check_authorization(
         &self,
@@ -637,6 +673,7 @@ mod tests {
                 require_authentication: false,
                 default_session_timeout_minutes: 480,
                 api_keys: HashMap::new(),
+                scram_users: HashMap::new(),
                 jwt: JwtConfig {
                     enabled: false,
                     secret: "test-secret".to_string(),
@@ -673,6 +710,7 @@ mod tests {
             encryption: EncryptionConfig::default(),
             key_store: KeyStoreConfig::default(),
             tenant: Default::default(),
+            pgwire: PgwireSecurityConfig::default(),
         }
     }
 

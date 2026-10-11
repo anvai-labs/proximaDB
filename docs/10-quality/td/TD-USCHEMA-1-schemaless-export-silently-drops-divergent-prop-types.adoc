@@ -1,0 +1,175 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USCHEMA-1: Schema-less Parquet export silently drops props whose type differs from the first record
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **In progress.** Filed 2026-09-24 from a review of U-Schema (arXiv:2105.06494). **Step 1 landed 2026-09-25** — the tail-less export path now fails closed instead of silently dropping values. Union rules 1–3 (steps 2–3) and variation statistics (step 4) remain open.
+| Priority | **HIGH** — silent data loss on an export path, with no error and no signal. Bounded by how often a prop key is heterogeneous.
+| Component | `crates/storage/proximadb-storage-common/src/proxima_arrow.rs` (`infer_proxima_schema`, `build_column`), `crates/storage/proximadb-iceberg-engine/src/lib.rs`
+| Relates to | ADR-024 (canonical type source of truth), ADR-094 (unified substrate), TD-USUB-6 (the residual tail hit the same issue on the PAX side), arXiv:2105.06494 §2.3
+| Blocked by | Nothing.
+|===
+
+== The finding, reproduced
+
+`infer_proxima_schema` locks a prop key's type to the **first record** that supplies a concrete
+value for it (`if types.contains_key(key) { continue; }`). `build_column` then coerces every
+other record's value through that type, and a value that does not coerce becomes
+`append_null()`.
+
+Measured with a two-record probe — `v = Int64(7)` then `v = String("hello")`:
+
+----
+inferred type for 'v': Int64
+row0 v = Some(Value(Int64(7)))
+row1 v = None          <-- the String is gone
+----
+
+**Why the two call sites differ, and why one of them loses data:**
+
+* `src/services/record_spill.rs` — survivable. The msgpack `PROPS` tail is complete there, so
+  the typed column being NULL costs nothing; the value is still recoverable from the tail.
+  (This is the same property TD-USUB-6's residual rule relies on.)
+* `crates/storage/proximadb-iceberg-engine/src/lib.rs` — **data loss.** This is the
+  schema-less `write_records_to_parquet` API, where the Parquet column *is* the data. There is
+  no tail. The value is silently dropped on export, and the exported file is a plausible,
+  well-formed Parquet that simply lacks it.
+
+Neither path errors or warns.
+
+== What the literature says about it
+
+U-Schema (Fernández Candel, Sevilla Ruiz, García-Molina, arXiv:2105.06494) formalises exactly
+this situation as **structural variation**: in a schemaless store, objects of the same entity
+type may have different structure, and a schema type is the set of its variations. Collapsing
+those variations into one "union schema" is a defined, *lossy* operation, and the paper states
+the rules it must follow (§2.3):
+
+. a feature present in **all** variations is included with `optional = false`;
+. a feature present in **some** is included with `optional = true`;
+. **a feature appearing with the same name but a different type is included with a numeric
+  identifier appended to its name, and `optional = true`.**
+
+Rule 3 is the one ProximaDB violates. `infer_proxima_schema` implements a union schema that
+silently resolves the collision in favour of whichever record happened to be first, rather than
+preserving both. Rules 1–2 are also unimplemented: every inferred column is `nullable: true`,
+so the common/specific distinction is lost as well.
+
+The paper notes this is not a solved problem in the tooling either — of the commercial
+multi-model tools it surveys, "the collision of fields with the same name but different type is
+not considered, but the modeler should make a decision" (§9.3). So the bar here is low, and
+being correct is a differentiator rather than table stakes.
+
+== How to apply
+
+Order matters: **(1) stop losing data, then (2) represent variation properly.** The second is
+the larger change and should not gate the first.
+
+. **Fail closed on the lossy path.** `write_records_to_parquet`'s schema-less API must not
+  silently null a non-conforming value. At minimum it must error, naming the key, both types,
+  and the offending record — the same "fail closed, never silently wrong" rule mandate #1
+  applies everywhere else. A caller that genuinely wants lossy coercion can opt in explicitly.
+. **Implement union rule 3** in `infer_proxima_schema`: a key seen with two irreconcilable
+  types yields two columns (`v`, `v_2`) rather than one, both nullable. This preserves the data
+  and matches the paper's canonical union semantics.
+. **Rules 1–2 do NOT belong on this code path — attempted 2026-09-25 and reverted.** See
+  "Why per-batch nullability inference is a category error" below.
+. **Record variation statistics.** U-Schema's `StructuralVariation` carries `count`,
+  `firstTimestamp`, `lastTimestamp`. ProximaDB currently decides which props to shred from a
+  *static* `filterable_columns` list (`resolve_flush_shred_spec`). Variation counts would let
+  that decision be evidence-driven, which is what the co-design mandate asks for
+  ("optimise toward the measured trace distribution"), and would directly inform TD-USUB-6's
+  per-path write-amplification story.
+
+== Evidence gate (mandate #6)
+
+* A round-trip test over records with a deliberately heterogeneous prop key: every value must
+  survive, or the write must fail with an actionable error. No third outcome.
+* The existing `proxima_arrow` round-trip tests stay green (this must not perturb the
+  homogeneous case, which is the overwhelmingly common one).
+* If variation statistics land: a measured comparison of shred-spec selection driven by
+  variation counts vs the static `filterable_columns` list, recorded in
+  `BENCHMARK_EVIDENCE.toml` per the ADR-094 narrowing (relational and vector arms separately).
+
+== Step 1 as landed (2026-09-25) — the lossy path fails closed
+
+`detect_type_divergence` reports every prop key seen with two irreconcilable types (once per
+key + conflicting type, not once per row, so a large batch yields a readable message), and
+`infer_proxima_schema_strict` refuses to produce a schema when any exist. The schema-less
+`ObjectStoreBridge::write_records_to_parquet` in `proximadb-iceberg-engine` now uses it.
+
+The error names the key, both types, and a diverging record's `oid`, because "a value somewhere
+was dropped" is not actionable.
+
+=== This is a behaviour change, not only a bug fix
+
+An export of a collection with a genuinely heterogeneous prop key now **fails** where it
+previously produced a lossy file. That is the right trade — mandate #1, and this is the
+*interop* path whose output external readers consume — but it is a behaviour change and should
+not be read as invisible.
+
+The escape hatch already exists in the API shape: `write_records_to_parquet_with_schema` is
+untouched, so a caller who knows their data can pass an explicit schema and choose the
+coercion. Only the schema-*less* convenience entry point fails closed, and that path's entire
+premise is "infer what is there", which it cannot honestly do for a divergent key.
+
+=== Deliberately still lenient
+
+`infer_proxima_schema` itself is unchanged, so `record_spill.rs` keeps working exactly as
+before. Divergence there is survivable because the msgpack `PROPS` tail is complete — the same
+property TD-USUB-6's residual rule depends on. Making inference strict everywhere would break a
+path that loses nothing.
+
+=== Evidence
+
+* `union_schema_drops_the_divergent_value_documented_not_endorsed` — pins the **loss** itself
+  (`back[1].props.get("v") == None`), so the union schema's defined-lossy behaviour stays
+  visible and cannot be mistaken for correctness.
+* `strict_inference_fails_closed_with_an_actionable_message` — asserts the error names the key,
+  both types, and the diverging record.
+* `detect_type_divergence_reports_key_types_and_record` — one entry per (key, conflicting type).
+* `strict_inference_accepts_consistent_records` — the common homogeneous case is unaffected, and
+  strict inference produces the same schema as lenient.
+* `absent_is_not_divergent` — a key merely **missing** from some records is ordinary optionality
+  (U-Schema's `optional` flag), not divergence. Conflating the two would fire the guard
+  constantly on normal sparse data and get it switched off.
+
+Root lib suite 6434/6434; `cargo check --workspace --all-targets`; crate suites 684/684;
+clippy `-D warnings`; fmt.
+
+== Why per-batch nullability inference is a category error (attempted, reverted 2026-09-25)
+
+The original "how to apply" proposed implementing U-Schema union rules 1–2 in
+`infer_proxima_schema`: count presence, and mark a key found in every record `nullable: false`.
+It was implemented, it worked, and it was **reverted**. Recording why, because the idea is
+appealing and will occur to the next reader.
+
+**The scope of `optional` is an entity type; the scope of this function is one write batch.**
+In U-Schema, `optional` describes a feature across *all structural variations of a schema
+type* — a property of the collection. `infer_proxima_schema` sees only the records handed to
+one `write_records_to_parquet` call. A batch is not the entity type, and "present in every
+record of this batch" is not "present in every object of this collection".
+
+Writing that inference into the file's Parquet schema asserts something true of the **file**
+that a reader will reasonably generalise to the **column**. With single-object publication that
+is merely imprecise. Under TD-USUB-10's multi-object direction it becomes actively harmful:
+part-0 could declare `k` NOT NULL and part-1 declare it nullable, for the same logical column.
+Lenient readers widen to nullable; strict ones object; either way the table's schema now depends
+on which files you looked at.
+
+An existing test, `infer_schema_unions_props_and_appends_vector`, asserts
+`by_name.values().all(|c| c.nullable)`. It is **not** encoding a defect — it pins the correct
+invariant for a per-batch inference, and the function's doc states the rule deliberately
+("Every column is nullable (a key absent from some record is a null there)").
+
+**Where rules 1–2 do belong:** the catalog's entity-type schema, where the scope matches — a
+`CatalogTableSchema` column can legitimately be NOT NULL because it constrains every object of
+the type, and the constraint is declared rather than inferred from a sample. Any future work
+should put presence/optionality there, and leave per-batch file inference maximally permissive.
+
+**A safety note for whoever tries anyway:** Arrow *rejects* a null in a non-nullable field, so
+a presence check even slightly looser than `build_column`'s extraction converts a silent null
+into a failed write. Whatever computes nullability must be provably no more permissive than the
+encoder that fills the column.

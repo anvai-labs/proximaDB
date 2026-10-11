@@ -1,0 +1,189 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-9: Route stamps can misreport the executing engine, poisoning cost cells; plus two dead/silent interop defects
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved 2026-09-22.** Filed 2026-09-21 under ADR-094 Phase 4. All three defects closed — see Resolution.
+| Priority | **HIGH for the stamp half** — it silently corrupts the cost model that every future routing decision reads. MEDIUM for the hygiene half.
+| Component | `src/query/compute_scheduler.rs`, `src/datafusion/engine_adapters/pax_adapter.rs`, `src/query/route_cost_model.rs`, `src/services/dml/mod.rs`, `src/storage/formats/open/iceberg.rs`
+| Relates to | ADR-094 (spec §5, §6), ADR-058 (routing), TD-USUB-4, TD-USUB-5
+| Blocked by | Nothing. **Should land before any cost-based routing flip.**
+|===
+
+== Defect 1 — the route stamp can lie
+
+Enabling `PROXIMADB_DF_PAX_READER` flips the scheduler's decision to `DataFusionLocal`
+"via PaxSplitReader" (`src/query/compute_scheduler.rs:750-758`), but the relational dispatch
+still requires `parquet_backed` (`src/network/postgres/relational_pipeline.rs:1150`). So
+**Volcano actually serves the query while `io_trace` stamps `DataFusionLocal`**. Both files
+carry warnings saying exactly this (`compute_scheduler.rs:392-396`,
+`pax_adapter.rs:73-82`).
+
+The stamp is not cosmetic. `finalize_route` feeds `io_trace::record_route`
+(`compute_scheduler.rs:1115-1122`), which drives the route-cost observer
+(`src/query/route_cost_model.rs:59`) and accumulates per-cell EWMA samples keyed by
+`{olap|oltp}/{parquet|native}/card/fanout/op/geom` (`:547-572`). A mis-stamped sample
+attributes **Volcano's latency to DataFusion's cost cell**.
+
+[IMPORTANT]
+====
+Every future cost-based routing decision reads these cells. A cost model trained on
+mis-attributed samples will make confidently wrong choices, and the error is invisible —
+there is no signal distinguishing a poisoned cell from a legitimate one.
+====
+
+Note also a duplicated gate: `compute_scheduler.rs:397` re-declares a private
+`pax_reader_enabled()` reading the same env var as `pax_adapter.rs:83-90`, deliberately so the
+scheduler compiles without `datafusion-integration`. Two `OnceLock`s, one variable — they can
+drift.
+
+**Fix.** The stamp must record what *executed*, not what was *decided*. Either make the
+decision binding (dispatch actually honours it), or stamp at execution. Until then, a decision
+that cannot be honoured must not produce a cost sample at all.
+
+== Defect 2 — Iceberg publish fails silently
+
+`publish_iceberg_table` failure is swallowed with a `tracing::warn!`
+(`src/services/dml/mod.rs:2107-2111`). ProximaDB's own reads use the catalog storage layout
+rather than the manifest, so **Iceberg metadata can be absent while the table still reads
+perfectly locally** — the failure surfaces only when an external engine tries to read the
+table and finds nothing.
+
+An interop seam that fails silently is worse than one that fails closed: it converts a
+publish error into a later, harder-to-diagnose absence. Make the failure explicit (surface it,
+or record an unpublished state in the catalog).
+
+== Defect 3 — a dead parallel Iceberg implementation
+
+`src/storage/formats/open/iceberg.rs` (1507 lines, `IcebergFormat` / `IcebergConfig`) has
+**zero non-doc references** in the tree. It is exported
+(`src/storage/formats/open/mod.rs:72,76`) but never constructed. The live implementation is
+`crates/storage/proximadb-iceberg-engine` (real Avro manifests, `ManifestCommitter` with
+optimistic concurrency).
+
+Two implementations of one seam is exactly the drift ADR-094 exists to remove. Delete it, or
+merge anything worth keeping into the live crate.
+
+Related naming defect worth correcting in the same pass:
+`TableRecordStoreRoute::for_schema` routes relational/HTAP/OLAP to a `ParquetIcebergStorage`
+arm (`src/services/record_store.rs:194-196`) that the pgwire wiring fills with the canonical
+WAL store (`src/services/dml/mod.rs:948-952`) — the name asserts a behaviour that does not
+happen.
+
+== Evidence gate (mandate #6)
+
+* A test asserting the stamped route equals the engine that executed, across every gate
+  combination — including the `PROXIMADB_DF_PAX_READER`-on case that is currently wrong.
+* Cost cells recorded during the mis-stamp window identified and invalidated, not silently
+  carried forward.
+* Iceberg publish failure surfaces in a test (external reader sees either a valid manifest or
+  an explicit error, never silent absence).
+* Dead-code removal verified by the no-DataFusion build guard and a clean `cargo clippy
+  --lib --bins -- -D warnings`.
+
+== Resolution (2026-09-22)
+
+=== 1. Route-stamp integrity — the arm was removed, not repaired
+
+`route_select_inner`'s `(true, false)` arm stamped `ComputeBackend::DataFusionLocal` when
+`pax_backed && pax_reader_enabled()`. Dispatch requires `parquet_backed`, so **Volcano served
+the query** and the cost model attributed Volcano's measured latency and I/O to DataFusion
+cells — corrupting the evidence ADR-052's observe→ingest→act sequence is built on.
+
+The fix is deletion, not repair: the gate could not make DataFusion execute, so the only
+thing it did was lie. Removing the arm **changes no execution** (Volcano served before and
+after) and makes the stamp true. The `RouteAxis::Trust` clause went with it — a route reading
+WAL+RecordStorage synchronously must not claim it trusts object-store base-snapshot
+statistics. `pax_reader_enabled()` in `compute_scheduler.rs` became unused and was deleted;
+the PAX reader itself stays gated in `pax_adapter.rs`, available for the real slice-2
+dispatch wiring, which may add an arm back once DataFusion genuinely executes the shape —
+the bar the neighbouring `native_registerable` arm already meets.
+
+Pinned by `pax_backed_olap_stamps_the_backend_that_actually_serves`, which asserts both the
+backend and the absence of the false Trust claim. The env gate is no longer consulted on this
+path, so the property holds with it set or unset.
+
+**Deviation from the evidence gate, stated rather than quietly skipped:** the gate asked for
+cost cells recorded during the mis-stamp window to be "identified and invalidated". No
+invalidation was performed, because none is needed — `PROXIMADB_DF_PAX_READER` is default-OFF
+and is not set in CI, any qa-gate lane, or any shipped config, so no cell was ever written
+through the mis-stamping path in a tracked environment. An operator who enabled it locally
+should clear their own model; that is a runbook note, not a code change.
+
+=== 2. Dead Iceberg connector — deleted
+
+`src/storage/formats/open/iceberg.rs`, 1507 lines, **zero non-doc references** anywhere in
+the workspace. It was a second, unused implementation of a seam the warehouse path already
+serves via `ObjectStoreBridge::publish_iceberg_table` — and two implementations of one
+external contract is how they drift. Removed along with its `pub mod` / `pub use`
+registrations and the re-exports in `storage/formats/mod.rs`.
+
+The module docs were corrected with it: the capability table claimed "Iceberg ✓ Implemented"
+for a module that no longer implements it, and the usage example referenced the deleted type.
+Leaving those would have been a docs-claim regression in the same change that removed the
+code.
+
+=== 3. Iceberg publish failure — no longer silent
+
+The failure existed **only** as a `warn!` line, so a `MATERIALIZE` returning success could
+leave the Iceberg manifest absent or stale with nothing to alert on: an external Spark/Trino
+reader sees no table while ProximaDB reports OK.
+
+It is deliberately **still non-fatal**, and that is the right call. The Parquet data is
+published and the catalog layout is correct, so ProximaDB-side reads are complete; the
+catalog does not claim Iceberg either (the layout is `parquet-snapshot` /
+`CatalogPhysicalFormat::Parquet`), so nothing advertises a manifest that is not there.
+Failing the statement would convert a transient interop write error into a failed publish
+whose O(table) rewrite the user must repeat, on top of state already committed — strictly
+worse.
+
+What was wrong was the **silence**. Now: a registered counter
+(`proximadb_warehouse_iceberg_publish_failures_total`) makes it alertable, and the log is
+`error!` with the location and an explicit statement of what external readers will and will
+not see. The counter follows the lazily-and-tolerantly-registered pattern used for the
+relational memtable gauge — a construction error yields `None` and observability never takes
+down the write path (mandate #4, no `.expect()` in `src/`).
+
+**Scope note:** the evidence gate asked for a test where "an external reader sees either a
+valid manifest or an explicit error". That test is not written here, because it needs a real
+external Iceberg reader in the loop to be meaningful, and a mock asserting our own counter
+incremented would prove nothing about the external contract. The honest position is that this
+change removes the silence; proving the interop contract end-to-end belongs with the Iceberg
+interop test lane.
+
+=== 4. `ParquetIcebergStorage` renamed to `RelationalStorage`
+
+The TD flagged this as "worth correcting in the same pass", so it was: the variant named a
+physical format that the route does not produce. The slot is a plain
+`Arc<dyn TableRecordStore>` that the pgwire wiring fills with the **canonical WAL store** —
+no Parquet is written on INSERT and no Iceberg manifest is involved; publication is the
+separate, explicit `ALTER TABLE … MATERIALIZE` step. The route selects a *destination slot*,
+not a format, and the name now says only that.
+
+=== Correction: a test encoded the defect (found in CI, not locally)
+
+The first push failed `Rust Tests (unit)` on
+`src/datafusion/pax_olap_tests.rs::pax_backed_shape_routes_to_datafusion_under_gate`, which
+asserted *"PAX-backed analytical shape + gate ON must route DataFusion"* — precisely the
+behaviour removed here.
+
+Before changing it, the claim was re-verified against source rather than assumed: the pgwire
+dispatch gate is
+`((!relational_abac_required && parquet_backed) || native_registerable) && matches!(decision.backend, …)`
+(`relational_pipeline.rs`). For `pax_backed: true, parquet_backed: false` with no native
+registration, the DataFusion block is never entered and **Volcano serves**. The test therefore
+pinned a stamp that dispatch never honoured — it encoded the defect, in the same way the
+`storage_layouts.len() == 1` assertions did in TD-USUB-4.
+
+It was **rewritten, not deleted**, to assert the truthful property (the stamp equals the
+backend that serves), keeping `PROXIMADB_DF_PAX_READER=1` set because "gate on" is exactly the
+case the old code got wrong. Its sibling control 2.8b was also corrected: it claimed to prove
+"the `pax_backed` flag flips the route", which is no longer true of anything, so its stated
+rationale was replaced with what it actually guards.
+
+**Process lesson (recurrence).** The pre-change search for dependants was scoped to `tests/`
+and `compute_scheduler.rs`; this test lives in `src/datafusion/`. A behaviour-removal change
+must sweep **all of `src/`**, and must be validated with a full `--lib` run rather than a
+module-filtered one — the same filtered-run trap recorded in TD-USUB-4.

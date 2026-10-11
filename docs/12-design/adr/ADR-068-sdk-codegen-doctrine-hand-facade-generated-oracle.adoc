@@ -8,7 +8,7 @@
 | Status | **Proposed; migration started** (reconciled 2026-07-22). S0 landed in #1112 and the S2a facade defect (collection-name length) landed in #1113. *Correction:* the prior revision recorded S2b (`search()` silent local fallback) as shipped in #1113 — that was erroneous; only S2a landed in #1113, and the S2b fix was orphaned on `feat/sdk-facade-fixes` (`a56296f5c`); it lands here. The decision is not yet accepted or operationally complete: S1's live behavioral round-trip and S3–S5's oracle/gate migration remain open, so the existing `<lang>-sdk-codegen-drift` gates still enforce the legacy contract.
 | Decider | Vijaykumar Singh (2026-07-20)
 | Date | 2026-07-20
-| Relates to | link:ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (co-design — the SDK is the customer-facing seam; correctness is measured, not asserted), link:ADR-060-oss-commercial-boundary.adoc[ADR-060] (the SDK is an OSS surface; neutral, stable), CLAUDE.md mandates #15/#16 (the spec-driven-SDK rule this ADR *refines*, not repeals). Inspired by Sandhi ADR-0003 (provider-adapter authoring — hand-written transport, generated types as a narrow reference + test oracle).
+| Relates to | link:ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (co-design — the SDK is the customer-facing seam; correctness is measured, not asserted), ADR-060 (the SDK is an OSS surface; neutral, stable), CLAUDE.md mandates #15/#16 (the spec-driven-SDK rule this ADR *refines*, not repeals). Inspired by Sandhi ADR-0003 (provider-adapter authoring — hand-written transport, generated types as a narrow reference + test oracle).
 | Refines | CLAUDE.md mandate #15 ("SDK REST transport is spec-driven, generated, never hand-rolled") — this ADR keeps the **spec as the contract** but demotes the **generated client** from the shipped product to a CI oracle, and makes the **shipped SDK** a hand-maintained facade over narrow generated types.
 | Tracked under | link:../../10-quality/td/TD-SDK-1-sdk-codegen-doctrine-migration.adoc[TD-SDK-1]
 | Non-goals | Removing the OpenAPI spec (it stays the canonical contract — first-party, `utoipa`-emitted, `verify-openapi-spec`-gated); changing the server's handler annotations; abandoning SDK generation tooling (it remains the bootstrap + the oracle); a multi-language typed-client SDK *product* strategy beyond REST (gRPC/proto and Arrow Flight are unchanged).
@@ -156,7 +156,7 @@ to exactly what customers call.
 
 * link:../../10-quality/td/TD-SDK-1-sdk-codegen-doctrine-migration.adoc[TD-SDK-1] — migration tracker (round-trip harness, facade-bug fixes, oracle demotion, gate conversion).
 * link:ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] — co-design spine (measured, not asserted).
-* link:ADR-060-oss-commercial-boundary.adoc[ADR-060] — SDK as an OSS-neutral surface.
+* ADR-060 — SDK as an OSS-neutral surface.
 * CLAUDE.md mandates #15 (spec-driven SDK transport) / #16 (read/write correctness) — this ADR refines #15.
 * Sandhi `docs/adr/0003-provider-adapter-authoring-and-codegen.md` (ADR-0003) — the hand-written-transport + generated-oracle doctrine this ADR adapts.
 * Tooling: `oxidecomputer/progenitor`, `Deep embassy/oapi-codegen`, `openapi-python-client`, `openapi-typescript`, `oxidecomputer/typify`.

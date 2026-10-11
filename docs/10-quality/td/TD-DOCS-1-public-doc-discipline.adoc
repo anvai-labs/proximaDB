@@ -9,7 +9,7 @@
 | Severity | Medium (trust / TAM-claim accuracy — public docs must not assert production-ready capabilities or unmeasured perf numbers)
 | Component | Public docs: `README.adoc`, `docs/00-product/{PRD,VISION,COMPETITIVE_LANDSCAPE}.adoc`, `docs/release-notes/*`; ADR index `docs/12-design/adr/README.adoc`
 | Governs | Authority hierarchy in link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] (support contract) + `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml` (measured-evidence ledger)
-| Relates | link:../REVIEW_RESPONSE_2026_07_07.adoc[REVIEW_RESPONSE_2026_07_07] §2.2 (the loose end this closes), link:TECHNICAL_DEBT.adoc[TD-148] (row_count approximate doc), the `td-adr-unique` guard's ADR-index warnings
+| Relates | link:../REVIEW_RESPONSE_2026_07_07.adoc[REVIEW_RESPONSE_2026_07_07] §2.2 (the loose end this closes), link:../TECHNICAL_DEBT.adoc[TD-148] (row_count approximate doc), the `td-adr-unique` guard's ADR-index warnings
 | Suitable for | Autonomous agent execution (docs-only, fully verifiable, low risk). NOTE: `TD-DOCS-` (plural, documentation discipline) is distinct from the `TD-DOC-` (singular, *document modality*) family.
 |===
 

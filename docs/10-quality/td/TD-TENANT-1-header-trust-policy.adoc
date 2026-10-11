@@ -3,10 +3,10 @@
 = TD-TENANT-1: credential-bound tenant identity — X-Tenant-ID header-trust policy
 :icons: font
 
-**Status:** Phase 2 shipped; follow-up (a) **CLOSED 2026-08-30** by
-API-key gateway roles (`ApiKeyInfo.roles`, delegation-only); follow-up (b)
-re-scoped below as its own future TD (pgwire SCRAM bindings). SSO/mTLS role
-stamping remains open.
+**Status:** Phase 2 shipped; follow-up (a) is **partially closed 2026-08-30**:
+legacy config-backed API keys can now carry delegation-only gateway roles, while
+ADR-090 registry-backed API keys, SSO, and mTLS role stamping remain open.
+Follow-up (b) is re-scoped below as its own future TD (pgwire SCRAM bindings).
 **Origin:** anvaiops live-UAT debugging (issues #949/#950, PR #956) — the fix
 review raised the question: the engine honors a bare `X-Tenant-ID` header, so
 any client that can reach the port can masquerade as any tenant unless a
@@ -94,20 +94,23 @@ silently running `open`. Unset ⇒ config value; default-safe, no flag-day.
 
 == Follow-ups (still open)
 
-* Credential-side stamping of the gateway role beyond JWTs — **API keys:
-  CLOSED 2026-08-30** (`ApiKeyInfo.roles`, `#[serde(default)]`; exact-match
+* Credential-side stamping of the gateway role beyond JWTs — **legacy
+  config-backed API keys: CLOSED 2026-08-30** (`ApiKeyInfo.roles`,
+  `#[serde(default)]`; exact-match
   `gateway`/`operator` only — a typo grants nothing; grants NO
   `UnifiedPermission`, delegation-only). **Adversarial review 2026-08-31
   found and structurally closed an escalation**: arbitrary role pass-through
   would have satisfied `SecurityPredicate::RoleBased` RLS predicates
-  (Unrestricted row access on role-string match) — the conversion now
-  passes ONLY the two delegation markers and drops every other configured
-  role with a warn; pinned by
-  `apikey_business_roles_are_dropped_not_passed_through`. **SSO/mTLS: half
-  closed** — generic OIDC bearer (with the same seam sanitization for IdP
-  role claims) is TD-SSO-1 (2026-09-01); the aws/azure enterprise SSO
-  variants and mTLS role stamping remain open, and TD-SSO-1 carries the
-  seam pattern for them.
+  (unrestricted row access on role-string match) — the conversion now passes
+  ONLY the two delegation markers and drops every other configured role with
+  a warn; pinned by `apikey_business_roles_are_dropped_not_passed_through`.
+  **ADR-090 registry-backed `pxk_` API keys remain open:** that namespace is
+  registry-authoritative and currently resolves principals with only
+  `api_user`; adding roles requires an explicit registry role-provisioning
+  authority, not inheritance from legacy config. **SSO/mTLS: half closed** —
+  generic OIDC bearer (with the same seam sanitization for IdP role claims) is
+  TD-SSO-1 (2026-09-01); the aws/azure enterprise SSO variants and mTLS role
+  stamping remain open, and TD-SSO-1 carries the seam pattern for them.
 * pgwire authenticated bindings — **re-scoped 2026-08-30 as its own future
   TD**, not a follow-up patch: it requires SCRAM/password wire-protocol
   authentication (a protocol-level work item). Until then, strict policies

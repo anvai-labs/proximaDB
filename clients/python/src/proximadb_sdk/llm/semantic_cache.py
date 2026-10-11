@@ -7,7 +7,7 @@
 
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from proximadb_sdk.llm.config import SemanticCacheConfig
@@ -149,9 +149,7 @@ class SemanticCache:
                 cached_at_str = metadata.get("cached_at", "")
                 if cached_at_str:
                     cached_at = datetime.fromisoformat(cached_at_str)
-                    age_hours = (
-                        datetime.now(timezone.utc) - cached_at
-                    ).total_seconds() / 3600
+                    age_hours = (datetime.now(UTC) - cached_at).total_seconds() / 3600
                     if age_hours > self.config.ttl_hours:
                         # Expired
                         self._stats["misses"] += 1
@@ -188,9 +186,7 @@ class SemanticCache:
                     collection=collection,
                     response=response,
                     embedding=result.get("vector", []),
-                    cached_at=(
-                        cached_at if cached_at_str else datetime.now(timezone.utc)
-                    ),
+                    cached_at=(cached_at if cached_at_str else datetime.now(UTC)),
                     hit_count=metadata.get("hit_count", 0) + 1,
                 )
 
@@ -226,7 +222,7 @@ class SemanticCache:
 
         try:
             cache_key = self._make_key(question, collection)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
 
             # Serialize sources
             sources_data = []

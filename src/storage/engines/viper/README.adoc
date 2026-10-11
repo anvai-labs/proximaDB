@@ -498,13 +498,13 @@ enable_dictionary = true
 
 == References
 
-* link:../../../../docs/storage/viper-engine-deep-dive.adoc[VIPER Engine Deep Dive]
-* link:../../../../docs/storage/hybrid-columnar-engines.adoc[Hybrid Columnar Engines]
-* link:../../../../docs/technical/unified-quantization-guide.adoc[Quantization Guide]
+* VIPER Engine Deep Dive
+* Hybrid Columnar Engines
+* link:../../../../docs/_internal/archive/technical/unified-quantization-guide.adoc[Quantization Guide]
 
 == See Also
 
-* Parent Module: link:../README.adoc[Storage Engines]
+* Parent Module: Storage Engines
 * SST Engine: link:../sst/README.adoc[SST README]
 * NOVA Engine: link:../nova/README.adoc[NOVA README]
-* Main Documentation: link:../../../../docs/README.adoc[ProximaDB Docs]
+* Main Documentation: ProximaDB Docs

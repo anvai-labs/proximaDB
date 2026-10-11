@@ -45,10 +45,16 @@ proximadb/
 
 | Category | Location | Command | Purpose |
 |----------|----------|---------|---------|
-| **Unit** | `src/**/mod.rs` | `cargo test --lib` | Test functions in isolation |
-| **Integration** | `tests/*.rs` | `cargo test --test <name>` | Test component interaction |
+| **Unit** | `src/**/mod.rs`, `crates/**` | `cargo nxlib` | Test functions in isolation (nextest, process-per-test) |
+| **Integration** | `tests/*.rs` | `cargo nxint` | Component interaction (sequential, port-safe) |
+| **All** | everything | `cargo nx` | The full nextest default profile |
 | **SDK** | `clients/*/tests/` | `pytest` | Test client libraries |
-| **E2E** | `tests/e2e/` | `cargo test --test e2e` | Full system tests |
+| **E2E** | `tests/*_e2e.rs` | `cargo nx -- e2e` | Full system tests |
+
+`cargo nx` / `nxlib` / `nxint` are the repo-standard runners (nextest aliases in
+`.cargo/config.toml`): process-per-test isolation makes env-mutation and
+shared-state tests safe, and the profiles live in `.config/nextest.toml`.
+Plain `cargo test` still works but shares one process — prefer nextest.
 
 ---
 
@@ -57,17 +63,20 @@ proximadb/
 ### Quick Tests (CI)
 
 ```bash
-# Unit tests only
-cargo test --lib
+# Unit tests only (repo standard)
+cargo nxlib
 
-# With feature flag
-cargo test --features test-quick
+# With feature flag (equivalent libtest shape)
+cargo test --lib --features test-quick
 ```
 
 ### Standard Tests
 
 ```bash
-# Unit + integration
+# Unit + integration (repo standard)
+cargo nx
+
+# With feature flag (equivalent libtest shape)
 cargo test --features test-standard
 
 # Include graph tests

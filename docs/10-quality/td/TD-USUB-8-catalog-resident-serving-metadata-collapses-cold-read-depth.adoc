@@ -1,0 +1,366 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-8: Cold PAX reads pay a 3-deep dependent GET chain — promote rebuildable serving metadata to the catalog
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 3. **Slices 0–2 landed.** Slice 0 (2026-09-24) carries the object size in `FileSplit`, removing the `HEAD` (4 → 3). Slice 1 (2026-09-27) wires the existing `SegmentIndexCache` into the DataFusion lane. Slice 2 (2026-09-27) **measures** it: index-acquisition round trips 3 → 0 on a warm read (`range_gets` 203 → 200), ratcheted at `cold - warm == 3`. Slice 3 (catalog-resident Layer B) remains open, and must now be argued on cold start / cross-node sharing / planner-time pruning rather than on a depth number a cache already delivers.
+| Priority | MEDIUM-HIGH — targets DEPTH, the term ADR-033's cost spine ranks highest (`DEPTH ≫ WIDTH ≫ BYTES ≫ CPU`).
+| Component | `crates/storage/proximadb-block-format/src/ranged.rs`, `crates/control/proximadb-catalog/`, `src/storage/engines/sst/`
+| Relates to | ADR-094 (Decision 4, spec §3), ADR-045 (Layer A/B split — this promotes Layer B only), ADR-034 (read-path GET depth), ADR-062 (D1 one-object atomicity), ADR-090 (BYOB)
+| Blocked by | TD-USUB-4 (catalog must model per-table representations first).
+|===
+
+== The finding
+
+`ranged.rs` documents the cold read order for a single block:
+
+. `head`/size → `footer_tail_range` → fetch trailing 32 B → `BlockFooter`
+. `metadata_ranges` → fetch column footer + vector params + row-group index
+. `BlockLayout::assemble` → in-memory metadata view (no stripe bytes)
+. prune (zone maps / row groups) → `column_stripe_range` → fetch surviving slabs
+
+Steps 1 → 2 → 4 are **serially dependent**: three round-trips before the first data byte.
+ADR-034 records the same shape at segment scale (`1+3K` serial dependent GETs for a pruned
+ranged read).
+
+ADR-033's spine is explicit that **latency is the depth of the dependent-request chain**, not
+the byte total or the request count — 100 parallel GETs cost about one GET's latency, three
+serial GETs cost 3×. So this chain, not bytes, is the dominant cold-read cost.
+
+ADR-062's per-segment invariants cache already elides steps 1–2 **on hot queries**. The cold
+path is untouched, and cold is where the 444 ms → 10 ms cliff lives.
+
+== The change
+
+Promote ADR-045 **Layer B** — RowDirectory, ColumnMeta statistics, blooms, SegmentIndex,
+deletion vector — into xCatalog. ADR-045 already classifies all of it as *rebuildable serving
+metadata*, so **nothing authoritative moves**.
+
+Cold read becomes: **catalog query (ms, no S3 round-trip) → fetch surviving slabs**.
+
+[.text-center]
+**Dependent GET depth 3 → 1.** (As originally filed. Superseded — slices 0–2 have since
+delivered most of this on the *warm* path with a read-side cache and no catalog change; see the
+Status row and "Slice 2 as landed".)
+
+This is the DuckLake insight — metadata as queryable rows rather than files-in-bucket,
+collapsing the `metadata.json → manifest list → manifest → data` chain — applied at the
+segment layer, where ProximaDB already owns a catalog and does not need to invent one.
+
+== The object must stay self-describing
+
+The in-object footer copy is **retained, not replaced**. An object must remain readable with
+no catalog present, for:
+
+* disaster recovery and catalog rebuild;
+* external tools reading the bucket directly;
+* **BYOB storage** (ADR-090), where the customer owns the bucket and may read it independently
+  of ProximaDB.
+
+Catalog is the fast path; the object remains the truthful one. **On divergence the object
+wins** and the catalog entry is rebuilt — which is sound precisely because Layer B is
+rebuildable by definition.
+
+== Constraints
+
+* **ADR-062 D1** — no sidecar object is introduced; a catalog row is not an object in the
+  data path.
+* **ADR-045** — Layer A (including the inviolable filter + vector stripe co-location) does not
+  move.
+* Catalog size and write rate become a scaling dimension: Layer B for a large collection is
+  not small. Bound it (per-segment granularity, eviction, lazy population) before enabling.
+
+== Evidence gate (mandate #6)
+
+* **Cold-read dependent-GET depth measured 3 → 1** via `io_trace` `range_gets` on a genuinely
+  cold cache — the headline claim as originally filed. **Superseded:** slice 2 measured
+  3 → 0 on the *warm* path from a read-side cache alone, so this is no longer the claim that
+  justifies the work. Slice 3 must be gated on the *cold*-path and cross-node numbers instead
+  (Status row; "Slice 2 as landed").
+* Catalog growth (bytes and write rate) per 1 TB of segments recorded.
+* **Catalog-unavailable recovery exercised**: read a segment with the catalog offline, then
+  rebuild Layer B from the object and verify byte-equality with the catalog copy.
+* Divergence handling tested: a deliberately stale catalog entry must not produce wrong
+  results.
+
+== Depth re-measured 2026-09-24: the cold chain is FOUR round trips, not three
+
+[NOTE]
+====
+**Read the rest of this document as a chronological record, not as current state.** The sections
+below were written across slices 0–2 and the earlier ones argue a "4 → 1" collapse that slices
+0–2 have since largely delivered *without* catalog-resident metadata. The Status row above and
+"Slice 2 as landed" carry the current, narrower claim. Nothing below is deleted — how the number
+moved is the useful part — but slice 3 must be sized against the later sections.
+====
+
+ADR-094 Decision 4 and this TD both describe the cold PAX read as a "3-deep dependent GET
+chain". Verified against the code, it is **four**, and the uncounted one is a `HEAD`.
+
+`PaxSplitReader::load_ranged` (`src/datafusion/engine_adapters/pax_adapter.rs`) does:
+
+. `filesystem_factory.metadata(path)` — **a HEAD for the object size**. On object storage this
+  is a full round trip, and nothing else can start without it.
+. `read_range(path, 0, SEG_HEADER_PREFIX_LEN)` — the header prefix.
+. `read_range(path, h.footer_off, h.footer_len)` — the footer, at an offset only step 2 reveals.
+. the surviving stripes, at ranges only step 3 reveals.
+
+Each depends on the previous, which is what makes depth the cost rather than bytes. The
+`ranged.rs` module doc states the same order and likewise begins at "`head`/size", so the
+omission is in the *design docs'* count, not in the code.
+
+**Why this matters beyond bookkeeping.** ADR-033 ranks `DEPTH ≫ WIDTH ≫ BYTES ≫ CPU`, and
+ADR-094 Decision 4 justifies catalog-resident Layer B by collapsing 3 → 1. The true
+improvement is **4 → 1**, so the case is stronger than written — but any measurement that
+counted only ranged reads would under-report the baseline by a full round trip and make the
+improvement look smaller than it is.
+
+=== A shortcut that does NOT work, verified
+
+The obvious fix is to drop the HEAD and take the object size from the split. **It is wrong.**
+`FileSplit.length` is the *split's* byte length, not the object's: the SST planner sets
+`length = file.block_size` per block (`sst_adapter.rs`). Using it as the object size would make
+`footer_tail_range` compute from the wrong length and read the wrong bytes — garbage or a
+spurious error, not a clean failure.
+
+Removing that round trip therefore requires the object size to be carried **explicitly**, which
+is precisely this TD's proposal: put it in the catalog alongside the rest of Layer B.
+
+=== Consequent cheapest first slice
+
+**Carry the object size in catalog/split metadata and skip the HEAD.** It is the smallest of
+the four round trips to remove, needs no format change, and is independently useful: every
+other Layer-B promotion still has to start by knowing where the object ends.
+
+Sequence: (0) object size in catalog/split → HEAD removed, 4 → 3; (1) footer/Layer-B promotion
+→ 3 → 1; (2) in-object self-describing copy retained for DR/BYOB (ADR-090), which ADR-094
+Decision 4 already requires.
+
+=== Measurement note
+
+Any baseline recorded for this work must count the HEAD. `io_trace`'s `range_gets` counts
+ranged reads only, so a trace-based number needs the metadata call counted separately (or a
+counting filesystem wrapper, as `segment_format.rs`'s tests already use) — otherwise the
+baseline reads as 3 and the improvement is understated.
+
+=== Slice 0 as landed (2026-09-24) — the HEAD is gone (4 → 3)
+
+`FileSplit` gained an explicit `object_size: Option<u64>`, populated by **both** PAX segment
+locators (`pax_segment_locator.rs` for the DataFusion lane,
+`discover_native_pax_segments` in `native_engine.rs` for the native lane) from the size
+`list()` already returned. `PaxSplitReader::load_ranged` prefers it and falls back to the
+`HEAD` when absent.
+
+The size was **already known and already being discarded**: both locators read
+`entry.metadata.size` and stored it in `length`, and the locator even carried a comment saying
+`PaxSplitReader` ignores `offset`/`length`. So the reader was paying a dependent round trip to
+rediscover a number the planner had been handed — the first of the four, which nothing else
+can start without.
+
+**An explicit field, not a reinterpretation of `length`.** `length` is producer-defined: the
+PAX locators set it to the whole-file size (their splits are whole-file), the SST planner to
+`file.block_size` per block. Reusing it would make `footer_tail_range` compute from the wrong
+length on the SST path and read the wrong bytes — garbage or a spurious error, not a clean
+failure. This is the shortcut the previous section flagged, and it is still the wrong one;
+carrying the size explicitly is what makes it safe.
+
+`None` falls back to the `HEAD`, so external or hand-built splits that never carried a size
+behave exactly as before.
+
+**Evidence:** `splits_carry_the_object_size_so_readers_need_no_head` asserts the recorded size
+equals the **real on-disk length** — not merely that it is `Some` — so a change that records
+the wrong number fails there rather than silently producing a bogus footer offset. It also
+asserts `object_size == length` for this producer while stating why the two fields are not
+interchangeable in general. Root lib suite 6434/6434.
+
+**Remaining for this TD:** promoting Layer B itself (footer/RowDirectory/stats/blooms) into
+xCatalog, which is the 3 → 1 collapse, with the in-object self-describing copy retained for DR
+and BYOB (ADR-090) as ADR-094 Decision 4 requires.
+
+=== Not all of Layer B is promotable — the RowDirectory is per-ROW
+
+ADR-094 Decision 4 and this TD both say to promote "ADR-045 **Layer B** — RowDirectory,
+ColumnMeta stats, blooms, SegmentIndex, deletion vector — into xCatalog". That list mixes two
+very different granularities, and one of them cannot go.
+
+`RowDirectory` is `Vec<RowEntry>` with `ROW_ENTRY_SIZE = 32` (`row_dir.rs`): **one 32-byte
+entry per row**. Promoting it would make the catalog grow with *row count* rather than segment
+count — of the order of 32 GB for a billion-row table. xCatalog is a control-plane store; that
+is a data-plane index and it must stay in the object.
+
+The correct split:
+
+[cols="1,2,1", options="header"]
+|===
+| Structure | Granularity | Promote?
+| `ColumnMeta` stats (min/max, null_count, distinct_hint) | per segment × column | **yes**
+| Bloom filters | per segment × column | yes, by reference (size-bounded)
+| `BlockHeader` zone summaries | per block | yes
+| `SegmentIndex` / `BlockFooter` extents | per segment | **yes — this is the one that collapses the chain**
+| Deletion vector (`PDV1`) | per segment, bounded by deletes | by reference
+| **`RowDirectory`** | **per ROW** | **NO — stays in the object**
+|===
+
+**This does not weaken the decision.** The chain is footer → metadata ranges → stripes, and
+what the planner needs in order to skip the first two hops is the *stripe extents and zone
+stats* — `SegmentIndex` + `ColumnMeta`. The `RowDirectory` only serves point lookups *within* a
+block, which happen after that block's bytes have been fetched, so leaving it in the object
+costs the read path nothing. The 3 → 1 collapse (4 → 1 counting the `HEAD`, now removed by
+slice 0) still holds.
+
+What it does change is the **sizing argument**: catalog growth is
+`O(segments × columns)`, not `O(rows)`. That is the number any design review should be given,
+and the decision's own wording currently implies the latter.
+
+== Two findings that reshape the remaining work (2026-09-26)
+
+=== 1. The instrumentation under-reports depth by TWO operations, not one
+
+`RangedSegmentReader::open` is documented as "(HEAD for size, suffix GET to locate the
+index)", and `open_inner` confirms it: `vector_segment_size` (a **HEAD**) → index-locate suffix
+GET → footer/metadata ranged reads → surviving stripes.
+
+`RangedSegmentSnapshot::range_gets` — the natural counter to reach for — states outright that
+it *"excludes the one-time index-locate suffix read performed before the reader is
+constructed"*, and it never sees the HEAD either.
+
+So a baseline built on `range_gets` understates the chain by **two** round trips. The earlier
+note in this TD said one; it is two. Any measurement for this work must count the HEAD and the
+index-locate read explicitly, or the improvement will be reported as smaller than it is.
+
+=== 2. The caches already exist — and one caller uses them
+
+`FooterCache` and `SegmentIndexCache` exist, and `RangedSegmentReader::open_with_cache` already
+collapses the chain: "a cached segment index skips the tail suffix GET, and cached per-block
+layouts skip the footer/metadata ranged reads."
+
+**Exactly one caller uses it:** `src/services/record_store.rs` (the vector record-store read
+path). `PaxSplitReader::load_ranged` — the DataFusion lane, and the path slice 0 just
+optimised — does not use `RangedSegmentReader` at all. It issues its own
+`metadata` → header-prefix → footer → stripes sequence through `filesystem_factory`, with **no
+footer or index cache**, re-paying the full chain on every read.
+
+This is the same shape as slice 0, where the object size was already known and thrown away: the
+mechanism exists and is not wired.
+
+==== Consequent re-ordering
+
+**Before** building catalog-resident Layer B — a new per-segment catalog entity, a write path,
+a planner read path, a rebuild path, and an invalidation story — wire the **existing** caches
+into the DataFusion lane. It is a fraction of the work and attacks the same dominant term.
+
+That also sharpens what the catalog promotion is actually *for*. It is not "collapse a chain
+that nothing collapses today". With caches wired, the remaining gaps are the ones a per-process
+cache cannot close:
+
+* **cold start** — a fresh process pays full depth until the cache warms;
+* **sharing** — every node warms its own cache independently;
+* **planning** — a read-side cache accelerates a decided plan; it cannot let the *planner*
+  prune before choosing one, which is what "catalog-resident" buys.
+
+Those are real and worth the architecture, but they are a smaller, sharper claim than 4 → 1,
+and the sizing argument (`O(segments × columns)`, per the RowDirectory correction above) should
+be made against *that* claim.
+
+==== Revised sequence
+
+. **Slice 0 (landed)** — object size in `FileSplit`; HEAD removed. 4 → 3.
+. **Slice 1 (new, cheap)** — wire `FooterCache`/`SegmentIndexCache` into `PaxSplitReader`.
+  Closes the warm-path gap with existing machinery.
+. **Slice 2** — measure cold vs warm depth with the HEAD and index-locate read counted, and
+  record the baseline in `BENCHMARK_EVIDENCE.toml`.
+. **Slice 3** — catalog-resident Layer B, justified on cold-start, cross-node sharing, and
+  planner-time pruning rather than on a depth number a cache already achieves.
+
+=== Slice 1 as landed (2026-09-27) — the DataFusion lane uses the existing cache
+
+`PaxSplitReader::load_ranged` now consults the global `SegmentIndexCache` before acquiring a
+segment index, and populates it on a miss. A warm read skips the index acquisition entirely —
+the v4 header-prefix + footer reads, or the legacy PAXZ tail probe.
+
+Nothing new was built: the cache, the key type (`CacheKey`/`CacheKind::SegmentIndex`) and the
+stored type (`SegmentIndex`) all already existed and served exactly one caller. This is the
+same shape as slice 0, where the object size was already known and discarded.
+
+**Keyed on path alone, deliberately.** A PAX segment is immutable once written — flush and
+compaction emit fresh names rather than overwriting — so a path never denotes different bytes.
+(The tenant is already in the path via `DrPathBuilder`; the tenant component of the cache key
+is for the cache's own per-tenant fair-share accounting, not for isolation.)
+
+**Inert when the caches are not initialised.** `segment_index_cache()` returns `None` before
+`init_segment_caches`, and every use is behind `if let Some(..)`, so embedded and test
+configurations behave exactly as before.
+
+==== A gap the test caught, worth recording
+
+The first implementation populated the cache **only on the v4 coalesced branch**. The legacy
+PAXZ tail-probe path — which every pre-v4 segment takes, and which the test fixture produces —
+never inserted, so warm and cold reads were identical (`range_gets` 203 vs 203).
+
+That path is the *more* expensive one to repeat: the probe grows ×4 on a short suffix, so a
+miss can cost several dependent reads rather than one. Both paths now populate the cache.
+
+The reason this surfaced is that the test asserts the **observable effect** (`range_gets` warm
+< cold) rather than the mechanism. A test asserting "the cache contains the key" after a v4
+read would have passed while the common path stayed uncached — the same lesson as TD-USUB-6's
+props projection, where the assertion had to run through SQL rather than the block layer.
+
+**Evidence:** `warm_read_skips_the_index_fetch` (warm `range_gets` strictly < cold) and
+`cached_index_returns_identical_rows` (a cached index must not change results). Root lib suite
+6436/6436.
+
+=== Slice 2 as landed (2026-09-27) — the depth is measured, and the number is a ratchet
+
+Artifact: `docs/_internal/status/PAX_DATAFUSION_READ_DEPTH_2026_09_27.adoc`. Ledger claim:
+`pax_datafusion_read_depth_index_acquisition` (**measured**).
+
+[cols="1,1,1", options="header"]
+|===
+| | `range_gets` | Index acquisition (dependent)
+| Cold read | 203 | **3**
+| Warm read | 200 | **0**
+|===
+
+**The claim is: index-acquisition round trips on the critical path 3 → 0.** For this v2 fixture
+the 3 are the header-prefix read plus two tail-probe iterations; they are strictly serial and
+nothing can be fetched until they finish. The residual 200 are per-surviving-block stripe
+fetches, which depend on the index but **not on each other** — WIDTH, addressed by range
+coalescing, not depth.
+
+`warm_read_skips_the_index_fetch` was tightened from `warm < cold` to `cold - warm == 3`, so a
+regression in the acquisition path fails rather than degrading quietly. ADR-033 ranks depth the
+dominant term; if the path legitimately changes, **re-derive** the constant from the call sites
+rather than adjusting it to whatever the run produced.
+
+==== Two things this measurement is deliberately not
+
+**Not a percentage.** 3 of 203 is ~1.5%, and quoting that would mislead in both directions: it
+understates the latency effect (the 3 are serial, the 200 parallelisable) and the ratio is an
+artifact of this fixture's 200 blocks — a 10-block segment shows 3 of 13 for the identical
+saving. Depth is the quantity; total request count is not.
+
+**Not a generalisation about `range_gets`.** It happens to be a *complete* depth count on this
+lane — but the reason is that **no operation on the lane is a HEAD once `object_size` is
+present**, not that the call sites are few. `load_ranged`'s own body has four (the `metadata`
+HEAD, now a fallback per slice 0, plus three `read_range` calls); it then delegates to
+`load_ranged_with_index`, which issues the per-block footer/metadata reads and the batched
+stripe fetch. All of those are `read_range`/`read_ranges` and therefore counted. Skipping the
+HEAD in slice 0 is what closed the gap — and a split arriving without `object_size` reopens it.
+That property does **not** hold elsewhere: `RangedSegmentReader` still pays a HEAD
+(`vector_segment_size`), and its own `SegmentReadStats` doc states it *"excludes the one-time
+index-locate suffix read"* — so **that struct** cannot attribute depth, and any measurement
+taken from it must count those operations explicitly.
+
+Note this is a statement about `SegmentReadStats`, **not** about what reaches `io_trace` on that
+lane. An earlier draft of TD-USUB-12 claimed those reads were unmetered; they are not — the
+object-store recorder hook counts them, and the reader's manual forward then double-counts the
+body reads. TD-USUB-12 carries the correction and the reachability analysis.
+
+==== What this leaves for slice 3
+
+A cache is per-process and every node warms independently, so a cold process still pays the 3.
+That — cold start, cross-node sharing, and planner-time pruning a read-side cache cannot
+provide — is the surviving case for catalog-resident Layer B, and it is the claim slice 3 must
+be argued against. Not "4 → 1", which a cache has now largely delivered on the warm path.

@@ -1,0 +1,1 @@
+"use strict";(globalThis.webpackChunk_mlflow_mlflow=globalThis.webpackChunk_mlflow_mlflow||[]).push([[817],{817(l,e,t){t.r(e),t.d(e,{default:()=>n});var o=t(51477),s=t(39521),u=t(19740),c=t(76887);const n=()=>{const l=(0,s.Zp)();return(0,o.useEffect)(()=>{l(u.Ay.getSettingsSectionRoute(c.Nr),{replace:!0})},[l]),null}}}]);

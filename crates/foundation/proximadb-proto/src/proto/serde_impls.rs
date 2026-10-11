@@ -6,6 +6,13 @@ use crate::proto::proximadb_v1::{SqlValue, sql_value::Value as SqlValueVariant};
 use crate::utils::encoding::{base64_decode, base64_encode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// A genuine JSONB payload is valid canonical MessagePack by construction —
+/// used to gate the `{"jsonb_value": <base64>}` tagged form against generic
+/// single-key objects whose string merely happens to be base64-decodable.
+fn valid_jsonb_bytes(bytes: &[u8]) -> bool {
+    rmp_serde::from_slice::<serde_json::Value>(bytes).is_ok()
+}
+
 // ============================================================================
 // QuantizationConfig - SDK Compatibility Shim
 // ============================================================================
@@ -206,6 +213,9 @@ impl Serialize for SqlValue {
             Some(SqlValueVariant::ObjectValue(v)) => {
                 map.serialize_entry("object_value", v)?;
             }
+            Some(SqlValueVariant::JsonbValue(v)) => {
+                map.serialize_entry("jsonb_value", &base64_encode(v))?;
+            }
             None => {
                 map.serialize_entry("null_value", &serde_json::Value::Null)?;
             }
@@ -282,6 +292,28 @@ impl<'de> Deserialize<'de> for SqlValue {
                     let bytes = base64_decode(s).map_err(serde::de::Error::custom)?;
                     return Ok(SqlValue {
                         value: Some(SqlValueVariant::BytesValue(bytes)),
+                    });
+                }
+                if obj.len() == 1
+                    && let Some(v) = obj.get("jsonb_value")
+                    && let Some(s) = v.as_str()
+                    && let Ok(bytes) = base64_decode(s)
+                    // Round-trip gate: a genuine JSONB payload is valid
+                    // MessagePack by construction. A generic object whose
+                    // literal key happens to be "jsonb_value" with an
+                    // arbitrary base64-ish string usually is not, and falls
+                    // through to ObjectValue instead of being reshaped.
+                    && valid_jsonb_bytes(&bytes)
+                {
+                    // The tagged form commits only for a SINGLE-KEY object
+                    // whose value decodes to valid JSONB bytes: sibling keys
+                    // must never be silently dropped, and a generic object
+                    // that merely contains a "jsonb_value" key falls through
+                    // to the generic-object handling below instead of 422-ing
+                    // or being reshaped. (Residual ambiguity mirrors the
+                    // pre-existing bytes_value tagged form.)
+                    return Ok(SqlValue {
+                        value: Some(SqlValueVariant::JsonbValue(bytes)),
                     });
                 }
                 if obj.contains_key("null_value") {

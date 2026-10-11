@@ -463,6 +463,7 @@ mod tests {
             id: id.to_string(),
             config: Some(CollectionConfig {
                 name: name.to_string(),
+                embedding_config: None,
                 dimension: 128,
                 distance_metric: Some(DistanceMetric::Cosine as i32),
                 storage_engine: Some(StorageEngine::Viper as i32),

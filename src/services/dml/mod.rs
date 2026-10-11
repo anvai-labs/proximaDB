@@ -86,6 +86,29 @@ use crate::storage::trait_components::path_resolver::DrPathBuilder;
 use proximadb_catalog::TableIdentifier;
 use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
 
+/// Count of Iceberg snapshot publishes that failed during `ALTER TABLE …
+/// MATERIALIZE` (TD-USUB-9).
+///
+/// This exists so an interop publish failure is **alertable** rather than living
+/// only in a log line. The publish is deliberately non-fatal — the Parquet data
+/// and catalog layout are correct without it — so a counter is the signal that
+/// tells an operator the Iceberg manifests have drifted from the published data.
+///
+/// Registered lazily and tolerantly, exactly like the relational memtable gauge:
+/// observability must never take down a write path, so a construction error
+/// yields `None` and a duplicate registration leaves a working-but-unexported
+/// counter. No `.expect()` — this is `src/` production code (mandate #4).
+static ICEBERG_PUBLISH_FAILURES: std::sync::LazyLock<Option<prometheus::IntCounter>> =
+    std::sync::LazyLock::new(|| {
+        let counter = prometheus::IntCounter::new(
+            "proximadb_warehouse_iceberg_publish_failures_total",
+            "Iceberg snapshot publishes that failed during warehouse materialization",
+        )
+        .ok()?;
+        let _ = prometheus::register(Box::new(counter.clone()));
+        Some(counter)
+    });
+
 /// Placeholder tenant used by warehouse materialization when no `TenantContext`
 /// reaches it. This path does NOT yet enforce tenant isolation (see the note in
 /// [`DmlService::materialize_table_to_parquet`]); the placeholder is named and
@@ -228,7 +251,7 @@ pub(crate) fn publish_ndv_statistics(
     schema: &CatalogTableSchema,
     records: &[ProximaRecord],
 ) {
-    use proximadb_search_types::sql_value_filter::proxima_value_to_json;
+    use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
 
     let mut summary = crate::core::statistics::StatisticsSummary::new(table_name);
     summary.set_record_count(records.len() as u64);
@@ -251,13 +274,42 @@ pub(crate) fn publish_ndv_statistics(
             // Same leaf extraction as `cluster_sort_key`: NULL/absent/object
             // nodes observe as `None` (counted in the null rate, not the HLL).
             let json_val = rec.props.get(*name).and_then(|node| match node {
-                ProximaTreeNode::Value(v) => Some(proxima_value_to_json(v)),
+                ProximaTreeNode::Value(v) => Some(proxima_value_to_filter_literal(v)),
                 _ => None,
             });
             summary.observe_field(name, ty, json_val.as_ref());
         }
     }
     crate::core::statistics::statistics_registry().put(summary);
+}
+
+/// TD-USUB-4: merge `incoming` into `existing` by layout `name`, rather than
+/// replacing the whole list.
+///
+/// `MATERIALIZE` published with `set_storage_layouts(&id, vec![layout])`, which
+/// **discards every other layout a table had**. A table could therefore hold exactly
+/// one physical representation, which makes cost-based routing across representations
+/// *inexpressible* — the router cannot choose between alternatives the catalog has no
+/// way to record (ADR-094 Decision 2).
+///
+/// `CatalogStorageLayout::name` is documented as the stable layout identifier, so it
+/// is the upsert key: re-publishing the same layout replaces it in place (no
+/// duplicates on repeat `MATERIALIZE`), while a layout of a different name is
+/// preserved.
+///
+/// Order is stable — the replaced layout keeps its original position, and a genuinely
+/// new one is appended — so a reader that treats the first match as the default sees
+/// no reordering churn across republications.
+pub(crate) fn upsert_storage_layout(
+    mut existing: Vec<CatalogStorageLayout>,
+    incoming: CatalogStorageLayout,
+) -> Vec<CatalogStorageLayout> {
+    if let Some(slot) = existing.iter_mut().find(|l| l.name == incoming.name) {
+        *slot = incoming;
+    } else {
+        existing.push(incoming);
+    }
+    existing
 }
 
 pub(crate) fn resolve_materialize_prefix(
@@ -900,6 +952,54 @@ impl crate::query::execution::olap_delta_merge::OlapDeltaSource for DmlService {
             }
         }
         Ok((schema, records))
+    }
+}
+
+/// TD-USUB-2: native relational rows for DataFusion registration.
+///
+/// Rows come from [`DmlService::scan_table_relational`], which resolves the ABAC row
+/// filter itself — a `Denied` subject yields zero rows, `Restricted(p)` applies the
+/// predicate, and an identity/storage tenant mismatch errors. So the rows returned here
+/// are already governed; registering them adds no enforcement bypass.
+#[async_trait::async_trait]
+impl crate::query::execution::native_table_provider::NativeTableSource for DmlService {
+    async fn full_table_records(
+        &self,
+        table: &str,
+        tenant: Option<&str>,
+        identity: PortIdentity<'_>,
+        row_cap: usize,
+    ) -> anyhow::Result<Option<(CatalogTableSchema, Vec<ProximaRecord>)>> {
+        let tenant_ctx = tenant.map(TenantContext::for_tenant_id);
+        // Fetch one MORE than the cap so an over-cap table is detected exactly rather
+        // than silently truncated — a truncated scan is a wrong answer, which is
+        // strictly worse than declining (mandate #1: fail closed, never silently wrong).
+        let (schema, rows) = self
+            .scan_table_relational(
+                table,
+                None,
+                None,
+                Some(row_cap.saturating_add(1)),
+                tenant_ctx.as_ref(),
+                identity,
+            )
+            .await?;
+        if rows.len() > row_cap {
+            tracing::debug!(
+                target: "proximadb::compute_route",
+                table,
+                row_cap,
+                "native table exceeds the registration row cap; declining to register"
+            );
+            return Ok(None);
+        }
+        let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let records: Vec<ProximaRecord> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| Self::value_row_to_relational_record(&i.to_string(), &col_names, row))
+            .collect();
+        Ok(Some((schema, records)))
     }
 }
 
@@ -2049,7 +2149,22 @@ impl DmlService {
             )]),
             ..Default::default()
         };
-        catalog.set_storage_layouts(&table_id, vec![layout]).await?;
+        // TD-USUB-4: additive publication. Read the table's current layouts and upsert
+        // this one by name, instead of replacing the list. Passing `vec![layout]` here
+        // dropped every other representation the table had, which is what made
+        // cost-based routing across representations inexpressible (ADR-094 Decision 2).
+        //
+        // Read fresh from the catalog rather than reusing the pre-write `schema`, so a
+        // layout added between the snapshot scan and here is not lost. A failed read
+        // degrades to "no existing layouts" — the pre-TD-USUB-4 behaviour — rather than
+        // failing the materialize.
+        let existing_layouts = catalog
+            .get_table(&table_id)
+            .await
+            .map(|s| s.storage_layouts)
+            .unwrap_or_default();
+        let layouts = upsert_storage_layout(existing_layouts, layout);
+        catalog.set_storage_layouts(&table_id, layouts).await?;
 
         // 5b. TD-OLAP-2 (A2): publish per-column NDV sketches (HLL) from the
         //     just-written records to the ADR-037 resident statistics registry,
@@ -2103,10 +2218,33 @@ impl DmlService {
             )
             .await
         {
-            tracing::warn!(
+            // TD-USUB-9: this failure used to exist ONLY as a `warn!` line, so a
+            // MATERIALIZE that returned success could leave the Iceberg manifest
+            // absent or stale with nothing to alert on — an external reader
+            // (Spark/Trino) would see no table while ProximaDB reported OK.
+            //
+            // It is deliberately still NOT fatal, and that is the right call: the
+            // Parquet data IS published and the catalog layout IS correct, so
+            // ProximaDB-side reads are complete. Failing the whole statement would
+            // turn a transient interop write error into a failed publish whose
+            // O(table) rewrite the user must repeat, on top of state already
+            // committed. The catalog also does not claim Iceberg — the layout is
+            // `parquet-snapshot` / `CatalogPhysicalFormat::Parquet` — so nothing
+            // advertises a manifest that isn't there.
+            //
+            // What was wrong was the SILENCE. Make it countable so it can be
+            // alerted on, and log at error level so it is not lost in warn noise.
+            if let Some(counter) = ICEBERG_PUBLISH_FAILURES.as_ref() {
+                counter.inc();
+            }
+            tracing::error!(
                 target: "proximadb::warehouse::iceberg",
                 table = %table_name,
-                "Iceberg snapshot publish failed (non-fatal, interop only): {e}"
+                location = %location,
+                "Iceberg snapshot publish FAILED — parquet data and catalog layout are \
+                 published and ProximaDB reads are correct, but the Iceberg manifest at \
+                 this location is now absent or stale, so external Iceberg readers will \
+                 not see this materialization: {e}"
             );
         }
 
@@ -5986,29 +6124,50 @@ impl DmlService {
         }
     }
 
-    /// Convert SqlValueLiteral to vector
+    /// Convert SqlValueLiteral to vector — the ONE non-finite policy:
+    /// every query boundary rejects inf/NaN literals, so persisting one
+    /// here writes a poison row no query can ever express.
     fn literal_to_vector(&self, val: &SqlValueLiteral) -> Result<Vec<f32>> {
+        let ensure_finite = |f: f32| {
+            if f.is_finite() {
+                Ok(f)
+            } else {
+                Err(anyhow!("vector elements must be finite"))
+            }
+        };
         match val {
-            SqlValueLiteral::Array(arr) => arr
-                .iter()
-                .map(|v| match v {
-                    SqlValueLiteral::Float(f) => Ok(*f as f32),
-                    SqlValueLiteral::Integer(i) => Ok(*i as f32),
-                    _ => Err(anyhow!("Vector elements must be numeric")),
-                })
-                .collect(),
-            SqlValueLiteral::String(value) => value
-                .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .split(',')
-                .filter(|part| !part.trim().is_empty())
-                .map(|part| {
-                    part.trim()
-                        .parse::<f32>()
-                        .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))
-                })
-                .collect(),
+            SqlValueLiteral::Array(arr) => {
+                // NOTE: empty vectors are permitted on the WRITE path (a
+                // schema DEFAULT '[]' is legal config; every QUERY boundary
+                // rejects empty — the asymmetry is deliberate, develop-
+                // compatible, and avoids breaking whole tables).
+                arr.iter()
+                    .map(|v| match v {
+                        SqlValueLiteral::Float(f) => ensure_finite(*f as f32),
+                        SqlValueLiteral::Integer(i) => ensure_finite(*i as f32),
+                        _ => Err(anyhow!("Vector elements must be numeric")),
+                    })
+                    .collect()
+            }
+            SqlValueLiteral::String(value) => {
+                // Lazy iterator (an intermediate Vec cost ~36KB per
+                // 1536-dim row on the INSERT coercion path); emptiness is
+                // checked on the RESULT.
+                value
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .filter(|part| !part.trim().is_empty())
+                    .map(|part| {
+                        let f = part
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|e| anyhow!("Invalid vector element '{}': {}", part, e))?;
+                        ensure_finite(f)
+                    })
+                    .collect()
+            }
             _ => Err(anyhow!("Vector column expects array value")),
         }
     }

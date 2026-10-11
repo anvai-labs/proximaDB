@@ -61,7 +61,7 @@ unaffected — it fires based on file count, not training status.
 
 == Related
 
-link:ADR-076-async-compaction-admission-control.adoc[ADR-076],
+link:../../12-design/adr/ADR-076-async-compaction-admission-control.adoc[ADR-076],
 link:TD-COMPACT-5-training-compaction-trigger.adoc[TD-COMPACT-5],
 link:TD-COMPACT-6-async-compaction.adoc[TD-COMPACT-6],
 link:TD-COMPACT-7-l0-admission-control-watermarks.adoc[TD-COMPACT-7].

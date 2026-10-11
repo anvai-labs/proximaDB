@@ -1,0 +1,72 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-7: Block layout is a static per-block mode — adopt per-column adaptive structural encoding
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-09-21 under ADR-094 Phase 3.
+| Priority | MEDIUM — targets the random-access path where ADR-033 measured the custom format's ~100× advantage.
+| Component | `crates/storage/proximadb-block-format/src/{header,stripe,writer,reader,coalesced_rabitq,coalesced_sq8}.rs`
+| Relates to | ADR-094 (spec §2.2), ADR-062 (coalesced RaBitQ — the ad-hoc form this generalizes), ADR-026 (recall ratchet), Lance 2.1 structural encodings
+| Blocked by | TD-USUB-6 (shares the PAX v3 version byte).
+|===
+
+== The finding
+
+Two layout decisions are made at the wrong granularity:
+
+* **`BlockMode { Oltp, Olap, Pax }`** (`header.rs`) is a **static, per-block** choice. One
+  block serves either row-wise access or columnar scan well, chosen once at write time for
+  *all* columns in it.
+* **`encoding_id`** is a single byte per column (`stripe.rs`, `ColumnMeta[6]`) conflating
+  *how values are compressed* with *how values are laid out for access*.
+
+Meanwhile the vector path has grown hand-tuned special cases — `coalesced_rabitq.rs`,
+`coalesced_sq8.rs` — that are, in effect, a bespoke random-access layout for one column type.
+They work (ADR-062 measured recall@10 0.990 at 36 GETs/query on SIFT1M), but they are a point
+solution rather than a rule.
+
+== The change
+
+Adopt the Lance 2.1 separation: **structural** encoding (nesting, repetition, validity →
+buffers) is chosen independently of **compressive** encoding (bitpacking, dictionary, FSST,
+zstd). Structure is then selected **per column, by value width**:
+
+[cols="1,1,3", options="header"]
+|===
+| Value width | Structure | Effect
+| ≥ 128 B | **full-zip** | Control word + optional length + value data zipped row-major. 1 IOP random access for fixed-width, 2 for variable. Repetition index kept separate.
+| < 128 B | **mini-block** | 4–8 KiB chunks with a small header; decode cost amortized across ≥32 values.
+|===
+
+A 768-dimension `f32` embedding is ~3 KB, so it lands in full-zip: **a 1-IOP random vector
+fetch**, which is exactly the ANN rerank access pattern the coalesced codecs hand-built. The
+reported effect on the search cache is large — Parquet's ~20 GiB per billion-row vector
+column versus ~1.28 GiB — because large values no longer force one page per value.
+
+`BlockMode` is retained in the header for v2 compatibility but becomes **advisory** in v3;
+the per-column structure marker in `ColumnMeta` is authoritative.
+
+*Composability reference:* Vortex's layout tree (Struct → Zoned → Chunked → Compressor →
+Buffered → Flat) is the model for treating layout as composable rather than as a fixed file
+shape. This TD adopts the *principle* (structure is a per-column, composable decision), not
+Vortex's tree wholesale.
+
+== Constraints
+
+* **ADR-062 D1 one-object atomicity** — no sidecar. This is an in-object layout change only.
+* **ADR-045 Layer-A co-location** of filter + vector stripes is inviolable and unaffected.
+* Mixed-read-safe: v2 blocks keep decoding; readers dispatch on the version byte.
+* Existing coalesced RaBitQ/SQ8 paths must be expressible as a *case* of the general rule
+  before they are retired — do not remove a measured, default-ON path in the same change that
+  introduces its replacement.
+
+== Evidence gate (mandate #6)
+
+* **IOPs per random vector fetch measured** via `io_trace` `range_gets` — target 1 for
+  full-zip fixed-width; compared against today's coalesced path.
+* Scan throughput not regressed on the relational/columnar shapes.
+* Recall ratchet (recall@10 ≥ 0.93) green; SIFT1M numbers at or above ADR-062's published
+  0.990 recall / 36 GETs.
+* Search-cache residency measured, since that is the claimed structural win.

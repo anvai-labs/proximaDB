@@ -308,11 +308,19 @@ impl ExecutionPlanner {
     }
 
     fn parse_vector_literal(&self, s: &str) -> Result<Vec<f32>> {
-        // Basic parser for "[0.1, 0.2, ...]"
+        // Basic parser for "[0.1, 0.2, ...]" — non-finite components
+        // reject (the ONE filtered policy; an inf/NaN here reaches the
+        // distance kernels).
         let trimmed = s.trim_matches(|c| c == '[' || c == ']' || c == ' ');
         trimmed
             .split(',')
-            .map(|v| v.trim().parse::<f32>().map_err(|e| anyhow!(e)))
+            .map(|v| {
+                let f = v.trim().parse::<f32>().map_err(|e| anyhow!(e))?;
+                if !f.is_finite() {
+                    return Err(anyhow!("query vector components must be finite"));
+                }
+                Ok(f)
+            })
             .collect()
     }
 

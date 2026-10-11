@@ -1,0 +1,76 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SSTCLEAN-1: DROP COLLECTION's SST cleanup lists the filesystem ROOT and deletes by basename
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-06, found by adversarial review of TD-ENCFS-1 — encryption was accidentally MASKING this, because the `.enc` suffix made the extension filter match nothing.
+| Priority | **Needs triage, potentially HIGH.** Two outcomes are possible depending on how `delete(basename)` resolves, and which one occurs has not been established. See "What is not yet known".
+| Component | `src/storage/engines/sst/collections.rs` (`cleanup_collection_files`), called from `src/storage/engine.rs:~1146`
+| Relates to | TD-ENCFS-1 (which unmasks this), mandate #1
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`cleanup_collection_files(collection_id)` runs on DROP COLLECTION. It:
+
+1. resolves the collection's storage URL and then **discards it** — `let _storage_url = self.get_collection_storage_url(collection_id).await?;`
+2. lists `"/"`, not the collection's prefix
+3. deletes every entry whose name ends in `.sst`, `.bloom`, `.meta` or `.idx`
+
+The filesystem it lists is **not** collection-scoped. `src/storage/engines/sst/core.rs:490-496`
+builds it as `UnifiedCachingFilesystem::new(filesystem.get_filesystem("file://"), String::new(),
+"sst")` — the comment says "Empty collection_id for singleton" — and
+`UnifiedCachingFilesystem::list` delegates straight to the underlying filesystem. So `list("/")`
+enumerates the filesystem root, which spans every collection.
+
+The `collection_id` argument is therefore used for **nothing** but a log line.
+
+== What is not yet known, and must be settled before fixing
+
+The delete uses `entry.name` — a bare **basename** — not `entry.url`:
+
+[source,rust]
+----
+match unified_fs.delete(&entry.name).await {
+----
+
+Two outcomes follow, and this TD deliberately does not assert which:
+
+* **(a) The basename does not resolve** ⇒ every delete fails, the `error_count` branch logs, and
+  cleanup is a silent no-op. Consequence: dropped collections leak their SST/bloom/meta/idx files
+  forever. Bad, not destructive.
+* **(b) The basename resolves** (e.g. relative to a root the local filesystem anchors, or a flat
+  object-store key space) ⇒ dropping ONE collection deletes the SST-family files of EVERY
+  collection visible from the root. Data destruction on a routine DDL operation.
+
+Settle it by test before changing behaviour: create two collections, write SSTs to both, drop one,
+and assert the other's files survive. That test is worth having regardless of which branch is true,
+because it pins the property the function is supposed to have.
+
+== Why encryption was hiding it
+
+Under configured encryption the objects are written as `….sst.enc`, so the extension filter matched
+nothing and the loop deleted nothing — outcome (a) by accident. TD-ENCFS-1 makes `list` transparent,
+so the filter starts matching and whichever outcome is real becomes reachable on encrypted
+deployments too. That is not a regression introduced by TD-ENCFS-1; it removes a mask.
+
+== How to apply
+
+1. Scope the listing to the collection: use the `storage_url` that is currently discarded, and list
+   that prefix rather than `"/"`.
+2. Delete by `entry.url`, not `entry.name`, so the path is the one the listing actually denotes
+   (the same lesson as TD-USUB-1's segment discovery: a basename is not a locator).
+3. Add the two-collection isolation test above.
+4. While there: `list` failure currently returns `Ok(())` with a `warn!` ("Don't fail cleanup"), so a
+   transport error is indistinguishable from "nothing to clean". Decide deliberately whether that is
+   fail-open on purpose and say so, per mandate #1.
+
+== Adjacent, same review, same mandate
+
+`src/storage/persistence/write_ahead_log/manifest/service.rs:~363` and `~880` wrap `list` in
+`.unwrap_or_default()`, so a list ERROR is indistinguishable from an empty prefix and recovery logs
+"No existing manifest segments found, starting fresh". Fail-open on a recovery path; worth the same
+deliberate decision.

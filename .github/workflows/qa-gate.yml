@@ -41,7 +41,8 @@ permissions:
   contents: read
 
 jobs:
-  # Enforce the promotion path: main may only be promoted FROM qa.
+  # Defense in depth for the main promotion path. The trusted metadata-only
+  # branch-route-guard workflow enforces all develop/qa/main PR routes.
   promotion-source-guard:
     name: Promotion Source Guard (main <- qa only)
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
@@ -254,10 +255,26 @@ jobs:
           PROXIMADB_SIFT_QUERIES: "1000"
           PROXIMADB_RECALL_DATASET_REQUIRED: "1"
           PROXIMADB_SIFT_CENTROID_MAX_RECALL_DROP: "0"
-        run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --nocapture
+        # --test-threads=1 here is DEFENCE-IN-DEPTH, not a fix: this repo already
+        # serialises libtest via `.cargo/config.toml` `[env] RUST_TEST_THREADS =
+        # "1"` (that file's own `test-parallel` alias exists to override it), so
+        # this job has always run one test at a time. An earlier revision of this
+        # comment claimed the arms "had been running in parallel" and that the
+        # flag was load-bearing; both were false -- and the reference table is
+        # positive evidence against the race, since [baseline] and [rg_layout]
+        # set the same process-global gate and produced two DIFFERENT geometries
+        # from one run, which a racing run would almost certainly not have done
+        # (each arm writes 100k vectors across five flushes, so concurrent starts
+        # would have both flushing under whichever value was current).
+        #
+        # The flag is kept because cargo's `[env]` without `force = true` does
+        # NOT override an externally exported RUST_TEST_THREADS, so a runner or
+        # wrapper that exports it would reintroduce parallelism -- and the three
+        # arms in this file do share process-global PAX gates with no mutex.
+        run: cargo test --release --features io-trace --test sift_pax_recall_ratchet_test -- --test-threads=1 --nocapture
 
   # Validate the object-store access-tier cost lever (TD-168/TD-173) against REAL
-  # cloud APIs via emulators — Azurite (Azure), MinIO (S3), fake-gcs (GCP) — the
+  # cloud APIs via emulators — Azurite (Azure), LocalStack (S3), fake-gcs (GCP) — the
   # "develop→qa upfront validation" for the cold-payload tier. The default CI only
   # exercises put_with_tier on memory:// (where the tier degrades to a plain put),
   # so a native-class mapping regression that a real cloud API would 4xx is
@@ -269,16 +286,35 @@ jobs:
   # store (Azure then S3, Azurite stopped before the S3 group so cross-store
   # leakage fails loudly) + the cold recall ratchet on Azure. One cloud-full
   # server build (jobs=1, 16GB OOM ceiling) — separate runner from the
-  # cloud-emulator job so neither compile budget starves the other. The 90m cap
-  # is a measured ratchet: record the first cold-cache wall time in
+  # cloud-emulator job so neither compile budget starves the other.
+  #
+  # Every step in this scope links the `proximadb` lib compiled WITHOUT
+  # cfg(test), so they genuinely share one build. The MLflow seam test used to
+  # live here and did NOT share: `--lib` builds the lib-test target (cfg(test)
+  # over ~779k LOC, ~7,100 inline tests), a second near-cliff codegen peak that
+  # got this job evicted mid-compile at 76 of 90 minutes, twice in a row. It now
+  # has its own job below. CARGO_PROFILE_TEST_DEBUG=0 drops debug info, which is
+  # the other dominant term in rustc peak memory and link time here.
+  #
+  # The 90m cap is a measured ratchet: record the first cold-cache wall time in
   # TD-OBJSTORE-5 and tighten.
   objstore-restart-qa-tier:
     name: Object-store QA tier (restart Azure+S3 + recall)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 90 was at the edge: the `--restart` job measured cold compiles of these
+    # cloud feature sets at ~85-90 min and was bumped 90 -> 150 for that reason.
+    # Splitting the lib-test out removes one full codegen peak, so this needs
+    # less than 150 -- but not 90. Record the post-split wall time in
+    # TD-OBJSTORE-5 and tighten to a measured ratchet.
+    timeout-minutes: 120
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
+      # Debug info dominates rustc peak memory and link time on this crate, and
+      # nothing here reads a backtrace symbol. This is a memory lever, not a
+      # speed one -- the failure mode being avoided is runner eviction.
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
       - name: Reclaim disk space
         run: |
@@ -290,6 +326,22 @@ jobs:
             /usr/local/.ghcup \
             /usr/local/share/boost || true
           echo "Disk after reclaim:"; df -h /
+      # ubuntu-latest ships with NO swap, so a residual peak above 16GB does not
+      # slow down -- it OOM-kills the runner mid-compile. That is precisely what
+      # happened here: evicted at ~60 and 76 min with
+      # "runner has received a shutdown signal", warnings still streaming, test
+      # never run. 12G on the big ephemeral /mnt disk turns the spike into a
+      # slowdown instead of a dead runner. This mirrors the `--restart` job in
+      # ci.yml and the unit-matrix job, where the same mitigation is what makes a
+      # structurally identical build survive. CARGO_BUILD_JOBS stays 1 -- the
+      # established OOM-safe setting; raising it would re-risk the kill.
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
       - name: Install system deps
@@ -305,11 +357,107 @@ jobs:
           path: /home/runner/.cache/sccache
           key: sccache-qa-tier-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: sccache-qa-tier-${{ runner.os }}-
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Restart proofs (Azure strict, S3 strict) + recall ratchet (Azure)
         run: bash scripts/run_cloud_emulator_tests.sh --qa
 
+  # TD-MLOPS-4 S1-remainder, split out of the QA tier (TD-OBJSTORE-5). It needs
+  # the `proximadb` lib-test target -- cfg(test) over ~779k LOC and ~7,100 inline
+  # tests, the largest codegen unit in the workspace -- which none of the QA
+  # tier's other steps build. Sharing a runner with them meant two near-cliff
+  # memory peaks in one 16GB job; it was evicted mid-compile twice. Its own
+  # runner gives it one peak. 60m rather than 90m: one build, no restart matrix.
+  mlflow-s3-artifact-seam:
+    name: MLflow S3 artifact seam (LocalStack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - name: Reclaim disk space
+        run: |
+          echo "Disk before reclaim:"; df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/boost || true
+          echo "Disk after reclaim:"; df -h /
+      # ubuntu-latest ships with NO swap, so a residual peak above 16GB does not
+      # slow down -- it OOM-kills the runner mid-compile. That is precisely what
+      # happened here: evicted at ~60 and 76 min with
+      # "runner has received a shutdown signal", warnings still streaming, test
+      # never run. 12G on the big ephemeral /mnt disk turns the spike into a
+      # slowdown instead of a dead runner. This mirrors the `--restart` job in
+      # ci.yml and the unit-matrix job, where the same mitigation is what makes a
+      # structurally identical build survive. CARGO_BUILD_JOBS stays 1 -- the
+      # established OOM-safe setting; raising it would re-risk the kill.
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-mlflow-s3-seam"
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/cache@v6
+        with:
+          path: /home/runner/.cache/sccache
+          key: sccache-mlflow-s3-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: sccache-mlflow-s3-${{ runner.os }}-
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: MLflow S3 artifact seam conformance
+        run: bash scripts/run_cloud_emulator_tests.sh --mlflow-s3
+
   cloud-emulator-object-store:
-    name: Cloud object-store emulators (Azurite/MinIO/fake-gcs)
+    name: Cloud object-store emulators (Azurite/LocalStack/fake-gcs)
     runs-on: ubuntu-latest
     # The --all scope compiles the full main crate under CARGO_BUILD_JOBS=2 (see
     # scripts/run_cloud_emulator_tests.sh) — a middle ground that stays off the 16GB
@@ -356,6 +504,24 @@ jobs:
           sudo mkswap /mnt/swapfile-ci
           sudo swapon /mnt/swapfile-ci
           free -h
+      # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
+      # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
+      # every job on the runner fleet -- so these jobs fail with
+      # "toomanyrequests: You have reached your unauthenticated pull rate limit"
+      # and exit 125 within ~90 seconds, before any compilation, for reasons
+      # entirely unrelated to the change under test. `publish-image.yml` already
+      # authenticates with these same secrets; these jobs simply never did.
+      # TD-CI-6 records the merge-blocking shape of this class: these jobs are in
+      # `ci-success`'s needs, so a rate-limited pull blocks the required check.
+      #
+      # continue-on-error so a fork PR, which cannot read secrets, still falls
+      # back to an anonymous pull rather than failing on the login itself.
+      - name: Log in to Docker Hub (raises the pull rate limit)
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Validate Cool tier against Azure/S3/GCS emulators
         # docker + aws/az CLIs are preinstalled on ubuntu-latest runners.
         run: bash scripts/run_cloud_emulator_tests.sh

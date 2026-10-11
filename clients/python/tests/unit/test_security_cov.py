@@ -7,7 +7,7 @@ matter (refresh backoff sleep is patched away on the retry paths).
 
 import base64
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -109,7 +109,7 @@ def test_token_response_no_expiry():
 
 def test_token_response_is_expired_true():
     tok = OAuth2TokenResponse(access_token="a", expires_in=10)
-    tok.issued_at = datetime.now(timezone.utc) - timedelta(seconds=100)
+    tok.issued_at = datetime.now(UTC) - timedelta(seconds=100)
     assert tok.is_expired is True
 
 
@@ -299,7 +299,7 @@ def test_token_property_auto_refreshes(fake_requests):
     cfg = OAuth2Config(token_url="https://idp/token", client_id="c", auto_refresh=True)
     mgr = OAuth2TokenManager(cfg)
     expired = OAuth2TokenResponse(access_token="OLD", expires_in=10, refresh_token="RT")
-    expired.issued_at = datetime.now(timezone.utc) - timedelta(seconds=100)
+    expired.issued_at = datetime.now(UTC) - timedelta(seconds=100)
     mgr.token = expired
     assert mgr.token.access_token == "FRESH"
 
@@ -547,7 +547,7 @@ def test_audit_event_to_dict_and_json():
     ev = AuditEvent(
         event_id="e1",
         event_type=AuditEventType.SYSTEM,
-        timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        timestamp=datetime(2025, 1, 1, tzinfo=UTC),
         user_id="u",
         tenant_id="t",
         action="act",
@@ -668,7 +668,7 @@ def test_audit_logger_flush_failure_keeps_batch(fake_requests):
         AuditEvent(
             event_id="e",
             event_type=AuditEventType.SYSTEM,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             user_id="u",
             tenant_id=None,
             action="a",

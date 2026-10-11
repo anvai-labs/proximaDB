@@ -1391,6 +1391,7 @@ mod tests {
                 },
                 statistics: Default::default(),
                 locality: Default::default(),
+                object_size: None,
             }],
         );
         let json = serde_json::to_string(&bad).unwrap();

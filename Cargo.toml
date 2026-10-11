@@ -1,6 +1,6 @@
 [package]
 name = "proximadb"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 autobenches = false
 authors = ["Vijaykumar Singh <vijay@anvaiops.com>"]
@@ -173,7 +173,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -280,6 +280,9 @@ rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1.10"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
+# MLflow read endpoints take GET + query-string params (proto HTTP annotation)
+# while writes are POST + JSON — the dual extractor needs urlencoded parsing.
+serde_urlencoded = "0.7"
 # On-demand stack growth for the plan-tree recursions (planner lowering, executor
 # build, native lowering) — grows the stack instead of overflowing on deeply
 # nested plans (TD-EXEC-2 §1.a). Same primitive rustc/Servo use.
@@ -372,7 +375,7 @@ xz2 = "0.1"
 zstd = "0.13"
 
 # Language bindings
-pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }  # abi3 floor = CPython 3.10 (our minimum supported Python); one wheel (cp310-abi3) installs on 3.10+
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }  # abi3 floor = CPython 3.11 (our minimum supported Python); one wheel (cp311-abi3) installs on 3.11+
 numpy = { version = "0.29" }
 
 # TurboQuant numerics (ADR-021, gated by `experimental-turboquant`).
@@ -398,6 +401,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_urlencoded.workspace = true
 
 # Sandhi neutral usage parsers (TD-SANDHI-2 / ADR-0047 D10a): single-sourced, fixture-proven
 # (Sandhi TD-0001 W1) usage/cache-split extraction adopted by the generation LLM path — not a
@@ -552,7 +556,7 @@ proximadb-query-filter = { path = "crates/query/proximadb-query-filter" }
 proximadb-uql = { path = "crates/query/proximadb-uql" }
 proximadb-vector-query = { path = "crates/query/proximadb-vector-query" }
 # Extracted from src/services/catalog_introspection.rs (re-export shim keeps callers stable).
-proximadb-catalog-introspection = { version = "0.2.0", path = "crates/binding/proximadb-catalog-introspection" }
+proximadb-catalog-introspection = { version = "0.4.0", path = "crates/binding/proximadb-catalog-introspection" }
 
 # SQL Parsing
 sqlparser = { version = "0.59", features = ["visitor"] }
@@ -565,6 +569,8 @@ crc32fast = "1.4"  # Used for SST codebook checksum
 
 # System information
 libc = "0.2"
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
 
 # Data structures
 once_cell = "1.19"
@@ -601,6 +607,9 @@ opentelemetry = { version = "0.32", optional = true }
 # feature transitively enables `experimental_async_runtime`.
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "experimental_metrics_periodicreader_with_async_runtime", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "metrics"], optional = true }
+# MLflow UI embedding (TD-MLOPS-3) — optional behind the `mlflow-ui` feature.
+include_dir = { version = "0.7", optional = true }
+mime_guess = { version = "2", optional = true }
 
 # Storage & Memory Management
 memmap2 = "0.9"
@@ -718,7 +727,7 @@ uuid = { version = "1.0", features = ["v4", "serde"] }  # Required for JWT token
 # v10 made the crypto backend a pluggable `CryptoProvider` (like rustls), with NO provider in
 # default features — without one, every sign/verify panics at runtime (crypto/mod.rs:124). Enable
 # `aws_lc_rs` (aws-lc-rs is already in the tree via rustls; `rust_crypto` would pull new rsa/p256/p384).
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }  # JWT token creation and validation
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }  # JWT token creation and validation
 chrono = { version = "0.4.31", features = ["serde"] }  # Updated for Arrow 51 compatibility
 chrono-tz = "0.10"  # Timezone support for log parsing
 hex = "0.4"  # Hex encoding for bytea types
@@ -761,10 +770,10 @@ moka = { version = "0.12", features = ["future"] }
 # Provides direct buffer access to numpy arrays without Python .tolist() conversion
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
-proximadb-raptor-common = { version = "0.2.0", path = "crates/storage/proximadb-raptor-common" }
-proximadb-raptor-engine = { version = "0.2.0", path = "crates/storage/proximadb-raptor-engine" }
-proximadb-engine-core = { version = "0.2.0", path = "crates/storage/proximadb-engine-core" }
-proximadb-mongodb-parser = { version = "0.2.0", path = "crates/binding/proximadb-mongodb-parser" }
+proximadb-raptor-common = { version = "0.4.0", path = "crates/storage/proximadb-raptor-common" }
+proximadb-raptor-engine = { version = "0.4.0", path = "crates/storage/proximadb-raptor-engine" }
+proximadb-engine-core = { version = "0.4.0", path = "crates/storage/proximadb-engine-core" }
+proximadb-mongodb-parser = { version = "0.4.0", path = "crates/binding/proximadb-mongodb-parser" }
 
 # GPU acceleration dependencies (platform-specific)
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -824,6 +833,11 @@ default = ["sql_frontend", "graph-first-sks", "unified-facade-routing", "canonic
 # builds (smaller binary, no AXIS boot/index-build cost); search then routes to the exact-scan
 # path (TD-AXIS-4 Superseded; ADR-052). Pure cfg gate — AXIS lives in the root crate, no dep.
 axis = []
+# MLflow UI serving (TD-MLOPS-3): embeds the vendored stock MLflow web bundle
+# (third_party/mlflow-ui/) into the server binary behind the
+# PROXIMADB_MLFLOW_COMPAT_ENABLE gate. Non-default: keeps the binary lean
+# for deployments that don't use the compatibility surface.
+mlflow-ui = ["dep:include_dir", "dep:mime_guess"]
 # Optional surfaces; keep off by default to minimize binary size and public API surface
 tenant_access = []
 # Experimental storage engines (RAPTOR, SWIFT); disabled by default to prevent
@@ -1102,6 +1116,13 @@ incremental = false
 name = "engine_performance_reporter"
 harness = false
 path = "benches/engine_performance_reporter.rs"
+
+# TD-USUB-6 2b: deterministic byte-count reporter for the residual PROPS tail.
+# Not criterion — the quantity is exact, not sampled.
+[[bench]]
+name = "pax_residual_tail_write_amplification"
+harness = false
+path = "benches/pax_residual_tail_write_amplification.rs"
 
 # Release build profile optimized for production
 [profile.release-server]

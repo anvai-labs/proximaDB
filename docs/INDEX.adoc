@@ -119,7 +119,7 @@ link:_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap].
 |===
 | Doc | Purpose
 
-| link:10-quality/proximadb-strategic-analysis.adoc[Strategic Analysis] | Historical/current drift-check input for feature gaps and competitive position
+| Strategic Analysis | Historical/current drift-check input for feature gaps and competitive position
 | link:10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register] | Active technical-debt register, including TD-110 for OLTP/OLAP HTAP storage and PostgreSQL constraint semantics
 | link:10-quality/code-coverage-report.adoc[Code Coverage Report] | Module-level coverage analysis and TDD action plan
 |===

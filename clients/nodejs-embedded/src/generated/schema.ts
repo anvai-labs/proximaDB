@@ -627,8 +627,37 @@ export interface paths {
         get: operations["getGraph"];
         put?: never;
         post?: never;
-        /** Delete a graph collection. */
+        /**
+         * Delete a graph collection.
+         * @description 204 on success (the handler's success body is not transmitted on
+         *     a 204). Not-found maps to 404 with the envelope error.
+         */
         delete: operations["deleteGraph"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update a graph collection's schema.
+         * @description The body carries the schema as free-form JSON (the handler
+         *     deserializes it into the port's GraphSchema). 200 returns the
+         *     updated collection (envelope; data = serialized collection);
+         *     invalid schema JSON maps to 400.
+         */
+        put: operations["updateGraphSchema"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -665,10 +694,35 @@ export interface paths {
         };
         /** Get a node by id. */
         get: operations["getNode"];
-        put?: never;
+        /**
+         * Replace a node.
+         * @description Full replacement: the body is the complete node input (its `id`
+         *     is overwritten by the path's `node_id`).
+         */
+        put: operations["updateNode"];
         post?: never;
         /** Delete a node by id. */
         delete: operations["deleteNode"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/nodes/{node_id}/neighbors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        /** Get a node's neighbors. */
+        get: operations["getNodeNeighbors"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -693,6 +747,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v2/graphs/{graph_id}/edges/{edge_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+                edge_id: components["parameters"]["EdgeId"];
+            };
+            cookie?: never;
+        };
+        /** Get an edge by id. */
+        get: operations["getEdge"];
+        /**
+         * Replace an edge.
+         * @description Full replacement: the body is the complete edge input (its `id`
+         *     is overwritten by the path's `edge_id`).
+         */
+        put: operations["updateEdge"];
+        post?: never;
+        /** Delete an edge by id. */
+        delete: operations["deleteEdge"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v2/graphs/{graph_id}/nodes/batch": {
         parameters: {
             query?: never;
@@ -706,8 +786,8 @@ export interface paths {
         put?: never;
         /**
          * Create multiple nodes in a single call.
-         * @description Batch counterpart to `createNode`. Use this on bulk-ingest paths
-         *     where individual round-trips would dominate latency.
+         * @description Per-item rejections ride `failed_count`/`errors[]` while
+         *     `results[]` carries what landed; the HTTP status stays 200.
          */
         post: operations["batchCreateNodes"];
         delete?: never;
@@ -729,7 +809,8 @@ export interface paths {
         put?: never;
         /**
          * Create multiple edges in a single call.
-         * @description Batch counterpart to `createEdge`.
+         * @description Per-item rejections ride `failed_count`/`errors[]` while
+         *     `results[]` carries what landed; the HTTP status stays 200.
          */
         post: operations["batchCreateEdges"];
         delete?: never;
@@ -757,6 +838,200 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v2/graphs/{graph_id}/walk": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * BFS walk from a start node.
+         * @description A traverse with the algorithm pinned to BFS (defaults:
+         *     max_depth 2, limit 100).
+         */
+        post: operations["walkGraph"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/step": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Single-step navigation (neighbors of one node).
+         * @description Returns the neighbors of `node_id` (optionally restricted to one
+         *     `edge_type`) in the traversal result shape.
+         */
+        post: operations["stepGraph"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/shortest-path": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Shortest path between two nodes. */
+        post: operations["shortestPath"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a graph query.
+         * @description Executes the query text through the port's JSON query path.
+         *     `language` (default `native`) and `timeout_ms` are accepted but
+         *     currently unused server-side.
+         */
+        post: operations["executeGraphQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/query/nodes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Query nodes by labels/properties.
+         * @description Paginated: `limit` (default 100) + `offset`, or a
+         *     `continuation_token` of the form `offset:<n>`.
+         */
+        post: operations["queryNodes"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/query/edges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Query edges by type/endpoints/properties.
+         * @description Paginated: `limit` (default 100) + `offset`, or a
+         *     `continuation_token` of the form `offset:<n>`. `edge_type`
+         *     defaults to the empty string (matches untyped edges).
+         */
+        post: operations["queryEdges"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/components": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        /** Get the graph's connected components. */
+        get: operations["getConnectedComponents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/cycles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        /** Check whether the graph contains a cycle. */
+        get: operations["checkCycles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/graphs/{graph_id}/constraints/unique": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Add a unique constraint on (label, property). */
+        post: operations["addUniqueConstraint"];
+        /** Remove a unique constraint on (label, property). */
+        delete: operations["removeUniqueConstraint"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v2/graphs/{graph_id}/stats": {
         parameters: {
             query?: never;
@@ -770,6 +1045,329 @@ export interface paths {
         get: operations["getGraphStats"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/timeseries/collections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List this tenant's time-series collections. */
+        get: operations["listTimeseriesCollections"];
+        put?: never;
+        /** Create a time-series collection. */
+        post: operations["createTimeseriesCollection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/timeseries/collections/{collection_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a time-series collection.
+         * @description Always 200; `success` distinguishes an actual deletion from a
+         *     no-op (unknown collection).
+         */
+        delete: operations["deleteTimeseriesCollection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/timeseries/collections/{collection_id}/ingest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Ingest time-series points. */
+        post: operations["ingestTimeseries"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/timeseries/collections/{collection_id}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query points in a time range (epoch millis). */
+        post: operations["queryTimeseries"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/timeseries/collections/{collection_id}/aggregate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Aggregate points into time buckets. */
+        post: operations["aggregateTimeseries"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a unified (UQL) query.
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        post: operations["executeUnifiedQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/multi-model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a multi-model query (free-form body).
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        post: operations["executeMultiModelQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/federated": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a federated query.
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        post: operations["executeFederatedQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/distributed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a distributed query.
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        post: operations["executeDistributedQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/explain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Explain a unified query (plan, no execution).
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        post: operations["explainUnifiedQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Prepare a statement for repeated execution.
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        post: operations["prepareStatement"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/execute/{statement_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                statement_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a prepared statement with parameters.
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        post: operations["executePreparedStatement"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/prepared/{statement_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                statement_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a prepared statement.
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        delete: operations["deletePreparedStatement"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/unified/prepared/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Prepared-statement execution statistics.
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — unified queries run without tenant selection.
+         */
+        post: operations["getPreparedStats"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/rank/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Multi-phase ranked search (retrieval + optional rerank profile).
+         * @description Runs the rank pipeline over the target collection: candidate
+         *     retrieval (vector + optional BM25 text leg), then the global
+         *     composition phase, then an optional profile-driven second phase.
+         *     `rank_profile` selects a named profile from the server registry;
+         *     when omitted, the response is retrieval-only (no score vectors —
+         *     the zero-cost-when-unused contract). `rank_overrides` tweak
+         *     per-phase knobs on top of the resolved profile. `query_vector`
+         *     is the POST-embedding vector (the caller computed it).
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler beyond the standard tenant middleware context.
+         *     Extractor rejections (malformed JSON, missing required field,
+         *     wrong content-type) are normalized to the canonical JSON error
+         *     envelope with status 400/415/422.
+         */
+        post: operations["rankSearch"];
         delete?: never;
         options?: never;
         head?: never;
@@ -820,9 +1418,33 @@ export interface paths {
         /** List document collections. */
         get: operations["listDocumentCollections"];
         put?: never;
-        /** Create a document collection. */
+        /** Create a document collection (with optional indexes). */
         post: operations["createDocumentCollection"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/document-collections/{collection}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get one collection's info.
+         * @description 404 when the collection does not exist. The body is an open
+         *     object (the serialized collection info).
+         */
+        get: operations["getDocumentCollection"];
+        put?: never;
+        post?: never;
+        /** Delete a document collection. */
+        delete: operations["deleteDocumentCollection"];
         options?: never;
         head?: never;
         patch?: never;
@@ -837,11 +1459,99 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Query documents. */
+        /** Query documents (filter/projection/limit). */
         get: operations["queryDocuments"];
         put?: never;
-        /** Insert a document. */
+        /** Insert one document. */
         post: operations["insertDocument"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/document-collections/{collection}/documents/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        /** Get one document. */
+        get: operations["getDocument"];
+        put?: never;
+        post?: never;
+        /** Delete one document. */
+        delete: operations["deleteDocument"];
+        options?: never;
+        head?: never;
+        /**
+         * Apply an update pipeline to a document.
+         * @description Optimistic concurrency: `expected_version` rejects stale writes.
+         */
+        patch: operations["updateDocument"];
+        trace?: never;
+    };
+    "/api/v2/document-collections/{collection}/documents/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Insert multiple documents (per-item partial success). */
+        post: operations["batchInsertDocuments"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/document-collections/{collection}/documents/aggregate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Run an aggregation pipeline. */
+        post: operations["aggregateDocuments"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/document-collections/{collection}/indexes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        /** List the collection's indexes. */
+        get: operations["listDocumentIndexes"];
+        put?: never;
+        /**
+         * Create an index on an existing collection.
+         * @description HONEST ALWAYS-400: creating indexes on existing collections is
+         *     not supported — specify `indexes` when creating the collection.
+         *     The 400 body says exactly this.
+         */
+        post: operations["createDocumentIndex"];
         delete?: never;
         options?: never;
         head?: never;
@@ -859,7 +1569,14 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Ingest a log entry. */
+        /**
+         * Ingest a log entry.
+         * @description Scope: path-namespace = isolation boundary (storage tenant key);
+         *     X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+         *     unconditionally on the unified server (the default, port 5678);
+         *     legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+         *     REST does not mount it.
+         */
         post: operations["ingestLog"];
         delete?: never;
         options?: never;
@@ -878,7 +1595,15 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Query logs. */
+        /**
+         * Query logs.
+         * @description Reads are scoped by the path namespace — the same boundary the other
+         *     observability ops use (any authenticated caller may query any
+         *     namespace; TD-SPECRAT-2 tracks the ownership decision). Availability:
+         *     mounted unconditionally on the unified server (the default, port
+         *     5678); legacy multi-port mode mounts it only with gRPC enabled;
+         *     cluster-mode REST does not mount it.
+         */
         post: operations["queryLogs"];
         delete?: never;
         options?: never;
@@ -900,6 +1625,13 @@ export interface paths {
          * @description Creates a namespace for log/metric/trace data with tiered retention.
          *     Retention days default to hot=1, warm=7, cold=30; archive is fixed at
          *     365 days server-side.
+         *
+         *     Scope: the path namespace IS the isolation boundary — it maps 1:1 onto
+         *     the storage tenant key. The request's X-Tenant-ID header is not
+         *     consulted by this surface (TD-SPECRAT-2 tracks multi-tenant namespace
+         *     ownership). Availability: mounted unconditionally on the unified
+         *     server (the default, port 5678); legacy multi-port mode mounts it only
+         *     with gRPC enabled; cluster-mode REST does not mount it.
          */
         post: operations["createObservabilityNamespace"];
         delete?: never;
@@ -919,7 +1651,14 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Ingest a batch of log entries. */
+        /**
+         * Ingest a batch of log entries.
+         * @description Scope: path-namespace = isolation boundary (storage tenant key);
+         *     X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+         *     unconditionally on the unified server (the default, port 5678);
+         *     legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+         *     REST does not mount it.
+         */
         post: operations["ingestLogs"];
         delete?: never;
         options?: never;
@@ -938,7 +1677,14 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Ingest a single metric sample. */
+        /**
+         * Ingest a single metric sample.
+         * @description Scope: path-namespace = isolation boundary (storage tenant key);
+         *     X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+         *     unconditionally on the unified server (the default, port 5678);
+         *     legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+         *     REST does not mount it.
+         */
         post: operations["ingestMetric"];
         delete?: never;
         options?: never;
@@ -957,7 +1703,14 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Ingest a batch of metric samples. */
+        /**
+         * Ingest a batch of metric samples.
+         * @description Scope: path-namespace = isolation boundary (storage tenant key);
+         *     X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+         *     unconditionally on the unified server (the default, port 5678);
+         *     legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+         *     REST does not mount it.
+         */
         post: operations["ingestMetrics"];
         delete?: never;
         options?: never;
@@ -980,6 +1733,12 @@ export interface paths {
          * Aggregate a metric over a time range.
          * @description Aggregation defaults to `avg` with a 60-second step. Results are
          *     grouped by `group_by` label names and filtered by exact `labels` match.
+         *
+         *     Scope: path-namespace = isolation boundary (storage tenant key);
+         *     X-Tenant-ID not consulted (TD-SPECRAT-2). Availability: mounted
+         *     unconditionally on the unified server (the default, port 5678);
+         *     legacy multi-port mode mounts it only with gRPC enabled; cluster-mode
+         *     REST does not mount it.
          */
         post: operations["aggregateMetrics"];
         delete?: never;
@@ -1006,6 +1765,535 @@ export interface paths {
          *     model-generated — validate before execution.
          */
         post: operations["translateNaturalLanguage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/policy-bindings/{tenant}/{object_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenant: string;
+                object_id: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Upsert an ABAC policy binding.
+         * @description Provisions (or replaces) the policy binding at `object_id` for
+         *     `tenant` — a constraint-layer rule (`scope` + `effect`, optionally a
+         *     `predicate_ref` row filter and a `field_mask`). Writes through the
+         *     same store the live enforcer reads: visible on the next request, no
+         *     restart. `Deny` wins during resolution; the default is deny.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the tenant path segment governs.
+         */
+        put: operations["putPolicyBinding"];
+        post?: never;
+        /**
+         * Remove an ABAC policy binding.
+         * @description Idempotent — 204 whether or not a binding existed at `object_id`.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the tenant path segment governs.
+         */
+        delete: operations["deletePolicyBinding"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/policy-bindings/{tenant}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenant: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List a tenant's live ABAC policy bindings.
+         * @description The exact binding set the enforcer composes for reads under
+         *     `tenant` — an operator inspection endpoint, not a per-tenant
+         *     self-service one.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the tenant path segment governs.
+         */
+        get: operations["listPolicyBindings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/tenant-posture/{tenant}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenant: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a tenant's explicit ABAC grant-enforcement posture.
+         * @description 404 means the tenant has NO explicit record — meaningfully
+         *     different from `Off`, since an absent record means the tenant
+         *     inherits the process default, which may itself be `Enforce`.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the tenant path segment governs.
+         */
+        get: operations["getTenantPosture"];
+        /**
+         * Set a tenant's ABAC grant-enforcement posture.
+         * @description Intended rollout: `Off` -> `Audit` (watch would-be-denials fall to
+         *     zero for this tenant) -> `Enforce`. Skipping the `Audit` rehearsal
+         *     is how an operator breaks a customer's traffic.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the tenant path segment governs.
+         */
+        put: operations["putTenantPosture"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Provision an ADR-090 grant (cross-tenant entitlement).
+         * @description Grants are the entitlement layer: "this grantee may perform these
+         *     actions on this resource", where the grantee MAY be a foreign
+         *     tenant or a foreign tenant's user — the one place cross-tenant
+         *     sharing is expressible. Both the owner and the grantee tenant must
+         *     resolve (fail-closed on unminted tenants); the grantee subject is
+         *     deliberately NOT validated against the principal registry, so a
+         *     share may be provisioned before its recipient's first login.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the body `tenant` field governs.
+         */
+        post: operations["postGrant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/grants/{owner_tenant}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                owner_tenant: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List an owner tenant's grants.
+         * @description Revoked grants stay listed with `revoked_at_ms` set — the audit
+         *     trail is the point, not a live-only view.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the tenant path segment governs.
+         */
+        get: operations["listGrants"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/grants/{owner_tenant}/{grant_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                owner_tenant: string;
+                grant_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke a grant.
+         * @description Idempotent — 204 whether the grant existed (and was revoked) or was
+         *     already unknown/revoked. Revocation under the wrong owner cannot
+         *     even name the grant (the store is owner-partitioned).
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the tenant path segment governs.
+         */
+        delete: operations["deleteGrant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/attribute-bindings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List every ABAC attribute binding.
+         * @description Cluster-operator scope — every `(subject, tenant)` attribute
+         *     binding across every tenant, by design (cross-tenant visibility is
+         *     the point of an operator inspection endpoint).
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — this is a cross-tenant operator view.
+         */
+        get: operations["listAttributeBindings"];
+        put?: never;
+        /**
+         * Upsert a subject's ABAC attribute binding.
+         * @description The authority half of ABAC — a `(subject, tenant)`-keyed,
+         *     multi-valued attribute set a policy's `predicate_ref` resolves
+         *     against. Writes through the same store the live enforcer reads.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the body `tenant` field governs.
+         */
+        post: operations["postAttributeBinding"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/predicate-objects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List every registered ABAC predicate object.
+         * @description The optional `X-Tenant-ID` header is not consulted by this
+         *     handler (predicate objects are global, not tenant-scoped).
+         */
+        get: operations["listPredicateObjects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/abac/predicate-objects/{object_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                object_id: number;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get one ABAC predicate object.
+         * @description 404 if unknown. Note a dangling `predicate_ref` on a policy binding
+         *     resolves fail-closed (safe) regardless of this endpoint.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler (predicate objects are global, not tenant-scoped).
+         */
+        get: operations["getPredicateObject"];
+        /**
+         * Register (or replace) an ABAC predicate object.
+         * @description The request body IS the `FilterExpression` directly (no wrapper) —
+         *     a stored row-filter predicate that a policy binding's
+         *     `predicate_ref` can reference.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler (predicate objects are global, not tenant-scoped).
+         */
+        put: operations["putPredicateObject"];
+        post?: never;
+        /**
+         * Revoke an ABAC predicate object.
+         * @description Idempotent (204). Subsequent resolves of `object_id` by any policy
+         *     binding fail-closed.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler (predicate objects are global, not tenant-scoped).
+         */
+        delete: operations["deletePredicateObject"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/collections/{collection_id}/pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a collection's pin state.
+         * @description 200 with `status: "pinned"` + state when pinned; 200 with
+         *     `status: "unpinned"` when not pinned.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler (the pin registry is collection-keyed, not
+         *     tenant-scoped).
+         */
+        get: operations["getCollectionPin"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Set or clear a collection pin.
+         * @description Pins a collection to a physical medium (or unpins it). Returns
+         *     immediately with the new pin state; physical data movement
+         *     happens out of band — the access-pattern engine reads the
+         *     registry on its next evaluation.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler (the pin registry is collection-keyed, not
+         *     tenant-scoped).
+         */
+        patch: operations["patchCollectionPin"];
+        trace?: never;
+    };
+    "/api/v2/collections/pinning": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List every pinned collection.
+         * @description Operator-dashboard view of all currently pinned collections
+         *     (cross-tenant — the registry is collection-keyed).
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler.
+         */
+        get: operations["listCollectionPins"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/collections/{collection_id}/affinity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read this node's cache-affinity entry for a collection.
+         * @description Returns `status: "affinitized"` (with query count, age, and a
+         *     `stale` flag) when an entry exists — including stale entries,
+         *     so operators can see which collections went cold — and
+         *     `status: "not_affinitized"` when there is no entry at all.
+         *     Routing has already stopped using stale entries.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler (the affinity registry is per-node, collection-keyed).
+         */
+        get: operations["getCollectionAffinity"];
+        put?: never;
+        post?: never;
+        /**
+         * Drop this node's cache-affinity entry for a collection.
+         * @description Invalidates the affinity hint so routing re-evaluates on the
+         *     next query. 200 always; `dropped` distinguishes an actual
+         *     removal from a no-op.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler.
+         */
+        delete: operations["deleteCollectionAffinity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/collections/affinity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List every cache-affinity entry on this node.
+         * @description Sorted by collection_id; includes stale entries so operators
+         *     can see which collections went cold.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler.
+         */
+        get: operations["listCollectionAffinities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/primary-pod/{tenant_id}/{collection_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tenant_id: string;
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Look up a (tenant, collection)'s primary pod.
+         * @description 200 with `status: "bound"` + the assignment when one exists;
+         *     200 with `status: "unbound"` when none does (never 404).
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the `tenant_id` PATH segment governs.
+         *     Requires REST auth enabled — in an auth-disabled
+         *     deployment every call to this operation returns 401
+         *     `missing_auth_context`.
+         */
+        get: operations["getPrimaryPod"];
+        /**
+         * Assign a (tenant, collection)'s primary pod.
+         * @description Operator-gated (SystemAdmin ∪ ConfigureSystem) — these expose
+         *     cross-tenant placement and drive WAL write routing. The
+         *     assignment is mirrored to the catalog; a mirror failure is
+         *     logged and counted but does NOT fail the request (PUT-success
+         *     means the binding is in effect for routing; the catalog
+         *     reconciles on the next write).
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the `tenant_id` PATH segment governs.
+         *     Requires REST auth enabled — in an auth-disabled
+         *     deployment every call to this operation returns 401
+         *     `missing_auth_context`.
+         */
+        put: operations["putPrimaryPod"];
+        post?: never;
+        /**
+         * Unassign a (tenant, collection)'s primary pod.
+         * @description 200 always; `removed` distinguishes an actual removal from a
+         *     no-op. Catalog-mirror policy is the same as PUT (logged, not
+         *     fatal).
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler — the `tenant_id` PATH segment governs.
+         *     Requires REST auth enabled — in an auth-disabled
+         *     deployment every call to this operation returns 401
+         *     `missing_auth_context`.
+         */
+        delete: operations["deletePrimaryPod"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/primary-pod": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List every primary-pod binding (all tenants).
+         * @description Cross-tenant operator view — the registry is keyed by
+         *     (tenant_id, collection_id).
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler.
+         *     Requires REST auth enabled — in an auth-disabled
+         *     deployment every call to this operation returns 401
+         *     `missing_auth_context`.
+         */
+        get: operations["listPrimaryPods"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/catalog/table-routing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Table-level xCatalog routing metadata.
+         * @description Serves `information_schema.table_routing` as a table-shaped
+         *     result — the same projection pgwire/SQL clients see. All cell
+         *     values are strings.
+         *     The optional `X-Tenant-ID` header is not consulted by this
+         *     handler (the introspection projection is cluster-scope).
+         *     The filter dispatch is LEXICAL over the composed SQL text, so a
+         *     `table_name` containing SQL fragments (e.g. ` from
+         *     xcatalog.namespaces`) can be misread as a different view — do
+         *     not treat this endpoint as a structured query interface
+         *     (TD-SPECRAT-3 tracks the structured-filter fix). Names match
+         *     case-insensitively; a name containing a single quote silently
+         *     truncates the filter at the quote.
+         */
+        get: operations["getCatalogTableRouting"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/catalog/table-write/explain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Explain table-write route selection WITHOUT executing.
+         * @description Runs the DML write planner in explain-only mode: resolves the
+         *     target (and source) tables, plans the copy/write, and returns
+         *     the full route decision — selected backend + access method,
+         *     write lane (+ rejected lanes with reasons), candidate/rejected
+         *     paths, estimated cost and data movement, required guards, and
+         *     the write intent summary. Nothing is written.
+         *     Provide EITHER `source_table` OR `source_sql` (400 otherwise).
+         *     Extractor rejections (malformed JSON body, duplicate query
+         *     params) bypass the JSON error envelope and return axum's
+         *     plain-text 400/415/422 bodies — the typed envelope below covers
+         *     handler-emitted errors only.
+         *     The optional `X-Tenant-ID` header is not consulted — tenant
+         *     context, if any, rides the body's `tenant_id`.
+         */
+        post: operations["explainTableWriteRoute"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1338,8 +2626,9 @@ export interface components {
             /**
              * @description Storage engine selection
              *
-             *     Options: "auto", "sst", "helix", "viper", "swift", "nova", "raptor", "tst"
+             *     Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
              *     Default: "auto" (system selects optimal engine)
+             *     ("viper" is no longer accepted — deprecated by ADR-093)
              */
             engine?: string | null;
             schema?: null | components["schemas"]["SchemaDefinition"];
@@ -2406,86 +3695,273 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        CreateGraphRequest: {
-            /** @description Unique identifier for the new graph collection. */
-            graph_id: string;
-            /** @description Optional human-readable name (defaults to graph_id). */
-            name?: string | null;
-            description?: string | null;
+        GraphErrorBody: {
+            /** @enum {string} */
+            code: "NOT_FOUND" | "ALREADY_EXISTS" | "INVALID_ARGUMENT" | "CONSTRAINT_VIOLATION" | "INTERNAL_ERROR" | "TIMEOUT" | "PERMISSION_DENIED";
+            message: string;
+            details?: unknown;
         };
         /**
-         * @description Server returns a `GraphResponse<T>` envelope around graph
-         *     collection metadata. The fields below are the common subset
-         *     SDKs rely on; extra server-side fields are passed through.
+         * @description The graph envelope in its error form — what every graph error
+         *     status actually carries on the wire ({success: false, error:
+         *     {code, message, details?}, metadata?}; `data` is absent.
+         */
+        GraphErrorResponse: {
+            success: boolean;
+            error: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphResponseMetadata: {
+            request_id?: string;
+            /** Format: uint64 */
+            execution_time_ms?: number;
+        };
+        GraphEmbedding: {
+            model_id: string;
+            model_version: string;
+            vector: number[];
+            /** Format: uint32 */
+            dimension: number;
+        };
+        CanonicalNode: {
+            id: string;
+            labels: string[];
+            properties: {
+                [key: string]: unknown;
+            };
+            embedding?: components["schemas"]["GraphEmbedding"];
+            created_at: string;
+            updated_at: string;
+        };
+        CanonicalEdge: {
+            id: string;
+            from_node_id: string;
+            to_node_id: string;
+            edge_type: string;
+            properties: {
+                [key: string]: unknown;
+            };
+            weight?: number;
+            created_at: string;
+            updated_at: string;
+        };
+        GraphNodeResponse: {
+            success: boolean;
+            data?: components["schemas"]["CanonicalNode"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphEdgeResponse: {
+            success: boolean;
+            data?: components["schemas"]["CanonicalEdge"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphNodeListResponse: {
+            success: boolean;
+            data?: components["schemas"]["CanonicalNode"][];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        /**
+         * @description Envelope around the serialized graph-collection object. The
+         *     payload is the port's collection record rendered as JSON — an
+         *     open object (the field set is the proto collection's, subject to
+         *     port evolution).
          */
         GraphCollectionResponse: {
-            graph_id?: string;
-            name?: string | null;
-            description?: string | null;
-            node_count?: number | null;
-            edge_count?: number | null;
-        } & {
-            [key: string]: unknown;
+            success: boolean;
+            data?: {
+                [key: string]: unknown;
+            };
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
         };
-        /**
-         * @description Server returns a `GraphResponse<Vec<...>>` envelope with `data`
-         *     containing the graph collections.
-         */
-        ListGraphsResponse: {
-            data?: components["schemas"]["GraphCollectionResponse"][];
-            success?: boolean;
-        } & {
-            [key: string]: unknown;
+        GraphCollectionListResponse: {
+            success: boolean;
+            data?: {
+                [key: string]: unknown;
+            }[];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
         };
-        /**
-         * @description 204 No Content on success with an empty `GraphResponse` envelope;
-         *     404 Not Found with an error envelope when the graph is missing.
-         */
-        DeleteGraphResponse: {
-            success?: boolean;
-        } & {
-            [key: string]: unknown;
+        GraphTraversalStats: {
+            /** Format: uint64 */
+            nodes_visited: number;
+            /** Format: uint64 */
+            edges_traversed: number;
+            /** Format: uint32 */
+            max_depth_reached: number;
+            /** Format: uint64 */
+            execution_time_ms?: number;
         };
-        /**
-         * @description Node payload nested inside `CreateNodeRequest.node`. Matches
-         *     `RestNodeInput` in proximadb-api's graph handler.
-         */
+        GraphTraversalData: {
+            nodes: components["schemas"]["CanonicalNode"][];
+            edges: components["schemas"]["CanonicalEdge"][];
+            paths?: string[][];
+            stats?: components["schemas"]["GraphTraversalStats"];
+        };
+        GraphTraversalResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphTraversalData"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphStats: {
+            /** Format: uint64 */
+            total_nodes: number;
+            /** Format: uint64 */
+            total_edges: number;
+            label_stats: unknown[];
+            edge_type_stats: unknown[];
+            /** Format: uint64 */
+            total_properties: number;
+            /** Format: uint64 */
+            memory_usage_bytes: number;
+            average_degree: number;
+            /** Format: uint32 */
+            max_degree: number;
+            /** Format: uint32 */
+            connected_components: number;
+        };
+        GraphStatsResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphStats"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphNodeBatchResults: {
+            /** Format: uint64 */
+            created_count: number;
+            /** Format: uint64 */
+            updated_count: number;
+            /** Format: uint64 */
+            failed_count: number;
+            results: components["schemas"]["CanonicalNode"][];
+            errors: unknown[];
+        };
+        GraphEdgeBatchResults: {
+            /** Format: uint64 */
+            created_count: number;
+            /** Format: uint64 */
+            updated_count: number;
+            /** Format: uint64 */
+            failed_count: number;
+            results: components["schemas"]["CanonicalEdge"][];
+            errors: unknown[];
+        };
+        GraphBatchNodesResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphNodeBatchResults"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphBatchEdgesResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphEdgeBatchResults"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphNodeQueryResults: {
+            items: components["schemas"]["CanonicalNode"][];
+            /** Format: uint64 */
+            total_count?: number;
+            has_more: boolean;
+            next_token?: string;
+        };
+        GraphEdgeQueryResults: {
+            items: components["schemas"]["CanonicalEdge"][];
+            /** Format: uint64 */
+            total_count?: number;
+            has_more: boolean;
+            next_token?: string;
+        };
+        GraphNodeQueryResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphNodeQueryResults"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphEdgeQueryResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphEdgeQueryResults"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphShortestPathData: {
+            path: string[];
+            total_weight?: number;
+            found: boolean;
+        };
+        GraphShortestPathResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphShortestPathData"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphQueryData: {
+            rows: unknown[];
+            /** Format: uint64 */
+            row_count: number;
+        };
+        GraphQueryResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphQueryData"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphComponentsData: {
+            components: string[][];
+        };
+        GraphComponentsResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphComponentsData"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphCyclesData: {
+            has_cycle: boolean;
+        };
+        GraphCyclesResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphCyclesData"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        GraphDdlData: {
+            success: boolean;
+        };
+        GraphDdlResponse: {
+            success: boolean;
+            data?: components["schemas"]["GraphDdlData"];
+            error?: components["schemas"]["GraphErrorBody"];
+            metadata?: components["schemas"]["GraphResponseMetadata"];
+        };
+        CreateGraphRequest: {
+            graph_id: string;
+            name?: string;
+            description?: string;
+        };
+        UpdateGraphSchemaRequest: {
+            schema: {
+                [key: string]: unknown;
+            };
+        };
         NodeInput: {
             id: string;
             labels?: string[];
             properties?: {
                 [key: string]: unknown;
             };
-            embedding?: components["schemas"]["EmbeddingInput"];
+            embedding?: {
+                vector: number[];
+                version?: string;
+                model_id?: string;
+            };
         };
-        EmbeddingInput: {
-            vector: number[];
-            model_id?: string | null;
-            modality?: string | null;
-        };
-        /** @description Wrapped envelope: server expects `{"node": NodeInput}`. */
         CreateNodeRequest: {
             node: components["schemas"]["NodeInput"];
         };
-        NodeResponse: {
-            id: string;
-            labels?: string[] | null;
-            properties?: {
-                [key: string]: unknown;
-            } | null;
-        } & {
-            [key: string]: unknown;
-        };
-        DeleteNodeResponse: {
-            success?: boolean;
-            id?: string;
-        } & {
-            [key: string]: unknown;
-        };
-        /**
-         * @description Edge payload nested inside `CreateEdgeRequest.edge`. Matches
-         *     `RestEdgeInput` in proximadb-api's graph handler.
-         */
         EdgeInput: {
             id: string;
             from_node_id: string;
@@ -2494,86 +3970,113 @@ export interface components {
             properties?: {
                 [key: string]: unknown;
             };
-            /** Format: double */
-            weight?: number | null;
+            weight?: number;
         };
-        /** @description Wrapped envelope: server expects `{"edge": EdgeInput}`. */
         CreateEdgeRequest: {
             edge: components["schemas"]["EdgeInput"];
         };
-        EdgeResponse: {
-            id: string;
-            from_node_id?: string;
-            to_node_id?: string;
-            edge_type?: string | null;
-            properties?: {
-                [key: string]: unknown;
-            } | null;
-            /** Format: double */
-            weight?: number | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /**
-         * @description Flat shape (no wrapper). Matches `RestTraversalRequest` in
-         *     proximadb-api.
-         */
-        TraverseRequest: {
-            start_node_id: string;
-            /** @default 3 */
-            max_depth: number;
-            edge_types?: string[];
-            node_labels?: string[];
-            /** @description bfs | dfs | shortest_path */
-            algorithm?: string | null;
-            limit?: number | null;
-        };
-        TraverseResponse: {
-            nodes?: components["schemas"]["NodeResponse"][];
-            edges?: components["schemas"]["EdgeResponse"][];
-            paths?: string[][];
-        } & {
-            [key: string]: unknown;
-        };
-        GraphStatsResponse: {
-            node_count?: number;
-            edge_count?: number;
-            /** Format: double */
-            density?: number | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** @description Body for `POST /api/v2/graphs/{id}/nodes/batch`. */
         BatchCreateNodesRequest: {
             nodes: components["schemas"]["NodeInput"][];
         };
-        /** @description Server returns a `GraphResponse<BatchResults<Node>>` envelope. */
-        BatchNodesResponse: {
-            success?: boolean;
-            data?: {
-                results?: components["schemas"]["NodeResponse"][];
-                count?: number;
-            } & {
-                [key: string]: unknown;
-            };
-        } & {
-            [key: string]: unknown;
-        };
-        /** @description Body for `POST /api/v2/graphs/{id}/edges/batch`. */
         BatchCreateEdgesRequest: {
             edges: components["schemas"]["EdgeInput"][];
         };
-        /** @description Server returns a `GraphResponse<BatchResults<Edge>>` envelope. */
-        BatchEdgesResponse: {
-            success?: boolean;
-            data?: {
-                results?: components["schemas"]["EdgeResponse"][];
-                count?: number;
-            } & {
+        TraverseRequest: {
+            start_node_id: string;
+            /**
+             * Format: uint32
+             * @default 5
+             */
+            max_depth: number;
+            edge_types?: string[];
+            node_labels?: string[];
+            /** @default bfs */
+            algorithm: string;
+            /** Format: uint32 */
+            limit?: number | null;
+        };
+        WalkRequest: {
+            start_node_id: string;
+            /**
+             * Format: uint32
+             * @default 2
+             */
+            max_depth: number;
+            /**
+             * Format: uint32
+             * @default 100
+             */
+            limit: number;
+        };
+        WalkStepRequest: {
+            node_id: string;
+            edge_type?: string;
+            /**
+             * Format: uint32
+             * @description Accepted but currently unused server-side.
+             * @default 50
+             */
+            limit: number;
+        };
+        ShortestPathRequest: {
+            start_node_id: string;
+            target_node_id: string;
+            /** Format: uint32 */
+            max_depth?: number | null;
+            edge_types?: string[];
+            algorithm?: string;
+            /** Format: uint32 */
+            k?: number | null;
+        };
+        GraphNodeQuery: {
+            labels?: string[];
+            properties?: {
                 [key: string]: unknown;
             };
-        } & {
-            [key: string]: unknown;
+            /**
+             * Format: uint32
+             * @default 100
+             */
+            limit: number;
+            /** Format: uint32 */
+            offset?: number | null;
+            /** @description "offset:<n>" form; decodes to the offset. */
+            continuation_token?: string | null;
+        };
+        GraphEdgeQuery: {
+            /** @default  */
+            edge_type: string;
+            from_node_id?: string;
+            to_node_id?: string;
+            properties?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Format: uint32
+             * @default 100
+             */
+            limit: number;
+            /** Format: uint32 */
+            offset?: number | null;
+            /** @description "offset:<n>" form; decodes to the offset. */
+            continuation_token?: string | null;
+        };
+        UniqueConstraintRequest: {
+            label: string;
+            property: string;
+        };
+        GraphQueryRequest: {
+            query: string;
+            /**
+             * @description Accepted but currently unused server-side.
+             * @default native
+             */
+            language: string;
+            /**
+             * Format: uint32
+             * @description Accepted but currently unused server-side.
+             */
+            timeout_ms?: number | null;
         };
         /**
          * @description Body for `POST /api/v2/observability/namespaces`. Retention days
@@ -2610,7 +4113,7 @@ export interface components {
             timestamp_ns?: number | null;
             message: string;
             /**
-             * @description One of: trace, debug, info, warn, error, fatal (case-insensitive).
+             * @description Canonical: trace, debug, info, warn, error, fatal. Aliases accepted (case-insensitive): verbose->trace, information->info, warning->warn, err->error, critical->fatal. Unknown values fall back to info.
              * @default info
              */
             severity: string;
@@ -2653,7 +4156,7 @@ export interface components {
             /** Format: int64 */
             end_time_ns: number;
             /**
-             * @description min, max, avg, sum, or count.
+             * @description Canonical: min, max, avg, sum, count. Percentile/rate forms also accepted: p50, p90, p95, p99, rate. Unknown values fall back to avg.
              * @default avg
              */
             aggregation: string;
@@ -2697,6 +4200,870 @@ export interface components {
             views: string[];
             final_query: string;
         };
+        /**
+         * @description The FLAT error shape every ABAC operator endpoint returns —
+         *     `{error, message, code}` where `error` is a short machine-readable
+         *     slug (e.g. `"tenant_unresolved"`). This is deliberately DISTINCT
+         *     from the canonical nested `ErrorResponse` (`{error: {type,
+         *     message, code}}`) used elsewhere in this spec; it is the actual
+         *     wire format of `abac_admin::OperatorErrorResponse`, carried
+         *     verbatim rather than normalized.
+         */
+        AbacOperatorErrorResponse: {
+            /** @description Machine-readable error slug. */
+            error: string;
+            message: string;
+            /** @description The HTTP status code, repeated in the body. */
+            code: number;
+        };
+        /**
+         * @description The catalog container a policy/grant governs — a stable-id-keyed,
+         *     externally-tagged Rust enum. Exactly one of `Namespace`, `Table`,
+         *     or `Column` is present.
+         */
+        AbacScope: {
+            Namespace: number;
+        } | {
+            /** Format: uint32 */
+            Table: number;
+        } | {
+            Column: components["schemas"]["AbacColumnScope"];
+        };
+        /** @description The `Column` variant payload of [AbacScope](#/components/schemas/AbacScope). */
+        AbacColumnScope: {
+            /** Format: uint32 */
+            table: number;
+            /** Format: uint32 */
+            column: number;
+        };
+        /**
+         * @description Permit or deny; deny wins during policy resolution.
+         * @enum {string}
+         */
+        AbacEffect: "Permit" | "Deny";
+        /**
+         * @description Column-level masking. `Forbid` rejects the read (existence must
+         *     not leak); `Null`/`Redact` are projection rewrites.
+         * @enum {string}
+         */
+        AbacFieldMask: "Null" | "Redact" | "Forbid";
+        /**
+         * @description An ABAC subject attribute value — an externally-tagged Rust enum;
+         *     exactly one of `Str`, `Int`, `Bool`, or `List` is present.
+         */
+        AbacAttrValue: {
+            Str: string;
+        } | {
+            /** Format: int64 */
+            Int: number;
+        } | {
+            Bool: boolean;
+        } | {
+            List: string[];
+        };
+        /** @enum {string} */
+        AbacComparisonOperator: "Equals" | "NotEquals" | "GreaterThan" | "GreaterThanOrEqual" | "LessThan" | "LessThanOrEqual" | "In" | "NotIn" | "Contains" | "StartsWith" | "EndsWith" | "Between" | "IsNull" | "IsNotNull" | "Like";
+        /**
+         * @description A predicate-object row filter — a RECURSIVE, externally-tagged Rust
+         *     enum (`proximadb_filter_expression::FilterExpression`). Modeled
+         *     here as free-form JSON (rather than a typed `oneOf`) because the
+         *     self-referential union is not representable in a form the SDK
+         *     codegen tooling can process (openapi-python-client cannot resolve
+         *     a `oneOf` branch whose `items` `$ref`s the union being defined);
+         *     this is the one schema in the ABAC surface where the generated
+         *     client falls back to an untyped object. Construct exactly one of:
+         *
+         *     * `{"Comparison": {"field": <string>, "operator": <one of
+         *       "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
+         *       "LessThan","LessThanOrEqual","In","NotIn","Contains",
+         *       "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+         *       "value": <any JSON value>}}`
+         *     * `{"And": [<AbacFilterExpression>, ...]}`
+         *     * `{"Or": [<AbacFilterExpression>, ...]}`
+         *     * `{"Not": <AbacFilterExpression>}`
+         *
+         *     See [AbacComparisonOperator](#/components/schemas/AbacComparisonOperator)
+         *     for the authoritative operator enum (referenced here for docs only;
+         *     not structurally, for the same recursion reason).
+         */
+        AbacFilterExpression: {
+            [key: string]: unknown;
+        };
+        /** @description Body for `PUT /api/v2/abac/policy-bindings/{tenant}/{object_id}`. */
+        AbacPutPolicyBindingRequest: {
+            scope: components["schemas"]["AbacScope"];
+            effect: components["schemas"]["AbacEffect"];
+            /**
+             * Format: uint64
+             * @description The predicate object this binding carries (a row-level rule).
+             *     Omit for a predicate-free table-level grant. A dangling ref
+             *     resolves fail-closed at read time.
+             */
+            predicate_ref?: number | null;
+            field_mask?: components["schemas"]["AbacFieldMask"] | null;
+        };
+        AbacPolicyBinding: {
+            /** Format: uint64 */
+            object_id: number;
+            /** Format: uint64 */
+            tenant_stable_id: number;
+            scope: components["schemas"]["AbacScope"];
+            effect: components["schemas"]["AbacEffect"];
+            /** Format: uint64 */
+            predicate_ref?: number | null;
+            field_mask?: components["schemas"]["AbacFieldMask"] | null;
+        };
+        AbacPolicyBindingsResponse: {
+            tenant: string;
+            /** Format: uint64 */
+            tenant_stable_id: number;
+            /** Format: uint64 */
+            count: number;
+            bindings: components["schemas"]["AbacPolicyBinding"][];
+        };
+        /** @description Body for `POST /api/v2/abac/attribute-bindings`. */
+        AbacPostAttributeBindingRequest: {
+            subject_id: string;
+            /** @description Tenant display name; resolved to the stable u64 server-side. */
+            tenant: string;
+            attrs: {
+                [key: string]: components["schemas"]["AbacAttrValue"];
+            };
+        };
+        AbacAttributeBinding: {
+            subject_id: string;
+            /** Format: uint64 */
+            tenant_stable_id: number;
+            attrs: {
+                [key: string]: components["schemas"]["AbacAttrValue"];
+            };
+        };
+        AbacAttributeBindingsResponse: {
+            /** Format: uint64 */
+            count: number;
+            bindings: components["schemas"]["AbacAttributeBinding"][];
+        };
+        AbacPredicateObjectResponse: {
+            /** Format: uint64 */
+            object_id: number;
+            expression: components["schemas"]["AbacFilterExpression"];
+        };
+        AbacPredicateObjectsResponse: {
+            /** Format: uint64 */
+            count: number;
+            objects: components["schemas"]["AbacPredicateObjectResponse"][];
+        };
+        /**
+         * @description Who a grant admits — an externally-tagged Rust enum. Exactly one
+         *     of `Tenant` (every subject of that tenant) or `User` (one specific
+         *     subject, possibly of a foreign tenant) is present.
+         */
+        AbacGrantee: {
+            /** Format: uint64 */
+            Tenant: number;
+        } | {
+            User: components["schemas"]["AbacGranteeUser"];
+        };
+        /** @description The `User` variant payload of [AbacGrantee](#/components/schemas/AbacGrantee). */
+        AbacGranteeUser: {
+            /** Format: uint64 */
+            tenant_stable_id: number;
+            subject: string;
+        };
+        /**
+         * @description `Grant` is delegation authority (further re-grant); it is not
+         *     consulted for data access, only by the admin surface.
+         * @enum {string}
+         */
+        AbacGrantAction: "Read" | "Write" | "Ddl" | "Grant";
+        /**
+         * @description Grantee as provisioned over the wire: a tenant-wide share when
+         *     `subject` is omitted/empty, else one user of (possibly foreign)
+         *     `tenant`. Clients supply tenant/subject strings; stable ids are
+         *     resolved server-side.
+         */
+        AbacGrantGranteeRequest: {
+            tenant: string;
+            subject?: string | null;
+        };
+        /** @description Body for `POST /api/v2/abac/grants`. */
+        AbacPostGrantRequest: {
+            /** @description The resource-owner tenant (string; resolved and must be minted). */
+            owner_tenant: string;
+            resource: components["schemas"]["AbacScope"];
+            grantee: components["schemas"]["AbacGrantGranteeRequest"];
+            actions: components["schemas"]["AbacGrantAction"][];
+            /** Format: uint64 */
+            predicate_ref?: number | null;
+            field_mask?: components["schemas"]["AbacFieldMask"] | null;
+            /** Format: int64 */
+            expires_at_ms?: number | null;
+        };
+        AbacPostGrantResponse: {
+            grant_id: string;
+            /** Format: uint64 */
+            owner_tenant_stable_id: number;
+        };
+        AbacGrantRecord: {
+            grant_id: string;
+            /** Format: uint64 */
+            owner_tenant_stable_id: number;
+            resource: components["schemas"]["AbacScope"];
+            grantee: components["schemas"]["AbacGrantee"];
+            actions: components["schemas"]["AbacGrantAction"][];
+            /** Format: uint64 */
+            predicate_ref?: number | null;
+            field_mask?: components["schemas"]["AbacFieldMask"] | null;
+            /** Format: int64 */
+            created_at_ms: number;
+            /** Format: int64 */
+            expires_at_ms?: number | null;
+            /**
+             * Format: int64
+             * @description Set once revoked; the record stays listed (audit trail).
+             */
+            revoked_at_ms?: number | null;
+        };
+        /**
+         * @description Rollout is intended `Off` -> `Audit` (would-be-denials logged, read
+         *     still admitted) -> `Enforce` (no applicable grant denies).
+         * @enum {string}
+         */
+        AbacGrantEnforcement: "Off" | "Audit" | "Enforce";
+        AbacPutTenantPostureRequest: {
+            grant_enforcement: components["schemas"]["AbacGrantEnforcement"];
+        };
+        AbacTenantSecurityPosture: {
+            /** Format: uint64 */
+            tenant_stable_id: number;
+            grant_enforcement: components["schemas"]["AbacGrantEnforcement"];
+            /** Format: int64 */
+            updated_at_ms: number;
+        };
+        /**
+         * @description Physical medium to pin to. `cloud` effectively means "do not
+         *     promote this collection" (an explicit unpin-in-spirit).
+         * @enum {string}
+         */
+        PinTarget: "memory" | "nvme_ssd" | "cloud";
+        /**
+         * @description Body for `PATCH /api/v2/collections/{collection_id}/pin`. Either
+         *     `{pinned: true, target: ..., replicas?: ...}` or `{pinned: false}`
+         *     (target/replicas ignored when unpinning; `target` is REQUIRED
+         *     when pinning — a plain-text 400 otherwise). `replicas` defaults
+         *     to 1.
+         */
+        PinRequest: {
+            pinned: boolean;
+            target?: components["schemas"]["PinTarget"] | null;
+            /** Format: uint32 */
+            replicas?: number | null;
+        };
+        /**
+         * @description Internally tagged by `status` (snake_case). `status: "pinned"`
+         *     carries `target`/`replicas`/`pinned_at_ns`; `status: "unpinned"`
+         *     carries `was_pinned` (true when the request removed an existing
+         *     pin — useful for audit logs; false on a no-op or read of an
+         *     unpinned collection).
+         */
+        PinResponse: {
+            /** @enum {string} */
+            status: "pinned" | "unpinned";
+            collection_id: string;
+            target?: components["schemas"]["PinTarget"];
+            /** Format: uint32 */
+            replicas?: number;
+            /** Format: int64 */
+            pinned_at_ns?: number;
+            was_pinned?: boolean;
+        };
+        PinListItem: {
+            collection_id: string;
+            target: components["schemas"]["PinTarget"];
+            /** Format: uint32 */
+            replicas: number;
+            /** Format: int64 */
+            pinned_at_ns: number;
+        };
+        PinListResponse: {
+            /** Format: uint64 */
+            count: number;
+            items: components["schemas"]["PinListItem"][];
+        };
+        /**
+         * @description Internally tagged by `status` (snake_case). `status:
+         *     "affinitized"` carries the entry — including STALE entries
+         *     (routing already ignores them; `stale: true` flags them for the
+         *     operator) — with `query_count` (monotonic queries served while
+         *     this node held affinity) and `age_seconds` (seconds since the
+         *     last recorded query). `status: "not_affinitized"` means no
+         *     entry exists at all.
+         */
+        AffinityResponse: {
+            /** @enum {string} */
+            status: "affinitized" | "not_affinitized";
+            collection_id: string;
+            node_id?: string;
+            /** Format: uint64 */
+            query_count?: number;
+            /** Format: uint64 */
+            age_seconds?: number;
+            stale?: boolean;
+        };
+        /**
+         * @description `status` is always `"dropped"`; the `dropped` flag
+         *     distinguishes an actual removal from a no-op.
+         */
+        AffinityDeleteResponse: {
+            /** @enum {string} */
+            status: "dropped";
+            collection_id: string;
+            dropped: boolean;
+        };
+        AffinityListItem: {
+            collection_id: string;
+            node_id: string;
+            /** Format: uint64 */
+            query_count: number;
+            /** Format: uint64 */
+            age_seconds: number;
+            stale: boolean;
+        };
+        AffinityListResponse: {
+            /** Format: uint64 */
+            count: number;
+            items: components["schemas"]["AffinityListItem"][];
+        };
+        /**
+         * @description Why an assignment was made (locked vocabulary for dashboards /
+         *     EXPLAIN). `catalog_replay` = loaded from durable state at
+         *     restart, not freshly assigned.
+         * @enum {string}
+         */
+        AssignmentReason: "create" | "operator" | "failover" | "rebalance" | "catalog_replay";
+        PrimaryPod: {
+            /** @description Pod identifier (typically a k8s pod name); opaque. */
+            pod: string;
+            /**
+             * Format: int64
+             * @description Wall-clock nanoseconds when last set; reassignments advance it.
+             */
+            assigned_at_ns: number;
+            reason: components["schemas"]["AssignmentReason"];
+        };
+        /**
+         * @description Internally tagged by `status` (snake_case). `status: "bound"`
+         *     carries `primary`; `status: "unbound"` means no binding (never
+         *     a 404).
+         */
+        PrimaryPodLookupResponse: {
+            /** @enum {string} */
+            status: "bound" | "unbound";
+            tenant_id: string;
+            collection_id: string;
+            primary?: components["schemas"]["PrimaryPod"];
+        };
+        /**
+         * @description Body for `PUT /api/v2/primary-pod/{tenant_id}/{collection_id}`.
+         *     `reason` defaults to `"operator"` when omitted.
+         */
+        PrimaryPodAssignRequest: {
+            pod: string;
+            reason?: components["schemas"]["AssignmentReason"];
+        };
+        PrimaryPodAssignResponse: {
+            tenant_id: string;
+            collection_id: string;
+            primary: components["schemas"]["PrimaryPod"];
+            /** @description The prior binding on re-assignment; null on first assignment. */
+            previous?: components["schemas"]["PrimaryPod"] | null;
+        };
+        PrimaryPodUnassignResponse: {
+            tenant_id: string;
+            collection_id: string;
+            /** @description True when a binding was actually removed; false when nothing was bound. */
+            removed: boolean;
+        };
+        PrimaryPodListItem: {
+            tenant_id: string;
+            collection_id: string;
+            primary: components["schemas"]["PrimaryPod"];
+        };
+        PrimaryPodListResponse: {
+            /** Format: uint64 */
+            count: number;
+            items: components["schemas"]["PrimaryPodListItem"][];
+        };
+        /**
+         * @description The FLAT error shape the primary-pod operator endpoints return
+         *     (`{error, message, code}`, `error` a short machine-readable
+         *     slug). Same convention as `AbacOperatorErrorResponse`; carried
+         *     as its own schema because the two handler families define the
+         *     type independently.
+         */
+        PrimaryPodOperatorErrorResponse: {
+            error: string;
+            message: string;
+            code: number;
+        };
+        /**
+         * @description Table-shaped catalog metadata (the projection pgwire/SQL clients
+         *     see). Every cell value is a string.
+         */
+        CatalogIntrospectionResult: {
+            columns: string[];
+            column_types: string[];
+            rows: string[][];
+        };
+        /**
+         * @description Body for `POST /api/v2/catalog/table-write/explain`. Provide
+         *     EITHER `source_table` OR `source_sql` — both, or neither, is a
+         *     400. `write_mode` (default `append`) accepts, case-insensitive:
+         *     append | insert | insert_only | insert-only | upsert | overwrite
+         *     | insert_overwrite | insert-overwrite | overwrite_table |
+         *     overwrite-table | merge. `distribution` (default `auto`) accepts:
+         *     auto | local | local_only | local-only | pseudo |
+         *     pseudo_distributed | pseudo-distributed | distributed. Upsert/
+         *     merge imply upsert conflict policy; everything else errors on
+         *     conflict.
+         */
+        TableWriteExplainRequest: {
+            /** @description Dotted name (`[namespace.]…table`); last segment is the table. */
+            target_table: string;
+            source_table?: string | null;
+            source_sql?: string | null;
+            write_mode?: string | null;
+            distribution?: string | null;
+            target_columns?: string[] | null;
+            tenant_id?: string | null;
+            actor?: string | null;
+            idempotency_key?: string | null;
+            /** Format: uint64 */
+            row_count_hint?: number | null;
+            /** Format: uint64 */
+            estimated_bytes?: number | null;
+            requires_row_level_semantics?: boolean | null;
+            batch_local_constraints_sufficient?: boolean | null;
+        };
+        /**
+         * @description The full DML write-planner route decision (explain-only; nothing
+         *     was written). `write_mode`/`distribution` echo the resolved
+         *     canonical enum names (PascalCase, e.g. `Append`,
+         *     `PseudoDistributed`). `execution_*` fields appear only for
+         *     EXPLAIN ANALYZE (never set by this REST explain path).
+         */
+        TableWriteRouteExplanation: {
+            target_table: string;
+            source: string;
+            write_mode: string;
+            distribution: string;
+            write_intent: components["schemas"]["TableWriteIntentExplanation"];
+            write_lane: string;
+            write_lane_reason: string;
+            write_lane_required_guards: string[];
+            rejected_write_lanes: components["schemas"]["TableWriteRejectedLaneExplanation"][];
+            selected_backend: string;
+            selected_access_method: string;
+            estimated_cost: components["schemas"]["TableWriteCostExplanation"];
+            data_movement: components["schemas"]["TableWriteDataMovementExplanation"];
+            required_guards: string[];
+            route_metadata: components["schemas"]["TableWriteRouteMetadataExplanation"];
+            candidate_paths: components["schemas"]["TableWriteCandidateExplanation"][];
+            rejected_paths: components["schemas"]["TableWriteRejectedPathExplanation"][];
+            /** Format: uint64 */
+            execution_elapsed_us?: number;
+            /** Format: uint64 */
+            execution_rows_written?: number;
+        };
+        TableWriteIntentExplanation: {
+            target_table: string;
+            operation_kind: string;
+            durability: string;
+            isolation: string;
+            projection_freshness: string;
+            tenant_id?: string | null;
+            actor?: string | null;
+            idempotency_key?: string | null;
+            /** Format: uint64 */
+            catalog_schema_version?: number | null;
+            /** Format: uint64 */
+            row_count_hint?: number | null;
+            /** Format: uint64 */
+            estimated_bytes?: number | null;
+            requires_row_level_semantics: boolean;
+            batch_local_constraints_sufficient: boolean;
+        };
+        TableWriteRejectedLaneExplanation: {
+            lane: string;
+            reason: string;
+        };
+        TableWriteCostExplanation: {
+            /** Format: uint64 */
+            rows?: number | null;
+            /** Format: uint64 */
+            bytes?: number | null;
+            /** @description Relative cost (unitless planner estimate). */
+            relative_cost: number;
+            reason: string;
+        };
+        TableWriteDataMovementExplanation: {
+            /** Format: uint64 */
+            source_rows?: number | null;
+            /** Format: uint64 */
+            source_bytes?: number | null;
+            /** Format: uint64 */
+            target_rows_before_write?: number | null;
+            /** Format: uint64 */
+            target_bytes_before_write?: number | null;
+            /** Format: uint64 */
+            estimated_read_bytes?: number | null;
+            /** Format: uint64 */
+            estimated_write_bytes?: number | null;
+            /** Format: uint64 */
+            estimated_rewrite_bytes?: number | null;
+            estimate_source: string;
+            /** Format: int64 */
+            source_last_analyzed_ms?: number | null;
+            /** Format: int64 */
+            target_last_analyzed_ms?: number | null;
+            /** Format: uint64 */
+            source_stats_age_ms?: number | null;
+            /** Format: uint64 */
+            target_stats_age_ms?: number | null;
+            /** Format: uint64 */
+            freshness_sla_ms?: number | null;
+            stats_freshness: string;
+        };
+        TableWriteRouteMetadataExplanation: {
+            authority_mode: string;
+            workload_profile: string;
+            storage_specialization: string;
+            primary_format?: string | null;
+            preferred_compute_route?: string | null;
+            partitioning?: string | null;
+            isolation_profile?: string | null;
+            freshness_sla?: string | null;
+            projection_freshness_state?: string | null;
+            projection_metadata: components["schemas"]["ProjectionRouteMetadataExplanation"][];
+            policy_boundary: string;
+            constraint_enforcement: string;
+            constraint_gaps: string[];
+        };
+        ProjectionRouteMetadataExplanation: {
+            name: string;
+            kind: string;
+            physical_format: string;
+            rebuild_source: string;
+            freshness: string;
+            freshness_state: string;
+            /** Format: int64 */
+            max_lag_ms?: number | null;
+            source_range?: string | null;
+            last_included_position?: string | null;
+            rebuildable: boolean;
+            invalidation_policy?: string | null;
+            policy_boundary?: string | null;
+            lossy: boolean;
+            support_status: string;
+            benchmark_gate?: string | null;
+        };
+        TableWriteCandidateExplanation: {
+            backend: string;
+            access_method: string;
+            estimated_cost: components["schemas"]["TableWriteCostExplanation"];
+            required_guards: string[];
+            pushdown: string[];
+        };
+        TableWriteRejectedPathExplanation: {
+            backend: string;
+            access_method: string;
+            reason: string;
+            required_guards: string[];
+        };
+        TsValueColumn: {
+            name: string;
+            /** @description Serialized as an explicit null when unset. */
+            unit?: string | null;
+            /** @description Serialized as an explicit null when unset. */
+            aggregation?: string | null;
+        };
+        TsCollectionConfig: {
+            name: string;
+            /** @default timestamp */
+            timestamp_column: string;
+            value_columns?: components["schemas"]["TsValueColumn"][];
+            tag_columns?: string[];
+            /** Format: int64 */
+            retention_ms?: number | null;
+        };
+        TsPoint: {
+            /**
+             * Format: int64
+             * @description Epoch milliseconds.
+             */
+            timestamp: number;
+            values?: {
+                [key: string]: number;
+            };
+            tags?: {
+                [key: string]: string;
+            };
+        };
+        TsCreateResponse: {
+            name: string;
+        };
+        TsListResponse: {
+            collections: components["schemas"]["TsCollectionConfig"][];
+        };
+        TsDeleteResponse: {
+            success: boolean;
+        };
+        TsIngestRequest: {
+            points: components["schemas"]["TsPoint"][];
+        };
+        TsIngestResponse: {
+            /** Format: uint64 */
+            ingested: number;
+        };
+        TsQueryRequest: {
+            /** Format: int64 */
+            start_time: number;
+            /** Format: int64 */
+            end_time: number;
+            /** Format: uint64 */
+            limit?: number | null;
+        };
+        TsQueryResponse: {
+            points: components["schemas"]["TsPoint"][];
+        };
+        TsAggregateRequest: {
+            /** Format: int64 */
+            start_time: number;
+            /** Format: int64 */
+            end_time: number;
+            /** @default avg */
+            aggregation: string;
+            /**
+             * Format: int64
+             * @default 60000
+             */
+            bucket_ms: number;
+        };
+        TsAggregateResponse: {
+            buckets: unknown[];
+        };
+        RankPhaseOverride: {
+            /** Format: uint32 */
+            rerank_count?: number | null;
+            /** Format: uint32 */
+            batch_size?: number | null;
+        };
+        RankOverrides: {
+            second_phase?: components["schemas"]["RankPhaseOverride"];
+            global_phase?: components["schemas"]["RankPhaseOverride"];
+        };
+        RankSearchRequest: {
+            collection: string;
+            /** @description Post-embedding query vector (caller-computed). */
+            query_vector?: number[];
+            /** @description Optional BM25/full-text leg; absent/empty = vector-only. */
+            query_text?: string | null;
+            /**
+             * Format: uint64
+             * @default 10
+             */
+            k: number;
+            /** @description Named profile; omitted = retrieval-only output. */
+            rank_profile?: string | null;
+            rank_overrides?: components["schemas"]["RankOverrides"];
+        };
+        ScoreComponent: {
+            /** @description e.g. bm25(title), closeness(embedding), model(rerank-v3). */
+            name: string;
+            /** Format: double */
+            value: number;
+            /** Format: double */
+            weight: number;
+            /**
+             * Format: double
+             * @description Typically value * weight.
+             */
+            contribution: number;
+        };
+        RankScoreVector: {
+            /** Format: float */
+            primary: number;
+            /** @description JSON-friendly phase ordinal (not the kernel newtype). */
+            phase: number;
+            components?: components["schemas"]["ScoreComponent"][];
+        };
+        RankScoredHit: {
+            id: string;
+            /** Format: float */
+            score: number;
+            score_vector?: components["schemas"]["RankScoreVector"];
+            match_features?: {
+                [key: string]: number;
+            };
+            summary_features?: {
+                [key: string]: number;
+            };
+        };
+        RankSearchResponse: {
+            hits: components["schemas"]["RankScoredHit"][];
+            phase_truncated: boolean;
+            rank_profile?: string | null;
+            /** Format: uint32 */
+            rank_profile_version?: number | null;
+        };
+        /** @description Serialized collection info (open field set). */
+        DocOpenObject: {
+            [key: string]: unknown;
+        };
+        DocCollectionListResponse: {
+            collections: components["schemas"]["DocOpenObject"][];
+        };
+        DocCreateCollectionResponse: {
+            success: boolean;
+            collection: components["schemas"]["DocOpenObject"];
+        };
+        DocDeleteAck: {
+            success: boolean;
+            /** @description Present on document deletes; absent on collection deletes. */
+            id?: string;
+        };
+        DocIndexDefinition: {
+            name?: string | null;
+            path: string;
+            /**
+             * @description btree | hash | inverted | fulltext | geo (unknown values
+             *     fall back to btree).
+             * @default btree
+             */
+            index_type: string;
+            /** @default false */
+            unique: boolean;
+            /** @default false */
+            sparse: boolean;
+        };
+        CreateDocumentCollectionRequest: {
+            name: string;
+            indexes?: components["schemas"]["DocIndexDefinition"][];
+        };
+        DocInsertRequest: {
+            /** @description Server-assigned when omitted. */
+            id?: string | null;
+            /** @description The document body (free-form JSON). */
+            document: unknown;
+        };
+        DocResponse: {
+            id: string;
+            document: unknown;
+            /** Format: uint64 */
+            version: number;
+        };
+        DocQueryResponse: {
+            documents: components["schemas"]["DocResponse"][];
+            /** Format: uint64 */
+            total_count?: number | null;
+            has_more: boolean;
+        };
+        DocUpdateRequest: {
+            /** @description Update pipeline steps ({operation, path, value} objects). */
+            updates: unknown[];
+            /**
+             * Format: uint64
+             * @description Optimistic-concurrency guard; rejects stale writes.
+             */
+            expected_version?: number | null;
+        };
+        DocUpdateResponse: {
+            success: boolean;
+            id: string;
+            /** Format: uint64 */
+            new_version: number;
+        };
+        DocBatchInsertRequest: {
+            documents: components["schemas"]["DocInsertRequest"][];
+        };
+        DocBatchInsertResponse: {
+            /** Format: uint64 */
+            inserted: number;
+            /**
+             * Format: uint64
+             * @description Count only — per-item failures are not enumerated.
+             */
+            failed: number;
+        };
+        DocAggregateRequest: {
+            /** @description Aggregation pipeline stages (free-form). */
+            pipeline: unknown[];
+        };
+        DocAggregateResponse: {
+            results: unknown[];
+            /** Format: uint64 */
+            query_time_ms: number;
+        };
+        DocIndexListResponse: {
+            indexes: {
+                name: string | null;
+                path: string;
+                unique: boolean;
+            }[];
+        };
+        /** @description Free-form JSON (the port's serde_json::Value rendering). */
+        UnifiedOpenValue: unknown;
+        /**
+         * @description The unified surface's BARE error shape — a plain string under
+         *     `error`, NOT the canonical {error:{type,message,code}} envelope
+         *     other surfaces carry.
+         */
+        UnifiedBareError: {
+            error: string;
+        };
+        UnifiedExecuteRequest: {
+            query: string;
+            parameters?: unknown[] | null;
+            collection?: string;
+            /** Format: uint32 */
+            limit?: number | null;
+        };
+        UnifiedFederatedRequest: {
+            query: string;
+            parameters?: unknown[] | null;
+        };
+        UnifiedExplainRequest: {
+            query: string;
+            collection?: string;
+        };
+        UnifiedPrepareRequest: {
+            query: string;
+            name?: string;
+            /** @default false */
+            cache_results: boolean;
+            /** Format: uint64 */
+            ttl_seconds?: number | null;
+        };
+        UnifiedPrepareResponse: {
+            statement_id: string;
+        };
+        UnifiedExecutePreparedRequest: {
+            parameters?: unknown[] | null;
+            collection?: string;
+        };
+        UnifiedPreparedStatsRequest: {
+            statement_ids?: string[];
+        };
+        /**
+         * @description A distributed query plus an optional row limit the implementation
+         *     applies to the result. Parameter binding is not supported on this
+         *     operation; use the federated or prepared surface when needed.
+         */
+        UnifiedDistributedRequest: {
+            query: string;
+            /** Format: uint32 */
+            limit?: number | null;
+        };
     };
     responses: {
         /** @description Invalid request. */
@@ -2706,6 +5073,33 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /** @description Malformed JSON or invalid request. */
+        UnifiedBadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["UnifiedBareError"];
+            };
+        };
+        /** @description Request body is not application/json. */
+        UnifiedUnsupportedMediaType: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["UnifiedBareError"];
+            };
+        };
+        /** @description JSON body does not match the request schema. */
+        UnifiedUnprocessableEntity: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["UnifiedBareError"];
             };
         };
         /** @description Resource not found. */
@@ -2726,10 +5120,138 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
+        /**
+         * @description Missing auth context (401) — the request reached the handler with
+         *     no resolved principal, indicating the auth middleware itself is
+         *     misconfigured for this deployment (`error: "missing_auth_context"`).
+         */
+        AbacUnauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AbacOperatorErrorResponse"];
+            };
+        };
+        /**
+         * @description Authenticated but lacks `SystemAdmin` or `ConfigureSystem`
+         *     (`error: "operator_permission_required"`) — this is a
+         *     cluster-scope operator surface; a tenant's own admin permissions
+         *     do not satisfy it.
+         */
+        AbacForbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AbacOperatorErrorResponse"];
+            };
+        };
+        /**
+         * @description The tenant path/body segment has no durable stable id and the
+         *     configured catalog could not mint one (`error:
+         *     "tenant_unresolved"`).
+         */
+        AbacTenantUnresolved: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AbacOperatorErrorResponse"];
+            };
+        };
+        /**
+         * @description ABAC is compiled in (`abac-policy`) but no durable store is open
+         *     for this process (no `data_dir`), or the underlying store returned
+         *     an error (`error: "abac_unavailable"` / `"grant_store_error"` /
+         *     `"posture_store_error"` / `"tenant_mint_failed"`).
+         */
+        AbacUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AbacOperatorErrorResponse"];
+            };
+        };
+        /**
+         * @description Missing auth context (401) — the request reached the handler
+         *     with no resolved principal (`error: "missing_auth_context"`).
+         */
+        PodUnauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["PrimaryPodOperatorErrorResponse"];
+            };
+        };
+        /**
+         * @description Authenticated but lacks `SystemAdmin` or `ConfigureSystem`
+         *     (`error: "operator_permission_required"`) — a cluster-scope
+         *     operator gate.
+         */
+        PodForbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["PrimaryPodOperatorErrorResponse"];
+            };
+        };
+        /** @description Internal server error (canonical error envelope). */
+        InternalError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ErrorResponse"];
+            };
+        };
+        /**
+         * @description Invalid argument — the FULL graph envelope with success=false
+         *     and error.code INVALID_ARGUMENT (a genuine handler-emitted JSON
+         *     400 exists only on updateGraphSchema; axum extractor rejections
+         *     — malformed JSON, wrong content-type, missing required field —
+         *     are 400/415/422 with PLAIN-TEXT bodies and no envelope).
+         */
+        GraphBadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["GraphErrorResponse"];
+            };
+        };
+        /**
+         * @description Not found — the FULL graph envelope with success=false and
+         *     error.code NOT_FOUND.
+         */
+        GraphNotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["GraphErrorResponse"];
+            };
+        };
+        /**
+         * @description Internal error — the FULL graph envelope with success=false and
+         *     error.code INTERNAL_ERROR.
+         */
+        GraphInternal: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["GraphErrorResponse"];
+            };
+        };
     };
     parameters: {
         GraphId: string;
         NodeId: string;
+        EdgeId: string;
     };
     requestBodies: never;
     headers: never;
@@ -2748,7 +5270,7 @@ export interface operations {
                 include_stats?: boolean;
             };
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -2771,7 +5293,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -2807,7 +5329,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -2842,7 +5364,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -2877,7 +5399,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -2925,7 +5447,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -2973,7 +5495,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3021,7 +5543,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3067,7 +5589,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3113,7 +5635,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3152,7 +5674,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3223,7 +5745,7 @@ export interface operations {
                 include_text?: boolean;
             };
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3260,7 +5782,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3288,7 +5810,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3323,7 +5845,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3362,7 +5884,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3401,7 +5923,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3449,7 +5971,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3497,7 +6019,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3520,7 +6042,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3565,7 +6087,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3600,7 +6122,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3657,7 +6179,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3705,7 +6227,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3741,7 +6263,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3777,7 +6299,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3840,7 +6362,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3863,7 +6385,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3886,7 +6408,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3909,7 +6431,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3932,7 +6454,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3940,22 +6462,23 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Graph collection listing. */
+            /** @description Graph collection listing (envelope; data = array). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ListGraphsResponse"];
+                    "application/json": components["schemas"]["GraphCollectionListResponse"];
                 };
             };
+            500: components["responses"]["GraphInternal"];
         };
     };
     createGraph: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -3967,8 +6490,8 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Graph collection metadata. */
-            200: {
+            /** @description Graph collection created (envelope; data = serialized collection). */
+            201: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3976,14 +6499,15 @@ export interface operations {
                     "application/json": components["schemas"]["GraphCollectionResponse"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            400: components["responses"]["GraphBadRequest"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     getGraph: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -3993,7 +6517,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Graph collection metadata. */
+            /** @description Graph collection metadata (envelope; data = serialized collection). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4002,14 +6526,15 @@ export interface operations {
                     "application/json": components["schemas"]["GraphCollectionResponse"];
                 };
             };
-            404: components["responses"]["NotFound"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     deleteGraph: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4019,23 +6544,54 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Deletion acknowledged. */
+            /** @description Graph collection deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    updateGraphSchema: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateGraphSchemaRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated collection (envelope). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DeleteGraphResponse"];
+                    "application/json": components["schemas"]["GraphCollectionResponse"];
                 };
             };
-            404: components["responses"]["NotFound"];
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     createNode: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4049,24 +6605,25 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Created node. */
-            200: {
+            /** @description Created node (envelope). */
+            201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["NodeResponse"];
+                    "application/json": components["schemas"]["GraphNodeResponse"];
                 };
             };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     getNode: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4077,23 +6634,57 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Node payload. */
+            /** @description Node payload (envelope). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["NodeResponse"];
+                    "application/json": components["schemas"]["GraphNodeResponse"];
                 };
             };
-            404: components["responses"]["NotFound"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    updateNode: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NodeInput"];
+            };
+        };
+        responses: {
+            /** @description Updated node (envelope). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphNodeResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     deleteNode: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4104,23 +6695,52 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Deletion acknowledged. */
+            /** @description Deleted node (envelope — the deleted node is echoed). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DeleteNodeResponse"];
+                    "application/json": components["schemas"]["GraphNodeResponse"];
                 };
             };
-            404: components["responses"]["NotFound"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    getNodeNeighbors: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+                node_id: components["parameters"]["NodeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Neighbor nodes (envelope; data = node array). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphNodeListResponse"];
+                };
+            };
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     createEdge: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4134,24 +6754,114 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Created edge. */
+            /** @description Created edge (envelope). */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphEdgeResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    getEdge: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+                edge_id: components["parameters"]["EdgeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Edge payload (envelope). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["EdgeResponse"];
+                    "application/json": components["schemas"]["GraphEdgeResponse"];
                 };
             };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    updateEdge: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+                edge_id: components["parameters"]["EdgeId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EdgeInput"];
+            };
+        };
+        responses: {
+            /** @description Updated edge (envelope). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphEdgeResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    deleteEdge: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+                edge_id: components["parameters"]["EdgeId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted edge (envelope — the deleted edge is echoed). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphEdgeResponse"];
+                };
+            };
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     batchCreateNodes: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4165,24 +6875,25 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Batch result. */
+            /** @description Batch outcome (envelope). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BatchNodesResponse"];
+                    "application/json": components["schemas"]["GraphBatchNodesResponse"];
                 };
             };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     batchCreateEdges: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4196,24 +6907,25 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Batch result. */
+            /** @description Batch outcome (envelope). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["BatchEdgesResponse"];
+                    "application/json": components["schemas"]["GraphBatchEdgesResponse"];
                 };
             };
-            400: components["responses"]["BadRequest"];
-            404: components["responses"]["NotFound"];
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
     traverseGraph: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4227,23 +6939,217 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Traversal result. */
+            /** @description Traversal result (envelope). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TraverseResponse"];
+                    "application/json": components["schemas"]["GraphTraversalResponse"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
         };
     };
-    getGraphStats: {
+    walkGraph: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WalkRequest"];
+            };
+        };
+        responses: {
+            /** @description Walk result (envelope; traversal shape). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphTraversalResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    stepGraph: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WalkStepRequest"];
+            };
+        };
+        responses: {
+            /** @description Step result (envelope). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphTraversalResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    shortestPath: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ShortestPathRequest"];
+            };
+        };
+        responses: {
+            /** @description Shortest-path result (envelope; found=false when unreachable). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphShortestPathResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    executeGraphQuery: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Query result (envelope; data carries rows and row_count). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphQueryResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    queryNodes: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphNodeQuery"];
+            };
+        };
+        responses: {
+            /** @description Matching nodes (envelope; QueryResults shape). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphNodeQueryResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    queryEdges: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphEdgeQuery"];
+            };
+        };
+        responses: {
+            /** @description Matching edges (envelope; QueryResults shape). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphEdgeQueryResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    getConnectedComponents: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4253,7 +7159,125 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Graph statistics. */
+            /** @description Components (envelope; data carries the node-id arrays). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphComponentsResponse"];
+                };
+            };
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    checkCycles: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cycle check (envelope; data carries has_cycle). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphCyclesResponse"];
+                };
+            };
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    addUniqueConstraint: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UniqueConstraintRequest"];
+            };
+        };
+        responses: {
+            /** @description DDL outcome (envelope; data carries success). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphDdlResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    removeUniqueConstraint: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UniqueConstraintRequest"];
+            };
+        };
+        responses: {
+            /** @description DDL outcome (envelope; data carries success). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphDdlResponse"];
+                };
+            };
+            400: components["responses"]["GraphBadRequest"];
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    getGraphStats: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                graph_id: components["parameters"]["GraphId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Graph statistics (envelope; data = GraphStats). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4262,13 +7286,686 @@ export interface operations {
                     "application/json": components["schemas"]["GraphStatsResponse"];
                 };
             };
+            404: components["responses"]["GraphNotFound"];
+            500: components["responses"]["GraphInternal"];
+        };
+    };
+    listTimeseriesCollections: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tenant-scoped collection configs. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TsListResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createTimeseriesCollection: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TsCollectionConfig"];
+            };
+        };
+        responses: {
+            /** @description Created (echoes the tenant-clean name). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TsCreateResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteTimeseriesCollection: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deletion outcome. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TsDeleteResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    ingestTimeseries: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TsIngestRequest"];
+            };
+        };
+        responses: {
+            /** @description Ingest count. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TsIngestResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    queryTimeseries: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TsQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Matching points. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TsQueryResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    aggregateTimeseries: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TsAggregateRequest"];
+            };
+        };
+        responses: {
+            /** @description Aggregation buckets (free-form result objects). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TsAggregateResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    executeUnifiedQuery: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnifiedExecuteRequest"];
+            };
+        };
+        responses: {
+            /** @description Query result (free-form — the port's JSON rendering). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedOpenValue"];
+                };
+            };
+            400: components["responses"]["UnifiedBadRequest"];
+            415: components["responses"]["UnifiedUnsupportedMediaType"];
+            422: components["responses"]["UnifiedUnprocessableEntity"];
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    executeMultiModelQuery: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnifiedOpenValue"];
+            };
+        };
+        responses: {
+            /** @description Query result (free-form). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedOpenValue"];
+                };
+            };
+            400: components["responses"]["UnifiedBadRequest"];
+            415: components["responses"]["UnifiedUnsupportedMediaType"];
+            422: components["responses"]["UnifiedUnprocessableEntity"];
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    executeFederatedQuery: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnifiedFederatedRequest"];
+            };
+        };
+        responses: {
+            /** @description Query result (free-form). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedOpenValue"];
+                };
+            };
+            400: components["responses"]["UnifiedBadRequest"];
+            415: components["responses"]["UnifiedUnsupportedMediaType"];
+            422: components["responses"]["UnifiedUnprocessableEntity"];
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    executeDistributedQuery: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnifiedDistributedRequest"];
+            };
+        };
+        responses: {
+            /** @description Query result (free-form). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedOpenValue"];
+                };
+            };
+            400: components["responses"]["UnifiedBadRequest"];
+            415: components["responses"]["UnifiedUnsupportedMediaType"];
+            422: components["responses"]["UnifiedUnprocessableEntity"];
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    explainUnifiedQuery: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnifiedExplainRequest"];
+            };
+        };
+        responses: {
+            /** @description The plan (free-form). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedOpenValue"];
+                };
+            };
+            400: components["responses"]["UnifiedBadRequest"];
+            415: components["responses"]["UnifiedUnsupportedMediaType"];
+            422: components["responses"]["UnifiedUnprocessableEntity"];
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    prepareStatement: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnifiedPrepareRequest"];
+            };
+        };
+        responses: {
+            /** @description Prepared — the statement id. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedPrepareResponse"];
+                };
+            };
+            400: components["responses"]["UnifiedBadRequest"];
+            415: components["responses"]["UnifiedUnsupportedMediaType"];
+            422: components["responses"]["UnifiedUnprocessableEntity"];
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    executePreparedStatement: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                statement_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnifiedExecutePreparedRequest"];
+            };
+        };
+        responses: {
+            /** @description Query result (free-form). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedOpenValue"];
+                };
+            };
+            400: components["responses"]["UnifiedBadRequest"];
+            415: components["responses"]["UnifiedUnsupportedMediaType"];
+            422: components["responses"]["UnifiedUnprocessableEntity"];
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    deletePreparedStatement: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                statement_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /**
+             * @description Deleted. NOTE an unknown (or already-deleted) statement id
+             *     is a 500 with the bare error shape — not a 204 and not a
+             *     404; an expired-but-not-evicted id may still 204.
+             */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    getPreparedStats: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnifiedPreparedStatsRequest"];
+            };
+        };
+        responses: {
+            /** @description Stats (free-form). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedOpenValue"];
+                };
+            };
+            400: components["responses"]["UnifiedBadRequest"];
+            415: components["responses"]["UnifiedUnsupportedMediaType"];
+            422: components["responses"]["UnifiedUnprocessableEntity"];
+            /** @description Port error — the BARE error shape (a plain string under error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+            /** @description The port returned not-implemented (non-default constructions). */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UnifiedBareError"];
+                };
+            };
+        };
+    };
+    rankSearch: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RankSearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Ranked hits. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RankSearchResponse"];
+                };
+            };
+            /**
+             * @description Invalid rank profile or malformed JSON. Both handler and extractor
+             *     errors use the canonical JSON envelope.
+             */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Request body is missing the application/json content type. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description JSON body has the wrong shape or omits a required field. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            /**
+             * @description The server was constructed without RankServices — NOT the
+             *     default deployment (the default server wires the pipeline
+             *     and returns 200s); reachable in embedded/test constructions.
+             */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     hybridSearch: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -4306,7 +8003,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -4337,7 +8034,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -4345,24 +8042,23 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Collections. */
+            /** @description Collections (an object carrying the array). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["DocCollectionListResponse"];
                 };
             };
+            500: components["responses"]["InternalError"];
         };
     };
     createDocumentCollection: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -4370,30 +8066,28 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": {
-                    [key: string]: unknown;
-                };
+                "application/json": components["schemas"]["CreateDocumentCollectionRequest"];
             };
         };
         responses: {
-            /** @description Created. */
+            /** @description Creation ack (success + collection). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["DocCreateCollectionResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
         };
     };
-    queryDocuments: {
+    getDocumentCollection: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4403,24 +8097,96 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Documents. */
+            /** @description Collection info. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["DocOpenObject"];
                 };
             };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteDocumentCollection: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deletion acknowledged (success flag). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocDeleteAck"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    queryDocuments: {
+        parameters: {
+            query?: {
+                /** @description Filter expression (server-parsed). */
+                filter?: string;
+                /** @description Comma-separated field list. */
+                projection?: string;
+                /** @description Defaults to 100. */
+                limit?: number;
+            };
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Matching documents. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocQueryResponse"];
+                };
+            };
+            /**
+             * @description Invalid filter JSON (canonical envelope) — the only 400
+             *     this op can emit; malformed query strings are axum plain
+             *     text.
+             */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            500: components["responses"]["InternalError"];
         };
     };
     insertDocument: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4430,31 +8196,228 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": {
-                    [key: string]: unknown;
-                };
+                "application/json": components["schemas"]["DocInsertRequest"];
             };
         };
         responses: {
-            /** @description Inserted. */
+            /** @description The stored document (with its version). */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["DocResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getDocument: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated field list. */
+                projection?: string;
+            };
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The document. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocResponse"];
                 };
             };
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteDocument: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deletion acknowledged (success + id). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocDeleteAck"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    updateDocument: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Update outcome (success, id, new_version). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocUpdateResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    batchInsertDocuments: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocBatchInsertRequest"];
+            };
+        };
+        responses: {
+            /** @description Counts (inserted + failed; failures counted, not enumerated). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocBatchInsertResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    aggregateDocuments: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocAggregateRequest"];
+            };
+        };
+        responses: {
+            /** @description Aggregation results (free-form) + timing. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocAggregateResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listDocumentIndexes: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Index definitions (name, path, unique). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocIndexListResponse"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createDocumentIndex: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DocIndexDefinition"];
+            };
+        };
+        responses: {
+            400: components["responses"]["BadRequest"];
         };
     };
     ingestLog: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4481,13 +8444,22 @@ export interface operations {
                     };
                 };
             };
+            /** @description Storage/processing failure (maps to internal_error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     queryLogs: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4514,13 +8486,22 @@ export interface operations {
                     };
                 };
             };
+            /** @description Storage/processing failure (maps to internal_error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     createObservabilityNamespace: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -4543,13 +8524,22 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            /** @description Storage/processing failure (maps to internal_error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     ingestLogs: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4574,13 +8564,22 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            /** @description Storage/processing failure (maps to internal_error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     ingestMetric: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4605,13 +8604,22 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            /** @description Storage/processing failure (maps to internal_error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     ingestMetrics: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4636,13 +8644,22 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            /** @description Storage/processing failure (maps to internal_error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     aggregateMetrics: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path: {
@@ -4667,13 +8684,22 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            /** @description Storage/processing failure (maps to internal_error). */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
         };
     };
     translateNaturalLanguage: {
         parameters: {
             query?: never;
             header?: {
-                /** @description Optional explicit tenant selector. Applied only when there is no authenticated tenant context — a JWT tenant claim takes precedence, and a header that disagrees with the authenticated tenant is rejected. Absent ⇒ the default tenant. Tenant isolation is structural on the server; this header only selects the tenant. */
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
                 "X-Tenant-ID"?: string;
             };
             path?: never;
@@ -4705,6 +8731,766 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
+        };
+    };
+    putPolicyBinding: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                tenant: string;
+                object_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AbacPutPolicyBindingRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored binding (tenant string resolved to its stable id). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacPolicyBinding"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    deletePolicyBinding: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                tenant: string;
+                object_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Binding removed (or already absent). */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    listPolicyBindings: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                tenant: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tenant's policy bindings. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacPolicyBindingsResponse"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    getTenantPosture: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                tenant: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tenant's explicit posture. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacTenantSecurityPosture"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            /** @description No explicit posture record (tenant inherits the process default). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacOperatorErrorResponse"];
+                };
+            };
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    putTenantPosture: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                tenant: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AbacPutTenantPostureRequest"];
+            };
+        };
+        responses: {
+            /** @description The tenant's updated posture. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacTenantSecurityPosture"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    postGrant: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AbacPostGrantRequest"];
+            };
+        };
+        responses: {
+            /** @description The provisioned grant id. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacPostGrantResponse"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    listGrants: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                owner_tenant: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The owner's grants (including revoked/expired ones). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacGrantRecord"][];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    deleteGrant: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                owner_tenant: string;
+                grant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Grant revoked (or already unknown/revoked). */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    listAttributeBindings: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every attribute binding. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacAttributeBindingsResponse"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    postAttributeBinding: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AbacPostAttributeBindingRequest"];
+            };
+        };
+        responses: {
+            /** @description The stored attribute binding. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacAttributeBinding"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            422: components["responses"]["AbacTenantUnresolved"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    listPredicateObjects: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every predicate object. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacPredicateObjectsResponse"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    getPredicateObject: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                object_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The predicate object. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacPredicateObjectResponse"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            /** @description No predicate object registered under this object_id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacOperatorErrorResponse"];
+                };
+            };
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    putPredicateObject: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                object_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AbacFilterExpression"];
+            };
+        };
+        responses: {
+            /** @description The registered predicate object. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AbacPredicateObjectResponse"];
+                };
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    deletePredicateObject: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                object_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Predicate object revoked (or already absent). */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["AbacUnauthorized"];
+            403: components["responses"]["AbacForbidden"];
+            503: components["responses"]["AbacUnavailable"];
+        };
+    };
+    getCollectionPin: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current pin state (pinned or unpinned). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PinResponse"];
+                };
+            };
+        };
+    };
+    patchCollectionPin: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PinRequest"];
+            };
+        };
+        responses: {
+            /** @description The resulting pin state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PinResponse"];
+                };
+            };
+            /**
+             * @description `pinned: true` without `target`. The body is PLAIN TEXT
+             *     (axum `(StatusCode, String)` error path), not JSON.
+             */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
+    listCollectionPins: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All pin entries. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PinListResponse"];
+                };
+            };
+        };
+    };
+    getCollectionAffinity: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The affinity entry (or its absence). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AffinityResponse"];
+                };
+            };
+        };
+    };
+    deleteCollectionAffinity: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Drop outcome. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AffinityDeleteResponse"];
+                };
+            };
+        };
+    };
+    listCollectionAffinities: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All affinity entries on this node. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AffinityListResponse"];
+                };
+            };
+        };
+    };
+    getPrimaryPod: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                tenant_id: string;
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The binding (bound or unbound). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrimaryPodLookupResponse"];
+                };
+            };
+            401: components["responses"]["PodUnauthorized"];
+            403: components["responses"]["PodForbidden"];
+        };
+    };
+    putPrimaryPod: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                tenant_id: string;
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrimaryPodAssignRequest"];
+            };
+        };
+        responses: {
+            /** @description The assignment (with the previous binding when re-assigning). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrimaryPodAssignResponse"];
+                };
+            };
+            401: components["responses"]["PodUnauthorized"];
+            403: components["responses"]["PodForbidden"];
+        };
+    };
+    deletePrimaryPod: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path: {
+                tenant_id: string;
+                collection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unassign outcome. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrimaryPodUnassignResponse"];
+                };
+            };
+            401: components["responses"]["PodUnauthorized"];
+            403: components["responses"]["PodForbidden"];
+        };
+    };
+    listPrimaryPods: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All bindings. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrimaryPodListResponse"];
+                };
+            };
+            401: components["responses"]["PodUnauthorized"];
+            403: components["responses"]["PodForbidden"];
+        };
+    };
+    getCatalogTableRouting: {
+        parameters: {
+            query?: {
+                /** @description Filter to one table (case-insensitive name match). */
+                table_name?: string;
+            };
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Routing rows (columns/column_types/rows, all strings). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogIntrospectionResult"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    explainTableWriteRoute: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Optional explicit tenant selector. An authenticated tenant binding takes precedence and a mismatch is rejected, except that an authenticated gateway principal may delegate an acting tenant when gateway-only trust is configured. Without an authenticated binding, acceptance depends on the configured header trust policy. When both this header and an authenticated tenant binding are absent, a single-tenant deployment selects its configured default tenant and a multi-tenant deployment rejects the request. Tenant isolation is structural on the server; this header only selects the tenant. */
+                "X-Tenant-ID"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableWriteExplainRequest"];
+            };
+        };
+        responses: {
+            /** @description The route explanation (no write executed). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableWriteRouteExplanation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
         };
     };
 }
