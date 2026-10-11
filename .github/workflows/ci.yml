@@ -73,6 +73,7 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 2 min over 14 runs, 2026-10-09..11
     outputs:
       # Three-tier CI (feat -> develop -> qa -> main):
       #   * feat -> develop runs the LIGHT jobs (compile + fmt/clippy + layering
@@ -414,6 +415,7 @@ jobs:
   hygiene-check:
     name: Hygiene Guardrails
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -453,6 +455,7 @@ jobs:
   repository-identity:
     name: Canonical Repository Identity
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -462,6 +465,7 @@ jobs:
   docs-authority:
     name: Docs Authority (no retired/engine drift)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.docs == 'true'
     steps:
@@ -474,6 +478,7 @@ jobs:
   risk-coverage:
     name: Risk-Coverage Contract
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.docs == 'true'
     steps:
@@ -484,6 +489,7 @@ jobs:
   oss-docs-decontamination:
     name: OSS Docs Decontamination
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     steps:
       - uses: actions/checkout@v7
@@ -495,6 +501,7 @@ jobs:
   rust-format:
     name: Rust Format
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -511,6 +518,7 @@ jobs:
   capability-matrix:
     name: Capability Matrix
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     # Run on rust changes (evidence refs point at source) AND on docs changes:
     # the validator now also guards the maturity-contract reconciliation in
@@ -549,6 +557,12 @@ jobs:
   proto-compat:
     name: Proto Compatibility (T4.2)
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # was 20, which is BELOW two real green runs: 31.0 min (run 33717025328)
+    # and 22.1 min (34268005745). Neither is a hang -- `Install Python SDK
+    # (editable) and test deps` took 29.1 and 20.0 min of them, i.e. pip
+    # dependency resolution. An earlier revision claimed a ~9 min wider-history
+    # figure; that was wrong.
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.proto == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     steps:
@@ -600,6 +614,7 @@ jobs:
   openapi-spec-drift:
     name: OpenAPI Spec From Code (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 60  # max 29 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -628,6 +643,7 @@ jobs:
   go-sdk-codegen-drift:
     name: Go SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.go_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -660,6 +676,7 @@ jobs:
   ts-sdk-codegen-drift:
     name: TS SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.nodejs_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -687,6 +704,7 @@ jobs:
   rust-sdk-codegen-drift:
     name: Rust SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 3 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -737,6 +755,8 @@ jobs:
   python-sdk-codegen-drift:
     name: Python SDK Codegen Drift (TD-126)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # max 7 min over 14 runs, 2026-10-09..11 (run 37870748694)
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -769,6 +789,7 @@ jobs:
   python-sdk-round-trip:
     name: Python SDK round-trip (ADR-068 D5)
     runs-on: ubuntu-24.04
+    timeout-minutes: 70  # max 36 min over 14 runs, 2026-10-09..11 (run 37880949062)
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
@@ -811,6 +832,7 @@ jobs:
   panic-policy-report:
     name: Panic Policy Report (WS-2 Stage 1)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -833,6 +855,7 @@ jobs:
   panic-policy-no-regression:
     name: Panic Policy No Regression (WS-2 Stage 2)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: [changes, panic-policy-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -849,6 +872,7 @@ jobs:
   panic-policy-module-guard:
     name: Panic Policy Critical Modules (WS-2 Stage 3)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: [changes, panic-policy-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.panic_policy == 'true'
     steps:
@@ -869,6 +893,7 @@ jobs:
   v1-proto-usage-report:
     name: v1 Proto Usage Report (TD-123)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.v1_proto_usage == 'true'
     steps:
@@ -891,6 +916,7 @@ jobs:
   v1-proto-usage-no-regression:
     name: v1 Proto Usage No Regression (TD-123)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: [changes, v1-proto-usage-report]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.v1_proto_usage == 'true'
     steps:
@@ -907,6 +933,7 @@ jobs:
   rust-clippy:
     name: Rust Clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 30  # max 13 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -958,6 +985,10 @@ jobs:
   feature-matrix:
     name: Feature Matrix (${{ matrix.label }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    # max 53 min over 14 runs, 2026-10-09..11, 14 legs. An earlier comment said 15: GitHub
+    # reports a SKIPPED matrix job under its raw un-expanded name, which the
+    # sample counted as a leg.
     needs: changes
     if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true'
     strategy:
@@ -1056,6 +1087,7 @@ jobs:
   rust-security:
     name: Security Audit
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 4 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -1070,6 +1102,8 @@ jobs:
   python-lint:
     name: Python Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    # was 15 against a 12.8-min green span (SDK dependency install)
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.proto == 'true'
     steps:
@@ -1107,6 +1141,7 @@ jobs:
   go-lint:
     name: Go SDK Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.go_sdk == 'true'
     steps:
@@ -1129,6 +1164,7 @@ jobs:
   nodejs-lint:
     name: Node.js SDK Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.nodejs_sdk == 'true'
     steps:
@@ -1146,6 +1182,7 @@ jobs:
   ui-build:
     name: Admin UI Install + Build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 2 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.ui == 'true'
     steps:
@@ -1165,6 +1202,9 @@ jobs:
   rust-sdk-lint:
     name: Rust SDK Lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    # max 3 min over 14 runs, 2026-10-09..11; full history holds 12.0 min, pre-dating the
+    # same 2026-09-02 dependency fix as sdk-contract-gates.
     needs: changes
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true'
     steps:
@@ -1197,6 +1237,12 @@ jobs:
   sdk-contract-gates:
     name: SDK OpenAPI Contract Gate (${{ matrix.sdk }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # max 4 min over 14 runs, 2026-10-09..11, 3 legs. Full history holds a 26.4-min
+    # observation (2026-08); that collapsed to ~3 min on 2026-09-02 when
+    # `clients/rust/Cargo.toml` dropped its non-optional path dep on
+    # proximadb-embedded and stopped dragging the monolith. Capped above the old
+    # figure so a regression of that dep fails loudly instead of by cancellation.
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1276,6 +1322,7 @@ jobs:
   connectors-contract-gates:
     name: Connectors Contract Gate (${{ matrix.kind }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 60  # max 28 min over 14 runs, 2026-10-09..11, 2 legs (rest/flight)
     needs: changes
     if: |
       needs.changes.outputs.openapi_spec == 'true' ||
@@ -1324,6 +1371,14 @@ jobs:
   spark-jni-smoke:
     name: Spark Connector JNI Smoke (TD-097)
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # NOT measured: path-gated on spark_jni, so it is absent from the sample.
+    # `clients/jvm/spark-connector/run-smoke.sh:14` builds
+    # `--manifest-path $REPO_ROOT/Cargo.toml -p proximadb-spark-jni`: ONE package,
+    # but `crates/binding/proximadb-spark-jni` carries a non-optional
+    # `proximadb = { path = "../../.." }` dep, so it drags the monolith. It caches
+    # it (`workspaces: ". -> target"` below), where comparable builds measure
+    # 28-37 min. At 30 this would have cancelled the TD-097 JNI link proof.
     needs: changes
     if: needs.changes.outputs.spark_jni == 'true'
     steps:
@@ -1349,6 +1404,7 @@ jobs:
   sdk-security-scan:
     name: SDK Security Scan
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 4 min over 14 runs, 2026-10-09..11
     needs: changes
     if: |
       needs.changes.outputs.python == 'true' ||
@@ -1433,6 +1489,7 @@ jobs:
   docs-validation:
     name: Docs Validation
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
     if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.td_citations == 'true' || needs.changes.outputs.docs_site == 'true'
     steps:
@@ -1496,6 +1553,11 @@ jobs:
   rust-compile:
     name: Rust Compile (${{ matrix.shape }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # max 32 min over 14 runs, 2026-10-09..11 (run 37926571641, `Rust Compile
+    # (test)`), 2 legs (lib/test). An earlier comment said 28 min / 4 legs: 28
+    # understated the window, and the 4 counted the SEPARATE rust-compile-benches
+    # job, whose literal name `Rust Compile (benches)` the prefix also matches.
     needs: changes
     if: needs.changes.outputs.compile == 'true'
     # CARGO_BUILD_JOBS=1: serial compilation keeps peak memory bounded. The
@@ -1551,6 +1613,7 @@ jobs:
   rust-compile-benches:
     name: Rust Compile (benches)
     runs-on: ubuntu-24.04
+    timeout-minutes: 50  # max 25 min over 14 runs, 2026-10-09..11
     needs: [changes]
     if: needs.changes.outputs.compile == 'true' && needs.changes.outputs.medium_tier == 'true'
     env:
@@ -1591,6 +1654,8 @@ jobs:
   rust-build:
     name: Rust Build (${{ matrix.profile }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    # max 37 min over 14 runs, 2026-10-09..11, 2 legs (dev/release)
     needs: [changes]
     if: needs.changes.outputs.rust == 'true' && !inputs.skip_tests
     strategy:
@@ -1667,8 +1732,10 @@ jobs:
     name: Rust Tests (${{ matrix.test-type }})
     runs-on: ubuntu-24.04
     # Fail fast instead of the 360-min default if a hang sneaks in; the healthy
-    # job finishes in ~30-45 min (compile-bound at CARGO_BUILD_JOBS=1).
-    timeout-minutes: 90
+    # job finishes in 51-70 min, measured from step spans (compile-bound at
+    # CARGO_BUILD_JOBS=1). An earlier note here said ~30-45; that understated it.
+    timeout-minutes: 120
+    # was 90; step spans reach 51-70 min
     needs: [changes, rust-build]
     if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true' && !inputs.skip_tests
     # NO sccache here (reverted from #920): with RUSTC_WRAPPER=sccache this job's
@@ -1810,7 +1877,8 @@ jobs:
     # 709/710 fast tests pass before the job was cancelled on the final N=100k
     # recall harness. If a future dependency edge makes the remaining graph
     # heavy again, fail after 10 wasted minutes, not 15.
-    timeout-minutes: 10
+    timeout-minutes: 20
+    # was 10 against a 9.6-min green span (1.04x)
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1934,11 +2002,14 @@ jobs:
     # The `--restart` scope (scripts/run_cloud_emulator_tests.sh) builds 3 test
     # targets across distinct cloud feature sets (azure; aws,azure,gcp) at
     # CARGO_BUILD_JOBS=1 (OOM-safe on the 16GB runner). No other CI job builds
-    # these feature sets, so they are always a COLD compile (~85-90 min) — the
-    # prior 90-min budget timed out at the edge. Bumped to 150 for reliable
+    # these feature sets, so they are always a COLD compile. Measured step span
+    # 129.8 min, not the ~85-90 an earlier note claimed, which is why 150 was
+    # only 1.16x. Bumped again to 200 for
     # headroom. (Efficiency follow-up: warm these feature sets in a shared
     # earlier job, or split the contract test out of --restart.)
-    timeout-minutes: 150
+    timeout-minutes: 200
+    # was 150 against a measured 129-min step span (1.16x) -- a TIGHTER ratio
+    # than the 45-vs-43 docker-build case this PR exists to fix.
     needs: [changes]
     if: |
       !inputs.skip_tests &&
@@ -2170,7 +2241,8 @@ jobs:
   rust-integration-test-authz:
     name: Rust Integration Tests (authz e2e)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45; green spans reach 30-34 min across the integration legs
     env:
       RUST_MIN_STACK: "8388608"
     # `needs: [changes]` ONLY — deliberately not `rust-build`. `rust-build` is
@@ -2225,7 +2297,8 @@ jobs:
   rust-integration-test-query:
     name: Rust Integration Tests (query)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45; green spans reach 30-34 min across the integration legs
     needs: [changes, rust-build]
     if: |
       !inputs.skip_tests &&
@@ -2262,7 +2335,8 @@ jobs:
   rust-integration-test-pgwire-accuracy:
     name: Rust Integration Tests (pgwire accuracy)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45 against a measured 38-min step span
     needs: [changes]
     if: |
       !inputs.skip_tests &&
@@ -2356,7 +2430,8 @@ jobs:
   rust-integration-test-graph:
     name: Rust Integration Tests (graph)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45; green spans reach 30-34 min across the integration legs
     needs: [changes, rust-build]
     if: |
       !inputs.skip_tests &&
@@ -2388,7 +2463,8 @@ jobs:
   rust-integration-test-cluster:
     name: Rust Integration Tests (cluster)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
+    # was 45; green spans reach 30-34 min across the integration legs
     needs: [changes, rust-build]
     if: |
       !inputs.skip_tests &&
@@ -2475,8 +2551,9 @@ jobs:
     # `cargo tarpaulin --lib` builds the `proximadb` lib-test target: cfg(test)
     # over ~779k LOC and ~7,100 inline tests, which #1971 identified as the
     # largest codegen unit in the workspace and fixed for three other jobs with
-    # exactly these three settings. ubuntu-latest ships NO swap, so a peak above
-    # 16GB kills the runner instead of slowing down; debug info is the other
+    # exactly these three settings. ubuntu-24.04 (this job's runner) ships only
+    # ~2 GiB of swap (measured: 14 GiB total after this step adds 12), so a peak
+    # above ~18GB kills the runner instead of slowing down; debug info is the other
     # dominant term in rustc peak memory, and nothing here reads a backtrace
     # symbol. An earlier revision of this change instead removed the job from
     # `ci-success.needs`, which was wrong twice over: the tiering comment at the
@@ -2484,14 +2561,15 @@ jobs:
     # whether `continue-on-error` even lets the aggregator see a `failure` is
     # unsettled -- so de-gating may have fixed nothing while quietly ensuring the
     # job can never gate again. Fix the eviction, keep the gate.
-    timeout-minutes: 120
+    timeout-minutes: 150
+    # was 120 against a measured 86-min step span (1.4x)
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
-      # ubuntu-latest ships NO swap, so a residual peak above 16GB kills the
+      # ubuntu-24.04 ships only ~2 GiB of swap, so a residual peak above ~18GB kills the
       # runner rather than slowing down. 12G on the big ephemeral /mnt disk,
       # mirroring the three jobs #1971 fixed and the two that already had it.
       - name: Add swap headroom
@@ -2556,11 +2634,13 @@ jobs:
   python-test:
     name: Python SDK Tests (${{ matrix.python-version }})
     runs-on: ubuntu-24.04
-    # Defense-in-depth: the suite runs in ~9min (measured, TD-CI-2; the "~5min"
+    # Defense-in-depth: the suite itself runs in ~9min (measured, TD-CI-2; the
+    # job's step span reaches 14 min including setup; the "~5min"
     # this comment used to claim was stale). If a future test leaks a
     # non-daemon thread / unshutdown pool, the interpreter's atexit join can hang
     # the job for hours. Cap it so a leak fails fast instead of stalling CI.
-    timeout-minutes: 20
+    timeout-minutes: 30
+    # was 20 against a measured 14-min step span
     needs: changes
     strategy:
       matrix:
@@ -2730,7 +2810,8 @@ jobs:
   chunking-conformance:
     name: Chunking Conformance + Quality Evals (TD-CHUNK-1/3)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
+    # was 15 against a 14.4-min green span (run 33816799344, 1.04x)
     needs: changes
     if: ${{ !inputs.skip_tests && needs.changes.outputs.python == 'true' }}
     steps:
@@ -2892,7 +2973,24 @@ jobs:
   docker-build:
     name: Docker Build
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # 45 was marginal and then starved the step that matters. Measured on the
+    # v0.4.0 promotion: a WARM build took 34 min, leaving `Test Container Health`
+    # 3 min -- enough, and it ran. A COLD build took 43 min, leaving the health
+    # check 1 min before the 45-min job timeout cancelled it mid-step, so the one
+    # check in the pipeline that can detect an unreachable published port did not
+    # execute. (`Build Docker Image` had succeeded; only the health check died.)
+    #
+    # Cold builds are not rare: `deploy/docker/Dockerfile` does `COPY config/`
+    # (line 37) before its real `cargo build` (line 43), so ANY change under
+    # `config/` invalidates the build layer -- a `config/config.toml` edit did
+    # exactly that here. Moving the COPY after the build is not available:
+    # `crates/foundation/proximadb-tenant/src/tenant_tier_types.rs` does
+    # `include_str!("../../../../config/tier-config.json")`, so `config/` is a
+    # genuine compile-time input.
+    #
+    # 75 gives a cold build (~43 min) plus the health check (~3 min) real
+    # headroom instead of 2 minutes of it.
+    timeout-minutes: 75
     needs: changes
     if: (needs.changes.outputs.docker == 'true' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.extensive == 'true'
     steps:
@@ -2927,7 +3025,18 @@ jobs:
             curl -s http://localhost:5678/health | jq .
           else
             echo "=== Health Check Failed - Container Logs ==="
+            # HEAD first, not just the tail. entrypoint.sh logs its bind_address
+            # decision at container START, so `tail -100` scrolled the one line
+            # that explains an unreachable container off the top -- the reason a
+            # loopback bind survived a full promotion round looking like a
+            # timeout. Keep both: head for the boot decisions, tail for the
+            # failure.
+            echo "--- first 60 lines (entrypoint + bind decisions) ---"
+            docker logs test-container 2>&1 | head -60
+            echo "--- last 100 lines ---"
             docker logs test-container 2>&1 | tail -100
+            echo "--- what the server actually bound ---"
+            docker logs test-container 2>&1 | grep -iE 'bind|listening|starting .* on' | head -20 || true
             docker stop test-container || true
             docker rm test-container || true
             exit 1
@@ -2942,6 +3051,7 @@ jobs:
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-24.04
+    timeout-minutes: 120  # extensive-only (main); not in the develop/qa sample
     needs: [rust-build]
     if: |
       inputs.run_benchmarks ||
@@ -3029,6 +3139,11 @@ jobs:
   promotion-freshness:
     name: Promotion Freshness (head must contain source branch)
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The sub-minute figure is the git check alone. This job checks out at
+    # `fetch-depth: 0` below, and a full-history clone of a repo that only grows
+    # is the entire cost. It gates every develop->qa and qa->main promotion, so a
+    # cancellation here blocks a release behind a misleading failure.
     if: github.event_name == 'pull_request' && contains(fromJson('["qa", "main"]'), github.base_ref)
     steps:
       - uses: actions/checkout@v7
@@ -3069,9 +3184,11 @@ jobs:
     # Release-mode compile of the recall test binary (pulls the full root crate) +
     # 10k-vector ingest measured 30m17s on 2026-08-09 (#1552) — right at the prior
     # 30m cap, so it tipped to CANCELLED under normal runner variance and blocked
-    # every storage/query-touching PR via the `ci-success` aggregator. 45m gives
-    # comfortable headroom without masking a genuine hang.
-    timeout-minutes: 45
+    # every storage/query-touching PR via the `ci-success` aggregator. 60m gives
+    # comfortable headroom without masking a genuine hang (was 45m, only 1.26x
+    # of the measured 38-min step span).
+    timeout-minutes: 60
+    # was 45 against a measured 38-min step span
     # only run when search/flush/WAL/PAX/cascade code changes
     # core_changes is required, not decorative: nprobe_multiplier/min/max and the
     # coarse-probe gates live in src/core/config.rs, which matches core_changes
@@ -3128,6 +3245,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-24.04
+    timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs:
       - deterministic-commit-contract
       - rust-format

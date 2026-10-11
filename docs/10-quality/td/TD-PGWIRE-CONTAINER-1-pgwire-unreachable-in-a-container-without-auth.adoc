@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGWIRE-CONTAINER-1: pgwire is unreachable from outside a container, and making it reachable requires per-connection auth
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open — containment is correct; the gap is a missing capability, not a bug.** The published image documents `-p 5433:5433` and both documented `docker run` invocations publish it, but nothing can connect: the pgwire listener stays on `127.0.0.1:5433` by design. Attempting to move it off loopback makes the server fail closed at boot.
+| Severity | Medium — a documented port accepts no connections. No data-path or isolation risk; the failure is closed, not open.
+| Component | `config/config.toml` (`[api] pg_port`), `src/database.rs` (pgwire bind re-derivation), `crates/platform/proximadb-runtime/src/bootstrap_config.rs` (`validate_trust_only_listener`), `deploy/docker/entrypoint.sh`, `deploy/docker/docker-compose.yml`, `deploy/kubernetes/deployment.yaml`
+| Relates | TD-PGWIRE-AUTH-1 (pgwire SCRAM — the actual unblock), #1885 (containment + the `unified_bind_address` coupling), #1973, #1977
+| Pillar | SEC/OPS
+|===
+
+toc::[]
+
+== What happens
+
+`deploy/docker/entrypoint.sh` rewrites `[server] bind_address` to `0.0.0.0`, because
+`docker run -p` cannot reach a loopback listener. Every network surface derives its bind
+interface from that value.
+
+pgwire is the exception, and deliberately so. `src/database.rs` only re-derives the pgwire
+bind when `[api] pg_port` is set:
+
+[source,rust]
+----
+if let Some(pg_port) = config.api.pg_port {
+    multi_config.postgres_config.port = pg_port;
+    multi_config.postgres_config.bind_address =
+        format!("{}:{}", config.server.bind_address, pg_port).parse()?;
+}
+----
+
+With `pg_port` unset, pgwire keeps `PostgresServerConfig::default()`'s `127.0.0.1:5433` and the
+container starts. REST/gRPC/Arrow Flight bind `0.0.0.0:5678` and are reachable; pgwire is not.
+
+== Why it must not simply be switched on
+
+Setting `pg_port` in the shipped config moves pgwire to `0.0.0.0:5433`, and
+`validate_trust_only_listener` refuses that before any socket is bound:
+
+----
+Error: Failed to start multi-server: pgwire currently supports only unauthenticated
+single-tenant loopback access unless the listener enforces its own per-connection
+authentication; disable this listener in authenticated, multi-tenant, or non-loopback
+deployments
+----
+
+The predicate admits a trust-mode listener only when there is no security coordinator, the
+deployment is single-tenant, **and** the address is loopback. With `[security] enabled = false`
+the shipped image is exactly that case, so `0.0.0.0` is refused. The server exits 1 — the whole
+image dies rather than losing one port.
+
+That is the right behaviour. An unauthenticated Postgres-wire listener on `0.0.0.0` inside a
+published image would be a trust-mode database exposed to whatever the host publishes.
+
+Measured both ways with the real binary in a container (2026-10-11, #1977):
+
+[cols="2,1,2", options="header"]
+|===
+| Shipped config | Server | `curl /health` from the host
+
+| `pg_port` unset
+| starts, mux on `0.0.0.0:5678`
+| `{"status":"healthy",...}`
+
+| `pg_port = 5433` in `[api]`
+| **exit 1** at the listener preflight
+| connection refused
+|===
+
+== How it stayed hidden
+
+`6a01497ff` (#1973) added `pg_port = 5433` with the comment "5433 is the value that was already
+hardcoded, so this changes nothing outside a container." That is backwards: *setting* the key is
+what makes `database.rs` re-derive the bind at all. It did not fail immediately because the same
+image copied `/config/config.toml` after `chown -R ... /config`, leaving it root-owned while the
+server ran as uid 999 — so `entrypoint.sh` could not rewrite `bind_address`, the listener stayed
+on loopback, and the preflight passed. Two defects masking each other: the ownership bug hid the
+config bug, and `docker logs | tail -100` hid the warning that would have named the first.
+
+Pinned by `container_bind_regression_tests` in `bootstrap_config.rs`, which asserts the shipped
+config does not set `pg_port` and that a `0.0.0.0` pgwire listener is refused.
+
+== The actual unblock
+
+Per-connection authentication on the pgwire listener (**TD-PGWIRE-AUTH-1**, pgwire SCRAM). Once
+`listener_authenticated` is true the containment does not apply and the listener may bind
+`0.0.0.0` at any tenancy. Until then:
+
+* keep `pg_port` unset in the shipped config;
+* document that `-p 5433:5433` is inert in the default image, so operators do not conclude the
+  database is broken — and so nobody "fixes" it by setting `pg_port`;
+* reconsider whether `deploy/docker/docker-compose.yml` and the Kubernetes manifest should
+  publish 5433 at all while it cannot serve.
+
+== Secondary finding worth recording
+
+`b2436f234` (#1885) changed `src/network/server_builder.rs` from a hardcoded
+`unified_bind_address: "0.0.0.0"` to `unified_bind_address: bind_interface`, i.e. derived from
+`server.bind_address`. That is what made the published image bind loopback in the first place —
+`Test Container Health` had passed as recently as 2026-09-04 (run `33868485852`, on the commit
+that is the `v0.3.0` tag) with a byte-identical step and the same `bind_address = "127.0.0.1"`.
+The same commit introduced the containment that makes the obvious remedy unavailable. Whether the
+image's reachability should come from a boot-time config rewrite or from that coupling is an open
+design question; the rewrite is the containing fix, not necessarily the right layer.

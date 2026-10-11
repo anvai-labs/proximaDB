@@ -167,6 +167,9 @@ refresh_models() {
 # can still pin it: PROXIMADB_BIND_ADDRESS=127.0.0.1 restores the old behaviour,
 # and any other value is honoured verbatim.
 BIND_ADDRESS="${PROXIMADB_BIND_ADDRESS:-0.0.0.0}"
+# Set by normalize_bind_address when it cannot write the config in place; the
+# exec below then points the server at this copy instead.
+NORMALIZED_CONFIG=""
 
 # The value lands in a sed replacement, where `&` and `\` are metacharacters and
 # an embedded `"` or newline can append a whole config line. Verified: a crafted
@@ -190,8 +193,13 @@ normalize_bind_address() {
             continue
         fi
         case "${arg}" in
-            --config|-c) want_config=1 ;;
+            --config | -c) want_config=1 ;;
             --config=*) config_path="${arg#--config=}" ;;
+            # clap also accepts `-c=path` and `-cpath` for a short option with a
+            # value. Missing these meant "no --config file found" and a silent
+            # loopback bind.
+            -c=*) config_path="${arg#-c=}" ;;
+            -c?*) config_path="${arg#-c}" ;;
         esac
     done
 
@@ -199,12 +207,15 @@ normalize_bind_address() {
         echo "[entrypoint] no --config file found; leaving bind_address to the binary's default" >&2
         return 0
     fi
-    if ! grep -qE '^[[:space:]]*bind_address[[:space:]]*=' "${config_path}"; then
+    # `--` so a config path beginning with `-` is a FILE, not an option. Without
+    # it grep/sed parsed it as a flag, reported "declares no bind_address" for a
+    # file that declares one, and left the loopback bind with a reassuring log.
+    if ! grep -qE -- '^[[:space:]]*bind_address[[:space:]]*=' "${config_path}"; then
         echo "[entrypoint] ${config_path} declares no bind_address; leaving it alone" >&2
         return 0
     fi
 
-    current="$(sed -n 's/^[[:space:]]*bind_address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${config_path}" | head -1)"
+    current="$(sed -n -e 's/^[[:space:]]*bind_address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' -- "${config_path}" | head -1)"
     if [ "${current}" = "${BIND_ADDRESS}" ]; then
         echo "[entrypoint] bind_address already ${BIND_ADDRESS}" >&2
         return 0
@@ -229,15 +240,57 @@ normalize_bind_address() {
     # fails inside the `if` on a :ro mount (so `set -e` stays suspended and the
     # container still boots), and never prompts. The atomicity `mv` bought is not
     # needed here -- nothing has read the config yet, the server is exec'd after.
-    tmp="${config_path}.bind.$$"
-    if sed "s|^\([[:space:]]*bind_address[[:space:]]*=[[:space:]]*\)\"[^\"]*\"|\1\"${BIND_ADDRESS}\"|" \
-        "${config_path}" > "${tmp}" 2>/dev/null && [ -s "${tmp}" ] \
-        && cat "${tmp}" > "${config_path}" 2>/dev/null; then
+    # The scratch file goes in TMPDIR, NOT next to the config. Writing it as
+    # "${config_path}.bind.$$" meant a read-only /config (a k8s ConfigMap mount,
+    # or `--read-only` rootfs) failed at the FIRST write, so the not-writable
+    # fallback below was never even attempted -- the one shape that most needs
+    # it. mktemp also replaces a fixed, predictable path that was a
+    # symlink-follow truncate (CWE-61) in a 1777 /tmp, and 0600 keeps a config
+    # holding API keys and a JWT secret from being cloned world-readable.
+    tmp="$(mktemp "${TMPDIR:-/tmp}/proximadb-config.XXXXXX" 2>/dev/null)" || tmp=""
+    if [ -z "${tmp}" ]; then
+        # TMPDIR is preferred because it survives a read-only /config, but it is
+        # not always the writable one: `--read-only` rootfs with a WRITABLE
+        # /config bind mount and no tmpfs is the mirror image, and the earlier
+        # next-to-the-config placement handled exactly that. Try both.
+        tmp="$(mktemp "$(dirname "${config_path}")/proximadb-config.XXXXXX" 2>/dev/null)" || tmp=""
+    fi
+    if [ -z "${tmp}" ]; then
+        echo "[entrypoint] WARN: no writable scratch dir (tried TMPDIR=${TMPDIR:-/tmp} and $(dirname "${config_path}")); leaving bind_address ${current}. The container will NOT be reachable on its published ports." >&2
+        return 0
+    fi
+    chmod 0600 "${tmp}" 2>/dev/null || true
+
+    if ! sed "s|^\([[:space:]]*bind_address[[:space:]]*=[[:space:]]*\)\"[^\"]*\"|\1\"${BIND_ADDRESS}\"|" \
+        -- "${config_path}" > "${tmp}" 2>/dev/null || [ ! -s "${tmp}" ]; then
+        rm -f "${tmp}"
+        echo "[entrypoint] WARN: could not normalize ${config_path}; leaving ${current}. The container will NOT be reachable on its published ports." >&2
+        return 0
+    fi
+
+    # Braces, not just a command redirect: `cat x > y 2>/dev/null` lets the
+    # SHELL's own "cannot create y: Permission denied" through, which lands in
+    # the CI log head looking like a crash. Grouping redirects that too.
+    if { cat "${tmp}" > "${config_path}"; } 2>/dev/null; then
         rm -f "${tmp}"
         echo "[entrypoint] bind_address ${current} -> ${BIND_ADDRESS} (container reachability; set PROXIMADB_BIND_ADDRESS to override)" >&2
     else
-        rm -f "${tmp}"
-        echo "[entrypoint] WARN: could not rewrite bind_address in ${config_path}; leaving ${current}" >&2
+        # In-place failed. Two real causes, both observed: the file is root-owned
+        # 0644 while we run as uid 999 (the Dockerfile COPY landed before the
+        # chown -- fixed there, but a bind-mounted config can reproduce it), and
+        # docker-compose.yml mounts the config `:ro`.
+        #
+        # Do NOT fall through to booting with the loopback bind. That is the
+        # defect this function exists to fix and it fails as an *unreachable
+        # container* -- `-p` cannot reach a loopback listener, the in-container
+        # HEALTHCHECK is structurally blind to it, and the CI health check's
+        # `docker logs | tail -100` scrolls this warning away. It cost one full
+        # promotion round to find. Write the normalized copy somewhere writable
+        # and point the server at that instead.
+        # The normalized file already exists and is already correct -- serve it
+        # directly rather than copying it again to a second path.
+        NORMALIZED_CONFIG="${tmp}"
+        echo "[entrypoint] ${config_path} is not writable; using a normalized copy at ${tmp} (bind_address ${current} -> ${BIND_ADDRESS})" >&2
     fi
 }
 
@@ -247,4 +300,50 @@ normalize_bind_address "$@"
 
 # Hand off to the server. `exec` so the server becomes PID 1 (signal
 # handling, OOM, healthchecks all work correctly).
+if [ -n "${NORMALIZED_CONFIG}" ]; then
+    # Rebuild the argument list with the --config value replaced, preserving
+    # every other argument and its order. Done inline rather than in a function
+    # because `set --` only rewrites the positional parameters of its own shell,
+    # and echoing the list back would corrupt any argument containing a space.
+    n=$#
+    i=0
+    want=0
+    while [ "${i}" -lt "${n}" ]; do
+        arg="$1"
+        shift
+        i=$((i + 1))
+        if [ "${want}" -eq 1 ]; then
+            want=0
+            set -- "$@" "${NORMALIZED_CONFIG}"
+            continue
+        fi
+        case "${arg}" in
+            --config | -c)
+                want=1
+                set -- "$@" "${arg}"
+                ;;
+            --config=*)
+                set -- "$@" "--config=${NORMALIZED_CONFIG}"
+                ;;
+            # Must mirror normalize_bind_address's arms exactly. They diverged
+            # once: detection accepted these two, the rebuild did not, so the
+            # server got the ORIGINAL path while the log below announced the
+            # normalized one.
+            -c=*)
+                set -- "$@" "-c=${NORMALIZED_CONFIG}"
+                ;;
+            -c?*)
+                set -- "$@" "-c${NORMALIZED_CONFIG}"
+                ;;
+            *)
+                set -- "$@" "${arg}"
+                ;;
+        esac
+    done
+    # $* is fine for a LOG line (the exec'd list above is byte-exact); it only
+    # renders ambiguously for an argument containing whitespace. The comment
+    # above is about rebuilding the list, not about printing it.
+    echo "[entrypoint] serving with the normalized config: $*" >&2
+fi
+
 exec /usr/local/bin/proximadb-server "$@"
