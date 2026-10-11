@@ -576,79 +576,131 @@ def check_conflict_markers(findings: list[Finding]) -> None:
 
 PROMOTION_REFS = ("main", "develop", "qa")
 
+# This module is deliberately dependency-free: `layering-check.yml` runs it on a
+# runner with no PyYAML, so an `import yaml` here fails the job outright (it did
+# -- `ModuleNotFoundError: No module named 'yaml'`). Parse the two blocks we need
+# from the text, the same way the rest of this contract reads workflows.
+_TOP_KEY_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?P<rest>.*)$")
 
-def _workflow_push_branches(doc: dict) -> list[str]:
-    """Branches a workflow triggers on for `push`, or [] if it has no push trigger.
 
-    `on` is the YAML 1.1 boolean `True` after safe_load, which is why this is a
-    helper rather than a one-liner.
+def _top_level_block(text: str, key: str) -> list[str]:
+    """Lines of a top-level mapping `key:`, excluding the key line itself."""
+    lines = text.splitlines()
+    out: list[str] = []
+    inside = False
+    for line in lines:
+        match = _TOP_KEY_RE.match(line)
+        if match:
+            if inside:
+                break
+            inside = match.group("key") == key
+            continue
+        if inside:
+            out.append(line)
+    return out
+
+
+def _scalar_after(block: list[str], key: str, indent: int) -> str | None:
+    """Value of `key:` at exactly `indent` spaces within `block`."""
+    pattern = re.compile(rf"^{' ' * indent}{re.escape(key)}:\s*(?P<value>.*)$")
+    for line in block:
+        found = pattern.match(line)
+        if found:
+            return found.group("value").strip()
+    return None
+
+
+def _push_branches(text: str) -> list[str]:
+    """Branches the workflow triggers on for `push`.
+
+    Returns every promotion ref when `push` is present but unqualified, since an
+    unqualified push trigger fires on all of them.
     """
-    trigger = doc.get("on", doc.get(True))
-    if isinstance(trigger, dict):
-        push = trigger.get("push")
-        if isinstance(push, dict):
-            return list(push.get("branches") or [])
-        return [] if push is None else list(PROMOTION_REFS)
-    if isinstance(trigger, list):
-        return list(PROMOTION_REFS) if "push" in trigger else []
-    return list(PROMOTION_REFS) if trigger == "push" else []
+    block = _top_level_block(text, "on")
+    if not block:
+        return []
+    push_at: int | None = None
+    for i, line in enumerate(block):
+        if re.match(r"^  push:\s*$", line):
+            push_at = i
+            break
+        if re.match(r"^  push:\s*\S", line) or re.match(r"^\s*-\s*push\s*$", line):
+            return list(PROMOTION_REFS)
+    if push_at is None:
+        return []
+    branches: list[str] = []
+    in_branches = False
+    for line in block[push_at + 1 :]:
+        if re.match(r"^  \S", line):  # next key under `on:`
+            break
+        if re.match(r"^    branches:\s*$", line):
+            in_branches = True
+            continue
+        inline = re.match(r"^    branches:\s*\[(?P<items>.*)\]\s*$", line)
+        if inline:
+            return [i.strip().strip("'\"") for i in inline.group("items").split(",") if i.strip()]
+        if in_branches:
+            item = re.match(r"^      -\s*(?P<name>\S+)\s*$", line)
+            if item:
+                branches.append(item.group("name").strip("'\""))
+                continue
+            if re.match(r"^    \S", line):
+                in_branches = False
+    return branches
 
 
 def check_promotion_concurrency(findings: list[Finding]) -> None:
-    """A workflow that runs on a promotion branch must not cancel itself.
+    """A workflow that runs on a promotion branch must not cancel its own run.
 
-    The concurrency group key across this repo is
+    The group key across this repo is
     `${{ github.workflow }}-${{ github.head_ref || github.ref_name }}`. For a
     `qa -> main` promotion the PR's `head_ref` IS `qa`, so the PR run and the
     push-to-qa run of the SAME workflow land in one group. With
     `cancel-in-progress` truthy for `qa`, whichever started second killed the
     other -- and `gh pr checks` renders a cancelled run as "fail", so the
     promotion PR displayed a phantom failure for a check that had passed on its
-    own run. That was misdiagnosed twice during the v0.4.0 cut before the cause
-    was found.
+    own run. That was misdiagnosed twice during the v0.4.0 cut.
 
     Accepted spellings are a literal `false` (qa-gate.yml) or an expression that
-    exempts every promotion ref AND pull requests targeting qa/main (ci.yml).
+    exempts every promotion ref it pushes on (ci.yml). The check applies ONLY
+    when the group key collapses a push and a PR into one value, i.e. when it
+    contains `head_ref`: a group keyed on `github.ref` alone is inherently safe,
+    because a push is `refs/heads/<b>` and a PR is `refs/pull/<n>/merge`. An
+    earlier revision omitted that condition and flagged `docs-site.yml`, which
+    cannot collide.
     """
-    import yaml  # local: this script must stay importable without the dep
-
-    workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
-    for path in workflows:
-        try:
-            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001 - a malformed workflow is another check's job
-            continue
-        if not isinstance(doc, dict):
-            continue
-        branches = _workflow_push_branches(doc)
-        touched = [b for b in branches if b in PROMOTION_REFS]
+    workflow_dir = ROOT / ".github" / "workflows"
+    if not workflow_dir.is_dir():
+        return
+    for path in sorted(workflow_dir.glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        touched = [b for b in _push_branches(text) if b in PROMOTION_REFS]
         if not touched:
             continue
-        concurrency = doc.get("concurrency")
-        if not isinstance(concurrency, dict) or "cancel-in-progress" not in concurrency:
+        block = _top_level_block(text, "concurrency")
+        if not block:
             continue
-        # The collision only exists when the GROUP KEY collapses a push and a PR
-        # of the same branch into one value, i.e. `head_ref || ref_name`. A group
-        # keyed on `github.ref` alone is inherently safe: a push is
-        # `refs/heads/<b>` and a PR is `refs/pull/<n>/merge`, so they never
-        # share a group. docs-site.yml is keyed that way and is NOT a finding --
-        # an earlier revision of this check flagged it, which was wrong.
-        group = str(concurrency.get("group", ""))
+        cancel = _scalar_after(block, "cancel-in-progress", indent=2)
+        if cancel is None:
+            continue
+        group = _scalar_after(block, "group", indent=2) or ""
         if "head_ref" not in group:
             continue
-        cancel = concurrency["cancel-in-progress"]
-        if cancel is False:
+        if cancel.strip().lower() in {"false", "'false'", '"false"'}:
             continue
-        expression = str(cancel)
-
-        def _exempted(ref: str) -> bool:
-            # Accept both the bare name and the full ref spelling.
-            return any(
-                token in expression
-                for token in (f"'{ref}'", f'"{ref}"', f"'refs/heads/{ref}'", f'"refs/heads/{ref}"')
+        missing = [
+            ref
+            for ref in touched
+            if not any(
+                token in cancel
+                for token in (
+                    f"'{ref}'",
+                    f'"{ref}"',
+                    f"'refs/heads/{ref}'",
+                    f'"refs/heads/{ref}"',
+                )
             )
-
-        missing = [ref for ref in touched if not _exempted(ref)]
+        ]
         if missing:
             findings.append(
                 Finding(
