@@ -2892,7 +2892,24 @@ jobs:
   docker-build:
     name: Docker Build
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # 45 was marginal and then starved the step that matters. Measured on the
+    # v0.4.0 promotion: a WARM build took 34 min, leaving `Test Container Health`
+    # 3 min -- enough, and it ran. A COLD build took 43 min, leaving the health
+    # check 1 min before the 45-min job timeout cancelled it mid-step, so the one
+    # check in the pipeline that can detect an unreachable published port did not
+    # execute. (`Build Docker Image` had succeeded; only the health check died.)
+    #
+    # Cold builds are not rare: `deploy/docker/Dockerfile` does `COPY config/`
+    # (line 37) before its real `cargo build` (line 43), so ANY change under
+    # `config/` invalidates the build layer -- a `config/config.toml` edit did
+    # exactly that here. Moving the COPY after the build is not available:
+    # `crates/foundation/proximadb-tenant/src/tenant_tier_types.rs` does
+    # `include_str!("../../../../config/tier-config.json")`, so `config/` is a
+    # genuine compile-time input.
+    #
+    # 75 gives a cold build (~43 min) plus the health check (~3 min) real
+    # headroom instead of 2 minutes of it.
+    timeout-minutes: 75
     needs: changes
     if: (needs.changes.outputs.docker == 'true' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.extensive == 'true'
     steps:
