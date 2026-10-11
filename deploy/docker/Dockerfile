@@ -121,7 +121,18 @@ RUN mkdir -p /data/proximadb /config /log /var/lib/proximadb/models && \
 COPY --from=builder-full /build/target/release/proximadb-server /usr/local/bin/proximadb-server
 # Config from builder-full (not the bookworm `builder`) so this target doesn't
 # pull the minimal builder's full compile into the graph — only builder-full builds.
-COPY --from=builder-full /build/config/config.toml /config/config.toml
+# --chown because the `chown -R ... /config` above runs BEFORE this COPY, so
+# without it the file lands root-owned 0644 while the server runs as uid 999.
+# That is what kept the published image binding 127.0.0.1: entrypoint.sh could
+# not rewrite bind_address, and `Test Container Health` failed with the fix
+# already present in the tree (measured: CI run 38068651767).
+#
+# It is defense-in-depth rather than load-bearing now -- entrypoint.sh also
+# falls back to serving a normalized copy it CAN write, so the image is
+# reachable either way (verified by building it without --chown). Keep it: the
+# in-place path leaves no stray file per container start, and the fallback
+# cannot help when the config is absent entirely.
+COPY --from=builder-full --chown=proximadb:proximadb /build/config/config.toml /config/config.toml
 COPY --from=models --chown=proximadb:proximadb /models/ /var/lib/proximadb/models/
 RUN chown proximadb:proximadb /usr/local/bin/proximadb-server
 USER proximadb
@@ -175,7 +186,18 @@ RUN mkdir -p /data/proximadb /config /log /var/lib/proximadb && \
 COPY --from=builder /build/target/release/proximadb-server /usr/local/bin/proximadb-server
 
 # Copy default configuration
-COPY --from=builder /build/config/config.toml /config/config.toml
+# --chown because the `chown -R ... /config` above runs BEFORE this COPY, so
+# without it the file lands root-owned 0644 while the server runs as uid 999.
+# That is what kept the published image binding 127.0.0.1: entrypoint.sh could
+# not rewrite bind_address, and `Test Container Health` failed with the fix
+# already present in the tree (measured: CI run 38068651767).
+#
+# It is defense-in-depth rather than load-bearing now -- entrypoint.sh also
+# falls back to serving a normalized copy it CAN write, so the image is
+# reachable either way (verified by building it without --chown). Keep it: the
+# in-place path leaves no stray file per container start, and the fallback
+# cannot help when the config is absent entirely.
+COPY --from=builder --chown=proximadb:proximadb /build/config/config.toml /config/config.toml
 
 # Set ownership
 RUN chown proximadb:proximadb /usr/local/bin/proximadb-server

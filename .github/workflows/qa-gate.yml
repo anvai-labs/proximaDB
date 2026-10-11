@@ -47,6 +47,7 @@ jobs:
     name: Promotion Source Guard (main <- qa only)
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # promotion-only guard; pure git check
     steps:
       - name: main PRs must originate from qa
         env:
@@ -74,6 +75,7 @@ jobs:
     name: Promotion Ancestry Guard (merge-base is current)
     if: github.event_name == 'pull_request' && (github.base_ref == 'qa' || github.base_ref == 'main')
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # promotion-only guard; pure git check
     steps:
       - uses: actions/checkout@v7
         with:
@@ -306,7 +308,7 @@ jobs:
     # Splitting the lib-test out removes one full codegen peak, so this needs
     # less than 150 -- but not 90. Record the post-split wall time in
     # TD-OBJSTORE-5 and tighten to a measured ratchet.
-    timeout-minutes: 120
+    timeout-minutes: 130  # 81.3-min green step span (run 37935965003) => 1.6x; 120 was 1.48x, under policy
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
@@ -387,7 +389,7 @@ jobs:
   mlflow-s3-artifact-seam:
     name: MLflow S3 artifact seam (LocalStack)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 80  # 49.7-min green step span => 1.6x; 75 was 1.51x, on the line
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
@@ -467,7 +469,7 @@ jobs:
     # promotion merge) — that cold ~35-40m compile + emulator round-trips pushed this
     # job past the old 60m cap on #980. 90m leaves headroom for the first (cold) run
     # while sccache warms; subsequent runs compile far less.
-    timeout-minutes: 90
+    timeout-minutes: 120  # was 90 against a 66.1-min green span (1.36x, under the 1.5x policy)
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
@@ -533,7 +535,7 @@ jobs:
   rust-coverage-ratchet:
     name: Rust Coverage Ratchet
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 130  # 80.2-min green step span => 1.6x; 90 was 1.12x and 120 only 1.50x
     # FIRST CUT: cargo-llvm-cov over the full workspace is heavy. 60m was too
     # tight — it timed out mid-lib-test-run (deep into the graph/index tests),
     # so the seed artifact was never produced. 90m lets it complete + emit the
