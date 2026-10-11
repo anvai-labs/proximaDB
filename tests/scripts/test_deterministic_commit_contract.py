@@ -202,3 +202,95 @@ class CiRunnerCommitContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromotionConcurrencyContractTest(unittest.TestCase):
+    """A workflow on a promotion branch must not cancel its own promotion run.
+
+    The group key across this repo is `head_ref || ref_name`, and a `qa -> main`
+    PR has `head_ref == 'qa'`, so the PR run and the push-to-qa run of the same
+    workflow share one group. With cancellation on, one killed the other and
+    `gh pr checks` rendered the cancellation as "fail" -- a phantom failure for
+    a check that had passed. Misdiagnosed twice during the v0.4.0 cut.
+    """
+
+    COLLAPSING_GROUP = "${{ github.workflow }}-${{ github.head_ref || github.ref_name }}"
+
+    def findings_for(self, workflow: str) -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wf_dir = root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "probe.yml").write_text(workflow, encoding="utf-8")
+            original_root = contract.ROOT
+            try:
+                contract.ROOT = root
+                findings: list[contract.Finding] = []
+                contract.check_promotion_concurrency(findings)
+                return findings
+            finally:
+                contract.ROOT = original_root
+
+    def _workflow(self, cancel: str, group: str | None = None) -> str:
+        return (
+            "name: Probe\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main, develop, qa]\n"
+            "  pull_request:\n"
+            "concurrency:\n"
+            f"  group: {group if group is not None else self.COLLAPSING_GROUP}\n"
+            f"  cancel-in-progress: {cancel}\n"
+            "jobs:\n"
+            "  probe:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    timeout-minutes: 15\n"
+            "    steps:\n"
+            "      - run: 'true'\n"
+        )
+
+    def test_cancelling_on_qa_is_rejected(self) -> None:
+        findings = self.findings_for(
+            self._workflow("${{ github.ref_name != 'main' && github.ref_name != 'develop' }}")
+        )
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("does not exempt qa", findings[0].message)
+
+    def test_literal_false_is_accepted(self) -> None:
+        self.assertEqual(self.findings_for(self._workflow("false")), [])
+
+    def test_exempting_every_promotion_ref_is_accepted(self) -> None:
+        canonical = (
+            "${{ !(github.event_name == 'pull_request' && "
+            "contains(fromJson('[\"qa\", \"main\"]'), github.base_ref)) && "
+            "!contains(fromJson('[\"main\", \"develop\", \"qa\"]'), github.ref_name) }}"
+        )
+        self.assertEqual(self.findings_for(self._workflow(canonical)), [])
+
+    def test_a_non_collapsing_group_key_is_not_a_finding(self) -> None:
+        """Keyed on `github.ref`, a push and a PR are in DIFFERENT groups.
+
+        docs-site.yml is keyed that way, so it cannot collide and must not be
+        flagged. An earlier revision of this check did flag it.
+        """
+        self.assertEqual(
+            self.findings_for(
+                self._workflow(
+                    "${{ github.ref != 'refs/heads/main' }}",
+                    group="docs-site-${{ github.ref }}",
+                )
+            ),
+            [],
+        )
+
+    def test_full_ref_spelling_counts_as_an_exemption(self) -> None:
+        canonical = (
+            "${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/develop' "
+            "&& github.ref != 'refs/heads/qa' }}"
+        )
+        self.assertEqual(self.findings_for(self._workflow(canonical)), [])
+
+    def test_the_real_tree_passes(self) -> None:
+        findings: list[contract.Finding] = []
+        contract.check_promotion_concurrency(findings)
+        self.assertEqual(findings, [], [f.message for f in findings])

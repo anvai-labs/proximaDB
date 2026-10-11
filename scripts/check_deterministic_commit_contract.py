@@ -574,6 +574,95 @@ def check_conflict_markers(findings: list[Finding]) -> None:
             )
 
 
+PROMOTION_REFS = ("main", "develop", "qa")
+
+
+def _workflow_push_branches(doc: dict) -> list[str]:
+    """Branches a workflow triggers on for `push`, or [] if it has no push trigger.
+
+    `on` is the YAML 1.1 boolean `True` after safe_load, which is why this is a
+    helper rather than a one-liner.
+    """
+    trigger = doc.get("on", doc.get(True))
+    if isinstance(trigger, dict):
+        push = trigger.get("push")
+        if isinstance(push, dict):
+            return list(push.get("branches") or [])
+        return [] if push is None else list(PROMOTION_REFS)
+    if isinstance(trigger, list):
+        return list(PROMOTION_REFS) if "push" in trigger else []
+    return list(PROMOTION_REFS) if trigger == "push" else []
+
+
+def check_promotion_concurrency(findings: list[Finding]) -> None:
+    """A workflow that runs on a promotion branch must not cancel itself.
+
+    The concurrency group key across this repo is
+    `${{ github.workflow }}-${{ github.head_ref || github.ref_name }}`. For a
+    `qa -> main` promotion the PR's `head_ref` IS `qa`, so the PR run and the
+    push-to-qa run of the SAME workflow land in one group. With
+    `cancel-in-progress` truthy for `qa`, whichever started second killed the
+    other -- and `gh pr checks` renders a cancelled run as "fail", so the
+    promotion PR displayed a phantom failure for a check that had passed on its
+    own run. That was misdiagnosed twice during the v0.4.0 cut before the cause
+    was found.
+
+    Accepted spellings are a literal `false` (qa-gate.yml) or an expression that
+    exempts every promotion ref AND pull requests targeting qa/main (ci.yml).
+    """
+    import yaml  # local: this script must stay importable without the dep
+
+    workflows = sorted((ROOT / ".github/workflows").glob("*.yml"))
+    for path in workflows:
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - a malformed workflow is another check's job
+            continue
+        if not isinstance(doc, dict):
+            continue
+        branches = _workflow_push_branches(doc)
+        touched = [b for b in branches if b in PROMOTION_REFS]
+        if not touched:
+            continue
+        concurrency = doc.get("concurrency")
+        if not isinstance(concurrency, dict) or "cancel-in-progress" not in concurrency:
+            continue
+        # The collision only exists when the GROUP KEY collapses a push and a PR
+        # of the same branch into one value, i.e. `head_ref || ref_name`. A group
+        # keyed on `github.ref` alone is inherently safe: a push is
+        # `refs/heads/<b>` and a PR is `refs/pull/<n>/merge`, so they never
+        # share a group. docs-site.yml is keyed that way and is NOT a finding --
+        # an earlier revision of this check flagged it, which was wrong.
+        group = str(concurrency.get("group", ""))
+        if "head_ref" not in group:
+            continue
+        cancel = concurrency["cancel-in-progress"]
+        if cancel is False:
+            continue
+        expression = str(cancel)
+
+        def _exempted(ref: str) -> bool:
+            # Accept both the bare name and the full ref spelling.
+            return any(
+                token in expression
+                for token in (f"'{ref}'", f'"{ref}"', f"'refs/heads/{ref}'", f'"refs/heads/{ref}"')
+            )
+
+        missing = [ref for ref in touched if not _exempted(ref)]
+        if missing:
+            findings.append(
+                Finding(
+                    "promotion-concurrency",
+                    f"{rel(path)}: runs on push to {', '.join(touched)} but "
+                    f"`cancel-in-progress` does not exempt {', '.join(missing)} "
+                    f"-- the push run and a promotion PR run share one "
+                    f"concurrency group, so one cancels the other and the PR "
+                    f"shows a phantom failure. Use `false`, or exempt every "
+                    f"promotion ref as ci.yml does.",
+                )
+            )
+
+
 def main() -> int:
     findings: list[Finding] = []
 
@@ -587,13 +676,14 @@ def main() -> int:
     check_rust_cache_keys(findings)
     check_tdd_rust_warning_contract(findings)
     check_conflict_markers(findings)
+    check_promotion_concurrency(findings)
 
     print("Deterministic commit contract")
     if not findings:
         print(
             "OK: nextest, CI runner/Makefile wiring, architecture guards, Flight/query/object-store "
-            "authorities, rust-cache keys, TDD Rust warning policy, and conflict-marker "
-            "checks pass."
+            "authorities, rust-cache keys, TDD Rust warning policy, promotion concurrency, and "
+            "conflict-marker checks pass."
         )
         return 0
 
