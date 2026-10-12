@@ -100,6 +100,7 @@ async fn external_parquet_indexed_in_place_and_searchable_without_copy() {
         uuid::Uuid::new_v4().simple()
     ));
     let expect = write_external_parquet(&parquet, 40, dim);
+    allowlist_parent_of(&parquet);
 
     let cat = catalog_manager().await;
     let axis = Arc::new(AxisManager::new(AxisConfig::default()).await.unwrap());
@@ -209,6 +210,7 @@ async fn external_hybrid_search_fuses_text_and_vector() {
         uuid::Uuid::new_v4().simple()
     ));
     let expect = write_external_parquet(&parquet, 40, dim);
+    allowlist_parent_of(&parquet);
 
     let cat = catalog_manager().await;
     let axis = Arc::new(AxisManager::new(AxisConfig::default()).await.unwrap());
@@ -245,4 +247,24 @@ async fn external_hybrid_search_fuses_text_and_vector() {
     assert!(d7.record.props.contains_key("title"));
 
     let _ = std::fs::remove_file(&parquet);
+}
+
+/// Allowlist the parquet's own directory for this test process.
+///
+/// `POST /api/v2/external-collections` is now gated by the same fail-closed
+/// `PROXIMADB_EXTERNAL_TABLE_ROOTS` allowlist as `CREATE EXTERNAL TABLE`
+/// (TD-SECSCAN-1: the location previously went straight to `fs::metadata` /
+/// `fs::read_dir`). Unset means every location is rejected, which is the
+/// shipped default, so a test that reads a real file must opt in.
+///
+/// The root is written as a BARE path, not `file://...`, because these tests
+/// pass a bare path as the location and the allowlist match is textual.
+fn allowlist_parent_of(path: &std::path::Path) {
+    let dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    // Safe here: integration tests get their own process, and this runs before
+    // the service under test reads the gate.
+    unsafe { std::env::set_var("PROXIMADB_EXTERNAL_TABLE_ROOTS", &dir) };
 }

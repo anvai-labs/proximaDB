@@ -2298,7 +2298,13 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
     Ok(())
 }
 
-/// Fail-closed allowlist for external-table `location`s (Path Isolation mandate).
+/// Fail-closed allowlist for external `location`s (Path Isolation mandate).
+///
+/// `pub(crate)` because external COLLECTIONS
+/// (`POST /api/v2/external-collections`) need the same decision: that surface
+/// shipped with no allowlist at all and would stat or enumerate any host path.
+/// One gate and one predicate for both, rather than a second near-miss gate --
+/// see the ENV_GATE_REGISTRY note on `PROXIMADB_IVF2` vs `PROXIMADB_IVF2_PROBE`.
 ///
 /// A location is permitted only when the operator has set
 /// `PROXIMADB_EXTERNAL_TABLE_ROOTS` to a comma-separated list of URI-prefix roots
@@ -2307,7 +2313,7 @@ fn add_open_table_layouts(schema: &mut CatalogTableSchema) -> Result<()> {
 /// containing `..` are always rejected (no traversal-escape). Matching is on a
 /// path boundary — a root `file:///data/ext` matches `file:///data/ext/a.parquet`
 /// but NOT `file:///data/ext-evil/…`.
-fn external_location_allowed(location: &str) -> bool {
+pub(crate) fn external_location_allowed(location: &str) -> bool {
     let loc = location.trim();
     if loc.is_empty() || loc.contains("..") {
         return false;

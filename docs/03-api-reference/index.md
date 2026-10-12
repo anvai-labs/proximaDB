@@ -108,13 +108,20 @@ stub = record_pb2_grpc.ProximaRecordServiceStub(channel)
 
 ## PostgreSQL Wire Protocol
 
-**Port**: `5433`
+**Port**: `5433`, bound to `127.0.0.1`
 
 Connect using any PostgreSQL client:
 
 ```bash
 psql -h localhost -p 5433 -U postgres
 ```
+
+> **Loopback only unless the listener authenticates.** Under the trust auth default the
+> boot-time listener preflight admits pgwire on loopback only, so the command above works
+> against a locally-run server but **not** through a port published from a container
+> (there pgwire is on the container's own `127.0.0.1:5433`). Serving it off loopback
+> requires pgwire SCRAM (`TD-PGWIRE-AUTH-1`) *and then* `[api] pg_port`; `pg_port` alone
+> makes the server fail closed at boot. See `TD-PGWIRE-CONTAINER-1`.
 
 ### SQL Extensions
 
@@ -198,8 +205,14 @@ data_dir = "/var/lib/proximadb"
 
 [api]
 unified_mode = true
-enable_postgres_wire = true
-postgres_port = 5433
+# Real key names are `enable_pgwire` / `pg_port` (the earlier
+# `enable_postgres_wire` / `postgres_port` spellings here were not read by the
+# server). pgwire is enabled by default; `pg_port` is deliberately left UNSET in
+# the shipped config because setting it re-derives the pgwire bind from
+# `[server] bind_address`, and a non-loopback trust-mode pgwire listener is
+# refused at boot. Set it only alongside pgwire SCRAM (TD-PGWIRE-AUTH-1).
+enable_pgwire = true
+# pg_port = 5433
 
 [monitoring]
 metrics_enabled = true

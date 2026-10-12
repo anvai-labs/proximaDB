@@ -32,6 +32,8 @@ docs_dir: docs
 # mkdocs cannot render AsciiDoc at all (TD-DOCSITE-1 tracks converting the
 # user-facing ones).
 exclude_docs: |
+  # Font license ships in the repo beside the font; not a page (TD-DOCSITE-1 guard).
+  stylesheets/fonts/Inter-OFL.txt
   _archive/
   _internal/
   06-internals/
@@ -83,6 +85,7 @@ validation:
 
 theme:
   name: material
+  font: false
   features:
     - navigation.instant
     - navigation.tracking
@@ -93,13 +96,15 @@ theme:
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-night
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-sunny
         name: Switch to light mode
@@ -145,3 +150,7 @@ nav:
   - Operations:
       - Overview: 04-operations/index.md
       - "Release: v0.2.1 macOS": 04-operations/release/v0.2.1-macos-support.md
+
+extra_css:
+  - stylesheets/tokens.css
+  - stylesheets/brand.css

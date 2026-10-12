@@ -69,6 +69,12 @@ impl Server {
         }];
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}/wal", tmp.path().display());
+        // Required for `POST /external-collections/:id/build`: external vector
+        // indexes are refused unless AXIS indexes are enabled, and the default
+        // is false (proximadb-config asserts that default). Without this the
+        // build step 500s and this test never reached its own assertions --
+        // pre-existing, found while adding the path-confinement gate opt-in.
+        config.storage.optimization.enable_axis_indexes = true;
 
         let mut db = ProximaDB::new(config).await?;
         db.start().await?;
@@ -168,6 +174,7 @@ async fn external_collection_bm25_hybrid_e2e_over_http() {
     let dim = 48usize;
     let parquet = std::env::temp_dir().join(format!("proximadb_bm25_e2e_{}.parquet", nanos()));
     write_parquet(&parquet, 40, dim);
+    allowlist_parent_of(&parquet);
 
     // 1) Register the external collection with a BM25 text column.
     let reg = http
@@ -249,4 +256,24 @@ async fn external_collection_bm25_hybrid_e2e_over_http() {
     );
 
     let _ = std::fs::remove_file(&parquet);
+}
+
+/// Allowlist the parquet's own directory for this test process.
+///
+/// `POST /api/v2/external-collections` is now gated by the same fail-closed
+/// `PROXIMADB_EXTERNAL_TABLE_ROOTS` allowlist as `CREATE EXTERNAL TABLE`
+/// (TD-SECSCAN-1: the location previously went straight to `fs::metadata` /
+/// `fs::read_dir`). Unset means every location is rejected, which is the
+/// shipped default, so a test that reads a real file must opt in.
+///
+/// The root is written as a BARE path, not `file://...`, because these tests
+/// pass a bare path as the location and the allowlist match is textual.
+fn allowlist_parent_of(path: &std::path::Path) {
+    let dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    // Safe here: integration tests get their own process, and this runs before
+    // the service under test reads the gate.
+    unsafe { std::env::set_var("PROXIMADB_EXTERNAL_TABLE_ROOTS", &dir) };
 }

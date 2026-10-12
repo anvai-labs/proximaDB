@@ -200,5 +200,256 @@ class CiRunnerCommitContractTest(unittest.TestCase):
         self.assertTrue(self.findings_for("    runs-on: ubuntu-24.04#different-label\n"))
 
 
+class NodeVersionPinContractTest(unittest.TestCase):
+    """Every spelling GitHub accepts must reach the check.
+
+    The first revision of `SETUP_NODE_RE` anchored on `- uses:` and silently
+    skipped two real steps in this repo; an adversarial review then found two
+    more spellings that passed. Each case below corresponds to one of those,
+    so a future regex edit that loses a spelling fails here instead of in six
+    months when a Node 20 pin reappears unnoticed.
+    """
+
+    STEP = "      - uses: actions/setup-node@v7\n        with:\n"
+
+    def findings_for(self, workflow: str, name: str = "ci.yml") -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / ".github/workflows" / name
+            path.parent.mkdir(parents=True)
+            path.write_text(workflow, encoding="utf-8")
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_node_version_pins(findings)
+                return findings
+
+    def test_the_checked_in_workflows_pass(self) -> None:
+        for name in ("ci.yml", "release.yml"):
+            with self.subTest(workflow=name):
+                text = (REPO_ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+                self.assertEqual(self.findings_for(text, name), [])
+
+    def test_the_agreed_major_is_accepted_in_every_benign_spelling(self) -> None:
+        for pin in ("'24'", '"24"', "24", "24.9.0", "'24.x'", "'24'  # pinned"):
+            with self.subTest(pin=pin):
+                self.assertEqual(
+                    self.findings_for(f"{self.STEP}          node-version: {pin}\n"), []
+                )
+
+    def test_another_major_is_rejected(self) -> None:
+        for pin in ("'20'", '"20"', "20", "20.11.0", "'18'", "'26'"):
+            with self.subTest(pin=pin):
+                self.assertTrue(
+                    self.findings_for(f"{self.STEP}          node-version: {pin}\n"), pin
+                )
+
+    def test_an_unpinned_step_is_rejected(self) -> None:
+        self.assertTrue(self.findings_for("      - uses: actions/setup-node@v7\n"))
+
+    def test_uses_under_a_name_or_if_is_checked(self) -> None:
+        # The two shapes the `- uses:`-anchored revision skipped -- release.yml
+        # writes `- name:` above its `uses:`, the contract-gate matrix `- if:`.
+        for bullet in ("- name: Setup Node", "- if: matrix.setup == 'node'"):
+            with self.subTest(bullet=bullet):
+                workflow = (
+                    f"      {bullet}\n"
+                    "        uses: actions/setup-node@v7\n"
+                    "        with:\n"
+                    "          node-version: '20'\n"
+                )
+                self.assertTrue(self.findings_for(workflow))
+
+    def test_a_quoted_action_ref_is_checked(self) -> None:
+        for ref in ('"actions/setup-node@v7"', "'actions/setup-node@v7'"):
+            with self.subTest(ref=ref):
+                workflow = (
+                    f"      - uses: {ref}\n"
+                    "        with:\n"
+                    "          node-version: '20'\n"
+                )
+                self.assertTrue(self.findings_for(workflow))
+
+    def test_a_flow_style_step_cannot_bypass_the_block_style_scan(self) -> None:
+        for workflow in (
+            "      - {uses: actions/setup-node@v7, with: {node-version: '20'}}\n",
+            '      - {uses: "actions/setup-node@v7", with: {node-version: 20}}\n',
+            "      - {uses: actions/setup-node@v7}\n",
+        ):
+            with self.subTest(workflow=workflow.strip()):
+                self.assertTrue(self.findings_for(workflow))
+
+    def test_a_flow_style_step_on_the_agreed_major_is_accepted(self) -> None:
+        self.assertEqual(
+            self.findings_for(
+                "      - {uses: actions/setup-node@v7, with: {node-version: '24'}}\n"
+            ),
+            [],
+        )
+
+    def test_a_sha_pinned_action_is_checked(self) -> None:
+        workflow = (
+            "      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020\n"
+            "        with:\n"
+            "          node-version: '20'\n"
+        )
+        self.assertTrue(self.findings_for(workflow))
+
+    def test_node_version_file_counts_as_unpinned(self) -> None:
+        workflow = f"{self.STEP}          node-version-file: '.nvmrc'\n"
+        findings = self.findings_for(workflow)
+        self.assertTrue(findings)
+        self.assertIn("node-version-file", findings[0].message)
+
+    def test_an_expression_is_rejected_because_the_major_is_not_visible(self) -> None:
+        for pin in ("${{ matrix.node }}", "${{env.NODE}}", "'lts/*'"):
+            with self.subTest(pin=pin):
+                self.assertTrue(
+                    self.findings_for(f"{self.STEP}          node-version: {pin}\n"), pin
+                )
+
+    def test_every_step_is_checked_not_just_the_first(self) -> None:
+        workflow = (
+            f"{self.STEP}          node-version: '24'\n"
+            "      - uses: actions/setup-node@v7\n"
+            "        with:\n"
+            "          node-version: '20'\n"
+        )
+        findings = self.findings_for(workflow)
+        self.assertEqual(len(findings), 1, findings)
+        # Anchored on the offending step's `uses:` line (4), not on its pin
+        # line (6) -- the step is what a reader has to go and edit.
+        self.assertIn("ci.yml:4", findings[0].message)
+
+    def test_a_pin_in_an_earlier_step_does_not_satisfy_a_later_one(self) -> None:
+        # The forward scan must stop at the step boundary, or an unrelated
+        # `node-version:` above would launder an unpinned setup-node below it.
+        workflow = (
+            "      - uses: ./.github/actions/other\n"
+            "        with:\n"
+            "          node-version: '24'\n"
+            "      - uses: actions/setup-node@v7\n"
+        )
+        self.assertTrue(self.findings_for(workflow))
+
+    def test_a_yaml_extension_workflow_is_not_skipped(self) -> None:
+        workflow = f"{self.STEP}          node-version: '20'\n"
+        self.assertTrue(self.findings_for(workflow, "zz-drift.yaml"))
+
+    def test_a_composite_action_is_not_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / ".github/actions/setup-stuff/action.yml"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "runs:\n  using: composite\n  steps:\n"
+                "    - uses: actions/setup-node@v7\n"
+                "      with:\n        node-version: '20'\n",
+                encoding="utf-8",
+            )
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_node_version_pins(findings)
+        self.assertTrue(findings)
+
+    def test_the_major_the_repo_agrees_on_is_the_one_asserted(self) -> None:
+        # Guards against the check passing vacuously if NODE_MAJOR is ever
+        # blanked, and ties the constant to what the workflows actually say.
+        self.assertTrue(contract.NODE_MAJOR.isdigit())
+        text = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn(f"node-version: '{contract.NODE_MAJOR}'", text)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromotionConcurrencyContractTest(unittest.TestCase):
+    """A workflow on a promotion branch must not cancel its own promotion run.
+
+    The group key across this repo is `head_ref || ref_name`, and a `qa -> main`
+    PR has `head_ref == 'qa'`, so the PR run and the push-to-qa run of the same
+    workflow share one group. With cancellation on, one killed the other and
+    `gh pr checks` rendered the cancellation as "fail" -- a phantom failure for
+    a check that had passed. Misdiagnosed twice during the v0.4.0 cut.
+    """
+
+    COLLAPSING_GROUP = "${{ github.workflow }}-${{ github.head_ref || github.ref_name }}"
+
+    def findings_for(self, workflow: str) -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wf_dir = root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "probe.yml").write_text(workflow, encoding="utf-8")
+            original_root = contract.ROOT
+            try:
+                contract.ROOT = root
+                findings: list[contract.Finding] = []
+                contract.check_promotion_concurrency(findings)
+                return findings
+            finally:
+                contract.ROOT = original_root
+
+    def _workflow(self, cancel: str, group: str | None = None) -> str:
+        return (
+            "name: Probe\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main, develop, qa]\n"
+            "  pull_request:\n"
+            "concurrency:\n"
+            f"  group: {group if group is not None else self.COLLAPSING_GROUP}\n"
+            f"  cancel-in-progress: {cancel}\n"
+            "jobs:\n"
+            "  probe:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    timeout-minutes: 15\n"
+            "    steps:\n"
+            "      - run: 'true'\n"
+        )
+
+    def test_cancelling_on_qa_is_rejected(self) -> None:
+        findings = self.findings_for(
+            self._workflow("${{ github.ref_name != 'main' && github.ref_name != 'develop' }}")
+        )
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("does not exempt qa", findings[0].message)
+
+    def test_literal_false_is_accepted(self) -> None:
+        self.assertEqual(self.findings_for(self._workflow("false")), [])
+
+    def test_exempting_every_promotion_ref_is_accepted(self) -> None:
+        canonical = (
+            "${{ !(github.event_name == 'pull_request' && "
+            "contains(fromJson('[\"qa\", \"main\"]'), github.base_ref)) && "
+            "!contains(fromJson('[\"main\", \"develop\", \"qa\"]'), github.ref_name) }}"
+        )
+        self.assertEqual(self.findings_for(self._workflow(canonical)), [])
+
+    def test_a_non_collapsing_group_key_is_not_a_finding(self) -> None:
+        """Keyed on `github.ref`, a push and a PR are in DIFFERENT groups.
+
+        docs-site.yml is keyed that way, so it cannot collide and must not be
+        flagged. An earlier revision of this check did flag it.
+        """
+        self.assertEqual(
+            self.findings_for(
+                self._workflow(
+                    "${{ github.ref != 'refs/heads/main' }}",
+                    group="docs-site-${{ github.ref }}",
+                )
+            ),
+            [],
+        )
+
+    def test_full_ref_spelling_counts_as_an_exemption(self) -> None:
+        canonical = (
+            "${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/develop' "
+            "&& github.ref != 'refs/heads/qa' }}"
+        )
+        self.assertEqual(self.findings_for(self._workflow(canonical)), [])
+
+    def test_the_real_tree_passes(self) -> None:
+        findings: list[contract.Finding] = []
+        contract.check_promotion_concurrency(findings)
+        self.assertEqual(findings, [], [f.message for f in findings])

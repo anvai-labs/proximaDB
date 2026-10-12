@@ -20,9 +20,36 @@ cargo run --release --bin proximadb-server
 ----
 docker run -it --rm \
   -p 5678:5678 \
-  -p 5433:5433 \
   vjsingh1984/proximadb:latest
 ----
+
+[NOTE]
+====
+*Do not publish 5433 here — it cannot serve.* pgwire runs in the image, but on
+`127.0.0.1:5433` inside the container, so `-p 5433:5433` publishes a port that accepts no
+connections. `entrypoint.sh` rewrites `[server] bind_address` to `0.0.0.0` for the other
+surfaces; pgwire is deliberately exempt because `src/database.rs` only re-derives its bind
+when `[api] pg_port` is set, and the shipped config leaves it unset. Setting `pg_port`
+makes it `0.0.0.0:5433`, which `validate_trust_only_listener` refuses at boot (an
+unauthenticated single-tenant listener is admitted on loopback only) — the server exits 1
+and the container dies.
+
+pgwire is reachable from a locally-run binary (the *Local (From Source)* section above) and from inside
+the container's network namespace:
+
+[source,bash]
+----
+# The image ships no psql client; attach one that shares the network namespace.
+docker run --rm -it --network container:proximadb postgres:16 \
+  psql -h 127.0.0.1 -p 5433 -U postgres -d proximadb
+----
+
+Serving it from the host requires per-connection authentication on the listener (pgwire
+SCRAM, TD-PGWIRE-AUTH-1): enable `[security]` with `[security.authentication] enabled =
+true` (or `[security.pgwire] auth = "password"`), *then* set `[api] pg_port = 5433` and
+publish the port. See
+`docs/10-quality/td/TD-PGWIRE-CONTAINER-1-pgwire-unreachable-in-a-container-without-auth.adoc`.
+====
 
 == Config‑Driven Run
 

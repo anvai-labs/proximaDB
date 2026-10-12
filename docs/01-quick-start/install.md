@@ -109,7 +109,6 @@ curl http://localhost:5678/health
 docker run -d \
   --name proximadb \
   -p 5678:5678 \
-  -p 5433:5433 \
   -v proximadb-data:/var/lib/proximadb \
   vjsingh1984/proximadb:latest
 
@@ -119,6 +118,20 @@ docker logs -f proximadb
 # Verify
 curl http://localhost:5678/health
 ```
+
+> **5433 (pgwire) is intentionally not published.** pgwire runs in the image, but on
+> `127.0.0.1:5433` inside the container, so `-p 5433:5433` would publish a port that
+> accepts no connections. Use it from a locally-run binary, or from a client sharing the
+> container's network namespace:
+>
+> ```bash
+> docker run --rm -it --network container:proximadb postgres:16 \
+>   psql -h 127.0.0.1 -p 5433 -U postgres -d proximadb
+> ```
+>
+> Serving it from the host needs pgwire SCRAM (`TD-PGWIRE-AUTH-1`) *before* `[api]
+> pg_port` — setting `pg_port` alone makes the server fail closed at boot. Details:
+> `deploy/README.md`, `TD-PGWIRE-CONTAINER-1`.
 
 ### Docker Compose
 
@@ -130,7 +143,7 @@ services:
     image: vjsingh1984/proximadb:latest
     ports:
       - "5678:5678"  # Unified API
-      - "5433:5433"  # PostgreSQL wire
+      # 5433 (pgwire) omitted on purpose — loopback-only in the container; see above.
     volumes:
       - proximadb-data:/var/lib/proximadb
     environment:
@@ -228,7 +241,7 @@ The default config file is installed at:
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | **5678** | HTTP/2 | Unified REST + gRPC (+ Arrow Flight, experimental) |
-| **5433** | PostgreSQL | SQL wire protocol |
+| **5433** | PostgreSQL | SQL wire protocol. Binds `127.0.0.1` unless the listener authenticates (pgwire SCRAM, `TD-PGWIRE-AUTH-1`), so in a container it is not reachable through a published port. |
 
 ### Minimal Config
 

@@ -184,7 +184,7 @@ drift, at the cost of a thin reviewable mapping layer.
 
 *`make gen-ts-sdk` + drift gate.* `make gen-ts-sdk` runs `npm run gen-sdk`, matching the
 `gen-go-sdk` / `verify-openapi-spec` target style. The new CI job `ts-sdk-codegen-drift` (modeled on
-`go-sdk-codegen-drift`) sets up Node 20, runs `make gen-ts-sdk`, and `git diff --exit-code`s
+`go-sdk-codegen-drift`) sets up Node 24, runs `make gen-ts-sdk`, and `git diff --exit-code`s
 `src/generated/`; it is in the `ci-success` aggregate `needs:`, so generated-client drift blocks
 merge. Triggered by changes to either the SDK source (`nodejs_sdk`) or the OpenAPI spec
 (`openapi_spec`).

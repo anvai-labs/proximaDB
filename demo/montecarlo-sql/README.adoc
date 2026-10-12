@@ -26,7 +26,10 @@ the data engineer in a notebook — with no second system to learn.
 == Run it — over a real pgwire session
 
 This demo needs **only pgwire** (no REST seeding). Build a ProximaDB from *this* code (the `mc_price`
-UDF + the pgwire OLAP route), enable pgwire (`pg_port = 5433` under `[api]`), then:
+UDF + the pgwire OLAP route) and run it *locally* — pgwire is already enabled at `127.0.0.1:5433`,
+so do **not** set `[api] pg_port` to "enable" it (that re-derives the bind from
+`[server] bind_address`, and a non-loopback trust-mode pgwire listener is refused at boot; in the
+published container pgwire is loopback-only — TD-PGWIRE-CONTAINER-1). Then:
 
 [source,bash]
 ----
