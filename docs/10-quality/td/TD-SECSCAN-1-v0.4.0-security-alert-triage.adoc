@@ -302,14 +302,43 @@ Consequences:
    "per-query predicate" the co-design mandate forbids; and nothing stops tenant
    A registering a location under tenant B's prefix.
 
-This class is **real, unfixed, and the only finding in this triage that is a
-genuine security defect reachable from the network.** It is not a v0.4.0
-regression (the endpoint predates the promotion and the same alerts are on
-`main`), so it does not block v0.4.0 — but it should be fixed before the external
--collection surface is documented as supported. Fix shape: resolve `location`
-through `DrPathBuilder` under the caller's `TenantContext`, canonicalise, and
-reject anything escaping the resulting root; keep the `.parquet` filter on both
-branches; make the not-accessible error generic.
+=== Status: host-path access CLOSED (2026-10-12); tenant isolation still OPEN
+
+Fixed by confining the location before any filesystem access, reusing the
+**existing** `PROXIMADB_EXTERNAL_TABLE_ROOTS` allowlist that `CREATE EXTERNAL
+TABLE` already enforced (`src/services/ddl/mod.rs`, promoted to `pub(crate)`).
+Deliberately NOT a new gate: a second near-miss name is the `PROXIMADB_IVF2` /
+`PROXIMADB_IVF2_PROBE` mistake the ENV_GATE_REGISTRY was written to prevent.
+
+Two layers, because each catches what the other cannot:
+
+1. the shared textual allowlist — fail-closed (unset ⇒ every location rejected),
+   rejects `..`, matches on a path boundary so a root `/data` does not admit
+   `/data-evil`, and works for URI locations (`s3://`) where canonicalisation is
+   meaningless;
+2. canonicalisation for a local path — a **symlink inside an allowed root**
+   pointing outside it passes a textual check, because the kernel resolves the
+   link and not the string. Directory entries are re-confined for the same
+   reason.
+
+Also fixed: the single-file branch had no extension check at all, so a location
+naming any file was pushed and then stat'ed by `snapshot_fingerprint`, leaking
+its length and mtime — now `is_parquet` on both branches. And every rejection
+returns one opaque message that does not distinguish "absent" from "forbidden"
+and does not echo the path, which removes the filesystem oracle.
+
+Pinned by nine tests in `path_confinement_tests`, including two that guard the
+**call site** rather than the helpers — without those, deleting `confine()` from
+`list_parquet_files` would leave the rest of the module green while restoring the
+original defect.
+
+**Still open — this fix does not deliver tenant isolation.** The allowlist is
+process-wide, so tenant A can still register a location under an allowlisted root
+that tenant B uses; the read path still does not go through `DrPathBuilder` and
+carries no tenant prefix. ADR-090 already records that this gate "cannot express
+*tenant A may read X*", and TD-AUTHZ-1 **L3.4** tracks replacing it with
+per-tenant location policy. Treat the mandate-violation point above as
+outstanding until that lands.
 
 == 7. `rust/access-invalid-pointer` (1 high) — false positive
 
