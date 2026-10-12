@@ -50,6 +50,31 @@ TIMED_WORKFLOWS = RELEASE_WORKFLOWS + (
     # Builds AND publishes the shipped image, so an unbounded job here is on the
     # release path.
     ".github/workflows/publish-image.yml",
+    # Everything else with a `jobs:` block. The first revision of this guard
+    # covered only the release + pipeline workflows, which left 31 jobs across
+    # 10 files on GitHub's 6h default -- including `release-python.yml`, whose
+    # jobs hold the `pypi` deployment environment while they run, and the two
+    # `workflow_call` libraries, whose jobs would inherit no bound from their
+    # caller. The bound is a property of a job, not of a workflow's tier, so the
+    # list is now every workflow in the directory and `check_every_workflow_is_timed`
+    # below fails if a new file is added without being named here.
+    ".github/workflows/_platform-packages.yml",
+    ".github/workflows/_shared-build.yml",
+    ".github/workflows/branch-route-guard.yml",
+    ".github/workflows/capability-contract-tests.yml",
+    ".github/workflows/codeql.yml",
+    ".github/workflows/docs-site.yml",
+    ".github/workflows/flake-rerun.yml",
+    ".github/workflows/infrastructure-deploy.yml",
+    ".github/workflows/layering-check.yml",
+    ".github/workflows/mirror-ci-images.yml",
+    ".github/workflows/objstore-nightly.yml",
+    ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
+    ".github/workflows/public-overflow-runner-smoke.yml",
+    ".github/workflows/release-python.yml",
+    ".github/workflows/tdd.yml",
+    ".github/workflows/tier-config-fingerprint.yml",
+    ".github/workflows/windows-compile-ratchet.yml",
 )
 REQUIRED_FEATURE = "cloud-full"
 # The image the publish workflow actually ships (publish-image.yml `file:`).
@@ -181,6 +206,45 @@ def check_workflow_timeouts(msgs: list[str]) -> None:
                     f"job would run to GitHub's 6h default (TD-CI-5)",
                 )
             job, body = m.group("job"), []
+
+
+def check_every_workflow_is_timed(msgs: list[str]) -> None:
+    """`TIMED_WORKFLOWS` must name every workflow that has a `jobs:` block.
+
+    Without this the guard is opt-in: a workflow added tomorrow is simply not
+    in the tuple, so its jobs run to GitHub's 6h default and the guard still
+    exits 0 -- which is exactly how 31 jobs across 10 files stayed unbounded
+    after the first revision bounded the release and pipeline tiers.
+
+    Scanned from the directory rather than trusted from the tuple, so the
+    failure mode is a loud "add it" rather than silence.
+    """
+    wf_dir = ROOT / ".github/workflows"
+    if not wf_dir.is_dir():
+        _fail(msgs, ".github/workflows: missing (this guard has lost its target)")
+        return
+    listed = set(TIMED_WORKFLOWS)
+    found = False
+    for path in sorted(wf_dir.glob("*.y*ml")):
+        rel = path.relative_to(ROOT).as_posix()
+        if "\njobs:" not in path.read_text(encoding="utf-8"):
+            continue  # no jobs to bound
+        found = True
+        if rel not in listed:
+            _fail(
+                msgs,
+                f"{rel}: has a `jobs:` block but is not in TIMED_WORKFLOWS, so "
+                f"its jobs are unchecked and a hung one runs to GitHub's 6h "
+                f"default -- add it to the tuple (and to the COPY list in "
+                f"tests/scripts/test_release_build_features.py, or the new "
+                f"assertions are vacuous)",
+            )
+    if not found:
+        _fail(
+            msgs,
+            ".github/workflows: no workflow with a `jobs:` block -- this guard "
+            "would pass vacuously",
+        )
 
 
 def _dockerfile_instructions(text: str) -> list[tuple[int, str]]:
@@ -471,6 +535,7 @@ def main() -> int:
     msgs: list[str] = []
     check_workflow_features(msgs)
     check_workflow_timeouts(msgs)
+    check_every_workflow_is_timed(msgs)
     check_dockerfiles(msgs)
     check_runtime_config_ownership(msgs)
     if msgs:

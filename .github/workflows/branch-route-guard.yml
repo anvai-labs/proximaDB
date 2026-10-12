@@ -18,6 +18,11 @@ jobs:
   branch-route-policy:
     name: Branch Route Policy
     runs-on: ubuntu-latest
+    # NO green history: this workflow is not registered with the Actions API
+    # yet (no runs recorded), so there is nothing to measure. Cap from the
+    # work: one `pull_request_target` job that reads event metadata and runs a
+    # bash `case` -- no checkout, no token, no network. Floor applies.
+    timeout-minutes: 15
     env:
       BASE_REF: ${{ github.event.pull_request.base.ref }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}

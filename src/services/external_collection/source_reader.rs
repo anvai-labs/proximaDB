@@ -168,25 +168,111 @@ pub fn snapshot_fingerprint(location: &str) -> Result<String> {
     Ok(format!("fnv1a:{:016x}", hash))
 }
 
+/// One opaque message for every rejection. Deliberately says nothing about
+/// whether the path exists, is a file, is a directory, or merely sits outside
+/// the allowed roots: `POST /api/v2/external-collections` is reachable by any
+/// caller the REST surface admits, so a specific error is a filesystem oracle.
+const REJECTED: &str = "external location is not an accepted source \
+(see PROXIMADB_EXTERNAL_TABLE_ROOTS)";
+
+/// Only `.parquet` is readable as an external source. The single-file branch of
+/// `list_parquet_files` had NO such check, so a location naming any file at all
+/// was pushed and then stat'ed by `snapshot_fingerprint`, leaking that file's
+/// length and mtime.
+fn is_parquet(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("parquet")
+}
+
+/// Is `candidate` inside `root`? Compared COMPONENT-WISE, never as a string
+/// prefix: `/data-evil/x` has the string prefix `/data` but is not inside it.
+fn is_within(candidate: &std::path::Path, root: &std::path::Path) -> bool {
+    let mut c = candidate.components();
+    for rc in root.components() {
+        match c.next() {
+            Some(cc) if cc == rc => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Confine `location` for reading.
+///
+/// Two layers, because they catch different things:
+///
+/// 1. `external_location_allowed` -- the SAME fail-closed
+///    `PROXIMADB_EXTERNAL_TABLE_ROOTS` allowlist `CREATE EXTERNAL TABLE` uses.
+///    It rejects `..`, matches on a path boundary, and works for URI locations
+///    (`s3://`) where canonicalisation is meaningless.
+/// 2. canonicalisation, for a local path -- the allowlist is textual, so a
+///    SYMLINK inside an allowed root that points outside it passes layer 1.
+///    The kernel resolves the link, not the string.
+///
+/// Before this, neither layer existed here: `location` came straight from the
+/// request body into `fs::metadata` / `fs::read_dir`. Reported as
+/// `rust/path-injection`; tracked in TD-SECSCAN-1.
+fn confine(location: &str) -> Result<std::path::PathBuf> {
+    if !crate::services::ddl::external_location_allowed(location) {
+        anyhow::bail!(REJECTED);
+    }
+    confine_canonical(location)
+}
+
+/// Layer 2 on its own, so tests exercise it without touching the process
+/// environment: `std::env::set_var` is `unsafe` in edition 2024 and races the
+/// threads `cargo test --lib` uses.
+fn confine_canonical(location: &str) -> Result<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(location).map_err(|_| anyhow::anyhow!(REJECTED))?;
+    // A local location that cleared layer 1 named a root it is textually under;
+    // require the RESOLVED path to still be under that same textual root.
+    let textual = std::path::Path::new(location.trim_start_matches("file://"));
+    let anchor = match std::fs::canonicalize(textual.parent().unwrap_or(textual)) {
+        Ok(a) => a,
+        Err(_) => return Ok(canonical),
+    };
+    if !is_within(&canonical, &anchor) {
+        anyhow::bail!(REJECTED);
+    }
+    Ok(canonical)
+}
+
 /// Resolve `location` to a sorted list of Parquet files. Accepts either a
 /// single `.parquet` file or a directory containing `.parquet` files.
+///
+/// Every path is confined by `confine` (shared `PROXIMADB_EXTERNAL_TABLE_ROOTS`
+/// allowlist, then canonicalisation) before any filesystem access. Before
+/// that this function took `location` straight from the unauthenticated
+/// `POST /api/v2/external-collections` body and handed it to `fs::metadata` /
+/// `fs::read_dir` with no canonicalisation, no root and no tenant prefix, so it
+/// would stat or enumerate any path on the host; the single-file branch had no
+/// extension check either, so any file at all was pushed for reading. Reported
+/// as `rust/path-injection` and tracked in TD-SECSCAN-1.
 fn list_parquet_files(location: &str) -> Result<Vec<std::path::PathBuf>> {
-    let path = std::path::Path::new(location);
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("external location '{location}' is not accessible"))?;
+    let path = confine(location)?;
+    let meta = std::fs::metadata(&path).map_err(|_| anyhow::anyhow!(REJECTED))?;
     let mut files = Vec::new();
     if meta.is_dir() {
-        for entry in std::fs::read_dir(path)
-            .with_context(|| format!("read external directory '{location}'"))?
-        {
+        for entry in std::fs::read_dir(&path).map_err(|_| anyhow::anyhow!(REJECTED))? {
             let entry = entry?;
             let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("parquet") {
-                files.push(p);
+            if is_parquet(&p) {
+                // Re-confine each entry: a symlink inside an allowed directory
+                // can still point outside it.
+                if let Ok(c) = std::fs::canonicalize(&p)
+                    && is_within(&c, &path)
+                {
+                    files.push(c);
+                }
             }
         }
     } else {
-        files.push(path.to_path_buf());
+        // The missing check. Without it a single-file location of any type was
+        // pushed and then stat'ed by snapshot_fingerprint, leaking length and
+        // mtime of an arbitrary host file.
+        if !is_parquet(&path) {
+            anyhow::bail!(REJECTED);
+        }
+        files.push(path);
     }
     files.sort();
     Ok(files)
@@ -405,7 +491,30 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     /// Write a tiny Parquet file with `id: Utf8` + `vector: FixedSizeList<Float32, dim>`.
+
+    /// Allowlist a fixture's own directory for this test process.
+    ///
+    /// `list_parquet_files` is now fail-closed behind
+    /// `PROXIMADB_EXTERNAL_TABLE_ROOTS` (TD-SECSCAN-1: the location used to go
+    /// straight to `fs::metadata` / `fs::read_dir`). Unset rejects everything,
+    /// which is the shipped default, so a test that reads a real fixture must
+    /// opt in. Called from the fixture WRITERS, so every test that creates one
+    /// is covered without 14 separate call sites.
+    ///
+    /// `set_var` is `unsafe` in edition 2024 and racy across threads; this is
+    /// safe under nextest, which gives each test its own process (the repo's
+    /// mandated runner). A bare path, not `file://`, because these tests pass
+    /// bare locations and the allowlist match is textual.
+    fn allowlist_fixture_dir(path: &std::path::Path) {
+        let dir = path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        unsafe { std::env::set_var("PROXIMADB_EXTERNAL_TABLE_ROOTS", &dir) };
+    }
+
     fn write_parquet(path: &std::path::Path, ids: &[&str], vectors: &[Vec<f32>], dim: i32) {
+        allowlist_fixture_dir(path);
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new(
@@ -449,6 +558,7 @@ mod tests {
         rows: &[(&str, &str, i64, Vec<f32>)],
         dim: i32,
     ) {
+        allowlist_fixture_dir(path);
         use arrow_array::builder::Int64Builder;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -632,5 +742,137 @@ mod tests {
         assert_ne!(fp1, fp3, "adding a file must change the fingerprint");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod path_confinement_tests {
+    //! `rust/path-injection` on `POST /api/v2/external-collections`
+    //! (TD-SECSCAN-1). The handler validated only that `location` was non-empty
+    //! and handed it to `fs::metadata` / `fs::read_dir`: no allowlist, no
+    //! canonicalisation, no tenant prefix.
+    //!
+    //! No test here mutates the process environment. `std::env::set_var` is
+    //! `unsafe` in edition 2024 and races the threads `cargo test --lib` uses,
+    //! so each layer is exercised through its own pure entry point. The
+    //! gate-unset case needs no mutation at all -- unset IS the test default,
+    //! and it is also the shipped default.
+    use super::*;
+
+    #[test]
+    fn the_shipped_default_rejects_every_location() {
+        // PROXIMADB_EXTERNAL_TABLE_ROOTS is unset here, as it is in production
+        // unless an operator opts in. Fail-closed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.parquet");
+        std::fs::write(&f, b"x").expect("write");
+        let err = confine(f.to_str().expect("utf8")).expect_err("must reject");
+        assert_eq!(err.to_string(), REJECTED);
+    }
+
+    #[test]
+    fn rejection_is_one_indistinguishable_message() {
+        // A specific error is a filesystem oracle: "no such file" vs
+        // "forbidden" reveals existence to any caller the surface admits.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.parquet");
+        std::fs::write(&real, b"x").expect("write");
+        let absent = dir.path().join("nope.parquet");
+
+        let a = confine(real.to_str().expect("utf8")).expect_err("real");
+        let b = confine(absent.to_str().expect("utf8")).expect_err("absent");
+        assert_eq!(a.to_string(), b.to_string(), "messages must not differ");
+        assert!(
+            !a.to_string().contains("real.parquet"),
+            "must not echo the path"
+        );
+        assert!(!b.to_string().contains("nope"), "must not echo the path");
+    }
+
+    #[test]
+    fn a_symlink_out_of_its_directory_is_rejected() {
+        // The hole the textual allowlist cannot see: the kernel resolves the
+        // link, not the string.
+        let base = tempfile::tempdir().expect("tempdir");
+        let allowed = base.path().join("allowed");
+        std::fs::create_dir_all(&allowed).expect("mkdir");
+        let outside = base.path().join("outside.parquet");
+        std::fs::write(&outside, b"x").expect("write");
+        let link = allowed.join("link.parquet");
+        if std::os::unix::fs::symlink(&outside, &link).is_err() {
+            return; // symlinks unavailable on this filesystem
+        }
+        let err = confine_canonical(link.to_str().expect("utf8")).expect_err("escape");
+        assert_eq!(err.to_string(), REJECTED);
+    }
+
+    #[test]
+    fn a_regular_file_in_place_is_accepted_by_canonicalisation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.parquet");
+        std::fs::write(&f, b"x").expect("write");
+        let got = confine_canonical(f.to_str().expect("utf8")).expect("in place");
+        assert!(got.ends_with("a.parquet"));
+    }
+
+    #[test]
+    fn list_parquet_files_is_confined_at_the_call_site() {
+        // Guards the CALL SITE, not just the helpers. Without this, deleting
+        // `confine(location)?` from `list_parquet_files` would leave every
+        // other test in this module green while restoring the original
+        // arbitrary-path read.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.parquet");
+        std::fs::write(&f, b"x").expect("write");
+        // Gate unset (the shipped default) => the reader must refuse.
+        let err = list_parquet_files(f.to_str().expect("utf8"))
+            .expect_err("list_parquet_files must confine before touching the filesystem");
+        assert_eq!(err.to_string(), REJECTED);
+    }
+
+    #[test]
+    fn list_parquet_files_refuses_a_directory_too() {
+        // The directory branch enumerated any path it was given.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.parquet"), b"x").expect("write");
+        let err = list_parquet_files(dir.path().to_str().expect("utf8"))
+            .expect_err("directory locations must be confined as well");
+        assert_eq!(err.to_string(), REJECTED);
+    }
+
+    #[test]
+    fn is_within_is_component_wise_not_textual() {
+        use std::path::Path;
+        assert!(is_within(Path::new("/a/b/c"), Path::new("/a/b")));
+        assert!(is_within(Path::new("/a/b"), Path::new("/a/b")));
+        // `/a/bb` shares the string prefix `/a/b` but is a different directory.
+        assert!(!is_within(Path::new("/a/bb/c"), Path::new("/a/b")));
+        assert!(!is_within(Path::new("/a"), Path::new("/a/b")));
+    }
+
+    #[test]
+    fn only_parquet_is_readable() {
+        use std::path::Path;
+        assert!(is_parquet(Path::new("/x/a.parquet")));
+        assert!(!is_parquet(Path::new("/etc/shadow")));
+        assert!(!is_parquet(Path::new("/x/a.parquet.bak")));
+        assert!(!is_parquet(Path::new("/x/parquet")));
+        assert!(
+            !is_parquet(Path::new("/x/a.PARQUET")),
+            "extension match is exact"
+        );
+    }
+
+    #[test]
+    fn the_shared_allowlist_is_what_gates_this_surface() {
+        // Pin the reuse: external collections must NOT grow a second gate.
+        // Unset => denied, same as CREATE EXTERNAL TABLE.
+        assert!(!crate::services::ddl::external_location_allowed(
+            "file:///tmp/whatever/a.parquet"
+        ));
+        assert!(!crate::services::ddl::external_location_allowed(
+            "../escape.parquet"
+        ));
+        assert!(!crate::services::ddl::external_location_allowed(""));
     }
 }

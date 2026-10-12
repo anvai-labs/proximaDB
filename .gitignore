@@ -351,6 +351,8 @@ check_*.py
 # Negation: scripts/ holds committed repo-tooling guards (check_workspace_boundaries.py,
 # check_tenant_path_guard.py, ...), not ad-hoc generated scripts. Keep them tracked.
 !scripts/check_*.py
+# Shared family-brand checker regression test (paired with check_brand_tokens.py).
+!scripts/test_check_brand_tokens.py
 clean_*.py
 comprehensive_*.py
 concrete_*.py
@@ -480,6 +482,8 @@ docs/archive/sessions/
 !clients/python/tests/mlflow_conformance_steps_3x.txt
 # Pinned docs-site toolchain — CI installs it, so it must track.
 !requirements-docs.txt
+# Inter font license ships beside the self-hosted font (OFL 1.1 condition 2).
+!docs/stylesheets/fonts/Inter-OFL.txt
 
 # Consolidated config dir (configs/ merged into config/)
 /configs/

@@ -55,7 +55,11 @@ services:
     image: vjsingh1984/proximadb:latest
     ports:
       - "5678:5678"
-      - "5433:5433"
+      # 5433 (pgwire) is deliberately NOT published: the shipped config leaves
+      # `[api] pg_port` unset, so pgwire listens on 127.0.0.1:5433 inside the
+      # container and a published 5433 accepts no connections. See
+      # "PostgreSQL wire protocol" in deploy/README.md and
+      # TD-PGWIRE-CONTAINER-1 for the SCRAM prerequisite to changing that.
     volumes:
       - proximadb-data:/var/lib/proximadb
     environment:
@@ -179,8 +183,13 @@ curl -k https://localhost:5678/health
 ```bash
 # Firewall (Linux)
 sudo firewall-cmd --add-port=5678/tcp --permanent
-sudo firewall-cmd --add-port=5433/tcp --permanent
 sudo firewall-cmd --reload
+
+# Only open 5433 (pgwire) for a deployment that actually serves it off loopback,
+# which requires pgwire SCRAM (TD-PGWIRE-AUTH-1) plus `[api] pg_port`. In the
+# default container pgwire binds 127.0.0.1:5433, so an open 5433 reaches nothing;
+# with SCRAM off, moving it to 0.0.0.0 is refused at boot, not exposed.
+# sudo firewall-cmd --add-port=5433/tcp --permanent
 
 # Only allow local connections
 sudo firewall-cmd --add-rich-rule='rule family="ipv4" source address="127.0.0.1" port protocol="tcp" port="5678" accept'

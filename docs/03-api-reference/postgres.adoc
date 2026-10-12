@@ -4,11 +4,31 @@
 :icons: font
 
 [.lead]
-ProximaDB exposes the PostgreSQL wire protocol on port `5433` by default. This
-reference covers v0.2's supported SQL surface and the v2 record-typed INSERT
-syntax that closes TD-084.
+ProximaDB exposes the PostgreSQL wire protocol on port `5433` by default, bound to
+`127.0.0.1`. This reference covers v0.2's supported SQL surface and the v2 record-typed
+INSERT syntax that closes TD-084.
 
 == Connection
+
+[IMPORTANT]
+====
+*The default bind is loopback, which makes the examples below host-local.* Under the trust
+auth default the boot-time listener preflight
+(`validate_trust_only_listener`) admits an unauthenticated single-tenant pgwire listener on
+**loopback only**. So:
+
+* a locally-run `proximadb-server` → `localhost:5433` works as shown;
+* the published container image → pgwire listens on `127.0.0.1:5433` *inside* the
+  container, so a published `5433` accepts no connections. Reach it from inside the
+  container's network namespace
+  (`docker run --rm -it --network container:proximadb postgres:16 psql -h 127.0.0.1 -p 5433 ...`),
+  since the image ships no psql client;
+* to serve it off loopback, give the listener per-connection authentication first (SCRAM,
+  below) and *then* set `[api] pg_port`. Setting `pg_port` without SCRAM is fail-closed:
+  the preflight refuses the listener and the server exits 1.
+
+Tracked in `TD-PGWIRE-CONTAINER-1`.
+====
 
 [source,bash]
 ----

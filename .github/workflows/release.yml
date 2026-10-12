@@ -982,31 +982,83 @@ jobs:
     environment:
       name: npm
       url: https://www.npmjs.com/package/@anvailabs/proximadb-client
+    # OIDC trusted publishing, mirroring anvai-labs/agentbrowser's npm-publish
+    # job, which has shipped this way since 1.8.x (latest 1.16.1, 2026-10-10)
+    # with NO npm secret in the repo at all.
+    #
+    # v0.4.0 failed here: `npm error code E404 ... PUT
+    # /@anvailabs%2fproximadb-client`. The package already existed at 0.3.0, so
+    # it was not a first publish or a missing --access; npm answers 404 rather
+    # than 403 on a PUT when the token lacks rights to an existing package. The
+    # classic NPM_TOKEN (secret last updated 2026-09-03) had stopped being
+    # accepted -- consistent with npm's own banner: "npm tokens that bypass 2FA
+    # are being restricted -- account changes (Aug 2026) and direct publishing
+    # (Jan 2027)".
+    #
+    # `id-token: write` is what lets the runner mint the OIDC token. The claims
+    # must match the trusted publisher registered on npm for this package:
+    #   repository anvai-labs/proximaDB, workflow release.yml, environment npm
+    # The `environment: npm` above is part of that match -- registering the
+    # publisher WITHOUT the environment name while this job declares one makes
+    # the environment claim mismatch and the publish is refused.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Node 24, not 22: OIDC trusted publishing needs npm >= 11.5.1 and node 22
+      # ships npm 10.x. The guard below fails loudly rather than letting npm
+      # fall back to a credential it does not have.
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Require an npm new enough for OIDC trusted publishing
+        run: |
+          NPM_VERSION="$(npm --version)"
+          echo "npm ${NPM_VERSION}"
+          MIN=11.5.1
+          if [ "$(printf '%s\n%s\n' "$MIN" "$NPM_VERSION" | sort -V | head -1)" != "$MIN" ]; then
+            echo "::error::npm ${NPM_VERSION} is older than ${MIN}; OIDC trusted publishing is unavailable and this job has no fallback credential"
+            exit 1
+          fi
 
       # The SDK is a standalone package (single public dep: openapi-fetch);
       # its own version field is the source of truth — the release version
       # and the package version are bumped together in the release commit.
+      #
+      # `npm ci`, NOT `npm install`: this is the one job whose tree becomes a
+      # published artifact, and `npm install` RE-RESOLVES rather than installing
+      # what the lockfile pinned — then rewrites the lock in the runner, where
+      # the rewrite is discarded. So the package users download would be built
+      # from a tree no committed lockfile describes, and a transitive release
+      # between CI and the tag would silently enter it. `npm ci` installs the
+      # lock exactly and fails closed if the lock and manifest disagree, which
+      # is the property every other npm job in this repo already relies on.
+      # Verified under both npm majors; see the Node-pin contract in
+      # scripts/check_deterministic_commit_contract.py.
       - name: Build
         working-directory: clients/nodejs-embedded
         run: |
-          npm install
+          npm ci
           npm run build
 
       # Idempotent: the tag's version may already be on npm (manual bootstrap
       # publish, or a re-run after a partial failure) — skip, don't fail.
-      - name: Publish to npm (skip if already published)
+      - name: Publish to npm via OIDC (skip if already published)
         working-directory: clients/nodejs-embedded
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Deliberately EMPTY, and the user config is sent to /dev/null:
+          # actions/setup-node writes an .npmrc wired to NODE_AUTH_TOKEN, and a
+          # present-but-invalid token makes npm authenticate with it instead of
+          # exchanging the OIDC token -- which is how this job 404'd. Both lines
+          # are load-bearing; neither is tidiness.
+          NODE_AUTH_TOKEN: ''
+          NPM_CONFIG_USERCONFIG: /dev/null
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           if curl -sf -A "proximadb-release" \
@@ -1014,7 +1066,7 @@ jobs:
             | grep -q "\"${VERSION}\""; then
             echo "::notice::${VERSION} already on npm — skipping"
           else
-            npm publish --access public
+            npm publish --access public --provenance
           fi
 
       - name: Verify the registry actually has this version
@@ -1238,32 +1290,62 @@ jobs:
   verify-release:
     timeout-minutes: 30
     name: Verify Release
-    needs: [prepare, publish-crates, validate-artifacts]
+    # `publish-npm` is in `needs` on purpose. It was absent, so this job neither
+    # waited for npm nor checked it -- and on v0.4.0 it reported SUCCESS while
+    # the npm publish had failed with a 404. A failed dependency now skips this
+    # job instead, which is honest; a green "Verify Release" over a broken
+    # registry is the one outcome that must not happen.
+    needs: [prepare, publish-crates, publish-npm, validate-artifacts]
     runs-on: ubuntu-latest
     if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true' && needs.validate-artifacts.outputs.validation_passed == 'true'
     steps:
-      - name: Wait for Package Propagation
-        run: sleep 60
-
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
-      - name: Verify PyPI Installation
+      # Registry APIs, not `pip install` / `cargo install`. The previous steps
+      # could not fail: every command ended in `|| echo ...` or `|| true`, so a
+      # missing package printed a note and the step went green. They also
+      # verified the wrong things -- PyPI is published by release-python.yml,
+      # not here, and `cargo install proximadb-sdk` installs a LIBRARY crate, so
+      # the `proximadb-server --version` that followed could never have worked.
+      #
+      # Querying the registries directly also drops the Python and Rust
+      # toolchain setup this job used to need.
+      - name: Verify the registries actually serve this version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          pip install proximadb==${{ needs.prepare.outputs.version }} || echo "PyPI package not yet available"
-          python -c "import proximadb; print(f'ProximaDB version: {proximadb.__version__}')" || true
+          set -uo pipefail
 
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          toolchain: stable
+          # crates.io REQUIRES a User-Agent and errors without one, which looks
+          # exactly like "version missing" if you do not know to set it.
+          UA='proximadb-release-verify (+https://github.com/anvai-labs/proximaDB)'
 
-      - name: Verify crates.io Installation
-        run: |
-          cargo install proximadb-sdk --version ${{ needs.prepare.outputs.version }} || echo "crates.io package not yet available"
-          proximadb-server --version || true
+          check() {
+            name="$1"; url="$2"; needle="$3"
+            for attempt in 1 2 3 4 5 6 7 8; do
+              body="$(curl -sSL -A "$UA" "$url" 2>/dev/null || true)"
+              if printf '%s' "$body" | grep -q -- "$needle"; then
+                echo "  OK   ${name}: ${VERSION} is live"
+                return 0
+              fi
+              echo "  ...  ${name}: ${VERSION} not visible yet (attempt ${attempt}/8)"
+              sleep 20
+            done
+            echo "::error::${name} does not serve ${VERSION} after ~160s of propagation time"
+            return 1
+          }
+
+          rc=0
+          check "crates.io proximadb-sdk" \
+                "https://crates.io/api/v1/crates/proximadb-sdk" \
+                "\"num\":\"${VERSION}\"" || rc=1
+          check "npm @anvailabs/proximadb-client" \
+                "https://registry.npmjs.org/@anvailabs%2fproximadb-client" \
+                "\"${VERSION}\"" || rc=1
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::release verification FAILED -- at least one registry is missing ${VERSION}"
+            exit 1
+          fi
+          echo "All registries serve ${VERSION}."
 
   # ============================================================================
   # CLEANUP - Remove old artifacts

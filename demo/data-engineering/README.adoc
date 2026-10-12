@@ -47,7 +47,11 @@ the data engineer actually uses.
 == Run it — live, over a real pgwire session
 
 Build a ProximaDB from *this* code (the cross-modal UDTFs + the pgwire OLAP route only exist in a
-same-code build), enable pgwire (`pg_port = 5433` under `[api]`), then:
+same-code build) and run it *locally*. pgwire is already enabled at `127.0.0.1:5433`
+(`[api] enable_pgwire = true`) — do **not** set `[api] pg_port` to "enable" it; that only
+re-derives the bind from `[server] bind_address`, and a non-loopback trust-mode pgwire listener is
+refused at boot. For the same reason this demo does not work against the published container image
+(pgwire is on the container's loopback; TD-PGWIRE-CONTAINER-1). Then:
 
 [source,bash]
 ----

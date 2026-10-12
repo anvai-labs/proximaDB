@@ -18,6 +18,10 @@ jobs:
   notes:
     name: Documentation Notes
     runs-on: ubuntu-latest
+    # NO green history: the 60 recorded runs (2026-02-22..2026-03-08) predate
+    # this file being made parseable and produced no job at all. The job is two
+    # `echo`s, so the 15-min floor is the cap.
+    timeout-minutes: 15
     steps:
       - name: Explain usage
         run: |

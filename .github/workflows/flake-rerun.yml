@@ -27,6 +27,9 @@ jobs:
   rerun-infra-flakes:
     name: Rerun infra-killed jobs (once)
     runs-on: ubuntu-latest
+    # max 0.1 min green step span over 60 runs since 2026-10-09 (9 green);
+    # one `gh api` rerun call. 1.5x is under the 15-min floor, so the floor applies.
+    timeout-minutes: 15
     # Only first attempts: one automatic retry, never a loop.
     if: >
       github.event.workflow_run.conclusion == 'failure' &&

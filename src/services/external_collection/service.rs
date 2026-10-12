@@ -710,11 +710,34 @@ mod tests {
     /// Write `n` vectors with **unique directions** (one-hot at position `i`,
     /// so under cosine each row's nearest neighbor is itself). Requires
     /// `dim >= n`. Rebuild needs >= 16 vectors to cluster.
+
+    /// Allowlist a fixture's own directory for this test process.
+    ///
+    /// `list_parquet_files` is now fail-closed behind
+    /// `PROXIMADB_EXTERNAL_TABLE_ROOTS` (TD-SECSCAN-1: the location used to go
+    /// straight to `fs::metadata` / `fs::read_dir`). Unset rejects everything,
+    /// which is the shipped default, so a test that reads a real fixture must
+    /// opt in. Called from the fixture WRITERS, so every test that creates one
+    /// is covered without 14 separate call sites.
+    ///
+    /// `set_var` is `unsafe` in edition 2024 and racy across threads; this is
+    /// safe under nextest, which gives each test its own process (the repo's
+    /// mandated runner). A bare path, not `file://`, because these tests pass
+    /// bare locations and the allowlist match is textual.
+    fn allowlist_fixture_dir(path: &std::path::Path) {
+        let dir = path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        unsafe { std::env::set_var("PROXIMADB_EXTERNAL_TABLE_ROOTS", &dir) };
+    }
+
     fn write_parquet_fixture(
         path: &std::path::Path,
         n: usize,
         dim: usize,
     ) -> Vec<(String, Vec<f32>)> {
+        allowlist_fixture_dir(path);
         assert!(dim >= n, "one-hot fixture requires dim >= n");
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -763,6 +786,7 @@ mod tests {
     /// Like `write_parquet_fixture` but adds `text: Utf8` + `year: Int64` columns
     /// so federated-fetch props can be asserted. One-hot directions, `dim >= n`.
     fn write_meta_fixture(path: &std::path::Path, n: usize, dim: usize) {
+        allowlist_fixture_dir(path);
         use arrow_array::builder::{Int64Builder, StringBuilder};
         assert!(dim >= n, "one-hot fixture requires dim >= n");
         let schema = Arc::new(Schema::new(vec![
