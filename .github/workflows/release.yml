@@ -982,15 +982,50 @@ jobs:
     environment:
       name: npm
       url: https://www.npmjs.com/package/@anvailabs/proximadb-client
+    # OIDC trusted publishing, mirroring anvai-labs/agentbrowser's npm-publish
+    # job, which has shipped this way since 1.8.x (latest 1.16.1, 2026-10-10)
+    # with NO npm secret in the repo at all.
+    #
+    # v0.4.0 failed here: `npm error code E404 ... PUT
+    # /@anvailabs%2fproximadb-client`. The package already existed at 0.3.0, so
+    # it was not a first publish or a missing --access; npm answers 404 rather
+    # than 403 on a PUT when the token lacks rights to an existing package. The
+    # classic NPM_TOKEN (secret last updated 2026-09-03) had stopped being
+    # accepted -- consistent with npm's own banner: "npm tokens that bypass 2FA
+    # are being restricted -- account changes (Aug 2026) and direct publishing
+    # (Jan 2027)".
+    #
+    # `id-token: write` is what lets the runner mint the OIDC token. The claims
+    # must match the trusted publisher registered on npm for this package:
+    #   repository anvai-labs/proximaDB, workflow release.yml, environment npm
+    # The `environment: npm` above is part of that match -- registering the
+    # publisher WITHOUT the environment name while this job declares one makes
+    # the environment claim mismatch and the publish is refused.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Node 24, not 22: OIDC trusted publishing needs npm >= 11.5.1 and node 22
+      # ships npm 10.x. The guard below fails loudly rather than letting npm
+      # fall back to a credential it does not have.
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Require an npm new enough for OIDC trusted publishing
+        run: |
+          NPM_VERSION="$(npm --version)"
+          echo "npm ${NPM_VERSION}"
+          MIN=11.5.1
+          if [ "$(printf '%s\n%s\n' "$MIN" "$NPM_VERSION" | sort -V | head -1)" != "$MIN" ]; then
+            echo "::error::npm ${NPM_VERSION} is older than ${MIN}; OIDC trusted publishing is unavailable and this job has no fallback credential"
+            exit 1
+          fi
 
       # The SDK is a standalone package (single public dep: openapi-fetch);
       # its own version field is the source of truth — the release version
@@ -1003,10 +1038,16 @@ jobs:
 
       # Idempotent: the tag's version may already be on npm (manual bootstrap
       # publish, or a re-run after a partial failure) — skip, don't fail.
-      - name: Publish to npm (skip if already published)
+      - name: Publish to npm via OIDC (skip if already published)
         working-directory: clients/nodejs-embedded
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Deliberately EMPTY, and the user config is sent to /dev/null:
+          # actions/setup-node writes an .npmrc wired to NODE_AUTH_TOKEN, and a
+          # present-but-invalid token makes npm authenticate with it instead of
+          # exchanging the OIDC token -- which is how this job 404'd. Both lines
+          # are load-bearing; neither is tidiness.
+          NODE_AUTH_TOKEN: ''
+          NPM_CONFIG_USERCONFIG: /dev/null
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           if curl -sf -A "proximadb-release" \
@@ -1014,7 +1055,7 @@ jobs:
             | grep -q "\"${VERSION}\""; then
             echo "::notice::${VERSION} already on npm — skipping"
           else
-            npm publish --access public
+            npm publish --access public --provenance
           fi
 
       - name: Verify the registry actually has this version
