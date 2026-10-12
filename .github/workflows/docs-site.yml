@@ -34,6 +34,7 @@ on:
       - '.github/workflows/docs-site.yml'
       - 'Makefile'
       - 'scripts/check_brand_tokens.py'
+      - 'scripts/test_check_brand_tokens.py'
   push:
     branches: [develop, main]
     paths:
@@ -44,6 +45,7 @@ on:
       - '.github/workflows/docs-site.yml'
       - 'Makefile'
       - 'scripts/check_brand_tokens.py'
+      - 'scripts/test_check_brand_tokens.py'
   workflow_dispatch:
 
 permissions:
@@ -59,6 +61,7 @@ permissions:
 concurrency:
   group: docs-site-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build:
     name: Build docs (strict)
@@ -78,7 +81,7 @@ jobs:
         # excluded file is an unraisable INFO), so it is checked out-of-band.
         run: python3 scripts/check_docs_site_coverage.py
       - name: Check family brand tokens
-        run: python scripts/check_brand_tokens.py .
+        run: python scripts/test_check_brand_tokens.py && python scripts/check_brand_tokens.py .
       - name: Build (strict)
         # --strict only escalates WARNINGs, and mkdocs ships link/nav checks at
         # INFO; the `validation:` block in mkdocs.yml raises them, which is what
