@@ -95,6 +95,26 @@ updates:
       - dependency-name: "@types/react-dom"
         update-types: ["version-update:semver-major"]
 
+      # `@types/node`'s major IS the Node major it types, so "latest" types a
+      # runtime we do not run. CI and the release build on the Node 24 LTS line
+      # (NODE_MAJOR in scripts/check_deterministic_commit_contract.py), and types
+      # for Node 26 let `tsc` accept calls that are absent at runtime -- a green
+      # build that fails in production. Anything at or above 25 is therefore
+      # ignored; 24.x and below remain open so patches still flow.
+      #
+      # Each major also carries a TypeScript floor, published as DefinitelyTyped
+      # `ts<x.y>` dist-tags -- the newest @types/node a given `tsc` can parse:
+      #
+      #   TS 4.9 -> 22.9.3     TS 5.1 -> 24.1.0     TS 5.7+ -> 26.6.5
+      #
+      # That is why PR #1908 (16.18.126 -> 26.5.1 in /ui) could not have
+      # typechecked: /ui is react-scripts 5.0.1, which holds TypeScript at 4.9.5.
+      # /ui can still reach 22.x under this rule; it cannot reach 24.x until the
+      # CRA migration lifts TypeScript past 5.1, and a proposal that tries will
+      # fail `Admin UI Install + Build` visibly rather than merge silently.
+      - dependency-name: "@types/node"
+        versions: [">=25.0.0"]
+
   - package-ecosystem: pip
     directories:
       - "/clients/python"
