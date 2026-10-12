@@ -1030,10 +1030,21 @@ jobs:
       # The SDK is a standalone package (single public dep: openapi-fetch);
       # its own version field is the source of truth — the release version
       # and the package version are bumped together in the release commit.
+      #
+      # `npm ci`, NOT `npm install`: this is the one job whose tree becomes a
+      # published artifact, and `npm install` RE-RESOLVES rather than installing
+      # what the lockfile pinned — then rewrites the lock in the runner, where
+      # the rewrite is discarded. So the package users download would be built
+      # from a tree no committed lockfile describes, and a transitive release
+      # between CI and the tag would silently enter it. `npm ci` installs the
+      # lock exactly and fails closed if the lock and manifest disagree, which
+      # is the property every other npm job in this repo already relies on.
+      # Verified under both npm majors; see the Node-pin contract in
+      # scripts/check_deterministic_commit_contract.py.
       - name: Build
         working-directory: clients/nodejs-embedded
         run: |
-          npm install
+          npm ci
           npm run build
 
       # Idempotent: the tag's version may already be on npm (manual bootstrap
