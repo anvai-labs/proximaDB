@@ -83,6 +83,7 @@ validation:
 
 theme:
   name: material
+  font: false
   features:
     - navigation.instant
     - navigation.tracking
@@ -93,13 +94,15 @@ theme:
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-night
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: indigo
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-sunny
         name: Switch to light mode
@@ -145,3 +148,7 @@ nav:
   - Operations:
       - Overview: 04-operations/index.md
       - "Release: v0.2.1 macOS": 04-operations/release/v0.2.1-macos-support.md
+
+extra_css:
+  - stylesheets/tokens.css
+  - stylesheets/brand.css

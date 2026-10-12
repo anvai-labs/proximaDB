@@ -76,6 +76,8 @@ jobs:
         # Needs no toolchain: mkdocs cannot report this at all (a link to an
         # excluded file is an unraisable INFO), so it is checked out-of-band.
         run: python3 scripts/check_docs_site_coverage.py
+      - name: Check family brand tokens
+        run: python scripts/check_brand_tokens.py .
       - name: Build (strict)
         # --strict only escalates WARNINGs, and mkdocs ships link/nav checks at
         # INFO; the `validation:` block in mkdocs.yml raises them, which is what
