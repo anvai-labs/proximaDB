@@ -33,6 +33,7 @@ on:
       - 'scripts/check_docs_site_coverage.py'
       - '.github/workflows/docs-site.yml'
       - 'Makefile'
+      - 'scripts/check_brand_tokens.py'
   push:
     branches: [develop, main]
     paths:
@@ -42,6 +43,7 @@ on:
       - 'scripts/check_docs_site_coverage.py'
       - '.github/workflows/docs-site.yml'
       - 'Makefile'
+      - 'scripts/check_brand_tokens.py'
   workflow_dispatch:
 
 permissions:
@@ -57,7 +59,6 @@ permissions:
 concurrency:
   group: docs-site-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
 jobs:
   build:
     name: Build docs (strict)
