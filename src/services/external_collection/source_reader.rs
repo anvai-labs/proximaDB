@@ -491,7 +491,30 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     /// Write a tiny Parquet file with `id: Utf8` + `vector: FixedSizeList<Float32, dim>`.
+
+    /// Allowlist a fixture's own directory for this test process.
+    ///
+    /// `list_parquet_files` is now fail-closed behind
+    /// `PROXIMADB_EXTERNAL_TABLE_ROOTS` (TD-SECSCAN-1: the location used to go
+    /// straight to `fs::metadata` / `fs::read_dir`). Unset rejects everything,
+    /// which is the shipped default, so a test that reads a real fixture must
+    /// opt in. Called from the fixture WRITERS, so every test that creates one
+    /// is covered without 14 separate call sites.
+    ///
+    /// `set_var` is `unsafe` in edition 2024 and racy across threads; this is
+    /// safe under nextest, which gives each test its own process (the repo's
+    /// mandated runner). A bare path, not `file://`, because these tests pass
+    /// bare locations and the allowlist match is textual.
+    fn allowlist_fixture_dir(path: &std::path::Path) {
+        let dir = path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        unsafe { std::env::set_var("PROXIMADB_EXTERNAL_TABLE_ROOTS", &dir) };
+    }
+
     fn write_parquet(path: &std::path::Path, ids: &[&str], vectors: &[Vec<f32>], dim: i32) {
+        allowlist_fixture_dir(path);
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new(
@@ -535,6 +558,7 @@ mod tests {
         rows: &[(&str, &str, i64, Vec<f32>)],
         dim: i32,
     ) {
+        allowlist_fixture_dir(path);
         use arrow_array::builder::Int64Builder;
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
