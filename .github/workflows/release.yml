@@ -1279,32 +1279,62 @@ jobs:
   verify-release:
     timeout-minutes: 30
     name: Verify Release
-    needs: [prepare, publish-crates, validate-artifacts]
+    # `publish-npm` is in `needs` on purpose. It was absent, so this job neither
+    # waited for npm nor checked it -- and on v0.4.0 it reported SUCCESS while
+    # the npm publish had failed with a 404. A failed dependency now skips this
+    # job instead, which is honest; a green "Verify Release" over a broken
+    # registry is the one outcome that must not happen.
+    needs: [prepare, publish-crates, publish-npm, validate-artifacts]
     runs-on: ubuntu-latest
     if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true' && needs.validate-artifacts.outputs.validation_passed == 'true'
     steps:
-      - name: Wait for Package Propagation
-        run: sleep 60
-
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-
-      - name: Verify PyPI Installation
+      # Registry APIs, not `pip install` / `cargo install`. The previous steps
+      # could not fail: every command ended in `|| echo ...` or `|| true`, so a
+      # missing package printed a note and the step went green. They also
+      # verified the wrong things -- PyPI is published by release-python.yml,
+      # not here, and `cargo install proximadb-sdk` installs a LIBRARY crate, so
+      # the `proximadb-server --version` that followed could never have worked.
+      #
+      # Querying the registries directly also drops the Python and Rust
+      # toolchain setup this job used to need.
+      - name: Verify the registries actually serve this version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          pip install proximadb==${{ needs.prepare.outputs.version }} || echo "PyPI package not yet available"
-          python -c "import proximadb; print(f'ProximaDB version: {proximadb.__version__}')" || true
+          set -uo pipefail
 
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          toolchain: stable
+          # crates.io REQUIRES a User-Agent and errors without one, which looks
+          # exactly like "version missing" if you do not know to set it.
+          UA='proximadb-release-verify (+https://github.com/anvai-labs/proximaDB)'
 
-      - name: Verify crates.io Installation
-        run: |
-          cargo install proximadb-sdk --version ${{ needs.prepare.outputs.version }} || echo "crates.io package not yet available"
-          proximadb-server --version || true
+          check() {
+            name="$1"; url="$2"; needle="$3"
+            for attempt in 1 2 3 4 5 6 7 8; do
+              body="$(curl -sSL -A "$UA" "$url" 2>/dev/null || true)"
+              if printf '%s' "$body" | grep -q -- "$needle"; then
+                echo "  OK   ${name}: ${VERSION} is live"
+                return 0
+              fi
+              echo "  ...  ${name}: ${VERSION} not visible yet (attempt ${attempt}/8)"
+              sleep 20
+            done
+            echo "::error::${name} does not serve ${VERSION} after ~160s of propagation time"
+            return 1
+          }
+
+          rc=0
+          check "crates.io proximadb-sdk" \
+                "https://crates.io/api/v1/crates/proximadb-sdk" \
+                "\"num\":\"${VERSION}\"" || rc=1
+          check "npm @anvailabs/proximadb-client" \
+                "https://registry.npmjs.org/@anvailabs%2fproximadb-client" \
+                "\"${VERSION}\"" || rc=1
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::release verification FAILED -- at least one registry is missing ${VERSION}"
+            exit 1
+          fi
+          echo "All registries serve ${VERSION}."
 
   # ============================================================================
   # CLEANUP - Remove old artifacts
