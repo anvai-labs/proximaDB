@@ -1,0 +1,89 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-UICDN-1: the admin UI fetches its editor from a third-party CDN at a hardcoded version, so `npm audit` audits a version nobody runs
+:toc: macro
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open — found while bumping the `ui/` lockfile in #1993; not fixed there
+| Severity | Medium — third-party script execution with no integrity check, and a dependency-audit blind spot that makes lockfile bumps look like fixes they are not
+| Component | `ui/src/components/SqlQueryTab.tsx`, `ui/package.json` (`@monaco-editor/react`), `ui/node_modules/@monaco-editor/loader`
+| Pillar | SECURITY
+| Found | 2026-10-12
+|===
+
+toc::[]
+
+== What is actually shipped
+
+`ui/src/components/SqlQueryTab.tsx` imports `@monaco-editor/react`, whose loader
+(`@monaco-editor/loader` 1.7.0) does **not** bundle Monaco. It injects a
+`<script>` at a URL hardcoded in its own config
+(`lib/cjs/config/index.js:7`):
+
+[source]
+----
+vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs'
+----
+
+Verified against the built artifact, not inferred from the manifest:
+
+* the production bundle is a single `main.*.js` of **645,931 bytes** — a bundled
+  Monaco would be several MB, and there is no separate Monaco chunk;
+* that bundle contains the literal string
+  `cdn.jsdelivr.net/npm/monaco-editor@0.55.1`;
+* `DOMPurify` appears **0** times in it.
+
+So the browser executes Monaco **0.55.1**, plus whatever DOMPurify that release
+bundles, fetched at page load from a host we do not control.
+
+== Two distinct problems
+
+**1. Unverified third-party script execution.** The tag carries no
+`integrity`/SRI attribute and no `crossorigin`, so a compromised or
+cache-poisoned CDN response executes with full access to the admin UI's
+origin — the surface that holds an operator's session. There is also a hard
+availability coupling: no jsdelivr, no SQL editor.
+
+**2. An audit blind spot that manufactures false security progress.** This is
+the part that bit us. `monaco-editor` is present in `ui/package-lock.json` only
+as a **peer** of `@monaco-editor/react` and is never bundled; `dompurify` is
+reachable *only* as `monaco-editor`'s own dependency. `npm audit` therefore
+reports on the locked `monaco-editor` / `dompurify` versions while the browser
+runs neither. In #1993 two of fourteen lockfile rows —
+`monaco-editor 0.56.0 -> 0.57.0` and `dompurify 3.4.8 -> 3.4.15` — changed
+`npm audit` output and **not one shipped byte**. Worse, the version actually
+executed (0.55.1) is *older* than both and is audited by nothing at all.
+
+(That PR's headline "critical 2 -> 0" is unaffected and stands: those were
+`proxy-addr` and `shell-quote`, genuine `react-scripts` dev-server
+transitives.)
+
+== Options
+
+. **Self-host Monaco** — add `monaco-editor` as a real dependency and point the
+  loader at a local path (`loader.config({ paths: { vs: '/vs' } })`), copying
+  `min/vs` into the build. Removes the CDN entirely, puts the executed version
+  under the lockfile and therefore under `npm audit`, and makes a bump like
+  #1993's actually mean something. Costs several MB of bundle and a build step.
+. **Keep the CDN, add SRI** — closes problem 1 only; problem 2 survives, and
+  the loader does not currently expose an integrity hook, so this needs an
+  upstream change or a patch.
+
+Option 1 is the one that fixes both and is the recommendation.
+
+== Why it is not fixed in #1993
+
+That PR is a lockfile security bump plus the Node 24 pin. Self-hosting Monaco
+changes what the UI ships and how it is built — a different change, with its own
+bundle-size and build-output review. It also lands naturally with the
+`react-scripts` migration, since the 101 remaining `ui/` advisories are all CRA
+transitives and that migration has to touch the build anyway.
+
+== Verification for the fix
+
+* no `cdn.jsdelivr.net` (or any external host) string in `ui/build/static/js/*`;
+* `monaco-editor` present in `ui/package.json` `dependencies`, so `npm audit`
+  covers the executed version;
+* the SQL editor loads with the network blocked to all origins but the app's own.

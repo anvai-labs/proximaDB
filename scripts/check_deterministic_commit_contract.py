@@ -655,16 +655,42 @@ def _push_branches(text: str) -> list[str]:
 # LTS line.
 NODE_MAJOR = "24"
 
-# Matched anywhere in the step, not just on the bullet: `uses:` sits on the
-# bullet line in `ci.yml` but under a `- name:` in `release.yml` and under a
-# `- if:` in the contract-gate matrix. An earlier revision anchored on
-# `- uses:` and so silently skipped BOTH of those -- including the pin that
-# builds the npm package the release publishes.
-SETUP_NODE_RE = re.compile(r"^(?P<indent>\s*)-?\s*uses:\s*actions/setup-node@")
+# Matched anywhere in the step and in any spelling GitHub accepts, because each
+# spelling it did NOT match was a silent pass:
+#
+#   * `uses:` on the bullet line (`ci.yml`), under a `- name:` (`release.yml`),
+#     or under a `- if:` (the contract-gate matrix). Anchoring on `- uses:`
+#     skipped the last two -- including the pin that builds the npm package the
+#     release publishes.
+#   * `- {uses: actions/setup-node@v7, with: {node-version: '20'}}` -- flow
+#     style, where there is no bullet-plus-key line at all.
+#   * `uses: "actions/setup-node@v7"` -- a quoted action ref.
+#
+# The sibling runner guard in this file is already tested against the last two
+# (`test_quoted_runner_key_is_checked`, `test_inline_job_cannot_bypass_the_
+# block_style_guard`); this check now is too.
+SETUP_NODE_RE = re.compile(
+    r"""^(?P<indent>\s*)(-\s*)?\{?\s*(?P<k>['"]?)uses(?P=k)\s*:\s*"""
+    r"""['"]?actions/setup-node@"""
+)
 STEP_BULLET_RE = re.compile(r"^(?P<indent>\s*)-\s")
 NODE_VERSION_RE = re.compile(
-    r"^\s*node-version:\s*(?P<quote>['\"]?)(?P<value>[^'\"#\s]+)(?P=quote)\s*(#.*)?$"
+    r"""^[\s{,]*(?P<k>['"]?)node-version(?P=k)\s*:\s*"""
+    r"""(?P<quote>['"]?)(?P<value>[^'"#\s,}]+)(?P=quote)\s*[,}]?\s*(#.*)?$"""
 )
+# `node-version-file:` points at an `.nvmrc`-style file instead of naming a
+# version, so the major is invisible here and drifts with that file. Treated as
+# unpinned rather than quietly accepted.
+NODE_VERSION_FILE_RE = re.compile(r"""^[\s{,]*(?P<k>['"]?)node-version-file(?P=k)\s*:""")
+
+# Unanchored twins, for the single line of a flow-style step: the anchored
+# patterns above can only match a line's FIRST key, so on
+# `- {uses: …, with: {node-version: '20'}}` they match nothing at all.
+INLINE_NODE_VERSION_RE = re.compile(
+    r"""(?P<k>['"]?)node-version(?P=k)\s*:\s*"""
+    r"""(?P<quote>['"]?)(?P<value>[^'"#\s,}]+)(?P=quote)"""
+)
+INLINE_NODE_VERSION_FILE_RE = re.compile(r"""(?P<k>['"]?)node-version-file(?P=k)\s*:""")
 
 
 def check_node_version_pins(findings: list[Finding]) -> None:
@@ -686,10 +712,20 @@ def check_node_version_pins(findings: list[Finding]) -> None:
     An unpinned step (no `node-version:`) is a finding too: it silently tracks
     whatever the runner image ships, which is the same drift by another route.
     """
-    workflow_dir = ROOT / ".github" / "workflows"
-    if not workflow_dir.is_dir():
-        return
-    for path in sorted(workflow_dir.glob("*.yml")):
+    # Both extensions, and composite actions too. GitHub honours `.yaml` as
+    # readily as `.yml`, and a `uses: ./.github/actions/x` step runs whatever
+    # that action's own `action.yml` sets up -- so globbing only
+    # `workflows/*.yml` left a pin one `git mv` or one new directory away from
+    # being unchecked. Neither gap is reachable in the tree today; both were
+    # reachable in the first revision of this check.
+    roots = [ROOT / ".github" / "workflows", ROOT / ".github" / "actions"]
+    paths: list[Path] = []
+    for directory in roots:
+        if not directory.is_dir():
+            continue
+        for pattern in ("*.yml", "*.yaml", "**/*.yml", "**/*.yaml"):
+            paths.extend(directory.glob(pattern))
+    for path in sorted(set(paths)):
         lines = path.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(lines):
             match = SETUP_NODE_RE.match(line)
@@ -710,10 +746,22 @@ def check_node_version_pins(findings: list[Finding]) -> None:
                     continue
                 if len(follow) - len(follow.lstrip()) <= bullet:
                     break
+                if NODE_VERSION_FILE_RE.match(follow):
+                    found = "<file>"
+                    break
                 version = NODE_VERSION_RE.match(follow)
                 if version:
                     found = version.group("value")
                     break
+            if found is None:
+                # A flow-style step is a single line, so the forward scan above
+                # never reaches its `with:` -- read the pin off the same line.
+                if INLINE_NODE_VERSION_FILE_RE.search(line):
+                    found = "<file>"
+                else:
+                    inline = INLINE_NODE_VERSION_RE.search(line)
+                    if inline:
+                        found = inline.group("value")
             if found is None:
                 findings.append(
                     Finding(
@@ -727,13 +775,25 @@ def check_node_version_pins(findings: list[Finding]) -> None:
                     )
                 )
                 continue
+            if found == "<file>":
+                findings.append(
+                    Finding(
+                        "node-version-pin",
+                        f"{rel(path)}:{index + 1}: `actions/setup-node` resolves "
+                        f"its version from `node-version-file`, so the Node "
+                        f"major is not visible here and drifts with that file. "
+                        f"Pin `node-version: '{NODE_MAJOR}'` instead.",
+                    )
+                )
+                continue
             if found.split(".")[0] != NODE_MAJOR:
                 findings.append(
                     Finding(
                         "node-version-pin",
                         f"{rel(path)}:{index + 1}: pins Node {found}, but this "
                         f"repo builds and publishes on Node {NODE_MAJOR} "
-                        f"(NODE_MAJOR in {rel(Path(__file__))}). Mixed majors "
+                        f"(NODE_MAJOR in scripts/"
+                        f"check_deterministic_commit_contract.py). Mixed majors "
                         f"mean the lockfile is generated by one npm and "
                         f"installed by another, which fails `npm ci` closed.",
                     )

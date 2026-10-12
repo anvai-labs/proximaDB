@@ -200,6 +200,165 @@ class CiRunnerCommitContractTest(unittest.TestCase):
         self.assertTrue(self.findings_for("    runs-on: ubuntu-24.04#different-label\n"))
 
 
+class NodeVersionPinContractTest(unittest.TestCase):
+    """Every spelling GitHub accepts must reach the check.
+
+    The first revision of `SETUP_NODE_RE` anchored on `- uses:` and silently
+    skipped two real steps in this repo; an adversarial review then found two
+    more spellings that passed. Each case below corresponds to one of those,
+    so a future regex edit that loses a spelling fails here instead of in six
+    months when a Node 20 pin reappears unnoticed.
+    """
+
+    STEP = "      - uses: actions/setup-node@v7\n        with:\n"
+
+    def findings_for(self, workflow: str, name: str = "ci.yml") -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / ".github/workflows" / name
+            path.parent.mkdir(parents=True)
+            path.write_text(workflow, encoding="utf-8")
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_node_version_pins(findings)
+                return findings
+
+    def test_the_checked_in_workflows_pass(self) -> None:
+        for name in ("ci.yml", "release.yml"):
+            with self.subTest(workflow=name):
+                text = (REPO_ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+                self.assertEqual(self.findings_for(text, name), [])
+
+    def test_the_agreed_major_is_accepted_in_every_benign_spelling(self) -> None:
+        for pin in ("'24'", '"24"', "24", "24.9.0", "'24.x'", "'24'  # pinned"):
+            with self.subTest(pin=pin):
+                self.assertEqual(
+                    self.findings_for(f"{self.STEP}          node-version: {pin}\n"), []
+                )
+
+    def test_another_major_is_rejected(self) -> None:
+        for pin in ("'20'", '"20"', "20", "20.11.0", "'18'", "'26'"):
+            with self.subTest(pin=pin):
+                self.assertTrue(
+                    self.findings_for(f"{self.STEP}          node-version: {pin}\n"), pin
+                )
+
+    def test_an_unpinned_step_is_rejected(self) -> None:
+        self.assertTrue(self.findings_for("      - uses: actions/setup-node@v7\n"))
+
+    def test_uses_under_a_name_or_if_is_checked(self) -> None:
+        # The two shapes the `- uses:`-anchored revision skipped -- release.yml
+        # writes `- name:` above its `uses:`, the contract-gate matrix `- if:`.
+        for bullet in ("- name: Setup Node", "- if: matrix.setup == 'node'"):
+            with self.subTest(bullet=bullet):
+                workflow = (
+                    f"      {bullet}\n"
+                    "        uses: actions/setup-node@v7\n"
+                    "        with:\n"
+                    "          node-version: '20'\n"
+                )
+                self.assertTrue(self.findings_for(workflow))
+
+    def test_a_quoted_action_ref_is_checked(self) -> None:
+        for ref in ('"actions/setup-node@v7"', "'actions/setup-node@v7'"):
+            with self.subTest(ref=ref):
+                workflow = (
+                    f"      - uses: {ref}\n"
+                    "        with:\n"
+                    "          node-version: '20'\n"
+                )
+                self.assertTrue(self.findings_for(workflow))
+
+    def test_a_flow_style_step_cannot_bypass_the_block_style_scan(self) -> None:
+        for workflow in (
+            "      - {uses: actions/setup-node@v7, with: {node-version: '20'}}\n",
+            '      - {uses: "actions/setup-node@v7", with: {node-version: 20}}\n',
+            "      - {uses: actions/setup-node@v7}\n",
+        ):
+            with self.subTest(workflow=workflow.strip()):
+                self.assertTrue(self.findings_for(workflow))
+
+    def test_a_flow_style_step_on_the_agreed_major_is_accepted(self) -> None:
+        self.assertEqual(
+            self.findings_for(
+                "      - {uses: actions/setup-node@v7, with: {node-version: '24'}}\n"
+            ),
+            [],
+        )
+
+    def test_a_sha_pinned_action_is_checked(self) -> None:
+        workflow = (
+            "      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020\n"
+            "        with:\n"
+            "          node-version: '20'\n"
+        )
+        self.assertTrue(self.findings_for(workflow))
+
+    def test_node_version_file_counts_as_unpinned(self) -> None:
+        workflow = f"{self.STEP}          node-version-file: '.nvmrc'\n"
+        findings = self.findings_for(workflow)
+        self.assertTrue(findings)
+        self.assertIn("node-version-file", findings[0].message)
+
+    def test_an_expression_is_rejected_because_the_major_is_not_visible(self) -> None:
+        for pin in ("${{ matrix.node }}", "${{env.NODE}}", "'lts/*'"):
+            with self.subTest(pin=pin):
+                self.assertTrue(
+                    self.findings_for(f"{self.STEP}          node-version: {pin}\n"), pin
+                )
+
+    def test_every_step_is_checked_not_just_the_first(self) -> None:
+        workflow = (
+            f"{self.STEP}          node-version: '24'\n"
+            "      - uses: actions/setup-node@v7\n"
+            "        with:\n"
+            "          node-version: '20'\n"
+        )
+        findings = self.findings_for(workflow)
+        self.assertEqual(len(findings), 1, findings)
+        # Anchored on the offending step's `uses:` line (4), not on its pin
+        # line (6) -- the step is what a reader has to go and edit.
+        self.assertIn("ci.yml:4", findings[0].message)
+
+    def test_a_pin_in_an_earlier_step_does_not_satisfy_a_later_one(self) -> None:
+        # The forward scan must stop at the step boundary, or an unrelated
+        # `node-version:` above would launder an unpinned setup-node below it.
+        workflow = (
+            "      - uses: ./.github/actions/other\n"
+            "        with:\n"
+            "          node-version: '24'\n"
+            "      - uses: actions/setup-node@v7\n"
+        )
+        self.assertTrue(self.findings_for(workflow))
+
+    def test_a_yaml_extension_workflow_is_not_skipped(self) -> None:
+        workflow = f"{self.STEP}          node-version: '20'\n"
+        self.assertTrue(self.findings_for(workflow, "zz-drift.yaml"))
+
+    def test_a_composite_action_is_not_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / ".github/actions/setup-stuff/action.yml"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "runs:\n  using: composite\n  steps:\n"
+                "    - uses: actions/setup-node@v7\n"
+                "      with:\n        node-version: '20'\n",
+                encoding="utf-8",
+            )
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_node_version_pins(findings)
+        self.assertTrue(findings)
+
+    def test_the_major_the_repo_agrees_on_is_the_one_asserted(self) -> None:
+        # Guards against the check passing vacuously if NODE_MAJOR is ever
+        # blanked, and ties the constant to what the workflows actually say.
+        self.assertTrue(contract.NODE_MAJOR.isdigit())
+        text = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn(f"node-version: '{contract.NODE_MAJOR}'", text)
+
+
 if __name__ == "__main__":
     unittest.main()
 
