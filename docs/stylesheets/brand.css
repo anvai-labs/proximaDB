@@ -1,4 +1,4 @@
-/* Anvai product-family brand for Material for MkDocs — shared v1.2.
+/* Anvai product-family brand for Material for MkDocs — shared v1.3.
 
    This file is shared VERBATIM by every Anvai docs site (AgentBrowser,
    AnvaiOps, genmedia, InferFlux, ProximaDB, Sandhi, Victor). It maps
@@ -52,7 +52,8 @@
   --md-default-fg-color--light: var(--text-2);
   --md-default-fg-color--lighter: var(--text-2);
   --md-typeset-a-color: var(--accent);
-  --md-code-bg-color: var(--surface-2);
+  /* --bg keeps every Material light syntax color >= 4.6:1 (surface-2 fell to 4.41). */
+  --md-code-bg-color: var(--bg);
   --md-code-fg-color: var(--text);
   --anvai-surface: var(--surface);
   --anvai-line: var(--line);

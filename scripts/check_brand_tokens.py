@@ -20,10 +20,10 @@ from pathlib import Path
 
 import yaml
 
-CANONICAL = "anvaiops design/tokens.css (as of e8215fc) + shared brand.css v1.2"
+CANONICAL = "anvaiops design/tokens.css (as of e8215fc) + shared brand.css v1.3"
 PINNED = {
     "tokens.css": "2ea50eda33844d7c1ae58a264c8356b5f08841c665365f97aa61df53b175bca6",
-    "brand.css": "07b5a062fa0b93776e9684ce32c629d621e9831630c6482d138f9af4ae14e887",
+    "brand.css": "926255104c120e55d5d3d39d1b0685554a30bf946a5ad7c86a060e5fc52ab335",
     "fonts/inter-latin-wght-normal.woff2": "313809049cc15a226aaca190f5aee5f18d8125a5219eafe1cd0b52098a9b9699",
     "fonts/Inter-OFL.txt": "3b0a5fca3d17942cde889069889dedbbbd075e9b599968c82a95f4d944e9b345",
 }
@@ -40,7 +40,7 @@ _Loader.add_multi_constructor("tag:yaml.org,2002:python/", lambda loader, suffix
 
 def check(root: Path) -> list[str]:
     config = yaml.load((root / "mkdocs.yml").read_text(encoding="utf-8"), Loader=_Loader)
-    docs_dir = root / config.get("docs_dir", "docs")
+    docs_dir = root / (config.get("docs_dir") or "docs")
     failures = []
     for name, digest in PINNED.items():
         path = docs_dir / "stylesheets" / name

@@ -78,11 +78,19 @@ class BrandCheckerTest(unittest.TestCase):
         self.assertTrue(any("theme.font" in f for f in self.failures()))
 
     def test_each_palette_entry_needs_custom_primary_and_accent(self):
+        original = self.mkdocs.read_text(encoding="utf-8")
         for key, value in (("primary", "indigo"), ("accent", "amber")):
-            with self.subTest(key=key):
-                self.edit(f"{key}: custom", f"{key}: {value}")
-                self.assertTrue(any(f"{key}: custom" in f for f in self.failures()))
-                self.edit(f"{key}: {value}", f"{key}: custom")
+            needle = f"{key}: custom"
+            for index in range(original.count(needle)):
+                with self.subTest(key=key, entry=index):
+                    at = -1
+                    for _ in range(index + 1):
+                        at = original.index(needle, at + 1)
+                    mutated = original[:at] + f"{key}: {value}" + original[at + len(needle) :]
+                    self.mkdocs.write_text(mutated, encoding="utf-8")
+                    self.assertTrue(any(needle in f for f in self.failures()))
+        self.mkdocs.write_text(original, encoding="utf-8")
+        self.assertEqual(self.failures(), [])
 
     def test_edited_shared_file_fails(self):
         with (self.stylesheets / "brand.css").open("a", encoding="utf-8") as handle:
