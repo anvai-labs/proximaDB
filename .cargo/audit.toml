@@ -1,0 +1,70 @@
+# cargo-audit baseline for `cargo audit -D warnings --no-yanked`
+# (the CI Security Audit job).
+#
+# TD-AUDITGATE-1: the job used to be doubly unfailable (`cargo audit || echo`
+# under `continue-on-error`), so these findings sat silently green. Everything
+# fixable was fixed in the PR that introduced this file (quinn-proto 0.11.19,
+# h2 0.4.20, event-listener 5.4.2, chacha20 0.10.2, simba 0.10.2, rand 0.10.3).
+# What remains here is unfixed upstream or reachable only through a dependency
+# we cannot move without a major-bump effort — each entry says which, and each
+# must be re-reviewed when its parent dependency moves. A NEW advisory that is
+# not in this list fails CI; that is the point.
+#
+# Why --no-yanked: cargo-audit has no per-crate ignore for yanked (they carry
+# no advisory ID), and the two current yanks (spin 0.9.8 via flume 0.12,
+# wide 1.6.0 via simba 0.10) have no parent bump that clears them. A yank is a
+# withdrawal signal, not a vulnerability; re-enable the check if either parent
+# moves.
+#
+# Re-audit after editing: cargo audit -D warnings --no-yanked   (must exit 0)
+
+[advisories]
+ignore = [
+    # --- vulnerabilities (unfixed upstream of us) ---
+
+    # h2 unbounded empty DATA frames (RUSTSEC-2026-0258). The h2 0.4 line is
+    # fixed (lock has 0.4.20); 0.3.27 remains only via httpmock 0.7 ->
+    # hyper 0.14, a DEV-dependency of the root crate — not a production
+    # surface. Dies when httpmock is upgraded or replaced.
+    "RUSTSEC-2026-0258",
+
+    # quick-xml quadratic run time / unbounded namespace allocation
+    # (RUSTSEC-2026-0194, RUSTSEC-2026-0195). Fixed in quick-xml >= 0.41, but
+    # the only parent is object_store 0.13.2, which pins ^0.39 — unfixable
+    # until an object_store 0.14 bump (API-breaking, own PR). Both advisories
+    # are denial-of-service-class on attacker-supplied XML (S3/GCS list
+    # responses), relevant only when a hostile party controls the bucket's
+    # listing payload.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # --- unmaintained (transitive; no patched line exists) ---
+
+    # async-std discontinued (RUSTSEC-2025-0052) — pulled by a transitive
+    # runtime dep; no runtime code of ours executes on it.
+    "RUSTSEC-2025-0052",
+    # bincode 1.x unmaintained (RUSTSEC-2025-0141) — 2.x is a different API;
+    # transitively required, not written against directly.
+    "RUSTSEC-2025-0141",
+    # paste unmaintained (RUSTSEC-2024-0436) — proc-macro helper of transitive
+    # deps; expands to ordinary code, no runtime exposure.
+    "RUSTSEC-2024-0436",
+    # rustls-pemfile unmaintained (RUSTSEC-2025-0134) — both 1.x and 2.x
+    # in-tree via TLS-setup paths of transitive deps.
+    "RUSTSEC-2025-0134",
+    # unsafe-libyaml unmaintained (RUSTSEC-2024-0449) — serde_yaml's backend;
+    # long-known, upstream replaced by libyaml-safer in newer serde_yaml.
+    "RUSTSEC-2024-0449",
+
+    # --- unsound (reported unfixed upstream) ---
+
+    # lru panic-safety UAF in LruCache::pop (RUSTSEC-2026-0253) — no patched
+    # 0.16 release at baseline time; re-check on every lru point release.
+    "RUSTSEC-2026-0253",
+
+    # --- yanked ---
+    # Excluded as a class via --no-yanked (see header): spin 0.9.8 (flume
+    # 0.12) and wide 1.6.0 (simba 0.10) are yanked with no parent bump that
+    # clears them. chacha20 0.10.1's yank WAS cleared by moving the lock to
+    # 0.10.2 — do not let it regress.
+]

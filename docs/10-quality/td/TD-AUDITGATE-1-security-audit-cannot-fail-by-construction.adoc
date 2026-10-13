@@ -6,7 +6,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Failure 2 FIXED** — `scripts/check_lockfile_no_downgrade.py` now gates every PR touching `Cargo.lock`, validated against the real #2003 -> #2004 regression. **Failure 1 still OPEN**: the `cargo audit` step remains unfailable, and fixing it needs the baseline decision below.
+| Status | **BOTH FAILURES FIXED.** Failure 2: `scripts/check_lockfile_no_downgrade.py` gates every PR touching `Cargo.lock`, validated against the real #2003 -> #2004 regression. Failure 1 (2026-10-13): both audit steps now run `cargo audit -D warnings --no-yanked` with a committed, per-entry-rationale baseline in `.cargo/audit.toml` — option 2 as written below. Running the gate for real surfaced **9 live vulnerabilities** that had sat silently green behind it; 6 were fixed in-lock the same day, 3 baseline-ignored with reasons (see `.cargo/audit.toml`).
 | Severity | High — a known advisory can be reintroduced into `Cargo.lock` and every one of ~83 checks still passes. The gate that exists to catch exactly this is incapable of going red.
 | Component | `.github/workflows/ci.yml` (`security-audit`), `.github/workflows/tdd.yml`
 | Pillar | SECURITY / CI
@@ -52,17 +52,48 @@ automated noticed at any point.
 
 == Two separate failures, both worth fixing
 
-**1. The gate cannot fail (this TD).** Even a *blocking* `cargo audit` has a
-known cost: a newly published advisory against an unchanged dependency turns
-unrelated PRs red. The usual resolution is to fail only on advisories that are
-**new relative to a committed baseline**, so the signal is "this PR introduced
-it", not "the world changed". Options, cheapest first:
+**1. The gate cannot fail (this TD). FIXED 2026-10-13.** Both `ci.yml`
+(`rust-security`) and `tdd.yml` now run:
+
+[source,yaml]
+----
+cargo audit -D warnings --no-yanked
+----
+
+with the tolerated set committed as `.cargo/audit.toml` — every ignore carries
+a rationale naming the pulling dependency and the condition under which it must
+be re-reviewed. Option 2 from the list below ("the list becomes the baseline,
+and adding to it is a visible decision"). `--no-yanked` because cargo-audit has
+no per-crate ignore for yanked crates (they carry no advisory ID) and the two
+current yanks (spin 0.9.8 via flume 0.12, wide 1.6.0 via simba 0.10) have no
+parent bump that clears them; a yank is a withdrawal signal, not a
+vulnerability. The original options, for the record:
 
   * drop the `|| echo` and `continue-on-error` and accept world-changes-break-CI;
   * `cargo audit --deny warnings` with an `audit.toml` ignore list, reviewed
     deliberately (the list becomes the baseline, and adding to it is a visible
-    decision);
+    decision); **← chosen, plus `--no-yanked`**
   * compute the advisory set before/after and fail only on the delta.
+
+**What the gate found the first time it ran for real.** 9 vulnerabilities
+across 4 crates, all invisible until this fix:
+
+* `quinn-proto` 0.11.15 — 5 advisories (RUSTSEC-2026-0338/0339/0340/0341/0342);
+  fixed in-lock to 0.11.19.
+* `h2` 0.4.15 (RUSTSEC-2026-0258); fixed in-lock to 0.4.20. The second h2
+  finding, 0.3.27 via httpmock → hyper 0.14, is **dev-only** and baseline-ignored.
+* `quick-xml` 0.39.4 — 2 denial-of-service advisories
+  (RUSTSEC-2026-0194/0195); pinned by `object_store` 0.13.2 (^0.39), unfixable
+  without an object_store 0.14 major bump — baseline-ignored with that note.
+* Plus warnings now denied: `event-listener` unsound (fixed to 5.4.2), `lru`
+  unsound (unfixed upstream, baseline-ignored), 5 unmaintained crates
+  (baseline-ignored), 3 yanked crates (one fixed in-lock: chacha20 0.10.2;
+  two excluded as a class via `--no-yanked`).
+
+The "newly published advisory breaks unrelated PRs" cost of a blocking gate is
+accepted deliberately: it now lands as a red CI run whose fix is "update the
+lock or add a reasoned ignore", both of which are visible decisions instead of
+silence.
 
 **2. A lockfile regression is invisible to review.** A `Cargo.lock` conflict is
 exactly where content can regress while the file list looks correct — the
@@ -103,9 +134,11 @@ filenames. Guard (2) above makes this mechanical instead of a habit.
 
 == Verification for the fix
 
-* Introduce a deliberate downgrade of a package with a known advisory on a
-  scratch branch; the audit job must go **red**, and guard (2) must name the
-  package and both versions.
-* An advisory published against an unchanged dependency must not break
-  unrelated PRs — whichever option is chosen has to satisfy this, or it will be
-  disabled again within a week.
+* Failure 1 verified by construction: the enforcing command exits 1 on the
+  pre-fix lock (it did — 9 findings) and 0 on the fixed lock + baseline
+  (`cargo audit -D warnings --no-yanked`, run locally in the fixing PR).
+* Failure 2 verified by replay (see DONE above) and by the negative case
+  (#2011's legitimate whole-line drop yields zero findings).
+* Ongoing: an advisory published against an unchanged dependency WILL break
+  unrelated PRs — accepted, because the resolution is now visible (lock bump
+  or reasoned baseline addition) rather than silence.

@@ -1109,9 +1109,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+      # TD-AUDITGATE-1: this job used to be doubly unfailable (`|| echo` under
+      # `continue-on-error`), which is how 9 vulnerabilities sat silently green
+      # until 2026-10. Now it fails the lane. The tolerated set lives in
+      # .cargo/audit.toml with per-entry rationale — a finding not in that list
+      # (or a yank, which the gate does not track as a class — see the file
+      # header) turns this red and blocks the PR.
       - name: Run security audit
-        continue-on-error: true
-        run: cargo audit || echo "::warning::Security audit found vulnerabilities - review required"
+        run: cargo audit -D warnings --no-yanked
 
   python-lint:
     name: Python Lint
