@@ -6,7 +6,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open — demonstrated by a real same-day regression, found by human review rather than by CI
+| Status | **Failure 2 FIXED** — `scripts/check_lockfile_no_downgrade.py` now gates every PR touching `Cargo.lock`, validated against the real #2003 -> #2004 regression. **Failure 1 still OPEN**: the `cargo audit` step remains unfailable, and fixing it needs the baseline decision below.
 | Severity | High — a known advisory can be reintroduced into `Cargo.lock` and every one of ~83 checks still passes. The gate that exists to catch exactly this is incapable of going red.
 | Component | `.github/workflows/ci.yml` (`security-audit`), `.github/workflows/tdd.yml`
 | Pillar | SECURITY / CI
@@ -72,6 +72,22 @@ guard: on any PR touching `Cargo.lock`, assert no package moves **backwards**
 versus the base branch, listing any that do. That catches this whole class
 (reverted security bumps, accidental downgrades from stale-base conflict
 resolution) without needing an advisory database.
+
+**DONE** — `scripts/check_lockfile_no_downgrade.py`, wired into the `changes` job
+(which already has `fetch-depth: 0`). Validated by replay against real commits,
+not synthetic fixtures:
+
+* `72092668f` (#2003) -> `61de80dd8` (#2004) yields exactly one finding,
+  `rustls: 0.23.45 -> 0.23.44` — the regression this TD was filed for.
+* `e4969ee15` (#2011), which legitimately dropped the whole `rustls 0.21` line,
+  yields **zero** findings. Avoiding that false positive is the difference
+  between a guard that survives and one that gets disabled in a week, so
+  comparison is per MAJOR line (and per 0.x minor, since Cargo treats those as
+  breaking).
+
+`--require-base` makes an unfetched base a FAILURE rather than a silent skip —
+a guard that quietly skips is the same defect class it exists to catch. 9 unit
+tests in `tests/scripts/test_lockfile_no_downgrade.py`.
 
 == The mechanism to avoid repeating (process note)
 
