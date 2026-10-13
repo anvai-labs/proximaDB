@@ -1614,14 +1614,12 @@ impl UnifiedDistanceCompute {
     ) {
         const UNROLL_FACTOR: usize = 4;
 
-        let chunks = vectors.chunks_exact(UNROLL_FACTOR);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = vectors.as_chunks::<UNROLL_FACTOR>();
 
-        let chunk_vec: Vec<&[&[f32]]> = chunks.collect();
-        for (i, chunk) in chunk_vec.iter().enumerate() {
+        for (i, chunk) in chunks.iter().enumerate() {
             // Prefetch next batch into L1 cache (locality hint 3 = L1, read intent 0)
-            if i + 1 < chunk_vec.len() {
-                let next = chunk_vec[i + 1];
+            if i + 1 < chunks.len() {
+                let next = &chunks[i + 1];
                 for v in next.iter() {
                     #[cfg(target_arch = "x86_64")]
                     {
@@ -1662,15 +1660,13 @@ impl UnifiedDistanceCompute {
     ) {
         const UNROLL_FACTOR: usize = 4;
 
-        let chunks = vectors.chunks_exact(UNROLL_FACTOR);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = vectors.as_chunks::<UNROLL_FACTOR>();
 
-        let chunk_vec: Vec<&[&[f32]]> = chunks.collect();
-        for (i, chunk) in chunk_vec.iter().enumerate() {
+        for (i, chunk) in chunks.iter().enumerate() {
             // Prefetch next batch into L1 cache while processing current batch
-            if i + 1 < chunk_vec.len() {
-                let next = chunk_vec[i + 1];
-                for v in next {
+            if i + 1 < chunks.len() {
+                let next = &chunks[i + 1];
+                for v in next.iter() {
                     // Hint to the compiler that we'll access this data soon.
                     // std::arch::aarch64::_prefetch is unstable on stable Rust,
                     // so we use a volatile read of the first byte as a portable

@@ -179,12 +179,10 @@ impl MmapVectorStorage {
 
             // Convert bytes to f32 vector
             let vector: Vec<f32> = vector_bytes
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let mut bytes = [0u8; 4];
-                    bytes.copy_from_slice(chunk);
-                    f32::from_le_bytes(bytes)
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
 
             vectors.push(vector);

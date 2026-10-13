@@ -166,7 +166,7 @@ pub struct SpillRecordStorage {
     /// A counter rather than a bool, because a bool cannot be cleared correctly.
     /// Clearing on success would discard the suspicion raised by an EARLIER
     /// cancelled or failed write — a later successful flush does not reconcile a
-    /// previous orphan. `saturating_add`/`saturating_sub` via `fetch_update`, not
+    /// previous orphan. `saturating_add`/`saturating_sub` via `try_update`, not
     /// `fetch_add`: atomics bypass `overflow-checks`, and a wrap from `MAX` to 0
     /// would silently clear the refusal.
     ///
@@ -890,7 +890,7 @@ impl SpillRecordStorage {
         // TD-USUB-18.
         let _ =
             self.unresolved_segment_writes
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                     Some(v.saturating_add(1))
                 });
         self.filesystem
@@ -901,7 +901,7 @@ impl SpillRecordStorage {
         // publishes into `segments` immediately below.
         let _ =
             self.unresolved_segment_writes
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                     Some(v.saturating_sub(1))
                 });
 

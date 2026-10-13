@@ -824,8 +824,10 @@ pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord
                 }
                 let bytes = fsb.value(row);
                 let values: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 let dim = values.len() as u32;
                 record.embeddings.push(EmbeddingCell {
@@ -1288,8 +1290,10 @@ mod tests {
 
         let raw = vecs.value(0);
         let decoded: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(decoded, vec![1.0, 2.0, 3.0]);
         assert!(vecs.is_null(1), "record without embedding must be null");

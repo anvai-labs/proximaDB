@@ -31,7 +31,6 @@
 
 use anyhow::{Result, anyhow};
 use std::cmp::Ordering;
-use std::f32;
 
 /// ## Vector Normalization
 ///
