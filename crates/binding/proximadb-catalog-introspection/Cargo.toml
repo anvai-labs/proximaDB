@@ -22,9 +22,12 @@ proximadb-catalog = { path = "../../control/proximadb-catalog" }
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
 anyhow.workspace = true
 serde.workspace = true
-# parse_select_aliases is a thin wrapper over sqlparser-rs (same version the root
-# sql_frontend uses). Inlined here to keep this crate free of a root-crate dep.
-sqlparser = { version = "0.59", features = ["visitor"] }
+# parse_select_aliases is a thin wrapper over sqlparser-rs. Declared via the
+# workspace so "same version the root sql_frontend uses" stays TRUE -- as a
+# hardcoded "0.59" it silently stopped being true when the root moved to 0.62,
+# and the workspace then compiled two sqlparser copies with divergent ASTs.
+# Still no root-crate dep; only the version is shared.
+sqlparser = { workspace = true }
 
 [dev-dependencies]
 # Integration tests exercise the service through the root crate's DDL/frontend

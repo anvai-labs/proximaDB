@@ -205,14 +205,14 @@ anyhow = "1.0"
 # `sqlparser = { workspace = true }` without first declaring the
 # dep at the workspace level. Same pin as the root `[dependencies]`
 # entry.
-sqlparser = { version = "0.59", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 arrow = { version = "59", features = ["prettyprint", "ffi"] }
 arrow-array = { version = "59", default-features = false }
 # Workspace-level so the root crate and `proximadb-embedded` resolve the SAME
 # datafusion. The embedded Python binding passes `SessionContext`/`DataFrame`
 # across the crate boundary, so two independently-specified versions would be two
 # distinct types and fail to compile in a way that is tedious to diagnose.
-datafusion = { version = "55.0", default-features = false, features = ["sql", "regex_expressions", "unicode_expressions", "datetime_expressions", "math_expressions"] }
+datafusion = { version = "55.2", default-features = false, features = ["sql", "regex_expressions", "unicode_expressions", "datetime_expressions", "math_expressions"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bincode = "1.3"
 arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
@@ -564,7 +564,7 @@ proximadb-vector-query = { path = "crates/query/proximadb-vector-query" }
 proximadb-catalog-introspection = { version = "0.4.0", path = "crates/binding/proximadb-catalog-introspection" }
 
 # SQL Parsing
-sqlparser = { version = "0.59", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 
 # Async recursion support
 async-recursion = "1.0"
@@ -639,8 +639,8 @@ arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
 arrow-cast = { version = "59", default-features = false }
 
 # DataFusion for SQL and compute engine compatibility (Arrow 57 compatible)
-datafusion = { version = "55.0", default-features = false, features = ["sql", "regex_expressions", "unicode_expressions", "datetime_expressions", "math_expressions"], optional = true }
-datafusion-common = { version = "55.0", optional = true }
+datafusion = { version = "55.2", default-features = false, features = ["sql", "regex_expressions", "unicode_expressions", "datetime_expressions", "math_expressions"], optional = true }
+datafusion-common = { version = "55.2", optional = true }
 # ADR-059: DuckDB-Local as a plugin OLAP engine (in-process, behind the
 # `duckdb` feature, default OFF). `bundled` builds libduckdb from source so no
 # system DuckDB is required. Used by the perf-ledger harnesses for an
