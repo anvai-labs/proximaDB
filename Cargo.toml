@@ -205,7 +205,7 @@ anyhow = "1.0"
 # `sqlparser = { workspace = true }` without first declaring the
 # dep at the workspace level. Same pin as the root `[dependencies]`
 # entry.
-sqlparser = { version = "0.59", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 arrow = { version = "59", features = ["prettyprint", "ffi"] }
 arrow-array = { version = "59", default-features = false }
 # Workspace-level so the root crate and `proximadb-embedded` resolve the SAME
@@ -271,7 +271,13 @@ dashmap = "6.1.0"
 moka = { version = "0.12", features = ["future"] }
 parking_lot = "0.12"
 tracing = "0.1"
-serde_json = "1.0"
+# Mirrors the root `[dependencies]` declaration (#2006) at the WORKSPACE level,
+# because 68 members inherit this entry via `serde_json.workspace = true`. Cargo
+# unifies features across the graph, so the built artifact is already correct --
+# but leaving this bare means those 68 crates' ordering guarantee rests on
+# unification from the root crate rather than on what they actually read. See
+# TD-SPECORD-1 for the mechanism and the measured cost of a flip.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "json", "chrono", "uuid"] }
 prost = "0.14"
 prost-types = "0.14"
@@ -564,7 +570,7 @@ proximadb-vector-query = { path = "crates/query/proximadb-vector-query" }
 proximadb-catalog-introspection = { version = "0.4.0", path = "crates/binding/proximadb-catalog-introspection" }
 
 # SQL Parsing
-sqlparser = { version = "0.59", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 
 # Async recursion support
 async-recursion = "1.0"
