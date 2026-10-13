@@ -1119,12 +1119,11 @@ impl SqlFrontendParser {
     fn try_convert_dml(&self, statement: &Statement) -> Result<Option<DmlStatement>> {
         match statement {
             Statement::Insert(insert) => Ok(Some(self.convert_insert(insert)?)),
-            Statement::Update {
-                table,
-                assignments,
-                selection,
-                ..
-            } => Ok(Some(self.convert_update(table, assignments, selection)?)),
+            Statement::Update(update) => Ok(Some(self.convert_update(
+                &update.table,
+                &update.assignments,
+                &update.selection,
+            )?)),
             Statement::Delete(delete) => Ok(Some(self.convert_delete(delete)?)),
             Statement::Query(_) => Ok(None), // SELECT query, not DML
             _ => Err(anyhow!("Unsupported statement type for DML")),
@@ -1243,7 +1242,7 @@ impl SqlFrontendParser {
             || select.selection.is_some()
             || select.having.is_some()
             || select.qualify.is_some()
-            || select.connect_by.is_some()
+            || !select.connect_by.is_empty()
             || !select.lateral_views.is_empty()
             || !select.cluster_by.is_empty()
             || !select.distribute_by.is_empty()
@@ -3138,13 +3137,8 @@ impl SqlFrontendParser {
         use sqlparser::ast::{AlterTableOperation, ColumnOption, ObjectType as SqlObjectType};
 
         match statement {
-            Statement::AlterTable {
-                name,
-                if_exists: _,
-                only: _,
-                operations,
-                ..
-            } => {
+            Statement::AlterTable(alter) => {
+                let (name, operations) = (&alter.name, &alter.operations);
                 let table_name = unquote_object_name(&name.to_string());
                 let mut changes = Vec::new();
 
@@ -3217,7 +3211,10 @@ impl SqlFrontendParser {
                         AlterTableOperation::AddConstraint { constraint, .. } => {
                             use sqlparser::ast::TableConstraint as SqlConstraint;
                             match constraint {
-                                SqlConstraint::Unique { name, columns, .. } => {
+                                // 0.62 wraps each variant's fields in a named
+                                // struct; the field names are unchanged.
+                                SqlConstraint::Unique(u) => {
+                                    let (name, columns) = (&u.name, &u.columns);
                                     let cols: Vec<String> = columns
                                         .iter()
                                         .map(|c| unquote_identifier_text(&c.to_string()))
@@ -3229,7 +3226,8 @@ impl SqlFrontendParser {
                                         constraint: TableConstraint::Unique { columns: cols },
                                     });
                                 }
-                                SqlConstraint::Check { name, expr, .. } => {
+                                SqlConstraint::Check(c) => {
+                                    let (name, expr) = (&c.name, &c.expr);
                                     changes.push(AlterTableChange::AddConstraint {
                                         constraint_name: name
                                             .as_ref()
@@ -3239,15 +3237,14 @@ impl SqlFrontendParser {
                                         },
                                     });
                                 }
-                                SqlConstraint::ForeignKey {
-                                    name,
-                                    columns,
-                                    foreign_table,
-                                    referred_columns,
-                                    on_delete,
-                                    on_update,
-                                    ..
-                                } => {
+                                SqlConstraint::ForeignKey(fk) => {
+                                    let (name, columns, foreign_table, referred_columns) = (
+                                        &fk.name,
+                                        &fk.columns,
+                                        &fk.foreign_table,
+                                        &fk.referred_columns,
+                                    );
+                                    let (on_delete, on_update) = (fk.on_delete, fk.on_update);
                                     let cols: Vec<String> = columns
                                         .iter()
                                         .map(|c| unquote_identifier_text(&c.to_string()))
@@ -3514,9 +3511,10 @@ impl SqlFrontendParser {
                 ColumnOption::Comment(c) => {
                     comment = Some(c.clone());
                 }
-                ColumnOption::Unique {
-                    is_primary: true, ..
-                } => {
+                // 0.62 gave PRIMARY KEY its own variant and dropped
+                // `Unique.is_primary`. Matching `Unique(_)` here would compile
+                // and mark every UNIQUE column as a primary key.
+                ColumnOption::PrimaryKey(_) => {
                     primary_key = true;
                     nullable = false;
                 }
@@ -3648,8 +3646,14 @@ fn apply_table_constraints(
 
     for constraint in constraints {
         match constraint {
-            SqlConstraint::PrimaryKey { columns: pk, .. } => {
-                for ident in pk {
+            // Shape-only change: `columns` is `Vec<IndexColumn>` in both 0.59
+            // and 0.62. The `.to_string()` below therefore keeps its existing
+            // behaviour -- including the pre-existing quirk that
+            // `PRIMARY KEY (c DESC)` stringifies to "c DESC" and then fails the
+            // column lookup. Preserved deliberately, not fixed here; see
+            // TD-SQLPARSE-1.
+            SqlConstraint::PrimaryKey(pk_c) => {
+                for ident in &pk_c.columns {
                     let name = unquote_identifier_text(&ident.to_string());
                     if let Some(column) = columns.iter_mut().find(|column| column.name == name) {
                         column.primary_key = true;
@@ -3659,10 +3663,9 @@ fn apply_table_constraints(
                     }
                 }
             }
-            SqlConstraint::Unique {
-                columns: unique, ..
-            } => {
-                let unique_columns = unique
+            SqlConstraint::Unique(u_c) => {
+                let unique_columns = u_c
+                    .columns
                     .iter()
                     .map(|ident| {
                         let name = unquote_identifier_text(&ident.to_string());
@@ -3677,20 +3680,17 @@ fn apply_table_constraints(
                     columns: unique_columns,
                 });
             }
-            SqlConstraint::Check { expr, .. } => {
+            SqlConstraint::Check(c_c) => {
                 table_constraints.push(TableConstraint::Check {
-                    expression: format!("{}", expr),
+                    expression: format!("{}", c_c.expr),
                 });
             }
-            SqlConstraint::ForeignKey {
-                columns: fk,
-                foreign_table,
-                referred_columns,
-                on_delete,
-                on_update,
-                ..
-            } => {
-                let fk_columns = fk
+            SqlConstraint::ForeignKey(fk_c) => {
+                let (foreign_table, referred_columns) =
+                    (&fk_c.foreign_table, &fk_c.referred_columns);
+                let (on_delete, on_update) = (fk_c.on_delete, fk_c.on_update);
+                let fk_columns = fk_c
+                    .columns
                     .iter()
                     .map(|ident| {
                         let name = unquote_identifier_text(&ident.to_string());

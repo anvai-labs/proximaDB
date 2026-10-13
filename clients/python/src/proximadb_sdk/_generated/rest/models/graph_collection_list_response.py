@@ -41,11 +41,13 @@ class GraphCollectionListResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.graph_collection_list_response_data_item import (
+        from ..models.graph_collection_list_response_data_item import (  # noqa: PLC0415
             GraphCollectionListResponseDataItem,
         )
-        from ..models.graph_error_body import GraphErrorBody
-        from ..models.graph_response_metadata import GraphResponseMetadata
+        from ..models.graph_error_body import GraphErrorBody  # noqa: PLC0415
+        from ..models.graph_response_metadata import (  # noqa: PLC0415
+            GraphResponseMetadata,
+        )
 
         success = self.success
 
@@ -82,11 +84,13 @@ class GraphCollectionListResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_collection_list_response_data_item import (
+        from ..models.graph_collection_list_response_data_item import (  # noqa: PLC0415
             GraphCollectionListResponseDataItem,
         )
-        from ..models.graph_error_body import GraphErrorBody
-        from ..models.graph_response_metadata import GraphResponseMetadata
+        from ..models.graph_error_body import GraphErrorBody  # noqa: PLC0415
+        from ..models.graph_response_metadata import (  # noqa: PLC0415
+            GraphResponseMetadata,
+        )
 
         d = dict(src_dict)
         success = d.pop("success")

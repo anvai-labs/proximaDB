@@ -33,7 +33,9 @@ class AbacAttributeBindingsResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_attribute_binding import AbacAttributeBinding
+        from ..models.abac_attribute_binding import (  # noqa: PLC0415
+            AbacAttributeBinding,
+        )
 
         count = self.count
 
@@ -55,7 +57,9 @@ class AbacAttributeBindingsResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_attribute_binding import AbacAttributeBinding
+        from ..models.abac_attribute_binding import (  # noqa: PLC0415
+            AbacAttributeBinding,
+        )
 
         d = dict(src_dict)
         count = d.pop("count")

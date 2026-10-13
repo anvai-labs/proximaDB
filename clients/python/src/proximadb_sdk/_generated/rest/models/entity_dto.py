@@ -35,7 +35,9 @@ class EntityDto:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.entity_dto_flexible_metadata import EntityDtoFlexibleMetadata
+        from ..models.entity_dto_flexible_metadata import (  # noqa: PLC0415
+            EntityDtoFlexibleMetadata,
+        )
 
         id = self.id
 
@@ -57,7 +59,9 @@ class EntityDto:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.entity_dto_flexible_metadata import EntityDtoFlexibleMetadata
+        from ..models.entity_dto_flexible_metadata import (  # noqa: PLC0415
+            EntityDtoFlexibleMetadata,
+        )
 
         d = dict(src_dict)
         id = d.pop("id")

@@ -57,15 +57,19 @@ class CatalogEmbeddingModelVersion:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.catalog_artifact_descriptor import CatalogArtifactDescriptor
-        from ..models.catalog_embedding_input_contract import (
+        from ..models.catalog_artifact_descriptor import (  # noqa: PLC0415
+            CatalogArtifactDescriptor,
+        )
+        from ..models.catalog_embedding_input_contract import (  # noqa: PLC0415
             CatalogEmbeddingInputContract,
         )
-        from ..models.catalog_embedding_output_contract import (
+        from ..models.catalog_embedding_output_contract import (  # noqa: PLC0415
             CatalogEmbeddingOutputContract,
         )
-        from ..models.catalog_model_governance import CatalogModelGovernance
-        from ..models.catalog_model_lineage import CatalogModelLineage
+        from ..models.catalog_model_governance import (  # noqa: PLC0415
+            CatalogModelGovernance,
+        )
+        from ..models.catalog_model_lineage import CatalogModelLineage  # noqa: PLC0415
 
         version = self.version
 
@@ -116,15 +120,19 @@ class CatalogEmbeddingModelVersion:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.catalog_artifact_descriptor import CatalogArtifactDescriptor
-        from ..models.catalog_embedding_input_contract import (
+        from ..models.catalog_artifact_descriptor import (  # noqa: PLC0415
+            CatalogArtifactDescriptor,
+        )
+        from ..models.catalog_embedding_input_contract import (  # noqa: PLC0415
             CatalogEmbeddingInputContract,
         )
-        from ..models.catalog_embedding_output_contract import (
+        from ..models.catalog_embedding_output_contract import (  # noqa: PLC0415
             CatalogEmbeddingOutputContract,
         )
-        from ..models.catalog_model_governance import CatalogModelGovernance
-        from ..models.catalog_model_lineage import CatalogModelLineage
+        from ..models.catalog_model_governance import (  # noqa: PLC0415
+            CatalogModelGovernance,
+        )
+        from ..models.catalog_model_lineage import CatalogModelLineage  # noqa: PLC0415
 
         d = dict(src_dict)
         version = d.pop("version")

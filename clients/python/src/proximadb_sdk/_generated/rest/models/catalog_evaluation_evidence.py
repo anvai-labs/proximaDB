@@ -46,7 +46,7 @@ class CatalogEvaluationEvidence:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.catalog_evaluation_evidence_metrics import (
+        from ..models.catalog_evaluation_evidence_metrics import (  # noqa: PLC0415
             CatalogEvaluationEvidenceMetrics,
         )
 
@@ -82,7 +82,7 @@ class CatalogEvaluationEvidence:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.catalog_evaluation_evidence_metrics import (
+        from ..models.catalog_evaluation_evidence_metrics import (  # noqa: PLC0415
             CatalogEvaluationEvidenceMetrics,
         )
 

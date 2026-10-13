@@ -39,9 +39,13 @@ class GraphBatchNodesResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.graph_error_body import GraphErrorBody
-        from ..models.graph_node_batch_results import GraphNodeBatchResults
-        from ..models.graph_response_metadata import GraphResponseMetadata
+        from ..models.graph_error_body import GraphErrorBody  # noqa: PLC0415
+        from ..models.graph_node_batch_results import (  # noqa: PLC0415
+            GraphNodeBatchResults,
+        )
+        from ..models.graph_response_metadata import (  # noqa: PLC0415
+            GraphResponseMetadata,
+        )
 
         success = self.success
 
@@ -75,9 +79,13 @@ class GraphBatchNodesResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_error_body import GraphErrorBody
-        from ..models.graph_node_batch_results import GraphNodeBatchResults
-        from ..models.graph_response_metadata import GraphResponseMetadata
+        from ..models.graph_error_body import GraphErrorBody  # noqa: PLC0415
+        from ..models.graph_node_batch_results import (  # noqa: PLC0415
+            GraphNodeBatchResults,
+        )
+        from ..models.graph_response_metadata import (  # noqa: PLC0415
+            GraphResponseMetadata,
+        )
 
         d = dict(src_dict)
         success = d.pop("success")

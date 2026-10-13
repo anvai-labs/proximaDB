@@ -43,10 +43,10 @@ class ProximaRecordInput:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.proxima_record_input_props_type_0 import (
+        from ..models.proxima_record_input_props_type_0 import (  # noqa: PLC0415
             ProximaRecordInputPropsType0,
         )
-        from ..models.text_field_input import TextFieldInput
+        from ..models.text_field_input import TextFieldInput  # noqa: PLC0415
 
         vector = self.vector
 
@@ -94,10 +94,10 @@ class ProximaRecordInput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.proxima_record_input_props_type_0 import (
+        from ..models.proxima_record_input_props_type_0 import (  # noqa: PLC0415
             ProximaRecordInputPropsType0,
         )
-        from ..models.text_field_input import TextFieldInput
+        from ..models.text_field_input import TextFieldInput  # noqa: PLC0415
 
         d = dict(src_dict)
         vector = cast(list[float], d.pop("vector"))

@@ -18,7 +18,6 @@ T = TypeVar("T", bound="NodeInputProperties")
 
 @_attrs_define
 class NodeInputProperties:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

@@ -22,14 +22,15 @@ T = TypeVar("T", bound="CatalogEmbeddingModelRegistryDeployments")
 
 @_attrs_define
 class CatalogEmbeddingModelRegistryDeployments:
-    """ """
 
     additional_properties: dict[str, CatalogDeploymentBinding] = _attrs_field(
         init=False, factory=dict
     )
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.catalog_deployment_binding import CatalogDeploymentBinding
+        from ..models.catalog_deployment_binding import (  # noqa: PLC0415
+            CatalogDeploymentBinding,
+        )
 
         field_dict: dict[str, Any] = {}
         for prop_name, prop in self.additional_properties.items():
@@ -39,7 +40,9 @@ class CatalogEmbeddingModelRegistryDeployments:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.catalog_deployment_binding import CatalogDeploymentBinding
+        from ..models.catalog_deployment_binding import (  # noqa: PLC0415
+            CatalogDeploymentBinding,
+        )
 
         d = dict(src_dict)
         catalog_embedding_model_registry_deployments = cls()

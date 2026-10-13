@@ -39,7 +39,7 @@ class EntityProvenanceInput:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.entity_provenance_input_metadata import (
+        from ..models.entity_provenance_input_metadata import (  # noqa: PLC0415
             EntityProvenanceInputMetadata,
         )
 
@@ -73,7 +73,7 @@ class EntityProvenanceInput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.entity_provenance_input_metadata import (
+        from ..models.entity_provenance_input_metadata import (  # noqa: PLC0415
             EntityProvenanceInputMetadata,
         )
 

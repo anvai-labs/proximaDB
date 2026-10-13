@@ -9,7 +9,7 @@
 #
 # Regenerate with:  make gen-python-sdk   (from the repo root)
 # The generator version is pinned in clients/python/codegen/requirements.txt
-# (openapi-python-client 0.24.3). openapi-python-client is OpenAPI 3.1-native, so
+# (see that file for the version). openapi-python-client is OpenAPI 3.1-native, so
 # the published 3.1 spec (docs/openapi/proximadb-openapi.yaml) is consumed
 # directly — no down-conversion (unlike the Go / Rust progenitor pipelines).
 #

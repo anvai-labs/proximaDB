@@ -55,8 +55,8 @@ pub struct EntityNodeMapper;
 /// third seam).
 /// Serialize with SORTED object keys — stable across HashMap iteration
 /// orders so exact-string property comparisons are write-order-independent
-/// (serde_json's preserve_order is active via utoipa; unsorted
-/// serialization is not canonical).
+/// (serde_json's preserve_order is active — proximadb declares it in
+/// Cargo.toml — so unsorted serialization is not canonical).
 pub(crate) fn canonical_json_string(value: &serde_json::Value) -> String {
     fn sort_rec(v: &serde_json::Value) -> serde_json::Value {
         match v {

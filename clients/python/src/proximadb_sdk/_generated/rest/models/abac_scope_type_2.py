@@ -31,7 +31,7 @@ class AbacScopeType2:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_column_scope import AbacColumnScope
+        from ..models.abac_column_scope import AbacColumnScope  # noqa: PLC0415
 
         column = self.column.to_dict()
 
@@ -47,7 +47,7 @@ class AbacScopeType2:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_column_scope import AbacColumnScope
+        from ..models.abac_column_scope import AbacColumnScope  # noqa: PLC0415
 
         d = dict(src_dict)
         column = AbacColumnScope.from_dict(d.pop("Column"))

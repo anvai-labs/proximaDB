@@ -39,8 +39,8 @@ class IndexSpecOutput:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.hnsw_config_output import HnswConfigOutput
-        from ..models.ivf_config_output import IvfConfigOutput
+        from ..models.hnsw_config_output import HnswConfigOutput  # noqa: PLC0415
+        from ..models.ivf_config_output import IvfConfigOutput  # noqa: PLC0415
 
         algorithm = self.algorithm
 
@@ -79,8 +79,8 @@ class IndexSpecOutput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.hnsw_config_output import HnswConfigOutput
-        from ..models.ivf_config_output import IvfConfigOutput
+        from ..models.hnsw_config_output import HnswConfigOutput  # noqa: PLC0415
+        from ..models.ivf_config_output import IvfConfigOutput  # noqa: PLC0415
 
         d = dict(src_dict)
         algorithm = d.pop("algorithm")

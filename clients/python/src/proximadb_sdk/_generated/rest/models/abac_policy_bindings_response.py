@@ -37,7 +37,7 @@ class AbacPolicyBindingsResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_policy_binding import AbacPolicyBinding
+        from ..models.abac_policy_binding import AbacPolicyBinding  # noqa: PLC0415
 
         tenant = self.tenant
 
@@ -65,7 +65,7 @@ class AbacPolicyBindingsResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_policy_binding import AbacPolicyBinding
+        from ..models.abac_policy_binding import AbacPolicyBinding  # noqa: PLC0415
 
         d = dict(src_dict)
         tenant = d.pop("tenant")

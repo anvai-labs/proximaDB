@@ -1,0 +1,129 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DOCKCI-1: the `docker` path filter watches three files CI never builds, and misses the one it does
+:toc: macro
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open — found during the 2026-10-12 `qa → main` promotion (#1997); not fixed there, which was content-free
+| Severity | Medium — a change confined to `deploy/docker/**` skips the only job that builds the published image, and the inverse wastes a ~38-minute build on a Dockerfile nothing publishes
+| Component | `.github/workflows/ci.yml` (the `changes` job's `docker` filter at the path-filter step; `docker-build` at `:2995`)
+| Pillar | CI / CORRECTNESS
+| Found | 2026-10-12
+|===
+
+toc::[]
+
+== The mismatch
+
+`docker-build` builds **`deploy/docker/Dockerfile`** — stated in the job and the
+only `file:` target in the repo, shared with `publish-image.yml`, i.e. the image
+we actually publish:
+
+[source,yaml]
+----
+# .github/workflows/ci.yml:3008
+file: deploy/docker/Dockerfile
+----
+
+Its gate is `(docker || rust) && extensive`, and the `docker` filter is:
+
+[source,yaml]
+----
+docker:
+  - 'Dockerfile*'
+  - 'docker-compose*.yml'
+  - '.dockerignore'
+----
+
+None of those patterns contains a `/`, so under picomatch — which
+`dorny/paths-filter` uses — they match **top-level paths only**. Evaluated with
+picomatch 4 against the patterns extracted from `ci.yml` itself (not retyped):
+
+[cols="3,1,1,1", options="header"]
+|===
+| Changed files | `docker` | `rust` | `docker-build`
+
+| `deploy/docker/Dockerfile` only | false | false | **SKIPS**
+| `deploy/docker/entrypoint.sh` only | false | false | **SKIPS**
+| `deploy/docker/Dockerfile` + `entrypoint.sh` | false | false | **SKIPS**
+| #1977 as actually shipped | false | true | RUNS
+| root `Dockerfile` (never built) | **true** | false | RUNS
+| `Dockerfile.prebuilt` (never built) | **true** | false | RUNS
+|===
+
+So the filter is **inverted relative to what the job builds**, in both
+directions:
+
+* **False negatives.** An edit confined to `deploy/docker/**` leaves
+  `docker == false`. `docker-build` then runs only if `rust` happens to be true.
+* **False positives.** The three watched paths are not built by CI at all. Root
+  `Dockerfile` is referenced only by `demo/config/docker-compose.yml`;
+  `Dockerfile.prebuilt` only by `build-docker-prebuilt.sh`, a local
+  OOM workaround. Touching either triggers a ~38-minute build of a *different*
+  Dockerfile.
+
+== Why this matters more than a wasted runner
+
+The two defects #1977 fixed were a root-owned `/config/config.toml` in
+`deploy/docker/Dockerfile` and a bind-address normalisation in
+`deploy/docker/entrypoint.sh` — both invisible to this filter. #1977 only
+reached `docker-build` because it also edited `.github/workflows/ci.yml`, which
+*is* in the `rust` filter. Had the fix been confined to the two files it was
+about, the job that validates it would have skipped, and
+`Test Container Health` — the one check in the pipeline able to detect an
+unreachable published port — would not have run.
+
+A gate that cannot see the change it exists to validate is the same defect class
+`ci.yml` already calls out for its own `rust` filter:
+
+____
+This file DEFINES the Rust jobs … but it was not listed, which meant **CI could
+not validate a change to its own Rust gating**. … A gate that cannot see the
+change to itself is the same defect class it exists to catch.
+____
+
+`docker` is the remaining instance of exactly that.
+
+== The repo already has the right pattern
+
+`publish-image.yml` — the workflow that publishes the image — gets it right:
+
+[source,yaml]
+----
+paths:
+  - "src/**"
+  …
+  - "deploy/docker/**"
+  - ".github/workflows/publish-image.yml"
+----
+
+So the fix is to bring `ci.yml`'s filter in line with the workflow that ships
+the artifact.
+
+== Proposed fix
+
+[source,yaml]
+----
+docker:
+  - 'deploy/docker/**'          # the Dockerfile + entrypoint CI actually builds
+  - '.dockerignore'             # changes the build context
+  - '.github/workflows/ci.yml'  # defines docker-build itself
+----
+
+Drop `Dockerfile*` and `docker-compose*.yml` unless the demo/prebuilt files
+gain a CI consumer; today they only cause false positives. Keep `rust` in the
+`||` — a source change still needs the image rebuilt.
+
+== Verification for the fix
+
+. Re-run the picomatch model above: the first three rows must flip to **RUNS**
+  and the last two to **SKIPS**.
+. A guard, so it cannot regress: assert that every `file:` Dockerfile target in
+  `.github/workflows/**` is matched by the `docker` filter. That is the
+  machine-checkable form of the invariant, and it belongs beside the other
+  workflow controls in `scripts/check_deterministic_commit_contract.py`
+  (see `node-version-pin`). Ship it with unit tests in
+  `tests/scripts/test_deterministic_commit_contract.py` — a new check added
+  there without tests shipped four evasions in #1993.

@@ -42,10 +42,12 @@ class CapabilitiesResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.capabilities_response_error_envelope import (
+        from ..models.capabilities_response_error_envelope import (  # noqa: PLC0415
             CapabilitiesResponseErrorEnvelope,
         )
-        from ..models.capabilities_response_limits import CapabilitiesResponseLimits
+        from ..models.capabilities_response_limits import (  # noqa: PLC0415
+            CapabilitiesResponseLimits,
+        )
 
         api_version = self.api_version
 
@@ -81,10 +83,12 @@ class CapabilitiesResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.capabilities_response_error_envelope import (
+        from ..models.capabilities_response_error_envelope import (  # noqa: PLC0415
             CapabilitiesResponseErrorEnvelope,
         )
-        from ..models.capabilities_response_limits import CapabilitiesResponseLimits
+        from ..models.capabilities_response_limits import (  # noqa: PLC0415
+            CapabilitiesResponseLimits,
+        )
 
         d = dict(src_dict)
         api_version = d.pop("api_version", UNSET)

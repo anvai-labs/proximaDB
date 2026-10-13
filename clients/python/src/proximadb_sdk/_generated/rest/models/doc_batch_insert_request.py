@@ -31,7 +31,7 @@ class DocBatchInsertRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.doc_insert_request import DocInsertRequest
+        from ..models.doc_insert_request import DocInsertRequest  # noqa: PLC0415
 
         documents = []
         for documents_item_data in self.documents:
@@ -50,7 +50,7 @@ class DocBatchInsertRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.doc_insert_request import DocInsertRequest
+        from ..models.doc_insert_request import DocInsertRequest  # noqa: PLC0415
 
         d = dict(src_dict)
         documents = []

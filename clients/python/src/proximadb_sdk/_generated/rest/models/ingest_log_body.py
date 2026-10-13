@@ -18,7 +18,6 @@ T = TypeVar("T", bound="IngestLogBody")
 
 @_attrs_define
 class IngestLogBody:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

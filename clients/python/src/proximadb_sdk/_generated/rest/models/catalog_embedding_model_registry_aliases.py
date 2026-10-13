@@ -18,7 +18,6 @@ T = TypeVar("T", bound="CatalogEmbeddingModelRegistryAliases")
 
 @_attrs_define
 class CatalogEmbeddingModelRegistryAliases:
-    """ """
 
     additional_properties: dict[str, int] = _attrs_field(init=False, factory=dict)
 

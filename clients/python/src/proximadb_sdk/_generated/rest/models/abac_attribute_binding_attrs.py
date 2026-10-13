@@ -25,7 +25,6 @@ T = TypeVar("T", bound="AbacAttributeBindingAttrs")
 
 @_attrs_define
 class AbacAttributeBindingAttrs:
-    """ """
 
     additional_properties: dict[
         str,
@@ -36,10 +35,10 @@ class AbacAttributeBindingAttrs:
     ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_attr_value_type_0 import AbacAttrValueType0
-        from ..models.abac_attr_value_type_1 import AbacAttrValueType1
-        from ..models.abac_attr_value_type_2 import AbacAttrValueType2
-        from ..models.abac_attr_value_type_3 import AbacAttrValueType3
+        from ..models.abac_attr_value_type_0 import AbacAttrValueType0  # noqa: PLC0415
+        from ..models.abac_attr_value_type_1 import AbacAttrValueType1  # noqa: PLC0415
+        from ..models.abac_attr_value_type_2 import AbacAttrValueType2  # noqa: PLC0415
+        from ..models.abac_attr_value_type_3 import AbacAttrValueType3  # noqa: PLC0415
 
         field_dict: dict[str, Any] = {}
         for prop_name, prop in self.additional_properties.items():
@@ -57,10 +56,10 @@ class AbacAttributeBindingAttrs:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_attr_value_type_0 import AbacAttrValueType0
-        from ..models.abac_attr_value_type_1 import AbacAttrValueType1
-        from ..models.abac_attr_value_type_2 import AbacAttrValueType2
-        from ..models.abac_attr_value_type_3 import AbacAttrValueType3
+        from ..models.abac_attr_value_type_0 import AbacAttrValueType0  # noqa: PLC0415
+        from ..models.abac_attr_value_type_1 import AbacAttrValueType1  # noqa: PLC0415
+        from ..models.abac_attr_value_type_2 import AbacAttrValueType2  # noqa: PLC0415
+        from ..models.abac_attr_value_type_3 import AbacAttrValueType3  # noqa: PLC0415
 
         d = dict(src_dict)
         abac_attribute_binding_attrs = cls()

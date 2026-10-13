@@ -88,21 +88,25 @@ class TableWriteRouteExplanation:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.table_write_candidate_explanation import (
+        from ..models.table_write_candidate_explanation import (  # noqa: PLC0415
             TableWriteCandidateExplanation,
         )
-        from ..models.table_write_cost_explanation import TableWriteCostExplanation
-        from ..models.table_write_data_movement_explanation import (
+        from ..models.table_write_cost_explanation import (  # noqa: PLC0415
+            TableWriteCostExplanation,
+        )
+        from ..models.table_write_data_movement_explanation import (  # noqa: PLC0415
             TableWriteDataMovementExplanation,
         )
-        from ..models.table_write_intent_explanation import TableWriteIntentExplanation
-        from ..models.table_write_rejected_lane_explanation import (
+        from ..models.table_write_intent_explanation import (  # noqa: PLC0415
+            TableWriteIntentExplanation,
+        )
+        from ..models.table_write_rejected_lane_explanation import (  # noqa: PLC0415
             TableWriteRejectedLaneExplanation,
         )
-        from ..models.table_write_rejected_path_explanation import (
+        from ..models.table_write_rejected_path_explanation import (  # noqa: PLC0415
             TableWriteRejectedPathExplanation,
         )
-        from ..models.table_write_route_metadata_explanation import (
+        from ..models.table_write_route_metadata_explanation import (  # noqa: PLC0415
             TableWriteRouteMetadataExplanation,
         )
 
@@ -185,21 +189,25 @@ class TableWriteRouteExplanation:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.table_write_candidate_explanation import (
+        from ..models.table_write_candidate_explanation import (  # noqa: PLC0415
             TableWriteCandidateExplanation,
         )
-        from ..models.table_write_cost_explanation import TableWriteCostExplanation
-        from ..models.table_write_data_movement_explanation import (
+        from ..models.table_write_cost_explanation import (  # noqa: PLC0415
+            TableWriteCostExplanation,
+        )
+        from ..models.table_write_data_movement_explanation import (  # noqa: PLC0415
             TableWriteDataMovementExplanation,
         )
-        from ..models.table_write_intent_explanation import TableWriteIntentExplanation
-        from ..models.table_write_rejected_lane_explanation import (
+        from ..models.table_write_intent_explanation import (  # noqa: PLC0415
+            TableWriteIntentExplanation,
+        )
+        from ..models.table_write_rejected_lane_explanation import (  # noqa: PLC0415
             TableWriteRejectedLaneExplanation,
         )
-        from ..models.table_write_rejected_path_explanation import (
+        from ..models.table_write_rejected_path_explanation import (  # noqa: PLC0415
             TableWriteRejectedPathExplanation,
         )
-        from ..models.table_write_route_metadata_explanation import (
+        from ..models.table_write_route_metadata_explanation import (  # noqa: PLC0415
             TableWriteRouteMetadataExplanation,
         )
 

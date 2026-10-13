@@ -39,7 +39,9 @@ class GraphNodeQuery:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.graph_node_query_properties import GraphNodeQueryProperties
+        from ..models.graph_node_query_properties import (  # noqa: PLC0415
+            GraphNodeQueryProperties,
+        )
 
         labels: list[str] | Unset = UNSET
         if not isinstance(self.labels, Unset):
@@ -81,7 +83,9 @@ class GraphNodeQuery:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_node_query_properties import GraphNodeQueryProperties
+        from ..models.graph_node_query_properties import (  # noqa: PLC0415
+            GraphNodeQueryProperties,
+        )
 
         d = dict(src_dict)
         labels = cast(list[str], d.pop("labels", UNSET))

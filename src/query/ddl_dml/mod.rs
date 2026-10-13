@@ -428,15 +428,15 @@ pub fn parse_ddl(sql: &str) -> Result<DdlStatement> {
                     .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
 
                 // Check for primary key in column options
-                if col_def.options.iter().any(|opt| {
-                    matches!(
-                        opt.option,
-                        sqlparser::ast::ColumnOption::Unique {
-                            is_primary: true,
-                            ..
-                        }
-                    )
-                }) {
+                // sqlparser 0.62 removed `ColumnOption::Unique.is_primary` and
+                // gave PRIMARY KEY its OWN variant. Matching `Unique(..)` here
+                // instead would compile and silently treat every column-level
+                // PRIMARY KEY as a mere UNIQUE constraint.
+                if col_def
+                    .options
+                    .iter()
+                    .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(_)))
+                {
                     primary_key.push(col_name.clone());
                 }
 
@@ -455,12 +455,14 @@ pub fn parse_ddl(sql: &str) -> Result<DdlStatement> {
 
             // Extract primary key from table constraints
             for constraint in &create.constraints {
-                if let sqlparser::ast::TableConstraint::PrimaryKey {
-                    columns: pk_cols, ..
-                } = constraint
-                {
-                    for col in pk_cols {
-                        // IndexColumn.column is an OrderByExpr, use to_string()
+                // 0.62 wraps the fields in a named struct; `columns` is
+                // `Vec<IndexColumn>` in BOTH 0.59 and 0.62, so only the pattern
+                // shape changes here.
+                if let sqlparser::ast::TableConstraint::PrimaryKey(pk) = constraint {
+                    for col in &pk.columns {
+                        // NOTE (pre-existing, not introduced here): `col.column`
+                        // is an `OrderByExpr`, so `PRIMARY KEY (c DESC)` yields
+                        // the column name "c DESC". Tracked in TD-SQLPARSE-1.
                         primary_key.push(col.column.to_string());
                     }
                 }
@@ -580,7 +582,21 @@ pub fn parse_dml(sql: &str) -> Result<DmlStatement> {
             // Insert.table is a TableObject in 0.59.0
             let table = insert.table.to_string();
 
-            let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
+            // 0.62 changed `Insert.columns` from `Vec<Ident>` to
+            // `Vec<ObjectName>`. Going through the parts keeps the RAW
+            // identifier; `ObjectName::to_string()` would re-apply the
+            // dialect's quoting, turning `col` into `"col"`. A part can also be
+            // a function call, which has no identifier -- those are skipped
+            // rather than stringified into a bogus column name.
+            let columns: Vec<String> = insert
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    c.0.last()
+                        .and_then(|part| part.as_ident())
+                        .map(|ident| ident.value.clone())
+                })
+                .collect();
 
             // Extract values from the source
             let values = extract_insert_values(&insert.source)?;
@@ -592,12 +608,9 @@ pub fn parse_dml(sql: &str) -> Result<DmlStatement> {
             })
         }
 
-        sqlparser::ast::Statement::Update {
-            table,
-            assignments,
-            selection,
-            ..
-        } => {
+        sqlparser::ast::Statement::Update(update) => {
+            let (table, assignments, selection) =
+                (&update.table, &update.assignments, &update.selection);
             // TableWithJoins.relation is a TableFactor
             let table_name = extract_table_name(&table.relation)?;
 
@@ -746,7 +759,10 @@ fn extract_insert_values(
     if let sqlparser::ast::SetExpr::Values(values) = query.body.as_ref() {
         for row in &values.rows {
             let mut row_values = Vec::new();
-            for expr in row {
+            // 0.62 wraps each VALUES row in `Parens { opening_token, content,
+            // closing_token }` -- a NAMED-field struct, so the payload is
+            // `.content`, not `.0`.
+            for expr in &row.content {
                 row_values.push(extract_value(expr)?);
             }
             result.push(row_values);

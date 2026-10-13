@@ -18,7 +18,6 @@ T = TypeVar("T", bound="SqlResponseRowsItem")
 
 @_attrs_define
 class SqlResponseRowsItem:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

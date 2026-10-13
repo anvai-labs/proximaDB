@@ -35,7 +35,9 @@ class AbacAttributeBinding:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_attribute_binding_attrs import AbacAttributeBindingAttrs
+        from ..models.abac_attribute_binding_attrs import (  # noqa: PLC0415
+            AbacAttributeBindingAttrs,
+        )
 
         subject_id = self.subject_id
 
@@ -57,7 +59,9 @@ class AbacAttributeBinding:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_attribute_binding_attrs import AbacAttributeBindingAttrs
+        from ..models.abac_attribute_binding_attrs import (  # noqa: PLC0415
+            AbacAttributeBindingAttrs,
+        )
 
         d = dict(src_dict)
         subject_id = d.pop("subject_id")

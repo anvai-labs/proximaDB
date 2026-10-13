@@ -44,7 +44,7 @@ class MetricAggregationInput:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.metric_aggregation_input_labels import (
+        from ..models.metric_aggregation_input_labels import (  # noqa: PLC0415
             MetricAggregationInputLabels,
         )
 
@@ -88,7 +88,7 @@ class MetricAggregationInput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.metric_aggregation_input_labels import (
+        from ..models.metric_aggregation_input_labels import (  # noqa: PLC0415
             MetricAggregationInputLabels,
         )
 

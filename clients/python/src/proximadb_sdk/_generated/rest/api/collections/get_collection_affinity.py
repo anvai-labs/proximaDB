@@ -66,12 +66,12 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[AffinityResponse]:
-    r"""Read this node's cache-affinity entry for a collection.
+    """Read this node's cache-affinity entry for a collection.
 
-     Returns `status: \"affinitized\"` (with query count, age, and a
+     Returns `status: "affinitized"` (with query count, age, and a
     `stale` flag) when an entry exists — including stale entries,
     so operators can see which collections went cold — and
-    `status: \"not_affinitized\"` when there is no entry at all.
+    `status: "not_affinitized"` when there is no entry at all.
     Routing has already stopped using stale entries.
     The optional `X-Tenant-ID` header is not consulted by this
     handler (the affinity registry is per-node, collection-keyed).
@@ -106,12 +106,12 @@ def sync(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> AffinityResponse | None:
-    r"""Read this node's cache-affinity entry for a collection.
+    """Read this node's cache-affinity entry for a collection.
 
-     Returns `status: \"affinitized\"` (with query count, age, and a
+     Returns `status: "affinitized"` (with query count, age, and a
     `stale` flag) when an entry exists — including stale entries,
     so operators can see which collections went cold — and
-    `status: \"not_affinitized\"` when there is no entry at all.
+    `status: "not_affinitized"` when there is no entry at all.
     Routing has already stopped using stale entries.
     The optional `X-Tenant-ID` header is not consulted by this
     handler (the affinity registry is per-node, collection-keyed).
@@ -141,12 +141,12 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[AffinityResponse]:
-    r"""Read this node's cache-affinity entry for a collection.
+    """Read this node's cache-affinity entry for a collection.
 
-     Returns `status: \"affinitized\"` (with query count, age, and a
+     Returns `status: "affinitized"` (with query count, age, and a
     `stale` flag) when an entry exists — including stale entries,
     so operators can see which collections went cold — and
-    `status: \"not_affinitized\"` when there is no entry at all.
+    `status: "not_affinitized"` when there is no entry at all.
     Routing has already stopped using stale entries.
     The optional `X-Tenant-ID` header is not consulted by this
     handler (the affinity registry is per-node, collection-keyed).
@@ -179,12 +179,12 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> AffinityResponse | None:
-    r"""Read this node's cache-affinity entry for a collection.
+    """Read this node's cache-affinity entry for a collection.
 
-     Returns `status: \"affinitized\"` (with query count, age, and a
+     Returns `status: "affinitized"` (with query count, age, and a
     `stale` flag) when an entry exists — including stale entries,
     so operators can see which collections went cold — and
-    `status: \"not_affinitized\"` when there is no entry at all.
+    `status: "not_affinitized"` when there is no entry at all.
     Routing has already stopped using stale entries.
     The optional `X-Tenant-ID` header is not consulted by this
     handler (the affinity registry is per-node, collection-keyed).

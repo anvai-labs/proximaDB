@@ -9,7 +9,7 @@
 #
 # Pipeline:
 #   1. Build/refresh an isolated venv pinned by codegen/requirements.txt
-#      (openapi-python-client 0.24.3). It is kept separate from the SDK's runtime
+#      (see that file for the openapi-python-client version). It is kept separate from the SDK's runtime
 #      deps because the generator's Typer CLI breaks on the SDK's newer click and
 #      its internal models break on the SDK's newer pydantic.
 #   2. Run openapi-python-client (3.1-native) directly on the published spec — no

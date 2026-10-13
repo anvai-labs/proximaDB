@@ -328,7 +328,8 @@ pub fn proxima_tree_to_json_map(props: &ProximaTree) -> HashMap<String, serde_js
 ///
 /// Key order must be canonical here, not incidental: `serde_json::Map` is
 /// order-preserving whenever some dependency enables the `preserve_order`
-/// feature (datafusion-physical-plan 55+ does, via `serde_json/preserve_order`)
+/// feature (the root `proximadb` crate declares it for the OpenAPI document;
+/// datafusion-physical-plan 55.0 also did, 55.2 no longer does)
 /// and a plain `BTreeMap` otherwise, so insertion-order serialisation changes
 /// byte-for-byte with the dependency graph. Sorting explicitly pins the
 /// serialised form — the same bytes `BTreeMap` semantics produced before.
