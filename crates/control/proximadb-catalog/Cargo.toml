@@ -39,7 +39,17 @@ async-trait.workspace = true
 chrono.workspace = true
 prost.workspace = true
 aws-config = { version = "1.0", optional = true }
-aws-sdk-glue = { version = "1.0", optional = true }
+# `default-features = false` drops aws-sdk-glue's default `rustls` feature,
+# which maps to `aws-smithy-runtime/tls-rustls` and pulls
+# `aws-smithy-http-client`'s OPTIONAL, non-default `legacy-rustls-ring` ->
+# legacy-hyper-rustls 0.24 -> rustls 0.21 -> rustls-webpki 0.101, which carries a
+# HIGH advisory (DoS via panic on a malformed CRL) with no patch in that line.
+# `aws-config`'s defaults are already modern and do not reach it. The modern TLS
+# stack is re-added explicitly below. See TD-RUSTDEP-1.
+aws-sdk-glue = { version = "1.0", optional = true, default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 dashmap.workspace = true
 parking_lot.workspace = true
 reqwest = { version = "0.12", optional = true, features = ["json"] }
