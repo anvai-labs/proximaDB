@@ -159,7 +159,7 @@ updates:
       # returns 404), so every toolchain setup failed with
       # "could not download nonexistent rust version".
       #
-      # The toolchain is pinned by rust-toolchain.toml (channel = "1.95.0") and
+      # The toolchain is pinned by rust-toolchain.toml (channel = "1.99.0") and
       # must only ever move by editing that file deliberately. Bump both together
       # by hand when the toolchain moves.
       - dependency-name: "dtolnay/rust-toolchain"
