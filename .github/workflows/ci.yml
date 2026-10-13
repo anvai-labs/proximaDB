@@ -144,6 +144,20 @@ jobs:
           fetch-depth: 0
       - name: Verify Cargo.lock is reproducible
         run: cargo metadata --locked --format-version 1 >/dev/null
+      # TD-AUDITGATE-1: #2004 regenerated Cargo.lock during a rebase and silently
+      # reverted #2003's `rustls` 0.23.45 bump (RUSTSEC-2026-0285), passing 83/83
+      # checks -- the Security Audit job cannot fail (`cargo audit || echo` under
+      # `continue-on-error`), so nothing noticed. A security fix is a version
+      # moving forwards, so a version moving BACKWARDS is the signal, and needs no
+      # advisory database. `--require-base` makes an unfetched base loud instead
+      # of silently green.
+      - name: Guard Cargo.lock against backwards version moves
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+          python3 scripts/check_lockfile_no_downgrade.py --require-base "origin/$BASE_REF"
       - name: Validate rust-cache key inputs before fan-out
         run: python3 scripts/check_deterministic_commit_contract.py
       - uses: dorny/paths-filter@v4
