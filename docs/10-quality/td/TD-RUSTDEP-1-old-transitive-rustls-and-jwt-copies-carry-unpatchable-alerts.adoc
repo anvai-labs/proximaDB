@@ -1,0 +1,116 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RUSTDEP-1: a HIGH alert rides an old transitive `rustls-webpki`, unfixable by any lockfile bump
+:toc: macro
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open — found 2026-10-12 while applying the security bumps in #2003; untracked until now, with no Dependabot PR
+| Severity | High — `rustls-webpki` DoS-via-panic on a malformed CRL, reachable only through the `aws`/`gcp` feature deps; no patch exists in the pinned line, so `cargo update` cannot close it
+| Component | `Cargo.lock` — `rustls 0.21.12`, `rustls-webpki 0.101.7`, `jsonwebtoken 9.3.1`; parents `aws-smithy-http-client`, `hyper-rustls`, `tokio-rustls`, `google-cloud-auth`
+| Pillar | SECURITY
+| Found | 2026-10-12
+|===
+
+toc::[]
+
+== Why no PR exists for these
+
+Dependabot opens a PR when a patched version satisfies the existing requirement.
+Here it does not: the alerts are against copies pinned to a line that was never
+patched, so the tool is silent and the alerts simply accumulate. They were found
+by reading the Dependabot **alerts API** rather than the PR list — which is the
+transferable lesson: *the PR list is not the alert list.* Of 32 open alerts,
+these two had no corresponding PR.
+
+== The chains, read out of `Cargo.lock`
+
+----
+rustls-webpki 0.101.7   HIGH    vulnerable < 0.103.13, first patched 0.103.13
+    <- rustls 0.21.12
+        <- aws-smithy-http-client 1.1.13
+        <- hyper-rustls 0.24.2
+        <- tokio-rustls 0.24.1
+
+jsonwebtoken 9.3.1      MEDIUM  vulnerable < 10.3.0, first patched 10.3.0
+    <- google-cloud-auth 0.13.2
+----
+
+Two lower-severity `rustls-webpki` advisories (name-constraint handling,
+patched 0.103.12) ride the same 0.101.7 copy.
+
+**The workspace already resolves safe copies alongside** —
+`rustls-webpki 0.103.15` and `jsonwebtoken 11.0.0` are both in the lock. So this
+is not "we are on an old version"; it is "we are on an old version *as well*,
+because a second dependency subtree pins it." A `cargo update --precise` cannot
+help: `0.103.13` does not satisfy `rustls 0.21`'s `^0.101` requirement, and
+bumping `rustls` to 0.23 inside that subtree is a semver-major change its
+parents must make.
+
+== Exposure
+
+Both chains are feature-gated: `aws` / `gcp` (root `Cargo.toml` `[features]`).
+A default build does not compile them. That bounds the blast radius but does not
+remove it — those features are the cloud object-store backends, i.e. exactly the
+configuration a deployment uses, and `Cargo.lock` is what the
+`security-audit` CI job reads regardless of features.
+
+The `rustls-webpki` advisory is a panic on a malformed CRL. Our TLS paths do not
+knowingly load CRLs, so the practical reachability is likely low — but "likely
+low" is an assertion, and this TD does not try to pass it off as a measurement.
+Establishing reachability is part of the work below.
+
+== We already declare the modern versions; two subtrees drag the old ones in
+
+This is the part that makes the fix tractable. Our own direct declarations are
+already current:
+
+[source,toml]
+----
+rustls       = { version = "0.23" }   # Cargo.toml:695
+tokio-rustls = "0.26"                 # Cargo.toml:697 -- comment even says "(rustls 0.23)"
+----
+
+Neither `hyper-rustls`, `aws-smithy-http-client` nor `google-cloud-auth` is a
+direct dependency. Every old copy enters through exactly **two** roots, and one
+of them is a direct dependency of ours:
+
+----
+aws-smithy-runtime 1.11.3            (transitive, via the aws-sdk stack)
+  -> aws-smithy-http-client 1.1.13   (latest 1.5.0)
+       -> hyper-rustls 0.24.2        (latest 0.27.10; 0.26+ is on rustls 0.23)
+            -> tokio-rustls 0.24.1   (latest 0.26.6)
+                 -> rustls 0.21.12
+                      -> rustls-webpki 0.101.7     <-- HIGH
+
+google-cloud-storage 0.15.0          (DIRECT, Cargo.toml:671, behind `gcp`)
+  -> google-cloud-auth 0.13.2        (latest 1.17.0)
+       -> jsonwebtoken 9.3.1         <-- MEDIUM
+----
+
+So the whole thing reduces to two dependency moves, both of which have upstream
+releases available:
+
+. **`google-cloud-storage` 0.15 -> 1.20** (ours to change, one line, `gcp`
+  feature). It is a 0.x -> 1.x jump, so expect API churn in the GCS backend.
+. **The aws-sdk stack** (`aws-config` 1.8.18 resolved today, latest 1.12.0),
+  which should pull `aws-smithy-http-client` onto a rustls-0.23 line. Verify
+  rather than assume: the smithy crates version independently of the SDK
+  façades.
+
+== What closing this needs
+
+. Bump `google-cloud-storage` and the aws-sdk stack as above, then confirm
+  `cargo tree -d` no longer shows two `rustls` majors.
+. If either bump turns out to be blocked (no release on the modern line, or an
+  API migration too large to take now), record the decision explicitly so the
+  alert is *accepted* rather than silently ignored.
+
+== Verification for the fix
+
+* `gh api repos/anvai-labs/proximaDB/dependabot/alerts?state=open` no longer
+  lists `rustls-webpki` or `jsonwebtoken`.
+* `grep -A1 '^name = "rustls"$' Cargo.lock` shows a single version.
+* `cargo check --features aws,gcp` and the object-store emulator CI lane stay
+  green — the point is to remove the old subtree, not to break the backends.
