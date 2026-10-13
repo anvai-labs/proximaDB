@@ -18,7 +18,6 @@ T = TypeVar("T", bound="EdgeInputProperties")
 
 @_attrs_define
 class EdgeInputProperties:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

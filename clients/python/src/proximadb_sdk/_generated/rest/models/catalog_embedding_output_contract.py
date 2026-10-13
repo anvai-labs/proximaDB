@@ -45,7 +45,9 @@ class CatalogEmbeddingOutputContract:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.catalog_dimension_policy_type_2 import CatalogDimensionPolicyType2
+        from ..models.catalog_dimension_policy_type_2 import (  # noqa: PLC0415
+            CatalogDimensionPolicyType2,
+        )
 
         native_dimension = self.native_dimension
 
@@ -79,7 +81,9 @@ class CatalogEmbeddingOutputContract:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.catalog_dimension_policy_type_2 import CatalogDimensionPolicyType2
+        from ..models.catalog_dimension_policy_type_2 import (  # noqa: PLC0415
+            CatalogDimensionPolicyType2,
+        )
 
         d = dict(src_dict)
         native_dimension = d.pop("native_dimension")

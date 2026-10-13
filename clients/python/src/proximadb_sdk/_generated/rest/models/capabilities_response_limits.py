@@ -18,7 +18,6 @@ T = TypeVar("T", bound="CapabilitiesResponseLimits")
 
 @_attrs_define
 class CapabilitiesResponseLimits:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

@@ -57,10 +57,10 @@ class CatalogEmbeddingInputContract:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.catalog_embedding_input_contract_document_parameters import (
+        from ..models.catalog_embedding_input_contract_document_parameters import (  # noqa: PLC0415
             CatalogEmbeddingInputContractDocumentParameters,
         )
-        from ..models.catalog_embedding_input_contract_query_parameters import (
+        from ..models.catalog_embedding_input_contract_query_parameters import (  # noqa: PLC0415
             CatalogEmbeddingInputContractQueryParameters,
         )
 
@@ -114,10 +114,10 @@ class CatalogEmbeddingInputContract:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.catalog_embedding_input_contract_document_parameters import (
+        from ..models.catalog_embedding_input_contract_document_parameters import (  # noqa: PLC0415
             CatalogEmbeddingInputContractDocumentParameters,
         )
-        from ..models.catalog_embedding_input_contract_query_parameters import (
+        from ..models.catalog_embedding_input_contract_query_parameters import (  # noqa: PLC0415
             CatalogEmbeddingInputContractQueryParameters,
         )
 

@@ -18,7 +18,6 @@ T = TypeVar("T", bound="MetricTimeSeriesLabels")
 
 @_attrs_define
 class MetricTimeSeriesLabels:
-    """ """
 
     additional_properties: dict[str, str] = _attrs_field(init=False, factory=dict)
 

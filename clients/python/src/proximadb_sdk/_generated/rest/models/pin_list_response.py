@@ -33,7 +33,7 @@ class PinListResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.pin_list_item import PinListItem
+        from ..models.pin_list_item import PinListItem  # noqa: PLC0415
 
         count = self.count
 
@@ -55,7 +55,7 @@ class PinListResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.pin_list_item import PinListItem
+        from ..models.pin_list_item import PinListItem  # noqa: PLC0415
 
         d = dict(src_dict)
         count = d.pop("count")

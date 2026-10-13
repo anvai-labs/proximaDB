@@ -18,7 +18,6 @@ T = TypeVar("T", bound="UpdateGraphSchemaRequestSchema")
 
 @_attrs_define
 class UpdateGraphSchemaRequestSchema:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

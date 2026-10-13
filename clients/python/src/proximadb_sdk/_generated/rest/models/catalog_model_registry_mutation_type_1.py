@@ -36,7 +36,9 @@ class CatalogModelRegistryMutationType1:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.catalog_model_alias_mutation import CatalogModelAliasMutation
+        from ..models.catalog_model_alias_mutation import (  # noqa: PLC0415
+            CatalogModelAliasMutation,
+        )
 
         payload = self.payload.to_dict()
 
@@ -55,7 +57,9 @@ class CatalogModelRegistryMutationType1:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.catalog_model_alias_mutation import CatalogModelAliasMutation
+        from ..models.catalog_model_alias_mutation import (  # noqa: PLC0415
+            CatalogModelAliasMutation,
+        )
 
         d = dict(src_dict)
         payload = CatalogModelAliasMutation.from_dict(d.pop("payload"))

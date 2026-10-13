@@ -43,7 +43,7 @@ class ResolvedModelBindingResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.resolved_embedding_model_response import (
+        from ..models.resolved_embedding_model_response import (  # noqa: PLC0415
             ResolvedEmbeddingModelResponse,
         )
 
@@ -76,7 +76,7 @@ class ResolvedModelBindingResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.resolved_embedding_model_response import (
+        from ..models.resolved_embedding_model_response import (  # noqa: PLC0415
             ResolvedEmbeddingModelResponse,
         )
 

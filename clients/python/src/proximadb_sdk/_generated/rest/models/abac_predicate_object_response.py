@@ -53,7 +53,9 @@ class AbacPredicateObjectResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_filter_expression import AbacFilterExpression
+        from ..models.abac_filter_expression import (  # noqa: PLC0415
+            AbacFilterExpression,
+        )
 
         object_id = self.object_id
 
@@ -72,7 +74,9 @@ class AbacPredicateObjectResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_filter_expression import AbacFilterExpression
+        from ..models.abac_filter_expression import (  # noqa: PLC0415
+            AbacFilterExpression,
+        )
 
         d = dict(src_dict)
         object_id = d.pop("object_id")

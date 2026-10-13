@@ -18,7 +18,6 @@ T = TypeVar("T", bound="QueryRequestParametersType0Item")
 
 @_attrs_define
 class QueryRequestParametersType0Item:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

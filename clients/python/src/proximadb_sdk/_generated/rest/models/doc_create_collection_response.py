@@ -33,7 +33,7 @@ class DocCreateCollectionResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.doc_open_object import DocOpenObject
+        from ..models.doc_open_object import DocOpenObject  # noqa: PLC0415
 
         success = self.success
 
@@ -52,7 +52,7 @@ class DocCreateCollectionResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.doc_open_object import DocOpenObject
+        from ..models.doc_open_object import DocOpenObject  # noqa: PLC0415
 
         d = dict(src_dict)
         success = d.pop("success")

@@ -41,8 +41,10 @@ class TypedSearchResult:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.text_field_output import TextFieldOutput
-        from ..models.typed_search_result_props import TypedSearchResultProps
+        from ..models.text_field_output import TextFieldOutput  # noqa: PLC0415
+        from ..models.typed_search_result_props import (  # noqa: PLC0415
+            TypedSearchResultProps,
+        )
 
         id = self.id
 
@@ -89,8 +91,10 @@ class TypedSearchResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.text_field_output import TextFieldOutput
-        from ..models.typed_search_result_props import TypedSearchResultProps
+        from ..models.text_field_output import TextFieldOutput  # noqa: PLC0415
+        from ..models.typed_search_result_props import (  # noqa: PLC0415
+            TypedSearchResultProps,
+        )
 
         d = dict(src_dict)
         id = d.pop("id")

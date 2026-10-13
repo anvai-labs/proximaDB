@@ -4,7 +4,7 @@
 # / httpx that break openapi-python-client's Typer CLI and its internal models).
 #
 # Regenerate with:  make gen-python-sdk
-openapi-python-client==0.28.4
+openapi-python-client==0.29.1
 # openapi-python-client's Typer CLI breaks on click >= 8.2 ("Secondary flag is
 # not valid for non-boolean flag"); pin below that boundary.
 click<8.6

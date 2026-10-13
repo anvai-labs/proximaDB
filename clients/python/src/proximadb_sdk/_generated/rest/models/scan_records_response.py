@@ -42,7 +42,7 @@ class ScanRecordsResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.record_v2_response import RecordV2Response
+        from ..models.record_v2_response import RecordV2Response  # noqa: PLC0415
 
         records = []
         for records_item_data in self.records:
@@ -83,7 +83,7 @@ class ScanRecordsResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.record_v2_response import RecordV2Response
+        from ..models.record_v2_response import RecordV2Response  # noqa: PLC0415
 
         d = dict(src_dict)
         records = []

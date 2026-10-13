@@ -18,7 +18,6 @@ T = TypeVar("T", bound="HybridSearchResponse200")
 
 @_attrs_define
 class HybridSearchResponse200:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

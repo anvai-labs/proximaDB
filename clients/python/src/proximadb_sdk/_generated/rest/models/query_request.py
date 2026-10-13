@@ -42,7 +42,7 @@ class QueryRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.query_request_parameters_type_0_item import (
+        from ..models.query_request_parameters_type_0_item import (  # noqa: PLC0415
             QueryRequestParametersType0Item,
         )
 
@@ -93,7 +93,7 @@ class QueryRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.query_request_parameters_type_0_item import (
+        from ..models.query_request_parameters_type_0_item import (  # noqa: PLC0415
             QueryRequestParametersType0Item,
         )
 

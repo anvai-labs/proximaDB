@@ -18,7 +18,6 @@ T = TypeVar("T", bound="CatalogEvaluationEvidenceMetrics")
 
 @_attrs_define
 class CatalogEvaluationEvidenceMetrics:
-    """ """
 
     additional_properties: dict[str, float] = _attrs_field(init=False, factory=dict)
 

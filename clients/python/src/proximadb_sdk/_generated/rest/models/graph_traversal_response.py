@@ -39,9 +39,11 @@ class GraphTraversalResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.graph_error_body import GraphErrorBody
-        from ..models.graph_response_metadata import GraphResponseMetadata
-        from ..models.graph_traversal_data import GraphTraversalData
+        from ..models.graph_error_body import GraphErrorBody  # noqa: PLC0415
+        from ..models.graph_response_metadata import (  # noqa: PLC0415
+            GraphResponseMetadata,
+        )
+        from ..models.graph_traversal_data import GraphTraversalData  # noqa: PLC0415
 
         success = self.success
 
@@ -75,9 +77,11 @@ class GraphTraversalResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_error_body import GraphErrorBody
-        from ..models.graph_response_metadata import GraphResponseMetadata
-        from ..models.graph_traversal_data import GraphTraversalData
+        from ..models.graph_error_body import GraphErrorBody  # noqa: PLC0415
+        from ..models.graph_response_metadata import (  # noqa: PLC0415
+            GraphResponseMetadata,
+        )
+        from ..models.graph_traversal_data import GraphTraversalData  # noqa: PLC0415
 
         d = dict(src_dict)
         success = d.pop("success")

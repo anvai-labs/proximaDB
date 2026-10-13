@@ -37,7 +37,7 @@ class RankSearchResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.rank_scored_hit import RankScoredHit
+        from ..models.rank_scored_hit import RankScoredHit  # noqa: PLC0415
 
         hits = []
         for hits_item_data in self.hits:
@@ -75,7 +75,7 @@ class RankSearchResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.rank_scored_hit import RankScoredHit
+        from ..models.rank_scored_hit import RankScoredHit  # noqa: PLC0415
 
         d = dict(src_dict)
         hits = []

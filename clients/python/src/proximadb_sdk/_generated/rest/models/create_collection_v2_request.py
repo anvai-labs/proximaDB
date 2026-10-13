@@ -104,10 +104,12 @@ class CreateCollectionV2Request:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.index_config_input import IndexConfigInput
-        from ..models.index_policy_input import IndexPolicyInput
-        from ..models.quantization_config_input import QuantizationConfigInput
-        from ..models.schema_definition import SchemaDefinition
+        from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
+        from ..models.index_policy_input import IndexPolicyInput  # noqa: PLC0415
+        from ..models.quantization_config_input import (  # noqa: PLC0415
+            QuantizationConfigInput,
+        )
+        from ..models.schema_definition import SchemaDefinition  # noqa: PLC0415
 
         name = self.name
 
@@ -221,10 +223,12 @@ class CreateCollectionV2Request:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.index_config_input import IndexConfigInput
-        from ..models.index_policy_input import IndexPolicyInput
-        from ..models.quantization_config_input import QuantizationConfigInput
-        from ..models.schema_definition import SchemaDefinition
+        from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
+        from ..models.index_policy_input import IndexPolicyInput  # noqa: PLC0415
+        from ..models.quantization_config_input import (  # noqa: PLC0415
+            QuantizationConfigInput,
+        )
+        from ..models.schema_definition import SchemaDefinition  # noqa: PLC0415
 
         d = dict(src_dict)
         name = d.pop("name")

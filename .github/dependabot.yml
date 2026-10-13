@@ -118,6 +118,7 @@ updates:
   - package-ecosystem: pip
     directories:
       - "/clients/python"
+      - "/clients/python/codegen"
       - "/demo"
     target-branch: develop
     schedule:

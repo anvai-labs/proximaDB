@@ -31,7 +31,7 @@ class AbacGranteeType1:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_grantee_user import AbacGranteeUser
+        from ..models.abac_grantee_user import AbacGranteeUser  # noqa: PLC0415
 
         user = self.user.to_dict()
 
@@ -47,7 +47,7 @@ class AbacGranteeType1:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_grantee_user import AbacGranteeUser
+        from ..models.abac_grantee_user import AbacGranteeUser  # noqa: PLC0415
 
         d = dict(src_dict)
         user = AbacGranteeUser.from_dict(d.pop("User"))

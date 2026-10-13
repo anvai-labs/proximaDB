@@ -18,7 +18,6 @@ T = TypeVar("T", bound="UpsertEntityRequestFlexibleMetadata")
 
 @_attrs_define
 class UpsertEntityRequestFlexibleMetadata:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
