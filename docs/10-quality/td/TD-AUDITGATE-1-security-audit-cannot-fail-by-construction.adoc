@@ -1,0 +1,95 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-AUDITGATE-1: the Security Audit job cannot fail, so a reintroduced advisory stays green
+:toc: macro
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open — demonstrated by a real same-day regression, found by human review rather than by CI
+| Severity | High — a known advisory can be reintroduced into `Cargo.lock` and every one of ~83 checks still passes. The gate that exists to catch exactly this is incapable of going red.
+| Component | `.github/workflows/ci.yml` (`security-audit`), `.github/workflows/tdd.yml`
+| Pillar | SECURITY / CI
+| Found | 2026-10-13
+|===
+
+toc::[]
+
+== The defect
+
+Both workflows run the audit like this:
+
+[source,yaml]
+----
+- name: Run security audit
+  continue-on-error: true
+  run: cargo audit || echo "::warning::Security audit found vulnerabilities - review required"
+----
+
+It is **doubly** unfailable. The `|| echo` alone guarantees exit 0 regardless of
+what `cargo audit` finds; `continue-on-error: true` would mask a failure even
+without it. So the step is a no-op as a *gate* — it emits an annotation nobody
+is required to read.
+
+== The regression that proved it
+
+Same day, two PRs, both mine:
+
+* **#2003** bumped `rustls` 0.23.44 -> **0.23.45**, closing
+  **RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc** (TLS 1.3 handshake messages
+  accepted across encryption-level boundaries).
+* **#2004** regenerated `Cargo.lock` and silently moved it **back to 0.23.44**,
+  reopening the advisory. It passed **83/83 checks**.
+
+----
+72092668f (#2003)  rustls 0.23.45
+61de80dd8 (#2004)  rustls 0.23.44   <- reverted, CI green
+----
+
+It was caught by an **independent human review** of an unrelated Dependabot PR,
+and fixed when #2008's rebased group happened to carry 0.23.45 again. Nothing
+automated noticed at any point.
+
+== Two separate failures, both worth fixing
+
+**1. The gate cannot fail (this TD).** Even a *blocking* `cargo audit` has a
+known cost: a newly published advisory against an unchanged dependency turns
+unrelated PRs red. The usual resolution is to fail only on advisories that are
+**new relative to a committed baseline**, so the signal is "this PR introduced
+it", not "the world changed". Options, cheapest first:
+
+  * drop the `|| echo` and `continue-on-error` and accept world-changes-break-CI;
+  * `cargo audit --deny warnings` with an `audit.toml` ignore list, reviewed
+    deliberately (the list becomes the baseline, and adding to it is a visible
+    decision);
+  * compute the advisory set before/after and fail only on the delta.
+
+**2. A lockfile regression is invisible to review.** A `Cargo.lock` conflict is
+exactly where content can regress while the file list looks correct — the
+author's own verification checked *which files* changed and that the expected
+docs were present, never the dependency **versions inside** the lock. A cheap
+guard: on any PR touching `Cargo.lock`, assert no package moves **backwards**
+versus the base branch, listing any that do. That catches this whole class
+(reverted security bumps, accidental downgrades from stale-base conflict
+resolution) without needing an advisory database.
+
+== The mechanism to avoid repeating (process note)
+
+The regression came from resolving the conflict with `git checkout --theirs
+Cargo.lock`. **During a rebase, `--theirs` is the commit being replayed, not the
+upstream branch** — so it restored the author's pre-#2003 lock. The intended
+fallback (`|| git checkout origin/develop -- Cargo.lock`) never ran, because
+`--theirs` had succeeded.
+
+Resolve lockfile conflicts by taking the BASE branch's lock and re-resolving
+from the manifest (`cargo metadata`), then verify by diffing **versions**, not
+filenames. Guard (2) above makes this mechanical instead of a habit.
+
+== Verification for the fix
+
+* Introduce a deliberate downgrade of a package with a known advisory on a
+  scratch branch; the audit job must go **red**, and guard (2) must name the
+  package and both versions.
+* An advisory published against an unchanged dependency must not break
+  unrelated PRs — whichever option is chosen has to satisfy this, or it will be
+  disabled again within a week.
