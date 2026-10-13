@@ -38,7 +38,7 @@ class AbacPostAttributeBindingRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_post_attribute_binding_request_attrs import (
+        from ..models.abac_post_attribute_binding_request_attrs import (  # noqa: PLC0415
             AbacPostAttributeBindingRequestAttrs,
         )
 
@@ -62,7 +62,7 @@ class AbacPostAttributeBindingRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_post_attribute_binding_request_attrs import (
+        from ..models.abac_post_attribute_binding_request_attrs import (  # noqa: PLC0415
             AbacPostAttributeBindingRequestAttrs,
         )
 

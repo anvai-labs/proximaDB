@@ -44,10 +44,14 @@ class UpsertEntityRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.entity_embedding_input import EntityEmbeddingInput
-        from ..models.entity_provenance_input import EntityProvenanceInput
-        from ..models.entity_relation_input import EntityRelationInput
-        from ..models.upsert_entity_request_flexible_metadata import (
+        from ..models.entity_embedding_input import (  # noqa: PLC0415
+            EntityEmbeddingInput,
+        )
+        from ..models.entity_provenance_input import (  # noqa: PLC0415
+            EntityProvenanceInput,
+        )
+        from ..models.entity_relation_input import EntityRelationInput  # noqa: PLC0415
+        from ..models.upsert_entity_request_flexible_metadata import (  # noqa: PLC0415
             UpsertEntityRequestFlexibleMetadata,
         )
 
@@ -97,10 +101,14 @@ class UpsertEntityRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.entity_embedding_input import EntityEmbeddingInput
-        from ..models.entity_provenance_input import EntityProvenanceInput
-        from ..models.entity_relation_input import EntityRelationInput
-        from ..models.upsert_entity_request_flexible_metadata import (
+        from ..models.entity_embedding_input import (  # noqa: PLC0415
+            EntityEmbeddingInput,
+        )
+        from ..models.entity_provenance_input import (  # noqa: PLC0415
+            EntityProvenanceInput,
+        )
+        from ..models.entity_relation_input import EntityRelationInput  # noqa: PLC0415
+        from ..models.upsert_entity_request_flexible_metadata import (  # noqa: PLC0415
             UpsertEntityRequestFlexibleMetadata,
         )
 

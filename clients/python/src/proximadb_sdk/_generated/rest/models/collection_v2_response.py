@@ -68,10 +68,12 @@ class CollectionV2Response:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.collection_stats_v2 import CollectionStatsV2
-        from ..models.index_spec_output import IndexSpecOutput
-        from ..models.quantization_config_output import QuantizationConfigOutput
-        from ..models.schema_definition import SchemaDefinition
+        from ..models.collection_stats_v2 import CollectionStatsV2  # noqa: PLC0415
+        from ..models.index_spec_output import IndexSpecOutput  # noqa: PLC0415
+        from ..models.quantization_config_output import (  # noqa: PLC0415
+            QuantizationConfigOutput,
+        )
+        from ..models.schema_definition import SchemaDefinition  # noqa: PLC0415
 
         collection_id = self.collection_id
 
@@ -156,10 +158,12 @@ class CollectionV2Response:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.collection_stats_v2 import CollectionStatsV2
-        from ..models.index_spec_output import IndexSpecOutput
-        from ..models.quantization_config_output import QuantizationConfigOutput
-        from ..models.schema_definition import SchemaDefinition
+        from ..models.collection_stats_v2 import CollectionStatsV2  # noqa: PLC0415
+        from ..models.index_spec_output import IndexSpecOutput  # noqa: PLC0415
+        from ..models.quantization_config_output import (  # noqa: PLC0415
+            QuantizationConfigOutput,
+        )
+        from ..models.schema_definition import SchemaDefinition  # noqa: PLC0415
 
         d = dict(src_dict)
         collection_id = d.pop("collection_id")

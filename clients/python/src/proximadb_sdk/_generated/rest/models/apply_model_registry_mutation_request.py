@@ -49,15 +49,19 @@ class ApplyModelRegistryMutationRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.append_model_evidence_mutation import AppendModelEvidenceMutation
-        from ..models.catalog_model_registry_mutation_type_1 import (
+        from ..models.append_model_evidence_mutation import (  # noqa: PLC0415
+            AppendModelEvidenceMutation,
+        )
+        from ..models.catalog_model_registry_mutation_type_1 import (  # noqa: PLC0415
             CatalogModelRegistryMutationType1,
         )
-        from ..models.record_model_decision_mutation import RecordModelDecisionMutation
-        from ..models.register_model_version_mutation import (
+        from ..models.record_model_decision_mutation import (  # noqa: PLC0415
+            RecordModelDecisionMutation,
+        )
+        from ..models.register_model_version_mutation import (  # noqa: PLC0415
             RegisterModelVersionMutation,
         )
-        from ..models.upsert_model_deployment_mutation import (
+        from ..models.upsert_model_deployment_mutation import (  # noqa: PLC0415
             UpsertModelDeploymentMutation,
         )
 
@@ -88,15 +92,19 @@ class ApplyModelRegistryMutationRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.append_model_evidence_mutation import AppendModelEvidenceMutation
-        from ..models.catalog_model_registry_mutation_type_1 import (
+        from ..models.append_model_evidence_mutation import (  # noqa: PLC0415
+            AppendModelEvidenceMutation,
+        )
+        from ..models.catalog_model_registry_mutation_type_1 import (  # noqa: PLC0415
             CatalogModelRegistryMutationType1,
         )
-        from ..models.record_model_decision_mutation import RecordModelDecisionMutation
-        from ..models.register_model_version_mutation import (
+        from ..models.record_model_decision_mutation import (  # noqa: PLC0415
+            RecordModelDecisionMutation,
+        )
+        from ..models.register_model_version_mutation import (  # noqa: PLC0415
             RegisterModelVersionMutation,
         )
-        from ..models.upsert_model_deployment_mutation import (
+        from ..models.upsert_model_deployment_mutation import (  # noqa: PLC0415
             UpsertModelDeploymentMutation,
         )
 

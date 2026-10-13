@@ -18,7 +18,6 @@ T = TypeVar("T", bound="HybridIndexResponse200")
 
 @_attrs_define
 class HybridIndexResponse200:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

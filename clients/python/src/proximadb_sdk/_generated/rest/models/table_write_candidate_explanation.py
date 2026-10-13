@@ -39,7 +39,9 @@ class TableWriteCandidateExplanation:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.table_write_cost_explanation import TableWriteCostExplanation
+        from ..models.table_write_cost_explanation import (  # noqa: PLC0415
+            TableWriteCostExplanation,
+        )
 
         backend = self.backend
 
@@ -67,7 +69,9 @@ class TableWriteCandidateExplanation:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.table_write_cost_explanation import TableWriteCostExplanation
+        from ..models.table_write_cost_explanation import (  # noqa: PLC0415
+            TableWriteCostExplanation,
+        )
 
         d = dict(src_dict)
         backend = d.pop("backend")

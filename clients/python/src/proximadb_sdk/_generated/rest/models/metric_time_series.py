@@ -34,8 +34,10 @@ class MetricTimeSeries:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.metric_data_point import MetricDataPoint
-        from ..models.metric_time_series_labels import MetricTimeSeriesLabels
+        from ..models.metric_data_point import MetricDataPoint  # noqa: PLC0415
+        from ..models.metric_time_series_labels import (  # noqa: PLC0415
+            MetricTimeSeriesLabels,
+        )
 
         labels = self.labels.to_dict()
 
@@ -57,8 +59,10 @@ class MetricTimeSeries:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.metric_data_point import MetricDataPoint
-        from ..models.metric_time_series_labels import MetricTimeSeriesLabels
+        from ..models.metric_data_point import MetricDataPoint  # noqa: PLC0415
+        from ..models.metric_time_series_labels import (  # noqa: PLC0415
+            MetricTimeSeriesLabels,
+        )
 
         d = dict(src_dict)
         labels = MetricTimeSeriesLabels.from_dict(d.pop("labels"))

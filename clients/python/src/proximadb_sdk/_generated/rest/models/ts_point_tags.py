@@ -18,7 +18,6 @@ T = TypeVar("T", bound="TsPointTags")
 
 @_attrs_define
 class TsPointTags:
-    """ """
 
     additional_properties: dict[str, str] = _attrs_field(init=False, factory=dict)
 

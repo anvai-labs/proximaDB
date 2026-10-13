@@ -18,7 +18,6 @@ T = TypeVar("T", bound="GraphCollectionListResponseDataItem")
 
 @_attrs_define
 class GraphCollectionListResponseDataItem:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

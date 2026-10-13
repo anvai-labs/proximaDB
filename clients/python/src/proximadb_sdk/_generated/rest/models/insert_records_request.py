@@ -72,7 +72,7 @@ class InsertRecordsRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.proxima_record_input import ProximaRecordInput
+        from ..models.proxima_record_input import ProximaRecordInput  # noqa: PLC0415
 
         records = []
         for records_item_data in self.records:
@@ -107,7 +107,7 @@ class InsertRecordsRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.proxima_record_input import ProximaRecordInput
+        from ..models.proxima_record_input import ProximaRecordInput  # noqa: PLC0415
 
         d = dict(src_dict)
         records = []

@@ -35,7 +35,7 @@ class SearchEntitiesRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.search_entities_request_filters import (
+        from ..models.search_entities_request_filters import (  # noqa: PLC0415
             SearchEntitiesRequestFilters,
         )
 
@@ -63,7 +63,7 @@ class SearchEntitiesRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.search_entities_request_filters import (
+        from ..models.search_entities_request_filters import (  # noqa: PLC0415
             SearchEntitiesRequestFilters,
         )
 

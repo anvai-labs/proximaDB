@@ -82,10 +82,10 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[PrimaryPodLookupResponse | PrimaryPodOperatorErrorResponse]:
-    r"""Look up a (tenant, collection)'s primary pod.
+    """Look up a (tenant, collection)'s primary pod.
 
-     200 with `status: \"bound\"` + the assignment when one exists;
-    200 with `status: \"unbound\"` when none does (never 404).
+     200 with `status: "bound"` + the assignment when one exists;
+    200 with `status: "unbound"` when none does (never 404).
     The optional `X-Tenant-ID` header is not consulted by this
     handler — the `tenant_id` PATH segment governs.
     Requires REST auth enabled — in an auth-disabled
@@ -125,10 +125,10 @@ def sync(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> PrimaryPodLookupResponse | PrimaryPodOperatorErrorResponse | None:
-    r"""Look up a (tenant, collection)'s primary pod.
+    """Look up a (tenant, collection)'s primary pod.
 
-     200 with `status: \"bound\"` + the assignment when one exists;
-    200 with `status: \"unbound\"` when none does (never 404).
+     200 with `status: "bound"` + the assignment when one exists;
+    200 with `status: "unbound"` when none does (never 404).
     The optional `X-Tenant-ID` header is not consulted by this
     handler — the `tenant_id` PATH segment governs.
     Requires REST auth enabled — in an auth-disabled
@@ -163,10 +163,10 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[PrimaryPodLookupResponse | PrimaryPodOperatorErrorResponse]:
-    r"""Look up a (tenant, collection)'s primary pod.
+    """Look up a (tenant, collection)'s primary pod.
 
-     200 with `status: \"bound\"` + the assignment when one exists;
-    200 with `status: \"unbound\"` when none does (never 404).
+     200 with `status: "bound"` + the assignment when one exists;
+    200 with `status: "unbound"` when none does (never 404).
     The optional `X-Tenant-ID` header is not consulted by this
     handler — the `tenant_id` PATH segment governs.
     Requires REST auth enabled — in an auth-disabled
@@ -204,10 +204,10 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> PrimaryPodLookupResponse | PrimaryPodOperatorErrorResponse | None:
-    r"""Look up a (tenant, collection)'s primary pod.
+    """Look up a (tenant, collection)'s primary pod.
 
-     200 with `status: \"bound\"` + the assignment when one exists;
-    200 with `status: \"unbound\"` when none does (never 404).
+     200 with `status: "bound"` + the assignment when one exists;
+    200 with `status: "unbound"` when none does (never 404).
     The optional `X-Tenant-ID` header is not consulted by this
     handler — the `tenant_id` PATH segment governs.
     Requires REST auth enabled — in an auth-disabled

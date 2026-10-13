@@ -45,7 +45,9 @@ class SchemaDefinition:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.rest_column_definition import RestColumnDefinition
+        from ..models.rest_column_definition import (  # noqa: PLC0415
+            RestColumnDefinition,
+        )
 
         columns = []
         for columns_item_data in self.columns:
@@ -80,7 +82,9 @@ class SchemaDefinition:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.rest_column_definition import RestColumnDefinition
+        from ..models.rest_column_definition import (  # noqa: PLC0415
+            RestColumnDefinition,
+        )
 
         d = dict(src_dict)
         columns = []

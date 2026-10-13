@@ -57,7 +57,7 @@ class TableWriteRouteMetadataExplanation:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.projection_route_metadata_explanation import (
+        from ..models.projection_route_metadata_explanation import (  # noqa: PLC0415
             ProjectionRouteMetadataExplanation,
         )
 
@@ -144,7 +144,7 @@ class TableWriteRouteMetadataExplanation:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.projection_route_metadata_explanation import (
+        from ..models.projection_route_metadata_explanation import (  # noqa: PLC0415
             ProjectionRouteMetadataExplanation,
         )
 

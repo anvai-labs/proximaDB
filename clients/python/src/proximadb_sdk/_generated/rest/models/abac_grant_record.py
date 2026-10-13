@@ -60,11 +60,11 @@ class AbacGrantRecord:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.abac_grantee_type_0 import AbacGranteeType0
-        from ..models.abac_grantee_type_1 import AbacGranteeType1
-        from ..models.abac_scope_type_0 import AbacScopeType0
-        from ..models.abac_scope_type_1 import AbacScopeType1
-        from ..models.abac_scope_type_2 import AbacScopeType2
+        from ..models.abac_grantee_type_0 import AbacGranteeType0  # noqa: PLC0415
+        from ..models.abac_grantee_type_1 import AbacGranteeType1  # noqa: PLC0415
+        from ..models.abac_scope_type_0 import AbacScopeType0  # noqa: PLC0415
+        from ..models.abac_scope_type_1 import AbacScopeType1  # noqa: PLC0415
+        from ..models.abac_scope_type_2 import AbacScopeType2  # noqa: PLC0415
 
         grant_id = self.grant_id
 
@@ -142,11 +142,11 @@ class AbacGrantRecord:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.abac_grantee_type_0 import AbacGranteeType0
-        from ..models.abac_grantee_type_1 import AbacGranteeType1
-        from ..models.abac_scope_type_0 import AbacScopeType0
-        from ..models.abac_scope_type_1 import AbacScopeType1
-        from ..models.abac_scope_type_2 import AbacScopeType2
+        from ..models.abac_grantee_type_0 import AbacGranteeType0  # noqa: PLC0415
+        from ..models.abac_grantee_type_1 import AbacGranteeType1  # noqa: PLC0415
+        from ..models.abac_scope_type_0 import AbacScopeType0  # noqa: PLC0415
+        from ..models.abac_scope_type_1 import AbacScopeType1  # noqa: PLC0415
+        from ..models.abac_scope_type_2 import AbacScopeType2  # noqa: PLC0415
 
         d = dict(src_dict)
         grant_id = d.pop("grant_id")

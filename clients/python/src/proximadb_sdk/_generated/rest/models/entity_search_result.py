@@ -33,7 +33,7 @@ class EntitySearchResult:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.entity_dto import EntityDto
+        from ..models.entity_dto import EntityDto  # noqa: PLC0415
 
         entity = self.entity.to_dict()
 
@@ -52,7 +52,7 @@ class EntitySearchResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.entity_dto import EntityDto
+        from ..models.entity_dto import EntityDto  # noqa: PLC0415
 
         d = dict(src_dict)
         entity = EntityDto.from_dict(d.pop("entity"))

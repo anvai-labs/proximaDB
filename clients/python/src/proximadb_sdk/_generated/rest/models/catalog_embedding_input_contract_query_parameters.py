@@ -18,7 +18,6 @@ T = TypeVar("T", bound="CatalogEmbeddingInputContractQueryParameters")
 
 @_attrs_define
 class CatalogEmbeddingInputContractQueryParameters:
-    """ """
 
     additional_properties: dict[str, str] = _attrs_field(init=False, factory=dict)
 

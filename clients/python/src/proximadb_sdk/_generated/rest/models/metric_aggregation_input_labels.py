@@ -18,7 +18,6 @@ T = TypeVar("T", bound="MetricAggregationInputLabels")
 
 @_attrs_define
 class MetricAggregationInputLabels:
-    """ """
 
     additional_properties: dict[str, str] = _attrs_field(init=False, factory=dict)
 

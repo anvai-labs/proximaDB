@@ -18,7 +18,6 @@ T = TypeVar("T", bound="GraphNodeQueryProperties")
 
 @_attrs_define
 class GraphNodeQueryProperties:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

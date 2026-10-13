@@ -31,7 +31,9 @@ class ListModelRegistriesResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.model_registry_record_response import ModelRegistryRecordResponse
+        from ..models.model_registry_record_response import (  # noqa: PLC0415
+            ModelRegistryRecordResponse,
+        )
 
         registries = []
         for registries_item_data in self.registries:
@@ -50,7 +52,9 @@ class ListModelRegistriesResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.model_registry_record_response import ModelRegistryRecordResponse
+        from ..models.model_registry_record_response import (  # noqa: PLC0415
+            ModelRegistryRecordResponse,
+        )
 
         d = dict(src_dict)
         registries = []

@@ -35,7 +35,7 @@ class PrimaryPodListItem:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.primary_pod import PrimaryPod
+        from ..models.primary_pod import PrimaryPod  # noqa: PLC0415
 
         tenant_id = self.tenant_id
 
@@ -57,7 +57,7 @@ class PrimaryPodListItem:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.primary_pod import PrimaryPod
+        from ..models.primary_pod import PrimaryPod  # noqa: PLC0415
 
         d = dict(src_dict)
         tenant_id = d.pop("tenant_id")

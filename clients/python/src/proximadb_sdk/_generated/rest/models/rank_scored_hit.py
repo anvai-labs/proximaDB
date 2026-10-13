@@ -41,9 +41,11 @@ class RankScoredHit:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.rank_score_vector import RankScoreVector
-        from ..models.rank_scored_hit_match_features import RankScoredHitMatchFeatures
-        from ..models.rank_scored_hit_summary_features import (
+        from ..models.rank_score_vector import RankScoreVector  # noqa: PLC0415
+        from ..models.rank_scored_hit_match_features import (  # noqa: PLC0415
+            RankScoredHitMatchFeatures,
+        )
+        from ..models.rank_scored_hit_summary_features import (  # noqa: PLC0415
             RankScoredHitSummaryFeatures,
         )
 
@@ -82,9 +84,11 @@ class RankScoredHit:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.rank_score_vector import RankScoreVector
-        from ..models.rank_scored_hit_match_features import RankScoredHitMatchFeatures
-        from ..models.rank_scored_hit_summary_features import (
+        from ..models.rank_score_vector import RankScoreVector  # noqa: PLC0415
+        from ..models.rank_scored_hit_match_features import (  # noqa: PLC0415
+            RankScoredHitMatchFeatures,
+        )
+        from ..models.rank_scored_hit_summary_features import (  # noqa: PLC0415
             RankScoredHitSummaryFeatures,
         )
 

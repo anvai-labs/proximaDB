@@ -18,7 +18,6 @@ T = TypeVar("T", bound="QueryLogsBody")
 
 @_attrs_define
 class QueryLogsBody:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

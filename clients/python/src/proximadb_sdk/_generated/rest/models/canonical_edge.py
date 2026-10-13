@@ -45,7 +45,9 @@ class CanonicalEdge:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.canonical_edge_properties import CanonicalEdgeProperties
+        from ..models.canonical_edge_properties import (  # noqa: PLC0415
+            CanonicalEdgeProperties,
+        )
 
         id = self.id
 
@@ -83,7 +85,9 @@ class CanonicalEdge:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.canonical_edge_properties import CanonicalEdgeProperties
+        from ..models.canonical_edge_properties import (  # noqa: PLC0415
+            CanonicalEdgeProperties,
+        )
 
         d = dict(src_dict)
         id = d.pop("id")

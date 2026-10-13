@@ -18,7 +18,6 @@ T = TypeVar("T", bound="EntityDtoFlexibleMetadata")
 
 @_attrs_define
 class EntityDtoFlexibleMetadata:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

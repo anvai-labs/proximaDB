@@ -44,9 +44,11 @@ class IndexConfigInput:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.hnsw_config_input import HnswConfigInput
-        from ..models.index_config_input_parameters import IndexConfigInputParameters
-        from ..models.ivf_config_input import IvfConfigInput
+        from ..models.hnsw_config_input import HnswConfigInput  # noqa: PLC0415
+        from ..models.index_config_input_parameters import (  # noqa: PLC0415
+            IndexConfigInputParameters,
+        )
+        from ..models.ivf_config_input import IvfConfigInput  # noqa: PLC0415
 
         algorithm = self.algorithm
 
@@ -104,9 +106,11 @@ class IndexConfigInput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.hnsw_config_input import HnswConfigInput
-        from ..models.index_config_input_parameters import IndexConfigInputParameters
-        from ..models.ivf_config_input import IvfConfigInput
+        from ..models.hnsw_config_input import HnswConfigInput  # noqa: PLC0415
+        from ..models.index_config_input_parameters import (  # noqa: PLC0415
+            IndexConfigInputParameters,
+        )
+        from ..models.ivf_config_input import IvfConfigInput  # noqa: PLC0415
 
         d = dict(src_dict)
         algorithm = d.pop("algorithm")

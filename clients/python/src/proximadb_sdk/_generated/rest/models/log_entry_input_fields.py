@@ -18,7 +18,6 @@ T = TypeVar("T", bound="LogEntryInputFields")
 
 @_attrs_define
 class LogEntryInputFields:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

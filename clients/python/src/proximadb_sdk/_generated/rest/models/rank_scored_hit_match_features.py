@@ -18,7 +18,6 @@ T = TypeVar("T", bound="RankScoredHitMatchFeatures")
 
 @_attrs_define
 class RankScoredHitMatchFeatures:
-    """ """
 
     additional_properties: dict[str, float] = _attrs_field(init=False, factory=dict)
 
