@@ -118,7 +118,6 @@ updates:
   - package-ecosystem: pip
     directories:
       - "/clients/python"
-      - "/clients/python/codegen"
       - "/demo"
     target-branch: develop
     schedule:
@@ -127,6 +126,20 @@ updates:
     groups:
       pip-minor-patch:
         update-types: ["minor", "patch"]
+
+  # The Python REST generator, kept apart from the SDK's runtime deps: a
+  # generator bump usually changes the generated transport, so the
+  # python-sdk-codegen-drift gate fails until someone runs
+  # `make gen-python-sdk` and pushes the result. Ungrouped so that one
+  # regeneration never blocks unrelated runtime bumps. (Security updates
+  # still target the default branch; Dependabot ignores target-branch for
+  # them.)
+  - package-ecosystem: pip
+    directory: "/clients/python/codegen"
+    target-branch: develop
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 1
 
   - package-ecosystem: github-actions
     directory: "/"
