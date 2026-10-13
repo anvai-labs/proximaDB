@@ -10,7 +10,7 @@
 | Severity | Medium-High — a mechanical port silently demotes `PRIMARY KEY` to `UNIQUE` in `CREATE TABLE`, and can round-trip INSERT column names through dialect quoting. Compiles clean either way.
 | Component | `src/query/sql_frontend/parser.rs` (17 sites), `src/query/ddl_dml/mod.rs` (5), `src/core/utils/mod.rs` (2), `crates/query/proximadb-relational-frontend/src/lib.rs` (4, DONE)
 | Pillar | CORRECTNESS / SQL
-| Blocks | DataFusion 55.0 -> 55.2, and with it `object_store`/arrow alignment
+| Blocks | Nothing. DataFusion **55.0** already requires `sqlparser ^0.62.0`, so the duplicate exists on `develop` today and collapsing it never needed 55.2. An earlier revision of this TD said 55.2 forced the migration -- wrong, and corrected here. See [[TD-SPECORD-1]] for the separate ordering defect the 55.2 attempt uncovered.
 | Found | 2026-10-13
 |===
 
@@ -18,8 +18,9 @@ toc::[]
 
 == Why this is forced, not optional
 
-DataFusion 55.2.0 requires `sqlparser ^0.62.0`. We declare `0.59`. Until the
-declaration moves, the workspace compiles **two sqlparser copies with divergent
+DataFusion **55.0.0** -- the version already on `develop` -- requires
+`sqlparser ^0.62.0`. We declare `0.59`. Until the declaration moves, the
+workspace compiles **two sqlparser copies with divergent
 ASTs** (confirmed: `sqlparser 0.59.0` and `0.62.0` both in `Cargo.lock`, plus
 `sqlparser_derive` 0.3.0 and 0.5.0). Moving it is what this TD is about.
 
