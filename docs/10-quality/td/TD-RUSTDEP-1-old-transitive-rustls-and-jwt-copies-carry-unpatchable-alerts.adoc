@@ -8,7 +8,7 @@
 | Field | Value
 | Status | Open — found 2026-10-12 while applying the security bumps in #2003; untracked until now, with no Dependabot PR
 | Severity | High — `rustls-webpki` DoS-via-panic on a malformed CRL, reachable only through the `aws`/`gcp` feature deps; no patch exists in the pinned line, so `cargo update` cannot close it
-| Component | `Cargo.lock` — `rustls 0.21.12`, `rustls-webpki 0.101.7`, `jsonwebtoken 9.3.1`; parents `aws-smithy-http-client`, `hyper-rustls`, `tokio-rustls`, `google-cloud-auth`
+| Component | `crates/control/proximadb-catalog/Cargo.toml` (`aws-sdk-glue` default features) and root `Cargo.toml:671` (`google-cloud-storage` 0.15). NOT the S3/Azure object-store path, which is already on the `object_store` crate.
 | Pillar | SECURITY
 | Found | 2026-10-12
 |===
@@ -99,13 +99,78 @@ releases available:
   rather than assume: the smithy crates version independently of the SDK
   façades.
 
+== It is NOT the object-store path, and the AWS half is a feature flag
+
+Worth stating plainly, because the opposite is the natural assumption: **the
+S3 + Azure object-store path is already clean.** It migrated to the canonical
+`object_store` crate (documented at `Cargo.toml:661-665`, which explicitly
+replaced "the heavy aws-sdk-s3 tree"), and `object_store` is now pulled by 18
+workspace and DataFusion crates. No `aws-sdk-s3` remains in the lock.
+
+The 23 remaining `aws-*` crates come from somewhere else entirely:
+
+[source,toml]
+----
+# crates/control/proximadb-catalog/Cargo.toml:25,41-42
+aws          = ["dep:aws-config", "dep:aws-sdk-glue"]
+aws-config   = { version = "1.0", optional = true }
+aws-sdk-glue = { version = "1.0", optional = true }
+----
+
+That is the **AWS Glue catalog** integration — not object storage.
+
+**Probed, not assumed:** bumping the stack with
+`cargo update -p aws-config --precise 1.12.0` moves
+`aws-smithy-http-client 1.1.13 -> 1.5.0` but does **not** drop the old subtree —
+after the bump the lock still carries `rustls 0.21.12`,
+`rustls-webpki 0.101.7`, `hyper-rustls 0.24.2` and `tokio-rustls 0.24.1`
+*alongside* the modern `0.23.45` / `0.103.15` / `0.27.9` / `0.26.5`. A lock
+update alone cannot close this. (The probe was reverted; the lock in this PR is
+unchanged apart from the `rustls` patch bump.)
+
+The reason is a feature, and it is ours to turn off.
+`aws-smithy-http-client` 1.5.0 declares the legacy path as **optional and NOT
+in `default`**:
+
+----
+legacy-rustls-ring = ['dep:legacy-hyper-rustls', 'dep:legacy-rustls',
+                      'dep:rustls-native-certs', 'hyper-014']
+----
+
+and it is reached because **`aws-sdk-glue`'s own `default` features include
+`rustls`**, which maps to `aws-smithy-runtime/tls-rustls`:
+
+----
+aws-sdk-glue  default = ['rustls', 'default-https-client', 'rt-tokio']
+              rustls  = ['aws-smithy-runtime/tls-rustls']
+aws-config    default = ['default-https-client', 'rt-tokio',
+                         'credentials-process', 'sso']   # note: no `rustls`
+----
+
+So `aws-config`'s defaults are already modern; `aws-sdk-glue`'s are not.
+
 == What closing this needs
 
-. Bump `google-cloud-storage` and the aws-sdk stack as above, then confirm
-  `cargo tree -d` no longer shows two `rustls` majors.
-. If either bump turns out to be blocked (no release on the modern line, or an
-  API migration too large to take now), record the decision explicitly so the
-  alert is *accepted* rather than silently ignored.
+. **AWS half — one manifest line.** In
+  `crates/control/proximadb-catalog/Cargo.toml`, take `aws-sdk-glue` with
+  `default-features = false` and re-add only the modern features
+  (`default-https-client`, `rt-tokio`), dropping the legacy `rustls`. Then
+  confirm `rustls 0.21.12` and `rustls-webpki 0.101.7` leave the lock and the
+  Glue catalog path still builds and passes its tests. This closes the **HIGH**
+  alert and both **LOW** ones.
+. **GCS half — a real decision, and the only genuine object-store debt here.**
+  `google-cloud-storage = "0.15"` (`Cargo.toml:671`, feature `gcp`) is five
+  majors behind (latest 1.20.0) and carries the `jsonwebtoken 9.3.1` alert. The
+  pin is *deliberate* and documented: `object_store`'s GCS backend speaks the
+  XML API, which `fake-gcs-server` — our test emulator — does not serve, so it
+  would be locally unverifiable. That reason is still valid, which makes this a
+  trade to weigh rather than an oversight: bump the SDK 0.15 -> 1.20 and absorb
+  the 0.x -> 1.x API churn in the GCS backend, or revisit the
+  `object_store`-for-GCS decision (and with it the emulator choice) so GCS
+  joins S3/Azure on one backend. Either way it is the last object-store
+  dependency not yet unified.
+. If either is deferred, record the decision explicitly so the alert is
+  *accepted* rather than silently ignored.
 
 == Verification for the fix
 
