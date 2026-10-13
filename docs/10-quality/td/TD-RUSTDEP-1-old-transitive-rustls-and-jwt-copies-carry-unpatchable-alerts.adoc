@@ -6,7 +6,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open — found 2026-10-12 while applying the security bumps in #2003; untracked until now, with no Dependabot PR
+| Status | **AWS half FIXED** (one line on `aws-sdk-glue`): the HIGH `rustls-webpki` advisory and both LOW ones are closed, duplicates 117 -> 113. **GCS half still OPEN** — `jsonwebtoken 9.3.1` rides `google-cloud-storage 0.15`, which is the deliberate trade described below.
 | Severity | High — `rustls-webpki` DoS-via-panic on a malformed CRL, reachable only through the `aws`/`gcp` feature deps; no patch exists in the pinned line, so `cargo update` cannot close it
 | Component | `crates/control/proximadb-catalog/Cargo.toml` (`aws-sdk-glue` default features) and root `Cargo.toml:671` (`google-cloud-storage` 0.15). NOT the S3/Azure object-store path, which is already on the `object_store` crate.
 | Pillar | SECURITY
@@ -171,6 +171,34 @@ So `aws-config`'s defaults are already modern; `aws-sdk-glue`'s are not.
   dependency not yet unified.
 . If either is deferred, record the decision explicitly so the alert is
   *accepted* rather than silently ignored.
+
+== AWS half: done, and what it measured
+
+`default-features = false` on `aws-sdk-glue` (re-adding only
+`default-https-client` + `rt-tokio`) removed the entire legacy subtree:
+
+----
+rustls         0.21.12 + 0.23.45  ->  0.23.45
+rustls-webpki  0.101.7 + 0.103.15 ->  0.103.15     <- HIGH + 2 LOW closed
+hyper-rustls   0.24.2  + 0.27.9   ->  0.27.9
+tokio-rustls   0.24.1  + 0.26.6   ->  0.26.6
+sct            removed entirely (only reachable via rustls 0.21)
+duplicated crates  117 -> 113
+----
+
+**Glue did not lose TLS, it gained the modern stack.** Verified by resolving the
+tree rather than inferring from a green build:
+`aws-smithy-http-client` now resolves with
+`['__rustls', 'default-client', 'rustls-aws-lc']` and reaches
+`hyper-rustls 0.27.9 -> rustls 0.23.45 -> rustls-webpki 0.103.15`. So
+`default-https-client` routes through `rustls-aws-lc`; only the *legacy* path
+was dropped.
+
+`cargo check -p proximadb-catalog --features aws --all-targets` is clean and
+`cargo test -p proximadb-catalog --features aws` passes 477 + 1 + 16 + 3 (9
+ignored). A whole-lock backwards-version scan reports **0** packages moving
+backwards — the guard TD-AUDITGATE-1 proposes, run by hand here because a
+reverted security bump is exactly how #2004 regressed earlier the same day.
 
 == Verification for the fix
 
