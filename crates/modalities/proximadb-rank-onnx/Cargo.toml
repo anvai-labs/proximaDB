@@ -54,7 +54,7 @@ ndarray = { version = "0.17", optional = true }
 # R-5b.1.2: HuggingFace tokenizers. Version + features pinned to match
 # `proximadb-embedding/Cargo.toml` so the two crates share one
 # compiled tokenizers staticlib at link time.
-tokenizers = { version = "0.20", optional = true, default-features = false, features = [
+tokenizers = { version = "0.23", optional = true, default-features = false, features = [
     "onig",
 ] }
 
