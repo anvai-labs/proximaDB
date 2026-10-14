@@ -6,7 +6,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open — found during the 2026-10-12 `qa → main` promotion (#1997); not fixed there, which was content-free
+| Status | **FIXED 2026-10-13.** The filter now watches `deploy/docker/**` + `.dockerignore` + `.github/workflows/ci.yml`; verified against picomatch itself (2.3.1 — the version dorny/paths-filter@v4 actually bundles, pinned `^2.3.1`; its unreleased master is on `^4.0.7`; identical verdicts under 4.0.5): `deploy/docker/Dockerfile`, `entrypoint.sh` and a nested Dockerfile all flip to RUNS, root `Dockerfile`/`Dockerfile.prebuilt`/`docker-compose*.yml` to SKIPS. The machine-checkable guard proposed below shipped in the same PR: `check_docker_filter_covers_build_targets` in `scripts/check_deterministic_commit_contract.py` (with tests) fails if any workflow `file:` Dockerfile target escapes every `docker` filter pattern.
 | Severity | Medium — a change confined to `deploy/docker/**` skips the only job that builds the published image, and the inverse wastes a ~38-minute build on a Dockerfile nothing publishes
 | Component | `.github/workflows/ci.yml` (the `changes` job's `docker` filter at the path-filter step; `docker-build` at `:2995`)
 | Pillar | CI / CORRECTNESS
@@ -39,7 +39,7 @@ docker:
 
 None of those patterns contains a `/`, so under picomatch — which
 `dorny/paths-filter` uses — they match **top-level paths only**. Evaluated with
-picomatch 4 against the patterns extracted from `ci.yml` itself (not retyped):
+picomatch 2.3.1 (with `{dot: true}`, exactly the options dorny passes) against the patterns extracted from `ci.yml` itself (not retyped):
 
 [cols="3,1,1,1", options="header"]
 |===
@@ -102,7 +102,7 @@ paths:
 So the fix is to bring `ci.yml`'s filter in line with the workflow that ships
 the artifact.
 
-== Proposed fix
+== Proposed fix (landed as proposed)
 
 [source,yaml]
 ----
@@ -115,6 +115,27 @@ docker:
 Drop `Dockerfile*` and `docker-compose*.yml` unless the demo/prebuilt files
 gain a CI consumer; today they only cause false positives. Keep `rust` in the
 `||` — a source change still needs the image rebuilt.
+
+== Known residuals (review rounds 2–3, recorded honestly)
+
+* The guard's matcher is a deliberate picomatch SUBSET, not a reimplementation:
+  literal segments, `*`, and whole-segment `**` (globstar, zero-or-more
+  segments). A mid-segment `**` degrades to `*`; a trailing `/**` grants the
+  bare-directory match only to heads without a `*` (picomatch declines it for
+  wildcard-terminal heads: `*/**` does NOT match `Dockerfile` — caught by
+  review round 2 and fixed). Pinned by tests, and differentially fuzzed
+  against real picomatch 2.3.1 `{dot:true}` — 1,583,160 pattern/path cases,
+  **zero over-matches** (the direction that would silently accept a filter
+  picomatch declines); the 273 divergences are all under-matches
+  (fail-closed): `./`-prefixed patterns and the `**/*a/**` exotica family,
+  none of which any filter in this repo uses.
+* The filter does NOT watch `config/**`, yet `deploy/docker/Dockerfile` COPYs
+  `config/` and bakes `/config/config.toml` — a config-only PR still skips
+  docker-build. Pre-existing; the guard's declared scope is `file:` targets,
+  and widening the filter is a cost decision (config edits would burn the
+  ~38-minute build), so it is recorded, not silently closed.
+* `.dockerignore` is watched but no such file exists in the repo — inert,
+  inherited from the old filter.
 
 == Verification for the fix
 
