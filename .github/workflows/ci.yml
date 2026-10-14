@@ -1011,7 +1011,8 @@ jobs:
     name: Feature Matrix (${{ matrix.label }})
     runs-on: ubuntu-24.04
     timeout-minutes: 110
-    # max 53 min over 14 runs, 2026-10-09..11, 14 legs. An earlier comment said 15: GitHub
+    # max 53 min over 14 runs, 2026-10-09..11. 15 legs since 2026-10-14
+    # (bert-tokenizer added; ~1min leg). An earlier comment said 15: GitHub
     # reports a SKIPPED matrix job under its raw un-expanded name, which the
     # sample counted as a leg.
     needs: changes
@@ -1032,6 +1033,13 @@ jobs:
           # Ledger modality gRPC service (S3, ADR-071) — the ProximaLedgerService + its port wiring
           # are behind the non-default `experimental-ledger` feature on the root crate.
           - { label: "experimental-ledger", pkg: proximadb,        args: "--features experimental-ledger" }
+          # rank-onnx BERT tokenizer surface (bert_pair_tokenizing_extractor):
+          # the feature is non-default, so two of its tests rotted silently for
+          # months (still asserting the pre-#1741 pad-to-max_seq_len contract;
+          # found 2026-10-14 while bumping tokenizers — CI never compiled them).
+          # Compile AND serve: the suite is small (<1s) and is the only guard on
+          # the padding/truncation contract the reranker depends on.
+          - { label: "bert-tokenizer",       pkg: proximadb-rank-onnx, args: "--features bert-tokenizer" }
           # F2 (ADR-072 D3/D5): the fenced ConditionalKeyStore in the relational insert
           # path is behind the non-default `oltp-integrity` feature; check it compiles so
           # cfg drift in that path is caught (the feature-gated test executes locally).
@@ -1108,6 +1116,18 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
         run: cargo clippy -p proximadb --lib --features enterprise-catalogs -- -D warnings
+      # Same compile-is-not-verification rule as enterprise-catalogs above: the
+      # bert-tokenizer leg serves the feature's tests, not just compiles them.
+      - name: serve bert-tokenizer tests (compile is not verification)
+        if: matrix.label == 'bert-tokenizer'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: |
+          if cargo nextest --version >/dev/null 2>&1; then
+            cargo nextest run -p proximadb-rank-onnx --features bert-tokenizer
+          else
+            cargo test -p proximadb-rank-onnx --features bert-tokenizer
+          fi
 
   rust-security:
     name: Security Audit

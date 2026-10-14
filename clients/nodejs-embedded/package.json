@@ -49,7 +49,7 @@
   },
   "homepage": "https://github.com/proximadb/proximadb#readme",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.12.0"
   },
   "dependencies": {
     "openapi-fetch": "0.17.0"
