@@ -81,7 +81,11 @@ across 4 crates, all invisible until this fix:
 * `quinn-proto` 0.11.15 — 5 advisories (RUSTSEC-2026-0338/0339/0340/0341/0342);
   fixed in-lock to 0.11.19.
 * `h2` 0.4.15 (RUSTSEC-2026-0258); fixed in-lock to 0.4.20. The second h2
-  finding, 0.3.27 via httpmock → hyper 0.14, is **dev-only** and baseline-ignored.
+  finding, 0.3.27, is **production-reachable** via the root crate's
+  unconditional `reqwest = "0.11"` → reqwest 0.11.27 → hyper 0.14.32 →
+  h2 0.3.27 (the httpmock → hyper 0.14 copy is dev-only, but that is not the
+  only copy) — no lock-only fix exists (whole 0.3 line unpatched), so it is
+  baseline-ignored pending the reqwest 0.12 major bump.
 * `quick-xml` 0.39.4 — 2 denial-of-service advisories
   (RUSTSEC-2026-0194/0195); pinned by `object_store` 0.13.2 (^0.39), unfixable
   without an object_store 0.14 major bump — baseline-ignored with that note.

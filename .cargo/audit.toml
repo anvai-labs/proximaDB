@@ -23,9 +23,13 @@ ignore = [
     # --- vulnerabilities (unfixed upstream of us) ---
 
     # h2 unbounded empty DATA frames (RUSTSEC-2026-0258). The h2 0.4 line is
-    # fixed (lock has 0.4.20); 0.3.27 remains only via httpmock 0.7 ->
-    # hyper 0.14, a DEV-dependency of the root crate — not a production
-    # surface. Dies when httpmock is upgraded or replaced.
+    # fixed (lock has 0.4.20); 0.3.27 is PRODUCTION-REACHABLE: the root crate's
+    # unconditional `reqwest = "0.11"` dependency pulls reqwest 0.11.27 ->
+    # hyper 0.14.32 -> h2 0.3.27 (the h2 0.3 copy httpmock 0.7 -> hyper 0.14
+    # brings is dev-only, but that is not the only copy). No lock-only fix
+    # exists — the whole 0.3 line is unpatched (fixed in >= 0.4.16). The real
+    # fix is the reqwest 0.11 -> 0.12 major bump (own PR); do not deprioritize
+    # it on the strength of this entry.
     "RUSTSEC-2026-0258",
 
     # quick-xml quadratic run time / unbounded namespace allocation
@@ -43,14 +47,18 @@ ignore = [
     # async-std discontinued (RUSTSEC-2025-0052) — pulled by a transitive
     # runtime dep; no runtime code of ours executes on it.
     "RUSTSEC-2025-0052",
-    # bincode 1.x unmaintained (RUSTSEC-2025-0141) — 2.x is a different API;
-    # transitively required, not written against directly.
+    # bincode 1.x unmaintained (RUSTSEC-2025-0141) — 2.x is a different API.
+    # bincode is a DIRECT production dependency of the root crate (and ~17
+    # workspace crates); the ignore stands only because the 1.x -> 2.x migration
+    # is an API break owned by its own effort.
     "RUSTSEC-2025-0141",
     # paste unmaintained (RUSTSEC-2024-0436) — proc-macro helper of transitive
     # deps; expands to ordinary code, no runtime exposure.
     "RUSTSEC-2024-0436",
-    # rustls-pemfile unmaintained (RUSTSEC-2025-0134) — both 1.x and 2.x
-    # in-tree via TLS-setup paths of transitive deps.
+    # rustls-pemfile unmaintained (RUSTSEC-2025-0134) — 2.x is a DIRECT
+    # production dependency of the root crate; 1.x rides transitive TLS-setup
+    # paths (reqwest 0.11, axum-server). Migration is ours to own for the
+    # direct copy.
     "RUSTSEC-2025-0134",
     # unsafe-libyaml unmaintained (RUSTSEC-2024-0449) — serde_yaml's backend;
     # long-known, upstream replaced by libyaml-safer in newer serde_yaml.
