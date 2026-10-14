@@ -698,6 +698,13 @@ class DockerFilterContractTest(unittest.TestCase):
         )
         self.assertIsNotNone(m)
         self.assertEqual(m.group("value"), "deploy/docker/Dockerfile")
+        # Trailing whitespace with NO comment is still a target (round-3
+        # review: the comment-tail space requirement must not swallow it).
+        m = contract.DOCKER_FILE_TARGET_RE.match(
+            "          file: deploy/docker/Dockerfile  \n"
+        )
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group("value"), "deploy/docker/Dockerfile")
 
 
 class SerdeJsonPreserveOrderContractTest(unittest.TestCase):

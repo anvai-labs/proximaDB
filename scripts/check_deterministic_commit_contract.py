@@ -870,8 +870,10 @@ def check_promotion_concurrency(findings: list[Finding]) -> None:
 
 # A `#` starts a YAML comment only after whitespace (or at line start); a
 # mid-scalar `#` (`file: deploy/Dockerfile#x`) is literal and must stay in the
-# value, so the comment tail requires at least one space.
-DOCKER_FILE_TARGET_RE = re.compile(r"^\s*file:\s*(?P<value>\S+?)(?:\s+#.*)?$")
+# value, so the comment tail requires at least one space. Trailing whitespace
+# with no comment is still a match (`(?:\s+(#.*)?)?` — the space is part of
+# the optional group).
+DOCKER_FILE_TARGET_RE = re.compile(r"^\s*file:\s*(?P<value>\S+?)(?:\s+(#.*)?)?$")
 DOCKER_FILTER_KEY_RE = re.compile(r"^(?P<indent>\s*)docker:\s*$")
 DOCKER_FILTER_ITEM_RE = re.compile(r"^\s*-\s*(?P<pattern>\S+)\s*$")
 CI_WORKFLOW = ".github/workflows/ci.yml"
@@ -918,9 +920,12 @@ def _compile_glob(segments: list[str]) -> str:
     if tail == ["**"]:
         if "*" in head:
             # picomatch (2.3.1 and 4.0.5 alike) declines the bare-directory
-            # allowance when the segment before a trailing globstar contains a
+            # allowance when the segment before a trailing globstar ENDS in a
             # wildcard: `*/**` does NOT match `Dockerfile`, while `a/**`,
-            # `a?/**` and literal heads do. Granting it here would be an
+            # `a?/**` and literal heads do. We decline for any head CONTAINING
+            # a `*` — slightly stricter than picomatch for star-leading heads
+            # (`*a/**` vs `ba`), which is the fail-closed direction for a
+            # subset matcher. Granting the wildcard case would be an
             # over-match — the one direction a subset matcher must never take.
             return f"{head_expr}/.+"
         return f"{head_expr}(?:/.*)?"
