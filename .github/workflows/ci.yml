@@ -235,10 +235,21 @@ jobs:
               - '.github/workflows/ci.yml'
               - third_party/mlflow-ui/**
 
+            # TD-DOCKCI-1: watch the Dockerfile CI actually BUILDS
+            # (deploy/docker/Dockerfile -- the `file:` target of docker-build
+            # and publish-image.yml), not the three top-level paths nothing
+            # builds. The old patterns contained no `/`, so picomatch matched
+            # top-level paths only: `deploy/docker/**` edits SKIPPED
+            # docker-build entirely, while root `Dockerfile` /
+            # `Dockerfile.prebuilt` edits (demo compose / a local OOM
+            # workaround; no CI consumer) burned a ~38-minute build of a
+            # different Dockerfile. `.github/workflows/ci.yml` keeps the gate
+            # able to see changes to itself. `rust` stays in the `||` at the
+            # docker-build gate -- a source change still rebuilds the image.
             docker:
-              - 'Dockerfile*'
-              - 'docker-compose*.yml'
+              - 'deploy/docker/**'
               - '.dockerignore'
+              - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
               - '*.adoc'

@@ -13,6 +13,8 @@ point at deterministic policies:
 * Arrow Flight exports bind client paths to the selected collection
 * query ratchets count only executed queries and cloud proofs cover every backend
 * rust-cache inputs resolve to keys accepted by GitHub's cache service
+* every Dockerfile a workflow `file:`-builds is visible to the `docker` path filter
+* `serde_json` is declared with `preserve_order` where the OpenAPI doc is serialised
 * conflict markers are not staged into source/docs
 """
 
@@ -866,6 +868,232 @@ def check_promotion_concurrency(findings: list[Finding]) -> None:
             )
 
 
+# A `#` starts a YAML comment only after whitespace (or at line start); a
+# mid-scalar `#` (`file: deploy/Dockerfile#x`) is literal and must stay in the
+# value, so the comment tail requires at least one space. Trailing whitespace
+# with no comment is still a match (`(?:\s+(#.*)?)?` — the space is part of
+# the optional group).
+DOCKER_FILE_TARGET_RE = re.compile(r"^\s*file:\s*(?P<value>\S+?)(?:\s+(#.*)?)?$")
+DOCKER_FILTER_KEY_RE = re.compile(r"^(?P<indent>\s*)docker:\s*$")
+DOCKER_FILTER_ITEM_RE = re.compile(r"^\s*-\s*(?P<pattern>\S+)\s*$")
+CI_WORKFLOW = ".github/workflows/ci.yml"
+
+
+def _compile_glob_segment(segment: str) -> str:
+    """Compile one path segment: ``*``/``?`` stay within the segment.
+
+    A mid-segment ``**`` (``a**b``) is NOT a picomatch globstar -- only a
+    whole-segment ``**`` crosses ``/`` -- so here it degrades to ``*``
+    (segment-local), the fail-closed direction for a subset matcher.
+    """
+    out = ""
+    index = 0
+    while index < len(segment):
+        char = segment[index]
+        if char == "*":
+            out += "[^/]*"
+            index += 1
+        elif char == "?":
+            out += "[^/]"
+            index += 1
+        else:
+            out += re.escape(char)
+            index += 1
+    return out
+
+
+def _compile_glob(segments: list[str]) -> str:
+    """Compile split segments to a regex picomatch-subset.
+
+    Whole-segment ``**`` is a globstar: as the last segment it covers the
+    directory itself and any depth under it; elsewhere it spans zero or more
+    whole segments (``**/Dockerfile`` matches root ``Dockerfile``).
+    """
+    if not segments:
+        return ""
+    head, tail = segments[0], segments[1:]
+    if head == "**":
+        if not tail:
+            return ".*"
+        return f"(?:[^/]+/)*{_compile_glob(tail)}"
+    head_expr = _compile_glob_segment(head)
+    if tail == ["**"]:
+        if "*" in head:
+            # picomatch (2.3.1 and 4.0.5 alike) declines the bare-directory
+            # allowance when the segment before a trailing globstar ENDS in a
+            # wildcard: `*/**` does NOT match `Dockerfile`, while `a/**`,
+            # `a?/**` and literal heads do. We decline for any head CONTAINING
+            # a `*` — slightly stricter than picomatch for star-leading heads
+            # (`*a/**` vs `ba`), which is the fail-closed direction for a
+            # subset matcher. Granting the wildcard case would be an
+            # over-match — the one direction a subset matcher must never take.
+            return f"{head_expr}/.+"
+        return f"{head_expr}(?:/.*)?"
+    if not tail:
+        return head_expr
+    return f"{head_expr}/{_compile_glob(tail)}"
+
+
+def _picomatch_subset_matches(pattern: str, path: str) -> bool:
+    """Match a dorny/paths-filter glob against a repo-relative path.
+
+    Supports the subset this repo's filters use: literal segments, ``*``
+    (within one segment) and whole-segment ``**`` (across segments, including
+    zero segments). picomatch matches bare patterns against top-level paths
+    only when they contain no ``/`` -- the exact trap TD-DOCKCI-1 documents --
+    so ``Dockerfile*`` deliberately does NOT match ``deploy/docker/Dockerfile``
+    here either. This is a deliberate SUBSET: when in doubt it declines, so a
+    filter the guard accepts is one picomatch certainly matches.
+    """
+    pattern = pattern.strip().strip("\"'")
+    # Collapse consecutive globstars (`**/**` == `**`).
+    collapsed: list[str] = []
+    for segment in pattern.split("/"):
+        if segment == "**" and collapsed and collapsed[-1] == "**":
+            continue
+        collapsed.append(segment)
+    return re.fullmatch(_compile_glob(collapsed), path) is not None
+
+
+def _ci_docker_filter_patterns() -> list[str] | None:
+    """Extract the `docker:` filter patterns from ci.yml, or None if absent."""
+    text = read_text(CI_WORKFLOW)
+    lines = text.splitlines()
+
+    def is_noise(line: str) -> bool:
+        stripped = line.strip()
+        return not stripped or stripped.startswith("#")
+
+    for index, line in enumerate(lines):
+        key = DOCKER_FILTER_KEY_RE.match(line)
+        if key is None:
+            continue
+        # A structural `docker:` key (mapping child or empty) is not the
+        # filter; the filter block's first content line is a list item.
+        first = index + 1
+        while first < len(lines) and is_noise(lines[first]):
+            first += 1
+        if first >= len(lines) or DOCKER_FILTER_ITEM_RE.match(lines[first]) is None:
+            continue
+        key_indent = len(key.group("indent"))
+        patterns: list[str] = []
+        cursor = first
+        while cursor < len(lines):
+            if is_noise(lines[cursor]):
+                cursor += 1
+                continue
+            item = DOCKER_FILTER_ITEM_RE.match(lines[cursor])
+            item_indent = len(lines[cursor]) - len(lines[cursor].lstrip())
+            if item is None or item_indent <= key_indent:
+                break
+            patterns.append(item.group("pattern"))
+            cursor += 1
+        # A matrix axis named `docker` (`- linux`) is structurally identical
+        # to the filter; path filters always carry a glob, slash or quote.
+        # Misclassifying the real filter degenerates to the missing-filter
+        # finding (fail-closed), never to silence.
+        if patterns and not any(any(c in p for c in '/*"\'') for p in patterns):
+            continue
+        return patterns
+    return None
+
+
+def check_docker_filter_covers_build_targets(findings: list[Finding]) -> None:
+    """Every `file:` Dockerfile a workflow builds must trip the `docker` filter.
+
+    TD-DOCKCI-1: the old filter watched three top-level paths CI never builds
+    and could not see `deploy/docker/**` -- the Dockerfile `docker-build` and
+    `publish-image.yml` actually build -- so an image-breaking edit skipped the
+    only job that validates it. This is the machine-checkable form: any
+    `file:` target under .github/workflows that no `docker` filter pattern
+    matches is a finding. Note the reverse leak (a watched path nothing
+    builds) is a waste, not a correctness hole, and is left to review.
+    """
+    patterns = _ci_docker_filter_patterns()
+    if patterns is None:
+        findings.append(
+            Finding(
+                "docker-filter",
+                f"{CI_WORKFLOW} has no `docker:` path filter, but "
+                f"docker-build gates on it -- the gate cannot see the change "
+                f"that defines it.",
+            )
+        )
+        return
+
+    workflow_dir = ROOT / ".github" / "workflows"
+    if not workflow_dir.is_dir():
+        return
+    for path in sorted(workflow_dir.glob("*.y*ml")):
+        for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            target = DOCKER_FILE_TARGET_RE.match(line)
+            if target is None:
+                continue
+            value = target.group("value").strip().strip("\"'")
+            if "Dockerfile" not in value:
+                continue
+            if not any(_picomatch_subset_matches(p, value) for p in patterns):
+                suggested = (
+                    f"{value.rsplit('/', 1)[0]}/**" if "/" in value else f"**/{value}"
+                )
+                findings.append(
+                    Finding(
+                        "docker-filter",
+                        f"{rel(path)}:{index} builds `{value}` but no `docker` "
+                        f"filter pattern in {CI_WORKFLOW} matches it -- an edit "
+                        f"confined to that Dockerfile skips docker-build "
+                        f"(TD-DOCKCI-1). Add a pattern covering it, e.g. "
+                        f"`{suggested}`.",
+                    )
+                )
+
+
+def check_serde_json_preserve_order(findings: list[Finding]) -> None:
+    """`serde_json` must be declared with `preserve_order` where the spec is built.
+
+    TD-SPECORD-1: the published OpenAPI document's key order rode on
+    serde_json/preserve_order being enabled TRANSITIVELY (DataFusion supplied
+    it until 55.2 deliberately stopped). When the feature drops, every map in
+    the generated spec serialises alphabetically and the drift gate fails with
+    a 9k-line, semantically empty diff. Both declarations are checked: the
+    root `[dependencies]` entry (what the serialising binary actually
+    compiles) and `[workspace.dependencies]` (what the 68 members inheriting
+    `serde_json.workspace = true` read).
+    """
+    manifest = ROOT / "Cargo.toml"
+    if not manifest.is_file():
+        return
+    with open(manifest, "rb") as handle:
+        try:
+            parsed = tomllib.load(handle)
+        except tomllib.TOMLDecodeError as error:
+            findings.append(
+                Finding("serde-json-preserve-order", f"Cargo.toml does not parse: {error}")
+            )
+            return
+
+    for section_path, where in (
+        (("dependencies",), "[dependencies]"),
+        (("workspace", "dependencies"), "[workspace.dependencies]"),
+    ):
+        table: object = parsed
+        for key in section_path:
+            table = table.get(key) if isinstance(table, dict) else None
+        entry = table.get("serde_json") if isinstance(table, dict) else None
+        features = entry.get("features") if isinstance(entry, dict) else None
+        if features is None or "preserve_order" not in features:
+            findings.append(
+                Finding(
+                    "serde-json-preserve-order",
+                    f"Cargo.toml {where}.serde_json must be declared with "
+                    f'`features = ["preserve_order"]` (TD-SPECORD-1: without '
+                    f"it the generated OpenAPI document serialises "
+                    f"alphabetically and every SDK regenerates as a 9k-line "
+                    f"diff). Found: {entry!r}",
+                )
+            )
+
+
 def main() -> int:
     findings: list[Finding] = []
 
@@ -881,13 +1109,16 @@ def main() -> int:
     check_conflict_markers(findings)
     check_promotion_concurrency(findings)
     check_node_version_pins(findings)
+    check_docker_filter_covers_build_targets(findings)
+    check_serde_json_preserve_order(findings)
 
     print("Deterministic commit contract")
     if not findings:
         print(
             "OK: nextest, CI runner/Makefile wiring, architecture guards, Flight/query/object-store "
             "authorities, rust-cache keys, TDD Rust warning policy, promotion concurrency, "
-            "Node version pins, and conflict-marker checks pass."
+            "Node version pins, docker-filter build targets, serde_json preserve_order, and "
+            "conflict-marker checks pass."
         )
         return 0
 
