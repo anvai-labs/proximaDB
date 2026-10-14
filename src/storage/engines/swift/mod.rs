@@ -1250,8 +1250,8 @@ impl SwiftFile {
                 let mut buf = vec![0u8; len * 4];
                 cursor.read_exact(&mut buf)?;
                 let mut centroid = Vec::with_capacity(len);
-                for chunk in buf.chunks_exact(4) {
-                    centroid.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                for chunk in buf.as_chunks::<4>().0 {
+                    centroid.push(f32::from_le_bytes(*chunk));
                 }
                 superblock.block_centroids.push(centroid);
             }

@@ -138,7 +138,7 @@ impl ColdGraphSegmentStore {
         if pending.is_empty() {
             return Ok(());
         }
-        // `fetch_update`, not `fetch_add`. Atomics are NOT covered by
+        // `try_update`, not `fetch_add`. Atomics are NOT covered by
         // `overflow-checks`, so `fetch_add` wraps silently in debug as well as
         // release — which left the resume-site refusals off by one against their
         // own stated invariant: a name carrying `u64::MAX - 1` resumes to
@@ -148,7 +148,7 @@ impl ColdGraphSegmentStore {
         // (`put_with_tier` is an unconditional PUT). Refusing at the point of
         // CONSUMPTION closes the class; refusing only at resume cannot.
         //
-        // `fetch_update` returns the PREVIOUS value on success, matching
+        // `try_update` returns the PREVIOUS value on success, matching
         // `fetch_add`'s contract, and leaves the counter untouched on refusal.
         //
         // Note it refuses once the counter REACHES `u64::MAX`, so that sequence
@@ -158,7 +158,7 @@ impl ColdGraphSegmentStore {
         // 2^64 to make a wrap structurally impossible is the right trade.
         let seq = match self
             .seq
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 cur.checked_add(1)
             }) {
             Ok(previous) => previous,
@@ -858,7 +858,7 @@ mod tests {
         // Parked one below the ceiling: that write succeeds and leaves the
         // counter at `u64::MAX`, after which the next must refuse rather than
         // wrap. (Sequence `u64::MAX` is deliberately never issued — see the
-        // `fetch_update` note at the write site.)
+        // `try_update` note at the write site.)
         store.seq.store(u64::MAX - 1, Ordering::Relaxed);
         store
             .upsert_record(record("graph/g/node/a"))
