@@ -204,49 +204,118 @@ reverted security bump is exactly how #2004 regressed earlier the same day.
 
 == GCS half: done, and what it changed
 
-`google-cloud-storage` 0.15 -> 1.20 (plus explicit `google-cloud-auth` 1.17 and
-`google-cloud-gax` 1.15 for the re-exported types the backend needs) is not
-a version bump — the 1.x crate is **Google's full rewrite** of the API the
-yoshidan 0.x line pioneered. The alert is closed because `jsonwebtoken` moved
-**9.3.1 -> 11.1.0** (the advisory is against < 10.3.0): it still rides
-`google-cloud-auth`, but the 1.x auth line requires the patched major, so the
-vulnerable copy is gone from the lock.
+`google-cloud-storage` 0.15 -> 1.20 (plus explicit `google-cloud-auth` 1.17
+and `http` 1.x for the credential-header plumbing) is not a version bump —
+the 1.x crate is **Google's full rewrite** of the API the yoshidan 0.x line
+pioneered. The alert is closed because the **jsonwebtoken 9.3.1 copy is
+REMOVED from the lock**: it rode `google-cloud-auth 0.13.2` via a
+version-qualified dependency, and the 1.x auth line does not carry
+jsonwebtoken at all. `jsonwebtoken 11.1.0` (patched; the advisory is against
+< 10.3.0) remains in the lock — it was already present as the root crate's
+own direct dependency and is untouched by this change.
 
 `src/storage/persistence/filesystem/gcs_store.rs` was rewritten for the 1.x
-shape; the trait surface (`FileSystem`) and `GcsConfig` are unchanged, so no
-caller moved:
+shape, as a deliberate two-plane split; the trait surface (`FileSystem`) and
+`GcsConfig` are unchanged, so no caller moved:
 
-* The 1.x SDK splits into a **data plane** (`client::Storage` — JSON API over
-  HTTP: upload/download incl. ranged reads) and a **metadata plane**
-  (`client::StorageControl` — get/delete/list), both addressing buckets as
-  `projects/_/buckets/{bucket}`. Both clients take the same custom endpoint,
-  so the fake-gcs-server story is unchanged.
-* Conditional create: `set_if_generation_match(0)` on the upload, with
-  `AlreadyExists`/`FailedPrecondition` gax codes mapped to
-  `FilesystemError::AlreadyExists` — same contract the 0.x preconditions gave.
-* **TD-173 residual (a) closed in the same stroke**: `set_storage_class` on the
-  1.x simple upload carries `ObjectAccessTier::as_gcs_storage_class()` per
-  ADR-036 (default-safe: unset tier => bucket default). The 0.15 resumable path
-  could not do this.
+* **Data plane** — the 1.x `client::Storage`, which speaks the **JSON API**
+  over HTTP (upload/download incl. ranged reads), buckets addressed as
+  `projects/_/buckets/{bucket}`, custom endpoint supported.
+* **Metadata plane** (get/delete/list) — a small hand-rolled JSON API client
+  on the workspace `reqwest`, tokened by `google-cloud-auth` ADC, buckets
+  addressed directly. The 1.x SDK's own metadata client
+  (`client::StorageControl`) is **gRPC-only** (`google.storage.v2` over
+  tonic — `generated/gapic/transport.rs`, no HTTP transport variant), and
+  `fake-gcs-server` — the emulator every GCS contract test and the qa-gate
+  lane verify against (TD-OBJSTORE-5) — serves the JSON API only, no gRPC.
+  The JSON API is exactly what fake-gcs emulates and the same wire surface
+  the 0.x client used for these verbs, so both the emulator verification
+  path and production behavior are preserved. This was an
+  adversarial-review catch: the first cut delegated metadata to
+  `StorageControl` and broke every fake-gcs verification path.
+* Conditional create: `set_if_generation_match(0)` on the upload, mapped to
+  `FilesystemError::AlreadyExists` via the **HTTP status** (409/412,
+  `Error::http_status_code()`) — the second review catch:
+  google-cloud-gax derives `status.code` only from the response body's
+  `status` string, which GCS error bodies do not carry (they carry
+  `error.code` + `errors[].reason`), so the parsed `Code` is `Unknown` and
+  code-based matching never fires.
+* **TD-173 residual (a) closed in the same stroke**: `set_storage_class` on
+  the 1.x write carries `ObjectAccessTier::as_gcs_storage_class()` per
+  ADR-036 (default-safe: unset tier => bucket default). The 0.15 resumable
+  path could not do this.
 * The 90-line hand-rolled resumable chunk loop (forced by a 0.15
   `UploadStatus::ResumeIncomplete` Range-header gap) is replaced by
   SDK-managed `send_buffered()` resumable upload with checksum verification;
-  small writes use `send_unbuffered()`.
-* One capability was **lost, and is documented at the call site**: the 1.x
-  `ListObjectsRequest` has no page-size control (no `maxResults`), so
-  `FileSystem::list`'s `max_results` hint is accepted and ignored; the
-  token loop still consumes every page. The multi-page emulator test was
-  rewritten to pin the prefix-list contract (every seeded object returned)
-  instead of forcing multiple pages.
+  small writes use `send_unbuffered()`. Recorded upload-mode drift: the SDK
+  switches small writes to resumable at its 16 MiB
+  `RESUMABLE_UPLOAD_THRESHOLD`, where 0.x used a simple PUT for every size —
+  a latency-only difference on the flush/spill path (checksum + bounded
+  buffers gained); revisit only if flush traces show it.
+* Page-size control is **kept, not lost**: the metadata layer passes
+  `maxResults` (the gRPC v2 model's lack of it is moot), and
+  `PROXIMADB_GCS_LIST_PAGE_SIZE` — previously a dead env var — is now
+  honored by `FileSystem::list`, so the multi-page emulator test really
+  forces three pages again (pagination regression net, TD-OBJSTORE-4 S1).
+
+== Two emulator-caught wire-protocol gaps, found by the contract tests during review remediation
+
+The local emulator lane caught two real 1.x-SDK wire behaviors the code review
+and the compile gates could not. Both are accommodated and each accommodation is
+verified end-to-end by the GCS contract tests; recorded here because both would
+bite a future reader of this backend.
+
+. **Trailing `checksums` multipart part corrupts objects stored by
+   fake-gcs-server.** The 1.x SDK's default single-shot upload appends a
+   *third* multipart part carrying `{"crc32c":"<base64-be>"}` whenever
+   on-the-fly checksums are active and no upfront crc32c is known
+   (`google-cloud-storage 1.20`, `perform_upload/unbuffered.rs:265-285`).
+   Real GCS consumes that part; fake-gcs **concatenates it into the stored
+   object** (proved with curl: uploading `hello` yields a 27-byte object whose
+   crc32c matches `hello` + the JSON part). Accommodation: every write path
+   now passes `.with_known_crc32c(crc32c::crc32c(payload))` (new optional
+   `crc32c` workspace dep — already a transitive dep of the SDK). A known
+   CRC32C moves the checksum into the part-1 metadata and disables on-the-fly
+   checksums, so no trailing part is emitted; the SDK still validates both
+   known-vs-server and computed-vs-server checksums on the response
+   (`validate_response_object`), so end-to-end verification is preserved, and
+   real GCS additionally validates the upload server-side.
+   `write_local_file` hashes with an incremental `crc32c_append` pass and
+   rewinds the handle for the SDK.
+. **The SDK's HTTP client sends a port-less `Host` header, and fake-gcs echoes
+   it into the resumable upload `Location` — uploads to any nonstandard port
+   die.** google-cloud-gax-internal sends `Host: <host>` with **no port**
+   (its own `tests/http_host.rs::host_is_present` asserts that shape);
+   fake-gcs echoes the request's Host header verbatim into the resumable
+   upload's `Location` (both `-public-host` and `-external-url` lose to the
+   echo — tested), and the SDK PUTs chunks to that `Location` verbatim, so a
+   `:8080` endpoint is silently rewritten to `:80` and the upload fails with
+   "cannot connect to endpoint". Accommodation: `scripts/run_cloud_emulator_tests.sh`
+   serves fake-gcs on **port 80** (the http default port makes the port-less
+   URL resolve); the script comment records the mechanism.
+
+A third catch is ours, not the SDK's: **the multi-page list contract test
+caught a silent truncation regression in this rewrite itself** — `GcsListPage`
+was missing `#[serde(rename_all = "camelCase")]`, so `nextPageToken`
+deserialized as `None` and listing stopped after page 1. Fixed; the test that
+exists to catch exactly this (TD-OBJSTORE-4 S1) caught exactly this.
 
 == Verification for the fix
 
 * `gh api repos/anvai-labs/proximaDB/dependabot/alerts?state=open` no longer
   lists `rustls-webpki` or `jsonwebtoken`.
 * `grep -A1 '^name = "rustls"$' Cargo.lock` shows a single version.
-* GCS half: `grep -A1 '^name = "jsonwebtoken"$' Cargo.lock` shows **11.1.0**
-  (patched; the 9.3.1 copy is gone with the 0.x google-cloud subtree);
-  `cargo check -p proximadb --features gcp`
-  green; `cargo clippy -p proximadb --lib --features gcp -- -D warnings` clean;
-  the gcs unit tests pass; the emulator CI lane stays green — the point is to
-  remove the old subtree, not to break the backends.
+* GCS half: `grep -A1 '^name = "jsonwebtoken"$' Cargo.lock` shows a single
+  entry at **11.1.0** (patched; the 9.3.1 copy is gone with the 0.x
+  google-cloud subtree); `cargo check -p proximadb --lib --features gcp`
+  green; `cargo clippy -p proximadb --lib --features gcp -- -D warnings`
+  clean; the gcs unit tests pass (4/4); `check_lockfile_no_downgrade.py
+  origin/develop` reports 0 backwards moves; and the **emulator lane was run
+  locally against fake-gcs-server** (the pinned CI digest): all four GCS
+  contract tests pass — prefix list+exists, resumable publish,
+  `write_if_absent`, and the multi-page list forced to three pages via
+  `PROXIMADB_GCS_LIST_PAGE_SIZE=2` — the point is to remove the old subtree,
+  not to break the backends. The lane was **re-run to EXIT=0 after the
+  wire-gap accommodations above** (known-crc32c writes, port-80 emulator,
+  camelCase list token), i.e. the final state of this PR is verified
+  end-to-end, not just the first cut.

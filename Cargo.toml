@@ -681,9 +681,19 @@ object_store = { workspace = true }
 # still issues true ranged object downloads (bandwidth-optimal). Feature `gcp`.
 google-cloud-storage = { version = "1.20", optional = true }
 # Direct deps of the GCS backend (transitive via google-cloud-storage, pinned
-# to the same majors): anonymous credentials + gax rpc::Code for error mapping.
+# to the same majors): ADC credentials (shared by the data client and the
+# JSON-API metadata layer) + `http::Extensions` for the credential headers.
 google-cloud-auth = { version = "1.17", optional = true, default-features = false }
-google-cloud-gax = { version = "1.15", optional = true, default-features = false }
+http = { version = "1", optional = true }
+# CRC32C of each uploaded payload is computed client-side and passed via
+# `with_known_crc32c` (already a transitive dep of google-cloud-storage). The
+# 1.x SDK's default single-shot upload appends a trailing `checksums` multipart
+# part that fake-gcs-server (our test emulator) does not understand — it
+# concatenates the part into the stored object, corrupting it. A known CRC32C
+# switches the SDK to the upfront-metadata protocol (no trailing part), keeps
+# end-to-end checksum verification, and lets real GCS validate the upload
+# server-side.
+crc32c = { version = "0.6", optional = true }
 
 # Vector operations & SIMD
 nalgebra = { version = "0.32", features = ["serde-serialize"] }  # For PCA eigendecomposition, with serde for model persistence
@@ -928,7 +938,7 @@ onnx = [
 # Cloud storage features (optional to avoid linking issues during testing)
 aws = ["object_store/aws", "proximadb-catalog/aws"]
 azure = ["object_store/azure"]
-gcp = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:google-cloud-gax"]
+gcp = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:http", "dep:crc32c"]
 
 # TD-161 external OTLP metering push (default-OFF). Compiles the OTLP exporter that
 # ships the per-tenant metering snapshot to a collector; runtime-gated additionally by
