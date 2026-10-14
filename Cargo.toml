@@ -386,7 +386,7 @@ numpy = { version = "0.29" }
 
 # TurboQuant numerics (ADR-021, gated by `experimental-turboquant`).
 # Kept here so future modality + benchmark consumers share a single version.
-faer = { version = "0.20", default-features = false, features = ["std"] }
+faer = { version = "0.24", default-features = false, features = ["std"] }
 statrs = "0.19"
 
 # Python embedded library (cdylib for PyO3)
