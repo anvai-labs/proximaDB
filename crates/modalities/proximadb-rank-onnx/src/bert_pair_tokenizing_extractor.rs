@@ -390,7 +390,9 @@ mod tests {
         }
         let model = WordLevel::builder()
             .unk_token("[UNK]".to_string())
-            .vocab(vocab)
+            // tokenizers 0.23 takes an ahash map here; collect() lets the
+            // parameter type drive the conversion without naming it.
+            .vocab(vocab.into_iter().collect())
             .build()
             .expect("synthetic WordLevel build");
         let mut tk = Tokenizer::new(model);
@@ -648,20 +650,20 @@ mod tests {
     }
 
     #[test]
-    fn extractor_tokenizer_outputs_are_rectangular_at_max_seq_len() {
-        // R-5b.1.4: configured tokenizer pads to exactly max_seq_len.
-        // The pad_or_truncate_to_i64 pass downstream becomes a no-op
-        // for the length dimension (it still does u32 → i64
-        // conversion). Verify rectangular output regardless of the
-        // input doc lengths.
+    fn extractor_tokenizer_outputs_are_rectangular_at_batch_longest() {
+        // TD-SELECTOR-1 gate 5 (#1741): rows pad to the batch's longest
+        // row, NOT to max_seq_len — padding to max_seq_len cost ~11x
+        // compute on realistic beds. The synthetic tokenizer has no
+        // post-processor, so a pair's true length is query words + doc
+        // words: the longest bed row here is query 3 + doc 4 = 7.
         let (e, qctx) = extractor_with(
             "alpha beta gamma",
             10,
             false,
             &[
-                (1, "doc"),                    // shorter than max
-                (2, "alpha beta gamma delta"), // still within max
-                (3, "doc alpha"),              // another short doc
+                (1, "doc"),                    // shortest
+                (2, "alpha beta gamma delta"), // batch longest: 7
+                (3, "doc alpha"),              // middle
             ],
         );
         let b = e
@@ -671,29 +673,41 @@ mod tests {
         for row in &b.input_ids {
             assert_eq!(
                 row.len(),
-                10,
-                "tokenizer padding/truncation must pre-shape every row to max_seq_len"
+                7,
+                "rows must be rectangular at the batch-longest length"
             );
         }
         for row in &b.attention_mask {
-            assert_eq!(row.len(), 10);
+            assert_eq!(row.len(), 7);
         }
+        // Batch-longest, not max_seq_len: every doc fits, so the width
+        // must stay strictly below the configured max.
+        assert!(b.input_ids[0].len() < 10);
         assert!(b.validate_rectangular().is_ok());
     }
 
     #[test]
     fn extractor_attention_mask_marks_padding_positions_zero() {
-        // R-5b.1.4: with Fixed padding configured, the attention_mask
-        // distinguishes real tokens (1) from padding (0). A short
-        // doc + short query → most positions should be padding (0).
-        let (e, qctx) = extractor_with("alpha", 10, false, &[(1, "doc")]);
-        let b = e.extract_batch(&[DocHandle(1)], &qctx).unwrap();
+        // R-5b.1.4 (as amended by TD-SELECTOR-1 gate 5, #1741): rows pad
+        // to the batch-longest length and the attention_mask marks the
+        // padded positions 0. A single short pair has no padding, so the
+        // bed mixes a short and a longer doc: width = 1 query word + 4
+        // doc words = 5, the short row masks its last 3 positions.
+        let (e, qctx) = extractor_with(
+            "alpha",
+            10,
+            false,
+            &[(1, "doc"), (2, "alpha beta gamma delta")],
+        );
+        let b = e
+            .extract_batch(&[DocHandle(1), DocHandle(2)], &qctx)
+            .unwrap();
         let mask = &b.attention_mask[0];
         let real = mask.iter().filter(|&&x| x == 1).count();
         let pad = mask.iter().filter(|&&x| x == 0).count();
-        assert!(real >= 1, "must include at least 1 real token");
-        assert!(pad >= 1, "must include at least 1 padding position");
-        assert_eq!(real + pad, 10);
+        assert_eq!(real, 2, "1 query word + 1 doc word are real tokens");
+        assert_eq!(pad, 3, "padding to the batch-longest row is masked 0");
+        assert_eq!(real + pad, 5);
     }
 
     #[test]
