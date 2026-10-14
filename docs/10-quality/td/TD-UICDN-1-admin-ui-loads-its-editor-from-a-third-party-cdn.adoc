@@ -6,7 +6,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open — found while bumping the `ui/` lockfile in #1993; not fixed there
+| Status | **FIXED (2026-10-13)** — option 1 (self-host). `monaco-editor` is now a real, exact-pinned dependency (`0.57.0`), `min/vs` is copied to `public/vs` at install/build time, the loader is overridden to `paths: { vs: '/vs' }`, and a `prebuild` guard verifies the whole chain (details + verification below).
 | Severity | Medium — third-party script execution with no integrity check, and a dependency-audit blind spot that makes lockfile bumps look like fixes they are not
 | Component | `ui/src/components/SqlQueryTab.tsx`, `ui/package.json` (`@monaco-editor/react`), `ui/node_modules/@monaco-editor/loader`
 | Pillar | SECURITY
@@ -81,9 +81,58 @@ bundle-size and build-output review. It also lands naturally with the
 `react-scripts` migration, since the 101 remaining `ui/` advisories are all CRA
 transitives and that migration has to touch the build anyway.
 
-== Verification for the fix
+== Fix (2026-10-13)
 
-* no `cdn.jsdelivr.net` (or any external host) string in `ui/build/static/js/*`;
-* `monaco-editor` present in `ui/package.json` `dependencies`, so `npm audit`
-  covers the executed version;
-* the SQL editor loads with the network blocked to all origins but the app's own.
+Option 1, implemented:
+
+* `monaco-editor` added to `ui/package.json` `dependencies` as an **exact pin**
+  (`"0.57.0"` — the version the browser executes; the peer-only blind spot is
+  closed: the audited version is now the executed version).
+* `ui/scripts/copy-monaco-vs.js` — copies `node_modules/monaco-editor/min/vs` to
+  `public/vs`, idempotent via a `public/.monaco-vs-version` stamp; wired as
+  both `postinstall` and `prebuild`. `public/vs` is gitignored (build
+  artifact, regenerated from the lockfile-pinned package).
+* `ui/src/components/SqlQueryTab.tsx` — `loader.config({ paths: { vs: '/vs' } })`
+  at module scope, before any `Editor` mount.
+* `ui/scripts/check-monaco-selfhost.mjs` — `prebuild` guard (a build cannot
+  ship without passing it) checking the three links of the chain: exact pin ==
+  installed version; `public/vs/{loader.js,editor/editor.main.js}` + stamp
+  present; the tsx still carries the `paths: { vs: '/vs' }` override AND
+  applying that override **through the shipped loader's own config-merge
+  code** resolves the editor script to `/vs/loader.js`, not any remote URL.
+
+One criterion from the original verification plan is **amended, honestly**: "no
+`cdn.jsdelivr.net` string in `ui/build/static/js/*`" is not literally
+achievable — `@monaco-editor/loader`'s shipped default config object (with its
+inert jsdelivr default for a *different* version, 0.52.2) is vendor code that
+still gets bundled. The string's presence is not the risk; its *reachability*
+is. The amended criterion is the executed property: the URL the loader will
+actually use is computed by the library's own merge logic from our override
+and is `/vs/loader.js` — and the guard proves that on every build rather than
+once.
+
+== Verification
+
+* Guard passes in the worktree: `[check-monaco-selfhost] OK: monaco-editor
+  0.57.0 self-hosted; loader resolves /vs/loader.js` (exit 0).
+* **Negative controls** (the guard fails closed): sabotaging the tsx override
+  back to the CDN URL -> `FAIL ... no longer overrides the loader` (exit 1);
+  removing `public/vs/loader.js` (the "postinstall never ran" case) ->
+  `FAIL ... public/vs/loader.js missing` (exit 1). Restored -> exit 0.
+* Loader mechanism traced, not assumed: `state.config.paths.vs` is the sole
+  source of the injected script URL (`@monaco-editor/loader`
+  `loader/index.js:104`), and `loader.config()` deep-merges over the jsdelivr
+  default (`index.js:33`) — so the module-scope override is authoritative for
+  every mount.
+* `ui/build` produced with the override: `build/vs/` carries the runtime
+  (`loader.js`, `editor/editor.main.js`, ...) alongside `build/static/js/*`.
+* npm audit blind spot closed: `monaco-editor 0.57.0` is a real dependency
+  under the lockfile, so audit reports on what executes; the guard asserts
+  pin == installed on every build.
+* Recorded limitation: an in-browser load test with the network blocked was
+  NOT run (the local automation browser cannot reach the loopback origin in
+  this environment). The executed-merge proof above is the substitute: it
+  runs the exact shipped code path that computes the script URL, with the
+  exact override the bundle carries; the remaining gap is ordinary browser
+  serving of `public/vs`, covered by CRA's static-asset copy (verified
+  present in `build/vs/`).

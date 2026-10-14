@@ -11,6 +11,11 @@
 # production
 /build
 
+# self-hosted monaco runtime, copied from node_modules by scripts/copy-monaco-vs.js
+# (TD-UICDN-1)
+/public/vs
+/public/.monaco-vs-version
+
 # misc
 .DS_Store
 .env.local

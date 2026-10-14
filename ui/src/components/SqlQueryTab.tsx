@@ -1,6 +1,13 @@
 import React, { useState, useCallback, useRef } from 'react';
-import Editor, { OnMount } from '@monaco-editor/react';
+import Editor, { loader, OnMount } from '@monaco-editor/react';
 import './SqlQueryTab.css';
+
+// TD-UICDN-1: resolve the Monaco runtime from our own origin (`public/vs`,
+// copied from node_modules by scripts/copy-monaco-vs.js) instead of the
+// jsdelivr CDN — the admin UI must have zero third-party script origins.
+// Module scope so it is configured before the first <Editor> mounts; the call
+// is idempotent.
+loader.config({ paths: { vs: '/vs' } });
 
 interface QueryResult {
   columns: string[];
