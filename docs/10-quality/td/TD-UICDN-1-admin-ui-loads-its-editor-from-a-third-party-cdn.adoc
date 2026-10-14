@@ -97,9 +97,13 @@ Option 1, implemented:
 * `ui/scripts/check-monaco-selfhost.mjs` — `prebuild` guard (a build cannot
   ship without passing it) checking the three links of the chain: exact pin ==
   installed version; `public/vs/{loader.js,editor/editor.main.js}` + stamp
-  present; the tsx still carries the `paths: { vs: '/vs' }` override AND
-  applying that override **through the shipped loader's own config-merge
-  code** resolves the editor script to `/vs/loader.js`, not any remote URL.
+  present; the tsx still carries a **statement-position**
+  `loader.config({ paths: { vs: '/vs' } })` call (an adversarial-review round
+  proved the earlier substring check was bypassable by commenting the line
+  out — the guard now matches the call itself, so a commented-out override
+  fails) AND applying that override **through the shipped loader's own
+  config-merge code** resolves the editor script to `/vs/loader.js`, not any
+  remote URL.
 
 One criterion from the original verification plan is **amended, honestly**: "no
 `cdn.jsdelivr.net` string in `ui/build/static/js/*`" is not literally
@@ -109,16 +113,20 @@ still gets bundled. The string's presence is not the risk; its *reachability*
 is. The amended criterion is the executed property: the URL the loader will
 actually use is computed by the library's own merge logic from our override
 and is `/vs/loader.js` — and the guard proves that on every build rather than
-once.
+once. (The vendor default that string references is monaco 0.55.1 — loader
+1.7.0's shipped default, the same version the "What is actually shipped"
+section cites.)
 
 == Verification
 
 * Guard passes in the worktree: `[check-monaco-selfhost] OK: monaco-editor
   0.57.0 self-hosted; loader resolves /vs/loader.js` (exit 0).
-* **Negative controls** (the guard fails closed): sabotaging the tsx override
-  back to the CDN URL -> `FAIL ... no longer overrides the loader` (exit 1);
-  removing `public/vs/loader.js` (the "postinstall never ran" case) ->
-  `FAIL ... public/vs/loader.js missing` (exit 1). Restored -> exit 0.
+* **Negative controls** (the guard fails closed): commenting out the tsx
+  override -> FAIL `... no longer calls loader.config ... (a commented-out
+  override does not count)` (exit 1); pointing the override back at the CDN
+  URL -> FAIL (exit 1); removing `public/vs/loader.js` (the "postinstall
+  never ran" case) -> `FAIL ... public/vs/loader.js missing` (exit 1).
+  Restored -> exit 0.
 * Loader mechanism traced, not assumed: `state.config.paths.vs` is the sole
   source of the injected script URL (`@monaco-editor/loader`
   `loader/index.js:104`), and `loader.config()` deep-merges over the jsdelivr

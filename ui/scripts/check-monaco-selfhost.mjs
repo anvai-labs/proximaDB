@@ -76,13 +76,20 @@ if (!fs.existsSync(stampPath) || fs.readFileSync(stampPath, 'utf8') !== installe
 //    shipped loader's own logic (`state.config = merge(state.config, config)`,
 //    loader/index.js:33; script URL = `state.config.paths.vs + '/loader.js'`,
 //    loader/index.js:104).
-const selfhostLiteral = "paths: { vs: '/vs' }";
+// Match an actual CALL at statement position, not a substring: a commented-out
+// `// loader.config(...)` must not satisfy the check (review finding — the
+// substring form was provably bypassable by commenting the line out).
+const selfhostCall =
+  /^\s*loader\.config\(\{\s*paths:\s*\{\s*vs:\s*'(\/vs)'\s*}\s*}\s*\)\s*;/m;
 const tsx = fs.readFileSync(
   path.join(uiRoot, 'src', 'components', 'SqlQueryTab.tsx'),
   'utf8',
 );
-if (!tsx.includes(selfhostLiteral)) {
-  fail(`SqlQueryTab.tsx no longer overrides the loader with \`${selfhostLiteral}\``);
+if (!selfhostCall.test(tsx)) {
+  fail(
+    'SqlQueryTab.tsx no longer calls `loader.config({ paths: { vs: \'/vs\' } })` ' +
+      'as a statement (a commented-out override does not count)',
+  );
 }
 const loaderLib = path.join(uiRoot, 'node_modules', '@monaco-editor/loader', 'lib', 'es');
 const { default: deepMerge } = await import(
