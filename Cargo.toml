@@ -679,7 +679,11 @@ object_store = { workspace = true }
 # the XML API, which fake-gcs-server (our test emulator) does not serve, so it
 # is unverifiable locally; this SDK uses the JSON API (fake-gcs-compatible) and
 # still issues true ranged object downloads (bandwidth-optimal). Feature `gcp`.
-google-cloud-storage = { version = "0.15", optional = true }
+google-cloud-storage = { version = "1.20", optional = true }
+# Direct deps of the GCS backend (transitive via google-cloud-storage, pinned
+# to the same majors): anonymous credentials + gax rpc::Code for error mapping.
+google-cloud-auth = { version = "1.17", optional = true, default-features = false }
+google-cloud-gax = { version = "1.15", optional = true, default-features = false }
 
 # Vector operations & SIMD
 nalgebra = { version = "0.32", features = ["serde-serialize"] }  # For PCA eigendecomposition, with serde for model persistence
@@ -924,7 +928,7 @@ onnx = [
 # Cloud storage features (optional to avoid linking issues during testing)
 aws = ["object_store/aws", "proximadb-catalog/aws"]
 azure = ["object_store/azure"]
-gcp = ["dep:google-cloud-storage"]
+gcp = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:google-cloud-gax"]
 
 # TD-161 external OTLP metering push (default-OFF). Compiles the OTLP exporter that
 # ships the per-tenant metering snapshot to a collector; runtime-gated additionally by

@@ -6,7 +6,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **AWS half FIXED** (one line on `aws-sdk-glue`): the HIGH `rustls-webpki` advisory and both LOW ones are closed, duplicates 117 -> 113. **GCS half still OPEN** — `jsonwebtoken 9.3.1` rides `google-cloud-storage 0.15`, which is the deliberate trade described below.
+| Status | **BOTH HALVES FIXED.** AWS half: one line on `aws-sdk-glue` (`default-features = false`) closed the HIGH `rustls-webpki` advisory and both LOW ones, duplicates 117 -> 113. GCS half (2026-10-13): `google-cloud-storage` 0.15 -> 1.20 — Google's own rewritten SDK — removes `jsonwebtoken 9.3.1` from the lock entirely; the GCS backend (`gcs_store.rs`) was rewritten for the 1.x API (details below).
 | Severity | High — `rustls-webpki` DoS-via-panic on a malformed CRL, reachable only through the `aws`/`gcp` feature deps; no patch exists in the pinned line, so `cargo update` cannot close it
 | Component | `crates/control/proximadb-catalog/Cargo.toml` (`aws-sdk-glue` default features) and root `Cargo.toml:671` (`google-cloud-storage` 0.15). NOT the S3/Azure object-store path, which is already on the `object_store` crate.
 | Pillar | SECURITY
@@ -158,17 +158,19 @@ So `aws-config`'s defaults are already modern; `aws-sdk-glue`'s are not.
   confirm `rustls 0.21.12` and `rustls-webpki 0.101.7` leave the lock and the
   Glue catalog path still builds and passes its tests. This closes the **HIGH**
   alert and both **LOW** ones.
-. **GCS half — a real decision, and the only genuine object-store debt here.**
-  `google-cloud-storage = "0.15"` (`Cargo.toml:671`, feature `gcp`) is five
-  majors behind (latest 1.20.0) and carries the `jsonwebtoken 9.3.1` alert. The
-  pin is *deliberate* and documented: `object_store`'s GCS backend speaks the
-  XML API, which `fake-gcs-server` — our test emulator — does not serve, so it
-  would be locally unverifiable. That reason is still valid, which makes this a
-  trade to weigh rather than an oversight: bump the SDK 0.15 -> 1.20 and absorb
-  the 0.x -> 1.x API churn in the GCS backend, or revisit the
-  `object_store`-for-GCS decision (and with it the emulator choice) so GCS
-  joins S3/Azure on one backend. Either way it is the last object-store
-  dependency not yet unified.
+. **GCS half — DONE 2026-10-13 (see the section below).**
+  `google-cloud-storage = "0.15"` (`Cargo.toml:671`, feature `gcp`) was five
+  majors behind (latest 1.20.0) and carried the `jsonwebtoken 9.3.1` alert. The
+  pin had been *deliberate*: `object_store`'s GCS backend speaks the XML API,
+  which `fake-gcs-server` — our test emulator — does not serve, so it would be
+  locally unverifiable. The chosen resolution keeps that constraint intact:
+  bump to **Google's own 1.x SDK** (the crate was donated to the community as
+  `gcloud-storage` and rewritten by Google as `google-cloud-storage` 1.x),
+  which speaks the **JSON API** — the same wire surface the 0.15 backend used —
+  so `fake-gcs-server` compatibility is preserved and the emulator stays the
+  verification path. `object_store`-for-GCS was considered and declined on
+  exactly that emulator ground; GCS remains the one object-store backend off
+  the unified crate, now as a recorded decision rather than drift.
 . If either is deferred, record the decision explicitly so the alert is
   *accepted* rather than silently ignored.
 
@@ -200,10 +202,51 @@ ignored). A whole-lock backwards-version scan reports **0** packages moving
 backwards — the guard TD-AUDITGATE-1 proposes, run by hand here because a
 reverted security bump is exactly how #2004 regressed earlier the same day.
 
+== GCS half: done, and what it changed
+
+`google-cloud-storage` 0.15 -> 1.20 (plus explicit `google-cloud-auth` 1.17 and
+`google-cloud-gax` 1.15 for the re-exported types the backend needs) is not
+a version bump — the 1.x crate is **Google's full rewrite** of the API the
+yoshidan 0.x line pioneered. The alert is closed because `jsonwebtoken` moved
+**9.3.1 -> 11.1.0** (the advisory is against < 10.3.0): it still rides
+`google-cloud-auth`, but the 1.x auth line requires the patched major, so the
+vulnerable copy is gone from the lock.
+
+`src/storage/persistence/filesystem/gcs_store.rs` was rewritten for the 1.x
+shape; the trait surface (`FileSystem`) and `GcsConfig` are unchanged, so no
+caller moved:
+
+* The 1.x SDK splits into a **data plane** (`client::Storage` — JSON API over
+  HTTP: upload/download incl. ranged reads) and a **metadata plane**
+  (`client::StorageControl` — get/delete/list), both addressing buckets as
+  `projects/_/buckets/{bucket}`. Both clients take the same custom endpoint,
+  so the fake-gcs-server story is unchanged.
+* Conditional create: `set_if_generation_match(0)` on the upload, with
+  `AlreadyExists`/`FailedPrecondition` gax codes mapped to
+  `FilesystemError::AlreadyExists` — same contract the 0.x preconditions gave.
+* **TD-173 residual (a) closed in the same stroke**: `set_storage_class` on the
+  1.x simple upload carries `ObjectAccessTier::as_gcs_storage_class()` per
+  ADR-036 (default-safe: unset tier => bucket default). The 0.15 resumable path
+  could not do this.
+* The 90-line hand-rolled resumable chunk loop (forced by a 0.15
+  `UploadStatus::ResumeIncomplete` Range-header gap) is replaced by
+  SDK-managed `send_buffered()` resumable upload with checksum verification;
+  small writes use `send_unbuffered()`.
+* One capability was **lost, and is documented at the call site**: the 1.x
+  `ListObjectsRequest` has no page-size control (no `maxResults`), so
+  `FileSystem::list`'s `max_results` hint is accepted and ignored; the
+  token loop still consumes every page. The multi-page emulator test was
+  rewritten to pin the prefix-list contract (every seeded object returned)
+  instead of forcing multiple pages.
+
 == Verification for the fix
 
 * `gh api repos/anvai-labs/proximaDB/dependabot/alerts?state=open` no longer
   lists `rustls-webpki` or `jsonwebtoken`.
 * `grep -A1 '^name = "rustls"$' Cargo.lock` shows a single version.
-* `cargo check --features aws,gcp` and the object-store emulator CI lane stay
-  green — the point is to remove the old subtree, not to break the backends.
+* GCS half: `grep -A1 '^name = "jsonwebtoken"$' Cargo.lock` shows **11.1.0**
+  (patched; the 9.3.1 copy is gone with the 0.x google-cloud subtree);
+  `cargo check -p proximadb --features gcp`
+  green; `cargo clippy -p proximadb --lib --features gcp -- -D warnings` clean;
+  the gcs unit tests pass; the emulator CI lane stays green — the point is to
+  remove the old subtree, not to break the backends.

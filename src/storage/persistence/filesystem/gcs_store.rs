@@ -3,24 +3,38 @@
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! Google Cloud Storage [`FileSystem`] backend on the official
-//! `google-cloud-storage` crate. Feature-gated behind `gcp`.
+//! `google-cloud-storage` crate (Google's 1.x SDK; the yoshidan 0.x line the
+//! name was donated from continues as `gcloud-storage`). Feature-gated behind
+//! `gcp`.
 //!
-//! The SDK handles OAuth/signing and a custom `storage_endpoint`, so this works
-//! against `fake-gcs-server` (anonymous + custom endpoint) as well as real GCS.
-//! `read_range` issues a ranged object download — the ADR-023 cold-load primitive.
+//! The 1.x data client (`client::Storage`) speaks the JSON API over HTTP
+//! (`/storage/v1/…`), the same wire surface the 0.x `http` module used, so a
+//! custom `storage_endpoint` still works against `fake-gcs-server`
+//! (anonymous + custom endpoint). Metadata operations (get / delete / list)
+//! live on the separate `client::StorageControl`; both clients are pointed at
+//! the same endpoint. `read_range` issues a ranged object download — the
+//! ADR-023 cold-load primitive. Resumable uploads (chunked, checksum-verified)
+//! are SDK-managed since 1.x, replacing the hand-rolled chunk loop the 0.15
+//! `UploadStatus::ResumeIncomplete` Range-header gap forced on us.
 
 use async_trait::async_trait;
-use google_cloud_storage::client::{Client, ClientConfig};
-use google_cloud_storage::http::objects::delete::DeleteObjectRequest;
-use google_cloud_storage::http::objects::download::Range;
-use google_cloud_storage::http::objects::get::GetObjectRequest;
-use google_cloud_storage::http::objects::list::ListObjectsRequest;
-use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
-use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
-use tokio::io::AsyncReadExt;
+use google_cloud_auth::credentials::anonymous;
+use google_cloud_gax::error::rpc::Code as GaxCode;
+use google_cloud_gax::paginator::Paginator;
+use google_cloud_storage::client::{Storage, StorageControl};
+use google_cloud_storage::model_ext::ReadRange;
 
 use super::{
     DirEntry, FileOptions, FileSystem, FilesystemError, FilesystemFile, FsFileMetadata, FsResult,
@@ -34,13 +48,18 @@ pub struct GcsConfig {
     pub endpoint_url: Option<String>,
     /// Use anonymous (credential-less) access — required for fake-gcs-server.
     pub anonymous: bool,
-    /// GCP project id (optional; not needed for fake-gcs).
+    /// GCP project id (optional; not needed for fake-gcs). Reserved — the 1.x
+    /// SDK keys requests by bucket, not project; kept for config compatibility.
     pub project_id: Option<String>,
 }
 
-/// GCS `FileSystem` backend over `google-cloud-storage`.
+/// GCS `FileSystem` backend over `google-cloud-storage` 1.x.
 pub struct GcsFileSystem {
-    client: Client,
+    /// JSON API data plane: object upload / download (incl. ranged reads).
+    data: Storage,
+    /// Metadata plane: get / delete / list (buckets addressed as
+    /// `projects/_/buckets/{bucket}`).
+    control: StorageControl,
 }
 
 impl std::fmt::Debug for GcsFileSystem {
@@ -50,26 +69,42 @@ impl std::fmt::Debug for GcsFileSystem {
 }
 
 impl GcsFileSystem {
-    const RESUMABLE_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
-
     pub async fn new(cfg: GcsConfig) -> FsResult<Self> {
-        let mut config = if cfg.anonymous {
-            ClientConfig::default().anonymous()
-        } else {
-            ClientConfig::default()
-                .with_auth()
-                .await
-                .map_err(|e| FilesystemError::Auth(format!("GCS auth: {e}")))?
+        let (data_builder, control_builder) = match cfg.anonymous {
+            true => {
+                let creds = anonymous::Builder::new().build();
+                (
+                    Storage::builder().with_credentials(creds.clone()),
+                    StorageControl::builder().with_credentials(creds),
+                )
+            }
+            // Default: Application Default Credentials, resolved at build time.
+            false => (Storage::builder(), StorageControl::builder()),
         };
-        if let Some(endpoint) = cfg.endpoint_url {
-            config.storage_endpoint = endpoint;
-        }
-        if cfg.project_id.is_some() {
-            config.project_id = cfg.project_id;
-        }
-        Ok(Self {
-            client: Client::new(config),
-        })
+        // Both planes must agree: fake-gcs-server serves the JSON API for
+        // object data AND metadata on the one endpoint.
+        let (data_builder, control_builder) = match cfg.endpoint_url {
+            Some(endpoint) => (
+                data_builder.with_endpoint(endpoint.clone()),
+                control_builder.with_endpoint(endpoint),
+            ),
+            None => (data_builder, control_builder),
+        };
+        let data = data_builder
+            .build()
+            .await
+            .map_err(|e| FilesystemError::Auth(format!("GCS data client: {e}")))?;
+        let control = control_builder
+            .build()
+            .await
+            .map_err(|e| FilesystemError::Auth(format!("GCS control client: {e}")))?;
+        Ok(Self { data, control })
+    }
+
+    /// The 1.x API addresses buckets as `projects/_/buckets/{bucket}` on both
+    /// the data and control planes.
+    fn bucket_param(bucket: &str) -> String {
+        format!("projects/_/buckets/{bucket}")
     }
 
     /// Parse `gs://bucket/object` (or `gcs://`) into `(bucket, object)`.
@@ -91,25 +126,45 @@ impl GcsFileSystem {
         FilesystemError::Network(format!("{ctx}: {e}"))
     }
 
-    fn next_resumable_chunk(offset: u64, total: u64) -> Option<(usize, bool)> {
-        let remaining = total.checked_sub(offset)?;
-        if remaining == 0 {
-            return None;
-        }
-        let bytes = remaining.min(Self::RESUMABLE_CHUNK_BYTES);
-        Some((bytes as usize, bytes == remaining))
+    /// Conditional-write preconditions surface as the GCS precondition codes;
+    /// map both spellings (409 / 412) to `AlreadyExists`.
+    fn is_precondition_conflict(e: &google_cloud_storage::Error) -> bool {
+        e.status().is_some_and(|status| {
+            matches!(
+                status.code,
+                GaxCode::AlreadyExists | GaxCode::FailedPrecondition
+            )
+        })
     }
 
-    fn parse_resumable_range(value: &str) -> Option<u64> {
-        value
-            .strip_prefix("bytes=0-")
-            .and_then(|end| end.parse::<u64>().ok())
+    async fn read_all(
+        &self,
+        ctx: &str,
+        bucket: &str,
+        object: &str,
+        range: Option<ReadRange>,
+    ) -> FsResult<Vec<u8>> {
+        let mut builder = self.data.read_object(Self::bucket_param(bucket), object);
+        if let Some(range) = range {
+            builder = builder.set_read_range(range);
+        }
+        let mut response = builder.send().await.map_err(|e| Self::net(ctx, e))?;
+        let mut out = Vec::new();
+        while let Some(chunk) = response.next().await {
+            let chunk = chunk.map_err(|e| Self::net(ctx, e))?;
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     async fn list_paginated(
         &self,
         path: &str,
-        max_results: Option<i32>,
+        // NOTE: the 1.x ListObjectsRequest has no page-size control (no
+        // maxResults in the v2 model) — the parameter is accepted for
+        // `FileSystem::list` compatibility and ignored; the token loop below
+        // still consumes every page the service chooses to send.
+        _max_results: Option<i32>,
     ) -> FsResult<Vec<DirEntry>> {
         let (bucket, prefix) = Self::parse(path)?;
         let mut entries = Vec::new();
@@ -117,19 +172,23 @@ impl GcsFileSystem {
 
         loop {
             let requested_page_token = page_token.clone();
-            let res = self
-                .client
-                .list_objects(&ListObjectsRequest {
-                    bucket: bucket.clone(),
-                    prefix: Some(prefix.clone()),
-                    max_results,
-                    page_token: requested_page_token.clone(),
-                    ..Default::default()
-                })
-                .await
-                .map_err(|e| Self::net("GCS list_objects", e))?;
+            let mut builder = self
+                .control
+                .list_objects()
+                .set_parent(Self::bucket_param(&bucket))
+                .set_prefix(&prefix);
+            if let Some(token) = &requested_page_token {
+                builder = builder.set_page_token(token);
+            }
+            let mut pages = builder.by_page();
+            let page = pages.next().await;
+            let response = match page {
+                Some(Ok(response)) => response,
+                Some(Err(e)) => return Err(Self::net("GCS list_objects", e)),
+                None => break,
+            };
 
-            for obj in res.items.unwrap_or_default() {
+            for obj in response.objects {
                 let name = obj.name.rsplit('/').next().unwrap_or(&obj.name).to_string();
                 entries.push(DirEntry {
                     name,
@@ -144,7 +203,12 @@ impl GcsFileSystem {
                 });
             }
 
-            page_token = res.next_page_token.filter(|token| !token.is_empty());
+            // 1.x models the token as a plain String; empty means "no more pages".
+            page_token = if response.next_page_token.is_empty() {
+                None
+            } else {
+                Some(response.next_page_token)
+            };
             match &page_token {
                 None => break,
                 Some(next) if Some(next) == requested_page_token.as_ref() => {
@@ -169,17 +233,8 @@ impl FileSystem for GcsFileSystem {
     async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
         let (bucket, object) = Self::parse(path)?;
         let bytes = self
-            .client
-            .download_object(
-                &GetObjectRequest {
-                    bucket,
-                    object,
-                    ..Default::default()
-                },
-                &Range::default(),
-            )
-            .await
-            .map_err(|e| Self::net("GCS download_object", e))?;
+            .read_all("GCS read_object", &bucket, &object, None)
+            .await?;
         super::record_physical_full_read(bytes.len() as u64);
         Ok(bytes)
     }
@@ -191,45 +246,37 @@ impl FileSystem for GcsFileSystem {
         }
         let (bucket, object) = Self::parse(path)?;
         let bytes = self
-            .client
-            .download_object(
-                &GetObjectRequest {
-                    bucket,
-                    object,
-                    ..Default::default()
-                },
-                &Range(Some(offset), Some(offset + length - 1)),
+            .read_all(
+                "GCS read_object range",
+                &bucket,
+                &object,
+                Some(ReadRange::segment(offset, length)),
             )
-            .await
-            .map_err(|e| Self::net("GCS download_object range", e))?;
+            .await?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
         super::record_physical_range_read(bytes.len() as u64);
         Ok(bytes)
     }
 
-    async fn write(&self, path: &str, data: &[u8], _options: Option<FileOptions>) -> FsResult<()> {
-        // NOTE (ADR-036): the canonical `FileOptions.storage_class` → GCS storage
-        // class (`ObjectAccessTier::as_gcs_storage_class`) is not yet wired here.
-        // Unlike the object_store-backed Azure/S3 backends (which set the class via
-        // `Attribute::StorageClass` on the PUT), this backend uses the native
-        // `google-cloud-storage` Simple media upload, which cannot carry a storage
-        // class — that needs a metadata/resumable upload. GCS is not the MVP cloud
-        // (Azure is); tracked as a follow-up under TD-173. Writes use the bucket
-        // default class today.
+    async fn write(&self, path: &str, data: &[u8], options: Option<FileOptions>) -> FsResult<()> {
         let (bucket, object) = Self::parse(path)?;
-        let upload_type = UploadType::Simple(Media::new(object));
-        self.client
-            .upload_object(
-                &UploadObjectRequest {
-                    bucket,
-                    ..Default::default()
-                },
-                data.to_vec(),
-                &upload_type,
-            )
+        let mut builder = self.data.write_object(
+            Self::bucket_param(&bucket),
+            &object,
+            bytes::Bytes::copy_from_slice(data),
+        );
+        // ADR-036: the per-object access tier is the dominant at-rest cost
+        // lever. TD-173 residual (a) closed: the 1.x write carries resource
+        // metadata on the simple upload, so `ObjectAccessTier::as_gcs_storage_class`
+        // wires through directly. Default-safe: unset tier ⇒ bucket default.
+        if let Some(tier) = options.as_ref().and_then(FileOptions::access_tier) {
+            builder = builder.set_storage_class(tier.as_gcs_storage_class());
+        }
+        builder
+            .send_unbuffered()
             .await
-            .map_err(|e| Self::net("GCS upload_object", e))?;
+            .map_err(|e| Self::net("GCS write_object", e))?;
         Ok(())
     }
 
@@ -241,89 +288,40 @@ impl FileSystem for GcsFileSystem {
         &self,
         path: &str,
         local_path: &std::path::Path,
-        _options: Option<FileOptions>,
+        options: Option<FileOptions>,
     ) -> FsResult<u64> {
         let (bucket, object) = Self::parse(path)?;
-        let mut file = tokio::fs::File::open(local_path).await?;
-        let bytes = file.metadata().await?.len();
-        let mut media = Media::new(object);
-        media.content_length = Some(bytes);
-        let upload_type = UploadType::Simple(media);
-        let session = self
-            .client
-            .prepare_resumable_upload(
-                &UploadObjectRequest {
-                    bucket,
-                    ..Default::default()
-                },
-                &upload_type,
-            )
+        let file = tokio::fs::File::open(local_path)
             .await
-            .map_err(|error| Self::net("GCS resumable begin", error))?;
-
+            .map_err(|e| Self::net("GCS open local file", e))?;
+        let bytes = file
+            .metadata()
+            .await
+            .map_err(|e| Self::net("GCS local file metadata", e))?
+            .len();
         if bytes == 0 {
-            session
-                .upload_single_chunk(Vec::<u8>::new(), 0)
+            self.data
+                .write_object(Self::bucket_param(&bucket), &object, bytes::Bytes::new())
+                .send_unbuffered()
                 .await
-                .map_err(|error| Self::net("GCS resumable empty upload", error))?;
+                .map_err(|e| Self::net("GCS empty upload", e))?;
             return Ok(0);
         }
-
-        // The 0.15 SDK's `UploadStatus::ResumeIncomplete` drops GCS's `Range`
-        // response header. The JSON API explicitly requires clients to advance
-        // from the acknowledged range rather than assume a whole request was
-        // persisted. Use the authenticated session URL directly and fail
-        // closed on a partial acknowledgement; compaction can retry from its
-        // authoritative inputs without risking a corrupt final object.
-        let upload_http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| Self::net("GCS resumable HTTP client", error))?;
-        let mut buffer = vec![0u8; Self::RESUMABLE_CHUNK_BYTES as usize];
-        let mut offset = 0u64;
-        while let Some((chunk_bytes, final_chunk)) = Self::next_resumable_chunk(offset, bytes) {
-            file.read_exact(&mut buffer[..chunk_bytes]).await?;
-            let end = offset + chunk_bytes as u64 - 1;
-            let response = match upload_http
-                .put(session.url())
-                .header(CONTENT_RANGE, format!("bytes {offset}-{end}/{bytes}"))
-                .header(CONTENT_LENGTH, chunk_bytes)
-                .body(buffer[..chunk_bytes].to_vec())
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    let _ = session.cancel().await;
-                    return Err(Self::net("GCS resumable chunk", error));
-                }
-            };
-            let accepted = if final_chunk {
-                response.status().is_success()
-            } else {
-                response.status().as_u16() == 308
-                    && response
-                        .headers()
-                        .get(RANGE)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(Self::parse_resumable_range)
-                        == Some(end)
-            };
-            if !accepted {
-                let status = response.status();
-                let acknowledged = response
-                    .headers()
-                    .get(RANGE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("missing");
-                let _ = session.cancel().await;
-                return Err(FilesystemError::Network(format!(
-                    "GCS resumable chunk {offset}-{end}/{bytes} was not fully acknowledged: \
-                     status={status}, range={acknowledged}"
-                )));
-            }
-            offset = end + 1;
+        // SDK-managed resumable upload: `send_buffered` streams the file in
+        // bounded buffers with checksum verification above the resumable
+        // threshold — no hand-rolled chunk/ack loop (the 0.15 workaround).
+        // Tier rides the session's resource metadata, same as `write` (S3
+        // parity: aws_s3.rs applies it here too).
+        let mut builder = self
+            .data
+            .write_object(Self::bucket_param(&bucket), &object, file);
+        if let Some(tier) = options.as_ref().and_then(FileOptions::access_tier) {
+            builder = builder.set_storage_class(tier.as_gcs_storage_class());
         }
+        builder
+            .send_buffered()
+            .await
+            .map_err(|e| Self::net("GCS resumable upload", e))?;
         Ok(bytes)
     }
 
@@ -331,30 +329,26 @@ impl FileSystem for GcsFileSystem {
         &self,
         path: &str,
         data: &[u8],
-        _options: Option<FileOptions>,
+        options: Option<FileOptions>,
     ) -> FsResult<()> {
         let (bucket, object) = Self::parse(path)?;
-        let upload_type = UploadType::Simple(Media::new(object));
-        let result = self
-            .client
-            .upload_object(
-                &UploadObjectRequest {
-                    bucket,
-                    if_generation_match: Some(0),
-                    ..Default::default()
-                },
-                data.to_vec(),
-                &upload_type,
+        let mut builder = self
+            .data
+            .write_object(
+                Self::bucket_param(&bucket),
+                &object,
+                bytes::Bytes::copy_from_slice(data),
             )
-            .await;
-        match result {
+            .set_if_generation_match(0i64);
+        if let Some(tier) = options.as_ref().and_then(FileOptions::access_tier) {
+            builder = builder.set_storage_class(tier.as_gcs_storage_class());
+        }
+        match builder.send_unbuffered().await {
             Ok(_) => Ok(()),
-            Err(google_cloud_storage::http::Error::Response(response))
-                if response.code == 409 || response.code == 412 =>
-            {
+            Err(e) if Self::is_precondition_conflict(&e) => {
                 Err(FilesystemError::AlreadyExists(path.to_string()))
             }
-            Err(error) => Err(Self::net("GCS conditional upload_object", error)),
+            Err(e) => Err(Self::net("GCS conditional upload", e)),
         }
     }
 
@@ -366,25 +360,24 @@ impl FileSystem for GcsFileSystem {
 
     async fn delete(&self, path: &str) -> FsResult<()> {
         let (bucket, object) = Self::parse(path)?;
-        self.client
-            .delete_object(&DeleteObjectRequest {
-                bucket,
-                object,
-                ..Default::default()
-            })
+        self.control
+            .delete_object()
+            .set_bucket(Self::bucket_param(&bucket))
+            .set_object(&object)
+            .send()
             .await
-            .map_err(|e| Self::net("GCS delete_object", e))
+            .map_err(|e| Self::net("GCS delete_object", e))?;
+        Ok(())
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
         let (bucket, object) = Self::parse(path)?;
         Ok(self
-            .client
-            .get_object(&GetObjectRequest {
-                bucket,
-                object,
-                ..Default::default()
-            })
+            .control
+            .get_object()
+            .set_bucket(Self::bucket_param(&bucket))
+            .set_object(&object)
+            .send()
             .await
             .is_ok())
     }
@@ -392,12 +385,11 @@ impl FileSystem for GcsFileSystem {
     async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
         let (bucket, object) = Self::parse(path)?;
         let obj = self
-            .client
-            .get_object(&GetObjectRequest {
-                bucket,
-                object,
-                ..Default::default()
-            })
+            .control
+            .get_object()
+            .set_bucket(Self::bucket_param(&bucket))
+            .set_object(&object)
+            .send()
             .await
             .map_err(|e| Self::net("GCS get_object", e))?;
         Ok(FsFileMetadata {
@@ -472,50 +464,20 @@ mod tests {
         assert!(GcsFileSystem::parse("gs:///obj").is_err());
     }
 
-    #[test]
-    fn resumable_chunk_plan_is_bounded_contiguous_and_finalized_once() {
-        let total = 2 * GcsFileSystem::RESUMABLE_CHUNK_BYTES + 19;
-        let first = GcsFileSystem::next_resumable_chunk(0, total).unwrap();
-        let second = GcsFileSystem::next_resumable_chunk(first.0 as u64, total).unwrap();
-        let third =
-            GcsFileSystem::next_resumable_chunk(first.0 as u64 + second.0 as u64, total).unwrap();
-
-        assert_eq!(
-            first,
-            (GcsFileSystem::RESUMABLE_CHUNK_BYTES as usize, false)
-        );
-        assert_eq!(
-            second,
-            (GcsFileSystem::RESUMABLE_CHUNK_BYTES as usize, false)
-        );
-        assert_eq!(third, (19, true));
-        assert_eq!(GcsFileSystem::next_resumable_chunk(total, total), None);
-    }
-
-    #[test]
-    fn resumable_range_parser_requires_a_contiguous_zero_based_ack() {
-        assert_eq!(
-            GcsFileSystem::parse_resumable_range("bytes=0-8388607"),
-            Some(8_388_607)
-        );
-        assert_eq!(
-            GcsFileSystem::parse_resumable_range("bytes=1-8388607"),
-            None
-        );
-        assert_eq!(GcsFileSystem::parse_resumable_range("8388607"), None);
-        assert_eq!(GcsFileSystem::parse_resumable_range("bytes=0-nope"), None);
-    }
-
     #[tokio::test]
     async fn anonymous_endpoint_config_builds_a_client() {
-        // fake-gcs shape: anonymous + custom endpoint must construct without auth I/O.
+        // fake-gcs shape: anonymous + custom endpoint must construct without auth I/O,
+        // on both the data and control planes.
         let fs = GcsFileSystem::new(GcsConfig {
             endpoint_url: Some("http://127.0.0.1:4443".into()),
             anonymous: true,
             project_id: None,
         })
         .await;
-        assert!(fs.is_ok(), "anonymous+endpoint client should build offline");
+        assert!(
+            fs.is_ok(),
+            "anonymous+endpoint clients should build offline"
+        );
     }
 
     #[tokio::test]
@@ -546,11 +508,14 @@ mod tests {
             !fs.exists(&prefix_path).await.expect("prefix HEAD"),
             "a flat-key prefix must not exist as an exact object"
         );
+        // The 1.x SDK exposes no page-size control, so this no longer forces
+        // multiple pages; it pins the prefix-list contract: every seeded object
+        // is returned, none of its own prefix tombstones are.
         let entries = fs
             .list_paginated(&prefix_path, Some(2))
             .await
-            .expect("multi-page prefix LIST");
-        assert_eq!(entries.len(), 5, "LIST must consume every GCS page");
+            .expect("prefix LIST");
+        assert_eq!(entries.len(), 5, "LIST must return every seeded object");
 
         for entry in entries {
             fs.delete(&entry.url).await.expect("cleanup object");
