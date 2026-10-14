@@ -83,8 +83,8 @@ pub fn score_rerank_row(
 ) -> f32 {
     scratch.clear();
     if quant_kind == QUANT_FP16 {
-        for chunk in row_bytes.chunks_exact(2) {
-            scratch.push(half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+        for chunk in row_bytes.as_chunks::<2>().0 {
+            scratch.push(half::f16::from_le_bytes(*chunk).to_f32());
         }
     } else {
         sq8::decode_into(row_bytes, params, scratch);
@@ -475,8 +475,8 @@ impl<'a> PaxBlockReader<'a> {
             );
         }
         let mut values = Vec::with_capacity(self.row_count() as usize);
-        for chunk in payload.chunks_exact(std::mem::size_of::<u64>()) {
-            values.push(u64::from_le_bytes(chunk.try_into()?));
+        for chunk in payload.as_chunks::<8>().0 {
+            values.push(u64::from_le_bytes(*chunk));
         }
         Ok(Some(values))
     }
@@ -679,8 +679,8 @@ impl<'a> PaxBlockReader<'a> {
                 continue;
             }
             decoded.clear();
-            for chunk in payload[off..end].chunks_exact(4) {
-                decoded.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in payload[off..end].as_chunks::<4>().0 {
+                decoded.push(f32::from_le_bytes(*chunk));
             }
             let dist = match metric {
                 // Squared L2 (lower = nearer).
@@ -751,8 +751,10 @@ impl<'a> PaxBlockReader<'a> {
                 continue;
             }
             let v: Vec<f32> = payload[off..end]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             out.push(Some(v));
         }
@@ -1201,8 +1203,8 @@ pub(crate) fn decode_f32_vec_v2(
                     bail!("raw f32 vector row {i} exceeds stripe length");
                 }
                 let mut floats = Vec::with_capacity(dim);
-                for c in payload[off..end].chunks_exact(4) {
-                    floats.push(f32::from_le_bytes(c.try_into()?));
+                for c in payload[off..end].as_chunks::<4>().0 {
+                    floats.push(f32::from_le_bytes(*c));
                 }
                 out.push(Some(floats));
             }

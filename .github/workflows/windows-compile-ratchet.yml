@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       # Deterministic interpreter for the `python`-feature rung (PyO3 needs one at
       # build time). Pin 3.12 to match release-python.yml's proven env rather than

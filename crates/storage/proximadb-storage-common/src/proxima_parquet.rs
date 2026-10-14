@@ -250,8 +250,10 @@ mod tests {
         assert_eq!(vecs.value_length(), (dim * 4) as i32);
         let decoded: Vec<f32> = vecs
             .value(0)
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(decoded, vec![1.0, 2.0, 3.0]);
         assert!(vecs.is_null(1), "record without embedding stays null");

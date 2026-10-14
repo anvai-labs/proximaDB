@@ -53,9 +53,8 @@ pub fn decode_f32(data: &[u8]) -> Result<Vec<f32>> {
 
     // Deserialize bytes → f32
     let mut values = Vec::with_capacity(data.len() / 4);
-    for chunk in data.chunks_exact(4) {
-        let bytes: [u8; 4] = chunk.try_into()?;
-        values.push(f32::from_le_bytes(bytes));
+    for chunk in data.as_chunks::<4>().0 {
+        values.push(f32::from_le_bytes(*chunk));
     }
 
     Ok(values)
@@ -89,9 +88,8 @@ pub fn decode_f64(data: &[u8]) -> Result<Vec<f64>> {
     }
 
     let mut values = Vec::with_capacity(data.len() / 8);
-    for chunk in data.chunks_exact(8) {
-        let bytes: [u8; 8] = chunk.try_into()?;
-        values.push(f64::from_le_bytes(bytes));
+    for chunk in data.as_chunks::<8>().0 {
+        values.push(f64::from_le_bytes(*chunk));
     }
 
     Ok(values)
@@ -125,9 +123,8 @@ pub fn decode_i64(data: &[u8]) -> Result<Vec<i64>> {
     }
 
     let mut values = Vec::with_capacity(data.len() / 8);
-    for chunk in data.chunks_exact(8) {
-        let bytes: [u8; 8] = chunk.try_into()?;
-        values.push(i64::from_le_bytes(bytes));
+    for chunk in data.as_chunks::<8>().0 {
+        values.push(i64::from_le_bytes(*chunk));
     }
 
     Ok(values)
@@ -161,9 +158,8 @@ pub fn decode_i32(data: &[u8]) -> Result<Vec<i32>> {
     }
 
     let mut values = Vec::with_capacity(data.len() / 4);
-    for chunk in data.chunks_exact(4) {
-        let bytes: [u8; 4] = chunk.try_into()?;
-        values.push(i32::from_le_bytes(bytes));
+    for chunk in data.as_chunks::<4>().0 {
+        values.push(i32::from_le_bytes(*chunk));
     }
 
     Ok(values)

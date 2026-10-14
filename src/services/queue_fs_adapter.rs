@@ -258,11 +258,7 @@ impl FactoryQueueFs {
             ))
         };
         let relative = if let Some(root) = &self.local_root {
-            let entry = Path::new(
-                entry_url
-                    .strip_prefix("file://")
-                    .ok_or_else(&outside_root)?,
-            );
+            let entry = Path::new(entry_url.strip_prefix("file://").ok_or_else(outside_root)?);
             Self::reject_parent_components(entry, "queue filesystem LIST entry")?;
             // Some local backends preserve an additional `./` in LIST URLs.
             // Compare path components, not raw URL spelling, without relaxing

@@ -2305,7 +2305,7 @@ impl SegmentInvariantsCache {
         use std::sync::atomic::Ordering;
         let _ = self
             .bytes_used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(n))
             });
     }

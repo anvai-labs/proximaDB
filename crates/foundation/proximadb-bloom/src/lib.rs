@@ -494,11 +494,11 @@ pub mod hash {
     /// MurmurHash3 32-bit implementation
     pub fn murmur3_32(key: &[u8], seed: u32) -> u32 {
         let mut h = seed;
-        let mut chunks = key.chunks_exact(4);
+        let (chunks, remainder) = key.as_chunks::<4>();
 
         // Process 4-byte chunks
-        for chunk in &mut chunks {
-            let mut k = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in chunks {
+            let mut k = u32::from_le_bytes(*chunk);
             k = k.wrapping_mul(0xcc9e2d51);
             k = k.rotate_left(15);
             k = k.wrapping_mul(0x1b873593);
@@ -509,7 +509,6 @@ pub mod hash {
         }
 
         // Process remaining bytes
-        let remainder = chunks.remainder();
         if !remainder.is_empty() {
             let mut k = 0u32;
             for (i, &byte) in remainder.iter().enumerate() {
