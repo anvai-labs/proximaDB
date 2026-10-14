@@ -174,13 +174,20 @@ docker run -d --name s3-emulator -p "127.0.0.1:$S3_EMULATOR_PORT:$S3_EMULATOR_PO
   -e SERVICES=s3 \
   -e AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" -e AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
   "$S3_EMULATOR_IMAGE" >/dev/null
-docker run -d --name fake-gcs -p 127.0.0.1:4443:4443 \
-  "$FAKE_GCS_IMAGE" -scheme http -port 4443 -public-host localhost:4443 >/dev/null
+# fake-gcs listens on PORT 80 (host + container), not 4443: the 1.x SDK's HTTP
+# client sends a Host header WITHOUT the port (asserted by google-cloud-gax-
+# internal's own tests), fake-gcs echoes that Host verbatim into the resumable
+# upload's Location header (public-host/-external-url lose to the echo), and
+# the SDK PUTs to the Location verbatim — a nonstandard port is silently
+# dropped and the upload dies on :80. Serving on the http default port makes
+# the port-less URL resolve. TD-RUSTDEP-1.
+docker run -d --name fake-gcs -p 127.0.0.1:80:80 \
+  "$FAKE_GCS_IMAGE" -scheme http -port 80 >/dev/null
 
 echo "==> Waiting for emulators"
 wait_port 10000 azurite
 wait_port "$S3_EMULATOR_PORT" s3-emulator 60
-wait_port 4443 fake-gcs
+wait_port 80 fake-gcs
 # Readiness is an ACTUAL S3 CALL, not `/_localstack/health`. Measured locally:
 # the health endpoint can return 200 while S3 still answers `NoSuchBucket` for a
 # bucket that was just created, and in one run S3 was already serving before the
@@ -202,7 +209,7 @@ create_s3_bucket
 az storage container create --name "$CONTAINER_BUCKET" --connection-string "$AZURITE_CONN" >/dev/null 2>&1 \
   || echo "  (azurite container exists / az CLI missing)"
 # fake-gcs bucket (JSON API, no auth)
-curl -sf -X POST "http://127.0.0.1:4443/storage/v1/b?project=proximadb" \
+curl -sf -X POST "http://127.0.0.1:80/storage/v1/b?project=proximadb" \
   -H "Content-Type: application/json" -d "{\"name\":\"$CONTAINER_BUCKET\"}" >/dev/null 2>&1 \
   || echo "  (fake-gcs bucket exists)"
 
@@ -217,9 +224,9 @@ echo "==> Running object-store tier integration tests (scope: $SCOPE)"
 export PROXIMADB_AZURE_EMULATOR=1 AZURE_STORAGE_USE_EMULATOR=true AZURE_ALLOW_HTTP=true
 export AWS_ENDPOINT="http://127.0.0.1:$S3_EMULATOR_PORT" AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false
 export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" AWS_REGION=us-east-1
-export PROXIMADB_GCS_TEST_ENDPOINT=http://127.0.0.1:4443
+export PROXIMADB_GCS_TEST_ENDPOINT=http://localhost:80
 # The production root FileSystem GCS backend (contract tests) reads these:
-export PROXIMADB_GCS_ENDPOINT=http://127.0.0.1:4443 PROXIMADB_GCS_ANONYMOUS=1 GCP_PROJECT=proximadb
+export PROXIMADB_GCS_ENDPOINT=http://localhost:80 PROXIMADB_GCS_ANONYMOUS=1 GCP_PROJECT=proximadb
 
 if [ "$SCOPE" = "restart" ]; then
   # TD-OBJSTORE-5 S1 (ADR-063 D8 PR tier = Azurite-strict): prove full-server
@@ -346,8 +353,8 @@ if [ "$SCOPE" = "nightly" ]; then
   # failures warn and never block promotion (GCS is explicitly NOT called a gate
   # while warn-only). Runs on a schedule, off the promotion path.
   echo "==> TD-OBJSTORE-5 nightly tier: GCS (fake-gcs, gs://) — best-effort"
-  export PROXIMADB_GCS_TEST_ENDPOINT=http://127.0.0.1:4443
-  export STORAGE_EMULATOR_HOST=http://127.0.0.1:4443
+  export PROXIMADB_GCS_TEST_ENDPOINT=http://localhost:80
+  export STORAGE_EMULATOR_HOST=http://localhost:80
   if PROXIMADB_OBJECT_STORE_URL="gs://$CONTAINER_BUCKET/nightly-restart-gcs" \
     CARGO_BUILD_JOBS=1 cargo test -p proximadb-server --features cloud-full \
     --test object_store_restart_recovery \
