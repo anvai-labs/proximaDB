@@ -33,7 +33,7 @@ class SearchEntitiesResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.entity_search_result import EntitySearchResult
+        from ..models.entity_search_result import EntitySearchResult  # noqa: PLC0415
 
         results = []
         for results_item_data in self.results:
@@ -55,7 +55,7 @@ class SearchEntitiesResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.entity_search_result import EntitySearchResult
+        from ..models.entity_search_result import EntitySearchResult  # noqa: PLC0415
 
         d = dict(src_dict)
         results = []

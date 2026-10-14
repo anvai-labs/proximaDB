@@ -52,8 +52,10 @@ class TypedSearchResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.predicate_shortfall_wire import PredicateShortfallWire
-        from ..models.typed_search_result import TypedSearchResult
+        from ..models.predicate_shortfall_wire import (  # noqa: PLC0415
+            PredicateShortfallWire,
+        )
+        from ..models.typed_search_result import TypedSearchResult  # noqa: PLC0415
 
         results = []
         for results_item_data in self.results:
@@ -104,8 +106,10 @@ class TypedSearchResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.predicate_shortfall_wire import PredicateShortfallWire
-        from ..models.typed_search_result import TypedSearchResult
+        from ..models.predicate_shortfall_wire import (  # noqa: PLC0415
+            PredicateShortfallWire,
+        )
+        from ..models.typed_search_result import TypedSearchResult  # noqa: PLC0415
 
         d = dict(src_dict)
         results = []

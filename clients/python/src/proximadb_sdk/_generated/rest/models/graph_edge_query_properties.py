@@ -18,7 +18,6 @@ T = TypeVar("T", bound="GraphEdgeQueryProperties")
 
 @_attrs_define
 class GraphEdgeQueryProperties:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

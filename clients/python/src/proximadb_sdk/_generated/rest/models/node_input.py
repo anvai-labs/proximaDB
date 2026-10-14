@@ -38,8 +38,8 @@ class NodeInput:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.node_input_embedding import NodeInputEmbedding
-        from ..models.node_input_properties import NodeInputProperties
+        from ..models.node_input_embedding import NodeInputEmbedding  # noqa: PLC0415
+        from ..models.node_input_properties import NodeInputProperties  # noqa: PLC0415
 
         id = self.id
 
@@ -73,8 +73,8 @@ class NodeInput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.node_input_embedding import NodeInputEmbedding
-        from ..models.node_input_properties import NodeInputProperties
+        from ..models.node_input_embedding import NodeInputEmbedding  # noqa: PLC0415
+        from ..models.node_input_properties import NodeInputProperties  # noqa: PLC0415
 
         d = dict(src_dict)
         id = d.pop("id")

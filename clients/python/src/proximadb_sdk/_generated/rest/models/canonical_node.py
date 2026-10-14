@@ -42,8 +42,10 @@ class CanonicalNode:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.canonical_node_properties import CanonicalNodeProperties
-        from ..models.graph_embedding import GraphEmbedding
+        from ..models.canonical_node_properties import (  # noqa: PLC0415
+            CanonicalNodeProperties,
+        )
+        from ..models.graph_embedding import GraphEmbedding  # noqa: PLC0415
 
         id = self.id
 
@@ -77,8 +79,10 @@ class CanonicalNode:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.canonical_node_properties import CanonicalNodeProperties
-        from ..models.graph_embedding import GraphEmbedding
+        from ..models.canonical_node_properties import (  # noqa: PLC0415
+            CanonicalNodeProperties,
+        )
+        from ..models.graph_embedding import GraphEmbedding  # noqa: PLC0415
 
         d = dict(src_dict)
         id = d.pop("id")

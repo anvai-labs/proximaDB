@@ -1,0 +1,112 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DEPSEC-1: Dependabot security updates target `main`, which structurally cannot accept them
+:toc: macro
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open — diagnosed 2026-10-12 after the second batch of unmergeable security PRs
+| Severity | Medium-High — every security update arrives as a PR that can never merge, so the fix rate depends on someone noticing and re-applying it by hand. Nine such PRs have now been closed unmerged.
+| Component | `.github/dependabot.yml`, `.github/workflows/qa-gate.yml` (`promotion-source-guard`), `.github/workflows/branch-route-guard.yml`
+| Pillar | SECURITY / CI
+| Found | 2026-10-12
+|===
+
+toc::[]
+
+== The contradiction
+
+Every ecosystem in `.github/dependabot.yml` sets `target-branch: develop`:
+
+----
+cargo           target-branch=develop
+gomod           target-branch=develop
+npm             target-branch=develop
+pip             target-branch=develop
+github-actions  target-branch=develop
+----
+
+**`target-branch` governs version updates only. Dependabot *security* updates
+ignore it and always open against the repository's default branch** — here
+`main`.
+
+And `main` accepts exactly one PR shape. `promotion-source-guard`
+(`qa-gate.yml`) fails unless `head_ref == 'qa'`, and `branch-route-guard.yml`
+independently fails unless `HEAD_REF == 'qa'`:
+
+[source,sh]
+----
+main accepts only the exact same-repository qa -> main promotion
+(got anvai-labs/proximaDB:dependabot/npm_and_yarn/... -> main)
+----
+
+So a Dependabot security PR is unmergeable the moment it is opened. Not
+"needs review" — structurally impossible, by two independent guards that are
+both correct.
+
+== Observed cost
+
+Nine security PRs have been closed unmerged rather than merged:
+
+* **#1983–#1987** (2026-10-11) — five `ui/` advisories including two criticals
+  (`proxy-addr` IP spoofing, `shell-quote` command injection). Re-applied by
+  hand on `develop` as #1993.
+* **#1998, #1999, #2000, #2002** (2026-10-12) — `openapi-python-client`,
+  `source-map-js`, `brace-expansion`, `rustls`. Being re-applied by hand again.
+
+The pattern is the defect: **the remediation path is a human noticing an
+unmergeable PR and redoing its work on another branch.** #1999/#2000 had
+already been open for a day; they cover `clients/nodejs-embedded`, which #1993
+deliberately skipped, and nothing connected the two.
+
+Note the alerts are *not* false: `npm audit` in `clients/nodejs-embedded`
+reported 2 high before the manual fix and 0 after. The advisories are real and
+the PRs carry the right change. Only the route is wrong.
+
+== Why the obvious fixes do not work
+
+. **Set `target-branch` on the security config.** There is no separate
+  security-update config block; the key is documented as applying to version
+  updates, and security updates deliberately follow the default branch so the
+  fix lands where releases are cut.
+. **Relax the guards for `dependabot[bot]`.** This is the tempting one and it is
+  wrong. Both guards exist because content reaching `main` other than through
+  `develop → qa → main` was the cause of the severed-ancestry failures
+  (47 phantom conflicts) that `promotion-ancestry-guard` now catches. An
+  exemption would let unvalidated content onto `main` and desync `main` from
+  `qa`, which is exactly what the promotion flow guarantees against.
+. **Change the default branch to `develop`.** Security PRs would then route
+  correctly and merge through the normal `feat → develop` path. But the default
+  branch is also what clones check out, what the README renders against, and
+  what external contributors fork — pointing all of that at an integration
+  branch is a larger decision than this TD should make. **This is nonetheless
+  the only option that fixes the root cause rather than the symptom.**
+
+== Options, in preference order
+
+. **Default branch → `develop`** (root-cause fix). Security PRs then target
+  `develop` and merge normally; promotions are unaffected since they are
+  explicit `develop → qa → main` PRs. Cost: clone/fork/README semantics change,
+  and `main` stops being the branch a casual visitor sees.
+. **An automated re-router.** A scheduled workflow that, for each open
+  Dependabot PR with `base == main`, cherry-picks its commit onto a
+  `deps/<slug>` branch off `develop`, opens the develop-targeted PR, and closes
+  the original with a link. Keeps the guards intact and removes the human step
+  — which is the actual failure. Costs a workflow to own.
+. **Status quo + a standing checklist item.** What happens today. Cheapest, and
+  it has already leaked a day-old pair of advisories; the fix rate depends on
+  attention, which is not a control.
+
+Option 2 is the recommendation if option 1 is judged too invasive: it makes the
+remediation path mechanical without weakening either guard.
+
+== Verification for the fix
+
+* Open a test security-equivalent PR (or wait for the next real one) and assert
+  it lands on a branch whose route guard passes — no manual re-application.
+* `gh pr list --author app/dependabot --json baseRefName` shows **no** open PR
+  with `baseRefName == "main"`.
+* The two promotion guards remain unchanged and still reject every non-`qa`
+  head targeting `main` — whatever is done here must not be bought by weakening
+  them.

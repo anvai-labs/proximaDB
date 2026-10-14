@@ -36,8 +36,8 @@ class TsPoint:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.ts_point_tags import TsPointTags
-        from ..models.ts_point_values import TsPointValues
+        from ..models.ts_point_tags import TsPointTags  # noqa: PLC0415
+        from ..models.ts_point_values import TsPointValues  # noqa: PLC0415
 
         timestamp = self.timestamp
 
@@ -65,8 +65,8 @@ class TsPoint:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.ts_point_tags import TsPointTags
-        from ..models.ts_point_values import TsPointValues
+        from ..models.ts_point_tags import TsPointTags  # noqa: PLC0415
+        from ..models.ts_point_values import TsPointValues  # noqa: PLC0415
 
         d = dict(src_dict)
         timestamp = d.pop("timestamp")

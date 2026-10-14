@@ -3,10 +3,10 @@
 # Regenerate with `make gen-python-sdk`. Source of truth:
 # docs/openapi/proximadb-openapi.yaml. The CI gate `python-sdk-codegen-drift`
 # fails if this directory drifts from a fresh regeneration.
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphErrorBodyCode(str, Enum):
+class GraphErrorBodyCode(StrEnum):
     ALREADY_EXISTS = "ALREADY_EXISTS"
     CONSTRAINT_VIOLATION = "CONSTRAINT_VIOLATION"
     INTERNAL_ERROR = "INTERNAL_ERROR"

@@ -63,20 +63,24 @@ class CatalogEmbeddingModelRegistry:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.catalog_embedding_model_registry_aliases import (
+        from ..models.catalog_embedding_model_registry_aliases import (  # noqa: PLC0415
             CatalogEmbeddingModelRegistryAliases,
         )
-        from ..models.catalog_embedding_model_registry_deployments import (
+        from ..models.catalog_embedding_model_registry_deployments import (  # noqa: PLC0415
             CatalogEmbeddingModelRegistryDeployments,
         )
-        from ..models.catalog_embedding_model_registry_tags import (
+        from ..models.catalog_embedding_model_registry_tags import (  # noqa: PLC0415
             CatalogEmbeddingModelRegistryTags,
         )
-        from ..models.catalog_embedding_model_registry_versions import (
+        from ..models.catalog_embedding_model_registry_versions import (  # noqa: PLC0415
             CatalogEmbeddingModelRegistryVersions,
         )
-        from ..models.catalog_evaluation_evidence import CatalogEvaluationEvidence
-        from ..models.catalog_model_decision import CatalogModelDecision
+        from ..models.catalog_evaluation_evidence import (  # noqa: PLC0415
+            CatalogEvaluationEvidence,
+        )
+        from ..models.catalog_model_decision import (  # noqa: PLC0415
+            CatalogModelDecision,
+        )
 
         schema_version = self.schema_version
 
@@ -141,20 +145,24 @@ class CatalogEmbeddingModelRegistry:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.catalog_embedding_model_registry_aliases import (
+        from ..models.catalog_embedding_model_registry_aliases import (  # noqa: PLC0415
             CatalogEmbeddingModelRegistryAliases,
         )
-        from ..models.catalog_embedding_model_registry_deployments import (
+        from ..models.catalog_embedding_model_registry_deployments import (  # noqa: PLC0415
             CatalogEmbeddingModelRegistryDeployments,
         )
-        from ..models.catalog_embedding_model_registry_tags import (
+        from ..models.catalog_embedding_model_registry_tags import (  # noqa: PLC0415
             CatalogEmbeddingModelRegistryTags,
         )
-        from ..models.catalog_embedding_model_registry_versions import (
+        from ..models.catalog_embedding_model_registry_versions import (  # noqa: PLC0415
             CatalogEmbeddingModelRegistryVersions,
         )
-        from ..models.catalog_evaluation_evidence import CatalogEvaluationEvidence
-        from ..models.catalog_model_decision import CatalogModelDecision
+        from ..models.catalog_evaluation_evidence import (  # noqa: PLC0415
+            CatalogEvaluationEvidence,
+        )
+        from ..models.catalog_model_decision import (  # noqa: PLC0415
+            CatalogModelDecision,
+        )
 
         d = dict(src_dict)
         schema_version = d.pop("schema_version")

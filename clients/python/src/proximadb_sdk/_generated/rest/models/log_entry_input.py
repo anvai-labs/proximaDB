@@ -45,7 +45,7 @@ class LogEntryInput:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.log_entry_input_fields import LogEntryInputFields
+        from ..models.log_entry_input_fields import LogEntryInputFields  # noqa: PLC0415
 
         message = self.message
 
@@ -95,7 +95,7 @@ class LogEntryInput:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.log_entry_input_fields import LogEntryInputFields
+        from ..models.log_entry_input_fields import LogEntryInputFields  # noqa: PLC0415
 
         d = dict(src_dict)
         message = d.pop("message")

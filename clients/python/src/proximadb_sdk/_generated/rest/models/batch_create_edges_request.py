@@ -31,7 +31,7 @@ class BatchCreateEdgesRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.edge_input import EdgeInput
+        from ..models.edge_input import EdgeInput  # noqa: PLC0415
 
         edges = []
         for edges_item_data in self.edges:
@@ -50,7 +50,7 @@ class BatchCreateEdgesRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.edge_input import EdgeInput
+        from ..models.edge_input import EdgeInput  # noqa: PLC0415
 
         d = dict(src_dict)
         edges = []

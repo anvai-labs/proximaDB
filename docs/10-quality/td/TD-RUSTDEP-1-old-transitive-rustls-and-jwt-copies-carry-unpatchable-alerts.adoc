@@ -1,0 +1,209 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RUSTDEP-1: a HIGH alert rides an old transitive `rustls-webpki`, unfixable by any lockfile bump
+:toc: macro
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **AWS half FIXED** (one line on `aws-sdk-glue`): the HIGH `rustls-webpki` advisory and both LOW ones are closed, duplicates 117 -> 113. **GCS half still OPEN** — `jsonwebtoken 9.3.1` rides `google-cloud-storage 0.15`, which is the deliberate trade described below.
+| Severity | High — `rustls-webpki` DoS-via-panic on a malformed CRL, reachable only through the `aws`/`gcp` feature deps; no patch exists in the pinned line, so `cargo update` cannot close it
+| Component | `crates/control/proximadb-catalog/Cargo.toml` (`aws-sdk-glue` default features) and root `Cargo.toml:671` (`google-cloud-storage` 0.15). NOT the S3/Azure object-store path, which is already on the `object_store` crate.
+| Pillar | SECURITY
+| Found | 2026-10-12
+|===
+
+toc::[]
+
+== Why no PR exists for these
+
+Dependabot opens a PR when a patched version satisfies the existing requirement.
+Here it does not: the alerts are against copies pinned to a line that was never
+patched, so the tool is silent and the alerts simply accumulate. They were found
+by reading the Dependabot **alerts API** rather than the PR list — which is the
+transferable lesson: *the PR list is not the alert list.* Of 32 open alerts,
+these two had no corresponding PR.
+
+== The chains, read out of `Cargo.lock`
+
+----
+rustls-webpki 0.101.7   HIGH    vulnerable < 0.103.13, first patched 0.103.13
+    <- rustls 0.21.12
+        <- aws-smithy-http-client 1.1.13
+        <- hyper-rustls 0.24.2
+        <- tokio-rustls 0.24.1
+
+jsonwebtoken 9.3.1      MEDIUM  vulnerable < 10.3.0, first patched 10.3.0
+    <- google-cloud-auth 0.13.2
+----
+
+Two lower-severity `rustls-webpki` advisories (name-constraint handling,
+patched 0.103.12) ride the same 0.101.7 copy.
+
+**The workspace already resolves safe copies alongside** —
+`rustls-webpki 0.103.15` and `jsonwebtoken 11.0.0` are both in the lock. So this
+is not "we are on an old version"; it is "we are on an old version *as well*,
+because a second dependency subtree pins it." A `cargo update --precise` cannot
+help: `0.103.13` does not satisfy `rustls 0.21`'s `^0.101` requirement, and
+bumping `rustls` to 0.23 inside that subtree is a semver-major change its
+parents must make.
+
+== Exposure
+
+Both chains are feature-gated: `aws` / `gcp` (root `Cargo.toml` `[features]`).
+A default build does not compile them. That bounds the blast radius but does not
+remove it — those features are the cloud object-store backends, i.e. exactly the
+configuration a deployment uses, and `Cargo.lock` is what the
+`security-audit` CI job reads regardless of features.
+
+The `rustls-webpki` advisory is a panic on a malformed CRL. Our TLS paths do not
+knowingly load CRLs, so the practical reachability is likely low — but "likely
+low" is an assertion, and this TD does not try to pass it off as a measurement.
+Establishing reachability is part of the work below.
+
+== We already declare the modern versions; two subtrees drag the old ones in
+
+This is the part that makes the fix tractable. Our own direct declarations are
+already current:
+
+[source,toml]
+----
+rustls       = { version = "0.23" }   # Cargo.toml:695
+tokio-rustls = "0.26"                 # Cargo.toml:697 -- comment even says "(rustls 0.23)"
+----
+
+Neither `hyper-rustls`, `aws-smithy-http-client` nor `google-cloud-auth` is a
+direct dependency. Every old copy enters through exactly **two** roots, and one
+of them is a direct dependency of ours:
+
+----
+aws-smithy-runtime 1.11.3            (transitive, via the aws-sdk stack)
+  -> aws-smithy-http-client 1.1.13   (latest 1.5.0)
+       -> hyper-rustls 0.24.2        (latest 0.27.10; 0.26+ is on rustls 0.23)
+            -> tokio-rustls 0.24.1   (latest 0.26.6)
+                 -> rustls 0.21.12
+                      -> rustls-webpki 0.101.7     <-- HIGH
+
+google-cloud-storage 0.15.0          (DIRECT, Cargo.toml:671, behind `gcp`)
+  -> google-cloud-auth 0.13.2        (latest 1.17.0)
+       -> jsonwebtoken 9.3.1         <-- MEDIUM
+----
+
+So the whole thing reduces to two dependency moves, both of which have upstream
+releases available:
+
+. **`google-cloud-storage` 0.15 -> 1.20** (ours to change, one line, `gcp`
+  feature). It is a 0.x -> 1.x jump, so expect API churn in the GCS backend.
+. **The aws-sdk stack** (`aws-config` 1.8.18 resolved today, latest 1.12.0),
+  which should pull `aws-smithy-http-client` onto a rustls-0.23 line. Verify
+  rather than assume: the smithy crates version independently of the SDK
+  façades.
+
+== It is NOT the object-store path, and the AWS half is a feature flag
+
+Worth stating plainly, because the opposite is the natural assumption: **the
+S3 + Azure object-store path is already clean.** It migrated to the canonical
+`object_store` crate (documented at `Cargo.toml:661-665`, which explicitly
+replaced "the heavy aws-sdk-s3 tree"), and `object_store` is now pulled by 18
+workspace and DataFusion crates. No `aws-sdk-s3` remains in the lock.
+
+The 23 remaining `aws-*` crates come from somewhere else entirely:
+
+[source,toml]
+----
+# crates/control/proximadb-catalog/Cargo.toml:25,41-42
+aws          = ["dep:aws-config", "dep:aws-sdk-glue"]
+aws-config   = { version = "1.0", optional = true }
+aws-sdk-glue = { version = "1.0", optional = true }
+----
+
+That is the **AWS Glue catalog** integration — not object storage.
+
+**Probed, not assumed:** bumping the stack with
+`cargo update -p aws-config --precise 1.12.0` moves
+`aws-smithy-http-client 1.1.13 -> 1.5.0` but does **not** drop the old subtree —
+after the bump the lock still carries `rustls 0.21.12`,
+`rustls-webpki 0.101.7`, `hyper-rustls 0.24.2` and `tokio-rustls 0.24.1`
+*alongside* the modern `0.23.45` / `0.103.15` / `0.27.9` / `0.26.5`. A lock
+update alone cannot close this. (The probe was reverted; the lock in this PR is
+unchanged apart from the `rustls` patch bump.)
+
+The reason is a feature, and it is ours to turn off.
+`aws-smithy-http-client` 1.5.0 declares the legacy path as **optional and NOT
+in `default`**:
+
+----
+legacy-rustls-ring = ['dep:legacy-hyper-rustls', 'dep:legacy-rustls',
+                      'dep:rustls-native-certs', 'hyper-014']
+----
+
+and it is reached because **`aws-sdk-glue`'s own `default` features include
+`rustls`**, which maps to `aws-smithy-runtime/tls-rustls`:
+
+----
+aws-sdk-glue  default = ['rustls', 'default-https-client', 'rt-tokio']
+              rustls  = ['aws-smithy-runtime/tls-rustls']
+aws-config    default = ['default-https-client', 'rt-tokio',
+                         'credentials-process', 'sso']   # note: no `rustls`
+----
+
+So `aws-config`'s defaults are already modern; `aws-sdk-glue`'s are not.
+
+== What closing this needs
+
+. **AWS half — one manifest line.** In
+  `crates/control/proximadb-catalog/Cargo.toml`, take `aws-sdk-glue` with
+  `default-features = false` and re-add only the modern features
+  (`default-https-client`, `rt-tokio`), dropping the legacy `rustls`. Then
+  confirm `rustls 0.21.12` and `rustls-webpki 0.101.7` leave the lock and the
+  Glue catalog path still builds and passes its tests. This closes the **HIGH**
+  alert and both **LOW** ones.
+. **GCS half — a real decision, and the only genuine object-store debt here.**
+  `google-cloud-storage = "0.15"` (`Cargo.toml:671`, feature `gcp`) is five
+  majors behind (latest 1.20.0) and carries the `jsonwebtoken 9.3.1` alert. The
+  pin is *deliberate* and documented: `object_store`'s GCS backend speaks the
+  XML API, which `fake-gcs-server` — our test emulator — does not serve, so it
+  would be locally unverifiable. That reason is still valid, which makes this a
+  trade to weigh rather than an oversight: bump the SDK 0.15 -> 1.20 and absorb
+  the 0.x -> 1.x API churn in the GCS backend, or revisit the
+  `object_store`-for-GCS decision (and with it the emulator choice) so GCS
+  joins S3/Azure on one backend. Either way it is the last object-store
+  dependency not yet unified.
+. If either is deferred, record the decision explicitly so the alert is
+  *accepted* rather than silently ignored.
+
+== AWS half: done, and what it measured
+
+`default-features = false` on `aws-sdk-glue` (re-adding only
+`default-https-client` + `rt-tokio`) removed the entire legacy subtree:
+
+----
+rustls         0.21.12 + 0.23.45  ->  0.23.45
+rustls-webpki  0.101.7 + 0.103.15 ->  0.103.15     <- HIGH + 2 LOW closed
+hyper-rustls   0.24.2  + 0.27.9   ->  0.27.9
+tokio-rustls   0.24.1  + 0.26.6   ->  0.26.6
+sct            removed entirely (only reachable via rustls 0.21)
+duplicated crates  117 -> 113
+----
+
+**Glue did not lose TLS, it gained the modern stack.** Verified by resolving the
+tree rather than inferring from a green build:
+`aws-smithy-http-client` now resolves with
+`['__rustls', 'default-client', 'rustls-aws-lc']` and reaches
+`hyper-rustls 0.27.9 -> rustls 0.23.45 -> rustls-webpki 0.103.15`. So
+`default-https-client` routes through `rustls-aws-lc`; only the *legacy* path
+was dropped.
+
+`cargo check -p proximadb-catalog --features aws --all-targets` is clean and
+`cargo test -p proximadb-catalog --features aws` passes 477 + 1 + 16 + 3 (9
+ignored). A whole-lock backwards-version scan reports **0** packages moving
+backwards — the guard TD-AUDITGATE-1 proposes, run by hand here because a
+reverted security bump is exactly how #2004 regressed earlier the same day.
+
+== Verification for the fix
+
+* `gh api repos/anvai-labs/proximaDB/dependabot/alerts?state=open` no longer
+  lists `rustls-webpki` or `jsonwebtoken`.
+* `grep -A1 '^name = "rustls"$' Cargo.lock` shows a single version.
+* `cargo check --features aws,gcp` and the object-store emulator CI lane stay
+  green — the point is to remove the old subtree, not to break the backends.

@@ -558,6 +558,12 @@ fn lower_select(
                     input: Box::new(plan),
                 };
             }
+            // `SELECT ALL` is the explicit spelling of the default: sqlparser
+            // documents `Distinct::All` as "keep duplicate rows", and omission
+            // is `None`, not `All`. So this adds NO node -- emitting a Distinct
+            // would silently dedup a query that asked not to be, and declining
+            // it would reject valid ANSI SQL.
+            Distinct::All => {}
             Distinct::On(_) => {
                 return Err(FrontendError::Unsupported("DISTINCT ON".into()));
             }
@@ -1191,6 +1197,16 @@ fn lower_projection_items(
                     name: alias.value.clone(),
                     expr: e,
                 });
+            }
+            // `expr AS (a1, a2, ...)` -- a Spark SQL extension for
+            // table-generating functions, not ANSI SQL. One expression binds
+            // several output names, which this projection model (one NamedExpr
+            // per item) cannot represent. Declined explicitly rather than
+            // collapsed to the first alias, which would silently drop columns.
+            SelectItem::ExprWithAliases { .. } => {
+                return Err(FrontendError::Unsupported(
+                    "multi-alias select item (`expr AS (a, b)`)".into(),
+                ));
             }
             SelectItem::Wildcard(_) => {
                 // SELECT * → expand to every column in the BASE scope only.
@@ -1961,6 +1977,14 @@ fn lower_projection_with_aggregates(
             SelectItem::QualifiedWildcard(_, _) => {
                 return Err(FrontendError::Unsupported("qualified wildcard".into()));
             }
+            // As in the projection path: Spark's `expr AS (a, b)` binds one
+            // expression to several names, which this aggregate model cannot
+            // express either.
+            SelectItem::ExprWithAliases { .. } => {
+                return Err(FrontendError::Unsupported(
+                    "multi-alias select item (`expr AS (a, b)`)".into(),
+                ));
+            }
         };
         match &sql_expr {
             SqlExpr::Function(f) if is_aggregate_function_name(&f.name) => {
@@ -2488,6 +2512,15 @@ fn lower_aggregate_call(
                     }
                     FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(None),
                     FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => Ok(None),
+                    // `HASH(* EXCLUDE(col))` -- a Snowflake extension. The
+                    // options SELECT which columns the wildcard covers, so
+                    // folding this into the bare-wildcard arm (`Ok(None)`)
+                    // would aggregate over columns the query excluded.
+                    FunctionArg::Unnamed(FunctionArgExpr::WildcardWithOptions(_)) => {
+                        Err(FrontendError::Unsupported(
+                            "wildcard with options in aggregate argument".into(),
+                        ))
+                    }
                     FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
                         Err(FrontendError::Unsupported("named function arg".into()))
                     }

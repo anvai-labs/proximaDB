@@ -18,7 +18,6 @@ T = TypeVar("T", bound="CapabilitiesResponseErrorEnvelope")
 
 @_attrs_define
 class CapabilitiesResponseErrorEnvelope:
-    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

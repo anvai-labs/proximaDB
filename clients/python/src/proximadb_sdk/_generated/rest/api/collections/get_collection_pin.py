@@ -66,10 +66,10 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[PinResponse]:
-    r"""Read a collection's pin state.
+    """Read a collection's pin state.
 
-     200 with `status: \"pinned\"` + state when pinned; 200 with
-    `status: \"unpinned\"` when not pinned.
+     200 with `status: "pinned"` + state when pinned; 200 with
+    `status: "unpinned"` when not pinned.
     The optional `X-Tenant-ID` header is not consulted by this
     handler (the pin registry is collection-keyed, not
     tenant-scoped).
@@ -104,10 +104,10 @@ def sync(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> PinResponse | None:
-    r"""Read a collection's pin state.
+    """Read a collection's pin state.
 
-     200 with `status: \"pinned\"` + state when pinned; 200 with
-    `status: \"unpinned\"` when not pinned.
+     200 with `status: "pinned"` + state when pinned; 200 with
+    `status: "unpinned"` when not pinned.
     The optional `X-Tenant-ID` header is not consulted by this
     handler (the pin registry is collection-keyed, not
     tenant-scoped).
@@ -137,10 +137,10 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[PinResponse]:
-    r"""Read a collection's pin state.
+    """Read a collection's pin state.
 
-     200 with `status: \"pinned\"` + state when pinned; 200 with
-    `status: \"unpinned\"` when not pinned.
+     200 with `status: "pinned"` + state when pinned; 200 with
+    `status: "unpinned"` when not pinned.
     The optional `X-Tenant-ID` header is not consulted by this
     handler (the pin registry is collection-keyed, not
     tenant-scoped).
@@ -173,10 +173,10 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     x_tenant_id: str | Unset = UNSET,
 ) -> PinResponse | None:
-    r"""Read a collection's pin state.
+    """Read a collection's pin state.
 
-     200 with `status: \"pinned\"` + state when pinned; 200 with
-    `status: \"unpinned\"` when not pinned.
+     200 with `status: "pinned"` + state when pinned; 200 with
+    `status: "unpinned"` when not pinned.
     The optional `X-Tenant-ID` header is not consulted by this
     handler (the pin registry is collection-keyed, not
     tenant-scoped).

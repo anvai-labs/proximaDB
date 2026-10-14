@@ -34,8 +34,8 @@ class FusionSearchResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.fusion_hit import FusionHit
-        from ..models.fusion_stats_dto import FusionStatsDto
+        from ..models.fusion_hit import FusionHit  # noqa: PLC0415
+        from ..models.fusion_stats_dto import FusionStatsDto  # noqa: PLC0415
 
         results = []
         for results_item_data in self.results:
@@ -57,8 +57,8 @@ class FusionSearchResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.fusion_hit import FusionHit
-        from ..models.fusion_stats_dto import FusionStatsDto
+        from ..models.fusion_hit import FusionHit  # noqa: PLC0415
+        from ..models.fusion_stats_dto import FusionStatsDto  # noqa: PLC0415
 
         d = dict(src_dict)
         results = []

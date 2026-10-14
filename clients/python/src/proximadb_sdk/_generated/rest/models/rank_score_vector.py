@@ -35,7 +35,7 @@ class RankScoreVector:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.score_component import ScoreComponent
+        from ..models.score_component import ScoreComponent  # noqa: PLC0415
 
         primary = self.primary
 
@@ -63,7 +63,7 @@ class RankScoreVector:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.score_component import ScoreComponent
+        from ..models.score_component import ScoreComponent  # noqa: PLC0415
 
         d = dict(src_dict)
         primary = d.pop("primary")

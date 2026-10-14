@@ -90,10 +90,10 @@ def sync_detailed(
     body: AbacPostGrantRequest,
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[AbacOperatorErrorResponse | AbacPostGrantResponse]:
-    r"""Provision an ADR-090 grant (cross-tenant entitlement).
+    """Provision an ADR-090 grant (cross-tenant entitlement).
 
-     Grants are the entitlement layer: \"this grantee may perform these
-    actions on this resource\", where the grantee MAY be a foreign
+     Grants are the entitlement layer: "this grantee may perform these
+    actions on this resource", where the grantee MAY be a foreign
     tenant or a foreign tenant's user — the one place cross-tenant
     sharing is expressible. Both the owner and the grantee tenant must
     resolve (fail-closed on unminted tenants); the grantee subject is
@@ -132,10 +132,10 @@ def sync(
     body: AbacPostGrantRequest,
     x_tenant_id: str | Unset = UNSET,
 ) -> AbacOperatorErrorResponse | AbacPostGrantResponse | None:
-    r"""Provision an ADR-090 grant (cross-tenant entitlement).
+    """Provision an ADR-090 grant (cross-tenant entitlement).
 
-     Grants are the entitlement layer: \"this grantee may perform these
-    actions on this resource\", where the grantee MAY be a foreign
+     Grants are the entitlement layer: "this grantee may perform these
+    actions on this resource", where the grantee MAY be a foreign
     tenant or a foreign tenant's user — the one place cross-tenant
     sharing is expressible. Both the owner and the grantee tenant must
     resolve (fail-closed on unminted tenants); the grantee subject is
@@ -169,10 +169,10 @@ async def asyncio_detailed(
     body: AbacPostGrantRequest,
     x_tenant_id: str | Unset = UNSET,
 ) -> Response[AbacOperatorErrorResponse | AbacPostGrantResponse]:
-    r"""Provision an ADR-090 grant (cross-tenant entitlement).
+    """Provision an ADR-090 grant (cross-tenant entitlement).
 
-     Grants are the entitlement layer: \"this grantee may perform these
-    actions on this resource\", where the grantee MAY be a foreign
+     Grants are the entitlement layer: "this grantee may perform these
+    actions on this resource", where the grantee MAY be a foreign
     tenant or a foreign tenant's user — the one place cross-tenant
     sharing is expressible. Both the owner and the grantee tenant must
     resolve (fail-closed on unminted tenants); the grantee subject is
@@ -209,10 +209,10 @@ async def asyncio(
     body: AbacPostGrantRequest,
     x_tenant_id: str | Unset = UNSET,
 ) -> AbacOperatorErrorResponse | AbacPostGrantResponse | None:
-    r"""Provision an ADR-090 grant (cross-tenant entitlement).
+    """Provision an ADR-090 grant (cross-tenant entitlement).
 
-     Grants are the entitlement layer: \"this grantee may perform these
-    actions on this resource\", where the grantee MAY be a foreign
+     Grants are the entitlement layer: "this grantee may perform these
+    actions on this resource", where the grantee MAY be a foreign
     tenant or a foreign tenant's user — the one place cross-tenant
     sharing is expressible. Both the owner and the grantee tenant must
     resolve (fail-closed on unminted tenants); the grantee subject is

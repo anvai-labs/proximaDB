@@ -31,7 +31,7 @@ class BulkMetricIngestRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.metric_sample_input import MetricSampleInput
+        from ..models.metric_sample_input import MetricSampleInput  # noqa: PLC0415
 
         metrics = []
         for metrics_item_data in self.metrics:
@@ -50,7 +50,7 @@ class BulkMetricIngestRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.metric_sample_input import MetricSampleInput
+        from ..models.metric_sample_input import MetricSampleInput  # noqa: PLC0415
 
         d = dict(src_dict)
         metrics = []

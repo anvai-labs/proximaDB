@@ -819,9 +819,23 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                 Statement::Insert(insert) => match &insert.table {
                     TableObject::TableName(name) => self.push_relation_unconditionally(name),
                     TableObject::TableFunction(function) => self.push_function(function),
+                    // `INSERT INTO (SELECT ...)` -- new in sqlparser 0.62. The
+                    // target is a query, not a named relation, so there is no
+                    // catalog target to push HERE; relations inside it are
+                    // still collected, because this collector also implements
+                    // `pre_visit_query` / `pre_visit_table_factor` and the
+                    // traversal descends into the nested query either way.
+                    //
+                    // Measured: the pinned GenericDialect rejects this syntax
+                    // outright, so the arm exists for exhaustiveness and is
+                    // unreachable today. See
+                    // `insert_into_query_target_still_reports_the_nested_relations`.
+                    TableObject::TableQuery(_) => {}
                 },
-                Statement::Update { table, .. } => {
-                    self.push_table_factor_unconditionally(&table.relation);
+                // 0.62 moved the fields into a named struct; the field names
+                // themselves are unchanged.
+                Statement::Update(update) => {
+                    self.push_table_factor_unconditionally(&update.table.relation);
                 }
                 Statement::Delete(delete) => {
                     if delete.tables.is_empty() {
@@ -839,8 +853,8 @@ pub(crate) fn collect_sql_catalog_targets(sql: &str, targets: &mut Vec<String>) 
                         }
                     }
                 }
-                Statement::Merge { table, .. } => {
-                    self.push_table_factor_unconditionally(table);
+                Statement::Merge(merge) => {
+                    self.push_table_factor_unconditionally(&merge.table);
                 }
                 Statement::Call(function) => {
                     self.push_function(function);
@@ -1250,6 +1264,52 @@ mod tests {
             let mut trailing = Vec::new();
             collect_sql_catalog_targets(malformed, &mut trailing);
             assert!(trailing.is_empty(), "{malformed}: {trailing:?}");
+        }
+    }
+
+    #[test]
+    fn insert_into_query_target_still_reports_the_nested_relations() {
+        // `TableObject::TableQuery` is new in sqlparser 0.62 and the
+        // `Statement::Insert` arm handles it by pushing nothing -- the target is
+        // a query, not a named relation. That is only correct if the nested
+        // relations are still discovered by traversal, which this collector
+        // does via `pre_visit_query` / `pre_visit_table_factor`. Assert the
+        // CONSEQUENCE rather than trusting the comment: a statement whose only
+        // relation sits inside the query target must still be reported.
+        let mut targets = Vec::new();
+        collect_sql_catalog_targets(
+            "INSERT INTO nested_sink SELECT * FROM inner_src",
+            &mut targets,
+        );
+        targets.sort();
+        assert!(
+            targets.iter().any(|t| t.ends_with("inner_src")),
+            "the INSERT source relation must be reported: {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|t| t.ends_with("nested_sink")),
+            "the INSERT target relation must be reported: {targets:?}"
+        );
+
+        // MEASURED: the pinned GenericDialect REJECTS the query-target form
+        // ("sql parser error: Expected: identifier"), so
+        // `TableObject::TableQuery` is unreachable through this path today and
+        // the assertion below does not fire. It is kept deliberately as a
+        // tripwire: if the dialect is ever broadened, this starts asserting
+        // that a query-shaped target still surfaces its relations, instead of
+        // the empty arm silently dropping them.
+        let mut query_target = Vec::new();
+        collect_sql_catalog_targets(
+            "INSERT INTO (SELECT * FROM routed_tbl) SELECT * FROM feed_tbl",
+            &mut query_target,
+        );
+        // Vacuous today by the measurement above -- not an oversight.
+        if !query_target.is_empty() {
+            assert!(
+                query_target.iter().any(|t| t.ends_with("feed_tbl"))
+                    || query_target.iter().any(|t| t.ends_with("routed_tbl")),
+                "a parsed query-target INSERT must still surface its relations: {query_target:?}"
+            );
         }
     }
 
