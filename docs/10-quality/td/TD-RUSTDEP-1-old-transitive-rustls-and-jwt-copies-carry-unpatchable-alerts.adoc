@@ -318,4 +318,9 @@ exists to catch exactly this (TD-OBJSTORE-4 S1) caught exactly this.
   not to break the backends. The lane was **re-run to EXIT=0 after the
   wire-gap accommodations above** (known-crc32c writes, port-80 emulator,
   camelCase list token), i.e. the final state of this PR is verified
-  end-to-end, not just the first cut.
+  end-to-end, not just the first cut. Honest caveat: the contract lane runs
+  fake-gcs in NON-STRICT mode (the tests warn that it lacks
+  ifGenerationMatch=0 enforcement), so the 409/412 → `AlreadyExists` mapping
+  is NOT wire-exercised by the emulator; its correctness rests on the
+  SDK-source evidence (gaxi's `to_http_error` populating
+  `http_status_code()`), not on the emulator run.

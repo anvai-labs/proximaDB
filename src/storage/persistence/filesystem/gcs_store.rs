@@ -515,9 +515,17 @@ impl FileSystem for GcsFileSystem {
             .map_err(|e| Self::net("GCS local file metadata", e))?
             .len();
         if bytes == 0 {
-            self.data
+            // Tier rides every write path, including this one (review nit:
+            // a zero-byte spill with an explicit tier must not fall back to
+            // the bucket default).
+            let mut builder = self
+                .data
                 .write_object(Self::bucket_param(&bucket), &object, bytes::Bytes::new())
-                .with_known_crc32c(0u32) // crc32c of the empty payload
+                .with_known_crc32c(0u32); // crc32c of the empty payload
+            if let Some(tier) = options.as_ref().and_then(FileOptions::access_tier) {
+                builder = builder.set_storage_class(tier.as_gcs_storage_class());
+            }
+            builder
                 .send_unbuffered()
                 .await
                 .map_err(|e| Self::net("GCS empty upload", e))?;
@@ -600,8 +608,12 @@ impl FileSystem for GcsFileSystem {
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
         let (bucket, object) = Self::parse(path)?;
-        // A failed metadata GET (auth/quota/…) reports `false` — same
-        // swallow-the-error contract the 0.x backend had (`is_ok()`).
+        // Fail-closed: only a well-formed "not found" answer is `false`; any
+        // other failure (auth, quota, 5xx) propagates as `Err`. Deliberately
+        // NOT the 0.x backend's `is_ok()` contract, which reported an auth
+        // outage as "object does not exist" — the object_store-based S3
+        // sibling propagates too, and a caching/skip decision built on a
+        // lying `false` is worse than a surfaced error.
         Ok(self.json.get_object(&bucket, &object).await?.is_some())
     }
 
@@ -629,9 +641,21 @@ impl FileSystem for GcsFileSystem {
         // Ops/test hook: pin the page size to force multi-page traversal —
         // the pagination regression net (TD-OBJSTORE-4 S1). Unset ⇒ service
         // default page.
-        let max_results = std::env::var("PROXIMADB_GCS_LIST_PAGE_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok());
+        let max_results = match std::env::var("PROXIMADB_GCS_LIST_PAGE_SIZE") {
+            Ok(v) => match v.parse::<i32>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    // A typo must not silently revert to the service-default
+                    // page and defeat the multi-page traversal this variable
+                    // exists to exercise.
+                    tracing::warn!(
+                        "PROXIMADB_GCS_LIST_PAGE_SIZE={v:?} is not an integer; ignoring"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
         self.list_paginated(path, max_results).await
     }
 
