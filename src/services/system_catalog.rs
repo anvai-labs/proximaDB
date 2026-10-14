@@ -253,7 +253,7 @@ impl SystemCatalog {
 
     fn allocate_bounded(&self, floor: &AtomicU64, max: u64, label: &str) -> Result<u64> {
         floor
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |id| {
                 (id > 0 && id <= max).then(|| id.checked_add(1)).flatten()
             })
             .map_err(|_| anyhow!("{label} id space exhausted"))

@@ -250,8 +250,8 @@ pub fn read_from<R: Read>(r: &mut R) -> Result<PersistedStore, TurboQuantError> 
     let mut scales_bytes = vec![0u8; expected_scales_bytes];
     r.read_exact(&mut scales_bytes).map_err(io_err)?;
     let mut scales = Vec::with_capacity(n_vectors);
-    for chunk in scales_bytes.chunks_exact(4) {
-        scales.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in scales_bytes.as_chunks::<4>().0 {
+        scales.push(f32::from_le_bytes(*chunk));
     }
 
     let calibration = if matches!(calibration_mode, CalibrationMode::TqPlus) {
@@ -259,11 +259,11 @@ pub fn read_from<R: Read>(r: &mut R) -> Result<PersistedStore, TurboQuantError> 
         r.read_exact(&mut cal_bytes).map_err(io_err)?;
         let mut shift = Vec::with_capacity(dim);
         let mut scale_tq = Vec::with_capacity(dim);
-        for chunk in cal_bytes[..dim * 4].chunks_exact(4) {
-            shift.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in cal_bytes[..dim * 4].as_chunks::<4>().0 {
+            shift.push(f32::from_le_bytes(*chunk));
         }
-        for chunk in cal_bytes[dim * 4..].chunks_exact(4) {
-            scale_tq.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in cal_bytes[dim * 4..].as_chunks::<4>().0 {
+            scale_tq.push(f32::from_le_bytes(*chunk));
         }
         Some(Calibration { shift, scale_tq })
     } else {
@@ -484,8 +484,8 @@ pub fn read_id_map_from<R: Read>(r: &mut R) -> Result<PersistedIdMap, TurboQuant
     let mut scales_bytes = vec![0u8; expected_scales_bytes];
     r.read_exact(&mut scales_bytes).map_err(io_err)?;
     let mut scales = Vec::with_capacity(n_vectors);
-    for chunk in scales_bytes.chunks_exact(4) {
-        scales.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in scales_bytes.as_chunks::<4>().0 {
+        scales.push(f32::from_le_bytes(*chunk));
     }
 
     let calibration = if matches!(calibration_mode, CalibrationMode::TqPlus) {
@@ -493,11 +493,11 @@ pub fn read_id_map_from<R: Read>(r: &mut R) -> Result<PersistedIdMap, TurboQuant
         r.read_exact(&mut cal_bytes).map_err(io_err)?;
         let mut shift = Vec::with_capacity(dim);
         let mut scale_tq = Vec::with_capacity(dim);
-        for chunk in cal_bytes[..dim * 4].chunks_exact(4) {
-            shift.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in cal_bytes[..dim * 4].as_chunks::<4>().0 {
+            shift.push(f32::from_le_bytes(*chunk));
         }
-        for chunk in cal_bytes[dim * 4..].chunks_exact(4) {
-            scale_tq.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in cal_bytes[dim * 4..].as_chunks::<4>().0 {
+            scale_tq.push(f32::from_le_bytes(*chunk));
         }
         Some(Calibration { shift, scale_tq })
     } else {
@@ -508,8 +508,8 @@ pub fn read_id_map_from<R: Read>(r: &mut R) -> Result<PersistedIdMap, TurboQuant
     let mut id_bytes = vec![0u8; n_vectors * 8];
     r.read_exact(&mut id_bytes).map_err(io_err)?;
     let mut ids = Vec::with_capacity(n_vectors);
-    for chunk in id_bytes.chunks_exact(8) {
-        ids.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+    for chunk in id_bytes.as_chunks::<8>().0 {
+        ids.push(u64::from_le_bytes(*chunk));
     }
     // Reject duplicate IDs in the persisted footer — corresponds to the
     // in-memory `id_to_slot` HashMap uniqueness invariant.

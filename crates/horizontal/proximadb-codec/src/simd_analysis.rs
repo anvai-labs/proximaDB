@@ -55,8 +55,7 @@ unsafe fn simd_min_max_f32_avx2(data: &[f32]) -> (f32, f32) {
         let mut min_vec = _mm256_set1_ps(f32::INFINITY);
         let mut max_vec = _mm256_set1_ps(f32::NEG_INFINITY);
 
-        let chunks = data.chunks_exact(8);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = data.as_chunks::<8>();
 
         // Process 8 f32 values per iteration
         for chunk in chunks {
@@ -136,8 +135,7 @@ unsafe fn simd_min_max_f32_neon(data: &[f32]) -> (f32, f32) {
         let mut min_vec = vdupq_n_f32(f32::INFINITY);
         let mut max_vec = vdupq_n_f32(f32::NEG_INFINITY);
 
-        let chunks = data.chunks_exact(4);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = data.as_chunks::<4>();
 
         // Process 4 f32 values per iteration (NEON is 128-bit)
         for chunk in chunks {
@@ -203,8 +201,7 @@ unsafe fn simd_zero_count_f32_avx2(data: &[f32], threshold: f32) -> usize {
         let neg_threshold_vec = _mm256_set1_ps(-threshold);
         let mut count = 0;
 
-        let chunks = data.chunks_exact(8);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = data.as_chunks::<8>();
 
         for chunk in chunks {
             let vals = _mm256_loadu_ps(chunk.as_ptr());
@@ -235,8 +232,7 @@ unsafe fn simd_zero_count_f32_neon(data: &[f32], threshold: f32) -> usize {
         let neg_threshold_vec = vdupq_n_f32(-threshold);
         let mut count = 0;
 
-        let chunks = data.chunks_exact(4);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = data.as_chunks::<4>();
 
         for chunk in chunks {
             let vals = vld1q_f32(chunk.as_ptr());

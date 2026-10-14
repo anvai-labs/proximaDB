@@ -567,11 +567,10 @@ impl ParquetReconstructor {
 
             // Convert bytes back to f32 vector
             let vector: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-                    f32::from_le_bytes(arr)
-                })
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
 
             if !vector.is_empty() {

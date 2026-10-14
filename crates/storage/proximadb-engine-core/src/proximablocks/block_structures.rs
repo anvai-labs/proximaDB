@@ -4666,9 +4666,8 @@ impl ProximaDataBlock {
                     }
 
                     let mut decoded = Vec::with_capacity(vector_count * dimension);
-                    for chunk in raw_data.chunks_exact(4) {
-                        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        decoded.push(value);
+                    for chunk in raw_data.as_chunks::<4>().0 {
+                        decoded.push(f32::from_le_bytes(*chunk));
                     }
                     trace!("🔧 [DECODE_FV] Fallback decoded {} floats", decoded.len());
                     decoded

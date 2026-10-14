@@ -144,7 +144,7 @@ jobs:
 
       # Advisory, matching the clippy and documentation steps above. Formatting
       # is authoritatively gated by `Rust Format` in ci.yml, which pins
-      # `dtolnay/rust-toolchain@1.95.0` to match rust-toolchain.toml and is in
+      # `dtolnay/rust-toolchain@1.99.0` to match rust-toolchain.toml and is in
       # `ci-success`'s needs, i.e. merge-blocking. This step adds nothing on
       # `stable` beyond duplicating that gate with a different toolchain, and on
       # `nightly` it checks a moving target: it was the one hard-failing step in
@@ -470,10 +470,11 @@ jobs:
         run: |
           cargo install cargo-audit --locked
 
+      # TD-AUDITGATE-1: enforcing since 2026-10 — same rationale as the
+      # ci.yml Security Audit job; tolerated set lives in .cargo/audit.toml.
       - name: Run security audit
-        continue-on-error: true
         run: |
-          cargo audit || echo "::warning::Security audit found vulnerabilities - review required"
+          cargo audit -D warnings --no-yanked
 
       - name: Check for unsafe code
         run: |

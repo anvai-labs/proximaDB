@@ -343,8 +343,8 @@ fn read_vector_row(
     vector: &mut [f32],
 ) -> Result<()> {
     reader.read_exact(input_bytes)?;
-    for (value, bytes) in vector.iter_mut().zip(input_bytes.chunks_exact(4)) {
-        *value = f32::from_le_bytes(bytes.try_into()?);
+    for (value, bytes) in vector.iter_mut().zip(input_bytes.as_chunks::<4>().0) {
+        *value = f32::from_le_bytes(*bytes);
     }
     Ok(())
 }

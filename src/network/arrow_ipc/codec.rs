@@ -853,11 +853,10 @@ impl ArrowProtoCodec {
         }
 
         Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| {
-                let arr = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                f32::from_le_bytes(arr)
-            })
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect())
     }
 

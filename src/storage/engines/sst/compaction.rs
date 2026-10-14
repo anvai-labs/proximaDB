@@ -676,10 +676,8 @@ impl Compaction {
         let resolver: Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver> =
             if let Some(resolver) = self.precision_resolver.get() {
                 Arc::clone(resolver)
-            } else if let Some(resolver) = get_global_precision_resolver() {
-                Arc::clone(resolver)
             } else {
-                return None;
+                Arc::clone(get_global_precision_resolver()?)
             };
         let table_id = Self::collection_to_table_identifier(collection);
         match resolver.resolve(&table_id).await {

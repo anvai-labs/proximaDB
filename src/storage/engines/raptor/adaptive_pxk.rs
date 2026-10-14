@@ -619,8 +619,8 @@ impl PxKStorageImpl for SparseCoverageStorage {
                 let range = if max > min { max - min } else { 1.0 };
 
                 let mut distances = Vec::new();
-                for chunk in compressed[8..].chunks_exact(2) {
-                    let quantized = u16::from_le_bytes([chunk[0], chunk[1]]);
+                for chunk in compressed[8..].as_chunks::<2>().0 {
+                    let quantized = u16::from_le_bytes(*chunk);
                     let normalized = quantized as f32 / 65535.0;
                     distances.push(min + normalized * range);
                 }

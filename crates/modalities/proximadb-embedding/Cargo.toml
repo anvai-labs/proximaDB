@@ -101,7 +101,7 @@ crossbeam-queue = "0.3"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 
 # Tokenization (BPE / WordPiece) — used for chunking and pre-embedding token counts
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 
 # Optional ONNX Runtime via the `ort` crate. The `download-binaries` feature
 # fetches a prebuilt ONNX Runtime shared library at build time so the binary

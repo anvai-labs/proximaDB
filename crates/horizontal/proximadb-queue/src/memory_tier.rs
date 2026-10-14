@@ -100,7 +100,7 @@ impl PartitionMemory {
         let offset =
             match self
                 .next_offset
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     next.checked_add(1)
                 }) {
                 Ok(offset) => offset,
@@ -125,6 +125,7 @@ impl PartitionMemory {
         self.enqueue_at(message, offset).await
     }
 
+    #[allow(clippy::result_large_err)] // same Err(Message) as the public wrappers above
     async fn enqueue_at(
         self: &Arc<Self>,
         message: Message,

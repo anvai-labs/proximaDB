@@ -1017,8 +1017,10 @@ impl UnifiedQuantizationEngine {
         }
 
         Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect())
     }
 
@@ -1153,14 +1155,11 @@ impl UnifiedQuantizationEngine {
                 let mut result = vec![0.0; dimension];
 
                 // Assume bytes encode (index, value) pairs
-                for chunk in bytes.chunks_exact(5) {
-                    if chunk.len() == 5 {
-                        let idx =
-                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
-                        let val = chunk[4] as f32 / 255.0;
-                        if idx < dimension {
-                            result[idx] = val;
-                        }
+                for chunk in bytes.as_chunks::<5>().0 {
+                    let idx = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
+                    let val = chunk[4] as f32 / 255.0;
+                    if idx < dimension {
+                        result[idx] = val;
                     }
                 }
 
@@ -1573,8 +1572,10 @@ impl UnifiedQuantizationEngine {
     /// Helper to convert bytes back to f32 vector
     fn bytes_to_f32(&self, bytes: &[u8]) -> Vec<f32> {
         bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect()
     }
 

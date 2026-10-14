@@ -453,3 +453,342 @@ class PromotionConcurrencyContractTest(unittest.TestCase):
         findings: list[contract.Finding] = []
         contract.check_promotion_concurrency(findings)
         self.assertEqual(findings, [], [f.message for f in findings])
+
+
+class DockerFilterContractTest(unittest.TestCase):
+    """Every Dockerfile a workflow `file:`-builds must trip the `docker` filter.
+
+    TD-DOCKCI-1: the old filter (`Dockerfile*`, `docker-compose*.yml`,
+    `.dockerignore`) matched top-level paths only, so `deploy/docker/**` --
+    the Dockerfile CI actually builds -- SKIPPED docker-build, while root
+    `Dockerfile` edits (nothing builds it) burned a ~38-minute job. Each test
+    pins one direction of that inversion.
+    """
+
+    def findings_for(
+        self, ci_text: str, extra_workflows: dict[str, str] | None = None
+    ) -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workflows = root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            (workflows / "ci.yml").write_text(ci_text, encoding="utf-8")
+            for name, text in (extra_workflows or {}).items():
+                (workflows / name).write_text(text, encoding="utf-8")
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_docker_filter_covers_build_targets(findings)
+                return findings
+
+    def test_the_checked_in_workflows_pass(self) -> None:
+        ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        publish = (REPO_ROOT / ".github/workflows/publish-image.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            self.findings_for(ci, {"publish-image.yml": publish}),
+            [],
+        )
+
+    def test_the_old_top_level_filter_is_rejected(self) -> None:
+        """The exact filter TD-DOCKCI-1 was filed against must stay rejected."""
+        ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        mutated = ci.replace(
+            "- 'deploy/docker/**'", "- 'Dockerfile*'", 1
+        )
+        self.assertNotEqual(mutated, ci, "sanity: the mutation must apply")
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any("deploy/docker/Dockerfile" in f.message for f in findings),
+            findings,
+        )
+
+    def test_a_dockerfile_outside_every_pattern_is_rejected(self) -> None:
+        ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        other = (
+            "jobs:\n"
+            "  demo:\n"
+            "    steps:\n"
+            "      - uses: docker/build-push-action@v7\n"
+            "        with:\n"
+            "          file: demo/config/Dockerfile\n"
+        )
+        findings = self.findings_for(ci, {"demo.yml": other})
+        self.assertTrue(
+            any("demo/config/Dockerfile" in f.message for f in findings),
+            findings,
+        )
+
+    def test_a_dockerfile_under_the_glob_directory_is_matched(self) -> None:
+        ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        other = (
+            "jobs:\n"
+            "  nested:\n"
+            "    steps:\n"
+            "      - uses: docker/build-push-action@v7\n"
+            "        with:\n"
+            "          file: deploy/docker/sub/Dockerfile\n"
+        )
+        self.assertEqual(self.findings_for(ci, {"nested.yml": other}), [])
+
+    def test_a_non_dockerfile_file_target_is_not_flagged(self) -> None:
+        ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        other = (
+            "jobs:\n"
+            "  pack:\n"
+            "    steps:\n"
+            "      - uses: docker/build-push-action@v7\n"
+            "        with:\n"
+            "          file: demo/config/bundle.tar\n"
+        )
+        self.assertEqual(self.findings_for(ci, {"pack.yml": other}), [])
+
+    def test_a_missing_docker_filter_is_rejected(self) -> None:
+        ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        # Anchor on the filter KEY LINE: a bare `ci.replace("docker:", ...)`
+        # would hit the outputs mapping at line 105 instead.
+        anchor = "docker:\n              - 'deploy/docker/**'"
+        self.assertIn(anchor, ci, "sanity: the filter key line is where expected")
+        mutated = ci.replace(anchor, "docke_removed:\n              - 'deploy/docker/**'", 1)
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any("no `docker:` path filter" in f.message for f in findings),
+            findings,
+        )
+
+    def test_the_matcher_keeps_the_top_level_trap_a_trap(self) -> None:
+        """`Dockerfile*` must NOT match deploy/docker/Dockerfile.
+
+        picomatch matches slash-less patterns against top-level paths only --
+        that IS the bug. If the matcher here starts matching it, the guard has
+        stopped modelling the tool and the old filter would pass silently.
+        """
+        self.assertFalse(
+            contract._picomatch_subset_matches("Dockerfile*", "deploy/docker/Dockerfile")
+        )
+        self.assertTrue(
+            contract._picomatch_subset_matches("Dockerfile*", "Dockerfile.prebuilt")
+        )
+        self.assertTrue(
+            contract._picomatch_subset_matches("deploy/docker/**", "deploy/docker/Dockerfile")
+        )
+        self.assertFalse(
+            contract._picomatch_subset_matches("deploy/docker/**", "deploy/config.toml")
+        )
+
+    def test_mid_segment_globstar_is_not_a_globstar(self) -> None:
+        """A mid-segment `**` must NOT cross `/` (picomatch: only a whole
+        segment is a globstar; `a**b` behaves like `a*b`).
+
+        Over-accepting here is the silent-skip class: a filter pattern
+        picomatch never matches would pass the guard, resurrecting the exact
+        TD-DOCKCI-1 hole this check exists to close.
+        """
+        self.assertFalse(
+            contract._picomatch_subset_matches("a**b", "a/x/b")
+        )
+        self.assertFalse(
+            contract._picomatch_subset_matches("deploy**/Dockerfile", "deploy/docker/Dockerfile")
+        )
+        self.assertTrue(contract._picomatch_subset_matches("a**b", "ab"))
+        self.assertTrue(contract._picomatch_subset_matches("a**b", "axb"))
+
+    def test_leading_globstar_spans_zero_segments(self) -> None:
+        """`**/Dockerfile` matches BOTH root Dockerfile and nested ones."""
+        self.assertTrue(contract._picomatch_subset_matches("**/Dockerfile", "Dockerfile"))
+        self.assertTrue(
+            contract._picomatch_subset_matches("**/Dockerfile", "deploy/docker/Dockerfile")
+        )
+        self.assertTrue(contract._picomatch_subset_matches("dir/**/file", "dir/file"))
+        self.assertTrue(contract._picomatch_subset_matches("dir/**/file", "dir/a/b/file"))
+
+    def test_trailing_globstar_covers_the_bare_directory(self) -> None:
+        """picomatch matches `x/**` against `x` itself (verified 2.3.1/4.0.5)."""
+        self.assertTrue(contract._picomatch_subset_matches("deploy/docker/**", "deploy/docker"))
+
+    def test_wildcard_head_before_trailing_globstar_declines_bare_dir(self) -> None:
+        """picomatch grants the bare-directory allowance of a trailing `/**`
+        only to heads with no `*`: `a/**` matches `a`, but `*/**` does NOT
+        match `Dockerfile` and `**/*/**` does NOT match `a` (verified against
+        picomatch 2.3.1 {dot:true}).
+
+        Granting it anyway is the silent-skip class — round 2 of the
+        adversarial review demonstrated exactly that hole for `*/**`.
+        """
+        self.assertFalse(contract._picomatch_subset_matches("*/**", "Dockerfile"))
+        self.assertFalse(contract._picomatch_subset_matches("a*/**", "ab"))
+        self.assertFalse(contract._picomatch_subset_matches("**/*/**", "a"))
+        # ...while the wildcard-headed head still spans everything BELOW it,
+        # and `?`-heads and literal heads keep the bare-directory match.
+        self.assertTrue(contract._picomatch_subset_matches("*/**", "a/b"))
+        self.assertTrue(contract._picomatch_subset_matches("a/**", "a"))
+        self.assertTrue(contract._picomatch_subset_matches("a?/**", "ab"))
+
+    def test_filter_block_survives_comments_and_skips_structural_keys(self) -> None:
+        """Comments between items must not truncate the pattern list, and a
+        structural `docker:` key (mapping child) must not hijack extraction."""
+        ci = (
+            "jobs:\n"
+            "  demo:\n"
+            "    steps:\n"
+            "      - uses: docker/build-push-action@v7\n"
+            "        with:\n"
+            "          file: deploy/docker/sub/Dockerfile\n"
+        )
+        ci_with_filter = (
+            "paths-filter:\n"
+            "  docker:\n"
+            "    # the image inputs\n"
+            "    - 'deploy/docker/**'\n"
+            "    # and the workflow that builds it\n"
+            "    - '.github/workflows/ci.yml'\n"
+        ) + ci
+        self.assertEqual(self.findings_for(ci_with_filter), [])
+        structural = (
+            "jobs:\n"
+            "  build:\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        docker:\n"
+            "          - linux\n"
+            "  paths-filter:\n"
+            "    docker:\n"
+            "      - 'deploy/docker/**'\n"
+        ) + ci
+        self.assertEqual(self.findings_for(structural), [])
+
+    def test_quoted_and_commented_file_targets_are_parsed(self) -> None:
+        ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        quoted = (
+            "jobs:\n"
+            "  quoted:\n"
+            "    steps:\n"
+            "      - uses: docker/build-push-action@v7\n"
+            "        with:\n"
+            "          file: \"deploy/docker/Dockerfile\"  # the image\n"
+        )
+        self.assertEqual(self.findings_for(ci, {"quoted.yml": quoted}), [])
+        uncovered = (
+            "jobs:\n"
+            "  quoted:\n"
+            "    steps:\n"
+            "      - uses: docker/build-push-action@v7\n"
+            "        with:\n"
+            "          file: \"demo/Dockerfile\"  # not watched\n"
+        )
+        findings = self.findings_for(ci, {"quoted.yml": uncovered})
+        self.assertTrue(
+            any("demo/Dockerfile" in f.message for f in findings),
+            findings,
+        )
+        # The suggestion must be a pattern picomatch actually matches.
+        suggestion = next(f for f in findings if "demo/Dockerfile" in f.message)
+        self.assertIn("`demo/**`", suggestion.message)
+
+    def test_mid_scalar_hash_stays_in_the_file_value(self) -> None:
+        """A `#` starts a YAML comment only after whitespace: in
+        `file: deploy/Dockerfile#x` the `#x` is part of the scalar, and the
+        guard must test the same path the workflow builds.
+        """
+        m = contract.DOCKER_FILE_TARGET_RE.match("          file: deploy/docker/Dockerfile#x\n")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group("value"), "deploy/docker/Dockerfile#x")
+        m = contract.DOCKER_FILE_TARGET_RE.match(
+            "          file: deploy/docker/Dockerfile  # real comment\n"
+        )
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group("value"), "deploy/docker/Dockerfile")
+        # Trailing whitespace with NO comment is still a target (round-3
+        # review: the comment-tail space requirement must not swallow it).
+        m = contract.DOCKER_FILE_TARGET_RE.match(
+            "          file: deploy/docker/Dockerfile  \n"
+        )
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group("value"), "deploy/docker/Dockerfile")
+
+
+class SerdeJsonPreserveOrderContractTest(unittest.TestCase):
+    """`serde_json` must carry `preserve_order` in both root tables.
+
+    TD-SPECORD-1: the generated OpenAPI document's key order rode on the
+    feature being enabled transitively; DataFusion 55.2 deliberately stopped
+    supplying it, and a drop flips every map to alphabetical -- a 9k-line,
+    semantically empty spec + SDK diff. The fix (#2006 + the workspace-level
+    entry) is silent, so this check makes removing it loud.
+    """
+
+    def findings_for(self, cargo_text: str) -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "Cargo.toml").write_text(cargo_text, encoding="utf-8")
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_serde_json_preserve_order(findings)
+                return findings
+
+    def test_the_checked_in_manifest_passes(self) -> None:
+        cargo = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        self.assertEqual(self.findings_for(cargo), [])
+
+    def test_dropping_the_feature_from_root_dependencies_is_rejected(self) -> None:
+        cargo = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        needle = 'serde_json = { version = "1.0", features = ["preserve_order"] }'
+        self.assertEqual(cargo.count(needle), 2, "sanity: both tables carry the entry")
+        # [workspace.dependencies] (line ~201) precedes [dependencies] (line
+        # ~402) in file order, so the ROOT-deps entry is the SECOND occurrence.
+        first = cargo.find(needle)
+        second = cargo.find(needle, first + 1)
+        mutated = (
+            cargo[:second] + 'serde_json = { version = "1.0" }' + cargo[second + len(needle):]
+        )
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any("[dependencies].serde_json" in f.message for f in findings),
+            findings,
+        )
+        self.assertFalse(
+            any("[workspace.dependencies].serde_json" in f.message for f in findings),
+            findings,
+        )
+
+    def test_dropping_the_feature_from_the_workspace_table_is_rejected(self) -> None:
+        cargo = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        needle = 'serde_json = { version = "1.0", features = ["preserve_order"] }'
+        first = cargo.find(needle)
+        mutated = cargo[:first] + 'serde_json = { version = "1.0" }' + cargo[first + len(needle):]
+        # The FIRST occurrence is the workspace table (alphabetical file order:
+        # [workspace.dependencies] precedes [dependencies]). Assert the split.
+        findings = self.findings_for(mutated)
+        self.assertTrue(
+            any("[workspace.dependencies].serde_json" in f.message for f in findings),
+            findings,
+        )
+        self.assertFalse(
+            any("[dependencies].serde_json" in f.message for f in findings),
+            findings,
+        )
+
+    def test_removing_the_entry_entirely_is_rejected(self) -> None:
+        cargo = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        needle = 'serde_json = { version = "1.0", features = ["preserve_order"] }\n'
+        mutated = cargo.replace(needle, "")
+        self.assertNotEqual(mutated, cargo, "sanity: the mutation must apply")
+        findings = self.findings_for(mutated)
+        self.assertEqual(len(findings), 2, findings)
+        self.assertTrue(
+            any("[dependencies].serde_json" in f.message for f in findings)
+            and any("[workspace.dependencies].serde_json" in f.message for f in findings),
+            findings,
+        )
+
+    def test_a_feature_list_without_preserve_order_is_rejected(self) -> None:
+        cargo = "\n".join(
+            [
+                "[dependencies]",
+                'serde_json = { version = "1.0", features = ["std"] }',
+                "[workspace.dependencies]",
+                'serde_json = { version = "1.0", features = ["std"] }',
+            ]
+        )
+        findings = self.findings_for(cargo)
+        self.assertEqual(len(findings), 2, findings)

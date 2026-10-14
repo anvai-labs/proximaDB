@@ -89,14 +89,11 @@ pub fn base64_encode_config(data: &[u8], config: Base64Config) -> String {
     }
 
     let mut result = Vec::with_capacity(data.len().div_ceil(3) * 4);
-    let chunks = data.chunks_exact(3);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = data.as_chunks::<3>();
 
     // Process complete 3-byte chunks
     for chunk in chunks {
-        let b1 = chunk[0];
-        let b2 = chunk[1];
-        let b3 = chunk[2];
+        let [b1, b2, b3] = *chunk;
 
         result.push(config.alphabet[(b1 >> 2) as usize]);
         result.push(config.alphabet[(((b1 & 0x03) << 4) | (b2 >> 4)) as usize]);
