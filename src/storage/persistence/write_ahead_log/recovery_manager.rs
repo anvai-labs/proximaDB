@@ -42,6 +42,13 @@ pub struct RecoveryManager {
     recovery_mode: RecoveryMode,
     /// Statistics
     stats: Arc<tokio::sync::RwLock<WalRecoveryStats>>,
+    /// ADR-069 S1 local WAL root, resolved ONCE from the same `WALConfig` the
+    /// write path uses (`local_wal_dir`: env override > TOML > None). TD-WAL-5:
+    /// recovery used to consult only the env, so WAL segments written under a
+    /// config-file `wal_local_dir` were invisible to replay until a manifest
+    /// entry happened to record their base — a crash right after the ack lost
+    /// acknowledged writes.
+    local_wal_dir: Option<String>,
 }
 
 /// Backwards-compat alias for [`WalRecoveryStats`].
@@ -78,6 +85,7 @@ impl Clone for RecoveryManager {
             flush_coordinator: self.flush_coordinator.clone(),
             recovery_mode: self.recovery_mode,
             stats: self.stats.clone(),
+            local_wal_dir: self.local_wal_dir.clone(),
         }
     }
 }
@@ -93,6 +101,7 @@ impl RecoveryManager {
         info!(
             "🎯 Creating RecoveryManager with direct-to-storage recovery (catalog-backed config resolution)"
         );
+        let local_wal_dir = crate::storage::persistence::write_ahead_log::local_wal_dir(&config);
 
         // Create disk manager
         let disk_manager = Arc::new(WriteAheadLogDiskManager::new(
@@ -115,6 +124,7 @@ impl RecoveryManager {
             // Can be flushed to storage later when engines are ready
             recovery_mode: RecoveryMode::ViaMemtable,
             stats: Arc::new(tokio::sync::RwLock::new(WalRecoveryStats::default())),
+            local_wal_dir,
         }
     }
 
@@ -225,6 +235,7 @@ impl RecoveryManager {
             let storage_engines = self.storage_engines.clone();
             let flush_coordinator = self.flush_coordinator.clone();
             let recovery_mode = self.recovery_mode;
+            let local_wal_dir = self.local_wal_dir.clone();
 
             // Execute recovery task through thread pool
             let task = thread_pool.execute_recovery_task("recover_collection", async move {
@@ -239,6 +250,7 @@ impl RecoveryManager {
                     storage_engines,
                     flush_coordinator,
                     recovery_mode,
+                    local_wal_dir.as_deref(),
                     None,
                 )
                 .await;
@@ -348,6 +360,7 @@ impl RecoveryManager {
             self.storage_engines.clone(),
             self.flush_coordinator.clone(),
             self.recovery_mode,
+            self.local_wal_dir.as_deref(),
             None, // No progress callback for startup recovery
         )
         .await?;
@@ -382,6 +395,7 @@ impl RecoveryManager {
             self.storage_engines.clone(),
             self.flush_coordinator.clone(),
             self.recovery_mode,
+            self.local_wal_dir.as_deref(),
             progress_callback,
         )
         .await?;
@@ -404,6 +418,7 @@ impl RecoveryManager {
         storage_engines: Arc<tokio::sync::RwLock<HashMap<String, Arc<dyn UnifiedStorageFormat>>>>,
         _flush_coordinator: Arc<WALFlushCoordinator>,
         recovery_mode: RecoveryMode,
+        local_wal_dir: Option<&str>,
         progress_callback: Option<RecoveryProgressCallback>,
     ) -> Result<(u64, u64)> {
         info!(
@@ -416,6 +431,7 @@ impl RecoveryManager {
             disk_manager.clone(),
             storage_engines.clone(),
             recovery_mode,
+            local_wal_dir,
             &progress_callback,
         )
         .await
@@ -426,6 +442,7 @@ impl RecoveryManager {
         disk_manager: Arc<WriteAheadLogDiskManager>,
         storage_engines: Arc<tokio::sync::RwLock<HashMap<String, Arc<dyn UnifiedStorageFormat>>>>,
         _recovery_mode: RecoveryMode,
+        local_wal_dir: Option<&str>,
         progress_callback: &Option<RecoveryProgressCallback>,
     ) -> Result<(u64, u64)> {
         if !storage_engines.read().await.contains_key(collection_id) {
@@ -459,6 +476,7 @@ impl RecoveryManager {
             .map(|entry| entry.storage_url.clone())
             .collect();
         let candidate_bases = Self::wal_candidate_bases(
+            local_wal_dir,
             catalog_base.as_deref(),
             &manifest_bases,
             disk_manager.get_base_wal_url(),
@@ -756,12 +774,14 @@ impl RecoveryManager {
     }
 
     /// Issue #1125: assemble the ordered, deduplicated list of WAL base URLs a
-    /// collection's files may live under. Priority: the catalog-assigned
+    /// collection's files may live under. Priority: the resolved local WAL
+    /// root (ADR-069 S1 / TD-WAL-5), then the catalog-assigned
     /// base_location (what the write path uses), then every distinct manifest
     /// storage_url (where files were actually recorded), then the configured
     /// primary base (this recovery manager's disk_manager root). Trailing
     /// slashes are normalized so `file:///x/` and `file:///x` dedupe.
     fn wal_candidate_bases(
+        local_wal_dir: Option<&str>,
         catalog_base: Option<&str>,
         manifest_bases: &[String],
         primary_base: &str,
@@ -773,12 +793,14 @@ impl RecoveryManager {
                 bases.push(normalized);
             }
         };
-        // ADR-069 S1: when an opt-in local WAL root is set (PROXIMADB_WAL_LOCAL_DIR),
-        // the write path roots the WAL there — prepend it as a candidate base so
-        // replay lists it (otherwise the .bcwal on /waldisk is missed → restart data
-        // loss). Listed FIRST so a present local WAL short-circuits the union.
-        if let Some(local) = crate::storage::persistence::write_ahead_log::local_wal_dir_env() {
-            push_base(&mut bases, &local);
+        // ADR-069 S1: when an opt-in local WAL root is set (env OR config — the
+        // caller passes the value resolved by the write path's own resolver,
+        // TD-WAL-5), the write path roots the WAL there — prepend it as a
+        // candidate base so replay lists it (otherwise the .bcwal on /waldisk is
+        // missed → restart data loss). Every base is listed and unioned; the
+        // order only decides which duplicate URL is kept.
+        if let Some(local) = local_wal_dir {
+            push_base(&mut bases, local);
         }
         if let Some(base) = catalog_base {
             push_base(&mut bases, base);
@@ -1440,6 +1462,7 @@ mod tests {
     #[test]
     fn wal_candidate_bases_unions_catalog_manifest_and_primary() {
         let bases = RecoveryManager::wal_candidate_bases(
+            None,
             Some("file:///tmp/pdb/d2/"),
             &[
                 "file:///tmp/pdb/d2".to_string(),
@@ -1460,10 +1483,49 @@ mod tests {
 
         // No catalog / no manifest degrades to the primary base only (pre-#1125 behavior).
         let primary_only =
-            RecoveryManager::wal_candidate_bases(None, &[], "file:///tmp/pdb/wal-primary");
+            RecoveryManager::wal_candidate_bases(None, None, &[], "file:///tmp/pdb/wal-primary");
         assert_eq!(
             primary_only,
             vec!["file:///tmp/pdb/wal-primary".to_string()]
+        );
+    }
+
+    /// TD-WAL-5 regression: a config-file `wal_local_dir` (no env) must reach
+    /// replay. The recovery manager resolves it with the write path's own
+    /// resolver and lists it FIRST, ahead of catalog/manifest/primary bases.
+    #[tokio::test]
+    async fn config_file_wal_local_dir_is_a_replay_candidate() {
+        if std::env::var("PROXIMADB_WAL_LOCAL_DIR").is_ok() {
+            return; // env override would win; this test pins the TOML-only path
+        }
+        let mut config = crate::storage::persistence::write_ahead_log::config::WALConfig::default();
+        config.wal_local_dir = Some("file:///waldisk/".to_string());
+        let wal_behavior = Arc::new(
+            crate::storage::memtable::specialized::wal_behavior::WALBehaviorWrapper::new(
+                crate::storage::memtable::MemtableConfig::default(),
+            ),
+        );
+        let filesystem = Arc::new(
+            FilesystemFactory::create(FilesystemConfig::default())
+                .await
+                .expect("filesystem factory"),
+        );
+        let manager = RecoveryManager::new(config, wal_behavior, filesystem);
+        assert_eq!(manager.local_wal_dir.as_deref(), Some("file:///waldisk"));
+
+        let bases = RecoveryManager::wal_candidate_bases(
+            manager.local_wal_dir.as_deref(),
+            Some("file:///tmp/pdb/d2"),
+            &[],
+            "file:///tmp/pdb/wal-primary",
+        );
+        assert_eq!(
+            bases,
+            vec![
+                "file:///waldisk".to_string(),
+                "file:///tmp/pdb/d2".to_string(),
+                "file:///tmp/pdb/wal-primary".to_string(),
+            ]
         );
     }
 
@@ -1512,6 +1574,7 @@ mod tests {
             &primary_disk_manager,
             &RecoveryManager::wal_candidate_bases(
                 None,
+                None,
                 &[],
                 primary_disk_manager.get_base_wal_url(),
             ),
@@ -1529,6 +1592,7 @@ mod tests {
         let unioned = RecoveryManager::list_wal_files_across_bases(
             &primary_disk_manager,
             &RecoveryManager::wal_candidate_bases(
+                None,
                 Some(&assigned_base),
                 &[assigned_base.clone()], // manifest repeats it — must dedupe
                 primary_disk_manager.get_base_wal_url(),
