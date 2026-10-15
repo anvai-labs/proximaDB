@@ -1,5 +1,13 @@
 = TD-CI-4: Benches/Examples CI Gap (2026-08-23)
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-10-15).** The examples-compile coverage was restored by adding `--examples` to the existing `rust-compile-benches` job (develop→qa), and `examples/**` was restored to the Rust path filter. On the same date `cargo check --workspace --benches --examples` was clean (exit 0) on develop `9dc2b033c`.
+| Regression history | The original fix added a per-PR `rust-compile-benches-examples` job. Commit `a5d4833e6` (2026-09-02) silently removed it and the `examples/**` filter line while recovering lost merges after a force-push rewind. That commit's message says the opposite: "TD-CI-4 also excluded (already on develop via #1725's surviving ancestry)". **Lesson:** a recovery re-land must diff the result against the pre-rewind tree, not trust its own exclusion list.
+| Tier choice | develop→qa, not per-PR. Examples rot slowly and are not shipped, and TD-CITIER-1 is removing long poles from feat→develop. One job covers both target kinds without an extra runner.
+|===
+
 == Problem Statement
 
 ProximaDB's CI does **not** compile the root crate's 50 bench files and 31 example files on every PR. These targets can rot without detection until develop→qa promotion.
