@@ -9,32 +9,40 @@ a running server over the REST API (proxied to `http://localhost:5678`).
 
 [IMPORTANT]
 ====
-*Status: standalone dev app, not part of the build/CI.* This app is **not** compiled
-by CI, **not** bundled into the `proximadb-server` binary, and **not** consumed by
-downstream services (e.g. `anvaiops`, which integrates via the SDK/REST API only). It
-is the heavier *full operator console* counterpart to the lightweight, read-only
-dashboard the server now serves at `GET /admin` (see
+*Status: standalone operator app, built by CI but not shipped in the server.* The
+`Admin UI Install + Build` CI job (`ui-build` in `.github/workflows/ci.yml`) runs
+`npm ci && npm run build` (typecheck + production bundle) on every change under `ui/`.
+The bundle is **not** embedded in or served by the `proximadb-server` binary, and is
+**not** consumed by downstream services (e.g. `anvaiops`, which integrates via the
+SDK/REST API only). It is the heavier *full operator console* counterpart to the
+lightweight, read-only dashboard the server serves at `GET /admin` (see
 `docs/04-operations/admin-dashboard.adoc` / `crates/platform/proximadb-admin-ui`).
-
-The CRA `public/` entry assets (`index.html`, `manifest.json`) are present, so the app
-builds with `npm install && npm run build`. It remains a developer/operator app that is
-not gated by CI, so verify a build before relying on it.
 ====
 
 == Stack
 
-* React 17 + TypeScript, Create-React-App (`react-scripts`) toolchain.
+* React 17 + TypeScript 5, built with https://vite.dev[Vite] (`@vitejs/plugin-react`).
+  Migrated off Create-React-App (`react-scripts` 5.0.1) to drop its unmaintained
+  build-toolchain transitives (see TD-UICDN-1).
 * Material-UI v4, Recharts (charts), Cytoscape (graph viz), Monaco (SQL editor), axios.
+* Monaco is self-hosted (TD-UICDN-1): `postinstall`/`prebuild` copy
+  `node_modules/monaco-editor/min/vs` to `public/vs` (served at `/vs`), and
+  `scripts/check-monaco-selfhost.mjs` gates every build.
 
 == Develop
 
 [source,console]
 ----
 $ cd ui
-$ npm install
-$ npm start      # dev server on :3000, proxies API calls to :5678
-$ npm run build  # production bundle into build/
+$ npm ci             # from the committed lockfile (Node 24 / npm 11, as CI)
+$ npm start          # Vite dev server on :3000, proxies /api to :5678
+$ npm run typecheck  # tsc --noEmit
+$ npm run build      # monaco guard + typecheck + production bundle into build/
+$ npm run preview    # serve build/ locally on :3000
 ----
+
+Configuration lives in `vite.config.mts` (dev proxy, `build.outDir: 'build'`); the
+HTML entry is `ui/index.html` (Vite convention), static assets stay in `public/`.
 
 == Layout
 
