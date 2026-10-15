@@ -14,10 +14,14 @@ did any text that defines that job change between the base and the working
 tree? "Defines" means:
 
   * the job's own block (`  <job>:` up to the next top-level job key);
-  * every `changes` output the job reads (`needs.changes.outputs.<X>`, plus
-    FILTER itself): the output's line in `changes.outputs` (so a redefined
-    `test_tier`/`medium_tier` counts) and, when `<X>` is a path filter, the
-    filter's block with its globs (so a narrowed filter counts);
+  * the whole `changes` job EXCEPT the bodies of `filters: |` block scalars:
+    every output line (a redefined `test_tier`/`medium_tier` counts), every
+    step, the paths-filter step's other `with:` keys (`predicate-quantifier:
+    every` changes every filter's meaning), and the selfdef step's own
+    `--job` list (deleting a pair would otherwise disarm this very check);
+  * the filter block of every `changes` output the job reads
+    (`needs.changes.outputs.<X>`, plus FILTER itself), with its globs, so a
+    narrowed filter counts while edits to OTHER filters' globs do not.
   * the workflow header before `jobs:` (`on:`, `concurrency:`, global `env:`).
 
 Comments count: the comparison is textual, so it errs towards running.
@@ -97,6 +101,30 @@ def filter_block(text: str, name: str) -> str | None:
     return None
 
 
+def changes_skeleton(text: str) -> str | None:
+    """The `changes` job with each `filters: |` block-scalar body removed.
+
+    Edits to other suites' globs (most ci.yml PRs) stay invisible; everything
+    else in the job -- outputs, steps, step options -- is compared.
+    """
+    changes = job_block(text, "changes")
+    if changes is None:
+        return None
+    out: list[str] = []
+    body_indent: int | None = None
+    for line in changes.splitlines():
+        stripped = line.lstrip()
+        depth = len(line) - len(stripped)
+        if body_indent is not None:
+            if not stripped or depth > body_indent:
+                continue
+            body_indent = None
+        out.append(line)
+        if re.match(r"filters:\s*[|>][-+]?\s*$", stripped):
+            body_indent = depth
+    return "\n".join(out)
+
+
 def output_line(text: str, name: str) -> str | None:
     """The `changes.outputs` entry `name: ...` (6-space key)."""
     changes = job_block(text, "changes")
@@ -114,7 +142,11 @@ def referenced_outputs(text: str, job: str, name: str) -> set[str]:
 
 
 def definition(text: str, job: str, names: set[str]) -> list[str | None]:
-    parts: list[str | None] = [header(text), job_block(text, job)]
+    parts: list[str | None] = [
+        header(text),
+        job_block(text, job),
+        changes_skeleton(text),
+    ]
     for output in sorted(names):
         line = output_line(text, output)
         parts.append(line)

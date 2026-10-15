@@ -56,6 +56,12 @@ jobs:
               - 'Cargo.lock'
             other_changes:
               - 'src/other/**'
+      - name: Detect edits to own definitions
+        id: selfdef
+        run: |
+          python3 scripts/ci_job_definition_changed.py --base "$base" \\
+            --job heavy=heavy_changes \\
+            --job other=other_changes
 
   heavy:
     name: Heavy suite
@@ -91,8 +97,11 @@ class DefinitionChangedTest(unittest.TestCase):
         # The filter right AFTER ours: proves the block boundary is correct.
         self.assertFalse(changed(BASE.replace("'src/other/**'", "'src/else/**'")))
 
-    def test_unrelated_output_edit_is_unchanged(self) -> None:
-        self.assertFalse(
+    def test_any_changes_output_edit_is_changed(self) -> None:
+        # The whole `changes` job outside the filter BODIES is part of every
+        # suite's definition: deliberately conservative (an output line is
+        # cheap to over-trigger on, expensive to miss).
+        self.assertTrue(
             changed(
                 BASE.replace(
                     "other_changes: ${{ steps.filter.outputs.other_changes }}",
@@ -137,6 +146,28 @@ class DefinitionChangedTest(unittest.TestCase):
                 )
             )
         )
+
+    def test_selfdef_job_pair_removed_is_changed(self) -> None:
+        # Review finding (#2043): deleting the suite's own `--job` pair from the
+        # selfdef step disarms the self-check, and was invisible to it.
+        self.assertTrue(changed(BASE.replace("            --job heavy=heavy_changes \\\n", "")))
+
+    def test_paths_filter_option_added_is_changed(self) -> None:
+        # Review finding (#2043): a non-`filters` key on the paths-filter step
+        # (predicate-quantifier: every) changes every filter's semantics.
+        self.assertTrue(
+            changed(
+                BASE.replace(
+                    "        with:\n          filters: |",
+                    "        with:\n          predicate-quantifier: every\n          filters: |",
+                )
+            )
+        )
+
+    def test_other_filter_body_edit_still_unchanged(self) -> None:
+        # The precision that matters: the 15/44 PRs that touch ci.yml mostly
+        # edit OTHER filters/jobs; those must not fire the heavy suite.
+        self.assertFalse(changed(BASE.replace("              - 'src/other/**'\n", "              - 'src/other/**'\n              - 'src/more/**'\n")))
 
     def test_header_env_edit_is_changed(self) -> None:
         self.assertTrue(changed(BASE.replace("CARGO_INCREMENTAL: 0", "CARGO_INCREMENTAL: 1")))

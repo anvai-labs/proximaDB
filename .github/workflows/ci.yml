@@ -128,7 +128,8 @@ jobs:
       # Specialised heavy suites path-scoped on feat->develop (unconditional at
       # develop->qa via `medium_tier`). Each is true when its path filter
       # matches OR the PR edits that suite's own CI definition (`selfdef` step:
-      # its job block, the filter/outputs it reads, the workflow header) —
+      # its job block, its filter, this job outside the filter bodies, the
+      # workflow header) —
       # the precise form of "a gate must see a change to itself". TD-CITIER-1.
       mlflow_changes: ${{ steps.filter.outputs.mlflow_changes == 'true' || steps.selfdef.outputs.mlflow_changes == 'true' }}
       openapi_code_changes: ${{ steps.filter.outputs.openapi_code_changes == 'true' || steps.selfdef.outputs.openapi_code_changes == 'true' }}
@@ -391,6 +392,23 @@ jobs:
             object_store_restart_changes:
               - 'src/storage/persistence/**'
               - 'src/storage/memtable/**'
+              # Review of #2043: the durable-write + flush + lease path the
+              # server crosses between INSERT and the SIGKILL/recover cycles,
+              # and the REST surface the test drives (CREATE/INSERT/search).
+              - 'src/storage/flush_materializer.rs'
+              - 'src/storage/auto_flush_driver.rs'
+              - 'src/storage/metadata/**'
+              - 'src/api_handlers/record_ops_service.rs'
+              - 'src/cluster/partition_lease.rs'
+              - 'src/network/shared_services.rs'
+              - 'src/network/rest/**'
+              - 'crates/foundation/proximadb-records/**'
+              - 'crates/storage/proximadb-storage-common/**'
+              - 'crates/storage/proximadb-storage-kv/**'
+              - 'crates/storage/proximadb-storage-ports/**'
+              - 'crates/storage/proximadb-storage-traits/**'
+              - 'crates/storage/proximadb-storage-tenant/**'
+              - 'crates/storage/proximadb-storage-operations/**'
               - 'src/storage/engines/sst/**'
               - 'src/storage/engines/helix/**'
               - 'src/storage/engines/factory.rs'
@@ -430,12 +448,20 @@ jobs:
               - 'src/services/mlflow_*'
               - 'src/services/mod.rs'
               - 'src/storage/document/**'
+              # Review of #2043: the run store persists through the WAL/
+              # filesystem layer and the records/tenant types; the DTOs use
+              # generated proto types (src/proto + build.rs + proto/**).
+              - 'src/storage/persistence/**'
+              - 'crates/foundation/proximadb-records/**'
+              - 'crates/foundation/proximadb-tenant/**'
               - 'src/catalog/**'
               - 'src/database.rs'
               - 'crates/control/proximadb-catalog/**'
               - 'apps/proximadb-server/**'
               - 'config/config.toml'
               - 'proto/**'
+              - 'src/proto/**'
+              - 'build.rs'
               - 'third_party/mlflow-ui/**'
               - 'scripts/vendor_mlflow_ui.sh'
               - 'clients/python/tests/*mlflow*'
@@ -471,6 +497,11 @@ jobs:
             # definition is covered by the `selfdef` step, not a ci.yml glob.
             enterprise_catalogs_changes:
               - 'crates/control/proximadb-catalog/**'
+              # Review of #2043: schema/data-model types the gated catalog
+              # code builds on, and the error types its handlers map.
+              - 'crates/foundation/proximadb-catalog-schema/**'
+              - 'crates/foundation/proximadb-data-model/**'
+              - 'src/errors/**'
               - 'src/catalog/**'
               - 'src/network/rest/**'
               - 'src/security/**'
@@ -556,9 +587,10 @@ jobs:
       # TD-CITIER-1: the four path-scoped heavy suites must still run when a PR
       # edits THEIR OWN CI definition. Listing all of ci.yml in their filters
       # would fire a 20-66 min job on the 34% of PRs that touch ci.yml for any
-      # reason; this compares just the text that defines each job (job block,
-      # the outputs/filters its `if:` reads, the workflow header) against the
-      # base. Fails OPEN (prints true) if the base is unreadable. PR-only: on
+      # reason; this compares just the text that defines each job against the
+      # base: its job block, the workflow header, this whole `changes` job
+      # except the `filters: |` bodies (so the outputs, THIS step's --job list
+      # and paths-filter options count), and the filter blocks its `if:` reads. Fails OPEN (prints true) if the base is unreadable. PR-only: on
       # push these jobs are gated off (test_tier) or forced on (medium_tier).
       - name: Detect edits to the path-scoped suites' own CI definitions
         id: selfdef
@@ -3526,7 +3558,18 @@ jobs:
     name: CI Success
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
+    # (Comments live here, not inside the list: scripts/check_risk_coverage.py
+    # reads `needs` as a contiguous run of `- job` lines.)
+    # `changes` is the root of every gated job. If it FAILS (Cargo.lock
+    # downgrade guard, `cargo metadata --locked`, the deterministic commit
+    # contract), every dependent is `skipped`, and skipped passes below — so
+    # without this entry a failed `changes` turned CI Success GREEN. As a
+    # direct need its `failure` hits "Require all required jobs green".
+    # `mlflow-conformance` was never in needs, so it gated nothing; path-scoped
+    # it must block when it runs. Last 60 CI runs: 28 attempts, 23 success,
+    # 0 failure, 5 cancelled (superseded-run concurrency cancels) — not flaky.
     needs:
+      - changes
       - deterministic-commit-contract
       - rust-format
       - capability-matrix
@@ -3577,6 +3620,7 @@ jobs:
       - spark-jni-smoke
       - openapi-spec-drift
       - feature-matrix-enterprise-catalogs
+      - mlflow-conformance
       # gates that encode load-bearing decisions as checks
       - docs-authority
       - risk-coverage

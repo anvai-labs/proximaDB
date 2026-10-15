@@ -82,8 +82,22 @@ feat→develop, the per-PR recall signal remains `vector_ann_recall_e2e` in
 | MLflow conformance (real client) | any `rust` or `python` change | `mlflow_changes`: the MLflow REST module + the router/middleware it mounts behind, run store / model registry (catalog crate, `src/services/mlflow_*`, `src/storage/document`), server app + `mlflow-ui` feature + vendored UI, `config/config.toml`, `proto/**`, the Python harness and ratchet floors, manifests + lockfile, toolchain
 | OpenAPI Spec From Code | any `rust` change | `openapi_code_changes`: `git grep -l 'utoipa\|ToSchema\|IntoParams'` finds annotated code only in `src/network/rest` and `crates/control/proximadb-catalog`; plus `tests/openapi_spec_gen.rs`, manifests + **lockfile** (TD-SPECORD-1: a dependency bump alone reorders the spec), toolchain. `docs/openapi/**` and `sweep` (every push to a protected branch) were already in the trigger and stay there
 | Feature Matrix (enterprise-catalogs) | any `rust` change (a matrix leg; 47 min vs ≤ 15 for the other legs because it also serves tests and runs clippy) | its own job with the **same check name**, gated on `enterprise_catalogs_changes`: the catalog crate, `src/catalog`, `src/network/rest` (where census finding 4 found the `/api/v1` route collision), `src/security`, proto, `tests/catalog*`, manifests + lockfile, toolchain
-| Object-store restart recovery (Azurite) | already path-gated, on a narrow filter | filter **widened** to what `--restart` exercises: server boot (`apps/proximadb-server/**`, `src/database.rs`), catalog recovery, all of `src/storage/persistence`, memtable, the SST/HELIX engines and the TD-CACHE-7 warm-manifest test, DrPathBuilder, and the object-store / encryption / block-format / SST / WAL-header / CKS crates
+| Object-store restart recovery (Azurite) | already path-gated, on a narrow filter | filter **widened** to what `--restart` exercises: server boot (`apps/proximadb-server/**`, `src/database.rs`), catalog recovery, all of `src/storage/persistence`, memtable, flush (`flush_materializer.rs`, `auto_flush_driver.rs`), `src/storage/metadata`, the SST/HELIX engines and the TD-CACHE-7 warm-manifest test, DrPathBuilder, the record-ops / partition-lease / shared-services path and the REST surface the test drives (`src/network/rest`), the records crate, and the object-store / encryption / block-format / SST / WAL-header / CKS / storage-{common,kv,ports,traits,tenant,operations} crates
 |===
+
+The review of #2043 widened three filters further: restart as above; MLflow with
+`src/storage/persistence`, the records and tenant crates, `src/proto`, `build.rs`; enterprise-catalogs
+with the catalog-schema and data-model crates and `src/errors`.
+
+**`CI Success` holes closed in the same PR (both pre-existing):**
+
+* `changes` was not in `ci-success.needs`. If it failed (the Cargo.lock downgrade guard,
+  `cargo metadata --locked`, the deterministic commit contract), every gated job was `skipped`.
+  Skipped passes, so `CI Success` went **green**. `changes` is now a direct need, and its failure
+  hits the "all required jobs green" step. It was the only upstream job missing from the list.
+* `mlflow-conformance` was never in `ci-success.needs`, so it gated nothing. It is added now. In
+  the last 60 CI runs it had 28 attempts: 23 success, 0 failure, and 5 cancelled (all
+  superseded-run concurrency cancels), so it is not a flaky gate.
 
 All four suites now run **unconditionally at develop→qa and qa→main**: `medium_tier` bypasses
 their path filters.
@@ -102,8 +116,13 @@ their path filters.
 . *ci.yml → the four suites.* 15 of 44 PRs touched `ci.yml`, almost never in these jobs. Listing
   the whole file in their filters would have fired a 20–66 min job on a third of PRs. The `changes`
   job's `selfdef` step (`scripts/ci_job_definition_changed.py`) checks only the text that defines
-  each suite: its job block, the outputs and filters its `if:` reads, and the workflow header. If
-  any of that differs from the merge-base, the suite runs. The step fails **open**: an unreadable
+  each suite. That is its job block, the workflow header, the whole `changes` job except the
+  bodies of the `filters: |` scalars, and the filter blocks its `if:` reads. "The whole `changes`
+  job" covers every output, the selfdef step's own `--job` list and the paths-filter step's
+  options. The review of #2043 showed by mutation that the first version missed a deleted
+  `--job` pair and an added `predicate-quantifier: every`; both now have tests. If any of that
+  text differs from the merge-base, the suite runs. The precision kept is narrow: an edit to
+  another filter's globs, or to another job, does not fire these suites. The step fails **open**: an unreadable
   base, a missing block or a crashed script all count as "changed". Its tests pin each
   definition-changing edit to `true` and each unrelated edit to `false`. They also fail if the
   real `ci.yml` stops resolving (which would silently mean "always run").
@@ -114,9 +133,9 @@ For each run the projection does the following:
 
 * drops the SIFT ratchet;
 * drops each specialised suite whose new filter does not match the PR's files. For PRs that
-  touched `ci.yml`, the patch hunks were mapped to job blocks to approximate `selfdef`;
+  touched `ci.yml`, the patch hunks were mapped to job blocks to approximate `selfdef`. Any hunk in the `changes` job outside a filter body, or in the header, fires all four suites;
 * adds a suite the widened filter now fires, timed as `changes` end + its median duration
-  (restart 66 min; this happened in 6/43 runs);
+  (restart 66 min; this happened in 9/43 runs);
 * restarts both `rust-test` legs at `changes` end + their measured queue + their measured
   duration;
 * uses each run's measured finish times for every other job.
@@ -126,19 +145,23 @@ One rerun-only outlier, with a 9.5-min wall clock, is excluded, leaving 43 runs.
 [cols="2,1,1",options="header"]
 |===
 | | before | after
-| median wall clock to `CI Success` | 67.1 min | **51.1 min**
-| p75 | 75.0 min | 66.4 min
+| median wall clock to `CI Success` | 67.1 min | **53.4 min**
+| p75 | 75.0 min | 67.0 min
 | typical PR, no specialised path touched | ≈ 68 (1 + 21 + 46) | ≈ 47–48 (1 + 46; next chain: 21 + 23.5 = 44.5)
-| PR touching a restart-recovery path (12/43) | ≈ 67 | ≈ 67, unchanged: the restart job is the critical path
+| PR touching a restart-recovery path (15/43) | ≈ 67 | ≈ 67, unchanged: the restart job is the critical path (14/43 runs)
 |===
 
 Runner time no longer spent on feat→develop in the 43-run sample:
 
 * SIFT: ~592 runner-min.
-* Enterprise-catalogs: ~1053 runner-min.
-* MLflow: ~403 runner-min.
-* OpenAPI: ~392 runner-min.
-* The widened restart filter added 6 runs (~400 runner-min).
+* Enterprise-catalogs: ~902 runner-min.
+* MLflow: ~341 runner-min.
+* OpenAPI: ~334 runner-min.
+* The widened restart filter added 9 runs (~590 runner-min).
+
+The first version of this projection, before the review widened the filters, was median 51.1 /
+p75 66.4. The wider filters and the broader `selfdef` cost about 2 min of median, mostly because
+restart fires more often.
 
 == Open residuals
 
