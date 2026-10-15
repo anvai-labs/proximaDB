@@ -13,6 +13,83 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CatalogColumn, CatalogTableSchema, ColumnConstraint};
 
+/// Which relational integrity rule a write violated (TD-DML-1).
+///
+/// Carried by [`RelationalConstraintViolation`] so protocol surfaces map a
+/// rejected write to the SQLSTATE a PostgreSQL driver keys on, instead of a
+/// generic error class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationalConstraintKind {
+    /// PRIMARY KEY or secondary UNIQUE duplicate — SQLSTATE `23505`.
+    Unique,
+    /// FOREIGN KEY reference to a missing parent row — SQLSTATE `23503`.
+    ForeignKey,
+    /// CHECK constraint evaluated to FALSE — SQLSTATE `23514`.
+    Check,
+    /// One `INSERT … ON CONFLICT DO UPDATE` statement proposes the same
+    /// conflict key twice — SQLSTATE `21000` (cardinality_violation).
+    UpsertAffectsRowTwice,
+}
+
+impl RelationalConstraintKind {
+    /// PostgreSQL SQLSTATE for this violation class.
+    pub fn sqlstate(self) -> &'static str {
+        match self {
+            Self::Unique => "23505",
+            Self::ForeignKey => "23503",
+            Self::Check => "23514",
+            Self::UpsertAffectsRowTwice => "21000",
+        }
+    }
+}
+
+/// A typed relational integrity violation (TD-DML-1).
+///
+/// Raised by the shared row-write enforcement (INSERT, UPSERT, UPDATE) and by
+/// [`CatalogRow::validate`] for CHECK constraints. It travels inside
+/// `anyhow::Error`; protocol surfaces recover it with
+/// [`find_relational_constraint_violation`]. `Display` is the specific,
+/// human-readable message only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalConstraintViolation {
+    /// Violation class (selects the SQLSTATE).
+    pub kind: RelationalConstraintKind,
+    /// Specific message naming the table, constraint and offending value.
+    pub message: String,
+}
+
+impl RelationalConstraintViolation {
+    /// Build a violation of `kind` with a specific `message`.
+    pub fn new(kind: RelationalConstraintKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// PostgreSQL SQLSTATE for this violation.
+    pub fn sqlstate(&self) -> &'static str {
+        self.kind.sqlstate()
+    }
+}
+
+impl std::fmt::Display for RelationalConstraintViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RelationalConstraintViolation {}
+
+/// Find a [`RelationalConstraintViolation`] anywhere in `err`'s chain (it may
+/// be wrapped by `.context(..)` on its way to the protocol surface).
+pub fn find_relational_constraint_violation(
+    err: &anyhow::Error,
+) -> Option<&RelationalConstraintViolation> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<RelationalConstraintViolation>())
+}
+
 /// Schema enforcement mode for table writes and external/schema-on-read scans.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RelationalSchemaMode {
@@ -462,11 +539,14 @@ fn validate_check_expression(
 ) -> Result<()> {
     match evaluate_check_expression(schema, row, expression)? {
         CheckOutcome::Pass | CheckOutcome::Unknown => Ok(()),
-        CheckOutcome::Fail => Err(anyhow!(
-            "CHECK constraint '{}' failed for table '{}'",
-            expression,
-            schema.name
-        )),
+        CheckOutcome::Fail => Err(RelationalConstraintViolation::new(
+            RelationalConstraintKind::Check,
+            format!(
+                "CHECK constraint '{}' failed for table '{}'",
+                expression, schema.name
+            ),
+        )
+        .into()),
     }
 }
 

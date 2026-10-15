@@ -1,7 +1,7 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-DML-1: UPSERT bypasses uniqueness and foreign-key enforcement
-:status: Open
+:status: Resolved
 :date: 2026-07-28
 :authors: cross-model red-team (Lens C), verified 2026-07-28
 :found-by: multi-LLM adversarial review of the FA/identity work (docs/_internal/cross-model-review-adr-077-fa-track-identity.md)
@@ -9,7 +9,7 @@
 
 [cols="1,3"]
 |===
-| Status | Open — silent integrity violation on the UPSERT path (re-verified 2026-10-15: `execute_upsert`, now at `src/services/dml/mod.rs:4146`, still calls no UNIQUE probe, CKS claim or FK check)
+| Status | Resolved 2026-10-15 — UPSERT now runs the same enforcement sequence as INSERT (see <<resolution>>). Originally re-verified open 2026-10-15: `execute_upsert` called no UNIQUE probe, CKS claim or FK check
 | Severity | High — a declared UNIQUE or FK can be violated by any UPSERT
 | Lane | `src/services/dml/mod.rs` (the F5 / OLTP write-path owner)
 |===
@@ -70,3 +70,82 @@ Route `execute_upsert` through the same enforcement sequence as
 `enforce_foreign_keys_for_batch`. An UPSERT that *replaces* an existing row must
 also release/refresh the prior row's UNIQUE and CKS claims, or the divergence
 above persists.
+
+[[resolution]]
+== Resolution (2026-10-15)
+
+*One enforcement sequence, two modes.* The PK / UNIQUE / FK block that lived
+inline in `execute_insert` was extracted, unchanged in substance, into
+`DmlService::enforce_row_write_constraints` (`src/services/dml/mod.rs`), and
+both `execute_insert` and `execute_upsert` call it — no check is duplicated. It
+runs, in order:
+
+. PRIMARY KEY — within-statement repeat, then the F2 fenced
+  `ConditionalKeyStore::put_if_absent` claim (or the `get_by_key` probe when no
+  CKS is wired);
+. secondary UNIQUE — `build_unique_candidate_sets` + `check_unique_conflict`;
+. FOREIGN KEY — `enforce_foreign_keys`.
+
+CHECK / NOT NULL / types were already row-local in `CatalogRow::validate`
+(reached by UPSERT through `build_mutation_record`), so CHECK was enforced
+before — but surfaced as SQLSTATE `42P01`.
+
+`RowWriteConstraintMode` differs only where the semantics do:
+
+* *INSERT* — a live PK holder is a duplicate (23505); nothing is excluded from the UNIQUE probe.
+* *UPSERT* — a live PK holder is the row being replaced (returned to the caller,
+  which now bumps the row-count statistic only for genuinely new rows); the
+  statement's own oids are excluded from the UNIQUE probe (exactly as UPDATE
+  excludes its targets), so a replaced row keeping its own unique value is not
+  a self-conflict; a conflict key repeated within one statement is rejected
+  `21000` (PostgreSQL's "ON CONFLICT DO UPDATE command cannot affect row a
+  second time") instead of last-writer-wins.
+
+UPSERT also now takes the same in-process table op-lock as INSERT, so its
+probes and write cannot interleave with a concurrent writer or a cascading
+parent DELETE.
+
+*CKS divergence closed.* UPSERT claims every new PK in the CKS, so a later
+INSERT of that key is rejected by the fenced store itself. If a later step of
+the sequence rejects the statement, the claims it made are released
+(`cks.tombstone`) — a rejected INSERT or UPSERT no longer leaves a
+claimed-but-rowless key that spuriously rejects the next INSERT of it.
+
+*Typed SQLSTATEs.* Integrity failures are now a typed
+`RelationalConstraintViolation` (`crates/control/proximadb-catalog/src/relational.rs`,
+kinds Unique `23505` / ForeignKey `23503` / Check `23514` /
+UpsertAffectsRowTwice `21000`), raised by the shared sequence, by UPDATE's
+UNIQUE probe, by the ON DELETE RESTRICT check and by `CatalogRow`'s CHECK
+evaluation. pgwire's INSERT / UPDATE / DELETE error arms map it with
+`dml_error_sqlstate` (`src/network/postgres/protocol.rs`); every other error
+keeps its historical code. Messages are unchanged.
+
+=== Evidence
+
+Over pgwire (`tests/pgwire_upsert_constraints_e2e.rs`), `INSERT … ON CONFLICT
+(id) DO UPDATE` violating UNIQUE, CHECK and FK on both the insert arm and the
+update arm:
+
+* *Before* (origin/develop `9dc2b033c`): 3/3 fail — the UNIQUE and FK UPSERTs
+  were *admitted* ("statement must be rejected"), and the CHECK UPSERT was
+  rejected with SQLSTATE `42P01` instead of `23514`.
+* *After*: 3/3 pass — `23505` / `23514` / `23503` with the table snapshot
+  unchanged after each rejection, and a valid UPSERT still updates the
+  existing row and inserts a new one.
+
+Unit (`src/services/dml/tests.rs`): `upsert_enforces_unique_with_typed_sqlstates`
+and, under `oltp-integrity`, `upsert_claims_and_releases_pk_in_fenced_store`.
+
+=== Out of scope (still open)
+
+* `ON CONFLICT` target and action are still not honoured: the conflict is
+  always resolved on the primary key, `DO UPDATE SET …` assignments are not
+  evaluated (the whole proposed row replaces the existing one), and `DO NOTHING`
+  replaces instead of skipping. With this fix a conflict on a non-PK target
+  (`ON CONFLICT (email)`) fails closed with `23505` instead of silently
+  duplicating.
+* A constraint violation raised while replaying a buffered transaction at
+  COMMIT still surfaces as `25P02`.
+* REST/gRPC record upserts and pgwire COPY (insert-only since #2036) do not
+  reach `execute_upsert`; they are collection/record paths, not relational
+  DML, and were not changed.
