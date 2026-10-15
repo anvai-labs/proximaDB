@@ -3540,7 +3540,6 @@ jobs:
       - rust-compile-benches
       - rust-clippy
       - feature-matrix
-      - feature-matrix-enterprise-catalogs
       - rust-security
       - rust-build
       - rust-test
@@ -3577,6 +3576,7 @@ jobs:
       - connectors-contract-gates
       - spark-jni-smoke
       - openapi-spec-drift
+      - feature-matrix-enterprise-catalogs
       # gates that encode load-bearing decisions as checks
       - docs-authority
       - risk-coverage
