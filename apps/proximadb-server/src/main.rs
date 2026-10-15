@@ -124,6 +124,15 @@ async fn ensure_required_directories(config: &proximadb::core::Config) -> anyhow
 }
 
 fn main() -> anyhow::Result<()> {
+    // rustls 0.23.46 (RUSTSEC-2026-0346..0349 fix, #2032) no longer auto-picks
+    // the process-default CryptoProvider when the feature-unified build carries
+    // BOTH `aws-lc-rs` (aws-smithy stack) and `ring` (axum-server/reqwest paths)
+    // — it panics at first TLS construction instead, which the Docker health
+    // check caught as a boot-time server death. Install aws-lc-rs explicitly
+    // (rustls's own default preference, and what the Glue/aws path already
+    // compiles) before anything can construct a TLS endpoint.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // ProximaDB's pgwire OLAP path plans through DataFusion, whose SQL planner + optimizer recurse
     // deeply on nested-subquery / cross-modal plans — e.g. a derived table wrapping a
     // `vector_search` / `timeseries_range` / `graph_traverse` aggregate that is then JOINed to a

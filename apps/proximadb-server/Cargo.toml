@@ -74,6 +74,10 @@ clap.workspace = true
 proximadb = { path = "../../", default-features = false }
 proximadb-embedding = { path = "../../crates/modalities/proximadb-embedding" }
 proximadb-runtime-common.workspace = true
+# Only for the explicit CryptoProvider::install_default() at boot — see main().
+# rustls 0.23.46 panics at first TLS use when both provider features are
+# feature-unified into the build (RUSTSEC-2026-0346..0349 follow-up, #2032).
+rustls.workspace = true
 tokio = { version = "1.37", features = ["full"] }
 tracing = "0.1"
 tracing-appender = "0.2"
