@@ -118,16 +118,16 @@ previously skipped every Rust job).
 
 == Exit Criteria
 
-1. ✅ **Decision:** Option A — PR-time job, same shape as the benches sibling
+1. ✅ **Decision:** Option A — PR-time job, same shape as the benches sibling (original decision; the 2026-10-15 restore moved it to develop→qa, see Status)
 2. ✅ **Implement** — landed #1725, lost in `a5d4833e6`; restored 2026-10-15 as `--examples` on the develop→qa `rust-compile-benches` job + `examples/**` in the `compile` filter (#2044)
 
 == Status
 
-**Resolved 2026-10-15 (#2044).** History: implemented in #1725 (2026-09-01) as a per-PR job; silently removed on 2026-09-02 by the recovery commit `a5d4833e6`, whose message claimed the reverse. Restored not as the per-PR Option A job above but as `--examples` on the existing develop→qa `rust-compile-benches` job, with `examples/**` back in the `compile` filter: examples are not shipped and rot slowly, and TD-CITIER-1 is shortening the feat→develop path. Option A below is kept as the original proposal.
+**Resolved 2026-10-15 (#2044).** History: implemented in #1725 (2026-09-01) as a per-PR job; silently removed on 2026-09-02 by the recovery commit `a5d4833e6`, whose message claimed the reverse. Restored not as the per-PR Option A job above but as `--examples` on the existing develop→qa `rust-compile-benches` job, with `examples/**` back in the `compile` filter: examples are not shipped and rot slowly, and TD-CITIER-1 is shortening the feat→develop path. The Option A section above is kept as the original proposal.
 
 == Next Steps
 
-1. ✅ Choose solution — Option A (PR-time job)
+1. ✅ Choose solution — Option A (PR-time job; restored on develop→qa instead, see Status)
 2. ✅ Implemented (restored 2026-10-15, #2044; see Status)
 3. ✅ Adversarial review pass — aggregator wiring, path filter, evidence correction
 
