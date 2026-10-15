@@ -1,7 +1,7 @@
 # Windows (MSVC) compile ratchet — TD-EMBED-1.
 #
 # proximadb_embedded now ships Linux + macOS + Windows wheels (release-python.yml
-# builds the x86_64-pc-windows-msvc wheel on every python-v* tag). This ratchet is
+# builds the x86_64-pc-windows-msvc wheel on every vX.Y.Z release tag). This ratchet is
 # the FAST, PATH-GATED MSVC regression guard: each rung is a compile scope that
 # now works on Windows and MUST stay green. It fires on develop PRs so an MSVC
 # regression surfaces on the INTRODUCING PR (Mandate #9), not only at release-tag
