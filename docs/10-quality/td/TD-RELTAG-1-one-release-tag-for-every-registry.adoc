@@ -8,7 +8,7 @@
 | Status | **Resolved in-PR (2026-10-15).** Filed and closed in the change that unified the tags; kept as the record of why the gate exists.
 | Severity | **MEDIUM**: user-visible version skew across registries for the same release, with no failing check.
 | Component | `.github/workflows/release.yml`, `.github/workflows/release-python.yml`, `scripts/version-sync.sh`, `scripts/check_release_build_features.py`
-| Runbook | link:../../04-operations/release/RELEASE_PROCEDURE.adoc[Release procedure]
+| Runbook | `docs/04-operations/release/release-procedure.md` (docs site: "Release procedure (one tag, every registry)")
 | Related | link:TD-HELMDUP-1-second-helm-chart-is-unrenderable-and-unwatched.adoc[TD-HELMDUP-1] (same "a version nothing watches" class)
 |===
 

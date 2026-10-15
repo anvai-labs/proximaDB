@@ -86,7 +86,7 @@
 #   3. Review dry_run output, verify all artifacts built successfully
 #   4. Re-run with dry_run: false to publish
 #
-# TAG-BASED RELEASE PROCESS (runbook: docs/04-operations/release/RELEASE_PROCEDURE.adoc):
+# TAG-BASED RELEASE PROCESS (runbook: docs/04-operations/release/release-procedure.md):
 #   1. `bash scripts/version-sync.sh set X.Y.Z` merged; `check-tag vX.Y.Z` passes
 #   2. Create and push ONE tag: git tag vX.Y.Z && git push origin vX.Y.Z
 #   3. release.yml AND release-python.yml both trigger on it
