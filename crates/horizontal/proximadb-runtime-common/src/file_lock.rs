@@ -10,6 +10,16 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Whether `name` is one of the coordination lock files `FileLockManager`
+/// creates inside a root (`access.lock`, `leader.lock`). These inodes are
+/// process-coordination state, never data: callers that replace files must
+/// refuse them, and anything that copies a root (cold backup) must skip them.
+pub fn is_coordination_lock_file(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.eq_ignore_ascii_case("access.lock") || name.eq_ignore_ascii_case("leader.lock")
+    })
+}
+
 /// Access modes for multi-process coordination
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
@@ -216,9 +226,7 @@ impl FileLockManager {
                     "conditional file requires a filename",
                 )
             })?;
-            if name.to_str().is_some_and(|name| {
-                name.eq_ignore_ascii_case("access.lock") || name.eq_ignore_ascii_case("leader.lock")
-            }) {
+            if is_coordination_lock_file(name) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "cannot replace or guard a coordination lock inode",

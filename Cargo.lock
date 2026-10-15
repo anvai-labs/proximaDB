@@ -9302,6 +9302,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "libc",
  "proximadb",
  "proximadb-embedding",
@@ -9311,6 +9312,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",

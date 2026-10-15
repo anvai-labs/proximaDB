@@ -43,6 +43,9 @@ compile_error!(
      target a little-endian arch (x86_64, aarch64, etc.)"
 );
 
+mod cli;
+mod cold_backup;
+mod durable_locations;
 mod runtime_state;
 mod shutdown;
 
@@ -50,30 +53,9 @@ use clap::Parser;
 use proximadb::ProximaDB;
 use proximadb::core::ConfigLoader;
 use proximadb::core::hardware_capabilities::initialize_hardware_capabilities;
-use std::path::PathBuf;
 use tracing::{error, info, warn};
 
 mod storage_ownership;
-
-#[derive(Parser)]
-#[command(name = "proximadb-server")]
-#[command(about = "ProximaDB cloud-native vector database server")]
-struct Args {
-    #[arg(short, long, default_value = "config/config.toml")]
-    config: PathBuf,
-
-    #[arg(short, long)]
-    data_dir: Option<PathBuf>,
-
-    #[arg(short, long)]
-    port: Option<u16>,
-
-    #[arg(long)]
-    node_id: Option<String>,
-
-    #[arg(short, long, help = "Set log level (error, warn, info, debug, trace)")]
-    log_level: Option<String>,
-}
 
 /// Ensure all required directories exist based on configuration
 async fn ensure_required_directories(config: &proximadb::core::Config) -> anyhow::Result<()> {
@@ -133,6 +115,14 @@ fn main() -> anyhow::Result<()> {
     // compiles) before anything can construct a TLS endpoint.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    let cli = cli::Cli::parse();
+    cli.validate()?;
+    if let Some(command) = cli.command {
+        // Offline maintenance: synchronous, no runtime, no embedding/hardware
+        // setup — and it resolves storage roots exactly as serving would.
+        return run_admin(&cli.common, command);
+    }
+
     // ProximaDB's pgwire OLAP path plans through DataFusion, whose SQL planner + optimizer recurse
     // deeply on nested-subquery / cross-modal plans — e.g. a derived table wrapping a
     // `vector_search` / `timeseries_range` / `graph_traverse` aggregate that is then JOINed to a
@@ -145,7 +135,7 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .thread_stack_size(32 * 1024 * 1024)
         .build()?;
-    let result = runtime.block_on(run());
+    let result = runtime.block_on(run(cli.common, cli.serve));
     // TD-LIFECYCLE-1: several always-on background loops leak their shutdown
     // senders by design (discovery executor, recall observer — see
     // shared_services.rs), so a plain Runtime drop can block forever on an
@@ -157,7 +147,7 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(common: cli::CommonArgs, serve: cli::ServeArgs) -> anyhow::Result<()> {
     // Initialize tracing with rolling file appender
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -189,19 +179,15 @@ async fn run() -> anyhow::Result<()> {
         .with_ansi(false) // No ANSI colors in file
         .with_writer(non_blocking);
 
-    // Parse arguments first to get config path
-    let args = Args::parse();
-
     // Load configuration first to get log level from TOML
-    let config_path_for_state = args.config.to_string_lossy().to_string();
-    let mut config = ConfigLoader::load_with_defaults(args.config.to_string_lossy().as_ref())
-        .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+    let config_path_for_state = common.config.to_string_lossy().to_string();
+    let mut config = load_config(&common.config)?;
 
     // Initialize subscriber with both console and file output - fully configurable
     // Priority: Environment variable > CLI args > TOML config > Default (INFO)
     // Default to info level - only show info, warn, error (no debug/trace)
     let log_level = std::env::var("RUST_LOG")
-        .or_else(|_| args.log_level.clone().ok_or(()))
+        .or_else(|_| common.log_level.clone().ok_or(()))
         .unwrap_or_else(|_| {
             // If config has a log level, use it, otherwise default to info
             if config.monitoring.log_level.is_empty()
@@ -237,7 +223,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // Override with CLI arguments
-    if let Some(data_dir) = args.data_dir {
+    if let Some(data_dir) = common.data_dir {
         // TD-PATH-1: `-d` must also rebase the storage/metadata locations that
         // are still at their BUILT-IN cwd-relative defaults — otherwise every
         // instance launched from one working directory shares `<cwd>/data` +
@@ -247,10 +233,10 @@ async fn run() -> anyhow::Result<()> {
         rebase_default_relative_paths(&mut config, &data_dir);
         config.server.data_dir = data_dir;
     }
-    if let Some(port) = args.port {
+    if let Some(port) = serve.port {
         config.server.port = port;
     }
-    if let Some(node_id) = args.node_id {
+    if let Some(node_id) = serve.node_id {
         config.server.node_id = node_id;
     }
 
@@ -337,6 +323,23 @@ async fn run() -> anyhow::Result<()> {
     // Runtime state is observability, not fencing. Acquire kernel-backed locks
     // before publishing lifecycle state or initializing any engine.
     let _storage_ownership = storage_ownership::StorageOwnershipLease::acquire(&config)?;
+    // A restore that did not complete leaves its marker in data_dir; booting on
+    // a half-restored set of roots would silently serve partial data.
+    let restore_marker = config
+        .server
+        .data_dir
+        .join(cold_backup::RESTORE_IN_PROGRESS_FILE);
+    if restore_marker.exists() {
+        anyhow::bail!(
+            "refusing to start: a cold restore into these storage roots did not complete ({}). \
+             Re-run `proximadb-server restore --from <backup> --force` to finish it.",
+            restore_marker.display()
+        );
+    }
+    // Record where THIS process writes durable state outside the leased roots
+    // (its env + config, absolute), so an offline backup run from another shell
+    // can refuse instead of silently omitting it.
+    durable_locations::record(&config)?;
 
     // Publish the lifecycle record BEFORE any slow work. Recovery can run for
     // minutes on a large data dir and binds no socket until it finishes, so a
@@ -457,6 +460,54 @@ async fn run() -> anyhow::Result<()> {
     if critical_drainer_stopped {
         anyhow::bail!("critical embedding drainer terminated; server shutdown completed");
     }
+    Ok(())
+}
+
+/// Load the TOML configuration (shared by serving and offline subcommands).
+fn load_config(path: &std::path::Path) -> anyhow::Result<proximadb::core::Config> {
+    ConfigLoader::load_with_defaults(path.to_string_lossy().as_ref())
+        .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))
+}
+
+/// The configuration an offline subcommand operates on: the SAME load + `-d`
+/// rebase serving applies, so backup/restore target exactly the roots the
+/// server would own.
+fn resolve_admin_config(common: &cli::CommonArgs) -> anyhow::Result<proximadb::core::Config> {
+    let mut config = load_config(&common.config)?;
+    if let Some(data_dir) = &common.data_dir {
+        rebase_default_relative_paths(&mut config, data_dir);
+        config.server.data_dir = data_dir.clone();
+    }
+    Ok(config)
+}
+
+fn run_admin(common: &cli::CommonArgs, command: cli::AdminCommand) -> anyhow::Result<()> {
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .or_else(|| common.log_level.clone())
+        .unwrap_or_else(|| "warn".to_string());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_new(&filter)
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let config = resolve_admin_config(common)?;
+    let (verb, summary) = match command {
+        cli::AdminCommand::Backup { to } => ("backup", cold_backup::run_backup(&config, &to)?),
+        cli::AdminCommand::Restore { from, force } => {
+            ("restore", cold_backup::run_restore(&config, &from, force)?)
+        }
+    };
+    for warning in &summary.warnings {
+        eprintln!("WARNING: {warning}");
+    }
+    println!(
+        "{verb} complete: {} root(s), {} file(s), {} bytes",
+        summary.roots, summary.files, summary.bytes
+    );
     Ok(())
 }
 
