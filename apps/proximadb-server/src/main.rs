@@ -105,6 +105,15 @@ async fn ensure_required_directories(config: &proximadb::core::Config) -> anyhow
 }
 
 fn main() -> anyhow::Result<()> {
+    // rustls 0.23.46 (RUSTSEC-2026-0346..0349 fix, #2032) no longer auto-picks
+    // the process-default CryptoProvider when the feature-unified build carries
+    // BOTH `aws-lc-rs` (aws-smithy stack) and `ring` (axum-server/reqwest paths)
+    // — it panics at first TLS construction instead, which the Docker health
+    // check caught as a boot-time server death. Install aws-lc-rs explicitly
+    // (rustls's own default preference, and what the Glue/aws path already
+    // compiles) before anything can construct a TLS endpoint.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = cli::Cli::parse();
     cli.validate()?;
     if let Some(command) = cli.command {

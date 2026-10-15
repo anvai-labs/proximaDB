@@ -9309,6 +9309,7 @@ dependencies = [
  "proximadb-queue",
  "proximadb-runtime-common",
  "reqwest 0.11.27",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
