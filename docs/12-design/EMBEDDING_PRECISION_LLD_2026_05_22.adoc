@@ -3,7 +3,7 @@
 :toclevels: 3
 :sectnums:
 
-Status: Locked specification — **Partial (verified 2026-10-15)**: Phase 2 (PR 1–12) shipped, completed by the link:EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[integration mini-phase] (fp16 canonical storage, default-OFF behind `PROXIMADB_EMBED_PRECISION_SCHEMA_V2`); Phase 3 (int8 canonical, PR 3.1–3.12) not started (no `Calibrator`, no `ACKNOWLEDGE LOSSY` in code); Phase 4+ items deferred. The wire/storage layout sections remain the contract for the shipped format. +
+Status: Locked specification — **Partial (verified 2026-10-15)**: Phase 2 (PR 1–12) shipped except the PR 12 fp32→fp16 epoch-bump migration test, completed by the link:EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[integration mini-phase] (fp16 canonical storage, default-OFF behind `PROXIMADB_EMBED_PRECISION_SCHEMA_V2`); Phase 3 (int8 canonical, PR 3.1–3.12) not started (no `Calibrator`, no `ACKNOWLEDGE LOSSY` in code); Phase 4+ items deferred. The wire/storage layout sections remain the contract for the shipped format. +
 Date: 2026-05-22 +
 Scope: Concrete bytes, signatures, DDL, and PR sequence for end-to-end
 embedding precision. Companion to `EMBEDDING_PRECISION_END_TO_END_2026_05_22.adoc`
@@ -788,28 +788,44 @@ Precision epoch bump flow:
 
 == Phase 2 PR Sequence — History (shipped)
 
-The twelve-PR Phase 2 breakdown is fully landed; this section records what shipped. Each PR was
+The twelve-PR Phase 2 breakdown has landed except one PR 12 migration test (open, below); this section records what shipped. Each PR was
 independently landable behind the default-OFF `PROXIMADB_EMBED_PRECISION_SCHEMA_V2` flag.
 
 * *PR 1–3:* `EmbeddingScalarType` / `EmbeddingValues` in `proximadb-records` (custom serde for the
   byte layout above; `EmbeddingCell.values` flipped to `EmbeddingValues` in INT-2.5b), big-endian
   `compile_error!`, `ProximaRecord.schema_version` dispatch in the WAL reader, the flag itself
   (`proximadb-config`, which also carries `precision_schema_v2_capable`).
-* *PR 4–5:* WAL v2 segment header (`v2_segment_header.rs`, `64d09e964`) and the PAX per-column
-  alignment header `PaxBlockHeaderV2` (`per_column_alignment.rs`, `6be54efdd`). **Lesson:** the PR 5
-  header is not on the live flush path — SST blocks were Arrow IPC, so the fp16 storage win shipped
-  through the Arrow bridge (`Float16Array`) instead; `PaxBlockHeaderV2` stays as the primitive for a
-  future PAX-native path (see link:EMBEDDING_PRECISION_INT3_FOLLOWUP_MEMO_2026_05_23.adoc[the INT-3 memo]).
+* *PR 4:* WAL v2 segment header (`v2_segment_header.rs`, `64d09e964`).
 * *PR 6–7:* xCatalog precision policy + collection fields (default `global_default_fp32`);
   `HardwareCapabilities::probe()` + precision Prometheus metrics + EXPLAIN precision section.
 * *PR 8–9:* `project_to_canonical` boundary + `prepare_query` query downconvert; `EmbedRoute::Byo`
   `declared_precision` (legacy JSON defaults to Fp32).
 * *PR 10–11:* PQ codebook `built_from_precision`/`built_at_epoch`/`status` lifecycle with stale-on-epoch
   bump; `proximadb-recall-bench` recall harness (SIFT-1M, GloVe-100).
-* *PR 12 / INT-4:* fp16 collection end-to-end across REST/gRPC/pgwire (`CREATE TABLE WITH
-  (canonical_embedding_precision='fp16')`)/Arrow Flight/SDKs; canonical-bytes gauge e2e
-  (`tests/fp16_canonical_bytes_metric_e2e.rs`) and the byte-halving assertion
-  (`arrow_block::writer::tests::fp16_file_is_approximately_half_the_fp32_size`).
+
+=== PR 5 — PAX per-column alignment header (Q7)
+
+**Shipped** (`per_column_alignment.rs`, `6be54efdd`): the PAX block header `PaxBlockHeaderV2` carries a
+per-column table (column_id, scalar_type, alignment, offset). Fp32 and fp16 columns coexist with correct
+alignment, and old blocks with the fixed 4-byte marker read transparently.
+
+**Lesson:** this header is not on the live flush path. SST blocks were Arrow IPC, so the fp16 storage win
+shipped through the Arrow bridge (`Float16Array`) instead. `PaxBlockHeaderV2` stays as the primitive for a
+future PAX-native path (see link:EMBEDDING_PRECISION_INT3_FOLLOWUP_MEMO_2026_05_23.adoc[the INT-3 memo]).
+
+=== PR 12 — End-to-end fp16 collection (the payoff)
+
+**Partial.**
+
+*Shipped (INT-4):* an fp16 collection works end to end across REST, gRPC, pgwire
+(`CREATE TABLE WITH (canonical_embedding_precision='fp16')`), Arrow Flight and the SDKs. Evidence: the
+canonical-bytes gauge e2e (`tests/fp16_canonical_bytes_metric_e2e.rs`) and the byte-halving assertion
+(`arrow_block::writer::tests::fp16_file_is_approximately_half_the_fp32_size`).
+
+*Open (restored 2026-10-15; no such test exists on develop):* the second integration test from the original plan —
+
+* Migrate an existing fp32 collection to fp16 via epoch bump; verify
+  mixed-segment reads return identical top-K (within recall gate).
 
 == Acceptance Criteria
 

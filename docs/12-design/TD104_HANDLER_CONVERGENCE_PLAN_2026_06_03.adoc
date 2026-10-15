@@ -7,7 +7,7 @@
 | Field | Value
 | Status | **Done (2026-07-08).** All four protocols moved off the concrete root `UnifiedHandlers` (S1 `f141dcc5d`, S2 `7e18a483b`, S3a/S3b `20e41ad95`, S3-c #757). The root handler was then retired (S3-e/S3-f #761, cleanup #768). `src/api_handlers/request_handlers.rs` no longer exists.
 | Component | `crates/platform/proximadb-runtime` (`ApiHandlersPort`, `RecordOpsPort`), `src/api_handlers/record_ops_service.rs`, `src/network/{rest,grpc,arrow_ipc,postgres}`
-| Relates to | link:SYSTEM_MAP_2026_05_30.adoc[System Map], link:V1_RETIREMENT_ROADMAP_2026_07_08.adoc[v1 retirement roadmap] (Tier 3 named this god-object), TD-104 (register row is stale "In Progress"; see STATUS_CORRECTIONS)
+| Relates to | link:SYSTEM_MAP_2026_05_30.adoc[System Map], link:V1_RETIREMENT_ROADMAP_2026_07_08.adoc[v1 retirement roadmap] (Tier 3 named this god-object), TD-104 (register row reconciled to Partial 2026-10-15)
 |===
 
 == History
