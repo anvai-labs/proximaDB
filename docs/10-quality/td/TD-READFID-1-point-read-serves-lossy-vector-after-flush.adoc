@@ -5,9 +5,9 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (Observed; root cause not yet traced).**
+| Status | **Fixed for declared-`fp32` collections (fix/readfid1-point-read-fidelity).** Undeclared (`Unspecified`) collections keep the lossy default by design; see <<residual>>.
 | Priority | **HIGH**: data fidelity on the GA read path. The value a client wrote is not the value it reads back, and nothing signals the change.
-| Component | REST v2 `GET /api/v2/collections/{c}/records/{id}` against an SST collection, and whatever segment read path serves it after flush (PAX / SQ8 decode). Exact path not yet traced.
+| Component | SST flush writer policy (`src/storage/engines/sst/flush/mod.rs`, `resolve_pax_f32_tier`) plus the flush materializer's engine DTO (`src/storage/flush_materializer.rs`). The read path was already correct.
 | Relates to | TD-RDSTRAT-7 (lossless clustered PAX bytes, which concerns storage encoding rather than read fidelity), mandate #3 (SQ8/RaBitQ **plus f32 rerank**), mandate #16 (read correctness).
 | Found | 2026-10-15, while building the cold backup/restore round-trip test (`apps/proximadb-server/tests/cold_backup_restore.rs`)
 |===
@@ -30,11 +30,46 @@ The error is about 8-bit quantization error, consistent with an SQ8-decoded vect
 * Anything that round-trips vectors, such as export, re-embedding pipelines, client-side caches or equality checks, sees data change on its own after flush.
 * If the f32 copy is not retained at all after flush, rerank quality is affected too. That must be checked.
 
-== Open questions (Unknown; trace before fixing)
+== Trace (Verified)
 
-. Is the f32 vector **stored** in the flushed segment and just not served by the point-read path, or is it never retained?
-. Which read paths are affected: REST v2 get-by-id only, or also gRPC, pgwire `SELECT embedding`, Arrow Flight and search results that return vectors?
-. Do HELIX/NOVA/VIPER behave the same way, or only SST?
+Point read path: REST v2 `get_record_v2` (`src/network/rest/v2/records.rs`) -> `VectorReadCoordinator::vector` (`src/services/operations/vectors/read.rs`, WAL first, then engine) -> `SstEngine::point_lookup` -> `read_all_records` (`src/storage/engines/sst/trait_impl.rs`) -> `segment_format::read_segment_records` -> `read_pax_segment_records` / `PaxSegmentScanner::read_records`.
+
+. **The f32 originals were NOT persisted at flush.** The flush resolves the base quant to `RaBitQ` by default (`resolve_pax_vector_quant`) with an `SQ8` rerank column, and emits the exact-f32 tier (`col_id::F32_TIER_BASE`, or Region C under the v4 row-group layout) only when `resolve_pax_f32_tier` says so. Before this fix that resolver read only the `pax_f32_tier:` collection tag and the `PROXIMADB_PAX_F32_TIER` env var, both default off. It never consulted `canonical_embedding_precision`. So for an `fp32` collection the segment held only RaBitQ codes plus SQ8, and the written value was gone.
+. **The declaration never reached the flush anyway.** Every flush trigger (inline, `AutoFlushDriver`, shutdown, `force_flush_collection`) goes through `flush_plan_from_collection_meta` -> `materialize_collection_with_coordinator` (`src/storage/flush_materializer.rs`). That function rebuilds a minimal transitional `Collection` DTO for `engine.flush()` holding only name, engine, dimension, filterable columns and `enable_proxima_record`, so `canonical_embedding_precision` was dropped. The same DTO also drops `tags` and `pax_vector_quant`, which means the documented per-collection `pax_f32_tier:` / `pax_vector_quant` / `pax_rg_layout:` knobs are dark on the production flush too; see <<residual>>. This was proven empirically: changing the resolver alone left the e2e reproduction failing with identical bytes.
+. **The read path did not pick the wrong column.** The materializers already prefer the exact tier when one exists: block-local in `crates/storage/proximadb-block-format/src/record.rs` (the `F32_TIER_BASE + e` probe in `FlatRow::from_block_reader`), and Region C first, then SQ8, in `read_pax_segment_records` (`crates/storage/proximadb-storage-common/src/pax_block.rs`). With no tier, the SQ8 Region-B fill is the only vector available, and that is the value the observation table shows.
+. **Not a storage-format change.** The exact tier is an existing optional section. It is declared in the footer (`has_f32_tier`), is magic/footer-detected, and has round-trip tests (`coalesced_requested_f32_tier_is_emitted_and_materializes_exact`, `exact_authority_holds_for_region_c_segment`, `v4_f32_tier_writes_region_c_not_block_stripes`). Segments without it still read, lossily, exactly as before. Compaction is *supposed* to keep the tier only when every input has it (`pax_inputs_have_f32_tier`), so old lossy segments are never presented as exact — **but on the production path this predicate currently fails closed: compaction input paths arrive as `file://` URLs (`GenericFileMetadata.path = entry.url`, LocalFileSystem emits `file://{abs}`), and `pax_inputs_have_f32_tier` / `pax_inputs_rerank_quant` read them with `std::fs::read`, which cannot open URL-bearing paths (verified: `std::fs::read(Path::new("file:///…"))` errors). The intersection therefore evaluates to false on every real deployment and the tier is dropped at the FIRST compaction even when every input is a new tier'd segment — an fp32 collection silently re-lossifies. Pre-existing on develop (predates this PR); filed as TD-READFID-2 and correcting this Trace claim per adversarial review of this PR.
+
+== Fix
+
+Two hops, both required:
+
+. `CollectionFlushPlan` now carries `canonical_embedding_precision` from the catalog meta into the engine DTO. Unit test: `canonical_precision_reaches_the_engine_flush_boundary`, which records what the engine's `do_flush` actually receives.
+. `resolve_pax_f32_tier` now takes the resolved base quant. Precedence: explicit `pax_f32_tier:` tag > **declared `canonical_embedding_precision = fp32` with a lossy base quant (anything except `RawF32`) => tier ON** > env > off. A `RawF32` base is already exact, so it gets no duplicate tier. Unit test: `fp32_declaration_resolves_the_exact_tier`.
+
+Storage cost: for fp32 collections only, about +4·dim bytes per row. That is the price of the declared contract. The tier is read lazily (point read, exact scan, materialization) and is not on the RaBitQ/SQ8 cascade's scan path.
+
+== Evidence
+
+* Reproduction through the real surface: `tests/v2_post_flush_search_e2e.rs::v2_fp32_point_read_is_byte_exact_after_flush`. It creates an fp32 SST collection over REST v2, does a batch insert, checks memtable reads bit-exact, calls `force_flush_collection`, asserts the WAL is drained and a `.pax` exists, then does GET-by-id and compares `f32::to_bits`.
+** Unfixed code (`origin/develop` 9dc2b033c): **FAIL**. Post-flush `rec-0` = `[0.0, 0.019972557, 0.039945114, 0.059917673, 0.07989023, 0.099862784, 0.11983535, 0.1398079]`, written = `[0.0, 0.020026812, 0.04005174, 0.06007289, 0.08008839, 0.10009634, 0.120094866, 0.14008209]`. The pre-flush control passed.
+** Fixed: **PASS**. All 6 records are bit-exact after flush.
+* `apps/proximadb-server/tests/cold_backup_restore.rs`: the plain-restart `NOTE:` is now an assertion that the restarted read equals the written read.
+
+== Rerank / search impact (Verified by reading the code; not measured)
+
+* **ANN cascade (RaBitQ -> SQ8), Approximate path:** the final ordering and scores come from `rerank_sq8_distance` (`src/storage/engines/sst/segment_format.rs`). The block-format exact rerank `rerank_rows_f32_exact` and `decode_f32_tier_rows` (`crates/storage/proximadb-block-format/src/reader.rs`) have **no production caller**, and `CascadeHit.vector` is always `None`. So the cascade's last stage is SQ8, not f32, **with or without the tier**. This differs from mandate #3's "f32 rerank". It is a recall-quality gap bounded by SQ8 error; the cascade's own doc comment cites recall 0.932 @ N=100k (L2) (`try_pax_cascade`, `src/storage/engines/sst/search/mod.rs`). It is not changed here; tracked below.
+* **Generic PAX scan (`search_pax_file_exact`):** this path scores the vectors that `read_segment_records` materializes. Before the fix, an fp32 collection's flushed segments were scored on SQ8 reconstructions. After the fix they are scored on the exact f32 tier.
+* **Explicit `SearchMode::Exact`** (`force_exact`) already failed closed on lossy segments ("exact vector search requires authoritative raw-f32 values"). For fp32 collections, flushed segments now satisfy `pax_segment_has_exact_vector_authority`.
+
+[[residual]]
+== Residual (Open)
+
+* **No production opt-out for declared-fp32 collections (runbook note).** Precedence is tag > declaration > env, and the flush DTO drops `tags` — so `pax_f32_tier:off` is dark (below), and `PROXIMADB_PAX_F32_TIER=0` is ALSO ignored for a declared-`fp32` collection because the declaration outranks the env var. The only rollback for the ~4·dim bytes/row cost is editing the collection's precision declaration in the catalog. If you need the tier off without touching the catalog, that is not currently possible; see the DTO-tags residual below.
+* **The transitional flush DTO drops `tags` and `pax_vector_quant`** (`materialize_collection_with_coordinator`). Every per-collection PAX tag resolver in `sst/flush/mod.rs` (`pax_f32_tier:`, `pax_vector_format:`, `pax_rg_layout:`, rerank quant) and `pax_vector_quant` therefore see nothing on the production flush; only the env vars apply. They are not propagated here because turning those knobs on is a behaviour change for any collection that set them; that needs its own PR with tests per knob. Until then, an explicit `pax_f32_tier:off` opt-out on an fp32 collection is also dark.
+* **`Unspecified` precision** (the default when a client sets none) still flushes lossy, and point reads after flush still return SQ8. Turning the tier on for every collection is a GB-month decision (about 5x the RaBitQ+SQ8 bytes at the default quant), so it needs measured cost evidence and is not taken here. Options: default REST create to `fp32`; add a `precision` signal on reads; or on by default with a per-collection opt-out.
+* **The cascade never uses the exact tier for final rerank** (see above). Wiring `rerank_rows_f32_exact` into the cascade's top-k stage when the tier is present is the mandate-#3 follow-up. It must be gated on the ANN recall ratchet.
+* `SstCompactor::write_merged_records` (`src/storage/engines/sst/compactor_impl.rs`) re-encodes `.pax` with `write_pax_segment` and no tier. It does not appear to be on the live compaction path (the live path is `compaction.rs`, which uses the intersection rule), but if it is reached it would drop the tier.
+* Other surfaces that materialize through `read_segment_records` (scan, pgwire `SELECT embedding`, Arrow Flight) inherit the fix for fp32 collections; only REST v2 get-by-id is tested end to end. HELIX/NOVA/VIPER were not traced.
 
 == Verification for a fix
 
