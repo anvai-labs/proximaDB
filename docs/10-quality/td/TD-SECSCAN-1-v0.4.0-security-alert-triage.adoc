@@ -217,7 +217,13 @@ the shared sinks (no third constant anywhere):
    `check_top_k(u64) -> Result<(), TopKLimitExceeded>`. The REST v2 inline
    env read was replaced by it. **Boundary rejects (client gets an explicit
    invalid-argument error)** — proven per route by the e2e test below: REST v2
-   record + entity search, REST v1 progressive search, REST hybrid search,
+   record + entity search, the legacy REST entity search
+   (`POST /api/v1/collections/{id}/entities/search` — this handler carried its
+   own hardcoded `top_k > 10000` bound and "between 1 and 10000" message,
+   both now routed through the shared limit; its `top_k == 0` rejection is
+   this surface's existing contract, kept as-is and consistent with REST v2
+   record search, while the shared `check_top_k` alone permits 0), REST v1
+   progressive search, REST hybrid search,
    REST graph fusion-search (`limit` AND `max_seeds`), REST analytics
    entanglement (`limit`), gRPC v2 `Search` / `SearchStream` /
    `SearchEntities`, gRPC `FusionSearch` (`limit` AND `max_seeds`), Arrow

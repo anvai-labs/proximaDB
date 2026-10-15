@@ -427,6 +427,39 @@ async fn every_search_surface_rejects_over_cap_top_k() {
         hybrid_at.text().await.unwrap_or_default()
     );
 
+    // --- Legacy REST entity search (POST /api/v1/collections/{id}/entities/search).
+    // This handler hardcoded its own `top_k > 10000` bound and message; the
+    // cap must come from the shared limit so PROXIMADB_SEARCH_MAX_TOP_K
+    // governs it (the error text naming the env var is the discriminator).
+    let legacy_over = http
+        .post(format!("{base}/api/v1/collections/{name}/entities/search"))
+        .json(&json!({ "query_vector": query_vector(), "top_k": OVER_CAP_TOP_K }))
+        .send()
+        .await
+        .expect("legacy entity search");
+    assert_eq!(
+        legacy_over.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "legacy entity search must reject top_k above the cap: {}",
+        legacy_over.status()
+    );
+    let legacy_body = legacy_over.text().await.unwrap_or_default();
+    assert!(
+        legacy_body.contains("PROXIMADB_SEARCH_MAX_TOP_K"),
+        "legacy entity search rejection must come from the shared limit (named the env var), got: {legacy_body}"
+    );
+    let legacy_zero = http
+        .post(format!("{base}/api/v1/collections/{name}/entities/search"))
+        .json(&json!({ "query_vector": query_vector(), "top_k": 0 }))
+        .send()
+        .await
+        .expect("legacy entity search zero");
+    assert_eq!(
+        legacy_zero.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "legacy entity search must keep rejecting top_k=0"
+    );
+
     // --- Graph fusion search (POST /api/v2/graphs/{id}/fusion-search).
     // The limit cap is checked before any collection/graph lookup, so an
     // over-cap request is 400 even without a registered graph.
