@@ -1,12 +1,12 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-WAL-5: a config-file `wal_local_dir` is written to but not replayed after a crash — acknowledged writes are lost
+= TD-WAL-5: with a config-file `wal_local_dir`, a crash shortly after an acknowledged write loses it
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open. Reproduced; root cause traced to a write/replay split, fix not started.**
-| Priority | **CRITICAL**: silent loss of acknowledged writes on any crash, for every deployment that sets `wal_local_dir` in the config file rather than in the environment.
+| Status | **Open. Reproduced; mechanism only partly traced (see *Mechanism*), fix not started.**
+| Priority | **CRITICAL**: silent loss of acknowledged writes when a crash falls inside a window after the ack, for every deployment that sets `wal_local_dir` in the config file rather than in the environment.
 | Component | `src/storage/persistence/write_ahead_log/mod.rs`: `local_wal_dir(&config)` (write path) vs `local_wal_dir_env()` (env-only, used by recovery/replay free functions that have no `WALConfig` handle). `[storage.wal_config] wal_local_dir` (ADR-069 S1).
 | Relates to | TD-WAL-1 (ADR-069 local-disk WAL; its S5 crash test covers only the default layout), mandate #16 (read-after-write correctness), the cold backup/restore PR that surfaced it.
 | Found | 2026-10-15, while adding a crash-consistent case to `apps/proximadb-server/tests/cold_backup_restore.rs`
@@ -26,11 +26,13 @@ Setup: SST collection, `sync_mode = "PerBatch"`, 6 records inserted over REST v2
 
 `enable_wal` is irrelevant. The trigger is a config-file `wal_local_dir`.
 
-== Mechanism (Observed in code)
+**The loss depends on timing.** The rows above SIGKILL *immediately* after the insert ack. An independent review re-ran the config-file case and killed about 2 s later, after some unrelated activity. Recovery then succeeded: restart produced an `L0_recovery_*.pax`, and the WAL manifest entry under `collections/wal/*.jsonl` carried `storage_url = file://…/<wal_local_dir>`. With the `PROXIMADB_WAL_LOCAL_DIR` env form, even the immediate kill recovered.
+
+== Mechanism (partly traced; must be re-traced before a fix is designed)
 
 * The write path resolves the WAL base with `local_wal_dir(&self.config)`. That honours the config field (and the env override), so WAL segments are written to `wal_local_dir`.
 * Recovery and replay run as free functions without a `WALConfig` handle, and use `local_wal_dir_env()`. That reads **only** `PROXIMADB_WAL_LOCAL_DIR`. Its own doc comment admits the gap: _"for full write and replay consistency an operator sets the env"_.
-* So when the location is set only in the config file, replay looks in the default location, finds nothing, and the server starts without the acknowledged-but-unflushed writes.
+* * That explanation is **incomplete**. Part of recovery follows the WAL manifest's `storage_url`, which does record the config directory. The likely window is the interval before the manifest entry for new WAL segments is persisted: an immediate crash leaves segments that only the env-only path could find. This is a hypothesis; trace manifest persistence timing against recovery to confirm it.
 
 The env-var form is consistent between write and replay; it is unaffected.
 
