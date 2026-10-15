@@ -22,7 +22,7 @@ The test creates a dim-8 `engine: "sst"` collection with `canonical_embedding_pr
 | After a plain graceful restart (flushed to a segment) | `[0.0, 0.009294118, 0.018588236, 0.030980391, 0.04027451, 0.049568627, 0.058862746, 0.0712549]`
 |===
 
-The error is about 8-bit quantization error, consistent with an SQ8-decoded vector being served instead of the stored f32. The test prints this as a `NOTE:` on every run. To keep backup fidelity separate from this behaviour, it compares the restored server against a **plain-restart** baseline rather than the pre-stop read.
+The error is about 8-bit quantization error, consistent with an SQ8-decoded vector being served instead of the stored f32. The test prints this as a `NOTE:` (visible with `--nocapture`, since libtest captures output from passing tests). To keep backup fidelity separate from this behaviour, it compares the restored server against a **plain-restart** baseline rather than the pre-stop read.
 
 == Why it matters
 

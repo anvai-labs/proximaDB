@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use proximadb::core::Config;
 use sha2::{Digest, Sha256};
 
+use crate::durable_locations;
 use crate::runtime_state::RUNTIME_STATE_FILE;
 use crate::storage_ownership::{RootRole, StorageOwnershipLease, root_plan};
 use manifest::{
@@ -35,6 +36,23 @@ use manifest::{
 };
 
 const COPY_BUF: usize = 1024 * 1024;
+
+/// Present in `data_dir` while a restore is writing. The server refuses to
+/// start on it, so a crashed, killed or failed restore can never be booted
+/// from silently; it is removed only after every byte is written and fsynced.
+pub(crate) const RESTORE_IN_PROGRESS_FILE: &str = ".proximadb-restore-in-progress";
+
+/// Consistency rests on the ownership lease, which is an advisory `flock` on
+/// unix. Elsewhere the lock is a no-op (it only warns), so a "server is
+/// stopped" proof does not exist — refuse rather than pretend.
+fn require_unix_lease() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cfg!(unix),
+        "cold backup/restore require unix advisory locks to prove the server is stopped; \
+         unsupported on this platform"
+    );
+    Ok(())
+}
 
 /// What a completed backup or restore did, for the operator summary.
 #[derive(Debug)]
@@ -103,53 +121,48 @@ fn other_roots(roots: &[ManifestRoot], index: usize) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-/// Durable state the ownership lease does not cover. Backup refuses rather
-/// than produce a copy that silently omits it.
-fn unleased_durable_state(config: &Config) -> Vec<String> {
+/// Durable state outside every leased root. Backup refuses rather than
+/// produce a copy that silently omits it.
+///
+/// Fail-closed on two sources, because a backup run from an operator's shell
+/// cannot see the server's per-pod environment:
+/// * the record the SERVING process wrote at boot (its own env + config,
+///   absolute paths) — required: a data dir without one cannot be checked;
+/// * this process's own env + config (catches a config edited since boot).
+///
+/// Remote locations are durable on their own and are not refused.
+fn unleased_durable_state(config: &Config) -> anyhow::Result<Vec<String>> {
+    let recorded = durable_locations::read_record(&config.server.data_dir)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no {} in {}: the server records where it writes durable state at boot, and \
+             without that record backup cannot prove nothing lies outside the storage roots. \
+             Start the server once with this version (then stop it) before taking a cold backup.",
+            durable_locations::DURABLE_LOCATIONS_FILE,
+            config.server.data_dir.display()
+        )
+    })?;
+    let mine =
+        durable_locations::effective_durable_locations(config, |key| std::env::var(key).ok());
+
+    let leased: Vec<PathBuf> = root_plan(config)
+        .local
+        .into_iter()
+        .filter_map(|(_, root)| absolute(&root).ok())
+        .collect();
     let mut found = Vec::new();
-    if config
-        .queue
-        .as_ref()
-        .is_some_and(|queue| queue.root.is_some())
-    {
-        found.push("[queue] root".to_string());
-    }
-    for var in ["PROXIMADB_QUEUE_ROOT", "PROXIMADB_WAL_LOCAL_DIR"] {
-        if std::env::var_os(var).is_some_and(|value| !value.is_empty()) {
-            found.push(var.to_string());
-        }
-    }
-    // An explicit WAL manifest location on LOCAL disk holds durable manifest
-    // state; it is covered only when it sits inside a leased root (the shipped
-    // `config/config.toml` points it at its own directory, outside them all).
-    if let Some(url) = config.storage.wal_config.global_manifest_url.as_deref()
-        && let Some(path) = local_path(url)
-    {
-        let leased: Vec<PathBuf> = root_plan(config)
-            .local
-            .into_iter()
-            .filter_map(|(_, root)| absolute(&root).ok())
-            .collect();
+    for location in recorded.iter().chain(mine.iter()) {
+        let Some(path) = durable_locations::local_path(&location.location) else {
+            continue;
+        };
         let inside = absolute(&path)
             .map(|path| leased.iter().any(|root| path.starts_with(root)))
             .unwrap_or(false);
-        if !inside {
-            found.push(format!(
-                "[storage.wal_config] global_manifest_url = {url} (outside every storage root)"
-            ));
+        let entry = format!("{} = {}", location.source, location.location);
+        if !inside && !found.contains(&entry) {
+            found.push(entry);
         }
     }
-    found
-}
-
-fn local_path(url: &str) -> Option<PathBuf> {
-    if let Some(path) = url.strip_prefix("file://") {
-        Some(PathBuf::from(path))
-    } else if !url.contains("://") {
-        Some(PathBuf::from(url))
-    } else {
-        None
-    }
+    Ok(found)
 }
 
 // --------------------------------------------------------------------------
@@ -210,6 +223,25 @@ fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
     Ok((size, hex::encode(hasher.finalize())))
 }
 
+fn manifest_dirs_of(root: usize, dirs: &[ManifestEntryDir]) -> Vec<String> {
+    dirs.iter()
+        .filter(|dir| dir.root == root)
+        .map(|dir| dir.path.clone())
+        .collect()
+}
+
+/// Payload directories under `base`, deepest first (fsync children before
+/// the parents that reference them).
+fn manifest_dirs_for(base: &Path, relative: &[String]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = relative
+        .iter()
+        .map(|dir| base.join(dir))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    dirs
+}
+
 fn fsync_dir(dir: &Path) -> anyhow::Result<()> {
     File::open(dir)
         .and_then(|handle| handle.sync_all())
@@ -229,7 +261,18 @@ fn is_empty_or_missing(dir: &Path) -> anyhow::Result<bool> {
 // --------------------------------------------------------------------------
 
 pub(crate) fn run_backup(config: &Config, to: &Path) -> anyhow::Result<Summary> {
-    let unleased = unleased_durable_state(config);
+    require_unix_lease()?;
+    anyhow::ensure!(
+        !config
+            .server
+            .data_dir
+            .join(RESTORE_IN_PROGRESS_FILE)
+            .exists(),
+        "a restore into these roots did not complete ({} present); finish it with \
+         `restore --force` before taking a backup",
+        RESTORE_IN_PROGRESS_FILE
+    );
+    let unleased = unleased_durable_state(config)?;
     anyhow::ensure!(
         unleased.is_empty(),
         "refusing cold backup: durable state outside the server's ownership lease is configured \
@@ -335,6 +378,22 @@ pub(crate) fn run_backup(config: &Config, to: &Path) -> anyhow::Result<Summary> 
         dirs,
         files,
     };
+    // Make the payload's directory entries durable before the manifest that
+    // vouches for them is published.
+    for root in &roots {
+        let base = to.join(ROOTS_DIR).join(root.index.to_string());
+        if !base.exists() {
+            continue;
+        }
+        for dir in manifest_dirs_for(&base, &manifest_dirs_of(root.index, &manifest.dirs)) {
+            fsync_dir(&dir)?;
+        }
+        fsync_dir(&base)?;
+    }
+    if to.join(ROOTS_DIR).exists() {
+        fsync_dir(&to.join(ROOTS_DIR))?;
+    }
+
     // Manifest LAST, atomically: a backup without manifest.json is incomplete
     // by definition and restore refuses it.
     let tmp = to.join(format!("{MANIFEST_FILE}.tmp"));
@@ -365,6 +424,7 @@ pub(crate) fn run_backup(config: &Config, to: &Path) -> anyhow::Result<Summary> 
 // --------------------------------------------------------------------------
 
 pub(crate) fn run_restore(config: &Config, from: &Path, force: bool) -> anyhow::Result<Summary> {
+    require_unix_lease()?;
     // 1. Structure. Nothing below this point writes until step 5.
     let manifest_path = from.join(MANIFEST_FILE);
     let manifest: Manifest = serde_json::from_reader(File::open(&manifest_path).map_err(|e| {
@@ -457,7 +517,9 @@ pub(crate) fn run_restore(config: &Config, from: &Path, force: bool) -> anyhow::
     })?;
     let roots = grouped_roots(config, true)?;
 
-    // 5. Empty targets, or an explicit --force wipe.
+    // 5. Decide first: refuse non-empty roots without --force BEFORE marking
+    //    anything, so a refused restore leaves the target exactly as it was.
+    let mut to_wipe = Vec::new();
     for root in &roots {
         let others = other_roots(&roots, root.index);
         let listing = walk::list_root(&root.path, &others)?;
@@ -471,10 +533,29 @@ pub(crate) fn run_restore(config: &Config, from: &Path, force: bool) -> anyhow::
             root.path.display(),
             root.roles
         );
-        wipe_root(&root.path, &others)?;
+        to_wipe.push((root.path.clone(), others));
     }
 
-    // 6. Copy, re-verifying every byte as it is written.
+    // 6. Mark the roots as mid-restore. From here until the marker is removed
+    //    the server refuses to start on them.
+    let data_root = roots
+        .iter()
+        .find(|root| root.roles.contains(&RootRole::DataDir))
+        .map(|root| root.path.clone())
+        .ok_or_else(|| anyhow::anyhow!("configuration has no data_dir root"))?;
+    let sentinel = data_root.join(RESTORE_IN_PROGRESS_FILE);
+    std::fs::write(&sentinel, b"restore in progress\n")
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", sentinel.display()))?;
+    File::open(&sentinel)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| anyhow::anyhow!("fsync {}: {e}", sentinel.display()))?;
+    fsync_dir(&data_root)?;
+
+    for (path, others) in &to_wipe {
+        wipe_root(path, others, &sentinel)?;
+    }
+
+    // 7. Copy, re-verifying every byte as it is written.
     let mut bytes = 0u64;
     for dir in &manifest.dirs {
         let root = manifest.root(dir.root)?;
@@ -491,20 +572,41 @@ pub(crate) fn run_restore(config: &Config, from: &Path, force: bool) -> anyhow::
         let dst = root.path.join(&file.path);
         let (size, sha256) = copy_hashing(&src, &dst).map_err(|e| {
             anyhow::anyhow!(
-                "{e:#} — the target roots are now partially restored; re-run restore with --force"
+                "{e:#} — the target roots are partially restored (the server will refuse to \
+                 start on them); re-run restore with --force"
             )
         })?;
         anyhow::ensure!(
             size == file.size && sha256 == file.sha256,
             "{} changed during restore (checksum mismatch) — the target roots are partially \
-             restored; re-run restore with --force",
+             restored (the server will refuse to start on them); re-run restore with --force",
             src.display()
         );
         bytes += size;
     }
+
+    // 8. Every directory entry durable, deepest first, then the roots.
+    let mut created: Vec<PathBuf> = manifest
+        .dirs
+        .iter()
+        .map(|dir| {
+            manifest
+                .root(dir.root)
+                .map(|root| root.path.join(&dir.path))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    created.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+    for dir in &created {
+        fsync_dir(dir)?;
+    }
     for root in &roots {
         fsync_dir(&root.path)?;
     }
+
+    // 9. Only now is the restore complete: clear the marker durably.
+    std::fs::remove_file(&sentinel)
+        .map_err(|e| anyhow::anyhow!("remove {}: {e}", sentinel.display()))?;
+    fsync_dir(&data_root)?;
 
     let mut warnings = Vec::new();
     if manifest.proximadb_version != env!("CARGO_PKG_VERSION") {
@@ -537,7 +639,7 @@ pub(crate) fn run_restore(config: &Config, from: &Path, force: bool) -> anyhow::
 
 /// Remove a root's contents, keeping coordination lock files (held by this
 /// process) and nested roots (handled as their own roots).
-fn wipe_root(root: &Path, nested: &BTreeSet<PathBuf>) -> anyhow::Result<()> {
+fn wipe_root(root: &Path, nested: &BTreeSet<PathBuf>, keep: &Path) -> anyhow::Result<()> {
     for entry in
         std::fs::read_dir(root).map_err(|e| anyhow::anyhow!("read {}: {e}", root.display()))?
     {
@@ -545,6 +647,7 @@ fn wipe_root(root: &Path, nested: &BTreeSet<PathBuf>) -> anyhow::Result<()> {
         let path = entry.path();
         if proximadb_runtime_common::is_coordination_lock_file(&entry.file_name())
             || nested.contains(&path)
+            || path == keep
         {
             continue;
         }
@@ -554,7 +657,7 @@ fn wipe_root(root: &Path, nested: &BTreeSet<PathBuf>) -> anyhow::Result<()> {
             // A nested root deeper down keeps its own contents; only plain
             // directories are removed wholesale.
             if nested.iter().any(|root| root.starts_with(&path)) {
-                wipe_root(&path, nested)?;
+                wipe_root(&path, nested, keep)?;
             } else {
                 std::fs::remove_dir_all(&path)
                     .map_err(|e| anyhow::anyhow!("remove {}: {e}", path.display()))?;
@@ -589,9 +692,16 @@ mod tests {
         config
     }
 
-    /// Create the roots (as a real server run would) and seed data files.
+    /// Create the roots and the durable-locations record (as a real server
+    /// boot would), then seed data files. The record is resolved with an EMPTY
+    /// environment so tests never depend on the developer's shell.
     fn seed(config: &Config) {
         drop(StorageOwnershipLease::acquire(config).expect("create roots"));
+        durable_locations::write_record(
+            &config.server.data_dir,
+            &durable_locations::effective_durable_locations(config, |_| None),
+        )
+        .expect("durable-locations record");
         std::fs::create_dir_all(config.server.data_dir.join("pgwire")).expect("mkdir");
         std::fs::write(
             config.server.data_dir.join("pgwire/canonical-records.wal"),
@@ -622,7 +732,8 @@ mod tests {
         seed(&config);
         let backup = temp.path().join("bk");
         let summary = run_backup(&config, &backup).expect("backup");
-        assert_eq!(summary.files, 2);
+        // Two seeded data files + the server's durable-locations record.
+        assert_eq!(summary.files, 3);
 
         wipe_all(&base);
         run_restore(&config, &backup, false).expect("restore");
@@ -809,6 +920,76 @@ mod tests {
         config.storage.wal_config.global_manifest_url =
             Some(format!("file://{}", base.join("wal/manifest").display()));
         run_backup(&config, &temp.path().join("bk2")).expect("manifest inside a root");
+    }
+
+    #[test]
+    fn backup_refuses_without_server_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let config = local_config(&base);
+        seed(&config);
+        std::fs::remove_file(
+            config
+                .server
+                .data_dir
+                .join(durable_locations::DURABLE_LOCATIONS_FILE),
+        )
+        .expect("remove record");
+        let err = run_backup(&config, &temp.path().join("bk")).expect_err("no record");
+        assert!(
+            format!("{err:#}").contains(durable_locations::DURABLE_LOCATIONS_FILE),
+            "{err:#}"
+        );
+    }
+
+    /// Review finding: the server's per-pod env (k8s/systemd) is invisible to a
+    /// backup run from an operator shell. The server's own record must make
+    /// backup refuse even though THIS process's environment is clean.
+    #[test]
+    fn backup_refuses_location_only_the_server_env_knew() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let config = local_config(&base);
+        seed(&config);
+        durable_locations::write_record(
+            &config.server.data_dir,
+            &[durable_locations::DurableLocation {
+                source: "PROXIMADB_WAL_LOCAL_DIR".into(),
+                location: temp.path().join("pod-wal").display().to_string(),
+            }],
+        )
+        .expect("record");
+        let err = run_backup(&config, &temp.path().join("bk")).expect_err("server env WAL");
+        assert!(
+            format!("{err:#}").contains("PROXIMADB_WAL_LOCAL_DIR"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn restore_sentinel_lifecycle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("live");
+        let config = local_config(&base);
+        seed(&config);
+        let backup = temp.path().join("bk");
+        run_backup(&config, &backup).expect("backup");
+        let sentinel = config.server.data_dir.join(RESTORE_IN_PROGRESS_FILE);
+
+        // A refused restore (non-empty, no --force) must not mark the roots.
+        assert!(run_restore(&config, &backup, false).is_err());
+        assert!(
+            !sentinel.exists(),
+            "a refused restore must not leave the marker"
+        );
+
+        // A crashed restore leaves the marker: backup refuses on it, and a
+        // forced restore finishes the job and clears it.
+        std::fs::write(&sentinel, b"crashed").expect("simulate crash");
+        let err = run_backup(&config, &temp.path().join("bk2")).expect_err("marker");
+        assert!(format!("{err:#}").contains("did not complete"), "{err:#}");
+        run_restore(&config, &backup, true).expect("forced restore");
+        assert!(!sentinel.exists(), "a completed restore clears the marker");
     }
 
     #[test]

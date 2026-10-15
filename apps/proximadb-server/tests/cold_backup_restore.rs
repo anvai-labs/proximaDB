@@ -21,8 +21,27 @@ use serde_json::{Value, json};
 
 mod support;
 
-fn write_config(path: &Path, data_dir: &Path, root: &str, ports: [u16; 4]) {
+/// Per-scenario knobs. `cwd` is where the server process runs: a temp dir,
+/// so cwd-relative durable state could not survive the "lose every root" step
+/// unnoticed (review finding).
+#[derive(Clone)]
+struct Scenario {
+    enable_wal: bool,
+    wal_local_dir: Option<PathBuf>,
+    cwd: PathBuf,
+    /// Environment of the SERVER process only (per-pod overrides) — never
+    /// passed to the offline admin subcommands.
+    server_env: Vec<(String, String)>,
+}
+
+fn write_config(path: &Path, data_dir: &Path, root: &str, ports: [u16; 4], scenario: &Scenario) {
     let [rest, grpc, flight, pg] = ports;
+    let enable_wal = scenario.enable_wal;
+    let wal_local_dir = scenario
+        .wal_local_dir
+        .as_ref()
+        .map(|dir| format!("wal_local_dir = \"file://{}\"\n", dir.display()))
+        .unwrap_or_default();
     let config = format!(
         r#"
 [server]
@@ -49,8 +68,9 @@ enable_mmap = false
 
 [storage.wal_config]
 write_buffer_directory = "{root}/wal"
-enable_wal = true
+enable_wal = {enable_wal}
 sync_mode = "PerBatch"
+{wal_local_dir}
 
 [storage.sst_config]
 data_directory = "{root}/collections"
@@ -81,15 +101,27 @@ struct ServerProcess {
 }
 
 impl ServerProcess {
-    async fn start(root: &str, data_dir: &Path, config_path: &Path) -> anyhow::Result<Self> {
+    async fn start(
+        root: &str,
+        data_dir: &Path,
+        config_path: &Path,
+        scenario: &Scenario,
+    ) -> anyhow::Result<Self> {
         let port_reservation = support::reserve_loopback_ports::<4>()?;
         let ports = port_reservation.ports();
-        write_config(config_path, data_dir, root, ports);
+        write_config(config_path, data_dir, root, ports, scenario);
         let mut command = Command::new(env!("CARGO_BIN_EXE_proximadb-server"));
         command
             .arg("--config")
             .arg(config_path)
             .env("RUST_LOG", "info")
+            .current_dir(&scenario.cwd)
+            .envs(
+                scenario
+                    .server_env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            )
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         drop(port_reservation);
@@ -119,6 +151,13 @@ impl ServerProcess {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// SIGKILL — no flush: acknowledged data lives only in the WAL.
+    fn crash(mut self) -> anyhow::Result<()> {
+        self.child.kill()?;
+        self.child.wait()?;
+        Ok(())
     }
 
     fn graceful(mut self) -> anyhow::Result<()> {
@@ -225,8 +264,9 @@ async fn read_vector(base: &str, collection: &str, id: &str) -> anyhow::Result<V
 }
 
 /// Run an offline subcommand of the server binary.
-fn admin(config: &Path, args: &[&str]) -> Output {
+fn admin(config: &Path, cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_proximadb-server"))
+        .current_dir(cwd)
         .arg("--config")
         .arg(config)
         .args(args)
@@ -252,9 +292,16 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
     let data_dir = live.join("server_data");
     let config = temp.path().join("server.toml");
     let collection = "cold_backup_rt";
+    let scenario = Scenario {
+        enable_wal: true,
+        wal_local_dir: None,
+        cwd: temp.path().join("cwd"),
+        server_env: Vec::new(),
+    };
+    std::fs::create_dir_all(&scenario.cwd)?;
 
     // 1. Write acknowledged data through the real server.
-    let server = ServerProcess::start(&root, &data_dir, &config).await?;
+    let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
     create_collection(&server.base_url, collection).await?;
     let mut ids = Vec::new();
     for batch in 0..2 {
@@ -280,6 +327,7 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
     let refused_to = temp.path().join("bk_live");
     let refused = admin(
         &config,
+        &scenario.cwd,
         &["backup", "--to", refused_to.to_str().expect("utf8")],
     );
     assert!(
@@ -299,7 +347,7 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
     //    pre-stop read would conflate backup fidelity with that tier change.
     //    Backup must reproduce exactly what a restart without it serves.
     server.graceful()?;
-    let server = ServerProcess::start(&root, &data_dir, &config).await?;
+    let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
     let mut expected = Vec::new();
     for id in &ids {
         expected.push(read_vector(&server.base_url, collection, id).await?);
@@ -317,6 +365,7 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
     let backup_to = temp.path().join("bk");
     let backup = admin(
         &config,
+        &scenario.cwd,
         &["backup", "--to", backup_to.to_str().expect("utf8")],
     );
     assert!(
@@ -349,6 +398,7 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
     }
     let restore = admin(
         &config,
+        &scenario.cwd,
         &["restore", "--from", backup_to.to_str().expect("utf8")],
     );
     assert!(
@@ -357,11 +407,201 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
         String::from_utf8_lossy(&restore.stderr)
     );
 
-    let server = ServerProcess::start(&root, &data_dir, &config).await?;
+    let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
     for (id, want) in ids.iter().zip(&expected) {
         let got = read_vector(&server.base_url, collection, id).await?;
         assert_eq!(&got, want, "record {id} must come back identical");
     }
     server.graceful()?;
+    Ok(())
+}
+
+/// Review regression (data loss): `root_plan` used to gate the WAL roots on
+/// `enable_wal`, but the WAL is written whether or not that flag is set — so
+/// with `enable_wal = false` the WAL (`write_buffer_directory`) was neither
+/// leased nor backed up, and backup + restore reported success while every
+/// acknowledged-but-unflushed write was lost. Crash (no flush) so the data
+/// lives ONLY in that WAL, back up, lose every root, restore: it must all come
+/// back via replay. (A config-file `wal_local_dir` is NOT exercised here: the
+/// engine itself loses writes across a plain crash with it — TD-WALDIR-1 — so
+/// no backup could preserve them; `crash_restart_control` pins the baseline.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_consistent_backup_includes_the_wal_when_enable_wal_is_false() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let live = temp.path().join("live");
+    std::fs::create_dir_all(&live)?;
+    let root = format!("file://{}", live.display());
+    let data_dir = live.join("server_data");
+    let config = temp.path().join("server.toml");
+    let collection = "cold_backup_crash";
+    let scenario = Scenario {
+        enable_wal: false,
+        wal_local_dir: None,
+        cwd: temp.path().join("cwd"),
+        server_env: Vec::new(),
+    };
+    std::fs::create_dir_all(&scenario.cwd)?;
+
+    let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
+    create_collection(&server.base_url, collection).await?;
+    let records: Vec<(String, Vec<f32>)> = (0..6)
+        .map(|n| {
+            (
+                format!("crash-{n}"),
+                (0..8).map(|d| (n * 8 + d) as f32 / 100.0).collect(),
+            )
+        })
+        .collect();
+    insert_batch(&server.base_url, collection, &records).await?;
+    server.crash()?;
+
+    let backup_to = temp.path().join("bk");
+    let backup = admin(
+        &config,
+        &scenario.cwd,
+        &["backup", "--to", backup_to.to_str().expect("utf8")],
+    );
+    assert!(
+        backup.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+    let manifest: Value =
+        serde_json::from_reader(std::fs::File::open(backup_to.join("manifest.json"))?)?;
+    assert_eq!(
+        manifest["clean_shutdown"],
+        json!(false),
+        "a SIGKILLed server leaves a crash-consistent backup"
+    );
+    let has_wal_root = manifest["roots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|root| {
+            root["roles"]
+                .as_array()
+                .is_some_and(|roles| roles.iter().any(|role| role == "WalWriteBuffer"))
+        });
+    assert!(
+        has_wal_root,
+        "with enable_wal = false the WAL must still be a backed-up root: {manifest:#}"
+    );
+
+    // Lose every root.
+    std::fs::remove_dir_all(&live)?;
+    let restore = admin(
+        &config,
+        &scenario.cwd,
+        &["restore", "--from", backup_to.to_str().expect("utf8")],
+    );
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+
+    let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
+    for (id, _) in &records {
+        read_vector(&server.base_url, collection, id)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("acknowledged write {id} lost across backup/restore: {e}")
+            })?;
+    }
+    server.graceful()?;
+    Ok(())
+}
+
+/// Control for `crash_consistent_backup_includes_the_wal_when_enable_wal_is_false`: the same
+/// crash scenario with NO backup in between. If acknowledged writes do not
+/// survive a plain SIGKILL + restart in this configuration, backup cannot be
+/// expected to preserve them either — this separates an engine recovery gap
+/// from a backup gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_restart_control() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let live = temp.path().join("live");
+    std::fs::create_dir_all(&live)?;
+    let root = format!("file://{}", live.display());
+    let data_dir = live.join("server_data");
+    let config = temp.path().join("server.toml");
+    let collection = "crash_control";
+    let scenario = Scenario {
+        enable_wal: false,
+        wal_local_dir: None,
+        cwd: temp.path().join("cwd"),
+        server_env: Vec::new(),
+    };
+    std::fs::create_dir_all(&scenario.cwd)?;
+
+    let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
+    create_collection(&server.base_url, collection).await?;
+    let records: Vec<(String, Vec<f32>)> = (0..6)
+        .map(|n| {
+            (
+                format!("ctl-{n}"),
+                (0..8).map(|d| (n * 8 + d) as f32 / 100.0).collect(),
+            )
+        })
+        .collect();
+    insert_batch(&server.base_url, collection, &records).await?;
+    server.crash()?;
+
+    let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
+    for (id, _) in &records {
+        read_vector(&server.base_url, collection, id)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("acknowledged write {id} lost across a plain crash: {e}")
+            })?;
+    }
+    server.graceful()?;
+    Ok(())
+}
+
+/// Review finding 2, end to end: a per-pod env override (here
+/// `PROXIMADB_WAL_LOCAL_DIR`, as a k8s/systemd unit would set it) is invisible
+/// to a backup run from an operator's shell. The server records the location
+/// it actually used, so backup — run with a CLEAN environment — must refuse
+/// instead of silently omitting that WAL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_refuses_wal_dir_set_only_in_the_server_env() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let live = temp.path().join("live");
+    std::fs::create_dir_all(&live)?;
+    let root = format!("file://{}", live.display());
+    let data_dir = live.join("server_data");
+    let config = temp.path().join("server.toml");
+    let pod_wal = temp.path().join("pod-wal");
+    let scenario = Scenario {
+        enable_wal: true,
+        wal_local_dir: None,
+        cwd: temp.path().join("cwd"),
+        server_env: vec![(
+            "PROXIMADB_WAL_LOCAL_DIR".to_string(),
+            format!("file://{}", pod_wal.display()),
+        )],
+    };
+    std::fs::create_dir_all(&scenario.cwd)?;
+
+    let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
+    server.graceful()?;
+
+    let backup_to = temp.path().join("bk");
+    let backup = admin(
+        &config,
+        &scenario.cwd,
+        &["backup", "--to", backup_to.to_str().expect("utf8")],
+    );
+    assert!(
+        !backup.status.success(),
+        "backup must refuse: the server wrote its WAL outside every storage root"
+    );
+    let stderr = String::from_utf8_lossy(&backup.stderr);
+    assert!(
+        stderr.contains("PROXIMADB_WAL_LOCAL_DIR"),
+        "the refusal must name the server-side override: {stderr}"
+    );
+    assert!(!backup_to.join("manifest.json").exists());
     Ok(())
 }

@@ -77,15 +77,18 @@ pub(crate) fn root_plan(config: &Config) -> RootPlan {
     for (index, location) in config.storage.storage_locations.iter().enumerate() {
         push_root(&mut plan, RootRole::StorageLocation(index), &location.url);
     }
-    if config.storage.wal_config.enable_wal {
-        push_root(
-            &mut plan,
-            RootRole::WalWriteBuffer,
-            &config.storage.wal_config.write_buffer_directory,
-        );
-        if let Some(path) = config.storage.wal_config.wal_local_dir.as_deref() {
-            push_root(&mut plan, RootRole::WalLocalDir, path);
-        }
+    // WAL roots are owned UNCONDITIONALLY. `enable_wal` only toggles an unused
+    // optimized-writer flag at runtime — the WAL is written to these paths
+    // either way — so gating them on it left a live WAL unleased (two servers
+    // could share it) and silently missing from cold backups (acknowledged
+    // writes lost on restore; found in review of the cold-backup PR).
+    push_root(
+        &mut plan,
+        RootRole::WalWriteBuffer,
+        &config.storage.wal_config.write_buffer_directory,
+    );
+    if let Some(path) = config.storage.wal_config.wal_local_dir.as_deref() {
+        push_root(&mut plan, RootRole::WalLocalDir, path);
     }
     if let Some(sst) = config.storage.sst_config.as_ref() {
         push_root(&mut plan, RootRole::SstData, &sst.data_directory);
@@ -133,7 +136,8 @@ mod tests {
         config.storage.storage_locations[0].url =
             format!("file://{}", root.join("storage").display());
         config.storage.metadata_url = format!("file://{}", root.join("metadata").display());
-        config.storage.wal_config.enable_wal = false;
+        config.storage.wal_config.write_buffer_directory =
+            format!("file://{}", root.join("wal").display());
         config.storage.sst_config = None;
         config.storage.viper_config = None;
         config
@@ -188,7 +192,8 @@ mod tests {
             vec![
                 RootRole::DataDir,
                 RootRole::Metadata,
-                RootRole::StorageLocation(0)
+                RootRole::StorageLocation(0),
+                RootRole::WalWriteBuffer,
             ]
         );
         assert_eq!(
@@ -198,6 +203,24 @@ mod tests {
                 "s3://bucket/prefix".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn wal_roots_are_owned_even_when_enable_wal_is_false() {
+        // Regression (cold-backup review): the WAL is written whether or not
+        // `enable_wal` is set, so its roots must be leased + backed up either way.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = local_config(temp.path());
+        config.storage.wal_config.enable_wal = false;
+        config.storage.wal_config.wal_local_dir =
+            Some(format!("file://{}", temp.path().join("waldisk").display()));
+        let roles: Vec<_> = root_plan(&config)
+            .local
+            .into_iter()
+            .map(|(role, _)| role)
+            .collect();
+        assert!(roles.contains(&RootRole::WalWriteBuffer));
+        assert!(roles.contains(&RootRole::WalLocalDir));
     }
 
     #[test]

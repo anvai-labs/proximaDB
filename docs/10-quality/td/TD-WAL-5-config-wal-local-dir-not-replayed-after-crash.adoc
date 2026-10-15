@@ -1,0 +1,43 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-WAL-5: a config-file `wal_local_dir` is written to but not replayed after a crash — acknowledged writes are lost
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open. Reproduced; root cause traced to a write/replay split, fix not started.**
+| Priority | **CRITICAL**: silent loss of acknowledged writes on any crash, for every deployment that sets `wal_local_dir` in the config file rather than in the environment.
+| Component | `src/storage/persistence/write_ahead_log/mod.rs`: `local_wal_dir(&config)` (write path) vs `local_wal_dir_env()` (env-only, used by recovery/replay free functions that have no `WALConfig` handle). `[storage.wal_config] wal_local_dir` (ADR-069 S1).
+| Relates to | TD-WAL-1 (ADR-069 local-disk WAL; its S5 crash test covers only the default layout), mandate #16 (read-after-write correctness), the cold backup/restore PR that surfaced it.
+| Found | 2026-10-15, while adding a crash-consistent case to `apps/proximadb-server/tests/cold_backup_restore.rs`
+|===
+
+== Reproduction (Observed, real server binary, no backup involved)
+
+Setup: SST collection, `sync_mode = "PerBatch"`, 6 records inserted over REST v2 and **acknowledged**, then SIGKILL, then restart on the same volumes, then a point read of every record.
+
+[cols="2,1"]
+|===
+| Configuration | Acknowledged writes after crash and restart
+| `enable_wal = true`, no `wal_local_dir` | ✅ all recovered
+| `enable_wal = false`, no `wal_local_dir` | ✅ all recovered
+| `enable_wal = true`, `wal_local_dir = "file://…"` **in the config file** | ❌ **all lost** (404)
+|===
+
+`enable_wal` is irrelevant. The trigger is a config-file `wal_local_dir`.
+
+== Mechanism (Observed in code)
+
+* The write path resolves the WAL base with `local_wal_dir(&self.config)`. That honours the config field (and the env override), so WAL segments are written to `wal_local_dir`.
+* Recovery and replay run as free functions without a `WALConfig` handle, and use `local_wal_dir_env()`. That reads **only** `PROXIMADB_WAL_LOCAL_DIR`. Its own doc comment admits the gap: _"for full write and replay consistency an operator sets the env"_.
+* So when the location is set only in the config file, replay looks in the default location, finds nothing, and the server starts without the acknowledged-but-unflushed writes.
+
+The env-var form is consistent between write and replay; it is unaffected.
+
+== Fix direction (to design; not a patch)
+
+Thread the resolved WAL configuration into recovery, so write and replay share **one** resolver. The pattern to follow is the one this repo already uses for tenant resolution: a single pure resolver used by every path. Removing the config field instead would also be consistent, but it is a breaking config change.
+
+== Verification for a fix
+
+`crash_restart_control` in `apps/proximadb-server/tests/cold_backup_restore.rs` already runs this scenario. Add the config-`wal_local_dir` variant to it; it must pass. That test file also has the harness for the crash-then-backup variant, which becomes valid once replay honours the config.

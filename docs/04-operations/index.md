@@ -241,7 +241,18 @@ What a backup contains:
   - object-storage roots: they are listed as *uncovered* and a warning is printed;
   - the warm-tier disk cache: it is rebuildable, and restore leaves it empty;
   - lock and runtime-state files.
-- **Backup refuses rather than silently omit durable state outside the lease.** That covers a `[queue]` root, `PROXIMADB_QUEUE_ROOT`, `PROXIMADB_WAL_LOCAL_DIR`, and a local `global_manifest_url` that sits outside every storage root. Move that state under a storage root first.
+- **Backup refuses rather than silently omit durable state outside the storage roots.**
+  - At boot, the server records where it writes durable state, resolved from *its own* environment and configuration: `<data_dir>/.proximadb-durable-locations.json`.
+  - Backup checks that record and its own environment, and refuses if any local location lies outside every storage root. The locations covered are a `[queue]` root, `PROXIMADB_QUEUE_ROOT`, `PROXIMADB_WAL_LOCAL_DIR`, a local `global_manifest_url`, `PROXIMADB_CORPUS_VERSION_PATH`, the io_trace spool, and the `rl_planner` log path.
+  - Because the server records its own view, per-pod environment variables (Kubernetes or systemd `Environment=`) are honoured even when you run `backup` from a plain shell.
+  - A data directory without the record (one never served by this version) is refused. Start the server once, then stop it, then back up.
+- **The shipped `config/config.toml` sets `global_manifest_url = file:///tmp/proximadb/manifest`.** That path is outside every storage root, so backup refuses with this config. Remove the key, or point it inside a storage root (for example under the WAL directory), before relying on cold backup.
+- **WAL directories are always included,** including a separate `wal_local_dir`, regardless of `enable_wal`. A backup taken after a crash is crash-consistent, and the WAL replays on restore.
+- **Known limitation for a separate local WAL disk (TD-WAL-5).**
+  - A *config-file* `wal_local_dir` is backed up, but the engine currently does **not** replay it after a crash: acknowledged-but-unflushed writes are lost on any crash, with or without backup.
+  - The *environment* form, `PROXIMADB_WAL_LOCAL_DIR`, replays correctly. But it lies outside the storage roots, so cold backup refuses it.
+  - Until TD-WAL-5 is fixed, keep the WAL at its default location under the data roots if you need both crash safety and cold backup.
+- **Docker:** pass `-c /config/config.toml`. The binary's default config path is `config/config.toml`, relative to the working directory.
 
 ### Restore
 
@@ -255,6 +266,8 @@ sudo systemctl start proximadb
 - The target configuration must have the **same absolute root layout** as the backup, because catalog and WAL state can embed absolute paths. Restoring to a different layout is not supported yet.
 - Non-empty storage roots are refused. Pass `--force` to replace their contents.
 - If the source did not shut down cleanly, the backup is crash-consistent, and the WAL replays on the next start.
+- While a restore runs, a `.proximadb-restore-in-progress` marker in `data_dir` makes the server **refuse to start**. A crashed or failed restore can never be booted from silently. Re-run `restore --force` to finish it.
+- Backup and restore require Unix advisory file locks; other platforms are refused.
 
 ## Performance Tuning
 

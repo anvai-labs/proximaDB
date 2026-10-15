@@ -45,6 +45,7 @@ compile_error!(
 
 mod cli;
 mod cold_backup;
+mod durable_locations;
 mod runtime_state;
 mod shutdown;
 
@@ -322,6 +323,23 @@ async fn run(common: cli::CommonArgs, serve: cli::ServeArgs) -> anyhow::Result<(
     // Runtime state is observability, not fencing. Acquire kernel-backed locks
     // before publishing lifecycle state or initializing any engine.
     let _storage_ownership = storage_ownership::StorageOwnershipLease::acquire(&config)?;
+    // A restore that did not complete leaves its marker in data_dir; booting on
+    // a half-restored set of roots would silently serve partial data.
+    let restore_marker = config
+        .server
+        .data_dir
+        .join(cold_backup::RESTORE_IN_PROGRESS_FILE);
+    if restore_marker.exists() {
+        anyhow::bail!(
+            "refusing to start: a cold restore into these storage roots did not complete ({}). \
+             Re-run `proximadb-server restore --from <backup> --force` to finish it.",
+            restore_marker.display()
+        );
+    }
+    // Record where THIS process writes durable state outside the leased roots
+    // (its env + config, absolute), so an offline backup run from another shell
+    // can refuse instead of silently omitting it.
+    durable_locations::record(&config)?;
 
     // Publish the lifecycle record BEFORE any slow work. Recovery can run for
     // minutes on a large data dir and binds no socket until it finishes, so a
