@@ -54,7 +54,6 @@ ADRs: 12 implemented, 3 superseded (ADR-008, ADR-031, ADR-057); the rest are acc
 | TD-HELIX-1/2/3 | HELIX ~2% recall in the all-engines bench; 953 MiB cold load; dedup scan empty after flush | HIGH (HELIX)
 | TD-IVF-2 / TD-COMPACT-2 / TD-COMPACT-10/11 | Trainer allocation, streaming merge, SIFT1M / 10M evidence | P0
 | TD-CACHE-9 / TD-OLAP-2 / TD-OLAP-4 / TD-OLAP-11 | SIFT1M cache acceptance; SegmentStatistics; SF1/SF10 ledger; grace spill | P0
-| TD-CI-4 (regressed) | The bench/examples compile job was removed by `a5d4833e6` (2026-09-02), so CI compiles no examples | HIGH (silent)
 | TD-NET-1 S3 | Startup self-check (a loopback Flight call verifies the instance id) | P0-class
 |===
 

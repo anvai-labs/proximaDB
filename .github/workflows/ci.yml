@@ -223,6 +223,10 @@ jobs:
               - 'apps/**'
               - 'tests/**'
               - 'benches/**'
+              # TD-CI-4: the line a5d4833e6 deleted lived HERE (the compile
+              # filter gates rust-compile-benches, the only job that compiles
+              # examples), not in `rust:`.
+              - 'examples/**'
               - 'build.rs'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -641,6 +645,13 @@ jobs:
             exit 1
           fi
           echo "No tracked artifact files detected."
+      # Every PROXIMADB_* env gate must have a row in ENV_GATE_REGISTRY.adoc.
+      # This check existed only in `make work-commit-check` (local), so
+      # PROXIMADB_GCS_LIST_PAGE_SIZE reached develop unregistered. It runs here
+      # because new gates arrive with Rust changes, and the docs-only
+      # docs-validation job would not see them.
+      - name: Check env gates are registered
+        run: python3 scripts/check_env_gates.py
 
   deterministic-commit-contract:
     name: Deterministic Commit Contract
@@ -715,7 +726,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
-    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
+    # `compile` too: examples/** lives only there (TD-CI-4), and `cargo fmt --all` covers examples.
+    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.compile == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -1923,8 +1935,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
-      - name: cargo check --workspace --benches
-        run: cargo check --workspace --benches
+      # TD-CI-4: examples compile here too. A dedicated per-PR examples job was
+      # added, then silently dropped by a5d4833e6 (2026-09-02); folding
+      # `--examples` into this job restores the coverage without a new runner
+      # or a longer feat→develop path.
+      - name: cargo check --workspace --benches --examples
+        run: cargo check --workspace --benches --examples
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats || true

@@ -797,8 +797,12 @@ impl RecoveryManager {
         // caller passes the value resolved by the write path's own resolver,
         // TD-WAL-5), the write path roots the WAL there — prepend it as a
         // candidate base so replay lists it (otherwise the .bcwal on /waldisk is
-        // missed → restart data loss). Every base is listed and unioned; the
-        // order only decides which duplicate URL is kept.
+        // missed → restart data loss). Every base is listed and unioned. The
+        // order decides which duplicate URL is kept and which listed file comes
+        // first; the first REPLAYED file's base becomes `storage_url`, which is
+        // the recovery flush target, the new manifest entries' `storage_url`,
+        // and the tokenless-orphan segment probe root (TD-WAL-5 residual: under
+        // a local WAL dir that is the WAL disk, not the data root).
         if let Some(local) = local_wal_dir {
             push_base(&mut bases, local);
         }

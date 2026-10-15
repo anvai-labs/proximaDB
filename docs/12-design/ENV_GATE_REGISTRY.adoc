@@ -116,6 +116,7 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_GCS_ANONYMOUS` | Use anonymous GCS auth (fake-gcs-server). | false | test-only; — | src/storage/persistence/filesystem/mod.rs
 | `PROXIMADB_GRPC_PORT` | Container-plumbing override of the gRPC listen port. | config-file value (5679) | config-mirror; — | deploy/docker/Dockerfile
 | `PROXIMADB_GCS_ENDPOINT` | Override the GCS endpoint URL (fake-gcs / custom). | None (real GCS) | config-mirror; — | src/storage/persistence/filesystem/mod.rs
+| `PROXIMADB_GCS_LIST_PAGE_SIZE` | Pins the GCS `list` page size (`max_results`) to force multi-page traversal; the pagination regression net. A non-integer value is ignored with a warning. | unset (service-default page) | test-only; TD-OBJSTORE-4 S1 | src/storage/persistence/filesystem/gcs_store.rs
 | `PROXIMADB_GCS_TEST` | Gate that enables the `#[ignore]`d GCS dual-store integration test. | test skipped unless set | test-only; — | src/index/axis/indexes/dual_store_ivf.rs
 | `PROXIMADB_GCS_TEST_BUCKET` | Bucket name for GCS integration tests. | "proximadb-test" | test-only; — | src/storage/persistence/filesystem/gcs_store.rs
 | `PROXIMADB_GCS_TEST_ENDPOINT` | fake-gcs-server endpoint for GCS integration tests; also gates them. | test skipped if unset | test-only; TD-OBJSTORE-5 | src/storage/persistence/filesystem/gcs_store.rs
