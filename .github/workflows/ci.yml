@@ -1770,6 +1770,14 @@ jobs:
         # build; serialize its process fixtures on memory-constrained runners.
         run: cargo test -p proximadb-server --test drainer_lifecycle_integration_test -- --test-threads=1
 
+      - name: Verify cold backup/restore round trip (real server)
+        if: matrix.profile == 'dev'
+        env:
+          RUST_MIN_STACK: "8388608"
+        # Backup refuses under a live server (ownership lease), then a stopped
+        # server's roots round-trip byte-identical through wipe + restore.
+        run: cargo test -p proximadb-server --test cold_backup_restore -- --test-threads=1
+
       - name: Upload Server Binary
         if: matrix.profile == 'release' && needs.changes.outputs.medium_tier == 'true'
         uses: actions/upload-artifact@v7

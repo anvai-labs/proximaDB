@@ -9302,6 +9302,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "libc",
  "proximadb",
  "proximadb-embedding",
@@ -9310,6 +9311,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",

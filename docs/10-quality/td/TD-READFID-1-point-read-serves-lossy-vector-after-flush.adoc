@@ -1,0 +1,41 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-READFID-1: a point read serves a lossy vector once the record is flushed, even on an `fp32` collection
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (Observed; root cause not yet traced).**
+| Priority | **HIGH**: data fidelity on the GA read path. The value a client wrote is not the value it reads back, and nothing signals the change.
+| Component | REST v2 `GET /api/v2/collections/{c}/records/{id}` against an SST collection, and whatever segment read path serves it after flush (PAX / SQ8 decode). Exact path not yet traced.
+| Relates to | TD-RDSTRAT-7 (lossless clustered PAX bytes, which concerns storage encoding rather than read fidelity), mandate #3 (SQ8/RaBitQ **plus f32 rerank**), mandate #16 (read correctness).
+| Found | 2026-10-15, while building the cold backup/restore round-trip test (`apps/proximadb-server/tests/cold_backup_restore.rs`)
+|===
+
+== Observation (Observed, reproducible)
+
+The test creates a dim-8 `engine: "sst"` collection with `canonical_embedding_precision: "fp32"` and writes `rec-0 = [0.0, 0.01, 0.02, …, 0.07]` over REST v2. Point reads of `rec-0`:
+
+[cols="1,3"]
+|===
+| Before a graceful restart (served from the memtable) | `[0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07]`, exact
+| After a plain graceful restart (flushed to a segment) | `[0.0, 0.009294118, 0.018588236, 0.030980391, 0.04027451, 0.049568627, 0.058862746, 0.0712549]`
+|===
+
+The error is about 8-bit quantization error, consistent with an SQ8-decoded vector being served instead of the stored f32. The test prints this as a `NOTE:` on every run. To keep backup fidelity separate from this behaviour, it compares the restored server against a **plain-restart** baseline rather than the pre-stop read.
+
+== Why it matters
+
+* Mandate #3 frames quantization as an *index* encoding with f32 rerank. A client's own `get-by-id` returning approximate values breaks read-your-writes at the value level, silently.
+* Anything that round-trips vectors, such as export, re-embedding pipelines, client-side caches or equality checks, sees data change on its own after flush.
+* If the f32 copy is not retained at all after flush, rerank quality is affected too. That must be checked.
+
+== Open questions (Unknown; trace before fixing)
+
+. Is the f32 vector **stored** in the flushed segment and just not served by the point-read path, or is it never retained?
+. Which read paths are affected: REST v2 get-by-id only, or also gRPC, pgwire `SELECT embedding`, Arrow Flight and search results that return vectors?
+. Do HELIX/NOVA/VIPER behave the same way, or only SST?
+
+== Verification for a fix
+
+A point read after flush returns the exact written f32 for an `fp32` collection. Add a restart-and-read assertion to an existing real-server test; `cold_backup_restore.rs` already has the plain-restart read to build it from.

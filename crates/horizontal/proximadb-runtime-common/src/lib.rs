@@ -17,7 +17,9 @@ pub mod vector_ops;
 pub use btree::{BPlusTree, BTreeError, BTreeIterator, BTreeStats, DiskNodeInfo};
 pub use cache::{CacheEntry, CacheError, CacheStats, LruCache, ThreadSafeLruCache};
 pub use disk_cache::{DiskCacheManager, DiskCacheStatistics};
-pub use file_lock::{AccessMode, FileLockError, FileLockManager, FileLockSet, LockOwner};
+pub use file_lock::{
+    AccessMode, FileLockError, FileLockManager, FileLockSet, LockOwner, is_coordination_lock_file,
+};
 pub use pool::{Pool, PoolConfig, PoolStats, PooledItem, VectorMemoryPool, VectorPoolStats};
 pub use query_cache::{Cache, ShardedMapCache};
 pub use skiplist::{SkipList, SkipListIterator};

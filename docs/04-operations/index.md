@@ -214,49 +214,47 @@ permissions = ["read"]
 
 ## Backup & Restore
 
-### Backup
+ProximaDB has two different protections, and they cover different failures:
+
+- **Node or disk loss when data is in object storage.** When collections and the catalog live in object storage (`adls://`, `s3://`, `gs://`), losing a node's local disks loses nothing durable. A fresh server reattaches and recovers. CI checks this with the SIGKILL restart suite (`object_store_restart_recovery`).
+- **Local-disk deployments, or a point-in-time copy.** Use the offline cold backup below.
+
+### Cold backup (server stopped)
 
 ```bash
-# Stop writes
-curl -X POST http://localhost:5678/api/v1/admin/freeze
+# 1. Stop the server. Backup takes the server's own storage-ownership lease,
+#    so it REFUSES while a server is running. It never takes a torn copy.
+sudo systemctl stop proximadb
 
-# Backup data directory
-tar -czf proximadb-backup-$(date +%Y%m%d).tar.gz /var/lib/proximadb
+# 2. Back up every local storage root the configuration names.
+#    Run from the server's working directory: relative paths resolve against it.
+proximadb-server -c /etc/proximadb/config.toml backup --to /backup/proximadb-$(date +%Y%m%d)
 
-# Resume writes
-curl -X POST http://localhost:5678/api/v1/admin/unfreeze
+sudo systemctl start proximadb
 ```
+
+What a backup contains:
+
+- **Every local root**: `data_dir`, metadata, storage locations, WAL, SST/VIPER data. Files are copied byte for byte and SHA-256 checksummed.
+- **`manifest.json`, written last and atomically.** A directory without a manifest is an incomplete backup, and restore refuses it.
+- **Not included:**
+  - object-storage roots: they are listed as *uncovered* and a warning is printed;
+  - the warm-tier disk cache: it is rebuildable, and restore leaves it empty;
+  - lock and runtime-state files.
+- **Backup refuses rather than silently omit durable state outside the lease.** That covers a `[queue]` root, `PROXIMADB_QUEUE_ROOT`, `PROXIMADB_WAL_LOCAL_DIR`, and a local `global_manifest_url` that sits outside every storage root. Move that state under a storage root first.
 
 ### Restore
 
 ```bash
-# Stop server
 sudo systemctl stop proximadb
-
-# Restore data
-tar -xzf proximadb-backup-20260222.tar.gz -C /
-
-# Start server
+proximadb-server -c /etc/proximadb/config.toml restore --from /backup/proximadb-20261015
 sudo systemctl start proximadb
 ```
 
-### Automated Backup
-
-```bash
-#!/bin/bash
-# /etc/cron.daily/proximadb-backup
-BACKUP_DIR="/backup/proximadb"
-DATE=$(date +%Y%m%d)
-
-curl -s -X POST http://localhost:5678/api/v1/admin/freeze
-tar -czf "$BACKUP_DIR/proximadb-$DATE.tar.gz" /var/lib/proximadb
-curl -s -X POST http://localhost:5678/api/v1/admin/unfreeze
-
-# Keep last 7 days
-find "$BACKUP_DIR" -name "proximadb-*.tar.gz" -mtime +7 -delete
-```
-
----
+- Restore verifies **every checksum before writing anything**. A corrupt backup is rejected and leaves the target untouched.
+- The target configuration must have the **same absolute root layout** as the backup, because catalog and WAL state can embed absolute paths. Restoring to a different layout is not supported yet.
+- Non-empty storage roots are refused. Pass `--force` to replace their contents.
+- If the source did not shut down cleanly, the backup is crash-consistent, and the WAL replays on the next start.
 
 ## Performance Tuning
 
