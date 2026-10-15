@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open. Reproduced; mechanism only partly traced (see *Mechanism*), fix not started.**
+| Status | **Resolved (2026-10-15).** Replay now resolves the local WAL root with the write path's own resolver (`local_wal_dir(&WALConfig)`); the env-only reader is private. Pinned end to end by `crash_restart_with_config_file_wal_local_dir`.
 | Priority | **CRITICAL**: silent loss of acknowledged writes when a crash falls inside a window after the ack, for every deployment that sets `wal_local_dir` in the config file rather than in the environment.
 | Component | `src/storage/persistence/write_ahead_log/mod.rs`: `local_wal_dir(&config)` (write path) vs `local_wal_dir_env()` (env-only, used by recovery/replay free functions that have no `WALConfig` handle). `[storage.wal_config] wal_local_dir` (ADR-069 S1).
 | Relates to | TD-WAL-1 (ADR-069 local-disk WAL; its S5 crash test covers only the default layout), mandate #16 (read-after-write correctness), the cold backup/restore PR that surfaced it.
@@ -36,10 +36,32 @@ Setup: SST collection, `sync_mode = "PerBatch"`, 6 records inserted over REST v2
 
 The env-var form is consistent between write and replay; it is unaffected.
 
-== Fix direction (to design; not a patch)
+== Mechanism (traced 2026-10-15)
 
-Thread the resolved WAL configuration into recovery, so write and replay share **one** resolver. The pattern to follow is the one this repo already uses for tenant resolution: a single pure resolver used by every path. Removing the config field instead would also be consistent, but it is a breaking config change.
+Startup replay belongs to the **storage engine's** WAL manager (`StorageEngine::recover_from_wal`). `StorageEngine::new_internal` built that manager's config from `WALConfig::default()` plus the storage locations. It never read `[storage.wal_config]`, so its recovery manager had no `wal_local_dir`. The write path's manager is built through the canonical converter (`WriteBufferUserConfig::to_engine_config`), so it did have the field and wrote segments under `wal_local_dir`.
 
-== Verification for a fix
+Replay lists these candidate bases, in order:
 
-`crash_restart_control` in `apps/proximadb-server/tests/cold_backup_restore.rs` already runs this scenario. Add the config-`wal_local_dir` variant to it; it must pass. That test file also has the harness for the crash-then-backup variant, which becomes valid once replay honours the config.
+. the local WAL root;
+. the catalog `base_location`;
+. every manifest `storage_url`;
+. the configured primary.
+
+The config-file directory therefore became a candidate only once a manifest entry had recorded it. A SIGKILL before that left the segments unlisted, and restart logged `Collection 1 recovered: 0 vectors from 0 files`.
+
+**Lesson.** The first fix threaded the resolver into `RecoveryManager` but changed nothing: the test still failed with the same 404. The config the recovery manager received had already lost the field one layer up. The fresh-test-first discipline caught it; reading the code alone would not have.
+
+== Fix (shipped)
+
+* `StorageEngine::new_internal` carries `wal_local_dir` from the user config into the replay manager's `WALConfig`.
+* `RecoveryManager::new` resolves `local_wal_dir(&config)` once, using the write path's own resolver (env override > TOML > None). It threads the value into `wal_candidate_bases`.
+* `local_wal_dir_env()` is now private to the resolver, so no reader can consult only half of the precedence chain.
+* Tests:
+** Unit test `config_file_wal_local_dir_is_a_replay_candidate`.
+** Real-binary test `crash_restart_with_config_file_wal_local_dir`: SIGKILL immediately after the ack, then restart; all 6 acknowledged records must be readable. It fails on the pre-fix code (`ctl-0` 404) and passes with the fix.
+
+== Residual (not fixed here)
+
+* The storage engine's replay WAL config is still built from `WALConfig::default()` rather than the canonical converter. Only `wal_local_dir` is carried across. Other `[storage.wal_config]` fields (for example `strategy_type` and the sync settings) do not reach this manager.
+** It is mostly a replay-side handle, but the same drift class as TD-CONFIG-CONSOLIDATE-1.
+** Routing it through `to_engine_config()` changes this manager's behaviour, so it needs its own crash/recovery verification.
