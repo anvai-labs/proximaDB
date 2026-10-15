@@ -32,7 +32,7 @@ Setup: SST collection, `sync_mode = "PerBatch"`, 6 records inserted over REST v2
 
 * The write path resolves the WAL base with `local_wal_dir(&self.config)`. That honours the config field (and the env override), so WAL segments are written to `wal_local_dir`.
 * Recovery and replay run as free functions without a `WALConfig` handle, and use `local_wal_dir_env()`. That reads **only** `PROXIMADB_WAL_LOCAL_DIR`. Its own doc comment admits the gap: _"for full write and replay consistency an operator sets the env"_.
-* * That explanation is **incomplete**. Part of recovery follows the WAL manifest's `storage_url`, which does record the config directory. The likely window is the interval before the manifest entry for new WAL segments is persisted: an immediate crash leaves segments that only the env-only path could find. This is a hypothesis; trace manifest persistence timing against recovery to confirm it.
+* That explanation is **incomplete**. Part of recovery follows the WAL manifest's `storage_url`, which does record the config directory. The likely window is the interval before the manifest entry for new WAL segments is persisted: an immediate crash leaves segments that only the env-only path could find. This is a hypothesis; trace manifest persistence timing against recovery to confirm it.
 
 The env-var form is consistent between write and replay; it is unaffected.
 
