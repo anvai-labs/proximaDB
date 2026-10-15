@@ -1904,7 +1904,10 @@ pub fn pax_rabitq_pool_for_top_k(k: usize, n: usize) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|m| *m >= k)
     {
-        return pool;
+        // TD-SECSCAN-1 §5: the pool can never usefully exceed the segment's
+        // rows, and an unclamped value derived from a client `top_k` used to
+        // drive a multi-TB merge allocation downstream.
+        return pool.min(n.max(1));
     }
     static C: std::sync::OnceLock<(usize, usize, f64)> = std::sync::OnceLock::new();
     let (mult, min, rate) = C.get_or_init(|| {
@@ -1925,7 +1928,18 @@ pub fn pax_rabitq_pool_for_top_k(k: usize, n: usize) -> usize {
     });
     let by_k = k.saturating_mul(*mult);
     let by_n = ((n as f64) * rate).ceil() as usize;
-    by_k.max(by_n).max(*min)
+    // TD-SECSCAN-1 §5: clamp to the segment rows — with `k = u32::MAX` (an
+    // uncapped surface) `by_k` alone was a ~4e11 survivor pool feeding a
+    // `Vec::with_capacity(pool * degree)` merge buffer.
+    by_k.max(by_n).max(*min).min(n.max(1))
+}
+
+/// Morsel merge-buffer capacity for ranking a region of `n_rows` rows into a
+/// `pool`-sized survivor set across `degree` workers: the pool is clamped to
+/// the rows it can actually select from, and the product saturates instead of
+/// overflowing (TD-SECSCAN-1 §5).
+pub(crate) fn morsel_merge_capacity(pool: usize, n_rows: usize, degree: usize) -> usize {
+    pool.min(n_rows).saturating_mul(degree)
 }
 
 /// Cached per-file-invariant bytes for a coalesced segment: header-prefix,
@@ -3143,7 +3157,11 @@ async fn coarse_probe_survivors(
         // k matches (the recall fix that the disarmed-probe path traded away).
         // Cells with zero matching rows are skipped (cell ∩ filter empty ⇒ no GET).
         Some(allow) => {
-            let target = pax_rabitq_pool_for_top_k(k, allow.len().max(1)).max(k);
+            // TD-SECSCAN-1 §5: probing stops at the pool (or the allowed
+            // rows — there is nothing more to match).
+            let target = pax_rabitq_pool_for_top_k(k, allow.len().max(1))
+                .max(k)
+                .min(allow.len());
             let mut selected = Vec::new();
             let mut matched = 0usize;
             for (c, _) in cell_dist.iter() {
@@ -3553,6 +3571,9 @@ async fn rank_region_morsels(
 ) -> Vec<usize> {
     let degree = crate::storage::engines::sst::search::morsel_degree();
     let n_rows = region.n_rows();
+    // TD-SECSCAN-1 §5: callers may pass `pool.max(k)` with a client-sized `k`;
+    // the pool can never select more survivors than the region has rows.
+    let pool = pool.min(n_rows);
     if degree <= 1 || n_rows < MORSEL_MIN_ROWS {
         return region.rank(query, metric, pool);
     }
@@ -3568,7 +3589,8 @@ async fn rank_region_morsels(
             })
         })
         .collect();
-    let mut merged: Vec<(usize, f32)> = Vec::with_capacity(pool * degree);
+    let mut merged: Vec<(usize, f32)> =
+        Vec::with_capacity(morsel_merge_capacity(pool, n_rows, degree));
     for t in tasks {
         match t.await {
             Ok(part) => merged.extend(part),
@@ -3970,8 +3992,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             // deliberate: the allowed count is typically well below the morsel
             // threshold; morsel-parallel allowed rank is a P3 follow-up.
             Some(allow) => {
-                let pool = pax_rabitq_pool_for_top_k(k, allow.len().max(1));
-                region.rank_allowed(query, metric, pool.max(k), allow)
+                let pool = pax_rabitq_pool_for_top_k(k, allow.len().max(1))
+                    .max(k)
+                    .min(allow.len().max(1));
+                region.rank_allowed(query, metric, pool, allow)
             }
             None => {
                 // ADR-062 PR2: adaptive survivor pool — scale M with the
@@ -4919,6 +4943,38 @@ pub async fn rabitq_search_segment_coalesced_allowed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-SECSCAN-1 §5 (review round 2): the RaBitQ survivor pool and the
+    /// morsel merge buffer are derived from a client-controlled `top_k`. A
+    /// huge `k` (e.g. u32::MAX on an uncapped surface) must never inflate the
+    /// pool past the segment's own row count or overflow the merge
+    /// `Vec::with_capacity(pool * degree)` — that was a multi-TB request /
+    /// alloc-abort on coalesced RaBitQ segments with morsel degree > 1.
+    #[test]
+    fn rabitq_pool_and_morsel_merge_capacity_are_bounded_by_rows() {
+        let n = 65_536usize; // MORSEL_MIN_ROWS: the coalesced morsel path
+        let huge_k = u32::MAX as usize;
+        let pool = pax_rabitq_pool_for_top_k(huge_k, n);
+        assert!(
+            pool <= n,
+            "survivor pool {pool} must not exceed segment rows {n}"
+        );
+        // A realistic k still gets a pool that covers it.
+        assert!(pax_rabitq_pool_for_top_k(10, n) >= 10);
+        // The morsel merge capacity built from (pool, n_rows, degree) never
+        // exceeds rows × degree — and never overflows for adversarial inputs.
+        let degree = crate::storage::engines::sst::search::morsel_degree().max(1);
+        assert!(
+            morsel_merge_capacity(huge_k, n, degree) <= n.saturating_mul(degree),
+            "merge capacity must be bounded by rows × degree"
+        );
+        // Adversarial inputs saturate instead of wrapping (degree itself is
+        // cores-clamped at the real call site via `morsel_degree()`).
+        assert_eq!(
+            morsel_merge_capacity(usize::MAX, n, usize::MAX),
+            n.saturating_mul(usize::MAX)
+        );
+    }
 
     /// TD-PAXRG-1 Phase A: the coalesced header-prefix GET floor covers the v4
     /// (row-group Region D) prefix length, so one ranged read serves every

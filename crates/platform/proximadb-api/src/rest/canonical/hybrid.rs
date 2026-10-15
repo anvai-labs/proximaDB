@@ -144,6 +144,10 @@ pub async fn hybrid_search(
         ));
     }
 
+    // Shared server top_k cap (TD-SECSCAN-1 §5).
+    proximadb_search_types::top_k_limit::check_top_k(u64::from(request.top_k))
+        .map_err(|e| RestError::InvalidArgument(e.to_string()))?;
+
     // TD-138 phase 1 (deprecate, keep live): surface every use loudly so operators
     // migrate to the v2 fusion seam. The endpoint already replies with HTTP
     // deprecation headers (`with_v1_compatibility_headers`); this is the per-request

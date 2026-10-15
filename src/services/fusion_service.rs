@@ -509,6 +509,17 @@ impl FusionService {
 
         let started = Instant::now();
 
+        // Shared server top_k cap (TD-SECSCAN-1 §5): the fusion limit seeds the
+        // vector ANN leg and `max_seeds` bounds graph expansion. Handlers reject
+        // over-cap values with a client-facing error; this choke clamp keeps any
+        // internal caller from deriving an unbounded workload from `params`.
+        let limit = params
+            .limit
+            .min(proximadb_search_types::top_k_limit::DEFAULT_MAX_TOP_K);
+        let max_seeds = params
+            .max_seeds
+            .min(proximadb_search_types::top_k_limit::DEFAULT_MAX_TOP_K);
+
         // Structural tenant scope, composed ONCE and shared by both legs (TD-ENTITY-TENANT-1):
         // - the graph leg keys reads + canonical oids by `scoped_gid` (`{tenant}/{graph_id}`, bare
         //   for the default tenant) so it matches the graph write path (`for_tenant`);
@@ -526,7 +537,6 @@ impl FusionService {
         let vector = self.vector.clone();
         let collection = params.vector_collection.clone();
         let query_vector = params.query_vector.clone();
-        let limit = params.limit;
 
         #[cfg(feature = "abac-policy")]
         let read_ctx = match (&params.principal, params.tenant_stable_id) {
@@ -600,7 +610,7 @@ impl FusionService {
         // 2. Graph expand from the top seeds (bounded). A seed that is not a node in this graph simply
         //    contributes nothing (its traverse errors are skipped) rather than failing the query.
         // T1.2: Graceful degradation — individual seed failures are logged but don't abort fusion.
-        let seeds = seed_node_ids(&scoped_gid, &hits, params.max_seeds, params.oid_key);
+        let seeds = seed_node_ids(&scoped_gid, &hits, max_seeds, params.oid_key);
         let mut nodes: Vec<Node> = Vec::new();
         let mut edges: Vec<Edge> = Vec::new();
         let mut failed_seeds = 0;
@@ -614,7 +624,7 @@ impl FusionService {
                 node_labels: Vec::new(),
                 filters: Vec::new(),
                 algorithm: ALGORITHM_BFS,
-                limit: Some(params.limit as u32),
+                limit: Some(u32::try_from(limit).unwrap_or(u32::MAX)),
                 timeout_ms: None,
                 max_frontier: None,
             };
@@ -703,7 +713,7 @@ impl FusionService {
             let doc_source = self.document.expand(
                 collection,
                 &spec.text_query,
-                spec.k.unwrap_or(params.limit),
+                spec.k.unwrap_or(limit),
                 spec.weight,
             );
             sources.push(normalize_source_keys(doc_source, params.oid_key));

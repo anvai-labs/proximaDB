@@ -1526,6 +1526,25 @@ impl VectorOperationsService {
         ))
     }
 
+    /// The query optimizer's `top_k` hint is a `u16` on the config struct.
+    /// Since the shared server cap (TD-SECSCAN-1 §5) is 10,000 < `u16::MAX`,
+    /// a capped `k` never truncates; an INTERNAL caller that bypassed the
+    /// boundary is clamped here with a warning instead of silently wrapping
+    /// (the old `k as u16` truncated e.g. 65_536 → 0).
+    fn optimizer_top_k_hint(k: usize) -> u16 {
+        const U16_MAX: usize = u16::MAX as usize;
+        if k > U16_MAX {
+            tracing::warn!(
+                k,
+                "top_k exceeds the optimizer's u16 hint range; clamping to {}",
+                u16::MAX
+            );
+            u16::MAX
+        } else {
+            k as u16
+        }
+    }
+
     /// Public v1 boundary: execute vector search and return v1 response
     pub async fn search_v1(
         &self,
@@ -1533,6 +1552,8 @@ impl VectorOperationsService {
         identity: proximadb_runtime::PortIdentity<'_>,
     ) -> Result<crate::proto::proximadb_v1::VectorOperationResponse> {
         let collection_id = req.collection_id.clone();
+        // Shared server top_k cap (TD-SECSCAN-1 §5) — v1 boundary choke.
+        proximadb_search_types::top_k_limit::check_top_k(u64::from(req.top_k))?;
         let top_k = req.top_k as usize;
         let search_query = req
             .queries
@@ -3122,7 +3143,7 @@ impl VectorOperationsService {
         // Without this, the query optimizer uses default top_k=10, and candidates = 10*10 = 100,
         // which incorrectly limits all searches to 100 results regardless of the requested k.
         let search_params = crate::query::query_optimizer::SearchParams {
-            top_k: Some(k as u16),
+            top_k: Some(Self::optimizer_top_k_hint(k)),
             distance_metric: Some(distance_metric),
             ..Default::default()
         };
@@ -3250,6 +3271,10 @@ impl VectorOperationsService {
         tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
         #[cfg(feature = "abac-policy")] read_context: &ReadContext,
     ) -> Result<Vec<crate::core::search::results::OptimizedSearchRecord>> {
+        // Shared server top_k cap (TD-SECSCAN-1 §5) — native-kernel choke:
+        // reached by routes that never pass through `handle_record_search_for_tenant`
+        // (progressive v1, hybrid, fusion seed leg, analytics entanglement).
+        proximadb_search_types::top_k_limit::check_top_k(k as u64)?;
         let resolved = match tenant_context {
             Some(context) if !context.tenant_id.is_empty() => {
                 self.validate_tenant_collection_access(collection_id, tenant_context)
@@ -3327,6 +3352,8 @@ impl VectorOperationsService {
         config: Option<UnifiedSearchConfig>,
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<Vec<crate::core::search::results::OptimizedSearchRecord>> {
+        // Shared server top_k cap (TD-SECSCAN-1 §5) — native-kernel choke.
+        proximadb_search_types::top_k_limit::check_top_k(k as u64)?;
         use std::time::Instant;
         let total_start = Instant::now();
         // FA-2 (abac-policy): push the subject's accessibility predicate into
@@ -3363,7 +3390,7 @@ impl VectorOperationsService {
         // Without this, the query optimizer uses default top_k=10, and candidates = 10*10 = 100,
         // which incorrectly limits all searches to 100 results regardless of the requested k.
         let search_params = crate::query::query_optimizer::SearchParams {
-            top_k: Some(k as u16),
+            top_k: Some(Self::optimizer_top_k_hint(k)),
             distance_metric: Some(distance_metric),
             ..Default::default()
         };
@@ -3639,7 +3666,7 @@ impl VectorOperationsService {
         // Run the optimizer on the EXPLAIN path (non-hot) to surface ADR-011 filtering mode.
         let collection = self.get_or_load_collection(collection_id).await?;
         let search_params = crate::query::query_optimizer::SearchParams {
-            top_k: Some(k as u16),
+            top_k: Some(Self::optimizer_top_k_hint(k)),
             filter_expression: filter.clone(),
             ..Default::default()
         };
@@ -3766,7 +3793,7 @@ impl VectorOperationsService {
         // Create unified context (combines what used to be two separate contexts)
         let search_params = crate::core::search::SearchParams {
             query_vectors: Some(vec![query_vector.clone()]),
-            top_k: Some(top_k as u16),
+            top_k: Some(Self::optimizer_top_k_hint(top_k)),
             distance_metric: Some(distance_metric),
             filter_expression: filter.clone(),
             enable_progressive_search: Some(true), // Enable by default if quantization available
@@ -3892,7 +3919,7 @@ impl VectorOperationsService {
         // Run the optimizer on the EXPLAIN path (non-hot) to surface ADR-011 filtering mode.
         let collection = self.get_or_load_collection(collection_id).await?;
         let search_params = crate::query::query_optimizer::SearchParams {
-            top_k: Some(k as u16),
+            top_k: Some(Self::optimizer_top_k_hint(k)),
             filter_expression: filter.clone(),
             ..Default::default()
         };
@@ -4266,7 +4293,7 @@ impl VectorOperationsService {
         // Prepare storage search context first
         let search_params = crate::core::search::SearchParams {
             query_vectors: Some(vec![query_vector.clone()]),
-            top_k: Some(candidates as u16),
+            top_k: Some(Self::optimizer_top_k_hint(candidates)),
             distance_metric: Some(distance_metric),
             filter_expression: filter.clone(), // Pass the same FilterExpression to storage engine
             include_expired: Some(false),
@@ -4724,7 +4751,7 @@ impl VectorOperationsService {
         // Convert IndexLookupParams to SearchParams
         let search_params = crate::core::search::SearchParams {
             query_vectors: params.query_vector.map(|v| vec![v]),
-            top_k: Some(params.top_k as u16),
+            top_k: Some(Self::optimizer_top_k_hint(params.top_k)),
             filter_expression: params.filter,
             include_expired: Some(false),
             ..Default::default()

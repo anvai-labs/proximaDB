@@ -139,6 +139,13 @@ probe was also functionally wrong: an instance with `HttpTokens=required`
 answers a token-less GET with 401, so a hardened EC2 host was detected as
 "not AWS".
 
+Operator caveat: IMDSv2 tokens are subject to the instance's packet TTL /
+hop limit (default 1). In container/Kubernetes deployments where the hop
+limit is not raised, the token PUT fails and detection now reports
+"not AWS" after the 5 s timeout where the old token-less v1 probe could
+still succeed — on such hosts, raise the hop limit (or set
+`HttpTokens=optional`) rather than reverting to v1.
+
 Evidence — `tests/aws_imds_v2_test.rs`, against an httpmock IMDS stand-in that
 refuses token-less GETs with 401:
 
@@ -202,25 +209,45 @@ boundaries so clients get an error rather than a truncated result.
 
 ==== Status: CLOSED (2026-10-15)
 
-One limit, one helper, two layers — no third constant:
+Enforced at three layers — the shared limit, the canonical choke points, and
+the shared sinks (no third constant anywhere):
 
-1. **Shared cap.** `proximadb_search_types::top_k_limit` now owns
+1. **Shared cap.** `proximadb_search_types::top_k_limit` owns
    `PROXIMADB_SEARCH_MAX_TOP_K` (default `DEFAULT_MAX_TOP_K = 10_000`) and
    `check_top_k(u64) -> Result<(), TopKLimitExceeded>`. The REST v2 inline
-   env read was replaced by it, and every other search surface calls it at its
-   boundary with an explicit invalid-argument error: REST v2 entity search,
-   gRPC v2 `Search` / `SearchStream` / `SearchEntities`, Arrow Flight `DoGet`
-   `vector_search` tickets and every `bulk_search` DoExchange control frame,
-   pgwire `vector_search(...)` UDTF and pgvector `ORDER BY … LIMIT n`. The
-   canonical search authority (`RecordOpsService::handle_record_search_for_tenant`)
-   re-checks it as defense in depth. A malformed or zero override now falls
-   back to the default instead of disabling (or zeroing) the cap.
-2. **Shared sink.** `TopKHeap::with_capacity(k)` and
-   `BoundedPriorityQueue::new(k)` keep `k` as the logical capacity but
-   pre-allocate only `top_k_limit::bounded_prealloc(k)` (≤ 10,000) and grow on
-   demand, so no caller — including internal ones that bypass the boundaries —
-   can turn a request field into an eager multi-GB reservation. Results are
-   never truncated by this layer.
+   env read was replaced by it. **Boundary rejects (client gets an explicit
+   invalid-argument error)** — proven per route by the e2e test below: REST v2
+   record + entity search, REST v1 progressive search, REST hybrid search,
+   REST graph fusion-search (`limit` AND `max_seeds`), REST analytics
+   entanglement (`limit`), gRPC v2 `Search` / `SearchStream` /
+   `SearchEntities`, gRPC `FusionSearch` (`limit` AND `max_seeds`), Arrow
+   Flight `DoGet` `vector_search` tickets and every `bulk_search` DoExchange
+   control frame, pgwire `vector_search(...)` UDTF and pgvector
+   `ORDER BY … LIMIT n`. A malformed or zero override now falls back to the
+   default instead of disabling (or zeroing) the cap.
+2. **Choke points (internal callers, error or clamp).** The two search
+   authorities every default-mounted route bottoms out in also enforce the
+   cap: `VectorOperationsService::search_v1` (progressive/hybrid v1 leg) and
+   `unified_search_native[_with_tenant_context]` (hybrid/fusion-seed/
+   entanglement leg), plus `handle_record_search_for_tenant` as defense in
+   depth. `GraphFusionService::graph_fusion_search_with_labels` clamps
+   `limit` and `max_seeds` to the cap, and the external-collection hybrid
+   pool saturates its `k * HYBRID_POOL_FACTOR` product. A route whose handler
+   maps these to `Internal` (rather than `InvalidArgument`) is capped but
+   reports a 500 — the list above names the routes that return 400 because
+   the e2e test proves it; untested internal callers are capped, not proven.
+3. **Shared sinks.** `TopKHeap::with_capacity(k)` /
+   `BoundedPriorityQueue::new(k)` pre-allocate only
+   `top_k_limit::bounded_prealloc(k)` (≤ 10,000) and grow on demand;
+   `pax_rabitq_pool_for_top_k(k, n)` is clamped to the segment's row count
+   and the RaBitQ morsel merge buffer is built via
+   `morsel_merge_capacity(pool, n_rows, degree)` (`pool.min(n_rows)` ×
+   degree, saturating) — the review-pass finding that `k = u32::MAX` on a
+   coalesced RaBitQ segment ≥ 65k rows with morsel degree > 1 requested a
+   multi-TB `Vec::with_capacity(pool * degree)` is closed by unit test. The
+   optimizer's `u16` `top_k` hint is clamped with a warning
+   (`optimizer_top_k_hint`) instead of `k as u16` truncating. Results are
+   never truncated by any of these layers.
 
 Evidence:
 
@@ -233,8 +260,9 @@ Evidence:
   `gRPC SearchStream: accepted top_k=1000000 (stream opened)` (REST already
   rejected). After: every surface returns `InvalidArgument` / HTTP 400, and
   `top_k = 10_000` (exactly at the cap) is still served on REST, Flight `DoGet`,
-  Flight `bulk_search` and gRPC. (The `bulk_search` case was added with the
-  fix; pre-fix it served the request like `DoGet`.)
+  Flight `bulk_search`, progressive, hybrid and fusion-search. (The
+  `bulk_search` and bypass-route cases were added with the fix or in the
+  review pass; pre-fix they served the request like `DoGet`.)
 * `bounded_queue` unit tests: before, `TopKHeap::with_capacity(1_000_000)` and
   `BoundedPriorityQueue::new(1_000_000)` reserved 1,000,000 slots; after ≤
   10,000 while `capacity()` stays 1,000,000 and 20,000 pushes are all kept.

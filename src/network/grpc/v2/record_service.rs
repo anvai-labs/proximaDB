@@ -1447,7 +1447,6 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         &self,
         request: Request<TypedSearchRequest>,
     ) -> Result<Response<TypedSearchResponse>, Status> {
-        check_search_top_k(request.get_ref().top_k)?;
         let identity = grpc_auth::port_identity(&request)?;
         grpc_auth::enforce_data_plane_request(
             &request,
@@ -1456,6 +1455,8 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             request.get_ref().top_k as usize,
             Some(prost::Message::encoded_len(request.get_ref()) as u64),
         )?;
+        // After auth: unauthenticated requests get the auth error, not the cap.
+        check_search_top_k(request.get_ref().top_k)?;
         let req = request.into_inner();
         debug!(
             "V2 gRPC: Search - collection='{}', top_k={}",
@@ -1534,7 +1535,6 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         &self,
         request: Request<TypedSearchRequest>,
     ) -> Result<Response<Self::SearchStreamStream>, Status> {
-        check_search_top_k(request.get_ref().top_k)?;
         let identity = grpc_auth::port_identity(&request)?;
         grpc_auth::enforce_data_plane_request(
             &request,
@@ -1543,6 +1543,8 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             request.get_ref().top_k as usize,
             Some(prost::Message::encoded_len(request.get_ref()) as u64),
         )?;
+        // After auth: unauthenticated requests get the auth error, not the cap.
+        check_search_top_k(request.get_ref().top_k)?;
         let req = request.into_inner();
         debug!(
             "V2 gRPC: SearchStream - collection='{}', top_k={}",

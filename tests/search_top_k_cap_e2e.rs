@@ -358,4 +358,125 @@ async fn every_search_surface_rejects_over_cap_top_k() {
         "uncapped top_k surfaces:\n  {}",
         violations.join("\n  ")
     );
+
+    // --- REST v1 progressive search (POST /api/v2/progressive/search/{id}).
+    // v1 proto shape: {"queries":[{"vector":[...]}], "top_k": n}.
+    let progressive_over = http
+        .post(format!("{base}/api/v2/progressive/search/{name}"))
+        .json(&json!({
+            "collection_id": name,
+            "queries": [{ "vector": query_vector() }],
+            "top_k": OVER_CAP_TOP_K
+        }))
+        .send()
+        .await
+        .expect("progressive search");
+    assert_eq!(
+        progressive_over.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "progressive search must reject top_k above the cap: {}",
+        progressive_over.status()
+    );
+    let progressive_at = http
+        .post(format!("{base}/api/v2/progressive/search/{name}"))
+        .json(&json!({
+            "collection_id": name,
+            "queries": [{ "vector": query_vector() }],
+            "top_k": AT_CAP_TOP_K
+        }))
+        .send()
+        .await
+        .expect("progressive search at cap");
+    assert!(
+        progressive_at.status().is_success(),
+        "progressive search must serve top_k exactly at the cap, got {}",
+        progressive_at.status()
+    );
+
+    // --- Hybrid search (POST /api/v2/hybrid/search).
+    let hybrid_over = http
+        .post(format!("{base}/api/v2/hybrid/search"))
+        .json(&json!({
+            "collection": name,
+            "vector": query_vector(),
+            "top_k": OVER_CAP_TOP_K
+        }))
+        .send()
+        .await
+        .expect("hybrid search");
+    assert_eq!(
+        hybrid_over.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "hybrid search must reject top_k above the cap: {}",
+        hybrid_over.status()
+    );
+    let hybrid_at = http
+        .post(format!("{base}/api/v2/hybrid/search"))
+        .json(&json!({
+            "collection": name,
+            "vector": query_vector(),
+            "top_k": AT_CAP_TOP_K
+        }))
+        .send()
+        .await
+        .expect("hybrid search at cap");
+    assert!(
+        hybrid_at.status().is_success(),
+        "hybrid search must serve top_k exactly at the cap, got {}: {}",
+        hybrid_at.status(),
+        hybrid_at.text().await.unwrap_or_default()
+    );
+
+    // --- Graph fusion search (POST /api/v2/graphs/{id}/fusion-search).
+    // The limit cap is checked before any collection/graph lookup, so an
+    // over-cap request is 400 even without a registered graph.
+    let fusion_over = http
+        .post(format!("{base}/api/v2/graphs/secscan1_graph/fusion-search"))
+        .json(&json!({
+            "vector_collection": name,
+            "query_vector": query_vector(),
+            "limit": OVER_CAP_TOP_K
+        }))
+        .send()
+        .await
+        .expect("fusion search");
+    assert_eq!(
+        fusion_over.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "fusion search must reject limit above the cap: {}",
+        fusion_over.status()
+    );
+    let fusion_seeds_over = http
+        .post(format!("{base}/api/v2/graphs/secscan1_graph/fusion-search"))
+        .json(&json!({
+            "vector_collection": name,
+            "query_vector": query_vector(),
+            "limit": 10,
+            "max_seeds": OVER_CAP_TOP_K
+        }))
+        .send()
+        .await
+        .expect("fusion search max_seeds");
+    assert_eq!(
+        fusion_seeds_over.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "fusion search must reject max_seeds above the cap: {}",
+        fusion_seeds_over.status()
+    );
+    let fusion_at = http
+        .post(format!("{base}/api/v2/graphs/secscan1_graph/fusion-search"))
+        .json(&json!({
+            "vector_collection": name,
+            "query_vector": query_vector(),
+            "limit": AT_CAP_TOP_K
+        }))
+        .send()
+        .await
+        .expect("fusion search at cap");
+    assert!(
+        fusion_at.status().is_success(),
+        "fusion search must serve limit exactly at the cap, got {}: {}",
+        fusion_at.status(),
+        fusion_at.text().await.unwrap_or_default()
+    );
 }
