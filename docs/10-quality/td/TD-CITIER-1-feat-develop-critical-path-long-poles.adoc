@@ -1,0 +1,151 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CITIER-1: feat→develop CI wall clock is set by a dead `needs:` edge and by suites that belong to a later tier
+:toc: macro
+:icons: font
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial**. The tier moves, path scoping and removal of the `needs: rust-build` edge shipped in the PR that filed this TD. The projection below comes from 44 recorded runs. Still open: the restart-recovery pole (see "Open residuals") and re-measuring after ~10 feat→develop runs on the new workflow, then correcting this table if the result differs.
+| Severity | Medium. Every feat→develop PR waited a median 67 min for `CI Success`. Results were correct, but the wait cost a runner and a reviewer cycle on every PR.
+| Component | `.github/workflows/ci.yml`: `rust-test`, `sift-recall-ratchet`, `object-store-restart-recovery`, `mlflow-conformance`, `openapi-spec-drift`, `feature-matrix` / `feature-matrix-enterprise-catalogs`, `changes`; new helper `scripts/ci_job_definition_changed.py` (tests in `tests/scripts/test_ci_job_definition_changed.py`)
+| Relates to | Mandate #9 (CI tiering); link:TD-CI-1-rust-test-compile-bottleneck.adoc[TD-CI-1] (the unit job's compile); link:TD-CI-5-feature-matrix-has-no-job-timeout.adoc[TD-CI-5]
+|===
+
+toc::[]
+
+== Measurement (2026-10-15)
+
+The sample is 16 recent feat→develop runs, widened to 44 PRs: the latest successful run of each
+distinct branch between 2026-09-11 and 2026-10-15. The data comes from
+`gh api repos/anvai-labs/proximaDB/actions/runs/<id>/jobs`. Queue wait was about 0.1 min median
+for every job, so the wall clock is set by job durations, not by queueing.
+
+[cols="3,1,1,2",options="header"]
+|===
+| Job (16-run sample) | median min | max min | when it finishes, median min after run start
+| Object-store restart recovery (Azurite) | 65.8 | 66.2 | 66.5 (path-gated, 2/16)
+| Feature Matrix (enterprise-catalogs) | 47.1 | 50.1 | 48.0
+| Rust Tests (unit) | 46.0 | 63.7 | **68.3**
+| SIFT PAX recall ratchet (N=10k) | 31.7 | 33.6 | 32.4 (13/16)
+| Rust Integration Tests (query / graph) | 23.4 / 23.5 | 28.8 / 29.5 | 42.2
+| Rust Compile (test) | 21.0 | 26.3 | 21.9
+| Rust Build (dev) | 20.0 | 28.1 | 20.8
+| OpenAPI Spec From Code | 19.7 | 27.7 | 20.5
+| MLflow conformance (real client) | 17.3 | 29.0 | 18.1
+| other Feature Matrix legs | 8–15 | 18 | ≤ 16
+|===
+
+**Critical path.** In 16 of 16 runs the last job to finish before `CI Success` was
+`Rust Tests (unit)`: `changes` (about 1 min), then `Rust Build (dev)` (about 20 min), then
+`Rust Tests (unit)` (about 46 min). That gives the 68 min median.
+
+== Finding 1: the `rust-test` → `rust-build` edge transferred nothing
+
+`rust-test` declared `needs: [changes, rust-build]`, but it downloads no artifact from that job.
+The only coupling was the shared rust-cache key: prefix `v1-rust-nightly-dev`, shared-key
+`build`. rust-cache saves a key once, and the first job to save it wins. The jobs restoring from
+that key included `rust-build`, both `rust-test` legs, four of the `rust-integration-test-*` jobs,
+and `mlflow-conformance`. `mlflow-conformance` needs only `changes`. Run 38752730686 shows what
+happened:
+
+* `Rust Build (dev)` started with "No cache found". At the end of the run its save failed with
+  "Unable to reserve cache … another job may be creating this cache".
+* That key had been saved by `mlflow-conformance`, which finished at 15:02:39.
+* `Rust Tests (unit)` restored that cache as a "full match". It still compiled 322 crates,
+  starting with third-party ones such as `value-bag`. The `test` profile compile took 42m15s and
+  the nextest run took about 2.5 min.
+
+The unit compile took 42–45 min in all 16 runs, whichever job had written the cache. The edge
+therefore added its ~21 min wait to every run and saved no compile time. **Fix:**
+`needs: [changes]`.
+
+This also corrects TD-CI-1's "lever 2: align rust-test's `shared-key` with `rust-build`". The
+keys were already aligned. Because the cache is first-writer-wins, aligning them does not give
+`rust-test` a warm cache.
+
+== Finding 2: the ANN-recall ratchet ran on the wrong tier
+
+`sift-recall-ratchet` is an ANN-recall conformance ratchet. Mandate #9 places those at
+develop→qa (MEDIUM). It ran on feat→develop whenever `storage_changes` or `core_changes`
+matched, which was 13/16 PRs at 32 min each. **Moved:** it now runs on `medium_tier` (develop→qa
+and qa→main) **unconditionally**, with no path filter, and still on `workflow_dispatch`. On
+feat→develop, the per-PR recall signal remains `vector_ann_recall_e2e` in
+`Rust Integration Tests (query)`.
+
+== Finding 3: specialised heavy suites ran regardless of what changed
+
+[cols="2,3,3",options="header"]
+|===
+| Suite | Was (feat→develop) | Now
+| MLflow conformance (real client) | any `rust` or `python` change | `mlflow_changes`: the MLflow REST module + the router/middleware it mounts behind, run store / model registry (catalog crate, `src/services/mlflow_*`, `src/storage/document`), server app + `mlflow-ui` feature + vendored UI, `config/config.toml`, `proto/**`, the Python harness and ratchet floors, manifests + lockfile, toolchain
+| OpenAPI Spec From Code | any `rust` change | `openapi_code_changes`: `git grep -l 'utoipa\|ToSchema\|IntoParams'` finds annotated code only in `src/network/rest` and `crates/control/proximadb-catalog`; plus `tests/openapi_spec_gen.rs`, manifests + **lockfile** (TD-SPECORD-1: a dependency bump alone reorders the spec), toolchain. `docs/openapi/**` and `sweep` (every push to a protected branch) were already in the trigger and stay there
+| Feature Matrix (enterprise-catalogs) | any `rust` change (a matrix leg; 47 min vs ≤ 15 for the other legs because it also serves tests and runs clippy) | its own job with the **same check name**, gated on `enterprise_catalogs_changes`: the catalog crate, `src/catalog`, `src/network/rest` (where census finding 4 found the `/api/v1` route collision), `src/security`, proto, `tests/catalog*`, manifests + lockfile, toolchain
+| Object-store restart recovery (Azurite) | already path-gated, on a narrow filter | filter **widened** to what `--restart` exercises: server boot (`apps/proximadb-server/**`, `src/database.rs`), catalog recovery, all of `src/storage/persistence`, memtable, the SST/HELIX engines and the TD-CACHE-7 warm-manifest test, DrPathBuilder, and the object-store / encryption / block-format / SST / WAL-header / CKS crates
+|===
+
+All four suites now run **unconditionally at develop→qa and qa→main**: `medium_tier` bypasses
+their path filters.
+
+**Two deliberate deviations from "list ci.yml and the lockfile in every filter":**
+
+. *Lockfile → restart recovery.* 14 of the first 16 sampled runs touched `Cargo.lock`, most of
+  them dependabot groups and the rustls wave. Putting a 66-min job on every lockfile bump would
+  have made the commonest PR class slower than before this change. A transitive
+  `object_store` / azure / reqwest / rustls bump is now caught on feat→develop by the 3–5 min
+  `Object-store Cool tier (emulators)` job instead. That job makes real tiered PUTs against
+  Azurite, LocalStack and fake-gcs through the same client stack, and `Cargo.toml` /
+  `Cargo.lock` were added to its filter. The full restart proof still runs at develop→qa on every
+  promotion. A direct dependency change to the object-store crate's own `Cargo.toml` still
+  triggers the restart job.
+. *ci.yml → the four suites.* 15 of 44 PRs touched `ci.yml`, almost never in these jobs. Listing
+  the whole file in their filters would have fired a 20–66 min job on a third of PRs. The `changes`
+  job's `selfdef` step (`scripts/ci_job_definition_changed.py`) checks only the text that defines
+  each suite: its job block, the outputs and filters its `if:` reads, and the workflow header. If
+  any of that differs from the merge-base, the suite runs. The step fails **open**: an unreadable
+  base, a missing block or a crashed script all count as "changed". Its tests pin each
+  definition-changing edit to `true` and each unrelated edit to `false`. They also fail if the
+  real `ci.yml` stops resolving (which would silently mean "always run").
+
+== Projection (44 PRs, each PR's real diff evaluated against the new filters)
+
+For each run the projection does the following:
+
+* drops the SIFT ratchet;
+* drops each specialised suite whose new filter does not match the PR's files. For PRs that
+  touched `ci.yml`, the patch hunks were mapped to job blocks to approximate `selfdef`;
+* adds a suite the widened filter now fires, timed as `changes` end + its median duration
+  (restart 66 min; this happened in 6/43 runs);
+* restarts both `rust-test` legs at `changes` end + their measured queue + their measured
+  duration;
+* uses each run's measured finish times for every other job.
+
+One rerun-only outlier, with a 9.5-min wall clock, is excluded, leaving 43 runs.
+
+[cols="2,1,1",options="header"]
+|===
+| | before | after
+| median wall clock to `CI Success` | 67.1 min | **51.1 min**
+| p75 | 75.0 min | 66.4 min
+| typical PR, no specialised path touched | ≈ 68 (1 + 21 + 46) | ≈ 47–48 (1 + 46; next chain: 21 + 23.5 = 44.5)
+| PR touching a restart-recovery path (12/43) | ≈ 67 | ≈ 67, unchanged: the restart job is the critical path
+|===
+
+Runner time no longer spent on feat→develop in the 43-run sample:
+
+* SIFT: ~592 runner-min.
+* Enterprise-catalogs: ~1053 runner-min.
+* MLflow: ~403 runner-min.
+* OpenAPI: ~392 runner-min.
+* The widened restart filter added 6 runs (~400 runner-min).
+
+== Open residuals
+
+* **The restart job is now the critical-path pole when it fires.** It takes about 66 min because
+  it makes two cold `--features azure` compiles at `CARGO_BUILD_JOBS=1`: the server test target,
+  then the root crate's `--lib` for the TD-CACHE-7 test. Its cache prefix `v1-objstore-restart` is
+  only ever written from PR scope, so a new PR never inherits it. Candidate levers: warm that
+  cache from a develop push, or move the warm-manifest `--lib` test to the qa tier.
+* **The unit job's ~45 min compile** is TD-CI-1. The sharding and nextest-archive analysis there
+  still holds: the run phase is about 2.5 min, so splitting it saves almost nothing.

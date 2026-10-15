@@ -83,8 +83,14 @@ jobs:
       #     correctness at the feat→dev boundary catches latent breakage (broken
       #     doctests, feature-gating gaps, test-isolation bugs) on the
       #     introducing PR instead of at develop→qa.
+      #     SPECIALISED heavy suites (object-store restart recovery over Azurite,
+      #     MLflow real-client conformance, the enterprise-catalogs feature leg,
+      #     OpenAPI spec-from-code) run here ONLY when the PR touches the paths
+      #     they exercise (`*_changes` filters below) — TD-CITIER-1.
       #   * develop -> qa = MEDIUM: the above plus the qa-gate conformance
-      #     suites (TPC-H/TPC-DS over pgwire, ANN recall ratchets).
+      #     suites (TPC-H/TPC-DS over pgwire, ANN recall ratchets incl. the
+      #     SIFT PAX N=10k ratchet in this file), and the specialised suites
+      #     above run UNCONDITIONALLY (`medium_tier` bypasses their path filter).
       #   * qa -> main = FULL (`extensive`): MEDIUM + docker-build, coverage,
       #     python multi-version, cross integration-test, benchmarks, CodeQL.
       #     The heaviest, pre-promotion gate.
@@ -118,7 +124,15 @@ jobs:
       network_changes: ${{ steps.filter.outputs.network_changes }}
       pgwire_accuracy_changes: ${{ steps.filter.outputs.pgwire_accuracy_changes }}
       object_store_cloud_changes: ${{ steps.filter.outputs.object_store_cloud_changes }}
-      object_store_restart_changes: ${{ steps.filter.outputs.object_store_restart_changes }}
+      object_store_restart_changes: ${{ steps.filter.outputs.object_store_restart_changes == 'true' || steps.selfdef.outputs.object_store_restart_changes == 'true' }}
+      # Specialised heavy suites path-scoped on feat->develop (unconditional at
+      # develop->qa via `medium_tier`). Each is true when its path filter
+      # matches OR the PR edits that suite's own CI definition (`selfdef` step:
+      # its job block, the filter/outputs it reads, the workflow header) —
+      # the precise form of "a gate must see a change to itself". TD-CITIER-1.
+      mlflow_changes: ${{ steps.filter.outputs.mlflow_changes == 'true' || steps.selfdef.outputs.mlflow_changes == 'true' }}
+      openapi_code_changes: ${{ steps.filter.outputs.openapi_code_changes == 'true' || steps.selfdef.outputs.openapi_code_changes == 'true' }}
+      enterprise_catalogs_changes: ${{ steps.filter.outputs.enterprise_catalogs_changes == 'true' || steps.selfdef.outputs.enterprise_catalogs_changes == 'true' }}
       # SDK change detection
       go_sdk: ${{ steps.filter.outputs.go_sdk }}
       nodejs_sdk: ${{ steps.filter.outputs.nodejs_sdk }}
@@ -334,24 +348,139 @@ jobs:
             # is scripts/run_cloud_emulator_tests.sh. Re-run the (cheap) emulator tier
             # tests when any of those change — catches a real-cloud-API tier regression
             # on the introducing PR instead of at develop→qa.
+            # Cargo.toml / Cargo.lock added by TD-CITIER-1: this cheap job is
+            # the feat->develop canary for a transitive object-store client-stack
+            # bump (object_store / azure / reqwest / rustls), standing in for the
+            # 66-min restart job, which no longer runs on lockfile-only changes.
             object_store_cloud_changes:
               - 'crates/storage/proximadb-object-store/**'
               - 'src/graph/cold_payload_store.rs'
               - 'scripts/run_cloud_emulator_tests.sh'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
               - '.github/workflows/ci.yml'
             # Full-server object-store RESTARTABILITY recovery (TD-OBJSTORE-5 S1,
             # ADR-063 D8 PR tier). Any change to the WAL recovery / durable-write /
             # object-store filesystem / catalog-restart path must prove a real
             # process-boundary restart recovers over Azurite before merge — the exact
             # regression class TD-OBJSTORE-1 batch 3 was.
+            #
+            # Widened 2026-10-15 (TD-CITIER-1) when this suite became path-scoped
+            # on feat->develop and unconditional at develop->qa: the filter now
+            # tracks everything the --restart scope actually exercises — server
+            # boot (apps/proximadb-server, src/database.rs), catalog recovery
+            # (catalog crate + system catalog), WAL replay + flush (all of
+            # src/storage/persistence, memtable), the SST/HELIX engines it
+            # reattaches + the TD-CACHE-7 warm-manifest test (sst/warming.rs),
+            # DrPathBuilder (trait_components), the object-store / encryption /
+            # block-format crates under it (their own Cargo.toml included, so a
+            # DIRECT dep change to them triggers it) — plus the toolchain.
+            # An edit to this job's own CI definition is caught by the
+            # `selfdef` step (not by listing all of ci.yml, which 15 of 44
+            # measured PRs touched — almost never in this job).
+            # Root Cargo.toml / Cargo.lock are DELIBERATELY absent here (they ARE
+            # in `object_store_cloud_changes` above): 14 of the 16 feat->develop
+            # runs measured for TD-CITIER-1 touched Cargo.lock (dependabot
+            # groups, the rustls wave), and putting a 66-min job on every
+            # lockfile bump would make the commonest PR class SLOWER than before.
+            # A transitive object_store / azure / reqwest / rustls bump is
+            # instead canaried on feat->develop by the 3-5 min emulator job
+            # (real tiered PUTs against Azurite/LocalStack/fake-gcs through the
+            # same client stack), and this job re-proves restart recovery
+            # UNCONDITIONALLY at develop->qa.
             object_store_restart_changes:
-              - 'src/storage/persistence/write_ahead_log/**'
-              - 'src/storage/persistence/filesystem/**'
-              - 'crates/storage/proximadb-object-store/**'
-              - 'crates/control/proximadb-catalog/**'
+              - 'src/storage/persistence/**'
+              - 'src/storage/memtable/**'
+              - 'src/storage/engines/sst/**'
+              - 'src/storage/engines/helix/**'
+              - 'src/storage/engines/factory.rs'
+              - 'src/storage/trait_components/**'
               - 'src/storage/engine.rs'
-              - 'apps/proximadb-server/tests/object_store_restart_recovery.rs'
+              - 'src/database.rs'
+              - 'src/services/system_catalog*'
+              - 'crates/storage/proximadb-object-store/**'
+              - 'crates/storage/proximadb-storage-encryption/**'
+              - 'crates/storage/proximadb-storage-filesystem-types/**'
+              - 'crates/storage/proximadb-block-format/**'
+              - 'crates/storage/proximadb-sst-engine/**'
+              - 'crates/storage/proximadb-wal-segment-header/**'
+              - 'crates/storage/proximadb-cks-objectstore/**'
+              - 'crates/control/proximadb-catalog/**'
+              - 'apps/proximadb-server/**'
               - 'scripts/run_cloud_emulator_tests.sh'
+              - 'rust-toolchain*'
+              - '.cargo/**'
+            # MLflow real-client conformance (mlflow-conformance). Path-scoped on
+            # feat->develop, unconditional at develop->qa (TD-CITIER-1). Derived
+            # from what the job builds and drives: the MLflow REST surface + the
+            # router/middleware it is mounted behind, the run store / model
+            # registry (catalog crate, src/services/mlflow_*, document storage it
+            # persists through), the server binary + its mlflow-ui feature and
+            # vendored UI, the config the job boots, the proto types the DTOs
+            # use, and the Python harness + ratchet floors. Its own CI
+            # definition is covered by the `selfdef` step, not a ci.yml glob.
+            mlflow_changes:
+              - 'src/network/rest/mlflow/**'
+              - 'src/network/rest/mod.rs'
+              - 'src/network/rest/server.rs'
+              - 'src/network/middleware/**'
+              - 'src/network/multi_server.rs'
+              - 'src/network/multiplex/**'
+              - 'src/network/shared_services.rs'
+              - 'src/services/mlflow_*'
+              - 'src/services/mod.rs'
+              - 'src/storage/document/**'
+              - 'src/catalog/**'
+              - 'src/database.rs'
+              - 'crates/control/proximadb-catalog/**'
+              - 'apps/proximadb-server/**'
+              - 'config/config.toml'
+              - 'proto/**'
+              - 'third_party/mlflow-ui/**'
+              - 'scripts/vendor_mlflow_ui.sh'
+              - 'clients/python/tests/*mlflow*'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - '.cargo/**'
+            # OpenAPI spec-from-code drift gate (openapi-spec-drift). The spec is
+            # emitted by utoipa from annotated handlers/DTOs; `git grep -l
+            # 'utoipa|ToSchema|IntoParams'` finds them ONLY under
+            # src/network/rest and crates/control/proximadb-catalog. Cargo.lock
+            # is load-bearing, not boilerplate: TD-SPECORD-1 — the spec's key
+            # order rides on serde_json/preserve_order being enabled
+            # transitively, so a dependency bump alone can drift it. Its own CI
+            # definition is covered by the `selfdef` step, not a ci.yml glob.
+            openapi_code_changes:
+              - 'src/network/rest/**'
+              - 'crates/control/proximadb-catalog/**'
+              - 'tests/openapi_spec_gen.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - '.cargo/**'
+            # Feature Matrix (enterprise-catalogs) — the only matrix leg that
+            # also SERVES tests and lints (~48 min vs ~15 for the others).
+            # Path-scoped on feat->develop, unconditional at develop->qa
+            # (TD-CITIER-1). The cfg(feature = unity-catalog|polaris-catalog|
+            # delta-lake|enterprise-catalogs) code lives in the catalog crate,
+            # src/catalog, and src/network/rest/canonical (the /api/v1 route
+            # collision class that census finding 4 found); the gated catalog
+            # REST handlers import src/security and proto types; plus the
+            # catalog integration test, manifests and toolchain. Its own CI
+            # definition is covered by the `selfdef` step, not a ci.yml glob.
+            enterprise_catalogs_changes:
+              - 'crates/control/proximadb-catalog/**'
+              - 'src/catalog/**'
+              - 'src/network/rest/**'
+              - 'src/security/**'
+              - 'proto/**'
+              - 'crates/foundation/proximadb-proto/**'
+              - 'tests/catalog*'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - '.cargo/**'
             graph_changes:
               - 'src/graph/**'
               - 'tests/*graph*'
@@ -423,6 +552,32 @@ jobs:
               - 'crates/binding/proximadb-spark-jni/**'
               - 'clients/jvm/spark-connector/**'
               - 'src/connectors/spark.rs'
+
+      # TD-CITIER-1: the four path-scoped heavy suites must still run when a PR
+      # edits THEIR OWN CI definition. Listing all of ci.yml in their filters
+      # would fire a 20-66 min job on the 34% of PRs that touch ci.yml for any
+      # reason; this compares just the text that defines each job (job block,
+      # the outputs/filters its `if:` reads, the workflow header) against the
+      # base. Fails OPEN (prints true) if the base is unreadable. PR-only: on
+      # push these jobs are gated off (test_tier) or forced on (medium_tier).
+      - name: Detect edits to the path-scoped suites' own CI definitions
+        id: selfdef
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+          base="$(git merge-base "origin/$BASE_REF" HEAD 2>/dev/null || echo "origin/$BASE_REF")"
+          # A crash must fail OPEN (run the suites), never silently skip them.
+          if ! verdicts="$(python3 scripts/ci_job_definition_changed.py --base "$base" \
+              --job object-store-restart-recovery=object_store_restart_changes \
+              --job mlflow-conformance=mlflow_changes \
+              --job openapi-spec-drift=openapi_code_changes \
+              --job feature-matrix-enterprise-catalogs=enterprise_catalogs_changes)"; then
+            echo "::warning::ci_job_definition_changed.py failed; running every path-scoped suite"
+            verdicts="$(printf '%s=true\n' object_store_restart_changes mlflow_changes openapi_code_changes enterprise_catalogs_changes)"
+          fi
+          echo "$verdicts" | tee -a "$GITHUB_OUTPUT"
 
   # NOTE (2026-07-13): the former `gpu-feature-check` (macOS) job was REMOVED.
   # It was pinned to `runs-on: macos-13` — the last free x86_64 macOS image,
@@ -641,7 +796,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60  # max 29 min over 14 runs, 2026-10-09..11
     needs: changes
-    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.openapi_spec == 'true'
+    # TD-CITIER-1: was gated on ANY rust change (~20 min on every Rust PR). The
+    # spec is emitted only from utoipa-annotated code (see the
+    # `openapi_code_changes` filter), so feat->develop runs it when that code,
+    # the committed spec, or a dependency (TD-SPECORD-1) changes; `sweep`
+    # (every push to a protected branch) and `medium_tier` (develop->qa,
+    # qa->main) still run it unconditionally.
+    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.medium_tier == 'true' || needs.changes.outputs.openapi_code_changes == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -1026,7 +1187,8 @@ jobs:
           - { label: "cloud-full+onnx",     pkg: proximadb-server, args: "--features cloud-full,onnx" }
           # Other gated surfaces invisible to default CI:
           - { label: "cluster",             pkg: proximadb,        args: "--features cluster" }
-          - { label: "enterprise-catalogs", pkg: proximadb,        args: "--features enterprise-catalogs" }
+          # enterprise-catalogs moved to its own path-scoped job
+          # (feature-matrix-enterprise-catalogs, same check name) — TD-CITIER-1.
           # Ledger modality durable backend (S2, ADR-071) — the WAL-backed impl is behind the
           # non-default `durable` feature, so it is invisible to the default workspace check.
           - { label: "ledger-durable",      pkg: proximadb-ledger, args: "--features durable" }
@@ -1091,13 +1253,63 @@ jobs:
             cargo check -p "$pkg" --tests ${{ matrix.args }}
             echo "::endgroup::"
           done
+      # Same compile-is-not-verification rule as the enterprise-catalogs job
+      # (feature-matrix-enterprise-catalogs, below): the bert-tokenizer leg serves the feature's tests, not just compiles them.
+      - name: serve bert-tokenizer tests (compile is not verification)
+        if: matrix.label == 'bert-tokenizer'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: |
+          if cargo nextest --version >/dev/null 2>&1; then
+            cargo nextest run -p proximadb-rank-onnx --features bert-tokenizer
+          else
+            cargo test -p proximadb-rank-onnx --features bert-tokenizer
+          fi
+
+  # Feature Matrix (enterprise-catalogs) — split out of the `feature-matrix`
+  # matrix (TD-CITIER-1) because it is the only leg that also SERVES tests and
+  # lints: measured 47 min median (50 max) over 16 feat->develop runs vs ~15 min
+  # for every other leg, i.e. it alone set the feature-matrix wall clock and sat
+  # second on the run's critical path. A matrix leg cannot carry its own job-level
+  # `if:`, hence a separate job. Its `name:` is IDENTICAL to the old leg's check
+  # name, so dashboards/history keep continuity (branch protection requires only
+  # `CI Success`). Same cache key (prefix `v1-feature-matrix`, shared-key
+  # `enterprise-catalogs`) so existing caches stay warm.
+  # Tiering: feat->develop runs it only when `enterprise_catalogs_changes`
+  # matches (the cfg-gated code + what it imports + manifests + this file);
+  # develop->qa and qa->main (`medium_tier`) run it unconditionally.
+  feature-matrix-enterprise-catalogs:
+    name: Feature Matrix (enterprise-catalogs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110  # max 50 min over 16 runs, 2026-10-13..15 (as a matrix leg)
+    needs: changes
+    # No `rust` guard: every `enterprise_catalogs_changes` glob is inside the
+    # `rust` filter already, and at develop->qa it runs unconditionally.
+    if: |
+      needs.changes.outputs.test_tier == 'true' &&
+      (needs.changes.outputs.medium_tier == 'true' ||
+       needs.changes.outputs.enterprise_catalogs_changes == 'true')
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler g++
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-feature-matrix"
+          shared-key: "enterprise-catalogs"
+      - name: cargo check -p proximadb --tests --features enterprise-catalogs
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: cargo check -p proximadb --tests --features enterprise-catalogs
       # TD-V1SUNSET-1 census finding 4: this lane COMPILES enterprise-catalogs
       # but never SERVED it — the /api/v1 path collision survived a green lane.
       # Run the (small, filtered) feature-gated catalog tests so the surface's
       # serving contract is verified where it is built. Nextest when present
       # (install-fast-tools convention), libtest fallback otherwise.
       - name: serve enterprise-catalog tests (compile is not verification)
-        if: matrix.label == 'enterprise-catalogs'
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
         run: |
@@ -1112,22 +1324,9 @@ jobs:
       # debt class cannot regrow unseen. lib-only, same as the main clippy job
       # (CI memory limits).
       - name: clippy enterprise-catalogs (feature code is not lint-blind)
-        if: matrix.label == 'enterprise-catalogs'
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
         run: cargo clippy -p proximadb --lib --features enterprise-catalogs -- -D warnings
-      # Same compile-is-not-verification rule as enterprise-catalogs above: the
-      # bert-tokenizer leg serves the feature's tests, not just compiles them.
-      - name: serve bert-tokenizer tests (compile is not verification)
-        if: matrix.label == 'bert-tokenizer'
-        env:
-          CARGO_PROFILE_DEV_DEBUG: 0
-        run: |
-          if cargo nextest --version >/dev/null 2>&1; then
-            cargo nextest run -p proximadb-rank-onnx --features bert-tokenizer
-          else
-            cargo test -p proximadb-rank-onnx --features bert-tokenizer
-          fi
 
   rust-security:
     name: Security Audit
@@ -1794,7 +1993,18 @@ jobs:
     # CARGO_BUILD_JOBS=1). An earlier note here said ~30-45; that understated it.
     timeout-minutes: 120
     # was 90; step spans reach 51-70 min
-    needs: [changes, rust-build]
+    # TD-CITIER-1: NO `rust-build` in needs. That edge serialized this job (the
+    # run's critical path) behind `Rust Build (dev)` (~21 min median) for no
+    # artifact: nothing here downloads one, and the only coupling was the shared
+    # rust-cache key (prefix v1-rust-nightly-dev / shared-key build), which is
+    # NOT reliably rust-build's output — rust-cache saves a key once, first
+    # writer wins, and on run 38752730686 rust-build's save failed ("Unable to
+    # reserve cache ... another job may be creating this cache") because
+    # `mlflow-conformance` (needs only `changes`) saved that key first; this job
+    # then restored mlflow's cache and still compiled 322 crates (42m15s). The
+    # compile is ~42-45 min whichever job wrote the cache (16/16 runs), so the
+    # edge only added its ~21 min wait to every feat->develop run's wall clock.
+    needs: [changes]
     if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true' && !inputs.skip_tests
     # NO sccache here (reverted from #920): with RUSTC_WRAPPER=sccache this job's
     # root-crate test-binary compile OOM-killed the 16GB runner 3/3 times on
@@ -2069,10 +2279,14 @@ jobs:
     # was 150 against a measured 129-min step span (1.16x) -- a TIGHTER ratio
     # than the 45-vs-43 docker-build case this PR exists to fix.
     needs: [changes]
+    # TD-CITIER-1: path-scoped on feat->develop (widened filter), and
+    # UNCONDITIONAL at develop->qa / qa->main (`medium_tier`) so no promotion
+    # can skip the process-boundary restart proof.
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
-      needs.changes.outputs.object_store_restart_changes == 'true'
+      (needs.changes.outputs.medium_tier == 'true' ||
+       needs.changes.outputs.object_store_restart_changes == 'true')
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
@@ -2199,10 +2413,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     needs: changes
+    # TD-CITIER-1: was any rust OR python change (~17-29 min on nearly every
+    # PR). Now path-scoped on feat->develop to what the job builds and drives
+    # (`mlflow_changes`), and UNCONDITIONAL at develop->qa / qa->main.
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
-      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true')
+      (needs.changes.outputs.medium_tier == 'true' ||
+       needs.changes.outputs.mlflow_changes == 'true')
     env:
       PROXIMADB_MLFLOW_COMPAT_ENABLE: "1"
     steps:
@@ -3229,11 +3447,13 @@ jobs:
           fi
 
   # ============================================================================
-  # SIFT PAX CASCADE RECALL RATCHET (feat→develop tier)
-  # Catches flush/cascade/segment regressions BEFORE they reach develop — the
-  # gap that let TD-FLUSH-4 (zero .pax files) land undetected. Path-filtered
-  # (only fires on search/WAL/PAX changes), N=10k (fast), floor 0.85.
-  # The qa-gate runs the full N=100k version; this is the early-warning tripwire.
+  # SIFT PAX CASCADE RECALL RATCHET (develop→qa tier since TD-CITIER-1)
+  # Catches flush/cascade/segment regressions — the gap that let TD-FLUSH-4
+  # (zero .pax files) land undetected. N=10k (fast), floor 0.85. The qa-gate
+  # runs the full N=100k version. Recall ratchets are MEDIUM-tier per mandate
+  # #9; on feat→develop the per-PR recall signal stays in the query
+  # integration lane (vector_ann_recall_e2e, path-filtered on src/query,
+  # WAL, memtable and src/services).
   # ============================================================================
   sift-recall-ratchet:
     name: SIFT PAX recall ratchet (N=10k)
@@ -3247,16 +3467,18 @@ jobs:
     # of the measured 38-min step span).
     timeout-minutes: 60
     # was 45 against a measured 38-min step span
-    # only run when search/flush/WAL/PAX/cascade code changes
-    # core_changes is required, not decorative: nprobe_multiplier/min/max and the
-    # coarse-probe gates live in src/core/config.rs, which matches core_changes
-    # and NOT storage_changes. Without it, a PR that lowers the probe count --
-    # the single most direct way to trade recall for GETs -- ran no recall
-    # ratchet at all.
+    # TD-CITIER-1 (2026-10-15): MOVED from feat->develop to develop->qa+. This is
+    # an ANN-recall conformance ratchet, which mandate #9 places at develop->qa
+    # (MEDIUM), not feat->develop (LIGHT + Rust-correctness). It ran on ~13/16
+    # recent feat->develop PRs (storage_changes || core_changes filters) at 32
+    # min median. At develop->qa / qa->main it now runs UNCONDITIONALLY — no
+    # path filter, so the old lesson (a probe-count edit in src/core/config.rs
+    # matched core_changes but not storage_changes and ran no ratchet) cannot
+    # recur: every promotion is measured regardless of which paths moved. workflow_dispatch still runs it on
+    # demand for a branch that wants the early signal.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      needs.changes.outputs.storage_changes == 'true' ||
-      needs.changes.outputs.core_changes == 'true'
+      needs.changes.outputs.medium_tier == 'true'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -3318,6 +3540,7 @@ jobs:
       - rust-compile-benches
       - rust-clippy
       - feature-matrix
+      - feature-matrix-enterprise-catalogs
       - rust-security
       - rust-build
       - rust-test
@@ -3357,7 +3580,7 @@ jobs:
       # gates that encode load-bearing decisions as checks
       - docs-authority
       - risk-coverage
-      # SIFT PAX cascade recall ratchet (path-filtered — skips on non-search PRs)
+      # SIFT PAX cascade recall ratchet (develop->qa+ only — TD-CITIER-1)
       - sift-recall-ratchet
       # promotion correctness — a promotion PR must not be a stale snapshot
       - promotion-freshness
