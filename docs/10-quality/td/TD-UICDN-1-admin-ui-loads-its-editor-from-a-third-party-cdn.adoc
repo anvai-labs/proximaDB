@@ -35,5 +35,8 @@ audited by nothing. Lesson: verify against the built artifact (bundle size, embe
 `ui/` now builds with Vite 8 instead of Create React App. This closes the residual "the 101 remaining `ui/` advisories are all CRA transitives".
 
 * `npm audit` went from **101 to 2** findings, and 22 of the 24 open Dependabot alerts closed.
-* The self-host chain was re-verified on the Vite output. The guard runs unchanged in `prebuild`, and a headless-browser review confirmed Monaco loads from `/vs` with no CDN requests.
+* The self-host chain was re-verified on the Vite output:
+** The guard runs unchanged in `prebuild` and prints `OK … loader resolves /vs/loader.js`.
+** `vite preview` serves `/vs/loader.js` and `/vs/editor/editor.main.js` with 200.
+** In the #2042 adversarial review's headless-Chrome (CDP) run, Monaco mounted with 18 requests to `/vs/` and zero CDN requests (recorded in a #2042 PR comment). That run was not network-blocked, so the History limitation above still holds for a blocked-network test.
 * The two that remain are `dompurify` 3.4.15. `monaco-editor` 0.57.0 vendors its own copy, so an `overrides` pin would clear the alert without changing the shipped bytes; that is exactly the audit theatre this TD describes. Both alerts were dismissed as tolerable risk: they affect `IN_PLACE` mode only, which Monaco never uses. The fix is a `monaco-editor` release that bundles dompurify >= 3.4.16.
