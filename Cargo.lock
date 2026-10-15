@@ -7645,6 +7645,7 @@ dependencies = [
  "proximadb-query-filter",
  "proximadb-records",
  "proximadb-runtime",
+ "proximadb-search-types",
  "proximadb-tenant",
  "serde",
  "serde_json",

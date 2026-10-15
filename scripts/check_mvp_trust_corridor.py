@@ -113,6 +113,28 @@ def validate_contract(data: dict) -> list[str]:
     return errors
 
 
+# One flat character class, no nested quantifier: linear-time on any input
+# (TD-SECSCAN-1 §8). The previous `([a-zA-Z0-9_-]+(?:-[a-zA-Z0-9_-]+)+)` nested
+# two quantifiers over a class containing the `-` separator and backtracked
+# exponentially on `-`-heavy text with no archive suffix.
+_RELEASE_ASSET_RE = re.compile(
+    r"proximadb-\$\{\{ needs\.prepare\.outputs\.version \}\}-([a-zA-Z0-9_-]+)\.(?:tar\.gz|zip)"
+)
+
+
+def release_note_targets(release_notes: str) -> set[str]:
+    """Binary targets named by `proximadb-<version>-<target>.(tar.gz|zip)` assets.
+
+    Keeps the old pattern's semantics: a target has at least two `-`-joined
+    segments, i.e. a `-` strictly inside the name (not first or last char).
+    """
+    return {
+        target
+        for target in _RELEASE_ASSET_RE.findall(release_notes)
+        if "-" in target[1:-1]
+    }
+
+
 def validate_repository(data: dict) -> list[str]:
     errors: list[str] = []
     positioning = data["positioning"]
@@ -188,7 +210,7 @@ def validate_repository(data: dict) -> list[str]:
     else:
         release_notes = release_workflow[notes_start:notes_end]
         expected = set(data["release"]["binary_targets"])
-        mentioned = set(re.findall(r"proximadb-\$\{\{ needs\.prepare\.outputs\.version \}\}-([a-zA-Z0-9_-]+(?:-[a-zA-Z0-9_-]+)+)\.(?:tar\.gz|zip)", release_notes))
+        mentioned = release_note_targets(release_notes)
         if mentioned != expected:
             errors.append(
                 "generated release notes advertise targets that differ from the MVP contract: "

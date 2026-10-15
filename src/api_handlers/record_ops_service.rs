@@ -791,6 +791,10 @@ impl RecordOpsService {
         request: RichSearchRequest,
         identity: proximadb_runtime::PortIdentity<'_>,
     ) -> Result<RichSearchResponse> {
+        // Defense in depth behind the per-surface boundary checks: the one
+        // shared top_k cap (TD-SECSCAN-1 §5) also holds at the canonical
+        // search authority, so a future caller cannot bypass it.
+        proximadb_search_types::top_k_limit::check_top_k(u64::from(request.top_k))?;
         let tenant_context = self
             .collection_service
             .load_tenant_context(identity.tenant_id)?;

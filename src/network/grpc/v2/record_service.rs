@@ -1455,6 +1455,8 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             request.get_ref().top_k as usize,
             Some(prost::Message::encoded_len(request.get_ref()) as u64),
         )?;
+        // After auth: unauthenticated requests get the auth error, not the cap.
+        check_search_top_k(request.get_ref().top_k)?;
         let req = request.into_inner();
         debug!(
             "V2 gRPC: Search - collection='{}', top_k={}",
@@ -1541,6 +1543,8 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             request.get_ref().top_k as usize,
             Some(prost::Message::encoded_len(request.get_ref()) as u64),
         )?;
+        // After auth: unauthenticated requests get the auth error, not the cap.
+        check_search_top_k(request.get_ref().top_k)?;
         let req = request.into_inner();
         debug!(
             "V2 gRPC: SearchStream - collection='{}', top_k={}",
@@ -2569,6 +2573,13 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
         created_at: c.created_at,
         updated_at: c.updated_at,
     }
+}
+
+/// Reject a `top_k` above the shared server cap with `InvalidArgument`
+/// (TD-SECSCAN-1 §5) — the same limit REST and Arrow Flight enforce.
+fn check_search_top_k(top_k: u32) -> Result<(), Status> {
+    proximadb_search_types::top_k_limit::check_top_k(u64::from(top_k))
+        .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
 #[cfg(test)]

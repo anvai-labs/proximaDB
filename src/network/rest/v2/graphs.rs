@@ -150,6 +150,14 @@ pub async fn fusion_search_v2(
             "graph_id is required".to_string(),
         ));
     }
+
+    // Shared server top_k cap (TD-SECSCAN-1 §5): the fusion `limit` seeds the
+    // vector ANN leg and `max_seeds` bounds graph expansion — both derive
+    // allocations from client input.
+    proximadb_search_types::top_k_limit::check_top_k(request.limit as u64)
+        .map_err(|e| ApiError::InvalidArgument(format!("limit: {e}")))?;
+    proximadb_search_types::top_k_limit::check_top_k(request.max_seeds as u64)
+        .map_err(|e| ApiError::InvalidArgument(format!("max_seeds: {e}")))?;
     tracing::debug!(
         tenant_id = %tenant.tenant_id,
         graph_id = %graph_id,

@@ -465,7 +465,12 @@ impl ExternalCollectionService {
         }
 
         // Oversample each side so fusion has overlap to work with.
-        let pool = (k * HYBRID_POOL_FACTOR).max(k);
+        // TD-SECSCAN-1 (sec review): saturate the oversample product and keep
+        // the pool within cap * factor (k itself is capped at the boundary).
+        let pool = k.saturating_mul(HYBRID_POOL_FACTOR).max(k).min(
+            proximadb_search_types::top_k_limit::DEFAULT_MAX_TOP_K
+                .saturating_mul(HYBRID_POOL_FACTOR),
+        );
         let vector_hits = self.vector_hits(&ec, query, pool).await?;
 
         // Lazily (re)build the BM25 index when a text query is supplied and the

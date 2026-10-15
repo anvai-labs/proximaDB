@@ -760,6 +760,8 @@ jobs:
         run: python3 scripts/validate_benchmark_evidence.py
       - name: Validate MVP Trust Corridor
         run: python3 scripts/check_mvp_trust_corridor.py
+      - name: Test MVP Trust Corridor checker (TD-SECSCAN-1 ReDoS)
+        run: python3 -m unittest discover -s tests/scripts -p 'test_check_mvp_trust_corridor.py'
       - name: Test canonical MVP smoke client
         run: python3 -m unittest discover -s tests/scripts -p 'test_mvp_smoke.py'
       # Guards the touched-crate fast lane's cost invariant (see the

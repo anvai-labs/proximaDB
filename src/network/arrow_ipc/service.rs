@@ -82,6 +82,14 @@ struct BulkSearchControl {
     filters: Vec<FlightFilter>,
 }
 
+/// Reject a `top_k` above the shared server cap with `InvalidArgument`
+/// (TD-SECSCAN-1 §5) — the same limit REST and gRPC enforce. Applied to the
+/// `DoGet` `vector_search` ticket and to every `bulk_search` control frame.
+fn check_flight_top_k(top_k: u32) -> std::result::Result<(), TonicStatus> {
+    proximadb_search_types::top_k_limit::check_top_k(u64::from(top_k))
+        .map_err(|e| TonicStatus::invalid_argument(e.to_string()))
+}
+
 /// Build a control-only `FlightData` frame (no body) carrying `metadata` as
 /// app-metadata — used for per-query error frames and the bulk_search
 /// completion frame.
@@ -1660,6 +1668,7 @@ impl FlightService for ProximaFlightService {
                 auth_context.capability.as_ref(),
                 &search_ticket.collection_id,
             )?;
+            check_flight_top_k(search_ticket.top_k)?;
 
             let batches = self
                 .handle_v2_search(
@@ -3290,6 +3299,7 @@ impl ProximaFlightService {
             {
                 debug!(?control, "Received bulk_search control frame");
                 if let Some(k) = control.top_k {
+                    check_flight_top_k(k)?;
                     top_k = k;
                 }
                 include_vector = control.include_vector;

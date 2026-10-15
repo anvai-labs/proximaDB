@@ -22,5 +22,6 @@ pub mod predicate_shortfall;
 pub mod results;
 pub mod search_params;
 pub mod sql_value_filter;
+pub mod top_k_limit;
 
 pub use predicate_shortfall::PredicateShortfall;

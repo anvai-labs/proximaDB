@@ -447,21 +447,14 @@ async fn probe_eviction(client: &reqwest::Client, provider: &str) -> Result<bool
             Ok(azure_eviction_imminent(&body))
         }
         "aws" => {
-            let token = client
-                .put("http://169.254.169.254/latest/api/token")
-                .header("X-aws-ec2-metadata-token-ttl-seconds", "300")
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
-                .text()
-                .await
-                .map_err(|e| e.to_string())?;
-            let resp = client
-                .get("http://169.254.169.254/latest/meta-data/spot/instance-action")
-                .header("X-aws-ec2-metadata-token", token.trim())
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
+            // Shared IMDSv2 helper — the same session-token flow environment
+            // detection uses (TD-SECSCAN-1 §4).
+            let resp = crate::core::utils::aws_imds::aws_imdsv2_get(
+                client,
+                crate::core::utils::aws_imds::AWS_IMDS_BASE,
+                "/latest/meta-data/spot/instance-action",
+            )
+            .await?;
             Ok(resp.status().is_success())
         }
         "gcp" => {

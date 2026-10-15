@@ -84,6 +84,13 @@ impl ProximaFusionService for ProximaFusionServiceImpl {
             return Err(Status::invalid_argument("vector_collection is required"));
         }
 
+        // Shared server top_k cap (TD-SECSCAN-1 §5): same bound on the fusion
+        // result limit and the graph-expansion seed count.
+        proximadb_search_types::top_k_limit::check_top_k(u64::from(req.limit))
+            .map_err(|e| Status::invalid_argument(format!("limit: {e}")))?;
+        proximadb_search_types::top_k_limit::check_top_k(u64::from(req.max_seeds))
+            .map_err(|e| Status::invalid_argument(format!("max_seeds: {e}")))?;
+
         debug!(
             tenant_id = ?tenant_id,
             graph_id = %req.graph_id,

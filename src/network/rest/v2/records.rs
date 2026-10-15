@@ -1569,23 +1569,10 @@ pub async fn search_with_typed_filters(
             "top_k must be greater than 0".to_string(),
         ));
     }
-    // v0.2 release-readiness audit (round 2): cap top_k to a defensive
-    // upper bound so a malformed client (or a malicious one) cannot ask
-    // the server to allocate an unbounded result buffer. The cap is
-    // intentionally generous — production HNSW workloads top out far
-    // below this — but small enough that a single bad request can't
-    // exhaust memory. Operators can raise it via an env var if they
-    // need a wider window for benchmark or batch-export shapes.
-    let max_top_k: usize = std::env::var("PROXIMADB_SEARCH_MAX_TOP_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
-    if request.top_k > max_top_k {
-        return Err(ApiError::InvalidArgument(format!(
-            "top_k={} exceeds server cap {} (set PROXIMADB_SEARCH_MAX_TOP_K to override)",
-            request.top_k, max_top_k
-        )));
-    }
+    // Server top_k cap — the ONE limit shared by REST, gRPC, Arrow Flight and
+    // pgwire (TD-SECSCAN-1 §5; override via PROXIMADB_SEARCH_MAX_TOP_K).
+    proximadb_search_types::top_k_limit::check_top_k(request.top_k as u64)
+        .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
 
     // Validate filters if provided
     if let Some(ref filters) = request.filters {
