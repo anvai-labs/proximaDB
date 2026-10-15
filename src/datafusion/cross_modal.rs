@@ -252,6 +252,9 @@ impl TableFunctionImpl for VectorSearchTableFunction {
         let top_k = u32::try_from(top_k).map_err(|_| {
             DataFusionError::Plan("vector_search: top_k exceeds the supported u32 range".into())
         })?;
+        // Shared server top_k cap (TD-SECSCAN-1 §5).
+        proximadb_search_types::top_k_limit::check_top_k(u64::from(top_k))
+            .map_err(|e| DataFusionError::Plan(format!("vector_search: {e}")))?;
         Ok(Arc::new(VectorSearchTableProvider::new(
             self.vector_ops.clone(),
             VectorSearchExpr {

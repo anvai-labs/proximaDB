@@ -1447,6 +1447,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         &self,
         request: Request<TypedSearchRequest>,
     ) -> Result<Response<TypedSearchResponse>, Status> {
+        check_search_top_k(request.get_ref().top_k)?;
         let identity = grpc_auth::port_identity(&request)?;
         grpc_auth::enforce_data_plane_request(
             &request,
@@ -1533,6 +1534,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         &self,
         request: Request<TypedSearchRequest>,
     ) -> Result<Response<Self::SearchStreamStream>, Status> {
+        check_search_top_k(request.get_ref().top_k)?;
         let identity = grpc_auth::port_identity(&request)?;
         grpc_auth::enforce_data_plane_request(
             &request,
@@ -2569,6 +2571,13 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
         created_at: c.created_at,
         updated_at: c.updated_at,
     }
+}
+
+/// Reject a `top_k` above the shared server cap with `InvalidArgument`
+/// (TD-SECSCAN-1 §5) — the same limit REST and Arrow Flight enforce.
+fn check_search_top_k(top_k: u32) -> Result<(), Status> {
+    proximadb_search_types::top_k_limit::check_top_k(u64::from(top_k))
+        .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
 #[cfg(test)]

@@ -29,6 +29,7 @@
 //! 4. Run tests to ensure functionality is preserved
 //! 5. Remove the old duplicate implementation
 
+pub mod aws_imds;
 pub mod metadata_conversions;
 pub mod validation;
 pub mod vector_ops;

@@ -358,6 +358,9 @@ pub async fn search_entities_v2(
     Extension(tenant): Extension<TenantContext>,
     Json(request): Json<SearchEntitiesRequest>,
 ) -> ApiResult<Json<SearchEntitiesResponse>> {
+    // Shared server top_k cap (TD-SECSCAN-1 §5).
+    proximadb_search_types::top_k_limit::check_top_k(u64::from(request.top_k))
+        .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
     let query_vector = if request.query_vector.is_empty() {
         None
     } else {

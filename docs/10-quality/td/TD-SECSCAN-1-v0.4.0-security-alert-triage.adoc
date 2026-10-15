@@ -6,9 +6,9 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: triage complete (5 criticals dismissed with evidence, #1981) and the `path-injection` host-path read closed (#1992); open: unbounded `top_k` allocation (§5), external-collection tenant isolation (§6, TD-AUTHZ-1 L3.4), IMDSv1 call site (§4), ReDoS regex (§8), and the process recommendations.**
+| Status | **Partial: triage complete (5 criticals dismissed with evidence, #1981); `path-injection` host-path read closed (#1992); unbounded `top_k` allocation (§5), IMDSv1 call site (§4) and ReDoS regex (§8) CLOSED 2026-10-15 (`fix/secscan1-topk-clamp`). Open: external-collection tenant isolation (§6, TD-AUTHZ-1 L3.4) and process recommendations 4–5.**
 | Severity | High — `rust/uncontrolled-allocation-size` is an unbounded `top_k` allocation on every non-REST search surface; the `path-injection` residual is a tenant-isolation (not host-path) gap
-| Component | `crates/foundation/proximadb-search-types/src/bounded_queue.rs`, `src/services/external_collection/source_reader.rs`, `src/deployment/discovery/environment_detector.rs`, `.github/workflows/codeql.yml`
+| Component | `crates/foundation/proximadb-search-types/src/{bounded_queue,top_k_limit}.rs`, `src/core/utils/aws_imds.rs`, `src/services/external_collection/source_reader.rs`, `src/deployment/discovery/environment_detector.rs`, `.github/workflows/codeql.yml`
 | Relates to | link:TD-AUTHZ-1-adr090-program-tracker.adoc[TD-AUTHZ-1] (overlap: L3.4 per-tenant location policy is canonical there)
 | Pillar | SECURITY / CORRECTNESS
 | Scanned refs | `refs/pull/1970/merge` (the v0.4.0 qa→main promotion) and `refs/heads/main`
@@ -124,7 +124,30 @@ client.get("http://169.254.169.254/latest/meta-data/instance-id").send()
 
 IMDSv1 is the SSRF-reachable variant AWS recommends disabling. This is a
 low-severity hardening item (it reads only `instance-id`, for environment
-detection), but the two call sites should agree. **Open.**
+detection), but the two call sites should agree. **CLOSED 2026-10-15** (see status below).
+
+==== Status: CLOSED (2026-10-15)
+
+Both call sites now go through ONE helper,
+`src/core/utils/aws_imds.rs::aws_imdsv2_get` (PUT `/latest/api/token`, then
+the GET carrying `X-aws-ec2-metadata-token`; a failed or non-2xx token request
+is an error and never falls back to a token-less GET). Environment detection
+calls it via `environment_detector::aws_imds_reachable(client, base)` (the base
+URL is a parameter so it is testable); the spot-eviction watch in `warming.rs`
+replaced its inline copy with the same helper. Besides the SSRF point, the v1
+probe was also functionally wrong: an instance with `HttpTokens=required`
+answers a token-less GET with 401, so a hardened EC2 host was detected as
+"not AWS".
+
+Evidence — `tests/aws_imds_v2_test.rs`, against an httpmock IMDS stand-in that
+refuses token-less GETs with 401:
+
+* before (seam extracted, v1 GET unchanged): both tests FAILED —
+  `aws_detection_uses_imdsv2_session_token`: "detector issued a token-less
+  IMDSv1 GET"; `aws_detection_never_falls_back_to_imdsv1`: "fell back to a
+  token-less GET";
+* after: both pass (token PUT hit once, token-bearing GET hit once, token-less
+  GET hit zero times; a refused token request reports "not reachable").
 
 
 === §5 `rust/uncontrolled-allocation-size` — the real hit
@@ -169,13 +192,52 @@ likewise uncapped. A Flight client sending `top_k = u32::MAX` requests a
 ~4.3e9-element heap allocation — tens to hundreds of GB — aborting the server
 process.
 
-The defence is in the wrong place: it is a per-handler check in one REST handler
-instead of a clamp at the shared sink. **Open. This is the highest-value fix in
-this TD and it is small**: clamp inside `TopKHeap::with_capacity` (e.g.
+The defence was in the wrong place: it was a per-handler check in one REST handler
+instead of a clamp at the shared sink. **Was open (CLOSED 2026-10-15, status
+below). This is the highest-value fix in this TD and it is small**: clamp inside `TopKHeap::with_capacity` (e.g.
 `BinaryHeap::with_capacity(k.min(CAP))`, growing on demand), which fixes every
 surface at once, and additionally reject over-cap `top_k` at the Flight and gRPC
 boundaries so clients get an error rather than a truncated result.
 
+
+==== Status: CLOSED (2026-10-15)
+
+One limit, one helper, two layers — no third constant:
+
+1. **Shared cap.** `proximadb_search_types::top_k_limit` now owns
+   `PROXIMADB_SEARCH_MAX_TOP_K` (default `DEFAULT_MAX_TOP_K = 10_000`) and
+   `check_top_k(u64) -> Result<(), TopKLimitExceeded>`. The REST v2 inline
+   env read was replaced by it, and every other search surface calls it at its
+   boundary with an explicit invalid-argument error: REST v2 entity search,
+   gRPC v2 `Search` / `SearchStream` / `SearchEntities`, Arrow Flight `DoGet`
+   `vector_search` tickets and every `bulk_search` DoExchange control frame,
+   pgwire `vector_search(...)` UDTF and pgvector `ORDER BY … LIMIT n`. The
+   canonical search authority (`RecordOpsService::handle_record_search_for_tenant`)
+   re-checks it as defense in depth. A malformed or zero override now falls
+   back to the default instead of disabling (or zeroing) the cap.
+2. **Shared sink.** `TopKHeap::with_capacity(k)` and
+   `BoundedPriorityQueue::new(k)` keep `k` as the logical capacity but
+   pre-allocate only `top_k_limit::bounded_prealloc(k)` (≤ 10,000) and grow on
+   demand, so no caller — including internal ones that bypass the boundaries —
+   can turn a request field into an eager multi-GB reservation. Results are
+   never truncated by this layer.
+
+Evidence:
+
+* `tests/search_top_k_cap_e2e.rs` (one in-process server, real REST / gRPC /
+  Flight clients, `top_k = 1_000_000` — far over the cap but harmless to serve
+  on an unfixed build, so the test fails on the defect instead of crashing the
+  host). Before: FAILED with
+  `Flight DoGet: accepted top_k=1000000 (1 batches)`,
+  `gRPC Search: accepted top_k=1000000 (3 results)`,
+  `gRPC SearchStream: accepted top_k=1000000 (stream opened)` (REST already
+  rejected). After: every surface returns `InvalidArgument` / HTTP 400, and
+  `top_k = 10_000` (exactly at the cap) is still served on REST, Flight `DoGet`,
+  Flight `bulk_search` and gRPC. (The `bulk_search` case was added with the
+  fix; pre-fix it served the request like `DoGet`.)
+* `bounded_queue` unit tests: before, `TopKHeap::with_capacity(1_000_000)` and
+  `BoundedPriorityQueue::new(1_000_000)` reserved 1,000,000 slots; after ≤
+  10,000 while `capacity()` stays 1,000,000 and 20,000 pushes are all kept.
 
 === §6 `rust/path-injection`
 
@@ -228,6 +290,19 @@ outstanding until that lands.
 controlled, not shipped, worst case a hung CI job on a self-inflicted edit.
 Low-priority hygiene; the regex should be rewritten anyway.
 
+==== Status: CLOSED (2026-10-15)
+
+Rewritten as one flat class, `([a-zA-Z0-9_-]+)\.(?:tar\.gz|zip)` behind the
+fixed `proximadb-${{ needs.prepare.outputs.version }}-` prefix, plus a
+post-filter that keeps the old pattern's semantics (a `-` strictly inside the
+name, i.e. ≥ 2 segments) — `release_note_targets()` in
+`scripts/check_mvp_trust_corridor.py`. Measured on the old regex with
+`a-a-…-a!` input: 20 segments 0.09 s, 22 → 0.28 s, 24 → 1.8 s (≈ ×2.5 per
+segment). `tests/scripts/test_check_mvp_trust_corridor.py` pins the semantics
+(multi-segment targets, edge-dash rejection, the live repo check stays green)
+and a 40-segment hostile input finishing within 5 s (it now takes
+milliseconds); it runs in CI next to the corridor check.
+
 
 == Process finding: CodeQL's signal-to-noise is why this went unread
 
@@ -239,7 +314,7 @@ through a release promotion.
 Recommended, in priority order:
 
 1. **Fix the two real classes** — clamp `TopKHeap::with_capacity` and cap
-   `top_k` at the Flight/gRPC boundaries (§5); confine
+   `top_k` at the Flight/gRPC boundaries (§5, DONE 2026-10-15); confine
    `external_collection` `location` under `DrPathBuilder` + `TenantContext`
    (§6).
 2. **Do not reach for a `paths-ignore` fix — it does not work here.** The
@@ -263,7 +338,7 @@ Recommended, in priority order:
    on new refs — which is why the same five benign criticals reappeared on
    `refs/pull/1970/merge`. Revisit if CodeQL's Rust extractor gains a
    `cfg(test)`-aware exclusion.
-3. **Fix the IMDSv1 call site** (§4) and the ReDoS regex (§8).
+3. **Fix the IMDSv1 call site** (§4) and the ReDoS regex (§8). DONE 2026-10-15.
 4. **Decide whether CodeQL stays non-blocking.** It need not gate `CI Success`,
    but "5 critical alerts on the promotion PR" should at minimum be a
    promotion-checklist read rather than something nobody is required to look at.

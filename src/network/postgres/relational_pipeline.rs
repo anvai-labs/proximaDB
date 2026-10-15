@@ -185,6 +185,9 @@ fn lower_pgvector_select(sql: &str) -> Result<Option<PgVectorSelectPlan>, String
     };
     let top_k = u32::try_from(top_k)
         .map_err(|_| "pgvector LIMIT exceeds the supported u32 result cardinality".to_string())?;
+    // Shared server top_k cap (TD-SECSCAN-1 §5).
+    proximadb_search_types::top_k_limit::check_top_k(u64::from(top_k))
+        .map_err(|e| format!("pgvector LIMIT: {e}"))?;
 
     let filter = select
         .selection
