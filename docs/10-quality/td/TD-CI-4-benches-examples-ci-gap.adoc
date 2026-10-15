@@ -3,7 +3,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Resolved (2026-10-15).** The examples-compile coverage was restored by adding `--examples` to the existing `rust-compile-benches` job (develop→qa), and `examples/**` was restored to the Rust path filter. On the same date `cargo check --workspace --benches --examples` was clean (exit 0) on develop `9dc2b033c`.
+| Status | **Resolved (2026-10-15).** The examples-compile coverage was restored by adding `--examples` to the existing `rust-compile-benches` job (develop→qa), and `examples/**` was restored to the `compile` path filter, which gates that job. On the same date `cargo check --workspace --benches --examples` was clean (exit 0) on develop `9dc2b033c`.
 | Regression history | The original fix added a per-PR `rust-compile-benches-examples` job. Commit `a5d4833e6` (2026-09-02) silently removed it and the `examples/**` filter line while recovering lost merges after a force-push rewind. That commit's message says the opposite: "TD-CI-4 also excluded (already on develop via #1725's surviving ancestry)". **Lesson:** a recovery re-land must diff the result against the pre-rewind tree, not trust its own exclusion list.
 | Tier choice | develop→qa, not per-PR. Examples rot slowly and are not shipped, and TD-CITIER-1 is removing long poles from feat→develop. One job covers both target kinds without an extra runner.
 |===
@@ -52,7 +52,7 @@ rust-compile-benches:
 * **Delayed discovery** — breakage surfaces only at develop→qa promotion (late cycle)
 * **Developer friction** — developers must manually run `cargo check --benches --examples` before PR (easy to forget)
 
-== Proposed Solution: Option A (RECOMMENDED)
+== Proposed Solution: Option A (original proposal; superseded by the develop→qa restore, see Status)
 
 Add a PR-time CI job that compiles benches+examples with **constrained parallelism**:
 
@@ -119,16 +119,16 @@ previously skipped every Rust job).
 == Exit Criteria
 
 1. ✅ **Decision:** Option A — PR-time job, same shape as the benches sibling
-2. ❌ **Implement** — job wired into `ci-success` + `examples/**` path filter (landed #1725, lost in `a5d4833e6`; re-apply)
+2. ✅ **Implement** — landed #1725, lost in `a5d4833e6`; restored 2026-10-15 as `--examples` on the develop→qa `rust-compile-benches` job + `examples/**` in the `compile` filter (#2044)
 
 == Status
 
-**OPEN (regressed) — corrected 2026-10-15.** The job was implemented in #1725 (2026-09-01), wired into the `ci-success` aggregator and the `compile` path filter (adversarial-review fixes 2026-09-01). It was then **silently removed on 2026-09-02** by the recovery commit `a5d4833e6` ("re-land #1724 + #1721"). That commit restored `ci.yml` from an orphaned pre-#1725 merge tree and deleted the `rust-compile-benches-examples` job, its `ci-success` `needs` entry and the `'examples/**'` path-filter line. Its message says "TD-CI-4 also excluded (already on develop via #1725's surviving ancestry)", which is the reverse of what its diff does. As of 2026-10-15, `ci.yml` has no `--examples` step and no `examples/**` filter, and benches still compile only on `medium_tier`. The Problem Statement below is accurate again. The fix is to re-apply the Option A job as specified.
+**Resolved 2026-10-15 (#2044).** History: implemented in #1725 (2026-09-01) as a per-PR job; silently removed on 2026-09-02 by the recovery commit `a5d4833e6`, whose message claimed the reverse. Restored not as the per-PR Option A job above but as `--examples` on the existing develop→qa `rust-compile-benches` job, with `examples/**` back in the `compile` filter: examples are not shipped and rot slowly, and TD-CITIER-1 is shortening the feat→develop path. Option A below is kept as the original proposal.
 
 == Next Steps
 
 1. ✅ Choose solution — Option A (PR-time job)
-2. ❌ Implement — `rust-compile-benches-examples` job in `.github/workflows/ci.yml` (lost in `a5d4833e6`; re-apply)
+2. ✅ Implemented (restored 2026-10-15, #2044; see Status)
 3. ✅ Adversarial review pass — aggregator wiring, path filter, evidence correction
 
 == Related

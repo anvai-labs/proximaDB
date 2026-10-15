@@ -9,7 +9,7 @@
 | Severity | Low (dev/maintainability) — the criterion benches are NOT the release benchmark surface (that is the `proximadb-bench` binary, built by `release.yml` and covered by the `--lib --bins` clippy gate). Only `bench_21_query_cache` is exercised in CI.
 | Component | `benches/*` (criterion micro-benchmarks); CI compile scope (`ci.yml`).
 | Tracked-by | develop->qa promotion 2026-07-14.
-| Relates to | link:TD-CI-4-benches-examples-ci-gap.adoc[TD-CI-4] (overlap: bench compile gating; the PR-time benches+examples job lives there, currently regressed)
+| Relates to | link:TD-CI-4-benches-examples-ci-gap.adoc[TD-CI-4] (overlap: bench compile gating; benches+examples now compile together on develop→qa, restored 2026-10-15)
 | Pillar | QUALITY (test/CI hygiene), DX
 |===
 

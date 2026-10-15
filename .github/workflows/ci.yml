@@ -182,7 +182,6 @@ jobs:
               - 'build.rs'
               - 'tests/**'
               - 'benches/**'
-              - 'examples/**'
               # Toolchain pin + cargo config (rustflags) change lint/test outcomes
               # workspace-wide, so a bump must re-run the Rust suite.
               - 'rust-toolchain*'
@@ -209,6 +208,10 @@ jobs:
               - 'apps/**'
               - 'tests/**'
               - 'benches/**'
+              # TD-CI-4: the line a5d4833e6 deleted lived HERE (the compile
+              # filter gates rust-compile-benches, the only job that compiles
+              # examples), not in `rust:`.
+              - 'examples/**'
               - 'build.rs'
               - 'Cargo.toml'
               - 'Cargo.lock'
