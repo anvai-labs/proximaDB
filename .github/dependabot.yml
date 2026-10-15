@@ -108,10 +108,10 @@ updates:
       #   TS 4.9 -> 22.9.3     TS 5.1 -> 24.1.0     TS 5.7+ -> 26.6.5
       #
       # That is why PR #1908 (16.18.126 -> 26.5.1 in /ui) could not have
-      # typechecked: /ui is react-scripts 5.0.1, which holds TypeScript at 4.9.5.
-      # /ui can still reach 22.x under this rule; it cannot reach 24.x until the
-      # CRA migration lifts TypeScript past 5.1, and a proposal that tries will
-      # fail `Admin UI Install + Build` visibly rather than merge silently.
+      # typechecked: /ui was then react-scripts 5.0.1, which held TypeScript at
+      # 4.9.5. /ui is now on Vite with TypeScript 5.9, so 24.x is in reach; the
+      # typecheck runs inside `npm run build`, so a proposal past the TS floor
+      # fails `Admin UI Install + Build` visibly rather than merging silently.
       - dependency-name: "@types/node"
         versions: [">=25.0.0"]
 
