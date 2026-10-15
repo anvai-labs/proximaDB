@@ -92,6 +92,7 @@ Then merge the PR **with a merge commit**, or the next cycle repeats.
 * Ancestry guard + `main ← qa` defense in depth: `.github/workflows/qa-gate.yml`
 * Exact-head freshness gate: `.github/workflows/ci.yml`
 * Repository ruleset `promotion-merge-method` permits only merge commits on `qa` and `main`.
+* Tagging the promoted `main` commit (one `vX.Y.Z` tag for every registry): link:RELEASE_PROCEDURE.adoc[Release procedure].
 
 NOTE: `pull_request_target` loads this guard from the repository default branch. The
 trusted check becomes authoritative after this workflow reaches `main`; at that point,

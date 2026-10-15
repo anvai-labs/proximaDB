@@ -67,6 +67,11 @@ COPY = (
     ".github/workflows/tdd.yml",
     ".github/workflows/tier-config-fingerprint.yml",
     ".github/workflows/windows-compile-ratchet.yml",
+    # TD-RELTAG-1: the unified-tag check reads the gate's implementation and
+    # its manifest list. Without it the check fails "missing", so the positive
+    # control would catch an omission -- but copy it so the mutations below
+    # exercise the real list.
+    "scripts/version-sync.sh",
 )
 
 
@@ -820,6 +825,173 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         p.write_text(text + '\n          #   features: ""\n', encoding="utf-8")
         result = _run(self.tree)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class UnifiedReleaseTagGuard(unittest.TestCase):
+    """TD-RELTAG-1: one tag `vX.Y.Z` releases every registry at one version.
+
+    Each test mutates ONE clause of the contract on a copy of the real tree and
+    asserts the guard names it. The positive control is
+    `ReleaseBuildFeaturesGuard.test_passes_on_the_real_tree`.
+    """
+
+    PY = ".github/workflows/release-python.yml"
+    REL = ".github/workflows/release.yml"
+
+    def setUp(self) -> None:
+        self.tree = _tree()
+        self.addCleanup(shutil.rmtree, self.tree, ignore_errors=True)
+
+    def _edit(self, rel: str, old: str, new: str) -> None:
+        p = self.tree / rel
+        text = p.read_text(encoding="utf-8")
+        self.assertIn(old, text, f"mutation anchor vanished from {rel}")
+        p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def _fails_with(self, needle: str) -> None:
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(needle, result.stdout)
+
+    def test_catches_the_retired_python_tag_family(self) -> None:
+        """The exact pre-fix state: release-python.yml on `python-v*`."""
+        self._edit(
+            self.PY,
+            "      - 'v[0-9]+.[0-9]+.[0-9]+'\n      - 'v[0-9]+.[0-9]+.[0-9]+-*'",
+            "      - 'python-v*'",
+        )
+        self._fails_with("release tag patterns differ")
+        self._fails_with("not the unified `v<semver>` family")
+
+    def test_catches_a_pattern_added_to_only_one_workflow(self) -> None:
+        """A tag that fires release.yml but not release-python.yml skips PyPI."""
+        self._edit(
+            self.REL,
+            "      - 'v[0-9]+.[0-9]+.[0-9]+'\n",
+            "      - 'v[0-9]+.[0-9]+.[0-9]+'\n      - 'v[0-9]+.[0-9]+'\n",
+        )
+        self._fails_with("release tag patterns differ")
+
+    def test_catches_a_live_legacy_tag_condition(self) -> None:
+        """Triggers aligned but a publish job still keyed on the old ref."""
+        self._edit(self.PY, "startsWith(github.ref, 'refs/tags/v')", "startsWith(github.ref, 'refs/tags/python-v')")
+        self._fails_with("retired per-package `python-v` tag family")
+
+    def test_a_commented_legacy_mention_is_history_not_a_finding(self) -> None:
+        p = self.tree / self.PY
+        p.write_text(p.read_text(encoding="utf-8") + "\n# old: python-v0.3.0\n", encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_catches_a_missing_version_gate(self) -> None:
+        for rel in (self.PY, self.REL):
+            with self.subTest(workflow=rel):
+                self.setUp()
+                p = self.tree / rel
+                text = p.read_text(encoding="utf-8")
+                self.assertIn("version-sync.sh check-tag", text)
+                p.write_text(text.replace("version-sync.sh check-tag", "version-sync.sh check"), encoding="utf-8")
+                self._fails_with(f"{rel}: no job runs")
+
+    def test_a_commented_out_gate_does_not_count(self) -> None:
+        p = self.tree / self.PY
+        lines = p.read_text(encoding="utf-8").splitlines()
+        idx = next(i for i, l in enumerate(lines) if "version-sync.sh check-tag" in l and not l.lstrip().startswith("#"))
+        lines[idx] = lines[idx].replace("bash", "# bash", 1)
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self._fails_with(f"{self.PY}: no job runs")
+
+    def test_catches_a_build_job_that_skips_the_gate(self) -> None:
+        """build-sdk not needing version-gate would build before the check."""
+        self._edit(
+            self.PY,
+            "    name: Build SDK (proximadb)\n    needs: [version-gate]\n",
+            "    name: Build SDK (proximadb)\n",
+        )
+        self._fails_with("job `build-sdk` does not depend")
+
+    def test_transitive_dependency_on_the_gate_suffices(self) -> None:
+        """test-embedded-wheels reaches the gate via build-embedded-wheels: OK."""
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("test-embedded-wheels", result.stdout)
+
+    def test_catches_a_release_job_that_skips_prepare(self) -> None:
+        self._edit(self.REL, "    needs: [prepare, build-binaries, validate-artifacts, create-release]\n    runs-on: ubuntu-latest\n    # Same gating",
+                   "    needs: [build-binaries]\n    runs-on: ubuntu-latest\n    # Same gating")
+        # build-binaries itself needs prepare, so this is still transitively gated...
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        # ...but a job with NO needs at all is not.
+        self._edit(self.REL, "    needs: [build-binaries]\n    runs-on: ubuntu-latest\n    # Same gating",
+                   "    runs-on: ubuntu-latest\n    # Same gating")
+        self._fails_with("job `publish-npm` does not depend")
+
+    def test_catches_a_published_manifest_dropped_from_version_sync(self) -> None:
+        """npm lagged at 0.3.0 once; its manifest must stay inside the gate."""
+        for entry in (
+            "clients/nodejs-embedded/package.json:package_json",
+            "clients/rust/Cargo.toml:cargo",
+            "clients/python/pyproject.toml:pyproject",
+            "pyproject.toml:pyproject",
+        ):
+            with self.subTest(entry=entry):
+                self.setUp()
+                p = self.tree / "scripts/version-sync.sh"
+                text = p.read_text(encoding="utf-8")
+                line = f'    "{entry}"\n'
+                self.assertIn(line, text)
+                p.write_text(text.replace(line, "", 1), encoding="utf-8")
+                self._fails_with(f"no longer covers published manifest `{entry}`")
+
+    def test_catches_a_removed_check_tag_command(self) -> None:
+        self._edit("scripts/version-sync.sh", "  check-tag)\n", "  check-tagx)\n")
+        self._fails_with("no `check-tag` command")
+
+
+class VersionSyncCheckTag(unittest.TestCase):
+    """Behaviour of `version-sync.sh check-tag` against the real tree."""
+
+    def _run(self, tag: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(ROOT / "scripts/version-sync.sh"), "check-tag", tag],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _version(self) -> str:
+        out = subprocess.run(
+            ["bash", str(ROOT / "scripts/version-sync.sh"), "get"],
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+
+    def test_the_current_version_tag_passes(self) -> None:
+        v = self._version()
+        for tag in (f"v{v}", f"refs/tags/v{v}"):
+            with self.subTest(tag=tag):
+                r = self._run(tag)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_tag_that_disagrees_with_the_manifests_fails(self) -> None:
+        major, minor, patch = (int(x) for x in self._version().split("-")[0].split("."))
+        r = self._run(f"v{major}.{minor}.{patch + 1}")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Cargo.toml [package].version", r.stderr)
+
+    def test_a_prerelease_suffix_is_not_stripped(self) -> None:
+        """The old warning stripped `-rc.1` and compared the base: no longer."""
+        r = self._run(f"v{self._version()}-rc.1")
+        self.assertEqual(r.returncode, 1)
+
+    def test_the_retired_and_malformed_spellings_fail(self) -> None:
+        v = self._version()
+        for tag in (f"python-v{v}", v, f"sdk-v{v}", f"v{v}.0", "vlatest"):
+            with self.subTest(tag=tag):
+                r = self._run(tag)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("not of the form vX.Y.Z", r.stderr)
 
 
 if __name__ == "__main__":
