@@ -5951,8 +5951,8 @@ impl PostgresProtocol {
 
         // TD-PGWIRE-COPY-1: COPY is a pgwire write like INSERT — it resolves the
         // same tenant, passes the same primary-pod gate, and ingests through the
-        // tenant-context insert (tenant stamping + the ingest precision checks)
-        // instead of the unscoped `insert_batch`. Gate BEFORE CopyInResponse so
+        // tenant-scoped insert-only path (`copy_insert`) instead of the unscoped
+        // `insert_batch`. Gate BEFORE CopyInResponse so
         // a misrouted client never streams its payload to the wrong pod.
         let write_tenant = self.pgwire_resolve_write_tenant().await;
         match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table_name) {
@@ -6099,6 +6099,46 @@ impl PostgresProtocol {
         Ok(row_count)
     }
 
+    /// The one write every COPY format funnels into (TD-PGWIRE-COPY-1).
+    ///
+    /// * Tenant-scoped: records are stamped with — and must agree with — the
+    ///   connection's write tenant (an Arrow `tenant_id` column can no longer
+    ///   forge a different tenant).
+    /// * Insert-only, like INSERT and like COPY's previous `insert_batch`
+    ///   (`insert_vectors_via_wal_insert_only`): a duplicate id within the
+    ///   payload, or an id that already exists, rejects the batch instead of
+    ///   silently overwriting — re-running a `\copy` must not upsert.
+    /// * Honest completion: a rejected batch is an ERROR, never `COPY n` for
+    ///   rows that were not written.
+    async fn copy_insert(
+        &self,
+        format: &str,
+        table_name: &str,
+        records: Vec<proximadb_records::ProximaRecord>,
+        tenant_ctx: &crate::storage::tenant::context::TenantContext,
+    ) -> Result<usize> {
+        let count = records.len();
+        let result = self
+            .vector_ops
+            .insert_records_only_with_tenant_context(table_name, records, Some(tenant_ctx))
+            .await
+            .map_err(|e| anyhow::anyhow!("{format} COPY insert failed: {e}"))?;
+        if !result.success {
+            let reason = if result.errors.is_empty() {
+                "write rejected".to_string()
+            } else {
+                result.errors.join("; ")
+            };
+            let code = result
+                .error_code
+                .map(|code| format!(" [{code}]"))
+                .unwrap_or_default();
+            warn!("{format} COPY into '{table_name}' rejected{code}: {reason}");
+            anyhow::bail!("{format} COPY insert rejected{code}: {reason}");
+        }
+        Ok(count)
+    }
+
     /// Process Arrow IPC format COPY data (most efficient path)
     async fn process_arrow_copy_data(
         &mut self,
@@ -6146,23 +6186,14 @@ impl PostgresProtocol {
             count, table_name
         );
 
-        match self
-            .vector_ops
-            .insert_batch_with_tenant_context(table_name, vectors, Some(tenant_ctx))
-            .await
-        {
-            Ok(_) => {
-                info!(
-                    "Arrow COPY inserted {} vectors into '{}'",
-                    count, table_name
-                );
-                Ok(count)
-            }
-            Err(e) => {
-                warn!("Arrow COPY insert failed: {}", e);
-                Err(anyhow::anyhow!("COPY insert failed: {}", e))
-            }
-        }
+        let inserted = self
+            .copy_insert("Arrow", table_name, vectors, tenant_ctx)
+            .await?;
+        info!(
+            "Arrow COPY inserted {} vectors into '{}'",
+            inserted, table_name
+        );
+        Ok(inserted)
     }
 
     /// Process CSV format COPY data
@@ -6218,14 +6249,8 @@ impl PostgresProtocol {
             return Ok(0);
         }
 
-        match self
-            .vector_ops
-            .insert_batch_with_tenant_context(table_name, records, Some(tenant_ctx))
+        self.copy_insert("CSV", table_name, records, tenant_ctx)
             .await
-        {
-            Ok(_) => Ok(count),
-            Err(e) => Err(anyhow::anyhow!("CSV COPY insert failed: {}", e)),
-        }
     }
 
     /// Parse vector from CSV string
@@ -6288,14 +6313,8 @@ impl PostgresProtocol {
             return Ok(0);
         }
 
-        match self
-            .vector_ops
-            .insert_batch_with_tenant_context(table_name, records, Some(tenant_ctx))
+        self.copy_insert("Text", table_name, records, tenant_ctx)
             .await
-        {
-            Ok(_) => Ok(count),
-            Err(e) => Err(anyhow::anyhow!("Text COPY insert failed: {}", e)),
-        }
     }
 
     /// Process PostgreSQL binary format COPY data
@@ -6388,14 +6407,8 @@ impl PostgresProtocol {
             return Ok(0);
         }
 
-        match self
-            .vector_ops
-            .insert_batch_with_tenant_context(table_name, records, Some(tenant_ctx))
+        self.copy_insert("Binary", table_name, records, tenant_ctx)
             .await
-        {
-            Ok(_) => Ok(count),
-            Err(e) => Err(anyhow::anyhow!("Binary COPY insert failed: {}", e)),
-        }
     }
 
     /// Send a data row

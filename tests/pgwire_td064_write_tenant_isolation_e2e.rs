@@ -376,18 +376,60 @@ async fn pgwire_copy_from_stdin_ingests_vector_rows() {
         "COPY must report the two parseable vector rows (the unparseable one is skipped)"
     );
 
-    for id in ["v1", "v2"] {
-        let read = http
-            .get(format!(
-                "{rest}/api/v2/collections/{collection}/records/{id}"
-            ))
-            .send()
-            .await
-            .expect("read record");
-        assert!(
-            read.status().is_success(),
-            "COPY row {id} must be readable: {}",
-            read.text().await.unwrap_or_default()
-        );
-    }
+    let read_vector = |id: &'static str| {
+        let http = http.clone();
+        let url = format!("{rest}/api/v2/collections/{collection}/records/{id}");
+        async move {
+            let read = http.get(url).send().await.expect("read record");
+            if !read.status().is_success() {
+                return None;
+            }
+            let body: serde_json::Value = read.json().await.expect("record json");
+            Some(body["vector"].clone())
+        }
+    };
+    let original = read_vector("v1")
+        .await
+        .expect("COPY row v1 must be readable");
+    assert!(
+        read_vector("v2").await.is_some(),
+        "COPY row v2 must be readable"
+    );
+
+    // Insert-only, like INSERT: re-running a COPY that carries an existing id
+    // must be REJECTED (an error, never a false `COPY n`) and must not
+    // overwrite the stored row — an upsert path would silently replace v1.
+    let rerun = copy_csv_simple(
+        &server,
+        proximadb_tenant::DEFAULT_TENANT,
+        &collection,
+        "v1,[0.9,0.9,0.9]\n",
+    )
+    .await;
+    assert!(
+        rerun.is_err(),
+        "COPY of an existing id must be rejected, got {rerun:?}"
+    );
+    assert_eq!(
+        read_vector("v1").await,
+        Some(original),
+        "a rejected COPY must leave the existing row unchanged"
+    );
+
+    // A duplicate id WITHIN one payload rejects the whole batch.
+    let dup = copy_csv_simple(
+        &server,
+        proximadb_tenant::DEFAULT_TENANT,
+        &collection,
+        "v3,[0.1,0.1,0.1]\nv3,[0.2,0.2,0.2]\n",
+    )
+    .await;
+    assert!(
+        dup.is_err(),
+        "in-payload duplicate ids must be rejected, got {dup:?}"
+    );
+    assert!(
+        read_vector("v3").await.is_none(),
+        "a rejected batch must write none of its rows"
+    );
 }
