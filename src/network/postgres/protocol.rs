@@ -3289,23 +3289,15 @@ impl PostgresProtocol {
         Self::write_intent_overrides_from_params(&session.parameters)
     }
 
-    /// Slice 6.3: resolve the tenant identifier for the primary-pod
-    /// gate. Reads the same session-parameter convention used by
-    /// `write_intent_overrides_from_session` (operators set tenant via
-    /// `SET proximadb.write.tenant_id = '...'`). Falls back to the
-    /// empty string when no explicit tenant is configured — matches
-    /// the gRPC v2 / REST v2 / Arrow Flight behaviour of treating
-    /// "no tenant" as a distinct shard from any named tenant.
-    async fn pgwire_resolve_tenant_id(&self) -> String {
-        let session = self.session.read().await;
-        let normalized: HashMap<String, String> = session
-            .parameters
+    /// The legacy session-variable tenant (`SET proximadb.write.tenant_id`).
+    /// One canonical default across all surfaces (foundation): a bare connection
+    /// with no session var resolves to `DEFAULT_TENANT`, not `""` — the empty
+    /// string used to split pgwire reads/writes from REST's `"default"` bucket.
+    fn session_var_tenant(parameters: &HashMap<String, String>) -> String {
+        let normalized: HashMap<String, String> = parameters
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
             .collect();
-        // One canonical default across all surfaces (foundation): a bare connection
-        // with no session var resolves to `DEFAULT_TENANT`, not `""` — the empty
-        // string used to split pgwire reads/writes from REST's `"default"` bucket.
         let session_var = normalized
             .get("proximadb.write.tenant_id")
             .or_else(|| normalized.get("proximadb.write_tenant_id"))
@@ -3313,17 +3305,23 @@ impl PostgresProtocol {
         proximadb_tenant::resolve_request_tenant(session_var)
     }
 
-    /// TD-064 S1 (read-half): resolve the tenant/catalog scope used to authorize
-    /// READ/search collection resolution. Per the `catalog.schema.table` model
-    /// the connection's catalog (startup `database` name) is the tenant/account
-    /// boundary, so it takes precedence; clients that sent no database fall back
-    /// to the legacy `proximadb.write.tenant_id` session var so they keep working
-    /// until the write path is migrated onto the same catalog binding.
+    /// TD-064 + TD-PGWIRE-COPY-1: THE tenant a pgwire statement authorizes,
+    /// routes (primary-pod gate) and scopes as. Per the `catalog.schema.table`
+    /// model the connection's catalog (startup `database`) is the tenant
+    /// boundary and takes precedence; clients that sent no database fall back
+    /// to the legacy session var, then `DEFAULT_TENANT`. Pure so the precedence
+    /// is unit-testable — every pgwire read, write, gate and COPY resolves
+    /// through this one function, so they can never disagree.
+    pub(super) fn write_tenant_for_session(session: &Session) -> String {
+        session
+            .catalog_tenant()
+            .unwrap_or_else(|| Self::session_var_tenant(&session.parameters))
+    }
+
+    /// TD-064 S1 (read-half): the tenant/catalog scope used to authorize
+    /// READ/search collection resolution — see [`Self::write_tenant_for_session`].
     async fn pgwire_resolve_read_tenant(&self) -> String {
-        if let Some(catalog) = self.session.read().await.catalog_tenant() {
-            return catalog;
-        }
-        self.pgwire_resolve_tenant_id().await
+        Self::write_tenant_for_session(&*self.session.read().await)
     }
 
     /// TD-064 (write-half): resolve the tenant/catalog scope used to authorize
@@ -5394,9 +5392,13 @@ impl PostgresProtocol {
                 // target_table) pair is known; pre-execute so a
                 // misroute never touches the catalog or WAL on this
                 // pod.
-                let tenant_id = self.pgwire_resolve_tenant_id().await;
+                // TD-PGWIRE-COPY-1: gate on the SAME tenant the write executes
+                // as (startup `database` first, then the session var). Gating on
+                // the session var alone checked `default` for a `database=acme`
+                // client whose write then landed in acme's partition.
+                let write_tenant = self.pgwire_resolve_write_tenant().await;
                 let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &tenant_id, &table) {
+                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
                     PgwireGateOutcome::Allow => {}
                     PgwireGateOutcome::Misrouted { target_pod } => {
                         return self
@@ -5417,7 +5419,7 @@ impl PostgresProtocol {
                 // cross-tenant target fails closed with 42P01 (never leaking
                 // existence); the scope is then threaded into execute_scoped so
                 // the write lands in the tenant's partition.
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
+                // `write_tenant` resolved once above, before the gate.
                 let tenant_scope = (!write_tenant.is_empty()).then(|| write_tenant.clone());
                 if let Some(ref tenant) = tenant_scope
                     && !dml_service
@@ -5557,9 +5559,13 @@ impl PostgresProtocol {
         match parser.parse_dml(query) {
             Ok(Some(statement)) => {
                 // Slice 6.3: gate before DELETE — symmetric with INSERT.
-                let tenant_id = self.pgwire_resolve_tenant_id().await;
+                // TD-PGWIRE-COPY-1: gate on the SAME tenant the write executes
+                // as (startup `database` first, then the session var). Gating on
+                // the session var alone checked `default` for a `database=acme`
+                // client whose write then landed in acme's partition.
+                let write_tenant = self.pgwire_resolve_write_tenant().await;
                 let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &tenant_id, &table) {
+                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
                     PgwireGateOutcome::Allow => {}
                     PgwireGateOutcome::Misrouted { target_pod } => {
                         return self
@@ -5576,7 +5582,7 @@ impl PostgresProtocol {
                 }
 
                 // TD-064 write-half: tenant scope + cross-tenant 42P01 gate (see INSERT).
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
+                // `write_tenant` resolved once above, before the gate.
                 let tenant_scope = (!write_tenant.is_empty()).then(|| write_tenant.clone());
                 if let Some(ref tenant) = tenant_scope
                     && !dml_service
@@ -5710,9 +5716,13 @@ impl PostgresProtocol {
         match parser.parse_dml(query) {
             Ok(Some(statement)) => {
                 // Slice 6.3: gate before UPDATE — symmetric with INSERT/DELETE.
-                let tenant_id = self.pgwire_resolve_tenant_id().await;
+                // TD-PGWIRE-COPY-1: gate on the SAME tenant the write executes
+                // as (startup `database` first, then the session var). Gating on
+                // the session var alone checked `default` for a `database=acme`
+                // client whose write then landed in acme's partition.
+                let write_tenant = self.pgwire_resolve_write_tenant().await;
                 let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &tenant_id, &table) {
+                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
                     PgwireGateOutcome::Allow => {}
                     PgwireGateOutcome::Misrouted { target_pod } => {
                         return self
@@ -5729,7 +5739,7 @@ impl PostgresProtocol {
                 }
 
                 // TD-064 write-half: tenant scope + cross-tenant 42P01 gate (see INSERT).
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
+                // `write_tenant` resolved once above, before the gate.
                 let tenant_scope = (!write_tenant.is_empty()).then(|| write_tenant.clone());
                 if let Some(ref tenant) = tenant_scope
                     && !dml_service
@@ -5939,12 +5949,36 @@ impl PostgresProtocol {
         // Detect store type
         let store_type = self.detect_insert_store_type(&table_name, &upper);
 
+        // TD-PGWIRE-COPY-1: COPY is a pgwire write like INSERT — it resolves the
+        // same tenant, passes the same primary-pod gate, and ingests through the
+        // tenant-context insert (tenant stamping + the ingest precision checks)
+        // instead of the unscoped `insert_batch`. Gate BEFORE CopyInResponse so
+        // a misrouted client never streams its payload to the wrong pod.
+        let write_tenant = self.pgwire_resolve_write_tenant().await;
+        match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table_name) {
+            PgwireGateOutcome::Allow => {}
+            PgwireGateOutcome::Misrouted { target_pod } => {
+                return self
+                    .send_error(
+                        "ERROR",
+                        "57P03",
+                        &format!(
+                            "misdirected_write: COPY into table '{}' must go to pod '{}' (reconnect to that pod and retry)",
+                            table_name, target_pod
+                        ),
+                    )
+                    .await;
+            }
+        }
+        let tenant_ctx =
+            crate::storage::tenant::context::TenantContext::for_tenant_id(write_tenant.clone());
+
         // Send CopyInResponse to signal client to start sending data
         self.send_copy_in_response(&format).await?;
 
         // Receive and process COPY data
         let row_count = self
-            .receive_copy_data(&table_name, store_type, &format)
+            .receive_copy_data(&table_name, store_type, &format, &tenant_ctx)
             .await?;
 
         // Send command complete
@@ -5998,6 +6032,7 @@ impl PostgresProtocol {
         table_name: &str,
         store_type: DataModel,
         format: &CopyFormat,
+        tenant_ctx: &crate::storage::tenant::context::TenantContext,
     ) -> Result<usize> {
         let mut all_data = Vec::new();
 
@@ -6040,19 +6075,19 @@ impl PostgresProtocol {
         // Process the collected data based on format
         let row_count = match format {
             CopyFormat::Arrow => {
-                self.process_arrow_copy_data(table_name, store_type, &all_data)
+                self.process_arrow_copy_data(table_name, store_type, &all_data, tenant_ctx)
                     .await?
             }
             CopyFormat::Csv => {
-                self.process_csv_copy_data(table_name, store_type, &all_data)
+                self.process_csv_copy_data(table_name, store_type, &all_data, tenant_ctx)
                     .await?
             }
             CopyFormat::Text => {
-                self.process_text_copy_data(table_name, store_type, &all_data)
+                self.process_text_copy_data(table_name, store_type, &all_data, tenant_ctx)
                     .await?
             }
             CopyFormat::Binary => {
-                self.process_binary_copy_data(table_name, store_type, &all_data)
+                self.process_binary_copy_data(table_name, store_type, &all_data, tenant_ctx)
                     .await?
             }
         };
@@ -6070,6 +6105,7 @@ impl PostgresProtocol {
         table_name: &str,
         _store_type: DataModel,
         data: &[u8],
+        tenant_ctx: &crate::storage::tenant::context::TenantContext,
     ) -> Result<usize> {
         if data.is_empty() {
             return Ok(0);
@@ -6110,7 +6146,11 @@ impl PostgresProtocol {
             count, table_name
         );
 
-        match self.vector_ops.insert_batch(table_name, vectors).await {
+        match self
+            .vector_ops
+            .insert_batch_with_tenant_context(table_name, vectors, Some(tenant_ctx))
+            .await
+        {
             Ok(_) => {
                 info!(
                     "Arrow COPY inserted {} vectors into '{}'",
@@ -6131,6 +6171,7 @@ impl PostgresProtocol {
         table_name: &str,
         _store_type: DataModel,
         data: &[u8],
+        tenant_ctx: &crate::storage::tenant::context::TenantContext,
     ) -> Result<usize> {
         let text = String::from_utf8_lossy(data);
         let mut records = Vec::new();
@@ -6177,7 +6218,11 @@ impl PostgresProtocol {
             return Ok(0);
         }
 
-        match self.vector_ops.insert_batch(table_name, records).await {
+        match self
+            .vector_ops
+            .insert_batch_with_tenant_context(table_name, records, Some(tenant_ctx))
+            .await
+        {
             Ok(_) => Ok(count),
             Err(e) => Err(anyhow::anyhow!("CSV COPY insert failed: {}", e)),
         }
@@ -6199,6 +6244,7 @@ impl PostgresProtocol {
         table_name: &str,
         _store_type: DataModel,
         data: &[u8],
+        tenant_ctx: &crate::storage::tenant::context::TenantContext,
     ) -> Result<usize> {
         let text = String::from_utf8_lossy(data);
         let mut records = Vec::new();
@@ -6242,7 +6288,11 @@ impl PostgresProtocol {
             return Ok(0);
         }
 
-        match self.vector_ops.insert_batch(table_name, records).await {
+        match self
+            .vector_ops
+            .insert_batch_with_tenant_context(table_name, records, Some(tenant_ctx))
+            .await
+        {
             Ok(_) => Ok(count),
             Err(e) => Err(anyhow::anyhow!("Text COPY insert failed: {}", e)),
         }
@@ -6254,6 +6304,7 @@ impl PostgresProtocol {
         table_name: &str,
         _store_type: DataModel,
         data: &[u8],
+        tenant_ctx: &crate::storage::tenant::context::TenantContext,
     ) -> Result<usize> {
         if data.len() < 11 {
             return Ok(0);
@@ -6337,7 +6388,11 @@ impl PostgresProtocol {
             return Ok(0);
         }
 
-        match self.vector_ops.insert_batch(table_name, records).await {
+        match self
+            .vector_ops
+            .insert_batch_with_tenant_context(table_name, records, Some(tenant_ctx))
+            .await
+        {
             Ok(_) => Ok(count),
             Err(e) => Err(anyhow::anyhow!("Binary COPY insert failed: {}", e)),
         }

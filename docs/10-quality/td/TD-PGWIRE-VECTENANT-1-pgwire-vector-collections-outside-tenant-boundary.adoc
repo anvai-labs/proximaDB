@@ -1,0 +1,34 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGWIRE-VECTENANT-1: pgwire's vector/document/graph collections sit outside the TD-064 tenant boundary
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Needs a design decision (catalog tenant keying); not a patch.
+| Priority | **HIGH**: multi-tenant isolation gap on a GA network surface. Single-tenant deployments are unaffected.
+| Component | `src/network/postgres/protocol.rs` (`create_vector_collection` and the document/graph create paths; vector INSERT/SELECT/COPY), `src/services/operations/vectors/legacy.rs` (`validate_tenant_collection_access`), service-context wiring (`ServiceContext.tenant_manager`).
+| Relates to | TD-064 (covered relational tables only), TD-PGWIRE-COPY-1 (found alongside), TD-TENANT-1 / TD-TENANT-2, TD-PGWIRE-AUTH-1.
+| Found | 2026-10-15, evidence-bounded platform review (dimension H)
+|===
+
+== The gap (Observed)
+
+TD-064 made pgwire **relational** tables tenant-scoped. Each tenant's CREATE/INSERT/SELECT addresses its own catalog row and record partition, keyed by the startup `database`. That design did not reach pgwire's multimodal collections:
+
+* `create_vector_collection` calls `collection_port.create_collection(config, None)`. The collection is created with **no tenant owner**, whichever `database` the connection named.
+* Vector INSERT/SELECT and COPY resolve collections **by name** in one global namespace.
+* `validate_tenant_collection_access` checks tenancy only when the service holds a `TenantManager`. Production never wires one: every `TenantManager::new()` is in tests or in an isolated crate, and `ServiceContext.tenant_manager` is never set. So that check is dead code in production, on every surface that relies on it.
+
+The result: two pgwire tenants (`database=acme`, `database=globex`) see the **same** vector collection namespace. Each can read and write the other's vector collections by name.
+
+== What is unknown (must be measured before a design is chosen)
+
+* How REST v2 / gRPC v2 vector collections are isolated today. Is the catalog keyed by (tenant, name) through `collection_port.get_collection(name, Some(tenant))`, or are they global too? If they are global, this is a platform-wide multimodal gap, not a pgwire one.
+* Whether any deployment runs pgwire multi-tenant with vector collections.
+
+== Direction (to decide in an ADR, not here)
+
+. Key multimodal collections by (tenant, name) at create time on every surface, matching TD-064's relational model, and resolve by (tenant, name) on every read and write.
+. Wire a real tenant authority, or delete the dead `TenantManager` branch, so that no code path *appears* to enforce tenancy without doing so.
+. Ratchet it with a two-tenant e2e test per surface: same collection name, disjoint contents, and cross-tenant reads and writes failing closed.

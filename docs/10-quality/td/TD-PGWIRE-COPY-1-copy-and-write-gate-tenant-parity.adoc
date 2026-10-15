@@ -1,0 +1,70 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGWIRE-COPY-1: pgwire COPY bypassed the write-tenant path, and the DML primary-pod gate checked the wrong tenant
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (this filing).** COPY and the three DML gates now resolve one tenant through `PostgresProtocol::write_tenant_for_session`.
+| Priority | **MEDIUM**. Both are parity defects, not cross-tenant breaches, under today's wiring (see *Severity, measured against the code*). The wider tenancy gap they sit inside is TD-PGWIRE-VECTENANT-1.
+| Component | `src/network/postgres/protocol.rs`: `execute_copy`, `receive_copy_data` and the four `process_*_copy_data` fns; the DML gate sites in `execute_insert`/`update`/`delete_via_dml_service`; `write_tenant_for_session`.
+| Relates to | TD-064 (pgwire tenant scoping, relational), TD-PGWIRE-AUTH-1, TD-PGWIRE-VECTENANT-1 (opened alongside), cluster Slice 6.3 (primary-pod write router).
+| Found | 2026-10-15, evidence-bounded platform review (dimension H)
+|===
+
+== Defect 1: the DML primary-pod gate checked a different tenant from the one the write ran as
+
+At all three DML sites the primary-pod gate resolved the tenant via `pgwire_resolve_tenant_id()`. That function read only the legacy `proximadb.write.tenant_id` session variable and otherwise fell back to `DEFAULT_TENANT`.
+
+The write itself runs as `pgwire_resolve_write_tenant()`, which puts the startup `database` (the TD-064 catalog/tenant boundary) first. So a client connected with `database=acme` and no session variable was routed as `default` and written as `acme`. A primary-pod binding for `acme/<table>` could never misroute it, and a binding for `default/<table>` could misroute it wrongly.
+
+gRPC v2, REST v2 and Arrow Flight already gate and write with one tenant value; they were checked and are consistent.
+
+*Fix:* each DML site resolves `write_tenant` **once**, before the gate, and uses that value for both the gate and the TD-064 `tenant_scope`. Precedence is now a pure function, `PostgresProtocol::write_tenant_for_session`: startup `database`, then the session variable, then `DEFAULT_TENANT`. Every pgwire read, write, gate and COPY resolves through it, so they cannot disagree again.
+
+== Defect 2: COPY used the unscoped insert and had no gate
+
+`COPY … FROM STDIN` is pgwire's bulk ingest for **vector** collections; its rows are `id,<vector>`. All four format processors (arrow, csv, text, binary) called `VectorOperationsService::insert_batch`. Compared with the `insert_batch_with_tenant_context` that every other write surface uses, that path:
+
+* did not stamp `tenant_id` onto the ingested records (`ensure_tenant_on_records`);
+* skipped the ingest precision-schema validation (a non-Fp32 cell is rejected while precision-schema v2 is off);
+* skipped `validate_tenant_collection_access`;
+* never consulted the primary-pod gate.
+
+*Fix:* `execute_copy` resolves `write_tenant` and gates on it **before** sending `CopyInResponse`, so a misrouted client never streams its payload. It then threads one `TenantContext` through `receive_copy_data` into all four processors, which now call `insert_batch_with_tenant_context`.
+
+== Severity, measured against the code
+
+The first-pass review rated defect 2 *Critical* (a cross-tenant write). Tracing the code refuted that:
+
+* Production never wires a `TenantManager` into the service context. Every `TenantManager::new()` is in tests or in an isolated crate. So the tenant branch of `validate_tenant_collection_access` does not run in production, and the scoped and unscoped inserts resolve a collection **by name** in the same way.
+* pgwire `CREATE TABLE … VECTOR(n)` creates the collection with **no tenant owner**: `collection_port.create_collection(config, None)`.
+
+So COPY could not reach another tenant's collection any more than an INSERT could. The real exposure is wider: the whole pgwire vector/document/graph surface sits outside the TD-064 boundary. That is filed as TD-PGWIRE-VECTENANT-1, because it is a catalog-design change, not a patch to COPY.
+
+== Verification
+
+* `protocol_tests.rs`:
+** `pgwire_gate_uses_startup_database_tenant`: an `acme` binding misroutes an `acme` write, and a `default` binding does not. Before the fix, the second assertion described the actual behaviour.
+** `pgwire_gate_tenant_matches_write_scope_tenant`: the startup database takes precedence over the session variable.
+** `pgwire_gate_falls_back_to_session_var_without_database`: falls back to the variable, then to `DEFAULT_TENANT`.
+** All 8 pgwire gate tests pass.
+* `tests/pgwire_td064_write_tenant_isolation_e2e.rs::pgwire_copy_from_stdin_ingests_vector_rows` is the **first end-to-end COPY test over the wire**:
+** it uses a raw simple-protocol client, the path `psql \copy` uses;
+** it COPYs into a REST-created dim-3 collection;
+** the result is `COPY 2`, the unparseable row is skipped, and both rows are readable over REST.
+* The existing `pgwire_relational_writes_and_reads_are_tenant_isolated` still passes. Run with `RUST_MIN_STACK=8388608` to match CI's integration jobs; at the default 2 MiB debug stack the in-process server overflows (the TD-STACK-1 class).
+
+== Pre-existing COPY gaps found while testing (not fixed here)
+
+Writing the first end-to-end COPY test surfaced two defects. Both reproduce **identically on unmodified `develop`**; this was checked by running the same test against the pre-change `protocol.rs`.
+
+. **COPY over the extended protocol is unsupported.** `tokio-postgres`'s `copy_in`, and similarly JDBC's `CopyManager`, send COPY as Parse/Describe/Bind/Execute. The server routes COPY only on the simple-query path, so the client sees the connection close. Simple-protocol COPY (`psql \copy`) works.
+. **COPY into a pgwire-created table fails.** Every pgwire `CREATE TABLE` now parses through the relational DDL service; pgvector columns live in relational tables. The legacy `create_vector_collection` path is therefore unreachable from pgwire `CREATE TABLE`. COPY resolves the table's backing collection, whose placeholder dimension is 1, and errors with `dimension 3 but collection expects dimension 1`. COPY works only against vector collections created over REST or gRPC.
+
+Both mean COPY does not yet work as a relational bulk loader. They need a design decision about COPY's target model (relational row ingest versus vector-collection ingest) and belong in a follow-up TD; they are not a patch to this one.
+
+== Out of scope
+
+* The Arrow Flight graph-exchange path (`do_exchange` graph nodes/edges) does not appear to call the primary-pod gate. This is unverified.
+* Binary COPY parsing is unchanged; only its insert call was scoped.

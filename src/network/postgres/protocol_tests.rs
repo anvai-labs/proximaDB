@@ -1714,6 +1714,72 @@ fn pgwire_gate_scopes_per_tenant_collection_pair() {
     ));
 }
 
+// TD-PGWIRE-COPY-1: the gate must check the SAME tenant the write executes as.
+// Before the fix the gate read only the session var (→ `default`) while the
+// write executed as the startup `database`, so a `database=acme` client was
+// gated as `default` and written as `acme`.
+
+async fn session_with(database: &str, params: &[(&str, &str)]) -> Session {
+    let mut session = SessionManager::new()
+        .create_session("127.0.0.1:5432".parse().expect("addr"))
+        .await
+        .expect("create_session");
+    session.database = database.to_string();
+    for (key, value) in params {
+        session
+            .parameters
+            .insert((*key).to_string(), (*value).to_string());
+    }
+    session
+}
+
+#[tokio::test]
+async fn pgwire_gate_uses_startup_database_tenant() {
+    let session = session_with("acme", &[]).await;
+    let tenant = PostgresProtocol::write_tenant_for_session(&session);
+    assert_eq!(tenant, "acme");
+
+    // A binding for acme/users on another pod must misroute an acme write…
+    let registry = Arc::new(PrimaryPodRegistry::new());
+    registry.assign("acme", "users", "pod-other", AssignmentReason::Operator);
+    match check_pgwire_primary_pod_gate(&make_pgwire_gate(registry, "pod-self"), &tenant, "users") {
+        PgwireGateOutcome::Misrouted { target_pod } => assert_eq!(target_pod, "pod-other"),
+        PgwireGateOutcome::Allow => panic!("acme write must be gated on acme's binding"),
+    }
+
+    // …and a binding for the DEFAULT tenant must not (the pre-fix gate tenant).
+    let registry = Arc::new(PrimaryPodRegistry::new());
+    registry.assign(
+        proximadb_tenant::DEFAULT_TENANT,
+        "users",
+        "pod-other",
+        AssignmentReason::Operator,
+    );
+    assert!(matches!(
+        check_pgwire_primary_pod_gate(&make_pgwire_gate(registry, "pod-self"), &tenant, "users"),
+        PgwireGateOutcome::Allow
+    ));
+}
+
+#[tokio::test]
+async fn pgwire_gate_tenant_matches_write_scope_tenant() {
+    // The startup database wins over the legacy session var.
+    let session = session_with("acme", &[("proximadb.write.tenant_id", "other")]).await;
+    assert_eq!(PostgresProtocol::write_tenant_for_session(&session), "acme");
+}
+
+#[tokio::test]
+async fn pgwire_gate_falls_back_to_session_var_without_database() {
+    let session = session_with("", &[("proximadb.write.tenant_id", "t1")]).await;
+    assert_eq!(PostgresProtocol::write_tenant_for_session(&session), "t1");
+
+    let bare = session_with("  ", &[]).await;
+    assert_eq!(
+        PostgresProtocol::write_tenant_for_session(&bare),
+        proximadb_tenant::DEFAULT_TENANT
+    );
+}
+
 /// TD-REL-LOWER-1: the legacy single-table SELECT path must recognize a
 /// multi-table / derived-table FROM (which the relational pipeline declined)
 /// and reject it specifically — never misparse `customer,` / `(select` as a
