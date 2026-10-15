@@ -442,8 +442,8 @@ in the Current Matrix stay authoritative for API-level claims. `StorageEngineStr
 
 | TITAN
 | — (graph modality)
-| Graph engine (see ORION row above for the graph tier); the legacy dir under `src/storage/engines/` is not a vector storage strategy — the storage factory falls back to SST with a warning.
-| Candidate for relocation next to ORION; tracked in TD-TAXO-1.
+| Graph engine name only (see ORION row above for the graph tier); the stub engine directory was removed (#702), leaving the `Titan` enum/proto value — the storage factory falls back to SST with a warning.
+| Relocation is moot; retire the proto value with CHRONO's (TD-TAXO-1).
 
 | Hybrid (variant)
 | Planned

@@ -9,7 +9,7 @@
 | Severity | **LOW**, and deliberately not raised. The first read of this looked like "four documented install paths would deploy the 0.2.0 image at a 0.4.0 release", which would be MEDIUM and user-visible. It is not: the chart cannot render at all, so those paths deploy nothing. The real defect is an abandoned duplicate that documentation still points at.
 | Component | `deploy/infrastructure/helm/proximadb/`, `deploy/infrastructure/terraform/environments/{dev,staging,production}/helm-values.yaml`, `deploy/infrastructure/scripts/deploy-dev.sh`
 | Evidence | Measured below. The canonical chart is `deploy/helm/proximadb/`.
-| Related | The `clients/python-embedded` precedent — a deliberately unwatched file that carries an in-place comment saying why. This chart has no such note, which is why the audit kept re-finding it.
+| Related | link:TD-DEMOIMG-1-root-dockerfile-has-no-working-consumer.adoc[TD-DEMOIMG-1] (same class: a tracked deploy artifact with no working consumer). The `clients/python-embedded` precedent — a deliberately unwatched file that carries an in-place comment saying why. This chart has no such note, which is why the audit kept re-finding it.
 |===
 
 == What is wrong

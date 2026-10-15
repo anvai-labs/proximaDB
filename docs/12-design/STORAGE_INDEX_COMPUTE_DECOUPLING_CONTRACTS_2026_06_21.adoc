@@ -6,8 +6,15 @@
 Firm interface contracts for decoupling `src/storage` from `src/index` (AXIS) and
 `src/compute`, designed *before* any extraction. This is the next phase of the root-crate
 decomposition (`ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`) after the mechanical leaf
-slices (kv/optimization/strategy/tenant). Status: *Proposed* — the contracts below are the
-review artifact engine sessions align to; exact signatures/LOC are finalized against code at
+slices (kv/optimization/strategy/tenant). Status: **Partial (reconciled 2026-10-15)**. Shipped:
+`proximadb-index-types` (A3), `proximadb-distance-kernel` and `proximadb-quantization-kernel`
+(Part B, #194, #229), `src/storage/compute_bridge/`, and the ISP traits `IndexQuery`/`IndexIngest`/
+`IndexMaintenance` in `crates/foundation/proximadb-index-traits` (A1). Open: the
+`proximadb-quantized-distance` crate (not present); the A2 query-envelope decision and per-engine DIP
+adoption (15 `crate::index` storage up-edges remain); and the `IndexLifecycle` trait. Sequencing
+continues in link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D] (overlap:
+port design here, sequencing there). The contracts below are the review artifact engine sessions
+align to; exact signatures/LOC are finalized against code at
 implementation time (the figures here come from a read-only review and are design inputs,
 not gospel).
 

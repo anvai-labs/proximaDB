@@ -8,47 +8,29 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In Progress.** D1-D6 implemented locally; corrected SIFT1M verification and CI remain.
+| Status | **Partial: D1–D6 + SEARCH-3 GET-counting merged (#1325; L2 probe counters in io-trace #1368); open: the corrected SIFT1M release acceptance against the exit criteria below, and its `BENCHMARK_EVIDENCE.toml` entry.**
 | Priority | P0 — object-store GET count dominates retrieval COGS and cold latency.
-| Component | `proximadb-cache`; SST `segment_format`, `survivor_range_cache`, flush, compaction, config, metrics.
+| Component | `proximadb-cache` (`PersistentArcBytesL2`); SST `segment_format`, `survivor_range_cache`, flush, compaction, config, metrics.
 | Design | ADR-085; ADR-080; TD-SEARCH-3.
-| Evidence | Handoff baseline reports 48.5 physical GETs/query at 1M after segment consolidation. That number remains historical input, not evidence for this implementation; the acceptance run must be re-recorded.
+| Relates to | link:TD-IOTRACE-4-persistent-l2-cache-counters-not-in-trace.adoc[TD-IOTRACE-4], link:TD-CACHE-8-hot-tier-value-diverse-queries.adoc[TD-CACHE-8], TD-COMPACT-11 (ledger `compaction_local_spill_cache_3m3` measures this tier at 3.3M: 4.98 GET/query first-after-write, 1.17 after restart with disk warm, 48.69 object-cold)
 |===
 
-== Verified gaps
+== History (shipped)
 
-* The pre-existing root `NvmeBackend` is memory-only and cannot survive a
-  restart. Reusing it would make the restart acceptance test a false positive.
-* Coarse-probe metadata insertion was effectively opt-in, explaining the
-  observed zero-hit invariants run. Unset now populates immutable control bytes;
-  the old gate is a kill switch.
-* A complete SQ8 seed cannot satisfy an exact subrange key without a parent
-  lookup. Persisted parent entries now serve checksum-verified selective ranges.
-* Survivor path purge previously covered DRAM entries only. Compaction could
-  leave persistent exact/parent entries and warm-replay keys for deleted inputs.
-* Whole-collection deletion previously removed authoritative storage without
-  reclaiming immutable bytes retained in the DRAM/persistent warm tier. The
-  deletion path now purges both caches only after the collection directory was
-  removed or confirmed absent; separator-aware matching preserves similarly
-  named sibling collections.
-* Filesystem `read_ranges` was counted as one GET even though its default
-  implementation loops over N `read_range` calls. The physical meter now counts
-  N.
+D1 optional persistent L2 behind `TenantCache` (L2 hit promotes to DRAM; authoritative load writes
+through); D2 persistent control/Region-A entries behind `SegmentInvariantsCache` with default-on
+coarse metadata insertion; D3 TOML+env path/budget config (unset disables L2); D4 exact Prometheus
+hit/miss/resident families with bounded `tier` labels; D5 env-gate registry + template; D6 writer
+installs byte-identical PAX regions only after final publication (`none/invariant/all` policy);
+SEARCH-3 physical GET counting corrected (filesystem `read_ranges` counts N, not 1) with bounded
+prefix coalescing.
 
-== Implementation slices
-
-[cols="1,3,1"]
-|===
-| Slice | Contract | State
-
-| D1 | Optional persistent L2 behind `TenantCache`; L2 hit promotes to DRAM; authoritative load writes through. | implemented
-| D2 | Optional persistent control/Region-A entries behind `SegmentInvariantsCache`; default-on coarse metadata insertion. | implemented
-| D3 | TOML + env path/budget configuration; local-path validation; unset disables L2. | implemented
-| D4 | Exact Prometheus hit/miss/resident-byte families with bounded `tier` labels. | implemented
-| D5 | Env-gate registry and config template. | implemented
-| D6 | Writer retains byte-identical PAX regions and installs them only after final publication; `none/invariant/all` policy. | implemented
-| SEARCH-3 | Correct physical GET counting and bounded prefix coalescing. | implemented, measurement pending
-|===
+Verified gaps that drove the design and still apply as lessons: the pre-existing root `NvmeBackend`
+was memory-only — reusing it would have made the restart acceptance test a false positive;
+coarse-probe metadata insertion was effectively opt-in (the observed zero-hit invariants run); a
+complete SQ8 seed cannot satisfy an exact subrange key without a parent lookup (persisted parent
+entries now serve checksum-verified selective ranges); survivor purge and whole-collection deletion
+previously reclaimed DRAM only (now both tiers, separator-aware so `12` never retires `123`).
 
 == Correctness boundaries
 

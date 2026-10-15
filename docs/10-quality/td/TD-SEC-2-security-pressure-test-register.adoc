@@ -3,100 +3,45 @@
 :dim: D5
 :pillar: SEC
 
-== Why this exists
-
-After the ADR-090 first arc landed (identity → grants → enforcement → admin surface), the
-whole authn/authz/audit/privacy surface was pressure-tested against common multi-tenant SaaS
-practice (OWASP ASVS V2/V4/V8, tenant-isolation patterns, SOC2-class controls, GDPR basics).
-
-**The headline finding was not missing controls. It was controls that exist, look
-implemented, and never fire.** That is worse than absence: an absent control does not appear
-on an architecture diagram as coverage, and does not stop anyone from looking for the real
-one. Five such controls were found; all five are now armed (Slice A, #1536).
-
-This file is the register: every finding, its evidence, and its disposition. It also carries
-the *worked design* for the one deferred item that is large enough to need one (the
-tamper-evident audit ledger) so the next session starts from the design rather than from
-scratch.
-
-NOTE: This TD was cited in the merged commits for #1536/#1537 and in the
-`PROXIMADB_AUTHZ_REQUIRE_GRANTS` registry row *before the file was filed*. That dangling
-reference was itself an instance of the defect this TD is about — a document asserting
-coverage that did not exist — and is recorded here rather than quietly fixed.
-
-== A. Controls that existed and never fired — RESOLVED in #1536
-
-[cols="1,4,1"]
+[cols="1,3"]
 |===
-| # | Finding (evidence) | State
-
-| A1
-| **No authentication event has ever been persisted.** `set_audit_logger`
-(`src/security/auth_service.rs:226`) had **zero callers**, so `auth_service.audit_logger` was
-always `None` (`:157`, `:193`) and the emit hook in `authenticate()` was dead code.
-| ✅ #1536
-
-| A2
-| **Brute-force detection collapsed into one bucket.** Failed auth was attributed to
-`UnifiedUserContext::anonymous()`, and `count_recent_auth_failures` keys on `event.user_id`,
-so every failure in the system shared one counter — an account under attack was
-indistinguishable from background noise. *Wiring A1 alone would NOT have fixed this; the
-initial plan claimed it would and was wrong.*
-| ✅ #1536
-
-| A3
-| **Bounded audit queries returned an arbitrary subset.** `query_events` truncated to `limit`
-while iterating the directory and sorted only afterwards, so the brute-force check — which
-samples the newest 100 — could miss recent failures entirely and never trip.
-| ✅ #1536
-
-| A4
-| **The cross-tenant access alert could never fire.** It compared `event.tenant_id` with
-`event.tenant_id` — the same field twice — an unsatisfiable condition. Fixed by adding
-`AuditResource.resource_tenant_id` (the tenant that *owns* the resource, distinct from the
-acting tenant) behind `#[serde(default)]` so pre-existing audit records still parse.
-| ✅ #1536
-
-| A5
-| **`RateLimitingService` had zero call sites.** Fully implemented, never constructed.
-Now `record_failed_auth` counts failures per attempted principal with its own budget knob
-(`failed_auth_per_minute_per_principal`), deliberately *not* reusing the request-rate knob.
-| ✅ #1536
+| Status | **Partial: §A five inert controls armed (#1536) and §B per-tenant enforcement posture with an Audit ramp (#1537) shipped; open: every §C finding (C1 tamper-evident audit ledger designed-not-built; C2 register).**
+| Component | `src/security/` (`auth_service.rs`, `advanced_features`), `src/audit/`, `src/security/rls/abac_adapter.rs`
+| Relates to | link:TD-AUTHZ-1-adr090-program-tracker.adoc[TD-AUTHZ-1] (overlap: "Six `System` bypasses", predicate-store partitioning, `FieldMask`, durable epochs are canonical there as L2.2/L2.3/L2.5), link:TD-RATE-1-inert-request-rate-limiting.adoc[TD-RATE-1] (REST request limiter, shipped), link:TD-AUTHZ-2-xcatalog-relational-object-id-empty.adoc[TD-AUTHZ-2] (same defect class)
 |===
 
-Two defects fixed alongside them:
+== History (shipped)
 
-* **Boot footgun** — `security.enabled = true` plus the *shipped* `config.toml` default
-  (`enable_audit_logging = false`) **refused to boot**. Now mode-gated: Development gets a
-  documented no-op sink plus a startup warning; every other mode still fails fast. Written as
-  `!matches!(mode, Development)` rather than `matches!(mode, Production)` **on purpose** —
-  `Enterprise` is production-grade too, and any mode added later must fail *closed*.
-* **Silent audit failure** — `let _ = log_event(..)` became a visible policy: `error!` plus an
-  `AUDIT_WRITE_FAILURES` counter, **default fail-open**, opt-in `audit_fail_closed`. Rationale
-  (stated in-code so it can be argued with): the credible failure is operational — a full disk,
-  and note the retention job has *no production caller* — and denying on it converts that into
-  a total authentication outage for every tenant, a self-inflicted DoS; an adversary who can
-  break the sink can already rewrite the unchained history. What matters is that the loss of
-  accountability is **visible**. Separately, on the authorization-denial path an audit-write
-  failure used to *replace* the "Insufficient permissions" error; the denial now always stands.
+The pressure test (OWASP ASVS V2/V4/V8, tenant-isolation patterns, SOC2-class controls, GDPR basics)
+found that the headline problem was not missing controls but **controls that exist, look implemented,
+and never fire** — worse than absence, because they appear as coverage. Armed in #1536: A1
+`set_audit_logger` had zero callers (no auth event ever persisted); A2 brute-force detection keyed every
+failure on `anonymous()` — one global bucket (wiring A1 alone would *not* have fixed it); A3 bounded
+audit queries truncated before sorting, so the newest-100 sample could miss recent failures; A4 the
+cross-tenant alert compared `event.tenant_id` with itself (fixed via
+`AuditResource.resource_tenant_id`, `#[serde(default)]`); A5 `RateLimitingService` was never
+constructed (now per-principal failed-auth budget `failed_auth_per_minute_per_principal`). Also fixed:
+the shipped `config.toml` + `security.enabled` refused to boot (now mode-gated, written as
+`!matches!(mode, Development)` so any future mode fails closed), and silent audit-write failures became
+`error!` + `AUDIT_WRITE_FAILURES`, default fail-open-but-loud with opt-in `audit_fail_closed` (denying
+on a full disk would be a self-inflicted all-tenant outage); an audit failure no longer replaces an
+authorization denial.
 
-**Attribution secrecy rule** (introduced with A2, applies to anything that identifies a
-credential in a record): a `pxk_` key contributes its *public* key id (the part before the
-`.`); every other credential shape contributes a truncated SHA-256 **fingerprint** — stable
-enough to count against, useless to replay. Secret material must never reach an audit record.
+**Attribution secrecy rule** (still binding): a `pxk_` key contributes its *public* key id; every other
+credential shape contributes a truncated SHA-256 fingerprint. Secret material must never reach an
+audit record.
 
-== B. Process-global enforcement — RESOLVED in #1537
+§B (#1537): ADR-090 L1.2's single process-global gate was the wrong SaaS shape (it never gets
+flipped). Per-tenant `TenantSecurityPosture { Off | Audit | Enforce }` at
+`<data_dir>/abac/tenant-posture.json` (admin `PUT|GET /api/v2/abac/tenant-posture/{tenant}`);
+`PROXIMADB_AUTHZ_REQUIRE_GRANTS` is only the default for tenants with no record. **`Audit` — evaluate,
+log the would-be denial, admit — is the rehearsal ramp without which a binary gate never gets turned
+on.**
 
-ADR-090 L1.2 gated grant enforcement on one process-global env var. That is the wrong shape
-for SaaS: an operator cannot flag-day every customer onto strict authorization at once, so in
-practice the switch never gets flipped and the enforcement stays permanently dark.
-
-Resolved by per-tenant `TenantSecurityPosture { Off | Audit | Enforce }`
-(`<data_dir>/abac/tenant-posture.json`, admin at `PUT|GET /api/v2/abac/tenant-posture/{tenant}`).
-`PROXIMADB_AUTHZ_REQUIRE_GRANTS` is demoted to the *default* for tenants with no record, so
-existing deployments are unchanged; the record overrides it in both directions. **`Audit` mode
-— evaluate, log the would-be denial, admit — is the rehearsal ramp without which a binary gate
-never gets turned on.**
+Correction on the record (§D): a pgwire per-IP limiter did exist (`PROXIMADB_PGWIRE_RATE_LIMIT_RPM`);
+the accurate pre-#1536 statement was that nothing throttled the REST/gRPC **auth** path and nothing
+counted auth *failures*. This TD was also cited by #1536/#1537 before it was filed — itself an instance
+of a document asserting coverage that did not exist.
 
 == C. Open findings (evidence + disposition)
 
@@ -201,14 +146,6 @@ unimplemented), or `chattr +a`.
 | Soft-revoked grants are retained deliberately (audit trail) but need a compaction/archival policy.
 |===
 
-== D. Correction on the record
-
-An early review note asserted that *no* rate limiting exists anywhere on the request path.
-That is too strong: an opt-in **per-IP limiter does exist on the pgwire path**
-(`PROXIMADB_PGWIRE_RATE_LIMIT_RPM`, default off, `src/network/multi_server.rs`). The accurate
-statement is that nothing throttles the REST/gRPC **auth** path, and nothing counted auth
-*failures* on any transport until #1536.
-
 == E. Next action
 
 The highest-value remaining item is not on this list — it is the **provision → permit → deny
@@ -218,3 +155,10 @@ The highest-value remaining item is not on this list — it is the **provision �
 
 Then, in order: C1 (ledger), predicate-store partitioning, the six `System` bypasses, and
 tenant self-service admin.
+
+NOTE (2026-10-15): the live L1.2 ratchet named above shipped with its CI lane (#1544), so §E's first
+item is done. Predicate-store partitioning was re-ranked by TD-AUTHZ-1 L2.3 as not a security gap
+(operator-only writes; reopen only if a tenant-facing policy API is added), and the "six `System`
+bypasses" were re-surveyed in TD-AUTHZ-1 L2.2 (22 `[CLIENT-PLACEHOLDER]` sites at 2026-08-20, 20 at
+2026-10-15). The C2 rows are otherwise unchanged; C1 remains unbuilt (no `pxdb_audit_chain` /
+`verify_chain` in `src/`).

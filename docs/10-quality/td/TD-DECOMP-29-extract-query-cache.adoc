@@ -5,42 +5,13 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Medium — structural enabler (partial module extraction; creates a home for the remaining coupled files)
+| Status | **Done (2026-08-06).** Created `proximadb-query-cache` with the 4 tractable `query/cache` files (per_category_policy, mismatch_cost, category_classifier, result_cache_gate; 40 tests) (#1515).
 | Component | `crates/query/proximadb-query-cache`; root `src/query/cache/mod.rs`
-| Relates to | [[TD-DECOMP-1]] (recipe); [[TD-DECOMP-25]] (batch_group extracted from same module)
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-25-extract-batch-group-cache.adoc[TD-DECOMP-25]; link:TD-DECOMP-32-extract-execution-result.adoc[TD-DECOMP-32]; link:TD-DECOMP-33-cascade-query-cache-step2.adoc[TD-DECOMP-33] (canonical list of the still-root-side query/cache files)
 |===
 
-== Why
+== History
 
-`src/query/cache/` has 98 tests across 9 files. batch_group (12 tests) was extracted earlier
-(TD-DECOMP-25). This TD extracts the **4 tractable files** (40 tests) whose only external refs are
-intra-module (to each other), creating the `proximadb-query-cache` crate as a **home** for the
-remaining coupled files to move into once their root-only deps resolve.
-
-== What moved (behavior-neutral)
-
-* `per_category_policy.rs` (8t, 0 crate::), `mismatch_cost.rs` (8t, 0 crate::),
-  `category_classifier.rs` (14t, 1 intra-module ref), `result_cache_gate.rs` (10t, 3 intra-module refs)
-  → `crates/query/proximadb-query-cache/src/`. Total: **40 tests**.
-* Intra-module refs rewritten: `crate::query::cache::X` → `crate::X` (4 sites, sibling-to-sibling).
-* Root `query/cache/mod.rs`: 4 `pub mod X;` → `pub use proximadb_query_cache::X;`.
-* New query-tier crate, dep `tokio` (workspace).
-
-== What stays root-side (and why)
-
-* `query_result_cache.rs` (19t) — depends on `ExecutionResult` (root-only, `query::federated`).
-* `plan_cache.rs` (14t) — depends on `PlanOutput` (root-only, `query::federated::optimizer`).
-* `invalidation_coordinator.rs` (11t, 14 crate:: refs) — depends on `QueryCache` (root-only, `storage::cache`).
-* `invalidation.rs` (11t) — test-only ref to `ExecutionResult`.
-* `adaptive_cache.rs` (3t) — depends on `QueryCacheKey` (in query_result_cache, root-staying).
-
-These move into `proximadb-query-cache` once their root-only deps extract to crates.
-
-== Follow-ups
-
-* **Running total once merged: ~960 tests out of root** (920 + 40).
-* Standalone crate `--all-targets` compiled in ~9s with `RUSTC_WRAPPER=sccache`.
-* Next: extract `ExecutionResult`/`PlanOutput` → query-fusion crate (federated types already
-  partially there); then `QueryCache` → a storage-cache crate. Each unblocks the corresponding
-  root-staying files.
+A partial module extraction whose purpose was to create a home for the coupled files: only intra-module
+refs, rewritten `crate::query::cache::X` → `crate::X`. The cascade continued in link:TD-DECOMP-32-extract-execution-result.adoc[TD-DECOMP-32] and link:TD-DECOMP-33-cascade-query-cache-step2.adoc[TD-DECOMP-33];
+the files still blocked on root-only types are tracked in link:TD-DECOMP-33-cascade-query-cache-step2.adoc[TD-DECOMP-33].

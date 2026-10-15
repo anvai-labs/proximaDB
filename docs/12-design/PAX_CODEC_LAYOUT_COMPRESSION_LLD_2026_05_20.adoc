@@ -3,9 +3,14 @@
 :toclevels: 4
 :sectnums:
 
-Status: Active implementation blueprint +
-Date: 2026-06-04 +
-Scope: `proximadb-codec`, compute `proximacodec`, Parquet block encodings, Iceberg manifest statistics, vector layout ordering, graph topology projections, JSON/document structural columns, codec profiling, xCatalog compression metadata, and EXPLAIN visibility.
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** PCX-000..009 are done: canonical codec selection lives in `proximadb-codec`; PAX stats/blooms; base-XOR, graph-CSR and JSON-shape pilots; profiling records; EXPLAIN `storage_authority.compression_profiles`. PCX-010 (dead/duplicate codec path retirement) is still in progress: `src/compute/proximacodec/` remains as a re-export shim. The three pilots are **not durable**: no `ProximaScheme` marker for base-XOR, ORION still traverses raw CSR, and live PAX still writes msgpack props. Typed-column authority moved to link:PAX_V3_UNIFIED_SUBSTRATE_SPEC_2026_09.adoc[PAX v3 §2.1] (TD-USUB-6).
+| Date | 2026-06-04
+| Scope | `proximadb-codec`, compute `proximacodec`, Parquet block encodings, Iceberg manifest statistics, vector layout ordering, graph topology projections, JSON/document structural columns, codec profiling, xCatalog compression metadata, and EXPLAIN visibility.
+| Relates to | link:PAX_V3_UNIFIED_SUBSTRATE_SPEC_2026_09.adoc[PAX v3 spec] (overlap: typed/structural column stripes — canonical there for the PAX arm), link:USCHEMA_UNIFIED_METAMODEL_REVIEW_2026_09_24.adoc[U-Schema review] (overlap: JSON shape/variation statistics), link:RELATIONAL_STORAGE_FORMAT_AND_INTEROPERABILITY_2026_05_19.adoc[relational storage format]
+|===
 
 == Purpose
 
@@ -477,32 +482,17 @@ Cleanup must happen after a checkpoint commit and only when the canonical path h
 should preserve compatibility modules when external or older internal imports still depend on the
 module path.
 
-Current pilot:
+Shipped (history): after checkpoint `b8122857f`, these were removed: the duplicate compute baseline
+codec files, archive-only and unreachable prototypes, private unused ProximaBlocks helpers,
+unreferenced per-engine `SqlValue`/JSON helper copies, stale protocol conversion helpers, unwired
+REST/Arrow helpers, and integration tests disabled by `cfg(disabled_due_to_obsolete_apis)`.
 
-* Commit `b8122857f` checkpoints PCX-005 through PCX-009 before deletion-oriented cleanup.
-* The duplicate compute baseline codec implementation files under
-  `src/compute/proximacodec/baseline/functions/` have been removed. The directory now keeps only a
-  compatibility `mod.rs` that re-exports `proximadb_codec::baseline::functions::*`.
-* Compute-facing `analysis`, `strategy`, `types`, and `simd_analysis` remain compatibility adapters
-  until all storage, benchmark, and test imports move to `proximadb-codec` or an explicit compute
+Remaining (PCX-010):
+
+* `src/compute/proximacodec/` is still a compatibility facade re-exporting `proximadb_codec::*`.
+  Compute-facing `analysis`, `strategy`, `types` and `simd_analysis` stay as compatibility adapters
+  until every storage, benchmark and test import moves to `proximadb-codec` or an explicit compute
   runtime routing API.
-* Archive-only and prototype files that were not module-reachable have been removed:
-  `src/storage/engines/sst/blocks_archive.rs`,
-  `src/compute/proximacodec/archive/README.md`, and uncompiled
-  `src/storage/engines/core/ops/proxima_encoding_*` design sketches.
-* Private unused ProximaBlocks helper code was removed: stale `SqlValue`/JSON converters,
-  a duplicate string-based tombstone helper, and obsolete SIMD panic stubs.
-* Unreferenced per-engine extractor `SqlValue`/JSON helper copies were removed from SST,
-  VIPER, and NOVA while leaving SWIFT/HELIX's called helpers intact.
-* Test-only/stale protocol conversion helpers were removed from storage format adapters and
-  WebSocket REST streaming after confirming canonical ProximaValue conversion remains in use.
-* Unwired REST/Arrow helper code was removed: unused Iceberg namespace encoder, Arrow Flight
-  JSON-to-`SqlValue` converter, old SQL-metadata score extraction, and REST-local storage-authority
-  explain helpers superseded by the unified query explain path.
-* Adjacent unused storage/catalog imports were removed after the helper deletions reduced the
-  remaining compiler warning set.
-* Integration tests permanently disabled by `cfg(disabled_due_to_obsolete_apis)` were removed
-  instead of being carried as non-compiling reference material.
 
 == Progress Tracker
 
@@ -510,63 +500,10 @@ Current pilot:
 |===
 | ID | Status | Work item | Exit criteria
 
-| PCX-000
+| PCX-000..009
 | Done
-| Establish this LLD and link it from the active architecture index.
-| Design is discoverable from `docs/12-design/README.adoc` and ADR-010 references it.
-
-| PCX-001
-| Done
-| Consolidate codec selection in `crates/horizontal/proximadb-codec`.
-| Compute `proximacodec` delegates selection to the crate; duplicate adaptive selector is removed
-  or reduced to compatibility wiring.
-
-| PCX-002
-| Done
-| Add `CompressionProfile`, `LayoutHints`, `CodecDecision`, and rejected-candidate reporting.
-| Unit tests cover exact-only rejection, hot/cold tier choices, sorted/correlated input, and raw
-  fallback.
-
-| PCX-003
-| Done
-| Wire PAX writer/reader through canonical codec selection.
-| PAX stripes can be encoded/decoded with at least raw, integer delta/FOR, dictionary/string, and
-  exact f32 raw schemes through the same dispatch path.
-
-| PCX-004
-| Done
-| Populate PAX stats, bloom/frequency summaries, and `BlockStats` consistently.
-| Predicate pruning works without stripe decode for supported scalar/string columns; stats are
-  validated in block-format tests.
-
-| PCX-005
-| Done
-| Pilot lossless vector co-location and exact base-XOR entropy codec.
-| Benchmark shows ratio, decode cost, and fallback behavior on representative embedding sets;
-  exact f32 bit reconstruction is tested.
-
-| PCX-006
-| Done
-| Introduce compressed graph CSR/CSC projection options.
-| Graph projection metadata records topology epoch, vertex order, codec, and fallback; traversal
-  tests pass on raw and compressed projections.
-
-| PCX-007
-| Done
-| Add JSON shape/path structural stripe projection.
-| Frequent JSON paths are typed, prunable, and exact-roundtrip safe with msgpack fallback.
-
-| PCX-008
-| Done
-| Add profiling harness and xCatalog feedback records.
-| Benchmarks emit machine-readable stats consumed by codec selection tests and EXPLAIN fixtures.
-
-| PCX-009
-| Done
-| Expose compression/layout decisions in unified EXPLAIN.
-| Plans show codec, layout/projection id, measured compression ratio, encode/decode hints,
-  exactness, and rejected-codec reasons through `storage_authority.compression_profiles`; freshness,
-  loss policy, authority mode, and policy boundary remain eligibility checks before runtime use.
+| LLD published; codec selection consolidated in `crates/horizontal/proximadb-codec`; `CompressionProfile`/`LayoutHints`/`CodecDecision` + rejected-candidate reporting; PAX writer/reader through canonical selection; PAX stats/bloom/`BlockStats`; base-XOR vector pilot; compressed graph CSR/CSC projection; JSON shape/path stripes; profiling harness + xCatalog `compression_stats_profiles`; unified EXPLAIN `storage_authority.compression_profiles`.
+| Exit criteria met per the original rows (git history of this file). Pilots remain evidence-only; see the per-LLD "Current pilot" notes for what is not yet durable.
 
 | PCX-010
 | In progress

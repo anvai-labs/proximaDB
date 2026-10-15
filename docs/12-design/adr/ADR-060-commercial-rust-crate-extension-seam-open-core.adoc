@@ -10,6 +10,8 @@
 == Status
 **Accepted** for the seam + its four non-negotiable rules (§3) **and the placement decision (§5 = Option A, a separate commercial Rust workspace, decided 2026-07-12)**.
 
+Applied by link:ADR-084-oss-commercial-placement-worm-and-distribution.adoc[ADR-084] (2026-07-30) to WORM/compliance and multi-node distribution placement; TD-OSS-1 (tenant mechanism/policy audit) Done.
+
 == Context
 
 `OSS_ENTERPRISE_BOUNDARY_2026_06_17.adoc` is the governing OSS↔enterprise spec. Its principle — *"OSS ships capability + mechanism; the enterprise layer supplies commercial policy, data, authority, go-to-market"* — is unchanged and endorsed here. It sanctions **three** commercial-extension seams:

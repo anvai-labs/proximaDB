@@ -7,7 +7,12 @@
 
 == Status
 
-Proposed
+Proposed — **implementation largely landed behind `experimental-turboquant`** (reconciled
+2026-10-15): P1/P3/P5/P7 complete; P2, P4, P6, P8, P9 partial; persistence (`.tq`), store
+registry, boot hydration and `QuantizationConfig.enable_turboquant` opt-in wired (Phases K–P).
+Promotion to Accepted is acceptance criterion 9 of the P9 gate — see the per-phase status table
+in link:../TURBOQUANT_LLD_2026_05_30.adoc[TURBOQUANT_LLD] (canonical; not repeated here). The
+`CandidateMaskSet` (P5) also serves ADR-002/ADR-011 and the ADR-023 cold path.
 
 == Context
 

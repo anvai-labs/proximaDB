@@ -9,7 +9,7 @@
 | Severity | Medium — analytics today is a separate engine copy, not a single-copy fresh read; Lakebase LTAP headline is unbuilt
 | Component | analytics read path (Parquet/VIPER arm + WAL-tail replay); generalization of `search_unflushed_vectors()` (`src/storage/persistence/write_ahead_log/mod.rs:2396`)
 | Tracked-by | link:../../12-design/adr/ADR-046-lsn-coherent-merge-read.adoc[ADR-046]
-| Relates to | link:../../12-design/adr/ADR-020-canonical-wal-authority.adoc[ADR-020] (delta source), link:../../12-design/adr/ADR-033-primary-storage-format-strategy.adoc[ADR-033] (materialized arm), link:../../12-design/adr/ADR-039-olap-engine-boundary-swappable-physical-backend.adoc[ADR-039] (engine isolation), link:TD-LTAP-1-pax-durable-core-serving-metadata-split.adoc[TD-LTAP-1]
+| Relates to | link:../../12-design/adr/ADR-020-canonical-wal-authority.adoc[ADR-020] (delta source), link:../../12-design/adr/ADR-033-primary-storage-format-strategy.adoc[ADR-033] (materialized arm), link:../../12-design/adr/ADR-039-olap-engine-boundary-swappable-physical-backend.adoc[ADR-039] (engine isolation), link:TD-LTAP-1-pax-durable-core-serving-metadata-split.adoc[TD-LTAP-1]; link:TD-OLAP-17-olap-delta-merge-changed-oids-since-per-query-wal-scan.adoc[TD-OLAP-17] (overlap, unverified extent: the pgwire OLAP path already merges post-snapshot WAL changes over the Parquet arm via `OlapDeltaSource` / `register_merged_olap_table` (ADR-025); check what of steps 1–3 and the differential ratchet below that covers before implementing)
 | Pillar | PERF, REL
 |===
 

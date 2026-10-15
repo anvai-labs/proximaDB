@@ -9,8 +9,8 @@
 |===
 | Field | Value
 
-| Status | **Scoped (execution plan; implementation not started).** This TD is the *plan* for the first
-safe slice — it migrates nothing. The first slice (S1) is internal-only and needs no flag; later
+| Status | **Partial (corrected 2026-10-15; the prior line said "implementation not started").** Shipped: dead `SstEntry` retired + reconciliation (#1452), the SST optimization fixture built as `ProximaRecord` (Bucket B, #1454), and **S0** of the revised roadmap: dead `VectorRecord` carriers deleted and a wrong claim retracted (#1508). Open: revised-roadmap S1 (composed round-trip harness + OQ-4 `tenant_id` audit) through S7, S-net and Sunset. Rough surface 2026-10-15: `git grep -c VectorRecord` over `src/`, `crates/` and `tests/` finds 1,110 matching lines in 215 files (comments included; not comparable with the 575-ref code-only count below). Original framing: this TD is the *plan* for the first
+safe slice. The first slice (S1) is internal-only and needs no flag; later
 durable-path changes are default-OFF until baked.
 | Severity | Medium — `VectorRecord` is a v1 proto *wire* type (`proximadb.v1.rs:2011`) **and** a legacy
 durable format, so this is a link:../../12-design/adr/ADR-024-single-canonical-data-type-and-schema.adoc[ADR-024]
@@ -20,6 +20,7 @@ tested (CLAUDE.md mandate #8). Recovery for S1 is a revert of an internal-only c
 `src/index/**`, `src/services/**`; the v1↔v2 bridge
 (`crates/foundation/proximadb-records/src/conversions.rs`); the legacy SST1 row format
 (`src/storage/engines/sst/mod.rs` — `SstEntry`, retired 2026-08-05).
+| Relates to | link:TD-V1SUNSET-3-sqlvalue-to-proximavalue.adoc[TD-V1SUNSET-3] (sequenced behind this TD), link:TD-CONFIG-CONSOLIDATE-1-duplicate-config-structs.adoc[TD-CONFIG-CONSOLIDATE-1] (same dead-symbol sweep retired `SstEntry`)
 | Tracked-by | link:../../12-design/adr/ADR-024-single-canonical-data-type-and-schema.adoc[ADR-024] (the
 canonical-type decision); link:../../12-design/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[V1_RETIREMENT_ROADMAP]
 Tier 3; the v1-proto ratchet (`scripts/check_v1_proto_usage.py`).

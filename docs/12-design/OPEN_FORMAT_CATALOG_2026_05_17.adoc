@@ -410,6 +410,13 @@ Table properties for HNSW discovery (external engines read these to plan vector 
 
 == OLTP Catalog Backends (ADR-008)
 
+WARNING: *Status corrected 2026-10-15 — retired.* `OltpCatalog` never worked (feature-off it was a
+silent in-memory no-op reporting success; feature-on it did not compile) and is now an explicit opt-in
+`#[cfg(feature = "oltp-catalog")]` module in `crates/control/proximadb-catalog/src/oltp.rs`, retired
+rather than rescued — see link:../10-quality/td/TD-CAT-10-oltp-catalog-retirement.adoc[TD-CAT-10]
+(#1721). The section below is the original design; the file paths under `src/catalog/` have moved to
+the catalog crate. The production catalog authority is `SystemCatalog` (ADR-048).
+
 === Motivation
 
 For collections < 1 GB, lakehouse metadata overhead (transaction logs, manifest files, compaction) is

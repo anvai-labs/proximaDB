@@ -1,146 +1,38 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-= TD-UICDN-1: the admin UI fetches its editor from a third-party CDN at a hardcoded version, so `npm audit` audits a version nobody runs
-:toc: macro
+= TD-UICDN-1: the admin UI fetched its editor from a third-party CDN, so `npm audit` audited a version nobody ran
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **FIXED (2026-10-13)** — option 1 (self-host). `monaco-editor` is now a real, exact-pinned dependency (`0.57.0`), `min/vs` is copied to `public/vs` at install/build time, the loader is overridden to `paths: { vs: '/vs' }`, and a `prebuild` guard verifies the whole chain (details + verification below).
-| Severity | Medium — third-party script execution with no integrity check, and a dependency-audit blind spot that makes lockfile bumps look like fixes they are not
-| Component | `ui/src/components/SqlQueryTab.tsx`, `ui/package.json` (`@monaco-editor/react`), `ui/node_modules/@monaco-editor/loader`
+| Status | **Done (2026-10-13).** Monaco is self-hosted: `monaco-editor` is an exact-pinned dependency (`0.57.0`), `min/vs` is copied to `public/vs` at install/build, the loader is overridden to `/vs`, and a `prebuild` guard verifies the chain. No third-party script origin remains (#2018).
+| Severity | Medium — third-party script execution with no integrity check, plus a dependency-audit blind spot
+| Component | `ui/src/components/SqlQueryTab.tsx`, `ui/package.json`, `ui/scripts/copy-monaco-vs.js`, `ui/scripts/check-monaco-selfhost.mjs`
 | Pillar | SECURITY
 | Found | 2026-10-12
 |===
 
-toc::[]
+== History
 
-== What is actually shipped
+`@monaco-editor/loader` does not bundle Monaco. It injected an un-SRI'd `<script>` from `cdn.jsdelivr.net/npm/monaco-editor@0.55.1`.
+That gave two defects: unverified third-party code ran on the operator-session origin (plus an availability coupling), and
+an **audit blind spot that manufactured false security progress**. `monaco-editor`/`dompurify` were lock-only peers, so #1993's
+bumps (0.56->0.57, dompurify 3.4.8->3.4.15) changed `npm audit` output and **not one shipped byte**, while the executed 0.55.1 was
+audited by nothing. Lesson: verify against the built artifact (bundle size, embedded URL), not the manifest.
 
-`ui/src/components/SqlQueryTab.tsx` imports `@monaco-editor/react`, whose loader
-(`@monaco-editor/loader` 1.7.0) does **not** bundle Monaco. It injects a
-`<script>` at a URL hardcoded in its own config
-(`lib/cjs/config/index.js:7`):
+* Chosen option: self-host, not CDN+SRI. SRI fixes only the first defect, and the loader has no integrity hook.
+* **Loader guard bypass (review catch):** the first guard checked for the `loader.config` *substring*, which commenting the line out
+  bypassed. The guard now requires a **statement-position** call, and it applies the override **through the shipped loader's own
+  config-merge code** to prove the resolved script URL is `/vs/loader.js`. That executes the property on every build instead of
+  asserting it once.
+* Amended criterion: "no `cdn.jsdelivr.net` string in the bundle" is unachievable, because the loader's inert vendor default still
+  bundles. The risk is reachability, not presence, and the executed-merge proof covers that.
+* **Evidence:** the guard passes, and it fails closed on three negative controls (commented override, CDN override, missing
+  `public/vs/loader.js`). Limitation: no network-blocked in-browser load test was run.
 
-[source]
-----
-vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs'
-----
+== Open residual (restored, outside this TD's scope)
 
-Verified against the built artifact, not inferred from the manifest:
+Recorded in the original and tracked nowhere else; it does not reopen this TD:
 
-* the production bundle is a single `main.*.js` of **645,931 bytes** — a bundled
-  Monaco would be several MB, and there is no separate Monaco chunk;
-* that bundle contains the literal string
-  `cdn.jsdelivr.net/npm/monaco-editor@0.55.1`;
-* `DOMPurify` appears **0** times in it.
-
-So the browser executes Monaco **0.55.1**, plus whatever DOMPurify that release
-bundles, fetched at page load from a host we do not control.
-
-== Two distinct problems
-
-**1. Unverified third-party script execution.** The tag carries no
-`integrity`/SRI attribute and no `crossorigin`, so a compromised or
-cache-poisoned CDN response executes with full access to the admin UI's
-origin — the surface that holds an operator's session. There is also a hard
-availability coupling: no jsdelivr, no SQL editor.
-
-**2. An audit blind spot that manufactures false security progress.** This is
-the part that bit us. `monaco-editor` is present in `ui/package-lock.json` only
-as a **peer** of `@monaco-editor/react` and is never bundled; `dompurify` is
-reachable *only* as `monaco-editor`'s own dependency. `npm audit` therefore
-reports on the locked `monaco-editor` / `dompurify` versions while the browser
-runs neither. In #1993 two of fourteen lockfile rows —
-`monaco-editor 0.56.0 -> 0.57.0` and `dompurify 3.4.8 -> 3.4.15` — changed
-`npm audit` output and **not one shipped byte**. Worse, the version actually
-executed (0.55.1) is *older* than both and is audited by nothing at all.
-
-(That PR's headline "critical 2 -> 0" is unaffected and stands: those were
-`proxy-addr` and `shell-quote`, genuine `react-scripts` dev-server
-transitives.)
-
-== Options
-
-. **Self-host Monaco** — add `monaco-editor` as a real dependency and point the
-  loader at a local path (`loader.config({ paths: { vs: '/vs' } })`), copying
-  `min/vs` into the build. Removes the CDN entirely, puts the executed version
-  under the lockfile and therefore under `npm audit`, and makes a bump like
-  #1993's actually mean something. Costs several MB of bundle and a build step.
-. **Keep the CDN, add SRI** — closes problem 1 only; problem 2 survives, and
-  the loader does not currently expose an integrity hook, so this needs an
-  upstream change or a patch.
-
-Option 1 is the one that fixes both and is the recommendation.
-
-== Why it is not fixed in #1993
-
-That PR is a lockfile security bump plus the Node 24 pin. Self-hosting Monaco
-changes what the UI ships and how it is built — a different change, with its own
-bundle-size and build-output review. It also lands naturally with the
-`react-scripts` migration, since the 101 remaining `ui/` advisories are all CRA
-transitives and that migration has to touch the build anyway.
-
-== Fix (2026-10-13)
-
-Option 1, implemented:
-
-* `monaco-editor` added to `ui/package.json` `dependencies` as an **exact pin**
-  (`"0.57.0"` — the version the browser executes; the peer-only blind spot is
-  closed: the audited version is now the executed version).
-* `ui/scripts/copy-monaco-vs.js` — copies `node_modules/monaco-editor/min/vs` to
-  `public/vs`, idempotent via a `public/.monaco-vs-version` stamp; wired as
-  both `postinstall` and `prebuild`. `public/vs` is gitignored (build
-  artifact, regenerated from the lockfile-pinned package).
-* `ui/src/components/SqlQueryTab.tsx` — `loader.config({ paths: { vs: '/vs' } })`
-  at module scope, before any `Editor` mount.
-* `ui/scripts/check-monaco-selfhost.mjs` — `prebuild` guard (a build cannot
-  ship without passing it) checking the three links of the chain: exact pin ==
-  installed version; `public/vs/{loader.js,editor/editor.main.js}` + stamp
-  present; the tsx still carries a **statement-position**
-  `loader.config({ paths: { vs: '/vs' } })` call (an adversarial-review round
-  proved the earlier substring check was bypassable by commenting the line
-  out — the guard now matches the call itself, so a commented-out override
-  fails) AND applying that override **through the shipped loader's own
-  config-merge code** resolves the editor script to `/vs/loader.js`, not any
-  remote URL.
-
-One criterion from the original verification plan is **amended, honestly**: "no
-`cdn.jsdelivr.net` string in `ui/build/static/js/*`" is not literally
-achievable — `@monaco-editor/loader`'s shipped default config object (with its
-inert jsdelivr default for a *different* version, 0.52.2) is vendor code that
-still gets bundled. The string's presence is not the risk; its *reachability*
-is. The amended criterion is the executed property: the URL the loader will
-actually use is computed by the library's own merge logic from our override
-and is `/vs/loader.js` — and the guard proves that on every build rather than
-once. (The vendor default that string references is monaco 0.55.1 — loader
-1.7.0's shipped default, the same version the "What is actually shipped"
-section cites.)
-
-== Verification
-
-* Guard passes in the worktree: `[check-monaco-selfhost] OK: monaco-editor
-  0.57.0 self-hosted; loader resolves /vs/loader.js` (exit 0).
-* **Negative controls** (the guard fails closed): commenting out the tsx
-  override -> FAIL `... no longer calls loader.config ... (a commented-out
-  override does not count)` (exit 1); pointing the override back at the CDN
-  URL -> FAIL (exit 1); removing `public/vs/loader.js` (the "postinstall
-  never ran" case) -> `FAIL ... public/vs/loader.js missing` (exit 1).
-  Restored -> exit 0.
-* Loader mechanism traced, not assumed: `state.config.paths.vs` is the sole
-  source of the injected script URL (`@monaco-editor/loader`
-  `loader/index.js:104`), and `loader.config()` deep-merges over the jsdelivr
-  default (`index.js:33`) — so the module-scope override is authoritative for
-  every mount.
-* `ui/build` produced with the override: `build/vs/` carries the runtime
-  (`loader.js`, `editor/editor.main.js`, ...) alongside `build/static/js/*`.
-* npm audit blind spot closed: `monaco-editor 0.57.0` is a real dependency
-  under the lockfile, so audit reports on what executes; the guard asserts
-  pin == installed on every build.
-* Recorded limitation: an in-browser load test with the network blocked was
-  NOT run (the local automation browser cannot reach the loopback origin in
-  this environment). The executed-merge proof above is the substitute: it
-  runs the exact shipped code path that computes the script URL, with the
-  exact override the bundle carries; the remaining gap is ordinary browser
-  serving of `public/vs`, covered by CRA's static-asset copy (verified
-  present in `build/vs/`).
+* The `react-scripts` migration remains: "the 101 remaining `ui/` advisories are all CRA
+  transitives and that migration has to touch the build anyway."

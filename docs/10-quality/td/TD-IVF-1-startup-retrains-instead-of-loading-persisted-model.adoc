@@ -5,11 +5,23 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Narrowed (boot symptom resolved for co-design collections).** #1163 gates recovery flushes: `index_flushed_into_axis` treats a missing `collection_config` as "no AXIS" and an empty `index_configs` as skip, and the AXIS EventLog consumer acknowledges-and-skips flush events for collections without `index_configs` — so a restart with co-design (no-`index_configs`) collections performs NO k-means training and NO in-memory projection (verified 2026-07-23 by call-chain audit: the only reachable `train_model` callers are the gated IVF build path and the poll-driven discovery recluster pass; `AxisManager::new` itself is lazy — no threads, no training, no I/O at construction, so boot-time construction is free). REMAINING scope: collections that opted into AXIS via `index_configs` still re-train on restart instead of loading the persisted model (S1 below); same reuse applies to compaction (TD-COMPACT-1 S3). Note: the `Option<Arc<AxisManager>>` boot refactor sketched in TD-AXIS-2 was assessed and REJECTED — construction is lazy/cheap, so Option-izing ~50 sites across ~19 files buys zero boot time; the per-collection gates are the correct mechanism. Measured 2026-07-23: server at 100% CPU (one core) for minutes after boot, logging "🎯 Training clustering model for collection 1 with 1000000 vectors". The PAX segment already stores the IVF centroids + PCA model in the A0 region (written at flush time) — but the startup path re-trains k-means from scratch instead of loading them.
+| Status | **Partial: the boot symptom is resolved for co-design (no-`index_configs`) collections — recovery flushes no longer train (#1163). Open: collections that opted into AXIS via `index_configs` still re-train on restart instead of loading the persisted model (S1–S3 below); same reuse applies to compaction (TD-COMPACT-1 S3).**
 | Priority | **P1** — every server restart costs ~2-3 minutes of 1-core CPU for IVF training. On Spot instances (frequent eviction-restart cycles), this is a direct QPS tax during the training window. Loading the persisted model would be ~1ms (one small ranged GET) — a 100,000× improvement. Compounds with TD-COMPACT-1 (compaction also re-trains → 666s).
 | Component | `src/storage/engines/sst/segment_format.rs` (the A0 region with persisted centroids + PCA model); the startup/collection-registration path that triggers `train_clustering_model`; `src/storage/engines/sst/core.rs` (engine init / collection load).
 | Evidence | Server log: `🎯 Training clustering model for collection 1 with 1000000 vectors` at boot. ps: CPU=100.0% for 3+ minutes after startup (single core). RSS=5.7 GB (the 1M vectors loaded into RAM for training). The A0 region in the `.pax` segment stores the centroids (the PAX cascade reader already reads them for the coarse probe — `coarse_probe_survivors` at segment_format.rs:1130 uses `dir.model.centroids`).
 |===
+
+== History (shipped)
+
+#1163 gates recovery flushes: `index_flushed_into_axis` treats a missing `collection_config` as "no AXIS" and an
+empty `index_configs` as skip, and the AXIS EventLog consumer acknowledges-and-skips flush events for collections
+without `index_configs`. A 2026-07-23 call-chain audit verified that a restart with co-design collections performs
+no k-means training and no in-memory projection: the only reachable `train_model` callers are the gated IVF build
+path and the poll-driven discovery recluster pass, and `AxisManager::new` is lazy (no threads, training or I/O).
+*Rejected:* the `Option<Arc<AxisManager>>` boot refactor sketched in TD-AXIS-2 (~50 sites across ~19 files) buys
+zero boot time because construction is already cheap; per-collection gates are the correct mechanism.
+*Measured before the fix (2026-07-23):* 100% of one core for minutes after boot, logging
+"Training clustering model for collection 1 with 1000000 vectors".
 
 == The finding
 
@@ -51,4 +63,4 @@ Spot eviction-restart cycle: typical eviction notice 30s → pod drains → new 
 For the anvaOps B4ms Spot deployment (`proximadb_on_spot = true`): every eviction costs 3 minutes of downtime for IVF training. The fix eliminates this entirely.
 
 == Related
-link:TD-COMPACT-1-slow-recluster-compaction.adoc[TD-COMPACT-1] (compaction also re-trains — same root cause: not loading the persisted model). link:../../12-design/adr/ADR-070-axis-not-needed-for-codesign-collections.adoc[ADR-070].
+link:TD-COMPACT-1-slow-recluster-compaction.adoc[TD-COMPACT-1] (compaction also re-trains — same root cause: not loading the persisted model). link:../../12-design/adr/ADR-070-axis-not-needed-for-codesign-collections.adoc[ADR-070]. link:TD-IVF-2-insert-path-axis-training-ignores-empty-index-specs.adoc[TD-IVF-2] (overlap: the same `index_configs` gate on the insert path; S1b superlinear trainer allocation for opted-in collections).

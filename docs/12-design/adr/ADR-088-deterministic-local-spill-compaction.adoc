@@ -6,7 +6,7 @@
 
 [cols="1,3"]
 |===
-|Status |**Proposed** — implementation and measurement tracked by TD-COMPACT-11
+|Status |**Proposed** — implementation and measurement tracked by TD-COMPACT-11 (Partial 2026-10-15: default-OFF local-spill executor + disk-cache promotion landed #1417; 3.3M functional/economic slice measured).
 |Date |2026-08-02
 |Decider |Vijaykumar Singh
 |Amends |ADR-076 and ADR-086

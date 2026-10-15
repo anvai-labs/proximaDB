@@ -5,11 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export
+| Status | **Done (2026-08-08).** Moved `services/write_intent.rs` (9 tests) into a new horizontal crate (#1550).
 | Component | `crates/horizontal/proximadb-write-intent`; root `src/services/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe)
 |===
 
-== What moved
-`src/services/write_intent.rs` (9 tests) → new horizontal crate `proximadb-write-intent`.
-Root `services/mod.rs` re-exports it. Deps: serde + anyhow. Verified: standalone + root lib both pass.
+== History
+
+Deps: serde + anyhow; root re-export keeps consumers unchanged.

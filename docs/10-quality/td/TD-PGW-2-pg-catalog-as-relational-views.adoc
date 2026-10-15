@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open — Phase 1 (crash-proof + shape-aware dispatch) landed in PR #738; the full relational-view rewrite is the work tracked here.
+| Status | **Partial: Phase 1 (width-safety invariant, shape-aware `\dt`/`\d` dispatch, read-side dedup) shipped (#738); open: Phase 2 — real relational pg_catalog/information_schema views, retiring the synthetic dispatch, and `\d` schema authority.**
 | Severity | Medium — `\d` shows the backing collection's canonical schema columns rather than the DDL's user-defined columns; psql/ORM introspection is crash-safe but not yet fully faithful.
 | Component | `src/services/catalog_introspection.rs` (dispatch + synthetic builders); `src/network/postgres/protocol.rs` (`execute_catalog_introspection_query`); the relational engine (`try_run_select`).
 | Relates to | PR #738, ADR-047 (collection≡table / schema authority), link:TD-PGW-1-catalog-double-registration-write-side.adoc[TD-PGW-1]

@@ -7,7 +7,7 @@
 
 [cols="1,3"]
 |===
-| Status | **Accepted.** Implemented 2026-07-29; final SIFT1M evidence pending.
+| Status | **Accepted.** Implemented 2026-07-29; final SIFT1M evidence pending (not re-verified 2026-10-15 — treat the evidence gate as open).
 | Date | 2026-07-29
 | Deciders | Vijaykumar Singh
 | Relates to | ADR-076 (async compaction — the D1+D2 arc), ADR-052 (co-design cost spine — GETs dominate), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (the dominant at-rest+read cost term is GET round-trips)

@@ -5,27 +5,12 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export
+| Status | **Done (2026-08-06).** Moved the Catapult graph-ANN shortcut-edge optimizer (11 tests) into a new tokio-only horizontal crate (#1510).
 | Component | `crates/horizontal/proximadb-catapult`; root `src/graph/mod.rs`
-| Relates to | [[TD-DECOMP-1]] (recipe); [[TD-DECOMP-25..27]] (tiny-crate leaves)
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe)
 |===
 
-== Why
+== History
 
-`src/graph/catapult.rs` (**11 tests**) is the Catapult shortcut-edge optimization for graph ANN search
-(LLD 6.3, CatapultDB arXiv 2603.02164): it observes successful search trajectories and injects shortcut
-edges from query regions to frequently-visited destination nodes, so future similar queries skip
-redundant hops. Truly self-contained: zero `crate::` climb-out, zero real `super::`, **`tokio`-only** dep,
-**0 external consumers** (just the `pub mod` decl). Not feature-gated (default binary).
-
-== What moved (behavior-neutral)
-
-* `src/graph/catapult.rs` → `crates/horizontal/proximadb-catapult/src/catapult.rs`.
-* Root `src/graph/mod.rs`: `pub mod catapult;` → `pub use proximadb_catapult::catapult;`.
-* New horizontal-tier crate, dep `tokio`. No `CAPABILITY_MATRIX.toml` pointer.
-
-== Follow-ups
-
-* **Running total once merged: ~920 tests out of root** (909 + 11).
-* Standalone crate `--all-targets` compiled in ~6s with `RUSTC_WRAPPER=sccache`.
+Observes successful search trajectories and injects shortcut edges so similar queries skip redundant
+hops. It had 0 external consumers at extraction time.

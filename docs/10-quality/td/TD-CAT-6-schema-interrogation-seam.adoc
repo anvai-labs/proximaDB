@@ -9,7 +9,7 @@
 
 [cols="1,3"]
 |===
-| Status | **In progress** — S0 (correctness) + S1 (canonical discovery) landed; the rest needs the `services` owner. Root fix decided in **ADR-077**.
+| Status | **Partial: S0 (correctness) + S1 (canonical discovery) shipped (#1268); open: S2 (root-crate callers still use `services::record_store::schema_unique_column_sets`, verified 2026-10-15), S3 (a)–(c), S4 (ADR-077 migration).** Root fix decided in **ADR-077**.
 | Problem | "Which column sets does this table declare UNIQUE?" is answered by **two independent implementations** that covered different, non-overlapping route subsets and silently disagreed for months.
 | Thesis | The duplication is **structurally forced**, not careless. Move the answer down to the crate that owns the type, and the duplication becomes unrepresentable.
 |===
@@ -115,24 +115,16 @@ is shared — which is precisely where they diverged.
 | after ADR-077 is accepted
 |===
 
-=== 4.1 Defects found while implementing (all fixed in S0)
+=== 4.1 History (shipped): defects found while implementing S0
 
-None of these were predicted by the design; each was found by a test written against
-*actual* behaviour rather than against the spec:
+Each was found by a test written against *actual* behaviour rather than the spec (#1268):
 
-. **`ALTER TABLE … ADD CONSTRAINT … UNIQUE` was cataloged and never enforced.** Evolution
-  wrote `properties` + (only when *named*) `schema.indexes`; enforcement reads only
-  `relational_capabilities`. Disjoint fields, so the conflict check never ran. An
-  **unnamed** one wrote only the properties blob, which nothing reads at all.
-. **Renaming a PK column left a stale primary key.** Only the top-level copies were
-  rewritten, and `relational::effective_primary_key` *prefers* the capabilities copy — so
-  row validation and oid encoding resolved a column that no longer existed. A PK column
-  could also be *dropped* if it was declared only in the capabilities copy.
-. **`DROP CONSTRAINT` leaked its property row.** The key is `constraint:unique:<cols>` —
-  derived from columns, never the constraint name — so the by-name filter never matched a
-  UNIQUE. Found because fixing (1) *without* fixing this would have been worse than the
-  bug: the enforced copy would outlive the drop, so a dropped UNIQUE would keep rejecting
-  inserts.
+. **`ALTER TABLE … ADD CONSTRAINT … UNIQUE` was cataloged and never enforced** — evolution wrote
+  `properties` (+ `schema.indexes` only when named); enforcement reads only `relational_capabilities`.
+. **Renaming a PK column left a stale primary key** — `relational::effective_primary_key` prefers the
+  capabilities copy, which was not rewritten; a PK declared only there could also be dropped.
+. **`DROP CONSTRAINT` leaked its property row** — the key `constraint:unique:<cols>` is derived from columns,
+  not the name. Fixing (1) without this would have been worse than the bug: a dropped UNIQUE would keep rejecting inserts.
 
 == 5. Gate
 

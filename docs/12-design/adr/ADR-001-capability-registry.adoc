@@ -9,6 +9,14 @@
 
 Accepted
 
+Reconciliation (2026-10-15): implemented in a **reduced shape**. The registry lives in
+`crates/query/proximadb-query-capability` (`CapabilityRegistry` over a `Capability` /
+`CapabilitySet` model; errors in `src/errors/capability_error.rs`), not the tiered
+`CapabilityDescriptor`/`CapabilityTier` model or the `src/query/capabilities/` paths in the File
+Plan below. **Open:** `SUPPORTED_SURFACE.json` is not generated from the live registry —
+`docs/SUPPORTED_SURFACE.adoc` is hand-maintained, guarded by `scripts/validate_capability_matrix.py`
+and its status-as-of tag. The File Plan paths are historical.
+
 == Context
 
 ProximaDB has 6 storage engines (SST, VIPER, NOVA, HELIX, SWIFT, RAPTOR), 5 data models (Vector, Document, Graph, Observability, Relational), 4 protocol surfaces (REST, gRPC, SQL, PostgreSQL wire), and multiple query entry points (federated, unified, facade). There is no unified mechanism to:

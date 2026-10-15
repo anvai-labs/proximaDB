@@ -10,7 +10,7 @@
 
 [cols="1,3"]
 |===
-| Status | Open — composite-PK tables get spurious rejects (or skip the fence) on the CKS path
+| Status | Open — composite-PK tables get spurious rejects (or skip the fence) on the CKS path (re-verified 2026-10-15: the INSERT CKS identity is still built from `std::slice::from_ref(&pk_value)`; line numbers below are from filing and have drifted). The defect bites only where a `ConditionalKeyStore` is wired — see link:TD-OLTP-WIRING-1-composition-root-conditionalkeystore.adoc[TD-OLTP-WIRING-1] (overlap: wiring the CKS in production makes this a live spurious-reject); fix before or with that wiring.
 | Severity | Medium-High (functionality) — the common `(tenant_id, id)` pattern is unusable through the fenced path
 | Lane | `src/services/dml/mod.rs` + `crates/foundation/proximadb-data-model/src/key_codec.rs`
 |===

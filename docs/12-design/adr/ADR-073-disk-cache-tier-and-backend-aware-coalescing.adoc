@@ -1,5 +1,5 @@
 = ADR-073: Reattachable-disk cache tier + backend-aware coalescing (measured)
-:status: Proposed
+:status: Proposed — reconciled 2026-10-15: no implementation commit cites this ADR; the persistent PAX warm tier (ADR-085, Accepted) covers part of the disk-cache-tier ground — check overlap before implementing.
 :date: 2026-07-25
 :authors: co-design session 2026-07-25
 

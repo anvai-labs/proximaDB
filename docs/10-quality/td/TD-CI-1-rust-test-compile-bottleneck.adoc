@@ -7,9 +7,10 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** — deferred to a billing-tier decision (larger GitHub-hosted runner). No code action until then.
+| Status | **Open** — deferred to a billing-tier decision (larger GitHub-hosted runner). No code action until then. *Evidence 2026-10-15:* the unit leg still runs `CARGO_BUILD_JOBS=1` on `ubuntu-24.04`, and its healthy wall time is now 51-70 min (`ci.yml` `rust-test`, `timeout-minutes: 120`). Lever 2 (sccache) **was tried on this job and reverted** (#920): it OOM-killed the 16 GB runner 3/3 on 2026-07-13. sccache stays on the three compile jobs only. Related OOM relief: #859 (cdc feature-gate), #941.
 | Severity | Medium — the slowest job on the develop/qa CI tier (~49 min); does not fail, only costs wall-clock + a runner for the duration.
 | Component | CI — `.github/workflows/ci.yml` `rust-test` (matrix `test-type: unit`)
+| Relates to | link:TD-CI-4-benches-examples-ci-gap.adoc[TD-CI-4] (filed under this id in #1725), link:TD-CI-5-feature-matrix-has-no-job-timeout.adoc[TD-CI-5] (job timeouts)
 | Tracked-by | This TD; related OOM root cause in the cloud-emulator fix (PR #803, `scripts/run_cloud_emulator_tests.sh`).
 | Resolution | (planned) trial a larger runner (16 GB → 64 GB) for `rust-test` so `CARGO_BUILD_JOBS` can rise from 1 → 4-8; measure the compile reduction. Fallback: sccache / shared-build reuse.
 |===

@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|**Accepted** (ratified 2026-07-09; proposed 2026-07-08 after multi-agent review v1→v3)
+|Status|**Accepted** (ratified 2026-07-09; proposed 2026-07-08 after multi-agent review v1→v3). *Progress (reconciled 2026-10-15):* Phase 0 contracts (#755), Phase 1 (#758), Phase 2/2.1 (TD-OLAP-10 Partial, #760/#772), Phase 2.5 PAX scan (TD-OLAP-14 Partial, #796/#798/#807), Phase 3 hash join (TD-OLAP-11 Partial, #779/#802/#820), Phase 4.0 morsel (TD-OLAP-12 Partial, #838 default-OFF); Phase 5 multimodal (TD-OLAP-13) Open. **Note:** the committed agent-rules seed (`docs/agent-rules/CLAUDE.md.seed`) still states ADR-052's "do NOT build native HashAgg/HashJoin/Sort", which this ADR reversed.
 |Date|2026-07-08 (proposed) · 2026-07-09 (ratified)
 |Deciders|Vijaykumar Singh (ratified 2026-07-09 — the §12 open questions are resolved with their stated recommendations; see Revision Notes v4)
 |Relates to|ADR-039 (`ExecutionEngine` / `LogicalNode` seam), ADR-052 (vectorized-over-Arrow via DataFusion; PAX-native scan as the wedge), ADR-050 (cost-based routing + stats-fed planning), ADR-033 (vertical inside, standard outside), ADR-025 (deletion vectors), ADR-011 (bloom/ANN pre-filter), `DATAFUSION_BALLISTA_DISTRIBUTED_EXECUTION_2026_06_05.adoc`, `RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc`

@@ -3,6 +3,13 @@
 :toclevels: 3
 :date: 2026-05-27
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** Slices 1–5 landed: `FilterableHnswMetadata`, `search_with_predicate` on the AXIS indexes, snapshot v2, ADR-011 mode wiring, and shortfall diagnostics + counters. Residual (a) has since landed: REST v2 and gRPC v2 search responses carry a first-class `predicate_shortfall` recomputed at the merged result (`src/network/rest/v2/records.rs`, `src/network/grpc/v2/record_service.rs`). The default filtered path is now the filter-aware PAX cascade (link:adr/ADR-089-filter-aware-pax-cascade.adoc[ADR-089], TD-FPRUNE-1, `PROXIMADB_PAX_FILTERED_CASCADE` default-ON 2026-08-31). Open: (b) IVF inline pushdown, (c) selectivity-source / projection-freshness / rejected-route diagnostics, and a published recall envelope by selectivity band. The v0.2 note below is historical.
+| Relates to | TD-064 and TD-075 in `docs/10-quality/TECHNICAL_DEBT.adoc`, link:SEARCH_SURFACE_CONTRACT_2026_06_24.adoc[search surface contract], link:TENANT_COLLECTION_POD_AFFINITY_2026_05_27.adoc[pod affinity] (overlap: `SearchPlanTrace` staleness disclosure)
+|===
+
 [NOTE]
 ====
 **v0.2 release status: Beta.** Predicate-aware HNSW traversal is wired

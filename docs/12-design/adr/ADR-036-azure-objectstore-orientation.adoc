@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **but cited as a binding mandate** (CLAUDE.md co-design mandate #6, "ADR-036") and **largely implemented** (reconciled 2026-10-15): TD-173 — scheme honesty + per-object access-tier plumbing done for Azure and S3; open: GCS and `ProximaObjectStore` follow-ups. Owner decision needed: mark Accepted to match the mandate.
 |Date|2026-06-27
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-033 (cost spine — at-rest GB-month is a co-design term, not CPU), ADR-034 (access-path depth; this ADR supplies the *residency tier* the access path tiers against), ADR-032 (tenant-prefixed object-store catalog), ADR-023 (ranged cold-load primitive), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (object storage as a co-designed dimension)

@@ -1,9 +1,17 @@
 = TD-TBL-1: Persist canonical ProximaType schema as the collection/table authority
-:status: Open
+:status: Partial
 :dim: D4
 :pillar: OE
 :adr: ADR-047
 :phase: 1
+
+NOTE: **Status (verified 2026-10-15): Partial.** Shipped (#606): canonical `Vec<CollectionSchemaColumn>` persisted
+verbatim as a `collection.canonical_schema` catalog-asset sidecar, written and read by the v2 schema handlers
+(read overrides the narrow view when present; legacy collections fall back — mixed-read-safe), sticky across
+unrelated `update_collection` rebuilds, and the legacy adapters no longer fail closed (best-effort narrow
+projection). Still open from the plan below: `StoredSchema` read-back still sets `record_schema.columns: Vec::new()`
+(`catalog_config.rs` ~L392), the collection **create path** does not write the canonical schema (opt-in via the v2
+schema endpoint only), so `CatalogTableSchema` is not yet the *single* persisted authority.
 
 == Problem
 

@@ -4,9 +4,32 @@
 :icons: font
 
 [.lead]
-Sprint-level roadmap derived from link:../../../../concepts/vision.adoc[Vision]. This plan
+Sprint-level roadmap derived from link:../../../../05-concepts/vision.adoc[Vision] (historical;
+canonical vision is link:../../../../00-product/VISION.adoc[VISION]). This plan
 focuses on unifying cross-model query, catalog-centric governance, deployment neutrality,
 and operational simplicity.
+
+[NOTE]
+====
+*Reconciliation (2026-10-15).* The sprint calendar (S1–S24) is historical, and several owner-module
+paths no longer exist (`src/api_handlers/unified_handlers.rs`, `src/network/rest/v1/*`,
+`/api/v1/*`). Milestone status against `origin/develop`:
+
+[cols="2,1,4", options="header"]
+|===
+| Milestone | State | Evidence / what remains
+| M1 Unified cross-model planner/executor | Partial | One engine-selection seam: `ComputeScheduler::route_select` (ADR-052, ADR-064 core). The duplicate SQL parser collapsed (#2004). `/api/v1/unified/explain` is gone with v1 (TD-V1SUNSET-1). Remaining: legacy federated paths are not yet isolated behind flags.
+| M2 Dual columnar execution (Arrow in-memory + I/O range scan) | Superseded | Replaced by DataFusion OLAP behind the `ComputeBackend` seam (ADR-052) plus the PAX-native scan (TD-OLAP-1, partial) and coalesced `read_ranges` (#1649).
+| M3 Graph API parity (REST/gRPC) | Partial | v2 `ProximaGraphService` delivered (TD-122 partial). Deferred v2 graph RPCs are open (TD-124).
+| M4 Observability + health baseline | Done | Prometheus/OTLP metrics exposed (#1115) with an admin dashboard (#1147).
+| M5 Catalog-centric governance v1 | Partial | xCatalog validates all write surfaces. External-catalog duplicates removed and config wired (TD-CAT-8, #1693). The lineage hooks exist only for MLOps (TD-MLOPS-1).
+| M6 Distributed foundations (3-node sharding/replication) | Open | `cluster` feature is Experimental. Distributed write replication is in progress (STRATEGIC_ROADMAP Phase 3/4).
+| M7 Backup and restore v1 | Done (offline) | TD-014 resolved. Offline cold backup/restore subcommands (#2037); the TD-WAL-5 timing caveat is documented there.
+| M8 Arrow Flight integration | Done; cost-based provider selection partial | Flight v2 (#1378), canonical v2 Flight vector search (TD-FLIGHT-1, #1351).
+| M9 HA, rebalancing, consistency | Open | Rebalancing algorithm exists; multi-node failure-injection validation does not.
+| M10 Governance enforcement across models | Partial | Relational ABAC enforced in-plan (ADR-090, TD-USUB-3 #1919). Cross-model policy matrix tests are open.
+|===
+====
 
 == Assumptions
 

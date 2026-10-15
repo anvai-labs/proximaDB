@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open (functions tranche 1 **landed 2026-07-04**: 32 ANSI scalars + 4 aliases (string/trim/math/greatest-least/date_part/date_trunc) as registry kernels for the native route — DataFusion keeps its vectorized natives via the skip-list; SUBSTRING/EXTRACT/TRIM/POSITION special-syntax AST now lowers to registry FuncCalls; coverage ratchet test added (floor 52, only goes up). Remaining: window framing, aggregate set, casting/array/map tranches, late-mat, result cache)
+| Status | **Partial: functions tranche 1 shipped (2026-07-04); open: window framing, aggregate set, casting/array/map tranches, late-materialization, result cache.** History: (functions tranche 1 **landed 2026-07-04**: 32 ANSI scalars + 4 aliases (string/trim/math/greatest-least/date_part/date_trunc) as registry kernels for the native route — DataFusion keeps its vectorized natives via the skip-list; SUBSTRING/EXTRACT/TRIM/POSITION special-syntax AST now lowers to registry FuncCalls; coverage ratchet test added (floor 52, only goes up). Remaining: window framing, aggregate set, casting/array/map tranches, late-mat, result cache)
 | Priority | Per slice in the ADR-052 execution order: functions **P1b** (independent; OCP — one `ProximaValue` kernel, N bindings, additive ratchet); late-materialization **P2b** (needs TD-OLAP-1); result cache **P2b** (needs the tenant-scoped key + ADR-046/051 LSN eligibility)
 | Severity | Medium — blocks real BI/pgwire workloads even after the execution engine is fast
 | Component | `crates/foundation/proximadb-functions`, `proximadb-relational-executor`/DataFusion scan path, query result cache

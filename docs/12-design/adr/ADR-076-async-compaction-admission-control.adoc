@@ -17,40 +17,18 @@
 
 == Context
 
-ProximaDB's SST compaction is **inline synchronous**: every flush awaits the
-full compaction cycle (read all L0 → merge → train PCA/IVF → write new segment
-→ delete inputs) before continuing (`flush/mod.rs:747-781`). This is the
-opposite of every production LSM system:
-
-[cols="1,2,2,2"]
-|===
-| System | Compaction model | Admission control | Write blocking?
-| RocksDB | Async (separate compaction thread pool) | `slowdown_trigger` + `stop_trigger` L0 watermarks | No
-| HBase | Async (background compaction threads) | Compaction throttling + pressure mode | No
-| Cassandra | Async (`concurrent_compactors`) | IO throughput throttle + backpressure | No
-| Delta / Iceberg | Batch maintenance (OPTIMIZE / rewrite_data_files) | N/A (append-only, no flush) | No
-| **ProximaDB (today)** | **Inline synchronous** (blocks flush) | **None** | **Yes — full compaction duration**
-|===
+SST compaction was **inline synchronous**: every flush awaited the full cycle (read all L0 →
+merge → train PCA/IVF → write → delete inputs) — the opposite of RocksDB/HBase/Cassandra, which
+compact asynchronously behind L0 admission watermarks and never block writes.
 
 === The measured pathology
 
-The 2026-07-26 verification (1M SIFT ingest, Azurite) showed the TD-COMPACT-5
-training arm firing **every ~35s during ingest** — 5-7 redundant cycles, each
-re-reading + re-training growing L0 segments. Each cycle: N object-store GETs
-(read inputs) + PCA training (~35s CPU) + 1 PUT (write output) + N DELETEs
-(remove inputs). On cloud (50 ms/GET), the 7 redundant cycles waste
-**7× the object-store I/O** of a single post-ingest training pass.
-
-The root cause is the intersection of three gaps:
-
-1. **Inline blocking**: flush awaits compaction → ingest throughput is gated by
-   compaction speed (~1 flush/35 s, not ~1 flush/1 s).
-2. **No admission control**: writes proceed at full speed regardless of L0
-   backlog → compaction falls behind → more untrained segments → more triggers.
-3. **No debounce**: the training arm (`should_trigger_compaction`, TD-COMPACT-5)
-   fires on every flush whenever ANY untrained L0 ≥ 32 MB exists — no
-   "recently-trained" or "segment-is-stable" guard. A segment that is still
-   growing (receiving new flushes) is re-trained on every cycle.
+The 2026-07-26 1M-SIFT ingest on Azurite showed the TD-COMPACT-5 training arm firing **every
+~35 s** — 5–7 redundant cycles, each re-reading and re-training growing L0 segments (N GETs +
+~35 s PCA CPU + 1 PUT + N DELETEs; ~7× the object-store I/O of one post-ingest pass). Three
+intersecting gaps: (1) inline blocking gated ingest at ~1 flush/35 s; (2) no admission
+control, so compaction fell behind; (3) no debounce — the arm fired on every flush while any
+untrained L0 ≥ 32 MB existed, re-training segments still receiving flushes.
 
 == Decision
 
@@ -170,36 +148,19 @@ metrics-panic + warm-manifest bugs ship.
 
 == Consequences
 
-* **Ingest throughput**: ~30× faster (1 flush/1 s vs 1 flush/35 s) — flush
-  is no longer gated by compaction/training wall time.
-* **Object-store I/O**: ~7× less compaction I/O during ingest (1 training
-  pass post-ingest vs 7 redundant cycles during ingest). Each saved cycle =
-  N GETs + 1 PUT + N DELETEs avoided.
-* **Latency**: query latency during ingest drops (no compaction CPU contention
-  on the query path — compaction runs on separate worker threads).
-* **Complexity**: introduces background-thread coordination (the worker pool
-  already exists; the `schedule_compaction` + `worker_loop` are built). The
-  inline path remains as a test-only synchronous option.
-* **Correctness**: compaction is idempotent (read-merge-write-delete); running
-  it async doesn't change the output. The atomic coordinator serializes the
-  publish (`finalize_atomic_operation`), so concurrent flushes + compaction
-  don't corrupt. The segment-header `layout_version` is the mixed-read-safe
-  marker (v1 + v3 coexist).
-
-== Co-design cost analysis
-
-On object storage, each compaction cycle costs N GETs (read inputs) + 1 PUT
-(write output) + N DELETEs (remove inputs). The dominant cost term is the GET
-round-trips (50 ms each on cloud). The 7 redundant training cycles during
-ingest waste 7 × N × 50 ms of pure object-store I/O. The async + debounced
-model reduces this to 1 × N × 50 ms (one post-ingest pass) — a **7× I/O cost
-reduction** in the compaction path, the single largest waste in the current
-system during streaming ingest.
-
-The admission control watermarks prevent the L0 backlog from growing unbounded
-(which would increase the per-query GET count — each un-compacted L0 file adds
-footer + data GETs). By keeping L0 bounded, the watermarks protect query
-latency during heavy ingest.
+* Flush is no longer gated by compaction/training wall time (projected ~30×: 1 flush/1 s vs
+  1 flush/35 s) and ingest-time compaction I/O drops ~7× (one post-ingest training pass instead
+  of 7 redundant cycles, each N GETs + 1 PUT + N DELETEs at ~50 ms/GET on cloud — the single
+  largest streaming-ingest waste). Query latency during ingest improves (compaction CPU on
+  worker threads).
+* L0 watermarks bound the backlog, which also bounds per-query GETs (each un-compacted L0 file
+  adds footer + data GETs).
+* Correctness unchanged: compaction is idempotent; the atomic coordinator serializes publish
+  (`finalize_atomic_operation`); segment-header `layout_version` is the mixed-read marker
+  (v1 + v3 coexist). Cost: background-thread coordination; the inline path survives only as a
+  deterministic test option.
+* Later refinements: link:ADR-081-admission-first-flush-ownership.adoc[ADR-081] **amends D2's L0 admission placement** (metadata-only preflight before any clone/sort); byte-weighted memory admission (ADR-086) and deterministic local-spill
+  compaction (ADR-088, Proposed) build on this async/admission model.
 
 == Explicitly out of scope
 

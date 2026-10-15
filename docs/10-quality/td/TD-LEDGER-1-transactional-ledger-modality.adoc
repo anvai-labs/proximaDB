@@ -9,100 +9,51 @@ toc::[]
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **S1–S3 + v1 gaps shipped** (updated 2026-07-24). Correctness core (#1170), durable WAL (#1171), service port (#1174), gRPC proto+service (#1177), server registration (#1178), tenant-verified settle (#1182), background TTL sweeper (#1183), Total/Daily windows (#1185). Ships **Experimental**, feature-gated (`experimental-ledger`). **Amended 2026-07-24 (ADR-071):** durability is a **dedicated** ledger WAL, *not* the shared record WAL (queue-modality precedent) — see §Synthesis + §stacking table. Remaining: HA (S4), Monthly window, reflection descriptor (deferred).
+| Status | **Partial: S1–S3 + v1 gaps shipped — correctness core (#1170), durable dedicated WAL (#1171), service port (#1174), gRPC proto+service (#1177), server registration (#1178), tenant-verified settle (#1182), background TTL sweeper (#1183), Total/Daily windows (#1185), dedicated-WAL amendment (#1186); ships Experimental behind `experimental-ledger`. Open: S4 HA (C4 failover no-double-admit, C5 sub-ms p99 evidence, graduation), runtime ledger-only launch profile, REST mirror, Monthly window, reflection descriptor (deferred), S5 Sandhi adoption (other repo).**
 | Implements | link:../../12-design/adr/ADR-071-transactional-ledger-modality.adoc[ADR-071] / link:../../rfcs/0001-transactional-ledger-modality.adoc[RFC-0001]
 | Acceptance bar | the Sandhi `TD-0007` `EnforcementLedger` conformance suite (C1–C6)
+| Component | `crates/modalities/proximadb-ledger`, `proto/proximadb/v2/ledger.proto`, `src/network/grpc/v2/ledger_service.rs`, `src/network/multi_server.rs`
+| Relates to | link:TD-SANDHI-1-gateway-egress-metering-wiring.adoc[TD-SANDHI-1] (Sandhi is the anchor consumer)
 |===
 
-== Context — the gap, in code
+== History (shipped)
 
-The audit that motivated ADR-071 found no store-backed, wire-reachable atomic conditional write:
+* **Gap.** No store-backed, wire-reachable atomic conditional write existed: `StorageKV` is non-atomic,
+  object-store `put_if_absent` is create-only, `MultiModelTransactionManager` participants are stubs,
+  and TTL (`valid_to_ns`) was enforced by read-time filtering only — no sweeper.
+* **Decision (ADR-071, the contract — do not restate here).** Memtable-authoritative counter + a
+  **dedicated** ADR-069-style local-disk WAL (CRC-framed, torn-tail-tolerant, replayed on open) with a
+  configurable sync knob (per-op fsync for `Block` scopes, group-commit for `Warn`), reclaimed by a timed
+  TTL sweeper. Derived from SQLite (single-writer-per-scope), Redis (sync policy as a knob), MemSQL
+  (in-memory structure authoritative, log for recovery) and Memcached (TTL lease). The shared-substrate
+  economy comes from the memtable model, `TenantContext` + `DrPathBuilder`, `ObjectAccessTier` and the
+  catalog/observability spine — **not** the log.
+* **Lesson (amendment 2026-07-24, #1186).** The original plan spliced `CanonicalOperation::Ledger*`
+  into the shared record WAL (`RecordStore::write_mutations`). Rejected: millions of tiny hot counter
+  mutations diverge from bulk record ingest (the queue-modality precedent), and an OLTP log wants its own
+  sync cadence and failure isolation. Any surviving reference to a ledger op on the record WAL is stale.
+* **Shipped primitives.** Atomic reserve/settle/CAS under one lock-held check-and-append
+  (`spent + reserved + ceiling ≤ limit`); idempotent settle (`Reserved → Settled`, replay matches zero
+  rows); background TTL sweeper (C2: freed without a read touching the scope) + opportunistic reclaim;
+  tenant-verified settle; store-owned Total + Daily windows (`Monthly` intentionally absent — needs
+  civil-calendar math). gRPC `ProximaLedgerService { Reserve; Settle; CompareAndSwap; SetLimit; GetScope; }`
+  registered under the compile-time gate.
+* **Evidence.** C1 (`ceiling_reservation_prevents_overshoot` + concurrent oversubscription), C2
+  (`expired_lease_is_reclaimed_no_capacity_leak`), C3 (`settle_is_idempotent_under_repeat`) as S1/S2 gates.
 
-* `crates/storage/proximadb-storage-kv/src/lib.rs:18` — `StorageKV::{put,get,delete}`, no atomicity.
-* `crates/storage/proximadb-object-store/src/lib.rs:247` — `put_if_absent`, **create-only**; cannot
-  decrement a counter.
-* `crates/storage/proximadb-storage-transaction/src/manager.rs:533,561,623` —
-  `MultiModelTransactionManager` participants are stubs; the crate is constructed by nobody.
-* `crates/foundation/proximadb-records/src/lib.rs:922,966` — TTL (`valid_to_ns`) is enforced by
-  **read-time filtering only**; there is no background sweeper that physically releases expired
-  durable records.
+== Open — runtime launch profile and REST mirror
 
-The three absences become the three new primitives (§4).
-
-== First principles — where does OLTP durability live?
-
-The load-bearing question. A ledger op is a **tiny, hot, correctness-critical write**: one keyed
-counter, twice per consumer request, on the critical path, where a lost or double-counted write breaks
-a hard cap. The reference OLTP/KV systems each answer "durability vs. latency" differently; we derive
-ProximaDB's answer by mapping their lessons onto the substrate we already have (ADR-069).
-
-[cols="1,2,2", options="header"]
-|===
-| System | Durability model | Lesson we take
-| *SQLite* | Single-writer; rollback/WAL journal; `fsync` at commit. Strong durability, but a single-writer throughput ceiling. | **Single-writer-per-scope** is the right serialization granularity for a hot key; ProximaDB's per-collection single-writer WAL (ADR-069) is the same shape. We do not need MVCC/OCC on the hot path.
-| *Redis* | In-memory; append-only file with `appendfsync = always \| everysec \| no`; periodic RDB snapshot. The durability/throughput trade is an explicit knob. | **Make the sync policy a knob** — per-op fsync vs. group-commit — and bind it to the caller's risk tier (hard cap = strict, soft cap = interval).
-| *MemSQL / SingleStore* | In-memory lock-free skiplist rowstore; durability via a write-ahead log + periodic snapshots; recovery replays the log. | **The in-memory structure is authoritative; the log is for recovery.** The memtable holds the live counter; the WAL is replayed on failover, not read on the hot path.
-| *Memcached* | Pure in-memory; **no durability**; LRU + native TTL. | The non-durable ceiling (the fail-open / `Warn` tier) *and* the **TTL-lease** primitive — expiry as a first-class, timed mechanism.
-|===
-
-**Synthesis (the decision, ADR-071 §3).** The ledger is a **memtable-authoritative counter**
-(memcache/memsql read/write latency) made durable by an **append to the ledger's dedicated
-ADR-069-style local-disk WAL** (sqlite-class durability, flat-cost, sub-ms fsync; *not* the shared
-record WAL — divergent access patterns, per the queue-modality precedent, amended 2026-07-24) with a
-**configurable sync policy** (the redis knob), reclaimed by a **timed TTL sweeper** (the memcache
-lease idea, made durable). Group-commit
-batches concurrent appends to amortize fsync. Crucially, **none of this is a new engine** — it is the
-existing `RecordStore::write_mutations` → `TableWalAppender::append_operations` → memtable path
-(`src/services/record_store.rs:1848`, `src/services/canonical_wal.rs:132`) with one new operation kind.
-
-== Cross-modal stacking — what the ledger harvests (the shared economy)
-
-ADR-071 §2. The modality composes existing machinery; each row is cost *not* re-paid:
-
-[cols="2,2,2", options="header"]
-|===
-| Shared component (file) | Reused by the ledger for | Economic / coherence benefit
-| ADR-069 local-disk WAL *pattern* — a **dedicated** ledger log, not `canonical_wal.rs` | per-op durability | reuses the ADR-069 *pattern* (flat-cost, sub-ms fsync), not the shared record log — divergent access patterns (queue-modality precedent, amended 2026-07-24)
-| memtable / partition (`src/storage/memtable/`) | the authoritative counter + live leases | O(1) read/write; restart via WAL replay — no bespoke persistence
-| partition-lease single-writer, CAS-fenced (`src/cluster/partition_lease.rs`) | HA + linearizable-per-scope | no per-op consensus; owner failover for free
-| `TenantContext` + `DrPathBuilder` | per-scope isolation & billing | fail-closed multi-tenancy at no extra cost
-| `ObjectAccessTier` (ADR-036) | cold ledger snapshots at rest | tiered at-rest cost lever
-| catalog + observability spine | scope discovery + metrics | operational surface inherited
-| `MultiModelTransactionManager` (future) | cross-modal multi-key txns | budgets/quotas attach to vector/doc collections
-|===
-
-Reverse pollination: once (7) is wired, a *vector* or *document* collection can carry a first-class
-budget/quota as ledger-backed metadata — the multi-model whole exceeds the sum.
-
-== Selective launch — run only the modality you need
-
-ADR-071 §4. Two composable gates:
-
-1. *Compile-time:* a cargo feature `experimental-ledger` gating the `crates/modalities/proximadb-ledger`
-   engine crate, the proto service, and the server impl. A build without it has zero ledger code.
-2. *Runtime:* a modality-enablement set consulted at service registration in
-   `src/network/multi_server.rs` (where `.add_service(canonical_*_grpc_service(...))` lines live). A
-   **ledger-only profile** registers only the ledger service and starts only WAL + memtable +
-   object-store — **no** AXIS/PAX/DataFusion/vector/graph engines.
-
-Result: one codebase, two shapes — the full multi-model store, or a lean *proximaDB-ledger* (a
-Redis/etcd-class OLTP-KV). The stacking (previous section) is what makes the lean profile a clean
-carve-out: the ledger depends only on the common lower layers, not on any search/analytics engine.
-
-== The three new primitives (the real work)
-
-1. *Atomic conditional write.* A new `CanonicalOperation::{LedgerReserve, LedgerSettle, CompareAndSwap}`
-   applied **under the partition memtable write lock** and appended to the WAL — check
-   `spent + reserved + ceiling ≤ limit` and mutate in one lock-held step. Not `put_if_absent`
-   (create-only), not `StorageKV` (non-atomic). A `MultiModelOperation::LedgerOperation` variant is
-   added at `crates/storage/proximadb-storage-transaction/src/operations.rs:243` for the *future*
-   multi-key path only.
-2. *Timed TTL lease reclaim.* A background sweeper per owned partition that physically releases expired
-   unsettled reservations (today there is no durable-record sweeper — `is_dead` only filters at read),
-   plus **opportunistic reclaim on the next `Reserve` for a scope** as a latency optimization.
-   Satisfies C2 ("freed without a read touching the scope").
-3. *Idempotent settle.* `Reserved → Settled` guarded by the lease state; a replay matches zero rows.
-   Built on (1).
+* *Runtime ledger-only profile (ADR-071 §4):* a modality-enablement set consulted at service
+  registration in `src/network/multi_server.rs`. A **ledger-only profile** registers only the ledger
+  service and starts only WAL + memtable + object-store — **no** AXIS/PAX/DataFusion/vector/graph
+  engines. Only the compile-time `experimental-ledger` gate exists today (no runtime profile found,
+  2026-10-15).
+* *REST mirror:* `src/network/rest/v2/ledger.rs` (planned in the v1 API surface) does not exist; v1 is
+  gRPC-only. pgwire is out of scope for v1 (autocommit-only today). Full shapes in RFC-0001 §API Changes.
+* *Future multi-key path:* a `MultiModelOperation::LedgerOperation` variant at
+  `crates/storage/proximadb-storage-transaction/src/operations.rs` for cross-modal multi-key
+  transactions only (non-goal for v1). Once wired, a *vector* or *document* collection can carry a
+  first-class budget/quota as ledger-backed metadata.
 
 == Consistency mechanism
 
@@ -152,9 +103,9 @@ Mirrors the anchor consumer's own sequencing (Sandhi ADR-0005: correctness core 
 [cols="1,4,2", options="header"]
 |===
 | Stage | Work | Gate
-| *S1 — correctness core* | `crates/modalities/proximadb-ledger`: the pure atomic reserve/settle/CAS state machine + TTL-lease logic, **in-memory, no wiring**, behind a small trait. | C1/C3 + concurrent oversubscription green as unit tests.
-| *S2 — durability* | WAL op on the ADR-069 substrate + memtable-resident counter + replay-on-open; configurable sync (per-op / group-commit); the C2 sweeper + opportunistic reclaim. | C2 + restart-survives-spend green.
-| *S3 — wire surface* | `DataModel::Ledger`, `ProximaLedgerService` proto + gRPC/REST server + router registration; the `experimental-ledger` feature gate + ledger-only launch profile. | end-to-end gRPC reserve/settle; ledger-only build boots.
+| *S1 — correctness core* — DONE (#1170) | `crates/modalities/proximadb-ledger`: the pure atomic reserve/settle/CAS state machine + TTL-lease logic, **in-memory, no wiring**, behind a small trait. | C1/C3 + concurrent oversubscription green as unit tests.
+| *S2 — durability* — DONE (#1171, #1183; dedicated WAL per #1186) | WAL op on the ADR-069 substrate + memtable-resident counter + replay-on-open; configurable sync (per-op / group-commit); the C2 sweeper + opportunistic reclaim. | C2 + restart-survives-spend green.
+| *S3 — wire surface* — DONE except the REST mirror and the runtime ledger-only profile (#1174, #1177, #1178) | `DataModel::Ledger`, `ProximaLedgerService` proto + gRPC/REST server + router registration; the `experimental-ledger` feature gate + ledger-only launch profile. | end-to-end gRPC reserve/settle; ledger-only build boots.
 | *S4 — HA* | partition-owner routing + WAL-replay failover; C4 no-double-admit test; C5 benchmark evidence filed; graduate per `SUPPORTED_SURFACE.adoc`. | C4 + C5 green; leaves Experimental.
 | *S5 — external adoption* | Sandhi adds a thin `ProximaLedger` arm behind its `EnforcementLedger` trait (Sandhi-repo work; listed for traceability). | Sandhi TD-0007 suite green on the ProximaDB backend.
 |===

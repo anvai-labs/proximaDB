@@ -13,6 +13,8 @@
 
 Proposed. Tracker TDs: `TD-TBL-1..5` (see _Phased rollout_).
 
+*Reconciled 2026-10-15:* all five TD-TBL files read `Open`, but Phase 1 groundwork has landed — catalog-authoritative collection lifecycle + `evolve_schema` (#609) and ADR-048 P1 "typed `CatalogTableSchema.columns` is the canonical schema" (#612). TD-TBL-1's status is likely stale; Phases 2–5 are open. ADR-048 (P1–P5) and ADR-049 (M2) carry overlapping schema-authority steps.
+
 == Context
 
 `CollectionService` "registers a table," but the persisted collection schema is the v1

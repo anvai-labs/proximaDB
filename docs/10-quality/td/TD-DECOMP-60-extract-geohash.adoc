@@ -5,17 +5,12 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export (one import rewrite)
+| Status | **Done (2026-08-12).** Moved `GeoHash` + `encode_geohash` / `decode_geohash` / `geohash_neighbors` (9 tests) into a new horizontal crate (#1586).
 | Component | `crates/horizontal/proximadb-geohash`; root `src/index/geo/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-59-extract-geo-types.adoc[TD-DECOMP-59]; link:TD-DECOMP-60-extract-geohash.adoc[TD-DECOMP-60]; link:TD-DECOMP-61-extract-geo-queries.adoc[TD-DECOMP-61]; link:TD-DECOMP-62-extract-geo-index.adoc[TD-DECOMP-62]; link:TD-DECOMP-64-rename-document-geo-index.adoc[TD-DECOMP-64]
 |===
 
-== What moved
-`src/index/geo/geohash.rs` (9 tests: `GeoHash` + `encode_geohash` / `decode_geohash` /
-`geohash_neighbors`) → new horizontal crate `proximadb-geohash`. Root `index/geo/mod.rs` re-exports it
-(`pub use proximadb_geohash::geohash;`), so the existing `pub use geohash::{GeoHash, decode_geohash,
-encode_geohash, geohash_neighbors};` resolves unchanged. Deps: `proximadb-geo-types` only (zero `crate::`
-climb-out, `super::` test-only). The one `use super::types::{GeoBoundingBox, GeoPoint};` was rewritten to
-`use proximadb_geo_types::types::{GeoBoundingBox, GeoPoint};` (the sibling geo-types hub, TD-DECOMP-59).
-Verified: standalone + clippy -D warnings + root lib all pass. SIFT recall ratchet SKIPS (index/** is not
-storage_changes).
+== History
+
+Depends only on `proximadb-geo-types`. This is the shared geohash implementation that the document-field
+geo index should reuse (open in link:TD-DECOMP-64-rename-document-geo-index.adoc[TD-DECOMP-64]).

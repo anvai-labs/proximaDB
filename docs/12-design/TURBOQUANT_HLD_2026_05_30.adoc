@@ -6,7 +6,7 @@
 :sectnums:
 :last-updated: 2026-05-30
 
-Status: Draft, paired with link:adr/ADR-021-turboquant-quantizer-and-in-kernel-allowlist.adoc[ADR-021] +
+Status: Draft, paired with link:adr/ADR-021-turboquant-quantizer-and-in-kernel-allowlist.adoc[ADR-021] — **implementation Partial (reconciled 2026-10-15)**; live per-phase status is the LLD Implementation Status table (canonical) +
 Date: 2026-05-30 +
 Scope: Algorithm, architecture, concurrency model, and route integration for TurboQuant. +
 Companion: link:TURBOQUANT_LLD_2026_05_30.adoc[TURBOQUANT_LLD_2026_05_30] (byte layouts, decisions locked, phased implementation).
@@ -178,70 +178,13 @@ Every search that selects TurboQuant must produce a `RoutedExecutionPlan` that r
 
 A planner that fails any of the rejected-route reasons in ADR-021 §"Rejected route reasons" produces a `RoutedExecutionPlan` with `valid=false` and a populated `rejected_route` reason, surfacing the decision to EXPLAIN clients.
 
-== Open Questions for LLD
+== Open Questions for LLD (resolved)
 
-The following questions are open after HLD review and MUST be locked in the LLD's Decision Index before any P2+ code lands:
-
-[cols="1,5,3", options="header"]
-|===
-| ID | Question | LLD section
-
-| Q1
-| Wire format for persisted `TurboQuantVectorData`: header byte layout, alignment, endianness.
-| §3 Wire / Storage Layouts
-
-| Q2
-| Persistence file naming and directory convention. (e.g. `/tmp/proximadb/quant/turboquant_v1_{collection_id}.tq`)
-| §3
-
-| Q3
-| Per-collection rotation seed: derivation function (e.g. `seed = blake3(collection_id, "turboquant.v1") truncated to u64`) and persistence in xCatalog.
-| §4 xCatalog schema
-
-| Q4
-| Lazy vs eager construction: do we materialize SIMD-blocked codes at `add()` or first `search()`? Trade-off: ingest latency vs first-query latency.
-| §5 Lifecycle
-
-| Q5
-| Memory layout: store calibration (`shift`, `scale_tq`) as `Vec<f32>` per-collection, persisted alongside codes? Or in xCatalog metadata?
-| §3, §4
-
-| Q6
-| TQ+ minimum sample threshold: turbovec uses 1000; do we keep it or parameterize?
-| §6 Calibration
-
-| Q7
-| Identity-calibration semantics for collections that never accumulate ≥ 1000 vectors: silent fallback or explicit error?
-| §6
-
-| Q8
-| AXIS adapter parameter shape: `Option<&dyn CandidateSet>` as a new search() parameter, vs an extension to the existing `filter: Option<&HashMap>`. ADR-021 picks the former; LLD locks the concrete signature.
-| §7 Adapter integration
-
-| Q9
-| Epoch-bump re-encode policy: lazy on next search vs eager async on epoch change.
-| §8 Epoch / repair
-
-| Q10
-| `repack_3bit` path: implement it now (4-bit and 2-bit are the main targets) or defer to a follow-up?
-| §9 Scope
-
-| Q11
-| Bit-identical scoring test: encode on one arch, search on another. Specify the test corpus.
-| §10 Test plan
-
-| Q12
-| Prometheus metric naming: `proximadb_turboquant_blocks_skipped_by_mask_total` vs a generic `proximadb_ann_kernel_blocks_skipped_total` with label.
-| §11 Observability
-
-| Q13
-| EXPLAIN field name: `mask_pushed_to_kernel` vs `kernel_mask_pushed`. Naming convention consistency check.
-| §11
-
-| Q14
-| Recall validation gates: per-bit-width thresholds vs single global gate.
-| §12 Acceptance criteria
-|===
+All fourteen HLD questions (Q1–Q14: wire format, file naming, rotation seed, lazy/eager
+construction, calibration storage, TQ+ threshold, identity fallback, AXIS adapter shape, epoch
+re-encode, 3-bit path, cross-arch test, metric and EXPLAIN naming, recall gates) are **locked** in
+the link:TURBOQUANT_LLD_2026_05_30.adoc[LLD] "Decision Index". It restates each question with its
+decision, and code cites it (e.g. `src/index/turboquant_bridge.rs`, `turboquant/calibration.rs`).
 
 == Sequencing & Multi-Session Tracking
 

@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **partially implemented** (reconciled 2026-10-15): TD-155 (per-collection VectorQuant) and TD-156 (configurable geometry; tier-2 rerank quant #624) Resolved; TD-158 Resolved (via ADR-030). Open: TD-150 (quant default-ON), TD-151, TD-153, TD-154, TD-157, TD-159; TD-152 (retire SWIFT/RAPTOR) Open. The rerank/cascade read path is now governed by ADR-062/ADR-089; storage-format scope by ADR-094.
 |Date|2026-06-25
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-010 (PAX Block Format), ADR-021 (TurboQuant), ADR-020 (Canonical WAL Authority), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`, `PAX_V2_SQ8_PUSHDOWN_2026_06_17.adoc`, `QUANTIZATION_KERNEL_SPLIT_2026_06_22.adoc`

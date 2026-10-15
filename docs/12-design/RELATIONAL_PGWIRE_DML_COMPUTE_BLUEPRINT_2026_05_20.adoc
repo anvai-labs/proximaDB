@@ -3,7 +3,7 @@
 :toclevels: 4
 :sectnums:
 
-Status: Active implementation blueprint +
+Status: **Partial (reconciled 2026-10-15)** — implementation blueprint. T0–T3, T14 and T17 are complete. T4, T5, T8–T11, T15 and T18 are partial. T6, T7, T12, T13 and T16 are pending. The tracker below keeps every open residual verbatim. Shipped narrative is compacted; the full per-test record is in git history. +
 Date: 2026-05-20 +
 Scope: PostgreSQL wire SQL DML, relational catalog validation, legacy VectorOps compatibility,
 table-record writes, table-to-table write planning, compute routing, and source-reader execution.
@@ -1104,49 +1104,24 @@ Retirement gates:
 |===
 | Phase | Status | Deliverable | Primary files
 
-| T0
+| T0–T3
 | Done
-| Parser and DML service lower VALUES DML into catalog-validated canonical records.
-| `src/query/sql_frontend/parser.rs`, `src/services/dml/mod.rs`,
-`crates/control/proximadb-catalog/src/relational.rs`
-
-| T1
-| Done
-| `TableRecordStore` boundary, scan contract, xCatalog route selection, direct `RecordStorage`
-adapter, and VectorOps compatibility adapter.
-| `src/services/record_store.rs`, `src/services/mod.rs`
-
-| T2
-| Done
-| `CopyIntoPlan`, `DmlWritePlanner`, `TableWriteRouter`, candidate paths, guards, rule costs.
-| `src/query/table_write_plan.rs`
-
-| T3
-| Done
-| `TableWriteExecutor` boundary, planned-only executor, native record-batch write executor, and
-cursor-based source-reader contract.
-| `src/query/table_write_executor.rs`, `src/services/dml/mod.rs`
+| VALUES DML lowered into catalog-validated canonical records (T0). `TableRecordStore` boundary, scan contract, xCatalog route selection, direct `RecordStorage` adapter and VectorOps compatibility adapter (T1). `CopyIntoPlan`, `DmlWritePlanner`, `TableWriteRouter`, candidate paths, guards and rule costs (T2). `TableWriteExecutor` boundary, native record-batch write executor and cursor-based source-reader contract (T3).
+| `src/query/sql_frontend/parser.rs`, `src/services/dml/mod.rs`, `src/services/record_store.rs`, `src/query/table_write_plan.rs`, `src/query/table_write_executor.rs`
 
 | T4
 | Partial
 | `TableRecordStoreSourceReader` for catalog-table scans through `TableRecordStore::scan_records`.
-Parser lowers only safe `INSERT INTO target SELECT * FROM source` into a catalog-table source;
-pgwire full-table scans now call `DmlService::scan_table_records` and project catalog columns from
-`ProximaRecord` rows through the compatibility store. Simple pgwire `WHERE` clauses with catalog
-column comparisons, `IN`, `LIKE`, and `IS NULL` joined by `AND` are evaluated over the scan result
-as a compatibility adapter step. Single-column OR-of-equality predicates (`col = v1 OR col = v2`)
-are now folded into `col IN (v1, v2, ...)` by `try_fold_or_as_in`; the smoke test OR case is
-promoted from `known_gap_until_contains` to `run_sql_contains` (pass=28). Added tests for AND+IN
-compound (`c_id IN (1,2,3) AND c_active = true` → two predicates correctly extracted), AND+IS_NULL
-(`label IS NULL AND c_id = 5` → IsNull + Comparison predicates), AND+LIKE
-(`label LIKE 'prefix%' AND c_id = 5` → Like + Comparison), AND+IS_NOT_NULL
-(`label IS NOT NULL AND c_active = true` → IsNull(negated=true) + Comparison), and AND+NOT_IN
-(`c_id NOT IN (10,20,30) AND c_active = false` → In(negated=true) + Comparison). Total pgwire protocol tests: 29.
-DML-level predicate filtering tests added for: `is_null_predicate_filters_nullable_column_rows`
-(IS NULL + IS NOT NULL via `scan_table_records_with_predicates`), `in_and_not_in_predicates_filter_correctly`
-(IN + NOT IN on TEXT column), `like_predicate_filters_correctly` (LIKE + NOT LIKE with `%` wildcard).
+*Shipped (history):* safe `INSERT INTO target SELECT * FROM source` lowering. pgwire full-table scans
+through `DmlService::scan_table_records`. Compatibility-adapter `WHERE` evaluation for
+`=`/`IN`/`LIKE`/`IS [NOT] NULL` joined by `AND`. Single-column OR-of-equality folded into `IN`.
 Multi-column OR, OR of non-equality expressions, and compound AND/OR branches still fall back to
 full scan. Joins, aggregates, full expression planning, and direct PAX/record-storage scanners remain pending.
+*Reconciled 2026-10-15:* joins, aggregates and expression planning for SELECT now run through
+`ComputeScheduler::route_select` (native Volcano or DataFusion; TPC-H 22/22 over pgwire,
+`tests/tpch_pgwire_e2e.rs`, `tests/tpcds_pgwire_e2e.rs`). The direct PAX scanner for DataFusion is
+TD-OLAP-1, slice 1 landed default-OFF. The remaining T4 gap is the compatibility-adapter
+predicate path above.
 | `src/query/table_write_executor.rs`, `src/query/sql_frontend/parser.rs`, `src/services/dml/mod.rs`,
 `src/network/postgres/protocol.rs`
 
@@ -1183,70 +1158,24 @@ closing, and PAX snapshot/partition overwrite commits.
 | T8
 | Partial
 | Statistics-backed CBO and EXPLAIN output for selected/rejected candidate paths.
-`TableWriteRouter` now consumes target/source xCatalog statistics when present and threads row/byte
-estimates into route cost and explanation output. Runtime feedback added: `DmlService::bump_row_count_stats`
-performs a read-delta-write on `CatalogTableStatistics.row_count` after successful INSERT (+N),
-DELETE (-N), and UPSERT (+N) operations; errors are non-fatal (logged as warnings). Test
-`insert_and_delete_update_catalog_row_count_statistics` verifies that three inserts set row_count=3
-and one delete decrements to row_count=2. Per-column NULL counts added:
-`DmlService::bump_column_null_counts` computes per-column null deltas before consuming the `values`
-vector, then performs a read-delta-write on `CatalogTableStatistics.column_stats[col].null_count`
-after each INSERT; null-free inserts skip the catalog write. `literal_to_proxima_value_for_column`
-extended to return `ProximaValue::Null` for nullable String, Integer, Float, Date, Time, and Decimal
-columns (previously returned `Err` for these types, causing INSERT to fail). Test
-`insert_null_values_update_column_null_count_statistics` verifies: 3 rows (row1 note=NULL,
-row2 score=NULL, row3 both present) → row_count=3, note.null_count=1, score.null_count=1,
-id.null_count=0. Per-column min/max tracking added: `DmlService::compute_column_minmax_from_records` extracts
-sortable string representations of String and integer column values from the canonical
-`ProximaRecord` batch before it is consumed by mutations; `bump_column_minmax` merges the
-batch min/max into `CatalogTableStatistics.column_stats[col].min_value` / `.max_value` using
-lexicographic comparison (integers zero-padded with explicit sign for correct sort order). Test
-`insert_updates_column_min_max_statistics` verifies: 3 rows (name ∈ {alice, bob, charlie},
-score ∈ {10, 20, 30}) → `name.min='alice', name.max='charlie'`, `score.min < score.max`.
-NDV (distinct count) tracking added: `DmlService::value_to_ndv_key` converts ProximaValue to a
-string key for counting (covers Int8/16/32/64, Float32/64, String, Bool, Date — wider than the
-min/max orderable set); `compute_column_ndv_from_records` collects a bounded `HashSet<String>` per
-column within the batch and returns `HashMap<String, u64>` (col → distinct count in this batch);
-`bump_column_ndv` merges the batch NDV into `CatalogColumnStatistics.distinct_count` using an
-additive estimate (assumes no overlap between batches) capped at `row_count` to prevent impossible
-values. Called in `execute_insert` alongside `bump_column_minmax`. Test
-`insert_updates_column_ndv_statistics` verifies: 4 rows across 4 single-row batches → NDV
-populated and capped at row_count for both `id` and `category` columns.
-Staleness TTL added: `DmlService::now_unix_ms` helper centralizes wall-clock reads; all four bump
-helpers (`bump_row_count_stats`, `bump_column_null_counts`, `bump_column_minmax`, `bump_column_ndv`)
-set `CatalogTableStatistics.last_analyzed_ms = Some(now)` after each successful update.
-`CatalogTableStatistics::is_stale(now_ms, ttl_ms) -> bool` added to the catalog crate: returns
-`true` when `last_analyzed_ms` is `None` or older than `ttl_ms`. Three catalog unit tests
-(`catalog_table_statistics_is_stale_when_never_analyzed`,
-`catalog_table_statistics_is_fresh_within_ttl_window`,
-`catalog_table_statistics_is_stale_past_ttl_window`) cover the boundaries. DML test
-`insert_marks_statistics_with_last_analyzed_timestamp` verifies INSERT sets `last_analyzed_ms`
-within the wall-clock window and that `is_stale` returns the expected freshness verdict.
-Total DML tests: 37 (+3 catalog tests). Remaining: bloom filter hints, HLL for cross-batch NDV
+*Shipped (history):* `TableWriteRouter` consumes xCatalog statistics and threads row/byte estimates
+into cost and explanation. DML keeps `CatalogTableStatistics` current on INSERT/DELETE/UPSERT: row
+count, per-column null counts, min/max, an additive batch NDV capped at `row_count`, and
+`last_analyzed_ms` with `is_stale(now, ttl)`. Nullable String/Integer/Float/Date/Time/Decimal INSERT
+of NULL was fixed along the way.
+Remaining: bloom filter hints, HLL for cross-batch NDV
 accuracy, planner usage of `is_stale` to gate CBO fallback paths.
 | `src/query/table_write_plan.rs`, `src/services/dml/mod.rs`, xCatalog stats
 
 | T9
 | Partial
-| SQL DML conformance tests using `DirectWalTableRecordStore` + `FramedTableWalAppender`:
-`direct_record_storage_insert_select_and_wal_replay` (INSERT/SELECT/WAL replay durability) and
-`direct_record_storage_update_and_delete_conformance` (UPDATE label visibility + DELETE tombstone
-invisibility) in `src/services/dml/mod.rs`. DDL metadata round-trip added:
-`ddl_create_table_visible_in_introspection_and_resolvable_by_dml` verifies CREATE TABLE → appears in
-`information_schema.tables` + `information_schema.columns`, all columns present (id/label/score), and
-`DmlService` resolves the table with correct primary key shape; ends with `explain_table_write` call to
-validate the DDL → route-planner chain.
-OLAP/HTAP route validation added: `explain_values_insert_to_olap_table_routes_to_datafusion` verifies
-that a table created with `WITH (workload = 'olap', layout = 'columnar', compute_route = 'datafusion-local')`
-routes `INSERT VALUES` to `DataFusionLocal` backend with `columnar_analytics` specialization — confirming
-xCatalog workload knobs flow end-to-end through `explain_table_write_with_overrides` and the VALUES synthesis
-path. Nullable column round-trip tests added:
-`insert_nullable_values_are_scannable_and_project_null_correctly` verifies that INSERT with NULL in
-TEXT/FLOAT nullable columns stores `ProximaValue::Null` in `record.props`, `scan_table_records` returns it,
-and `select_table_records_with_projection` surfaces `ProximaValue::Null` per-column.
-`is_null_predicate_filters_nullable_column_rows` verifies `IS NULL` returns only null-tagged rows and
-`IS NOT NULL` returns only non-null rows via `scan_table_records_with_predicates`.
-Total DML tests: 32 (26 previous + 6 new: T8 null stats, T9 nullable scan+projection, T9 IS NULL filter, T4 IN/NOT IN filter, T4 LIKE/NOT LIKE filter, T9 UPDATE nullable column to NULL). Remaining: pgwire wire-protocol SQL tests (external TPC/BenchBase driver hitting port 5433).
+| SQL DML conformance tests using `DirectWalTableRecordStore` + `FramedTableWalAppender`.
+*Shipped (history):* INSERT/SELECT/WAL-replay durability, UPDATE/DELETE visibility, DDL →
+information_schema → DML resolution, OLAP `WITH (...)` knobs routing `INSERT VALUES` to
+`DataFusionLocal`, and nullable round-trip and IS [NOT] NULL tests.
+Remaining: pgwire wire-protocol SQL tests (external TPC/BenchBase driver hitting port 5433).
+*Reconciled 2026-10-15:* the TPC half exists (`tests/tpch_pgwire_e2e.rs`,
+`tests/tpcds_pgwire_e2e.rs`, qa-gate ratchets). BenchBase OLTP profiles remain open.
 | `src/services/dml/mod.rs`, `tools/pgwire/**`, `tests/**`, external benchmark harness
 
 | T10
@@ -1265,33 +1194,13 @@ catalog DDL/introspection modules
 | T11
 | Partial
 | Route rejection and `EXPLAIN` metadata: selected backend, rejected candidates, required guards,
-policy boundary, projection freshness, authority mode, and estimated data movement. The write router
-now returns selected/rejected paths and route metadata; `RoutedExecutionPlan` exposes a stable
-JSON-serializable explanation and REST exposes planning-only route inspection at
-`/api/v1/catalog/table_write/explain`; pgwire `EXPLAIN INSERT ... SELECT` now returns the same
-planning-only JSON shape without executing the write. Route explanations now include estimated
-source read bytes, target rewrite bytes, write bytes, and before-write target size from xCatalog
-statistics when source/target stats are available.
-gRPC EXPLAIN now wired: `UnifiedHandlers` gains an optional `dml_service: RwLock<Option<Arc<DmlService>>>`
-field (same post-init pattern as `query_adapter`); `execute_sql_v1` detects `EXPLAIN [OPTIONS] <dml>` via
-`strip_explain_prefix`, parses the inner DML, and calls `DmlService::explain_table_write`, returning the
-JSON plan as a single `QUERY PLAN` column in `ExecuteSqlResponse`. If `DmlService` is not wired, the EXPLAIN
-falls through to the legacy path. `SharedServices` injects the service after `UnifiedHandlers::new`. Five unit
-tests cover `strip_explain_prefix` correctness.
-VALUES DML EXPLAIN extended: `explain_table_write_with_overrides` now handles all `DmlStatement` variants.
-INSERT VALUES and UPSERT VALUES synthesize a `CopyIntoPlan` with `ReadSource::QuerySql("VALUES")` and the
-actual row count as the hint so bulk-vs-WAL lane selection is informed. UPDATE and DELETE synthesize similar
-plans with `WriteMode::Upsert`/`WriteMode::Append`. Two new tests verify: INSERT VALUES routes to Native
-backend with WAL lane for a default OLTP table; UPDATE and DELETE both resolve to Native backend.
-EXPLAIN ANALYZE implemented: `DmlService::explain_analyze_table_write` calls planning-only EXPLAIN, then
-executes the write, and returns the route explanation enriched with `execution_elapsed_us` and
-`execution_rows_written`. `TableWriteRouteExplanation` gains two optional `#[serde(skip_serializing_if)]`
-fields. pgwire EXPLAIN handler upgraded: `extract_explain_inner_query` now delegates to new
-`extract_explain_with_analyze(query) → (bool, &str)`, which handles `EXPLAIN ANALYZE <dml>` and
-`EXPLAIN (ANALYZE, ...) <dml>` without rejection; the EXPLAIN response tag becomes "EXPLAIN ANALYZE"
-when applicable. gRPC `execute_sql_v1` now calls `parse_explain_kind` (replaces `strip_explain_prefix`
-call) and dispatches to `explain_analyze_table_write` when `is_analyze = true`.
-8 `explain_prefix_tests` + 4 pgwire `test_extract_explain*` + 1 DML T11 test all pass. Total DML tests: 35.
+policy boundary, projection freshness, authority mode, and estimated data movement.
+*Shipped (history):* the write router returns selected/rejected paths and a stable JSON
+`RoutedExecutionPlan` explanation with byte estimates from xCatalog stats. This is exposed via REST
+`/api/v1/catalog/table_write/explain` (since moved with the v1 sunset), pgwire `EXPLAIN [ANALYZE]
+<dml>` and gRPC `execute_sql_v1` EXPLAIN. VALUES DML (INSERT/UPSERT/UPDATE/DELETE) synthesizes a
+`CopyIntoPlan` so lane selection is informed. EXPLAIN ANALYZE adds `execution_elapsed_us` and
+`execution_rows_written`.
 Remaining: richer estimates as catalog statistics mature (NDV/distinct_count for CBO, bloom hints).
 | `src/query/table_write_plan.rs`, `src/api_handlers/request_handlers.rs`, `src/network/shared_services.rs`
 
@@ -1299,6 +1208,9 @@ Remaining: richer estimates as catalog statistics mature (NDV/distinct_count for
 | Pending
 | PAX/Arrow local HTAP reader path: catalog-table scan reader over PAX/record storage, Arrow
 `RecordBatch` source, tenant/time/min-max pruning, and DataFusion source-reader integration.
+*Reconciled 2026-10-15:* tracked as link:../10-quality/td/TD-OLAP-1-pax-native-vectorized-scan-feeds-datafusion.adoc[TD-OLAP-1].
+`PaxSplitReader` (slices 1/1.5) landed default-OFF (`PROXIMADB_DF_PAX_READER`) and is not wired to a
+route. A native table provider (TD-USUB-2) also exists default-OFF.
 | `crates/storage/proximadb-block-format`, `crates/storage/proximadb-storage-common`,
 `src/query/table_write_executor.rs`, `src/datafusion/**`
 
@@ -1312,15 +1224,8 @@ Arrow Flight modules, external compute adapters
 | T14
 | Complete
 | Shared write-intent contract and write-lane router: `WalCurrentState`, `BulkAppendCommit`,
-`OverwriteSnapshotCommit`, and `ProjectionOnly`. REST/gRPC/Arrow/pgwire must all lower into this
-contract after their protocol-specific decoding/parsing.
-All protocol adapters now gate on the lane decision: `NativeTableWriteExecutor::validate_native_write_lane`
-rejects non-WAL lanes for the SQL/DML path; gRPC record_service (Insert/Upsert/Update/Delete,
-BatchWriteStream) and Arrow Flight (DoPut/DoExchange) call `WriteLaneDecision::require_wal_lane`
-before dispatching to storage handlers, returning `Status::invalid_argument` / aborting the stream
-when a non-WAL lane is selected. `require_wal_lane` is tested with 3 unit tests covering
-`WalCurrentState` pass-through, `ProjectionOnly` reject, and `OverwriteSnapshotCommit` reject.
-All 9 write_intent tests and 27 gRPC tests pass.
+`OverwriteSnapshotCommit`, and `ProjectionOnly`. All protocol adapters (SQL/DML, gRPC record service,
+Arrow Flight DoPut/DoExchange) lower into it and gate on `require_wal_lane` before dispatch.
 | `src/services/write_intent.rs`, `src/services/dml/mod.rs`, `src/query/table_write_plan.rs`,
 `src/services/record_store.rs`, `src/network/grpc/v2/record_service.rs`,
 `src/network/arrow_ipc/service.rs`
@@ -1330,46 +1235,15 @@ All 9 write_intent tests and 27 gRPC tests pass.
 | Protocol fast-lane parity: REST/gRPC typed writes and Arrow Flight batch writes skip SQL syntax,
 while pgwire lowers simple DML into the same record-batch executor. All surfaces share xCatalog
 validation, RLS/tenant coercion, constraints, WAL/direct-commit policy, and projection freshness.
-xCatalog statistics feedback wired to gRPC fast-lane: `handle_record_batch_for_tenant` and
-`handle_record_insert_batch_for_tenant` now call `DmlService::bump_row_count_stats` after every
-successful batch write; the method is `pub(crate)` and guards silently (non-fatal) when the
-collection is not registered as a relational table. This aligns gRPC and DML on catalog stats.
-Column-schema constraint validation added: `DmlService::validate_record_batch_against_schema`
-validates each incoming `ProximaRecord`'s props against the xCatalog schema using
-`RelationalWriteProfile::fast_lane()` (no unknown-column rejection, no full-column requirement,
-but null-constraint and type-compatibility checks are enforced). Both
-`handle_record_batch_for_tenant` and `handle_record_insert_batch_for_tenant` call this before
-dispatching to the vector-ops path; a failing record returns
-`BatchOperationResult::failure("SCHEMA_VALIDATION_FAILED")` without touching storage.
-Collections not registered as relational tables silently skip validation (non-relational
-collections remain unrestricted). Arrow Flight writes inherit this validation transitively
-since DoPut/DoExchange route through the same handlers. New `RelationalWriteProfile::fast_lane()`
-profile added to `crates/control/proximadb-catalog/src/relational.rs`. Two unit tests:
-`fast_lane_schema_validation_rejects_null_for_not_null_column` and
-`fast_lane_schema_validation_skips_non_relational_collections`.
-WAL-policy enforcement at record-batch level added: free function
-`enforce_wal_lane_for_record_batch(collection_id, op_kind, row_count, context) -> Result<(), String>`
-in `request_handlers.rs` builds a `WriteIntent` with `WalRequired` durability, routes via
-`WriteLaneRouter::new().route()`, then calls `decision.require_wal_lane(context)`.
-`handle_record_batch_for_tenant`, `handle_record_insert_batch_for_tenant`, and
-`handle_record_delete_batch_for_tenant` call it before dispatching to vector-ops; a non-WAL lane
-(e.g. ProjectionOnly for ProjectionRefresh) returns
-`BatchOperationResult::failure(reason, "WAL_LANE_REJECTED")` without touching storage. Delete
-batches also decrement catalog row-count statistics after successful vector deletes. This brings
-REST callers - which go directly to these handlers and previously skipped the gRPC pre-check
-(`network/grpc/v2/record_service.rs::require_wal_lane`) - to lane parity with gRPC and Arrow Flight
-(T14). Four unit tests cover Insert/Upsert/Delete accept and ProjectionRefresh reject with context
-propagation.
-DELETE stats parity added: `handle_record_delete_batch_for_tenant` now calls
-`DmlService::bump_row_count_stats(&collection_name, -n)` after successful delete (where
-`n = result.vector_ids.len()`). gRPC `DeleteRecords` and Arrow Flight `DoPut(Delete)` both route
-through this handler, so all three surfaces decrement `row_count` and refresh `last_analyzed_ms`
-consistently. INSERT/UPSERT already routed through `handle_record_batch_for_tenant` /
-`handle_record_insert_batch_for_tenant` and inherited stats bumping transitively, so the DELETE
-wiring closes the last fast-lane stats gap.
-Total DML tests: 37; 4 wal_lane_enforcement_tests in `request_handlers.rs`.
+*Shipped (history):* the fast-lane handlers bump catalog row-count stats on insert/upsert/delete,
+validate record batches against the xCatalog schema (`RelationalWriteProfile::fast_lane()`:
+null-constraint and type checks), and enforce the WAL lane per record batch. That brings REST to lane
+parity with gRPC and Flight (T14).
 Remaining: RLS/tenant coercion wiring (catalog `TenantRlsCoercion` guard is declared but the
 fast-lane handlers do not yet enforce per-tenant column rewriting / row filtering).
+*Reconciled 2026-10-15:* relational ABAC row filtering has since landed on the SQL path (ADR-090,
+TD-USUB-3 #1919). Whether the REST/gRPC fast lane enforces it was not verified, so this residual
+stays open.
 | `src/api_handlers/request_handlers.rs`, `src/services/dml/mod.rs`,
 `crates/control/proximadb-catalog/src/relational.rs`,
 `src/network/grpc/v2/record_service.rs`, `src/network/arrow_ipc/service.rs`,
@@ -1385,11 +1259,9 @@ PAX/manifest modules, xCatalog snapshot modules
 
 | T17
 | Complete
-| VectorOps bulk-route cleanup: rename stale “direct write bypasses WAL” comments/metrics; keep
-current bulk path honest as WAL-backed fast batching. `BulkWriteDecision::use_direct_write` →
-`use_bulk_lane`; `should_use_direct_write_records` → `route_records`; `would_trigger_direct_write`
-→ `would_use_bulk_lane`; `catalog_bulk_write::should_use_direct_write` → `would_use_bulk_lane`.
-All 9 bulk_write_router tests pass with the new names. No false “bypasses WAL” semantics remain.
+| VectorOps bulk-route cleanup: the stale “direct write bypasses WAL” names were renamed
+(`use_bulk_lane`, `route_records`, `would_use_bulk_lane`). The bulk path is honestly WAL-backed fast
+batching.
 | `src/services/operations/vectors/legacy.rs`, `src/services/operations/bulk_write_router.rs`,
 `src/services/operations/catalog_bulk_write.rs`
 
@@ -1397,22 +1269,8 @@ All 9 bulk_write_router tests pass with the new names. No false “bypasses WAL�
 | Partial
 | Cross-surface write conformance: same insert/upsert/update/delete/merge semantics and visibility
 through pgwire, REST, gRPC, Arrow Flight, and embedded mode for the same cataloged table.
-Unit-level conformance tests in `src/services/dml/mod.rs`:
-
-* `dml_and_fast_lane_agree_on_not_null_constraint` — runs a NOT NULL column through both the SQL
-DML path (`DmlService::execute` → SQL frontend → `build_mutation_record` → record store) and the
-fast-lane path (`validate_record_batch_against_schema` over a pre-built `ProximaRecord`); asserts
-both surfaces accept the conforming row and both reject the NULL violation with an error chain
-naming the constraint.
-
-* `dml_and_fast_lane_agree_on_type_mismatch` — runs the same schema through both paths with a
-string-into-INTEGER mismatch; asserts both surfaces reject (DML at `literal_to_i64`, fast-lane at
-`matches_catalog_type`) with error chains that mention integer-type context. Exact wording
-differs between the layers, but the semantic outcome — rejection with diagnostic context — is
-identical.
-
-These lock in REST/gRPC/Arrow Flight parity with SQL clients for the fundamental schema-on-write
-constraints already exercised in production traffic.
+*Shipped (history):* `dml_and_fast_lane_agree_on_not_null_constraint` and
+`dml_and_fast_lane_agree_on_type_mismatch` pin SQL-vs-fast-lane parity for schema-on-write rejection.
 Remaining: pgwire wire-protocol smoke tests against an external psql, surface-level upsert/delete
 parity, and embedded-mode crossings.
 | `tests/**`, `tools/pgwire/**`, Arrow Flight/gRPC/REST smoke scripts

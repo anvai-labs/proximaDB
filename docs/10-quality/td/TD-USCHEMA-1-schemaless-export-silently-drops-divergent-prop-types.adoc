@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-24 from a review of U-Schema (arXiv:2105.06494). **Step 1 landed 2026-09-25** — the tail-less export path now fails closed instead of silently dropping values. Union rules 1–3 (steps 2–3) and variation statistics (step 4) remain open.
+| Status | **Partial: step 1 shipped — the schema-less `write_records_to_parquet` export fails closed on divergent prop types (#1938); per-batch nullability (rules 1–2) attempted and reverted as a category error (#1939). Open: union rule 3 (step 2) and variation statistics (step 4).** Filed 2026-09-24 from a review of U-Schema (arXiv:2105.06494).
 | Priority | **HIGH** — silent data loss on an export path, with no error and no signal. Bounded by how often a prop key is heterogeneous.
 | Component | `crates/storage/proximadb-storage-common/src/proxima_arrow.rs` (`infer_proxima_schema`, `build_column`), `crates/storage/proximadb-iceberg-engine/src/lib.rs`
 | Relates to | ADR-024 (canonical type source of truth), ADR-094 (unified substrate), TD-USUB-6 (the residual tail hit the same issue on the PAX side), arXiv:2105.06494 §2.3
@@ -95,81 +95,32 @@ the larger change and should not gate the first.
 
 == Step 1 as landed (2026-09-25) — the lossy path fails closed
 
-`detect_type_divergence` reports every prop key seen with two irreconcilable types (once per
-key + conflicting type, not once per row, so a large batch yields a readable message), and
-`infer_proxima_schema_strict` refuses to produce a schema when any exist. The schema-less
-`ObjectStoreBridge::write_records_to_parquet` in `proximadb-iceberg-engine` now uses it.
+History (shipped, #1938): `detect_type_divergence` reports each prop key seen with irreconcilable types (once per key
++ conflicting type), and `infer_proxima_schema_strict` — used by the schema-less
+`ObjectStoreBridge::write_records_to_parquet` — refuses to produce a schema, naming the key, both types and a
+diverging record's `oid`.
 
-The error names the key, both types, and a diverging record's `oid`, because "a value somewhere
-was dropped" is not actionable.
+* **Behaviour change, stated:** an export of a genuinely heterogeneous key now **fails** where it previously produced
+  a lossy file. The escape hatch is `write_records_to_parquet_with_schema` (explicit schema, caller-chosen coercion).
+* **Deliberately still lenient:** `infer_proxima_schema` itself is unchanged, so `record_spill.rs` keeps working —
+  divergence there is survivable because the msgpack `PROPS` tail is complete.
+* A key merely **missing** from some records is ordinary optionality, not divergence (`absent_is_not_divergent`);
+  conflating them would fire the guard on normal sparse data and get it switched off.
 
-=== This is a behaviour change, not only a bug fix
-
-An export of a collection with a genuinely heterogeneous prop key now **fails** where it
-previously produced a lossy file. That is the right trade — mandate #1, and this is the
-*interop* path whose output external readers consume — but it is a behaviour change and should
-not be read as invisible.
-
-The escape hatch already exists in the API shape: `write_records_to_parquet_with_schema` is
-untouched, so a caller who knows their data can pass an explicit schema and choose the
-coercion. Only the schema-*less* convenience entry point fails closed, and that path's entire
-premise is "infer what is there", which it cannot honestly do for a divergent key.
-
-=== Deliberately still lenient
-
-`infer_proxima_schema` itself is unchanged, so `record_spill.rs` keeps working exactly as
-before. Divergence there is survivable because the msgpack `PROPS` tail is complete — the same
-property TD-USUB-6's residual rule depends on. Making inference strict everywhere would break a
-path that loses nothing.
-
-=== Evidence
-
-* `union_schema_drops_the_divergent_value_documented_not_endorsed` — pins the **loss** itself
-  (`back[1].props.get("v") == None`), so the union schema's defined-lossy behaviour stays
-  visible and cannot be mistaken for correctness.
-* `strict_inference_fails_closed_with_an_actionable_message` — asserts the error names the key,
-  both types, and the diverging record.
-* `detect_type_divergence_reports_key_types_and_record` — one entry per (key, conflicting type).
-* `strict_inference_accepts_consistent_records` — the common homogeneous case is unaffected, and
-  strict inference produces the same schema as lenient.
-* `absent_is_not_divergent` — a key merely **missing** from some records is ordinary optionality
-  (U-Schema's `optional` flag), not divergence. Conflating the two would fire the guard
-  constantly on normal sparse data and get it switched off.
-
-Root lib suite 6434/6434; `cargo check --workspace --all-targets`; crate suites 684/684;
-clippy `-D warnings`; fmt.
+Evidence: `union_schema_drops_the_divergent_value_documented_not_endorsed` (pins the loss so the lenient union stays
+visibly lossy), `strict_inference_fails_closed_with_an_actionable_message`,
+`detect_type_divergence_reports_key_types_and_record`, `strict_inference_accepts_consistent_records`.
 
 == Why per-batch nullability inference is a category error (attempted, reverted 2026-09-25)
 
-The original "how to apply" proposed implementing U-Schema union rules 1–2 in
-`infer_proxima_schema`: count presence, and mark a key found in every record `nullable: false`.
-It was implemented, it worked, and it was **reverted**. Recording why, because the idea is
-appealing and will occur to the next reader.
+History (#1939): union rules 1–2 (mark a key present in every record `nullable: false`) were implemented, worked, and
+were **reverted**. **The scope of `optional` is an entity type; the scope of this function is one write batch.**
+"Present in every record of this batch" is not "present in every object of this collection", and writing it into a
+file's Parquet schema asserts something a reader will generalise to the column. Under TD-USUB-10's multi-object
+direction, part-0 could declare `k` NOT NULL and part-1 nullable for the same logical column.
+`infer_schema_unions_props_and_appends_vector` (all columns nullable) pins the *correct* invariant, not a defect.
 
-**The scope of `optional` is an entity type; the scope of this function is one write batch.**
-In U-Schema, `optional` describes a feature across *all structural variations of a schema
-type* — a property of the collection. `infer_proxima_schema` sees only the records handed to
-one `write_records_to_parquet` call. A batch is not the entity type, and "present in every
-record of this batch" is not "present in every object of this collection".
-
-Writing that inference into the file's Parquet schema asserts something true of the **file**
-that a reader will reasonably generalise to the **column**. With single-object publication that
-is merely imprecise. Under TD-USUB-10's multi-object direction it becomes actively harmful:
-part-0 could declare `k` NOT NULL and part-1 declare it nullable, for the same logical column.
-Lenient readers widen to nullable; strict ones object; either way the table's schema now depends
-on which files you looked at.
-
-An existing test, `infer_schema_unions_props_and_appends_vector`, asserts
-`by_name.values().all(|c| c.nullable)`. It is **not** encoding a defect — it pins the correct
-invariant for a per-batch inference, and the function's doc states the rule deliberately
-("Every column is nullable (a key absent from some record is a null there)").
-
-**Where rules 1–2 do belong:** the catalog's entity-type schema, where the scope matches — a
-`CatalogTableSchema` column can legitimately be NOT NULL because it constrains every object of
-the type, and the constraint is declared rather than inferred from a sample. Any future work
-should put presence/optionality there, and leave per-batch file inference maximally permissive.
-
-**A safety note for whoever tries anyway:** Arrow *rejects* a null in a non-nullable field, so
-a presence check even slightly looser than `build_column`'s extraction converts a silent null
-into a failed write. Whatever computes nullability must be provably no more permissive than the
-encoder that fills the column.
+**Where rules 1–2 do belong:** the catalog's entity-type schema (`CatalogTableSchema`), where a NOT NULL constraint is
+declared rather than inferred from a sample. Safety note for anyone trying anyway: Arrow *rejects* a null in a
+non-nullable field, so whatever computes nullability must be provably no more permissive than the encoder that fills
+the column, or a silent null becomes a failed write.

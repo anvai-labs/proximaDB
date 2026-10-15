@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **status conflict (reconciled 2026-10-15):** Phase 0 already applied this ADR's amendments to ADR-010, ADR-033, ADR-045 and *narrowed* ADR-027 (which now reads "Accepted (as narrowed by ADR-094)" and lifted the TD-162 gate on that basis), and Phases 1–4 are being implemented (#1917–#1957; see <<_implementation_progress>>). Accepted ADRs are therefore amended by a Proposed one — owner decision needed: mark this Accepted, or re-mark the amendments as provisional.
 |Date|2026-09-21
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-010 (PAX block format), ADR-026 (PAX canonical vector path), ADR-027 (unified storage + metering substrate), ADR-033 (primary storage format strategy), ADR-034 (object-store access-path co-design), ADR-039 (OLAP engine boundary), ADR-045 (PAX durable core vs serving metadata), ADR-052 (analytics execution competitiveness), ADR-054 (operator plane), ADR-055 (document canonical format), ADR-062 (coalesced RaBitQ + self-describing footer), ADR-090 (identity, grants, BYOB storage)
@@ -323,6 +323,25 @@ Note on ordering: ADR-034 deliberately ranks TD-162a-2 (typed user columns) **la
 because it buys < 2× on scans. TD-USUB-6 does not overturn that ranking — it re-justifies
 the work on *unification and routing* grounds (one store, a real second cost arm, uniform
 pruning), which is the rationale ADR-033 already recast it to.
+
+== Implementation progress
+
+Reconciled 2026-10-15 against `origin/develop` (per-slice detail lives in the TDs):
+
+* Phase 0 — this ADR + amendments + spec + TD-USUB-1..10: #1916.
+* Phase 1 — TD-USUB-1 (In progress): slice 1 bound memtable #1918; slice 2a durable spill store
+  #1923 + wiring #1945; DROP deletes spilled objects #1947; LSN plumbing / computable truncation
+  point #1950; canonical dead-record predicate at spill read boundaries #1952; segment discovery
+  #1953; persisted spill tombstones #1957. **Open:** WAL truncation itself (slice 2b — the
+  ADR-010 amendment's rule), production factory wiring + obligation drain. TD-USUB-13 (flush vs
+  delete race) fixed #1951. TD-USUB-2 native table provider default-OFF #1917 (In progress).
+  TD-USUB-3 Resolved #1919.
+* Phase 2 — TD-USUB-4 additive layouts Resolved #1920; TD-USUB-5 `RecordReader` + `PAR1` arm
+  Resolved #1921; TD-USUB-11 faithful Parquet round-trip (kept `valid_to_ns`) Resolved #1922.
+* Phase 3 — TD-USUB-6 typed shred columns In progress (#1925, #1926, #1929, #1930, #1931, #1934);
+  TD-USUB-7 Open; TD-USUB-8 slices 0–2 (cold-read depth 3→0, ratcheted) #1936, #1941, #1943.
+* Phase 4 — TD-USUB-9 route-stamp integrity + dead code Resolved #1924; TD-USUB-10 slice 0
+  manifest-driven file selection #1927 (In progress).
 
 == Evidence
 

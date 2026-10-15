@@ -7,6 +7,12 @@
 
 == Status
 
+*Reconciled 2026-10-15:* **Partial.** A1–A5 and A9 are complete. A6 is staged: the storage-write
+fence is **default-OFF** (`PROXIMADB_WRITE_FENCING=1`) and fail-open when the lease store is absent.
+A7 is partial: the lease manager, renew loop and DDL leases are wired in production (#922, #938);
+the DML lock path is optional. A8 (protocol error mapping) is pending. The tracking table below is
+the original snapshot.
+
 Approved on 2026-06-24 as the tracking snapshot for the `feat/unified-resource-key`
 branch.
 

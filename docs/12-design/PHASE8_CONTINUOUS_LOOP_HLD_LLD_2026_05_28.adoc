@@ -4,8 +4,25 @@
 :icons: font
 :sectnums:
 
-Status: Active feature specification (HLD/LLD) — not an accepted ADR +
+Status: **Partial (reconciled 2026-10-15)** — feature specification (HLD/LLD), not an accepted ADR +
 Date: 2026-05-28 +
+
+[cols="1,1,3", options="header"]
+|===
+| Feature | State | Evidence (verified against `origin/develop` 2026-10-15)
+| F1 Discovery loop (TD-086) | **Largely shipped** | Registry + snapshot publish coordinator (`7d8ae14c8`). Service + background executor (`ef64331b2`). Passes `recluster`/`dedup`/`quality`/`trajectory` in `src/services/discovery/passes/`. Recluster apply-step with atomic swap for IVF and HNSW (`b92772c90`, `4d1476334`). Trigger arm: `DiscoveryTrigger`, write-volume `DriftWatcher`, recall-degradation producer (`9ebd2325f`, `ceb6ea516`, `1b1548457`). REST `/api/v2/collections/:id/discovery-jobs`. Tests `tests/discovery_job_republish_test.rs`, `tests/discovery_drift_watcher_e2e.rs`. **Open:** the `ReEmbed` pass (no `passes/reembed`). The T1.x checkboxes below are not ticked individually; this table supersedes them.
+| F2 Cold path (TD-087, closes TD-075) | **Largely shipped** | Gate-driven quantized IVF route (`abad12437`). Slice A binary tier + two-stage (`48d1c23f7`). Slice B IVF persistence (`2456f72ce`). Binary route activated (`d0f67c42c`). WARM byte-directory (`cd615cb80`, ADR-023). Recall observer makes the TD-075 gate live (`e5c70ed86`).
+| F3 Point-read layout (TD-088) | **Partial** | pgwire primary-key point-lookup access path (`c34134bed`). The PAX column-group mode (T3.1) was not verified.
+| F4a Single-node scale-to-zero (TD-094) | **Shipped (first slice)** | Collection suspend/resume (`57f012de3`).
+| F4b Multi-node elastic (TD-089) | **Open / blocked** | Blocked on TD-077 distributed transport.
+| F5 External Collection (TD-090) | **Largely shipped** | Slices 1–3: federated record fetch + staleness refresh, BM25 over external text, hybrid retrieval, lazy BM25 rebuild, configurable fusion (`1e779170f`, `d1edf0967`, `4f2335842`, `1d80b66f4`, `8a4c5f6f9`).
+| F6 Lance (TD-091) | **Open** | No commits.
+|===
+
+The `TECHNICAL_DEBT.adoc` register still lists TD-086..091/094 as "Open". For TD-086/087/090/094
+that is stale; the evidence is in the table above. Tables and checkboxes below are the original
+specification, preserved for the open residuals.
+
 Scope: dial the Vector Lakebase alignment trajectory down to executable feature specifications.
 HLD + LLD + task checklists + success criteria for six features (F1–F6), deep for F1/F2/F3/F5 and
 outline for F4/F6. Tracks roadmap Phase 8 and TD-086..TD-091.

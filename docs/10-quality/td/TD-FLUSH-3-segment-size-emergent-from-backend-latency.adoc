@@ -5,52 +5,22 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **S1+S2 shipped (2026-07-24).** `flush_floor_predicted_mb` (default 128 object-store band; 0 disables) gates the SIZE trigger on PREDICTED segment bytes (Σ dim×9/8+8, tracked per-batch in the WAL coordinator — RaBitQ+SQ8 occupancy, not serialized-record bytes); time (RPO) and capacity triggers override, so trickle collections still drain. Trigger reason logged with mem/predicted/floor bytes (S2). Pressure-tested across common dims: 128 MB floor ⇒ ~883k vecs @128d / ~305k @384d / ~154k @768d / ~77k @1536d per segment, RaBitQ region ≥12 MB (≥3× the 4 MiB IOP target) at every dim, and the IVF cell rule (N·d/4MiB) yields a consistent ~27-29 cells/segment. NOTE found during implementation: `vector_count_threshold` (100k) is a DEAD knob — config+tests only, no production fire site; retired/removed 2026-08 (#1526). **1M verification (2026-07-24, floor 128 + caches armed)**: segments 10→**4**, recall 0.9825, cold c=1 3.9→**10.2 QPS** (98 ms), cold c=16 ceiling 18.2→**59.4 QPS** (264 ms, 3.3× baseline; scaling efficiency 47→58%), hot 3,974 QPS, invariants cache 3,676 hits/4 misses (99.9%), zero compactions needed (segments floor-sized at the source). Residual RESOLVED (S2b, same PR): the 4-not-2 segments were the AutoFlushDriver's ~30s tick still using legacy `evaluate()` (floor treated as satisfied) — the driver now calls `evaluate_with_predicted` so BOTH flush paths honor the floor; `needs_global_flush` (the `count >= 50_000` dead-reckoning clause) was found to be dead code (zero callers) and deleted. Also hardened: `predicted == 0` bypasses the floor so document/graph collections (no dense embeddings) keep legacy serialized-size flushing instead of being blocked behind a vector-bytes floor. S3 (small-file L0 stitch) remains. Original filing: **Proposed** (2026-07-23, Azurite pressure test, develop @ bcbcde710 + azure feature).
+| Status | **Partial: S1 (min-segment floor on predicted bytes, `flush_floor_predicted_mb`, default 128) and S2 (accounting + trigger-reason logging), incl. S2b (AutoFlushDriver honors the floor), shipped and 1M-verified (2026-07-24, #1179); open: S3 (small-file L0 stitch), S4 (retire the time trigger, bound recovery by WAL bytes), S5 (lane split for bulk loads).**
 | Priority | **P1 (P0 for object-store deployments)** — file count is THE round-trip multiplier: identical config produced 6 L0 files locally (51 GETs/q at 1M) but **104 L0 files over Azurite → 1812 GETs/query, 12 s cold mean, and a survivor cache that can no longer hold its 100%-hit property (hot = 279 GETs/q, 805 ms vs 0 GETs/0.45 ms locally)**.
 | Component | WAL flush triggering (`memory_flush_size_bytes` check in the serialization strategy → `trigger_background_flush`), ADR-069 auto-flush driver; flush sizing policy.
-| Evidence | Azurite run: 1M ingested at 5,190 rec/s with default thresholds (16 MB / 100k vectors / 300 s) → **104 flushes, one per ~1.9 s, ~10k records ≈ 5 MB raw each**. Local run, same config, 15.7k rec/s → 6 large files. Neither hit the 100k-vector or 300 s triggers.
+| Relates to | link:TD-FLUSH-4-ingest-flush-triggers-dead-timer-only.adoc[TD-FLUSH-4], link:TD-COMPACT-5-training-compaction-trigger.adoc[TD-COMPACT-5] (the floor made the L0-count gate unreachable), link:TD-WAL-3-flush-mechanism-consolidation.adoc[TD-WAL-3] (overlap: S4 time-trigger retirement), TD-RDSTRAT-10/11, TD-COMPACT-2/4
+| Evidence (2026-07-23) | Azurite run: 1M ingested at 5,190 rec/s with default thresholds (16 MB / 100k vectors / 300 s) → **104 flushes, one per ~1.9 s, ~10k records ≈ 5 MB raw each**. Local run, same config, 15.7k rec/s → 6 large files. Neither hit the 100k-vector or 300 s triggers.
 |===
 
-== The finding
+== History (shipped)
 
-Two compounding causes:
+* Finding: segment size was emergent, not chosen — the background flush drained whatever accumulated while the previous flush ran, so the same config yielded 6 files locally and 104 over Azurite. The 16 MB threshold measured serialized `ProximaRecord` bytes (~1.6 KB/record ≈ 10k vectors), ~6× smaller than intended. On object storage GETs/query ∝ file count.
+* Lesson: durability does not require flushing (the WAL is local disk); flush policy only trades memtable memory vs replay time, so small segments buy nothing.
+* S1/S2: the SIZE trigger is gated on PREDICTED segment bytes (Σ dim×9/8+8 per batch — RaBitQ+SQ8 occupancy), tracked in the WAL coordinator; time (RPO) and capacity triggers override so trickle collections still drain; trigger reason logged with mem/predicted/floor bytes. 128 MB ⇒ ~883k vecs @128d … ~77k @1536d per segment, ~27–29 IVF cells/segment at every dim.
+* S2b: the 4-not-2 segments were the AutoFlushDriver's ~30 s tick still calling legacy `evaluate()`; it now calls `evaluate_with_predicted`. `needs_global_flush` (`count >= 50_000`) had zero callers and was deleted; `vector_count_threshold` was a dead knob (retired, #1526/#1557). `predicted == 0` bypasses the floor so document/graph collections keep serialized-size flushing.
+* Evidence (1M, floor 128 + caches armed): segments 10→4, recall 0.9825, cold c=16 18.2→59.4 QPS, zero compactions needed.
 
-1. **The 16 MB threshold measures serialized `ProximaRecord` bytes (~1.6 KB per
-   record), not payload** — so "16 MB" ≈ 10k vectors ≈ 5 MB of raw vector data.
-   The floor is ~6× smaller than intended for vector workloads.
-2. **Segment size is emergent, not chosen.** The background flush drains
-   whatever accumulated while the previous flush ran. When the flush backend is
-   fast relative to ingest (small objects to a nearby store, emulator, NVMe),
-   each drain is small → many small files. When the flush is slow, drains grow
-   → few large files. The same config therefore yields 6 files on one backend
-   and 104 on another. Nothing in the policy expresses "a segment should not be
-   smaller than X" — and on object storage X is the whole game, because
-   GETs/query ∝ file count (co-design round-trips term).
-
-Durability does NOT require flushing: the WAL/write buffer is local disk, so
-flush policy only trades memtable memory vs recovery-replay time. Small
-segments buy nothing and cost 35× on the read path.
-
-== Direction
-
-S1 — **Min-segment floor on PREDICTED bytes**: final on-disk size is unknowable
-pre-encode (compression varies), but it does not need to be known — the region
-layout is deterministic per collection config, so
-`predicted_segment_bytes ≈ N × dim × k(config)` where
-`k = 1/8 (RaBitQ) + 1 (SQ8) + 4·f32_tier` bytes/dim, plus props payload. Do
-not drain the memtable below the floor on predicted bytes unless (a) the RPO
-timer (`flush_interval_secs`, default 300 s) fires, or (b) memtable memory
-pressure (high watermark) forces it. Default floor per backend class: object
-storage 128–256 MB predicted (≈0.9–1.8M vectors at 128-dim RaBitQ+SQ8); local
-disk 32 MB. This is "flush after 5 min or memory pressure, whichever first" —
-with the predicted-size floor making the emergent-size problem impossible.
-
-S2 — **Fix the accounting**: the current `memory_flush_size_bytes` measures
-serialized `ProximaRecord` bytes (~1.6 KB/record) — a memtable-RAM bound, not
-a segment-size proxy. Keep it for memory pressure, but add the S1 predictor
-(`vector_count × dim × k` — cheap, exact for the dominant regions) as the
-flush-decision input; log the trigger reason (floor/count/timer/pressure) on
-every flush so cadence is diagnosable from logs.
+== Open
 
 S3 — **Small-file self-healing**: when L0 accumulates >N small files (already
 the case for existing deployments), a cheap L0→L0 stitch (concatenate

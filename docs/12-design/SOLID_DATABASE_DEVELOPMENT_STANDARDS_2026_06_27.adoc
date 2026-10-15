@@ -3,6 +3,13 @@
 :toclevels: 3
 :revdate: 2026-06-27
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Adopted standard (normative).** Codified as engineering mandate #17 in `docs/agent-rules/CLAUDE.md.seed`. This document is the long-form reference that mandate points to, so it is preserved as-is. Its rules are ongoing obligations, not a work item.
+| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[root-crate decomposition] (Rule 1/4 are the decomposition's coupling discipline)
+|===
+
 [IMPORTANT]
 ====
 **Why this exists:** A recurring pattern of PR failures — stale imports (`pv1`), fragile unit

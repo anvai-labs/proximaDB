@@ -1,63 +1,18 @@
 = TD-LIFECYCLE-1: process exit after SIGTERM blocked by leaked background shutdown senders
-:status: Resolved (durable fix 2026-07-25; shutdown_timeout kept as defense-in-depth)
+:status: Done (2026-07-25)
 :filed: 2026-07-24
 :priority: P2
 
-== Symptom (measured)
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Done (2026-07-25).** Leaked shutdown senders replaced by a process-level shutdown registry fired first in `ProximaDB::shutdown`; `runtime.shutdown_timeout(5s)` kept as defense-in-depth (#1187, #1199).
+| Component | `src/network/shared_services.rs`; `services::shutdown_registry`; `apps/proximadb-server/src/main.rs`.
+| Relates to | link:TD-FLUSH-4-ingest-flush-triggers-dead-timer-only.adoc[TD-FLUSH-4] (this hang masked the flush-trigger diagnosis), mandate #11
+|===
 
-Restart-under-load verification for the production-resilience package
-(feat/restart-resilience, 100k SIFT bed): after SIGTERM the server logs the
-full clean shutdown sequence — flush, compaction stop, warm-manifest emit,
-`Server shutdown complete`, `ProximaDB server stopped` — but the **process
-never exits** (observed >2 min, state R). `sample` shows the main thread stuck
-in `drop_in_place<tokio::Runtime>` → `BlockingPool::shutdown` → `park`, while a
-blocking-pool worker is still executing
-`services::discovery::passes::run` under
-`DiscoveryJobExecutor::execute` / `spawn_discovery_executor`.
+== History
 
-== Root cause
-
-`src/network/shared_services.rs` (discovery executor spawn block, and the
-recall observer that documents itself as "matching the discovery executor")
-**intentionally leaks the shutdown watch sender**:
-
-[source,rust]
-----
-let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-std::mem::forget(shutdown_tx);
-----
-
-The executor's `watch`-based cooperative shutdown therefore never fires, and
-its drain loop (`while executor.run_once().await.is_some() {}`) also does not
-re-check shutdown between jobs. `Runtime::drop` waits for in-flight blocking
-tasks, so one long/looping discovery pass at teardown blocks exit forever.
-Under systemd/K8s the supervisor's grace-period SIGKILL masks it; on a bare
-Spot instance the process wastes the eviction notice window doing nothing.
-
-== Mitigation (shipped with feat/restart-resilience)
-
-`apps/proximadb-server/src/main.rs`: `runtime.shutdown_timeout(5s)` after
-`block_on(run())` returns — durable state is persisted by
-`ProximaDB::shutdown` before this point, so bounding teardown is safe. The
-process now exits deterministically ≤5 s after a clean shutdown.
-
-== Durable fix ✅ SHIPPED (2026-07-25)
-
-`services::shutdown_registry` — all five leaked senders (discovery executor,
-recall observer, drift watcher, drift observer, AXIS EventLog consumer) now
-`register(name, sender)` instead of `std::mem::forget`; `ProximaDB::shutdown`
-calls `fire_all()` FIRST so cooperative exits overlap the shutdown sequence.
-The discovery drain loop re-checks its receiver between jobs so a queued
-backlog cannot extend teardown. `runtime.shutdown_timeout(5s)` stays as
-defense-in-depth. Original plan below.
-
-== Durable fix (original plan)
-
-1. Register the leaked senders in a process-level shutdown registry
-   (discovery executor, recall observer, drift watch) and flip them from
-   `ProximaDB::shutdown` before server stop.
-2. Re-check the shutdown receiver inside the drain loop
-   (`spawn_discovery_executor`) so a queued backlog cannot extend teardown.
-3. Audit for other `std::mem::forget(<shutdown sender>)` /
-   dropped-JoinHandle always-on loops (mandate #11: no non-daemon background
-   work that outlives shutdown).
+* Symptom: after a clean SIGTERM shutdown sequence the process never exited — `Runtime::drop` waited on a blocking-pool worker running a discovery pass. Root cause: `shared_services.rs` spawned background loops with `std::mem::forget(shutdown_tx)`, so their `watch`-based cooperative shutdown could never fire, and the discovery drain loop did not re-check shutdown between jobs. Supervisor SIGKILL masked it under systemd/K8s; on bare Spot it wastes the eviction window.
+* Fix: all five leaked senders (discovery executor, recall observer, drift watcher, drift observer, AXIS EventLog consumer) `register(name, sender)` with `services::shutdown_registry`; `ProximaDB::shutdown` calls `fire_all()` first; the discovery drain loop re-checks its receiver between jobs. `shutdown_timeout(5s)` stays (durable state is persisted before it).
+* Lesson that still applies: `std::mem::forget` of a shutdown sender creates a non-daemon background loop that outlives shutdown (mandate #11). A bounded teardown can also remove accidental grace that other subsystems relied on — see TD-FLUSH-4.

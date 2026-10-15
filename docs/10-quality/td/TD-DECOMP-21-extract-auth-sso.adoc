@@ -5,48 +5,16 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Superseded — the crate was removed again by [[TD-SSO-3]] (2026-09-03): after TD-SSO-1 shipped the real OIDC seam, the extracted legacy SSO stack had zero live consumers. The extraction's remaining value (the `EnterpriseUserContext` type) was relocated back to root `src/auth/mod.rs`.
-| Severity | Low — behavior-neutral re-export (security-sensitive module; verbatim move)
-| Component | `crates/horizontal/proximadb-auth-sso`; root `src/auth/mod.rs`
-| Relates to | [[TD-DECOMP-1]] (recipe); broad clean-leaf scan across root `src/`
+| Status | **Superseded by link:TD-SSO-3-legacy-sso-removal.md[TD-SSO-3] (2026-09-02).** The extracted crate was removed again: after TD-SSO-1 shipped the real OIDC seam, the legacy SSO stack had zero live consumers.
+| Component | formerly `crates/horizontal/proximadb-auth-sso` (removed); root `src/auth/mod.rs`
+| Relates to | link:TD-SSO-3-legacy-sso-removal.md[TD-SSO-3]; link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe)
 |===
 
-== Why
+== History
 
-A broad scan of root `src/` for clean-leaf candidates (files with tests and zero `crate::` climb-out)
-surfaced the **largest single opportunity in the repo**: `src/auth/sso/` — a cohesive 6-file,
-4121-LOC, **139-test** subsystem (AWS IAM 46, SAML 33, types 33, mod 22, google_cloud 4, azure_ad 1)
-with **zero `crate::` climb-out** across every file. It is the biggest extraction available (~1.5% of
-the root lib test binary in one move) and the highest-ROI since the cluster/cdc veins.
+Extracted in #1434: `src/auth/sso/` (6 files, 4,121 LOC, 139 tests — the largest single slice of the
+initiative) moved verbatim to a horizontal crate. TD-SSO-3 deleted the crate and relocated the remaining
+value (`EnterpriseUserContext`) back to root `src/auth/mod.rs`.
 
-The module is pure logic over a small dep set — `anyhow`/`chrono`/`serde`/`serde_json`/`tokio`/
-`dashmap`/`uuid` — with **no cloud SDKs** (the `aws_sdk_sts` reference is a commented-out stub). That
-makes it a clean horizontal-tier leaf despite being security-sensitive: the move is verbatim, with a
-root re-export shim so all 9 consumers (`security/auth_service`, `api_handlers/enterprise`,
-`audit/mod`, `ai/*`, `auth/federated_delegation_complete`) resolve unchanged.
-
-== What moved (behavior-neutral)
-
-* Whole `src/auth/sso/` dir (6 files) → `crates/horizontal/proximadb-auth-sso/src/sso/`.
-* Root `src/auth/mod.rs`: `pub mod sso;` → `pub use proximadb_auth_sso::sso;` (intra-module `super::`
-  refs — `super::types::*`, `super::aws_iam::*`, etc. — stay valid inside the crate's `sso` module).
-* New horizontal crate with deps `anyhow`/`chrono`/`dashmap`/`serde`/`serde_json`/`tokio`/`tracing`
-  (workspace) + `uuid = { version = "1.0", features = ["v4","serde"] }` (inline; uuid is a root-local
-  dep, not in `[workspace.dependencies]`). No `CAPABILITY_MATRIX.toml` pointer referenced these files.
-* **Orphan-rule fix (not purely verbatim):** `src/auth/mod.rs` had
-  `impl From<EnterpriseUserContext> for storage::tenant::UserContext`. After the move both types are
-  foreign to root (`EnterpriseUserContext` → auth-sso; `UserContext` lives in `proximadb-storage-tenant`),
-  so the trait impl violates E0117, and it cannot move to auth-sso (horizontal→storage layering). It is
-  replaced with an orphan-rule-clean free function `enterprise_to_storage_user_context` in root, and the
-  10 `.into()` call sites (`api_handlers/enterprise.rs`, `auth/mod.rs`, `ai/mod.rs`) now call it. The
-  conversion logic is byte-identical — only the invocation changed (`From::into` → fn call).
-
-== Follow-ups
-
-* **Running total once merged: ~791 tests out of root** (652 + 139) — the single largest slice of the
-  initiative.
-* The provider integrations are pure-logic mocks (no real cloud SDK calls); a future PR can wire real
-  STS/IAM/Graph calls behind the `aws`/`azure`/`gcp` features if/when needed.
-* NOTE process: a "0 `crate::`" clean-leaf scan measures **root climb-out**, not external deps —
-  always confirm the full external dep set (incl. test-only + fully-qualified usage like `serde_json`,
-  `tokio`, `uuid`) before sizing a move; the `use`-statement scan alone missed three deps here.
+* Lesson (still applies): moving a type out of the root can turn a root `impl From<Foreign> for Foreign`
+  into an orphan-rule error (E0117); here it was replaced by a free function.
