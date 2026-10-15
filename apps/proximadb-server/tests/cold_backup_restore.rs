@@ -342,23 +342,20 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
     assert!(!refused_to.join("manifest.json").exists());
 
     // 3. Baseline = what a PLAIN restart serves. A graceful stop flushes the
-    //    memtable to segments, and reads may then come from a different tier
-    //    than before the stop; comparing the restored server against the
-    //    pre-stop read would conflate backup fidelity with that tier change.
-    //    Backup must reproduce exactly what a restart without it serves.
+    //    memtable to segments, so reads now come from the segment tier. On an
+    //    `fp32` collection that tier must still serve the written f32 exactly
+    //    (TD-READFID-1: the flush used to keep only the SQ8/RaBitQ columns).
     server.graceful()?;
     let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
     let mut expected = Vec::new();
     for id in &ids {
         expected.push(read_vector(&server.base_url, collection, id).await?);
     }
-    if expected != written {
-        eprintln!(
-            "NOTE: point reads changed across a plain restart (memtable -> segment tier); \
-             rec-0 written={} restarted={}",
-            written[0], expected[0]
-        );
-    }
+    assert_eq!(
+        expected, written,
+        "TD-READFID-1: point reads on an fp32 collection changed across a plain restart \
+         (memtable -> segment tier)"
+    );
 
     // 4. Stop cleanly, back up.
     server.graceful()?;
