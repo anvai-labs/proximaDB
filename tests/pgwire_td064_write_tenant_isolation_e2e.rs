@@ -407,8 +407,11 @@ async fn pgwire_copy_from_stdin_ingests_vector_rows() {
     )
     .await;
     assert!(
-        rerun.is_err(),
-        "COPY of an existing id must be rejected, got {rerun:?}"
+        rerun
+            .as_ref()
+            .is_err_and(|error| error.contains("INSERT_CONFLICT")),
+        "COPY of an existing id must be rejected as an insert conflict (not a dropped \
+         connection), got {rerun:?}"
     );
     assert_eq!(
         read_vector("v1").await,
@@ -425,8 +428,9 @@ async fn pgwire_copy_from_stdin_ingests_vector_rows() {
     )
     .await;
     assert!(
-        dup.is_err(),
-        "in-payload duplicate ids must be rejected, got {dup:?}"
+        dup.as_ref()
+            .is_err_and(|error| error.contains("INSERT_CONFLICT")),
+        "in-payload duplicate ids must be rejected as an insert conflict, got {dup:?}"
     );
     assert!(
         read_vector("v3").await.is_none(),

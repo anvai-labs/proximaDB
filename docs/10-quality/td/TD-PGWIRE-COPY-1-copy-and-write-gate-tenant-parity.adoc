@@ -66,6 +66,14 @@ So COPY could not reach another tenant's collection any more than an INSERT coul
 * The existing `pgwire_relational_writes_and_reads_are_tenant_isolated` still passes.
 * Run with `RUST_MIN_STACK=8388608`, which is what CI's integration jobs use. At the default 2 MiB debug stack the in-process server overflows (TD-STACK-1 class).
 
+== Known residuals of the insert-only path (review round 2; shared with REST insert-only)
+
+* **Throughput: one point lookup per row.** `insert_records_only_with_tenant_context` runs one existence check per row, in sequence and under the insert-only lock: a WAL lookup, then the engine's point lookup. Develop's guard was an in-memory memtable check. For a bulk COPY into a collection that has flushed segments, this may reach object storage once per row, depending on footer and bloom caching. REST insert-only has the same cost. This was not measured. Before COPY is advertised as a bulk loader, measure it with io_trace on a COPY of a few thousand fresh ids, and if the probe does per-row GETs, follow up with a batched existence probe.
+* **Concurrency: the lock is keyed per tenant.** The lock key is (collection, tenant). Two sessions with different `database` values, or a COPY racing a REST insert-only call (tenant `None`), take different locks. Both can pass the existence check, and then the WAL-level upsert lets the later write win. The race is rare, and REST has the same window between tenants.
+* **Tombstones count as existing.** The existence check does not filter dead records. Re-COPYing an id that was deleted but not yet compacted away can be rejected as already existing.
+* **SQLSTATE.** A conflict surfaces as `XX000` with `INSERT_CONFLICT` in the message, not as `23505` (unique violation). Clients that branch on `23505` will not recognise it.
+* **Table-name case.** COPY lowercases the table name for its gate key, its collection lookup and its tenant scope, so it is consistent with itself. The DML gates keep the case of quoted identifiers. A binding on `"Users"` therefore gates INSERT but not COPY. That cannot let a write through the gate, because COPY into a quoted mixed-case table already fails to resolve the collection (pre-existing).
+
 == Pre-existing COPY gaps found while testing (not fixed here)
 
 Writing the first end-to-end COPY test surfaced two gaps. Each was established differently:
