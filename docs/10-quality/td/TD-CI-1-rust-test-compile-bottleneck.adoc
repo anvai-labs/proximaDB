@@ -10,7 +10,7 @@
 | Status | **Open** — deferred to a billing-tier decision (larger GitHub-hosted runner). No code action until then. *Evidence 2026-10-15:* the unit leg still runs `CARGO_BUILD_JOBS=1` on `ubuntu-24.04`, and its healthy wall time is now 51-70 min (`ci.yml` `rust-test`, `timeout-minutes: 120`). Lever 2 (sccache) **was tried on this job and reverted** (#920): it OOM-killed the 16 GB runner 3/3 on 2026-07-13. sccache stays on the three compile jobs only. Related OOM relief: #859 (cdc feature-gate), #941.
 | Severity | Medium — the slowest job on the develop/qa CI tier (~49 min); does not fail, only costs wall-clock + a runner for the duration.
 | Component | CI — `.github/workflows/ci.yml` `rust-test` (matrix `test-type: unit`)
-| Relates to | link:TD-CI-4-benches-examples-ci-gap.adoc[TD-CI-4] (filed under this id in #1725), link:TD-CI-5-feature-matrix-has-no-job-timeout.adoc[TD-CI-5] (job timeouts)
+| Relates to | link:TD-CI-4-benches-examples-ci-gap.adoc[TD-CI-4] (filed under this id in #1725), link:TD-CI-5-feature-matrix-has-no-job-timeout.adoc[TD-CI-5] (job timeouts), link:TD-CITIER-1-feat-develop-critical-path-long-poles.adoc[TD-CITIER-1] (removed the `needs: rust-build` serialization; this job's ~45 min compile is now the feat→develop critical path on its own)
 | Tracked-by | This TD; related OOM root cause in the cloud-emulator fix (PR #803, `scripts/run_cloud_emulator_tests.sh`).
 | Resolution | (planned) trial a larger runner (16 GB → 64 GB) for `rust-test` so `CARGO_BUILD_JOBS` can rise from 1 → 4-8; measure the compile reduction. Fallback: sccache / shared-build reuse.
 |===
@@ -56,6 +56,18 @@ measured, not asserted.
    `shared-key` with `rust-build`) so the compile is a cache hit on repeat/related
    runs. Does not help the cold first compile of a changed graph, but speeds churn.
    Safe, modest.
++
+*Correction (2026-10-15, link:TD-CITIER-1-feat-develop-critical-path-long-poles.adoc[TD-CITIER-1]):*
+the "align the key" half of this lever was already in place. `rust-test` restored
+`rust-build`'s exact key (`v1-rust-nightly-dev` / `build`), and the job also
+declared `needs: rust-build` so that it would inherit that build. It did not. rust-cache
+saves a key once and the first writer wins, so the cache a run restored had usually
+been written by whichever job sharing the key finished first. On run 38752730686 that was
+`mlflow-conformance`, and `rust-build`'s own save was refused. The unit leg then still
+compiled 322 crates (42m15s). The compile was 42–45 min in 16/16 sampled runs regardless
+of who wrote the cache, so the `needs: rust-build` edge only added ~21 min of waiting
+to the critical path. TD-CITIER-1 removed the edge. The sccache half of this lever
+is unchanged: it is still reverted on this job because of the OOM noted above.
 3. **Shared compiled test binary across shards.** Compile once, shard the run reusing
    it. *Marginal* here (run is only ~3.4 min) and ferrying `target/` across runners is
    a documented-unsolved problem (the qa-gate pgwire-recall job builds-on-one-runner
