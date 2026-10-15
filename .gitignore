@@ -391,8 +391,8 @@ reports/
 !crates/platform/proximadb-admin-ui/assets/*.html
 !target/criterion/**/*.html
 !src/network/rest/dashboard.html
-# CRA operator console entry assets are source, not generated reports.
-!ui/public/index.html
+# Operator console (Vite) entry assets are source, not generated reports.
+!ui/index.html
 !ui/public/manifest.json
 
 # Generated configuration files (but keep examples)

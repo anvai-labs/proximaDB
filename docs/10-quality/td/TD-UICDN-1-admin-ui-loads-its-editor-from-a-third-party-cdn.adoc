@@ -144,3 +144,35 @@ section cites.)
   exact override the bundle carries; the remaining gap is ordinary browser
   serving of `public/vs`, covered by CRA's static-asset copy (verified
   present in `build/vs/`).
+
+== Residual closed: `react-scripts` migration (2026-10-15, branch `fix/ui-vite-migration`)
+
+The residual recorded under "Why it is not fixed in #1993" — "the 101 remaining
+`ui/` advisories are all CRA transitives and that migration has to touch the build
+anyway" — is done: `ui/` is migrated off Create-React-App (`react-scripts` 5.0.1) to
+Vite 8 + `@vitejs/plugin-react` 6, TypeScript 4.9 -> 5.9.
+
+* Build: `vite.config.mts` keeps `build.outDir: 'build'` (the `ui-build` CI job and
+  this TD's `build/vs/` criterion are unchanged), `base: '/'` (the loader override is
+  the absolute `/vs`), dev proxy `/api` -> `:5678` (was CRA's `"proxy"`). The entry
+  moved to `ui/index.html` with `%PUBLIC_URL%` dropped. `npm run build` =
+  `prebuild` (copy + this TD's guard, unchanged) -> `tsc --noEmit` -> `vite build`,
+  so the typecheck CRA ran via fork-ts-checker is still a build gate.
+* Self-host chain re-verified on the Vite output: guard prints `OK: monaco-editor
+  0.57.0 self-hosted; loader resolves /vs/loader.js`; `build/vs/loader.js` and
+  `build/vs/editor/editor.main.js` present; the bundle carries
+  `config({paths:{vs:`/vs`}})`; `vite preview` serves `/`, `/vs/loader.js`,
+  `/vs/editor/editor.main.js` and the app chunk with 200.
+* Lockfile regenerated from scratch (npm 11, the Node 24 CI line). `npm audit`:
+  **101 -> 2** (all deps; 5 low / 33 moderate / 63 high -> 2 low) and **2 -> 2**
+  with `--omit=dev`. 22 of the 24 open Dependabot alerts on `ui/package-lock.json`
+  leave the lockfile with the toolchain (`svgo`, `serialize-javascript`,
+  `webpack-dev-server`, `webpack-dev-middleware`, `node-forge`, `sprintf-js`,
+  `@tootallnate/once`, `postcss-selector-parser`, `uuid` are gone; `postcss`
+  survives only as Vite's 8.5.30, above every alert's patched version).
+* The 2 remaining are `dompurify` 3.4.15 (and `monaco-editor` as its parent):
+  `monaco-editor` 0.57.0 pins it exactly and **vendors its own copy** into
+  `min/vs` (and `esm/vs/base/browser/dompurify/`); nothing imports the npm package.
+  An `overrides` pin would clear the alert while leaving the shipped bytes unchanged
+  — exactly the audit-theatre this TD's problem 2 describes — so none was added; the
+  fix is the next `monaco-editor` release that bundles dompurify >= 3.4.16.
