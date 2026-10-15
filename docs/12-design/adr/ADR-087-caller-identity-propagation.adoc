@@ -6,48 +6,28 @@
 
 Accepted and implemented. The identity carrier, total stable-id mint,
 fail-closed composition rule, and live SQL/record transport matrix are pinned.
+One residual (2026-10-15): the TD-ABAC-10 follow-on — see Slices.
 
 == Context
 
-The ABAC enforcement chain for record reads is complete at the seam
-(`unified_search_v1_inner` + the get-by-id admit-check) and every records door
-(REST, gRPC, Arrow Flight) now delivers a caller identity to it via
-`PortIdentity` (TD-ABAC-7). Closing those slices exposed three *structural*
-residues that patch-level threading cannot fix:
+The ABAC chain for record reads was complete at the seam (`unified_search_v1_inner` +
+get-by-id admit-check) and every records door delivered a `PortIdentity` (TD-ABAC-7), but three
+structural residues remained that patch-level threading could not fix:
 
-1. **Identity-type proliferation (the bridge tax).** A request's identity is
-   re-represented per surface: `MiddlewareTenantContext` (root, REST),
-   `GrpcAuthContext` (root, gRPC), `AuthenticatedFlightContext` (root, Flight),
-   pgwire session state, `UnifiedUserContext`, storage `TenantContext`,
-   `PortIdentity` (runtime). Each new consumer pays a bridge, and each bridge is
-   a drift seam. The concrete casualty: the `proximadb-api` crate's live hybrid
-   SQL route cannot thread a subject at all, because the REST identity extension
-   is a *root-crate* type the api crate may not name (layering) — an
-   architectural wall, not a missing line.
-2. **The stable-id gap is silent-open.** `tenant_stable_id` (the ADR-0083
-   account projection, the ABAC *policy-lookup key*) is stamped per-surface by
-   optional resolvers. The seam's composition rule
-   (`records_read_context`) enforces only on
-   `(Some(subject), Some(stable_id))`; the cell
-   `(Some(subject), None)` — an authenticated subject whose tenant is unminted
-   or whose surface has no resolver wired — **falls through to passthrough**.
-   The `GrpcAuthContext` field doc claims "unminted ⇒ fail-closed deny"; the
-   seam does not implement that. Enforcement strength today equals
-   mint/resolver *coverage*, and the failure mode is silent-open.
-3. **Trust provenance is dropped at the seam.** The foundation already
-   classifies how an identity was established (`AuthClass`: Authenticated /
-   TrustAsserted / Anonymous), but `PortIdentity` does not carry it, so the
-   seam cannot distinguish a credentialed subject from a spoofable
-   trust-asserted one for audit or policy purposes.
+1. **Identity-type proliferation (the bridge tax).** Seven per-surface identity types
+   (`MiddlewareTenantContext`, `GrpcAuthContext`, `AuthenticatedFlightContext`, pgwire session,
+   `UnifiedUserContext`, storage `TenantContext`, `PortIdentity`); each bridge was a drift seam,
+   and the api crate's hybrid SQL route could not thread a subject at all because the REST
+   identity was a root-crate type it may not name (a layering wall).
+2. **The stable-id gap was silent-open.** The seam enforced only on
+   `(Some(subject), Some(stable_id))`; an authenticated subject with an unminted tenant or an
+   unwired resolver fell through to passthrough, despite a field doc claiming fail-closed.
+   Enforcement strength equalled resolver *coverage*.
+3. **Trust provenance was dropped.** `AuthClass` (Authenticated / TrustAsserted / Anonymous)
+   existed in the foundation but `PortIdentity` did not carry it.
 
-What the codebase already has — and this ADR builds on rather than replaces —
-is `proximadb_tenant::ResolvedRequestIdentity { tenant, subject, auth_class }`
-(foundation layer, TD-ABAC-6): "the resolved identity every network surface
-produces uniformly," with the root orchestrator
-`src/security/request_identity::resolve_request_identity` already adopted
-end-to-end by Arrow Flight. The gaps above exist because this primitive is
-*incomplete* (no `tenant_stable_id`) and *not yet the carrier* (surfaces
-produce it, then immediately re-encode into their local types).
+The foundation already had `proximadb_tenant::ResolvedRequestIdentity` (TD-ABAC-6), adopted
+end-to-end by Arrow Flight — incomplete (no `tenant_stable_id`) and not yet the carrier.
 
 == Decision
 
@@ -109,23 +89,21 @@ carried unchanged to every consumer; everything else is a projection.**
   flip — which is the correct dependency direction: totality first, then
   strictness.
 
-== Slices
+== Slices (implementation history)
 
-* TD-ABAC-8 — complete + carry: `tenant_stable_id` (+ stamp-once) on
-  `ResolvedRequestIdentity`; REST middleware inserts the foundation Extension;
-  `PortIdentity` becomes a projection (+ `auth_class`).
-* TD-ABAC-9 — api-crate consumers: hybrid SQL route extracts the foundation
-  identity and threads it (closes the last live REST `None` subject).
-* TD-ABAC-10 — pgwire constructor: startup/session → `ResolvedRequestIdentity`
-  → relational read boundary.
-* TD-ABAC-11 — mint + strictness: default-tenant mint, binding-provisioning
-  e2e fixture, flip the composition rule to fail-closed on the absent stable
-  id, and live pgwire + credential-authenticated gRPC relational ratchets using
-  the authenticated REST policy-control plane, plus canonical `POST /api/v2/sql`
-  as a thin adapter over the same typed SQL authority. Canonical REST record
-  search/point-get, authenticated gRPC v2 unary/streaming search + point-get,
-  and authenticated Arrow Flight canonical record search now have live
-  row-policy evidence.
+* TD-ABAC-8 (Resolved) — `tenant_stable_id` + stamp-once on `ResolvedRequestIdentity`; REST
+  inserts the foundation Extension; `PortIdentity` is a projection carrying `auth_class` (#1397).
+* TD-ABAC-9 (Resolved) — api-crate hybrid SQL route threads the foundation identity, closing the
+  last live REST `None` subject (#1397).
+* TD-ABAC-10 (**Partial**) — pgwire constructor: 10a session identity (#1397), 10b full-identity
+  carrier (#1405), 10c the three pgwire ABAC bypasses closed (#1400). **Open:** grow
+  relational-pipeline coverage so the legacy single-table fail-closed guard can be deleted.
+* TD-ABAC-11 (Resolved) — default-tenant mint, binding-provisioning e2e fixture, composition
+  rule flipped to fail-closed on an absent stable id; live row-policy ratchets on pgwire,
+  credential-authenticated gRPC (unary/streaming search + point-get), canonical
+  `POST /api/v2/sql`, REST record search/point-get and Arrow Flight record search.
+* Lesson: totality first, then strictness — the mint had to be total before the fail-closed
+  flip; the ABAC bypass surface is now one reviewable composition function.
 
 == References
 

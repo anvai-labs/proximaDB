@@ -4,7 +4,7 @@
 :icons: font
 :sectnums:
 
-Status: Active architecture trajectory +
+Status: Trajectory input — **recommendations Partial (reconciled 2026-10-15)**. R1–R6 are implemented through link:PHASE8_CONTINUOUS_LOOP_HLD_LLD_2026_05_28.adoc[the Phase 8 HLD/LLD] (overlap: R1–R6 ≡ F1–F6; canonical implementation status lives there). R1/R2/R5 are largely shipped. R3 and R4a have first slices. R4b (blocked on TD-077) and R6 (Lance) are open. +
 Date: 2026-05-28 +
 Scope: industry-trend analysis of the "Vector Lakebase" thesis (Zilliz, James Luan, 2026-05-26),
 mapped against ProximaDB's current architecture, with a gap scorecard and concrete recommendations

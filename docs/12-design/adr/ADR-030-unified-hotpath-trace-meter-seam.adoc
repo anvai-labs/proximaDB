@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **all five implementation slices shipped** (reconciled 2026-10-15): Slice 0+3 io-trace emission gate + billing-never-gated guard (#394, TD-160 Resolved); Slice 1 range GETs/bytes on the live read path (#533, TD-158 Resolved); Slice 2 always-on KRU billing observer (#387); compute_ms on DataFusion + SST-AXIS (#389); Slice 4 KSU snapshot daemon (#391). Out-of-scope follow-ups still open: TD-161 (Partial), TD-157/TD-159. Owner decision needed: mark Accepted.
 |Date|2026-06-26
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-027 (Unified Storage + Metering — the two-class trace decision this *implements*), ADR-026 (PAX canonical vector path), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (dominant cost term = I/O round-trips + egress; meter every dimension), `EXACT_VS_ANN_ROUTING_COST_MODEL_2026_06_26.adoc` (cost-from-measured-quantities)

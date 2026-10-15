@@ -9,6 +9,12 @@
 
 Accepted
 
+Reconciliation (2026-10-15): implemented as `MultiModelPlan` in
+`crates/query/proximadb-multimodel-plan` (no `V1` suffix; also carries resolved authority/storage/
+projection context). Whether *every* public entry point lowers into it (the Decision's rule) is
+not verified here — treat as open. File Plan paths below are historical. SQL routing is now
+governed by ADR-064 (`ComputeScheduler::route_select`).
+
 == Context
 
 ProximaDB has multiple query entry points that produce different internal representations:

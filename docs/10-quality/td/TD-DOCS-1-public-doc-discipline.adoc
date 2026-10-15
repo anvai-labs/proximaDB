@@ -5,11 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open
+| Status | **Partial: Slice B done (re-checked 2026-10-15: `check_td_adr_unique.py` emits 0 ADR-index warnings); Slice A partly done: the VISION / COMPETITIVE_LANDSCAPE "sub-millisecond" descriptors and PRD:34 no longer match the acceptance grep. Open: the PRD trading-persona claims (now `PRD.adoc:67`, `:120`, `:128`: "Sub-ms OHLC", "sub-millisecond … 10x faster", "Sub-millisecond query latency").**
 | Severity | Medium (trust / TAM-claim accuracy — public docs must not assert production-ready capabilities or unmeasured perf numbers)
 | Component | Public docs: `README.adoc`, `docs/00-product/{PRD,VISION,COMPETITIVE_LANDSCAPE}.adoc`, `docs/release-notes/*`; ADR index `docs/12-design/adr/README.adoc`
 | Governs | Authority hierarchy in link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] (support contract) + `docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml` (measured-evidence ledger)
-| Relates | link:../REVIEW_RESPONSE_2026_07_07.adoc[REVIEW_RESPONSE_2026_07_07] §2.2 (the loose end this closes), link:../TECHNICAL_DEBT.adoc[TD-148] (row_count approximate doc), the `td-adr-unique` guard's ADR-index warnings
+| Relates | link:TD-DOCS-2-status-of-record-drift-guard.adoc[TD-DOCS-2] (same discipline family: freshness of status-of-record docs), link:TD-DOCSITE-1-user-facing-asciidoc-not-rendered-by-mkdocs.adoc[TD-DOCSITE-1] (public doc site), link:../REVIEW_RESPONSE_2026_07_07.adoc[REVIEW_RESPONSE_2026_07_07] §2.2 (the loose end this closes), link:../TECHNICAL_DEBT.adoc[TD-148] (row_count approximate doc), the `td-adr-unique` guard's ADR-index warnings
 | Suitable for | Autonomous agent execution (docs-only, fully verifiable, low risk). NOTE: `TD-DOCS-` (plural, documentation discipline) is distinct from the `TD-DOC-` (singular, *document modality*) family.
 |===
 
@@ -30,7 +30,7 @@ link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] marks **Beta** or **Ex
 * `docs/00-product/PRD.adoc:34` — positioning line "...sub-millisecond latency in a single Rust
   binary." Aspirational; soften to low-latency / single-node phrasing or route to a measured
   ledger entry.
-* `docs/00-product/PRD.adoc:56`, `:109`, `:117` — "sub-millisecond OHLC" / "10x faster" claims
+* `docs/00-product/PRD.adoc:56`, `:109`, `:117` (now `:67`, `:120`, `:128`; still present 2026-10-15) — "sub-millisecond OHLC" / "10x faster" claims
   for the trading persona. These are not in the measured ledger; qualify or remove the hard
   numbers.
 * `docs/00-product/VISION.adoc:71`, `docs/00-product/COMPETITIVE_LANDSCAPE.adoc:34` —
@@ -55,24 +55,11 @@ link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] marks **Beta** or **Ex
 * No public doc asserts a Beta/Experimental capability (per SUPPORTED_SURFACE) as production-ready.
 * README's existing SLA caveats are intact.
 
-== Slice B — Complete the ADR README index (zero the guard warnings)
+== Slice B — Complete the ADR README index (DONE)
 
-`python3 scripts/check_td_adr_unique.py` emits ~15 warnings of the form
-`WARNING: ADR file not listed in the README index: ADR-NNN-*.adoc`. The ADR index at
-`docs/12-design/adr/README.adoc` is how ADRs are discovered; an incomplete index is real debt.
-
-=== Steps
-
-1. Run `python3 scripts/check_td_adr_unique.py 2>&1 | grep 'not listed in the README index'` to
-   derive the current list (do not hard-code it — derive fresh).
-2. For each missing ADR, add an entry to `docs/12-design/adr/README.adoc` **matching the existing
-   entry format** (read the file first; mirror the columns/link style of an already-indexed ADR).
-3. Re-run the guard.
-
-=== Acceptance (Slice B)
-
-* `python3 scripts/check_td_adr_unique.py` reports **0 ADR-index warnings** (the `0 error(s)`
-  TD-unique count must remain 0 — do not introduce a duplicate TD id).
+Done: the ADR index at `docs/12-design/adr/README.adoc` is complete, and `check_td_adr_unique.py` reports 0 ADR-index warnings.
+`check_design_status_index.py` (see link:TD-DOCS-2-status-of-record-drift-guard.adoc[TD-DOCS-2]) now requires every ADR to appear
+in the index exactly once.
 
 == Constraints / how to land
 

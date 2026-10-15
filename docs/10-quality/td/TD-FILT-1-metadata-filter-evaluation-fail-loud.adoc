@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | In Progress — slice 1 (typed `FilterEvalError` + `evaluate_filter_resolved_strict` / `evaluate_filter_proxima_strict` on the canonical v2 seam) landed 2026-07-07. The live hybrid and progressive-search v2 gates now default to the strict evaluator; explicit false-valued compatibility flags temporarily restore the legacy behavior. Lower-level bool-only storage predicates remain to be migrated. Re-scoped from a v1 `MetadataValue` target the same day (see below).
+| Status | **Partial: slice 1 strict evaluator (#747), slice 2a strict-by-default on the live hybrid + progressive-search v2 gates (#770), native `ProximaValue` comparison for the strict filter (#775) shipped, and the dead v1 `TypeSafeFilterEvaluator` is gone (no references in `src/`/`crates/`, 2026-10-15); open: slice 2b (lower-level bool-only vector/storage predicates) and retiring the `PROXIMADB_FILTER_FAIL_LOUD=false` / `PROXIMADB_FILTER_STRICT=false` rollback escapes.**
 | Severity | High (silent correctness loss in results — records whose filter field is absent, or a non-scalar leaf, are silently dropped from every non-null comparison with no error)
 | Component | Canonical v2 filter seam: `crates/foundation/proximadb-search-types/src/sql_value_filter.rs` — `evaluate_filter_resolved` (the shared spine, line ~315), `evaluate_filter_proxima` (ProximaTree/ProximaValue adapter, line ~350), `evaluate_filter` (SqlValue adapter).
 | Governs | link:../../12-design/adr/ADR-024-single-canonical-data-type-and-schema.adoc[ADR-024] (single canonical `ProximaValue`/`ProximaRecord` type) + link:../../12-design/adr/ADR-043-unified-relational-expression-evaluation.adoc[ADR-043] (fail-loud predicate evaluation). v2-canonical: only the `ProximaValue`/`ProximaTree` path is extended; the v1 `MetadataValue`/`VectorRecord` path is *not* (see "Re-scope note").
@@ -72,7 +72,7 @@ there is no per-comparison "type mismatch" to surface here. The silent drop on t
 * **Slice 2b (remaining):** migrate lower-level vector/storage predicates once their interfaces
   can return `Result` instead of bare `bool`. Do not fake fail-loud semantics by logging and
   returning `false`.
-* **Slice 3 (cleanup):** delete the dead v1 `TypeSafeFilterEvaluator` under v1 sunset (TD-123).
+* **Slice 3 (cleanup, done):** the dead v1 `TypeSafeFilterEvaluator` no longer exists in the tree (verified 2026-10-15).
 
 == Default posture
 

@@ -4,7 +4,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open — documentation + manifests corrected; the remaining gap is a deployment capability, not a bug.** Containment is correct. The docs and deploy manifests no longer advertise a reachable `5433` in a container (see "Documentation action item — DONE" below); what remains is making pgwire *serviceable* from outside a container, which needs SCRAM to be configured and the port republished.
+| Status | **Partial: documentation + manifests corrected; open: whether the shipped image should default to an authenticated pgwire (product question; SCRAM itself shipped in TD-PGWIRE-AUTH-1) and the `unified_bind_address` coupling design question (see "Secondary finding").** The remaining gap is a deployment capability, not a bug. Containment is correct. The docs and deploy manifests no longer advertise a reachable `5433` in a container (see "Documentation action item — DONE" below); what remains is making pgwire *serviceable* from outside a container, which needs SCRAM to be configured and the port republished.
 | Severity | Medium — a documented port accepts no connections. No data-path or isolation risk; the failure is closed, not open.
 | Component | `config/config.toml` (`[api] pg_port`), `src/database.rs` (pgwire bind re-derivation), `crates/platform/proximadb-runtime/src/bootstrap_config.rs` (`validate_trust_only_listener`), `deploy/docker/entrypoint.sh`, `deploy/docker/docker-compose.yml`, `deploy/kubernetes/deployment.yaml`
 | Relates | TD-PGWIRE-AUTH-1 (pgwire SCRAM — the actual unblock), #1885 (containment + the `unified_bind_address` coupling), #1973, #1977
@@ -112,82 +112,24 @@ shipping credentials, so it stays opt-in.
 
 == Documentation action item — DONE
 
-Every place that told a reader pgwire/Postgres is reachable on 5433 in the default container, or
-published it in a `docker run`/Compose invocation, now states the truth: the listener *runs*, on
-loopback, so a published 5433 accepts nothing; it serves a host-local binary and a client inside
-the container's network namespace; serving it from the host needs SCRAM first, then `pg_port`.
+History (shipped): every place that said pgwire is reachable on 5433 in the default container, or published it,
+now states the truth — the listener runs on loopback, so a published 5433 accepts nothing; it serves a host-local
+binary and clients inside the container's network namespace; serving it from the host needs SCRAM first, then `pg_port`.
 
-*Manifests / executable claims*
-
-* `deploy/docker/docker-compose.yml` — the `"5433:5433"` mapping is **removed**, replaced by a
-  comment giving the reason and the three-step re-enable recipe. A published port that accepts
-  nothing is a false claim in executable form, it makes `docker ps` affirmative evidence of a
-  listener that is not there, and it holds host 5433 (a common second local Postgres) for no
-  benefit.
-* `scripts/validate_capability_matrix.py` — the `maturity_contract` drift rule **required** the
-  `'"5433:5433"  # PostgreSQL wire protocol'` substring, i.e. it enforced the untrue claim. It now
-  forbids the active mapping (matched at its YAML indent, so the replacement comment cannot
-  satisfy it vacuously) and requires the explanation plus this TD id. Mutation-checked: re-adding
-  the mapping fails the guard.
-* `deploy/docker/Dockerfile` — both published stages (`runtime`, `runtime-full`) keep
-  `EXPOSE … 5433`, because `EXPOSE` publishes nothing by itself and is the right record of the
-  port the server would use; each now carries a comment saying listing it is not a claim that a
-  host can connect, and that `-P` would publish an inert port.
-* `deploy/kubernetes/deployment.yaml` + `service.yaml` — **no change needed**: verified they
-  never declared 5433 (only 5678/5679/5680/9090). The same holds for `deploy/helm/**`,
-  `deploy/k8s/**`, `deploy/systemd/**`, `deploy/packaging/**` and `deploy/terraform/**`, none of
-  which reference 5433 or pgwire.
-
-*Operator and quick-start docs*
-
-* `deploy/README.md` — dropped `-p 5433:5433` from both `docker run` examples and `localhost:5433`
-  from the Compose "Access" list; added a "PostgreSQL wire protocol (pgwire) is loopback-only in
-  the container" section with the mechanism, the two places it does work, and the SCRAM recipe;
-  annotated the ports table.
-* `docs/04-operations/deployment.adoc` — dropped `-p 5433:5433` from the `docker run` example and
-  added the explanatory NOTE.
-* `docs/04-operations/index.md` — removed 5433 from the Compose quick-start; commented out the
-  `firewall-cmd --add-port=5433/tcp` rule, which opened a hole to a listener that is not there.
-* `docs/04-operations/production-readiness.adoc` — the "Beta on port 5433" bullet now records the
-  loopback restriction and its prerequisite.
-* `docs/01-quick-start/install.md` — dropped 5433 from the `docker run` and Compose examples;
-  added the in-namespace psql recipe; annotated the default-ports table.
-* `docs/01-quick-start/index.md`, `docs/01-quick-start/first-query.md` — the `psql -h localhost -p
-  5433` SQL-interface blocks now say when that host/port actually resolves.
-* `docs/01-quick-start/architecture-basics.md` — the "plus pgwire on 5433" line records the
-  loopback bind.
-
-*API reference and guides*
-
-* `docs/03-api-reference/postgres.adoc` — "exposes … on port 5433 by default" is now "…bound to
-  `127.0.0.1`", with an IMPORTANT block covering the three cases.
-* `docs/03-api-reference/index.md` — annotated the port + `psql` example. Also fixed the config
-  sample, which used `enable_postgres_wire` / `postgres_port` — key names the server does not
-  read — and which invited a reader to set `pg_port`, the exact move that caused this filing.
-* `docs/03-api-reference/client-surface-map.adoc` — the ports table's bare "5433 … Beta" row and
-  the "Port `5433`" lowering heading.
-* `docs/02-guides/api-surface-performance-guide.md` — the surface table's `localhost:5433` default
-  endpoint.
-* `docs/02-guides/platform-packages.md` — "`5433` (if enabled)" → enabled by default, loopback
-  bound; the commented `# pg_port = 5433` knob now warns that uncommenting it under a non-loopback
-  `bind_address` is a boot failure.
-* `docs/SUPPORTED_SURFACE.adoc` — the containment paragraph said MCP *and* pgwire "are restricted
-  to unauthenticated, single-tenant loopback deployments", which went stale when TD-PGWIRE-AUTH-1
-  landed: that is unconditional for MCP but trust-mode-only for pgwire, which may bind any
-  interface under SCRAM. Split per listener and added the container consequence.
-* `demo/data-engineering/{run.sh,README.adoc}`, `demo/montecarlo-sql/{run.sh,README.adoc}` — these
-  told the reader to "enable pgwire (`pg_port = 5433` under `[api]`)", which is both unnecessary
-  (pgwire is already on at `127.0.0.1:5433`) and the precise misunderstanding behind `6a01497ff`.
-  The data-engineering runner additionally said "Docker: … then publish 5678 and 5433", which
-  cannot work. Both now say to run the binary locally and not to set `pg_port`.
-
-Deliberately NOT changed: `docs/12-design/SYSTEM_MAP_2026_05_30.adoc` makes no reachability claim
-about pgwire (its 5433 mentions are module/diagram labels), and `docs/SUPPORTED_SURFACE.adoc`'s
-`status-as-of` tag was left at its current date — the guard's contract is that the tag is bumped
-only after re-verifying the doc's status sections as a whole, and only the pgwire listener claim
-was re-verified here. Architecture/design docs that merely label the port (`docs/README.md`,
-`docs/architecture-diagrams/**`, `docs/12-design/**`) were left alone: they describe the surface,
-not its container reachability.
+* `deploy/docker/docker-compose.yml`: the `"5433:5433"` mapping is **removed** (replaced by the reason and the
+  three-step re-enable recipe). A published port that accepts nothing is a false claim in executable form.
+* `scripts/validate_capability_matrix.py`: the `maturity_contract` rule used to **require** the untrue mapping; it
+  now forbids it (matched at YAML indent so the comment cannot satisfy it vacuously) and requires this TD id.
+  Mutation-checked.
+* `deploy/docker/Dockerfile` keeps `EXPOSE … 5433` (publishes nothing by itself) with a comment; Kubernetes, Helm,
+  systemd, packaging and Terraform manifests never declared 5433 (verified).
+* Operator, quick-start, API-reference and guide docs plus the two demos were corrected (`deploy/README.md`,
+  `docs/04-operations/*`, `docs/01-quick-start/*`, `docs/03-api-reference/{postgres.adoc,index.md,client-surface-map.adoc}`,
+  `docs/02-guides/*`, `demo/{data-engineering,montecarlo-sql}`); `docs/03-api-reference/index.md` also used config
+  keys the server does not read (`enable_postgres_wire` / `postgres_port`).
+* `docs/SUPPORTED_SURFACE.adoc`'s containment paragraph was split per listener (unconditional for MCP;
+  trust-mode-only for pgwire, which may bind any interface under SCRAM). Its `status-as-of` tag was deliberately
+  not bumped (only the pgwire claim was re-verified). `SYSTEM_MAP` and design docs that merely label the port were left alone.
 
 == Secondary finding worth recording
 

@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 = Review — "A Unified Metamodel for NoSQL and Relational Databases" (U-Schema, arXiv:2105.06494)
 :toc:
-:status-as-of: 2026-09-24
+:status-as-of: 2026-10-15
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** Recommendation 1, step 1 shipped: the tail-less schema-less Parquet export now **fails closed** on divergent prop types (#1938). A follow-up docs finding notes that per-batch nullability inference is a category error (#1939). Open: union rules 1–3 in `infer_proxima_schema` (TD-USCHEMA-1 steps 2–3) and write-time per-key variation statistics driving shred-spec selection (step 4).
+| Relates to | link:../10-quality/td/TD-USCHEMA-1-schemaless-export-silently-drops-divergent-prop-types.adoc[TD-USCHEMA-1], link:PAX_V3_UNIFIED_SUBSTRATE_SPEC_2026_09.adoc[PAX v3 §2.1] / TD-USUB-6 (overlap: typed-stripe vs residual-tail), link:PAX_CODEC_LAYOUT_COMPRESSION_LLD_2026_05_20.adoc[PAX codec LLD] (overlap: JSON shape/path statistics)
+|===
 
 Full read of Fernández Candel, Sevilla Ruiz & García-Molina, *A Unified Metamodel for NoSQL and
 Relational Databases* (arXiv:2105.06494v2, May 2021), assessed against ProximaDB's canonical

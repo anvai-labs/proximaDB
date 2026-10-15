@@ -3,7 +3,7 @@
 :toclevels: 3
 :sectnums:
 Date: 2026-06-22
-Status: Draft (design intent; engine work tracked as TD-127..TD-134)
+Status: **Partial (verified 2026-10-15)** — design intent; engine work tracked as TD-127..TD-134. Resolved: TD-128, TD-129, TD-133, TD-134 (closed-ledger `docs/_archive/quality/2026-06/TECHNICAL_DEBT_CLOSED_2026_06_24.adoc`); embedded parity test shipped (#308). Open: TD-127 (Partial), TD-130 (Open), TD-131 (subsumed by TD-137, In Progress), TD-132 (Partial).
 
 toc::[]
 
@@ -249,15 +249,15 @@ See `docs/10-quality/TECHNICAL_DEBT.adoc`:
 
 [cols="1,5,1", options="header"]
 |===
-| TD | Item | Priority
-| TD-127 | OLTP secondary indexes (name/file) on native tables | HIGH
-| TD-128 | Volcano IN-list/range pushdown → multi-key point-batch | HIGH
-| TD-129 | pgwire `ON CONFLICT DO UPDATE` upsert | MED
-| TD-130 | Graph edge bulk-load (sorted LSM merge; kills per-edge uniqueness serialization) | MED
-| TD-131 | Graph on REST v2 + first-class co-planned hybrid endpoint (seed→expand→filter) | MED
-| TD-132 | Tier-B CPG-fragment PAX storage contract + per-query I/O trace emission | MED
-| TD-133 | Optional transactional multi-modal write (node+embedding+edges atomic) | LOW
-| TD-134 | Code-embedding meter (KEU variant) + per-repo RBAC entitlement | MED
+| TD | Item | Priority — status (2026-10-15)
+| TD-127 | OLTP secondary indexes (name/file) on native tables | HIGH — *Partial*
+| TD-128 | Volcano IN-list/range pushdown → multi-key point-batch | HIGH — *Resolved*
+| TD-129 | pgwire `ON CONFLICT DO UPDATE` upsert | MED — *Resolved*
+| TD-130 | Graph edge bulk-load (sorted LSM merge; kills per-edge uniqueness serialization) | MED — *Open*
+| TD-131 | Graph on REST v2 + first-class co-planned hybrid endpoint (seed→expand→filter) | MED — *subsumed by TD-137 (In Progress)*
+| TD-132 | Tier-B CPG-fragment PAX storage contract + per-query I/O trace emission | MED — *Partial*
+| TD-133 | Optional transactional multi-modal write (node+embedding+edges atomic) | LOW — *Resolved*
+| TD-134 | Code-embedding meter (KEU variant) + per-repo RBAC entitlement | MED — *Resolved*
 |===
 
 A benchmark gap (no e2e cold trace for graph/hybrid at 80K-node scale) is registered in

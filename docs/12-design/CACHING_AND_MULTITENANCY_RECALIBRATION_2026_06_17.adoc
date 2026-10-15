@@ -8,6 +8,14 @@ quantization, footer-first ranged reads, block/row-group predicate pushdown).
 
 toc::[]
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (verified 2026-10-15).** Shipped: R2 footer/metadata caching (`SegmentInvariantsCache` in `src/storage/engines/sst/segment_format.rs`, Parquet/PAX footer caches), R4 tenant-fair pool (`TenantCache` weighted fair-share with floor/ceiling in `crates/foundation/proximadb-cache`; per-tenant hot tier TD-CACHE-3 S1/S2 #1191, arming TD-CACHE-4 #1179). Open: R1 zero-copy `Bytes` (`FileSystem::read`/`read_range` still return `Vec<u8>`), R3 quantized hot-tier as designed, R5 small-tenant pack store (no `PackIndex` in code), R6 full cache-zoo consolidation (partial — `TenantCache` exists, legacy caches not all migrated).
+| Relates to | link:../10-quality/td/TD-CACHE-3-hot-tier-per-tenant-enforcement.adoc[TD-CACHE-3], link:../10-quality/td/TD-CACHE-9-persistent-pax-warm-tier.adoc[TD-CACHE-9], link:CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc[CODESIGN_DIMENSIONAL_ARCHITECTURE] (overlap: cache dimension; canonical for the cost spine)
+|===
+
+
 == 1. What changed since the last system map (the new I/O profile)
 
 The PAX v2 work fundamentally changed *what bytes a query touches*, which

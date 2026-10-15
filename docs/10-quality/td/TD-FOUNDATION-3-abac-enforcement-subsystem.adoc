@@ -1,7 +1,7 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-FOUNDATION-3: ABAC enforcement subsystem (FA)
-:status: In progress — P1–P4 met; slices FA-a + FA-a2 delivered
+:status: In progress — P1–P4 met; FA-a, FA-a2, FA-b (relational + unified_search_native), FA-c delivered; FA-d/e/f + graph S7 open
 :date: 2026-07-26
 :authors: co-design session 2026-07-26
 :realizes: ADR-072 D6 (structural tenancy), D15 (RLS-as-global-filter)
@@ -10,7 +10,7 @@
 
 [cols="1,3"]
 |===
-| Status | **In progress** — all four preconditions met (§2); slices **FA-a** (S1, S2) and **FA-a2** (S3) are delivered (§5); FA-b is the next slice and is *lane-blocked*, see §5
+| Status | **In progress (status re-verified 2026-10-15 against git; the prior line stopped at FA-a2).** All four preconditions met (§2). Delivered: **FA-a** (S1, S2, #1245); **FA-a2** (S3, #1246, #1247); **FA-b** `ReadContext` type (#1312), threaded as a required parameter through the relational read primitives (#1320) and `unified_search_native` (#1321); **FA-c** compile bridge (#1289), `abac-policy` feature + e2e proof (#1293), `AbacEnforcer` (#1298), vector-path post-filter (#1309), durable `FileSystemAttributeAuthority` (#1310), relational read-path wiring (#1324). Live relational ABAC enforcement then proceeded under the TD-ABAC-* / ADR-087 / ADR-090 track (#1391–#1408, #1607, #1636, #1689, #1919). **Not found in git (treat as open):** FA-b's graph-executor primitive and CI signature check (S4/S7), **FA-d** cache subject-binding (S10), **FA-e** write-path disclosure + mask isolation (S8, S9), **FA-f** egress reconstruction audit (S5); and the §6 deferrals.
 | Scope | The runtime ABAC **enforcement** subsystem split out of FC (TD-FOUNDATION-2 §0.1) after three red-team rounds proved it is a multi-package subsystem, not a wiring job.
 | Design of record | **TD-FOUNDATION-2** — the enforcement architecture (§3.4), the S1–S10 acceptance criteria (§8), and the fail-closed bridge (§1.4) live there, attacked across three rounds. This doc is the **build track**: preconditions, the surface-by-surface contract, the S-item test targets, and the slice order.
 | Consumes | FC's metamodel + policy model (`PolicyBinding`, `resolve_effective_policy`, `SubjectAttributes`, `filterable_columns`), the FA substrate crate `proximadb-abac`, the F0 codec, the F1b/F1d store.
@@ -303,13 +303,13 @@ while silently widening.
 | The bridge, part 2: type strictness, delivered as an **opt-in comparison mode + a separate evaluator**, not a schema seam. `compare_json_values`/`compare_json_op`/`evaluate_filter_resolved` are untouched, so metadata search, document filtering and pushdown keep their semantics; the security path opts in via the `_type_strict` family, resolving on the `ProximaValue`/`ProximaTree` seam (ADR-024), never the deprecated v1 `SqlValue` envelope. Two walkers rather than one tree with two semantics: `AND` associativity makes evaluating the security and user expressions separately exactly equivalent to their conjunction, so no marker node in the shared `FilterExpression` type is needed.
 | S3 — green
 
-| **FA-b** — next, but **lane-blocked**
+| **FA-b** — partly landed (#1312, #1320, #1321: relational primitives + `unified_search_native`); graph executor + CI signature check not found in git
 | Signature change at the three read primitives (FA-1) + the CI signature check. Behavior-neutral while every caller passes a `SystemReadContext`; the point is that the *shape* becomes non-optional.
 
 **Coordination note (2026-07-27):** this is a *wide* signature change across every caller of `services/record_store.rs` and `services/operations/vectors/legacy.rs` — precisely the files an FK-referential-integrity / HTAP workstream reads through. It should be taken by whoever owns those files, or sequenced after that work lands; running it in parallel guarantees conflicts. §3 specifies the target shape per primitive so it is pick-up-able.
 | S4, S7
 
-| **FA-c**
+| **FA-c** — landed (#1289, #1293, #1298, #1309, #1310, #1324)
 | Policy resolution wired at the primitives behind `abac-policy` (FA-6): resolve → bridge → AND. Default-OFF.
 | End-to-end: a `dept=eng` subject sees only `dept=eng` rows through **both** `SELECT *` and a vector search — the D15 unification claim
 

@@ -9,15 +9,7 @@
 |===
 | Field | Value
 
-| Status | **Bridge DONE; Slice 1 (raptor swap) DONE; the residue is SEQUENCED BEHIND TD-V1SUNSET-2 — see Reconciliation 2026-08-05.** The
-`SqlValue ↔ ProximaValue` bridge exists in `proximadb-records::conversions`
-(`sql_value_to_proxima` / `proxima_to_sql_value` / `json_to_proxima`) — the original "no bridge
-exists" claim verified the wrong crate (`data-model`); it lives in `records`.
-Slice 1 has since **landed**: `raptor-common/src/lib.rs:500` is
-`pub use proximadb_data_model::ProximaValue as MetadataValue;`, and the stated blocker is
-**resolved** — `compare_proxima_values` is implemented in raptor-engine with unit tests. The
-remaining raptor-engine `SqlValue` references are **deliberate**, not backlog: they carry
-`VectorRecord.metadata`, so they retire with TD-V1SUNSET-2, not here.
+| Status | **Partial: bridge (`proximadb-records::conversions`) and Slice 1 (raptor `MetadataValue` = `ProximaValue`) shipped (reconciled #1435); open: Slice 2, the codebase-wide `SqlValue` tail, which is SEQUENCED BEHIND link:TD-V1SUNSET-2-vectorrecord-to-proximatecord-first-slice.adoc[TD-V1SUNSET-2]** (the raptor-engine residue carries `VectorRecord.metadata`, so it retires with VectorRecord).
 | Severity | Medium — `SqlValue` is a v1 proto *wire/in-memory* type used for predicate pushdown and
 metadata stats (not a durable format), so this is an in-memory type swap (lower risk than the
 VectorRecord durable migration in link:TD-V1SUNSET-2-vectorrecord-to-proximatecord-first-slice.adoc[TD-V1SUNSET-2]).
@@ -39,46 +31,15 @@ raptor crates landed by the decomposition track (`proximadb-raptor-common` #955/
 (raptor-common currently deps only `proto`; Slice 1 adds `records` + `data-model`).
 |===
 
-== Context — why v1 `SqlValue` is still in the raptor path
+== History (shipped)
 
-The raptor engine is legacy code that predates v2/`ProximaValue`. It uses the v1 proto
-`SqlValue` (+ `sql_value::Value` variants: `StringValue`/`NumberValue`/`BoolValue`/…) for
-**predicate pushdown** — matching metadata values during scans. The raptor-common `Predicate`
-struct holds `value: MetadataValue` where `MetadataValue` is a re-export alias for
-`proximadb_proto::proximadb_v1::SqlValue` (`raptor-common/src/lib.rs:498`). The decomposition
-track relocated this code as-is (the moves preserve v1 by design — a relocation is not a
-migration), which surfaced the question this TD answers.
+The raptor engine predates v2 and used v1 `SqlValue` for predicate pushdown and column stats (`MetadataValue` alias); the
+decomposition relocated it as-is. The target is the ADR-024 canonical `ProximaValue` (27+ typed variants). Two corrections are
+worth keeping. The original "no bridge exists" claim checked the wrong crate (`data-model`): the bridge (`sql_value_to_proxima` /
+`proxima_to_sql_value` / `json_to_proxima`) lives in `records`. And the "needs a comparator first" blocker was already resolved:
+`compare_proxima_values` is implemented and tested in raptor-engine, so do not re-derive it. `ProximaValue` derives only `PartialEq`,
+so the explicit comparator is the right shape.
 
-`ProximaValue` (`proximadb_data_model::ProximaValue`, the link:../../12-design/adr/ADR-024-single-canonical-data-type-and-schema.adoc[ADR-024]
-canonical seam) is the v2 target — and the codebase already flags the migration:
-`sql_value_filter.rs:44` comments *"v2-canonical: this lives on the `ProximaValue`/`ProximaTree`
-seam (ADR-024)"*.
-
-== The v2 target — `ProximaValue` (rich, typed)
-
-`ProximaValue` is a 27+-variant typed enum (`proximadb-data-model/src/lib.rs:629`) — far richer
-than v1 `SqlValue`:
-
-```
-Boolean | Int8..Int64 | UInt8..UInt64 | Float16 | Float32 | Float64 | Decimal |
-String | Symbol | Binary | Date | Time | Timestamp | TimestampTz | Uuid | ULID |
-Json | Jsonb | Array<Vec<ProximaValue>> | Map | Struct | DenseVector(Vec<f32>) | …
-```
-
-== Surface (measured)
-
-NOTE: The figures below are the **2026-07-14 original**; see
-<<reconciliation-2026-08-05>> for the re-measured current surface. The bullet
-claiming no bridge exists was already corrected in the Status field above.
-
-* **raptor crates** (the first slice): ~79 `SqlValue`/`sql_value::Value` refs — `raptor-common`
-  (`Predicate.value`, `PredicateOp`, the column-stats `min_value`/`max_value`/`default_value`) +
-  `raptor-engine` (predicate evaluation match arms).
-* **Codebase-wide** (the later slice): ~77 files reference `proximadb_v1::SqlValue`/`sql_value`.
-* **No `SqlValue ↔ ProximaValue` bridge exists** today (verified — `proximadb-data-model` has
-  neither direction). This TD adds it.
-
-[[reconciliation-2026-08-05]]
 == Reconciliation (2026-08-05) — Slice 1 has landed; the residue is not backlog
 
 A fresh `origin/develop` audit (the "don't trust this blindly" step this TD's
@@ -138,17 +99,11 @@ blocker that is **already resolved**.
   (6), and `src/network/rest/canonical` (3). Each needs the same
   VectorRecord-coupling check before it can be called migratable.
 
-== Approach — phased, bridge-first
+== Remaining slice
 
-. **Build the bridge** (`proximadb-data-model` or `proximadb-records`): `SqlValue → ProximaValue`
-  (variant mapping: `StringValue→String`, `NumberValue→Float64`/`Int64`, `BoolValue→Boolean`, …)
-  + the inverse for any read-back boundary.
-. **Slice 1 — raptor crates**: swap `MetadataValue` (= `SqlValue`) for `ProximaValue` inside the
-  raptor crates, converting at the input boundary (predicates arrive as `SqlValue` from the rest
-  of the codebase; the bridge converts once on entry). This aligns the raptor crates to v2
-  *without* a codebase-wide flag-day.
+. ~~Build the bridge~~ (done, in `proximadb-records`). ~~Slice 1 — raptor crates~~ (done).
 . **Slice 2 — codebase-wide**: retire `SqlValue` entirely as the rest of the v1 sunset completes
-  (the ~77 files), removing the bridge once no v1 caller remains.
+  (the ~77 files, re-measured at 74 above), removing the bridge once no v1 caller remains.
 
 == Risks / non-goals
 

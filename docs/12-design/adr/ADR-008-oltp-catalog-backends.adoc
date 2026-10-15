@@ -1,12 +1,15 @@
 = ADR-008: OLTP Catalog Backends in xCatalog
-:status: Accepted
+:status: Accepted — implementation retired (TD-CAT-10, 2026-09-01)
 :date: 2026-05-17
 :deciders: ProximaDB Architecture
 :supersedes: none
 
 == Status
 
-Accepted
+Accepted (2026-05-17); **implementation retired as non-functional by
+link:../../10-quality/td/TD-CAT-10-oltp-catalog-retirement.adoc[TD-CAT-10] (Done 2026-09-01, #1721).**
+`OltpCatalog` is kept only as an opt-in `oltp-catalog` module; it is not a working catalog
+backend. Reviving SQL-backed catalog support is new feature work and would re-open this decision.
 
 == Context
 
@@ -155,38 +158,26 @@ message OltpCatalogConfig {
 }
 ----
 
-=== Key Source Files
-
-* `src/catalog/oltp.rs` — `OltpCatalog` struct; `Catalog` trait impl; DDL generation; in-memory HashMap fallback when no feature flag active
-* `src/catalog/mod.rs` — `CatalogManager::create_oltp_catalog()` factory; `catalog_for_size()` routing helper
-* `proto/proximadb/v1/catalog.proto` — OLTP catalog type enum + `OltpCatalogConfig` message
-
-=== Build Commands
-
-[source,bash]
-----
-cargo build --features oltp-catalog-postgres   # PostgreSQL, Neon, Supabase, CockroachDB
-cargo build --features oltp-catalog-mysql      # MariaDB, MySQL, TiDB, PlanetScale
-cargo build --features oltp-catalog-sqlite     # SQLite (dev/embedded)
-cargo build --features oltp-catalog-full       # All three backends
-----
-
 == Consequences
 
-=== Positive
+* Intended (not realized — see Status): small collections get fast ACID point-lookup metadata without lakehouse overhead; managed
+  serverless Postgres (Neon/Supabase) and fully embedded SQLite are both viable; routing is
+  transparent behind the one `Catalog` trait.
+* Metadata-only is the intended separation, not a compromise: engines own record durability,
+  xCatalog owns schema and statistics. The 1 GB threshold is configurable
+  (`OltpCatalogConfig.size_threshold_bytes`).
+* Risks that still apply: `sqlx::AnyPool` loses compile-time typing in the fallback path;
+  per-backend DDL (`generate_ddl()`) must track MySQL/SQLite dialect gaps; **without an
+  `oltp-catalog-*` feature, `OltpCatalog` falls back to a non-durable in-memory HashMap.**
 
-* Small collections (< 1 GB) get fast ACID point-lookup metadata without lakehouse overhead.
-* Neon/Supabase support lets operators use managed serverless Postgres with zero ops burden.
-* SQLite allows fully embedded deployments with no external DB dependency.
-* Catalog routing is transparent to query and insert paths — same `Catalog` trait throughout.
+== Implementation history
 
-=== Negative / Risks
-
-* `sqlx::AnyPool` requires runtime backend detection from connection string; type information is lost at compile time in the fallback path.
-* MySQL/SQLite dialect differences in DDL (no native array type, no `JSONB`) require per-backend DDL generation — `generate_ddl()` in `OltpCatalog` handles this but must be kept in sync.
-* Without `oltp-catalog-*` feature flags, `OltpCatalog` falls back to an in-memory HashMap — correct but not durable across restarts.
-
-=== Neutral
-
-* OLTP catalog is metadata-only by design.  This is not a compromise — it is the correct separation: ProximaDB engines own record durability; xCatalog owns schema and statistics.
-* The 1 GB default threshold is configurable per `OltpCatalogConfig.size_threshold_bytes`.
+* Filed with code (2026-05-17): `crates/control/proximadb-catalog/src/oltp.rs` (`OltpCatalog`,
+  DDL generation, in-memory fallback), `manager.rs` (`create_oltp_catalog`, `catalog_for_size`),
+  `OltpCatalogConfig` in `proto/proximadb/v1/catalog.proto`.
+* **It never worked** (TD-CAT-10): feature-off it was a silent in-memory no-op that reported
+  success; feature-on it did not compile (sqlx `SqlSafeStr`); the root feature did not forward to
+  the catalog crate, and no CI workflow built `oltp-catalog*`. Lesson: a green build without the
+  feature in CI is not evidence the feature works.
+* Retired 2026-09-01 (#1721): gated behind opt-in `oltp-catalog` (root `oltp-catalog[-postgres|
+  -mysql|-sqlite|-full]` now forward to `proximadb-catalog`); root test users migrated off it.

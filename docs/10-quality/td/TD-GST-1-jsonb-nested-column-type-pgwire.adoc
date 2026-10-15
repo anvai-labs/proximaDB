@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Open — enhancement request (external consumer: AnvaiOps GST-ASP vertical)
+| Status | Open — enhancement request (external consumer: AnvaiOps GST-ASP vertical). Dependency note (2026-10-15): SQL aggregation (`SUM`/`GROUP BY`) and the `->`/`->>` accessors now work over pgwire (TPC-H 22/22; link:TD-183-document-json-projection-zero-rows.adoc[TD-183]); the nested prop type, containment `@>`, and unnest-to-rows remain open.
 | Priority | High — blocks a lossless, aggregatable invoice table; the single biggest schema-fidelity gap for the GST filing workload
 | Severity | Medium — worked around today (JSON-as-string in props), but the workaround forecloses engine-side filter/aggregate
 | Component | record props type system; pgwire SQL surface (`src/network/postgres/`, `crates/query/proximadb-query/`); `crates/foundation/proximadb-functions`

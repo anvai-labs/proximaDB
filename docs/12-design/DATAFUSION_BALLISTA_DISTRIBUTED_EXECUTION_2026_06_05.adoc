@@ -2,7 +2,7 @@
 :toc:
 :toclevels: 3
 
-Status: Active ProximaDB-side blueprint +
+Status: Active ProximaDB-side blueprint — **Partial (verified 2026-10-15)**: P0 contract shipped (`RoutedReadPlan` in `src/query/read_route.rs`, `ComputeScheduler::route_select_plan`, `ReadRouteExplanation` nested in pgwire EXPLAIN); P1 split-consuming DataFusionLocal not re-audited; P2 Ballista adapter and P3 multi-node verification open (no `ballista` dependency in the workspace; `ComputeBackend::DataFusionDistributed` is vocabulary only). Read with link:adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (DataFusion is the OLAP executor; distribution stays on the DataFusion route). +
 Date: 2026-06-05 +
 Scope: database-owned read-route contracts, split planning, DataFusion local execution, and
 Ballista-backed `DataFusionDistributed` integration boundaries.
@@ -70,7 +70,7 @@ Implementation anchor:
 
 === P0: Contract Only
 
-Status: Partial 2026-06-05.
+Status: Contract + EXPLAIN items done (verified 2026-10-15; was Partial 2026-06-05). Explicit rejection of unsupported policy/freshness boundaries not re-audited.
 
 * Define `RoutedReadPlan` and `ReadRouteExplanation`.
 * `ComputeScheduler::route_select_plan` materializes the typed route plan from the existing

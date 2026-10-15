@@ -1,87 +1,38 @@
+// Copyright (C) 2025 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
 = TD-DECOMP-82: Seed the `proximadb-sst-engine` crate + three supporting hoists
 :id: TD-DECOMP-82
-:status: implemented
+:status: partial
 :date: 2026-08-16
 :phase: root-crate decomposition — phase 6, PR C
 
-== Problem
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial: `proximadb-sst-engine` seeded with error / row_filter / staged_write / deletion_vector_store / decompression_cache, plus write_strategy, cache-stats and proto-metadata-helper hoists (#1658); open: `multi_stage_filter.rs` and the later SST waves (segment_format, compaction, query engine).**
+| Severity | Low — behavior-neutral move behind existing ports
+| Component | `crates/storage/proximadb-sst-engine`; `proximadb-storage-common` (`write_strategy`, `proto_metadata_helper`); `proximadb-storage-ports` (`UsageStats`, `CacheStatsProvider`); root `src/storage/engines/sst/`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-1-segment-format-to-storage-common.adoc[TD-DECOMP-1] (overlap: `segment_format` write/search half); link:TD-DECOMP-79-extract-sst-format-types-io-layer.adoc[TD-DECOMP-79]; link:TD-DECOMP-81-extract-ops-compression-cluster.adoc[TD-DECOMP-81]
+|===
 
-The SST engine dir (`src/storage/engines/sst/`, ~60K LOC) is the largest
-remaining root-crate block. Whole-dir extraction needs an engine-port surface
-that doesn't exist yet, but the phase-6 survey found five leaf files whose
-coupling was already dissolved — enough to start the destination crate the
-right way rather than extracting into a grab-bag.
+== History (shipped)
 
-== Change
+The SST engine dir (~60K LOC) is the largest root block; whole-dir extraction needs an engine-port surface
+that does not exist yet, so the destination crate was seeded with five leaves whose coupling had already
+dissolved. It has zero root deps (ports + extracted siblings only), so later waves peel in without
+re-plumbing. Root call sites coerce via new `filesystem_port()` accessors on `SstEngine` and `Compaction`;
+`staged_write`'s API widened `pub(crate)` → `pub`.
 
-1. **New crate** `crates/storage/proximadb-sst-engine` (all three Cargo.toml
-   wirings: workspace member, `[workspace.dependencies]`, root `[dependencies]`).
-   Seed modules (moved via `git mv`):
-   - `error.rs` (59) — `SstError`/`Result`; the FilesystemError variant re-points
-     at `proximadb-storage-filesystem-types` (same enum via the root re-export).
-   - `row_filter.rs` (418) + `row_filter_tests.rs` — zero root deps after the
-     survey rewrites (ProximaDataBlock ← engine-core, metadata helpers ← the
-     hoist below, `evaluate_filter_proxima` ← search-types shim target).
-   - `staged_write.rs` (420) — `Arc<FilesystemFactory>` →
-     `Arc<dyn FilesystemPort>`; its API (`StagedSegmentWrite`,
-     `LocalizedSegment`, `read_object_bytes`) widened `pub(crate)` → `pub`
-     (cross-crate consumers in root sst compaction/search/flush).
-   - `deletion_vector_store.rs` (422) — fs port swap; tests use the new
-     `test_local_port` (tokio::fs-backed `FilesystemPort`, same shape as
-     engine-core's TD-78 stub).
-   - `decompression_cache.rs` (736) — cache-stats refs resolved by the hoist below.
-2. **Hoist `write_strategy.rs`** (66 LOC) → `proximadb-storage-common`
-   (`WriteStrategyFactory`/`MetadataWriteStrategy`; only deps are
-   filesystem-types). Root `persistence/filesystem/` keeps a `pub use` shim;
-   its 7 consumers (transaction_coordinator, WAL ×4, sst ×2) unchanged.
-3. **Hoist `UsageStats` + `CacheStatsProvider`** (orchestrator.rs:622–630) →
-   `proximadb-storage-ports` (beside `CacheAccessPatternPort`); the root
-   orchestrator re-exports back. Graph service, viper, and sst implementers
-   unchanged.
-4. **Hoist `proto_metadata_helper.rs`** (186 LOC) → `proximadb-storage-common`
-   — row_filter's last root dep; `proto` + `serde_json` only (both already
-   storage-common deps). Root `src/core/` keeps the re-export shim.
-5. **Root call-site coercions** (9 sites across compaction/search/flush):
-   `self.filesystem()` / `&self.filesystem_factory` → new
-   `filesystem_port()` accessors on `SstEngine` (core.rs) and `Compaction` —
-   `FilesystemFactory` impls the port root-side, callers coerce at the boundary.
-6. Root `sst/mod.rs` shims: `pub use proximadb_sst_engine::{error, row_filter,
-   staged_write, deletion_vector_store, decompression_cache}`.
+* Manifest hazard (recurring): root `Cargo.toml` has a second `proximadb-engine-core` entry under
+  `[dependencies]` at the file tail; deleting "the duplicate-looking" line by name breaks ~40 shims. Verify
+  section headers; never delete by name-match alone.
+* "Allows don't travel" again: `row_filter`'s dead `get_or_convert_vector_metadata` was deleted when the
+  crate's clippy gate flagged it.
+* Evidence: nextest sst-engine 15/15, storage-common 586/586.
 
-== Manifest note (recurring hazard)
+== Open: deferred work
 
-The root `Cargo.toml` has an entry for `proximadb-engine-core` under
-`[dependencies]` at the file tail (beside the raptor NAPI-RS block) — an edit
-that relocates "the duplicate-looking" line silently removes the root's dep and
-breaks ~40 `proximadb_engine_core::` shims. This PR restored it after hitting
-exactly that. Future manifest edits: verify each section header, never delete
-by name-match alone.
-
-== Deviation notes
-
-- `row_filter`'s `get_or_convert_vector_metadata` deleted: dead code with zero
-  callers workspace-wide, flagged by the crate clippy gate (root's crate-level
-  allows suppressed it — the recurring "allows don't travel" class).
-- `staged_write`/`deletion_vector_store` tests now exercise the port seam via
-  `test_local_port` instead of constructing the real `FilesystemFactory` —
-  the production path keeps the port, tests keep real files on disk.
 - `multi_stage_filter.rs` deferred (needs `ReadStrategy` from
-  sst_query_engine — pull that whole file with its reader in a later wave).
-
-== Verification
-
-* `cargo check -p proximadb-sst-engine --all-targets` clean
-* `cargo check -p proximadb --lib` clean; workspace `--lib --bins --tests` clean
-* `cargo clippy --lib --bins -p {sst-engine, storage-ports, storage-common, root} -- -D warnings` clean
-* `check_workspace_boundaries.py --strict` — no findings
-* `nextest -p proximadb-sst-engine`: 15/15; `-p proximadb-storage-common`: 586/586
-* `cargo fmt --check` clean; TD-unique guard pass
-
-== Impact
-
-~2,545 LOC out of the root crate; the sst-engine crate is live with the
-correct dependency posture (ports + extracted siblings only — zero root deps),
-so later waves (segment_format, compaction, query engine) peel into it without
-re-plumbing. Three cross-cutting vocabulary types (`WriteStrategyFactory`,
-`CacheStatsProvider`/`UsageStats`, proto metadata helpers) now live where
-storage-tier consumers can name them.
+  sst_query_engine — pull that whole file with its reader in a later wave). (Still root-side, verified 2026-10-15.)
+- Later waves (segment_format, compaction, query engine) peel into the sst-engine crate without
+  re-plumbing — see link:TD-DECOMP-1-segment-format-to-storage-common.adoc[TD-DECOMP-1] for the open `segment_format` write/search/probe half.

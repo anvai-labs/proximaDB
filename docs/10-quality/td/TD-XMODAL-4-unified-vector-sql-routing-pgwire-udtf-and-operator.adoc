@@ -5,11 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress**. Both SQL syntaxes lower to the canonical `proximadb_vector_query::VectorSearchExpr` and execute through the shared native vector-search port. The canonical `ComputeScheduler` exposes a distinct vector *access-path* decision; successful SST exact/ANN executions land attributable trace/warehouse samples and observe-only cost cells. Vector cost cells partition storage locality and route-time cache availability, while completed cache outcome remains arm-specific evidence. The bounded paired SIFT gate rejects unknown policy or outcome and now reports each outcome separately. A replicated 50 ms RTT-injected/full-cache cohort refuted the assumption that `full` implies warm execution and exposed missing collection geometry, cache-capacity, and canonical decision-boundary context. Automatic cost selection and cross-surface parity remain open.
+| Status | **Partial: S1 UDTF reachability (#926) + v2 kernel (#939), clean-break canonical lowering (#1653), typed router contract (#1672), measured access-path evidence (#1683) and the paired/regime/cache-policy evidence slices (#1709, #1720, #1728, #1729, #1734, #1756) shipped; open: automatic cost-based exact/ANN selection behind the corrected single route boundary, S3 REST-SQL/UQL convergence, cross-surface parity tests, streaming authority scan, S4 docs.** Both SQL syntaxes lower to the canonical `proximadb_vector_query::VectorSearchExpr` and execute through the shared native vector-search port. The canonical `ComputeScheduler` exposes a distinct vector *access-path* decision; successful SST exact/ANN executions land attributable trace/warehouse samples and observe-only cost cells. Vector cost cells partition storage locality and route-time cache availability, while completed cache outcome remains arm-specific evidence. The bounded paired SIFT gate rejects unknown policy or outcome and now reports each outcome separately. A replicated 50 ms RTT-injected/full-cache cohort refuted the assumption that `full` implies warm execution and exposed missing collection geometry, cache-capacity, and canonical decision-boundary context. Automatic cost selection and cross-surface parity remain open.
 | Severity | Medium-High (surface consistency + moat: one internal vector-search intent behind every SQL surface; removes the hardcoded pgwire `<->` bypass and the pgwire/UDTF reachability gap)
 | Component | pgwire (`src/network/postgres/relational_pipeline.rs`, `pgvector_params.rs`) ; router (`src/query/compute_scheduler.rs` `VectorQueryShape`/`route_vector_search`) ; DataFusion UDTF (`src/datafusion/cross_modal.rs` `VectorSearchTableFunction`, `src/datafusion/mod.rs` `register_udtf`) ; vector engine (`SstEngine::search_vectors_unified`, `VectorOpsPort::unified_search_native`).
 | Governs / derives from | link:../../12-design/adr/ADR-053-cross-modal-query-fabric.adoc[ADR-053] (cross-modal query fabric — "no new DSL; reuse SQL + table functions") ; the reserved TD-XMODAL-4 forward-reference therein.
-| Relates | link:TD-RDSTRAT-4-centroid-block-clustering-and-segment-directory.adoc[TD-RDSTRAT-4] / link:TD-RDSTRAT-5-cache-first-voe-directory-activation-codesign.adoc[TD-RDSTRAT-5] (the vector-execution knobs — striped read, centroid prune — become router-tunable properties of the VectorSearch node) ; TD-EXEC (shape_class / geometry routing key) ; TD-076 (pgwire SQL parity) ; ADR-052/ADR-034 (cost model + io_trace the router costs from).
+| Relates | link:TD-XMODAL-10-graph-traverse-udtf-pgwire-reachability-unverified.adoc[TD-XMODAL-10] and link:TD-RERANK-PGWIRE-1-rerank-not-reachable-over-pgwire.adoc[TD-RERANK-PGWIRE-1] (same pgwire UDTF-reachability class; this TD is the precedent for closing them) ; link:TD-RDSTRAT-4-centroid-block-clustering-and-segment-directory.adoc[TD-RDSTRAT-4] / link:TD-RDSTRAT-5-cache-first-voe-directory-activation-codesign.adoc[TD-RDSTRAT-5] (the vector-execution knobs — striped read, centroid prune — become router-tunable properties of the VectorSearch node) ; TD-EXEC (shape_class / geometry routing key) ; TD-076 (pgwire SQL parity) ; ADR-052/ADR-034 (cost model + io_trace the router costs from).
 |===
 
 == Finding (the pieces exist — unify + route them, don't rebuild)
@@ -65,50 +65,32 @@ VectorSearchExpr { collection, vector_column?, query_vector, top_k, threshold?,
 
 `VectorSearchTableFunction` / `VectorSearchTableProvider` (`cross_modal.rs`), `register_udtf` (`datafusion/mod.rs`), `VectorOpsPort::unified_search_native`, `SstEngine::search_vectors_unified`, and the `ComputeScheduler`/`route_cost_model`/`QueryShape` router already exist — S1–S4 wire them behind one node, they do not rebuild them. Distance-metric mapping follows pgvector semantics for ecosystem compatibility.
 
-== Implemented clean-break slice (2026-08-16)
+== History (shipped)
 
-The current implementation establishes one trustworthy boundary before adding router policy:
-
-* deleted `protocol.rs::execute_vector_search` and the translator's regex operator rewrite;
-* added PostgreSQL-AST lowering for `<->`, `<=>`, and `<#>`, including typed filters, positive `LIMIT`, and SQL projection; unsupported shapes fail with `0A000` rather than falling through or widening a filter;
-* made vector dispatch AST-only: operator-looking text in literals/comments remains on the ordinary relational path, and oversized `LIMIT` values fail rather than truncating into the canonical `u32 top_k`;
-* made extended-protocol `Describe` reuse the same projection lowerer as `Execute`;
-* extended the existing `VectorSearchExpr` instead of adding a pgwire-only public plan: it now carries a named vector column and typed filter, and both pgvector lowering and the UDTF construct it. Shared validation rejects empty/non-finite vectors, zero top-k, and invalid thresholds. The UQL/multimodel executor now forwards metric/filter, applies its similarity threshold, and rejects unsupported non-default per-query tuning instead of silently dropping it;
-* extended `VectorOpsPort::unified_search_native` with the requested metric and complete `PortIdentity`; its default implementation now errors instead of returning a false empty success. The canonical multimodel executor likewise propagates missing-service and backend failures, preserving the semantic distinction between "not executed" and a successful zero-match result;
-* included metric in query-cache identity and threaded it through planner, WAL, storage, and delta merge;
-* made `SearchMode::Exact` and metric/index incompatibility bypass AXIS, then enriched the bounded result set with metric-tagged semantic distances when an engine returned only a normalized score;
-* established a single source-of-truth rule for SQL tables: pgvector search reads the catalog table's `TableRecordStore`, with tenant/ABAC enforcement and the typed predicate evaluated at that boundary. It never treats an empty legacy vector-WAL result as evidence that a SQL table is empty. Exact table scan is the correctness floor; an ANN/PAX structure may accelerate it only as a rebuildable projection of that same primary;
-* bounded exact ranking to `O(top_k)` retained candidates with cooperative cancellation checks, no result-vector copies, projection-late metadata materialization, full composite-primary-key identity, named multi-vector-column selection, dimension validation, and route timing/cardinality telemetry. The current record-store API still materializes the filtered authority scan itself, so scan memory remains `O(matches)` until a streaming scan contract lands;
-* preserved JSON/JSONB container paths (`payload.type`) through AST lowering and filter evaluation instead of flattening them into an ambiguous global metadata namespace;
-* hardened the pgwire integration fixtures: metadata/catalog state is temp-directory scoped, setup errors are fatal, and both filtered and unfiltered searches assert exact non-empty ID sets. These gates exposed the previously false-green split-store behavior.
-
-That S1 snapshot did **not** close TD-XMODAL-4: the UDTF and operator converged on the explicit `VectorSearchExpr` node and one native port, but had no vector access-path decision. Exact ranking was bounded; the underlying authoritative record scan was not streaming. The next section records the subsequent router-contract increment; cross-surface parity, full route-level I/O traces, projection freshness/rebuild tests, and measured geometry-driven exact/ANN selection remain acceptance gates for S2/S3.
-
-== Implemented router-contract slice (2026-08-17)
-
-The first S2 increment closes the policy-loss boundary without claiming an unmeasured route flip:
-
-* added `ComputeScheduler::route_vector_search(VectorQueryShape)` returning an observable, typed `VectorRouteDecision` for exact/approximate/adaptive access inside `ComputeBackend::Native`; the relational `QueryShape` and its backend decisions are unchanged by construction;
-* kept absent intent on the existing exact correctness floor. Approximate/adaptive access requires explicit typed intent until exact-vs-ANN cost observations are comparable and the recall ratchet admits a default change;
-* replaced `VectorSearchParams { mode: String, ef_search, n_probes }` with the canonical typed `SearchMode`. The former shape accepted index-family-specific knobs before choosing an index family, and the runtime port dropped all three. `Approximate { nprobe }` is now one value that reaches storage unchanged; invalid zero ANN effort/adaptive cutoffs are rejected at shared validation;
-* changed `VectorOpsPort::unified_search_native` to accept the complete `VectorSearchExpr` rather than six independently threaded arguments. Both pgvector lowering and the DataFusion UDTF now cross the same intent boundary, making field omission reviewable at one seam; shared validation and similarity-threshold semantics live on that expression;
-* routed the production port and multimodel executor through the same scheduler decision and removed the hard-coded `SearchMode::Exact` overwrite for explicit caller intent.
-
-This is deliberately **observe/static**, not a claimed completion of cost selection. The current route cost model ranks whole-plan `ComputeBackend` candidates and its one trace route slot cannot honestly compare nested vector access methods. The next S2 increment must add a distinct access-path trace dimension and warm comparable `(vector shape, exact|ANN)` cells before any default or live override can flip. Reusing the backend label for ANN would poison the existing engine cells; adding arbitrary dimension/top-k buckets before trace-density evidence would repeat ADR-058's warned failure mode.
-
-== Implemented measured-access slice (2026-08-19)
-
-The second S2 increment adds the evidence substrate without enabling an automatic route flip:
-
-* added a repeated, typed `vector_accesses[]` dimension to `IoTraceSnapshot`, separate from the single containing-compute route. Each successful access retains physical engine, exact numeric dimensions/top-k, filter presence, requested mode, and the actual exact/ANN path; no vector, predicate, collection name, or user data is captured;
-* projected those samples into normalized `trace_vector_access` warehouse rows keyed by the existing writer/sequence/query identity and access ordinal. Multi-vector SQL therefore remains queryable instead of being overwritten by a last-write-wins slot;
-* reused the existing `RouteCostModel` EWMA/persistence store for `(vector engine + exact geometry, actual path)` cells. Exact dimensions/top-k are not Prometheus labels and are not forced into unmeasured buckets. Caller intent remains durable evidence but is intentionally not part of the cost key, because partitioning by intent would make exact-vs-ANN comparison impossible;
-* made online attribution fail closed: only a trace with exactly one vector access can fold aggregate query I/O/compute into a cost cell. Multi-access traces stay durable but do not train the model until operator-local cost accounting exists;
-* record ANN only after positive physical engagement proof (non-empty AXIS result, PAX cascade result, or file-centroid pruning). An Approximate/Adaptive request that falls back without such proof does not poison the ANN cell. Exact is recorded only after successful exact execution;
-* rebind the owning `IoTrace` handle across SST's per-file `tokio::spawn` boundary, so multi-core PAX I/O and ANN engagement contribute to the same query sample instead of disappearing with the task-local context;
-* fixed an exactness defect exposed by that attribution audit: `execute_exact_segment_scan` previously set only `block_prune.force_exact`, leaving Adaptive file pruning enabled, while every direct-scan implementation attempted the RaBitQ cascade before consulting that flag. The effective mode is now forced to `Exact`, and one shared cascade gate makes `force_exact` dominate sequential and multi-core PAX scans.
-
-This snapshot remained observe-only. The scheduler's absent-intent default stayed Exact, persisted vector cells were not admitted to the whole-plan backend recommendation table, and no gate could flip vector access automatically. The next section records the paired-evidence increment and the correctness defects it exposed.
+* **Clean-break lowering (2026-08-16, #1653).** The hardcoded pgwire `<->` bypass
+  (`protocol.rs::execute_vector_search` + regex rewrite) is deleted; `<->`/`<=>`/`<#>` lower from the
+  PostgreSQL AST (typed filters, positive `LIMIT`, SQL projection, JSON container paths preserved) and
+  unsupported shapes fail `0A000`. Dispatch is AST-only (operator text in literals/comments stays
+  relational); extended-protocol `Describe` reuses the `Execute` lowerer. `VectorSearchExpr` gained a
+  named vector column + typed filter, with shared validation; `VectorOpsPort::unified_search_native`'s
+  default now errors instead of a false empty success; metric is part of query-cache identity.
+  **Binding rule:** pgvector search reads the catalog table's `TableRecordStore` (tenant/ABAC enforced
+  there) and never treats an empty legacy vector-WAL result as evidence a SQL table is empty — exact
+  table scan is the correctness floor and ANN/PAX may only accelerate it as a rebuildable projection.
+  Exact ranking is bounded to `O(top_k)`, but the authority scan still materializes `O(matches)` until
+  a streaming scan contract lands (open). Hardened fixtures exposed the prior false-green split-store.
+* **Router contract (2026-08-17, #1672).** `ComputeScheduler::route_vector_search(VectorQueryShape)`
+  returns a typed `VectorRouteDecision` inside `ComputeBackend::Native`; relational `QueryShape` is
+  unchanged (a vector source can nest inside a DataFusion join, so access method and whole-plan engine are
+  orthogonal axes). Absent intent stays Exact. Stringly `VectorSearchParams` replaced by the typed
+  `SearchMode` (`Approximate { nprobe }` reaches storage unchanged); the port takes the whole
+  `VectorSearchExpr`. Observe/static only — reusing the backend label for ANN would poison engine cells.
+* **Measured access (2026-08-19, #1683).** Repeated typed `vector_accesses[]` in `IoTraceSnapshot`
+  (no vectors/predicates/names captured) projected to `trace_vector_access` warehouse rows; `RouteCostModel`
+  cells keyed by engine + exact geometry + actual path (intent recorded but not keyed, else exact-vs-ANN is
+  incomparable). Attribution fails closed: only single-access traces train; ANN is recorded only after
+  positive engagement proof. Fixed an exactness defect: `execute_exact_segment_scan` had left Adaptive file
+  pruning enabled and every direct scan tried the RaBitQ cascade first — `force_exact` now dominates.
 
 == Paired evidence and exact-authority correction (2026-08-21)
 

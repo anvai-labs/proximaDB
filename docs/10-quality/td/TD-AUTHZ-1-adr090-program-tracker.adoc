@@ -3,12 +3,18 @@
 :dim: D5
 :pillar: SEC
 
-== CURRENT STATE (2026-08-17) — read this before the dated sections below
+[cols="1,3"]
+|===
+| Status | **Partial: L0.1, L0.3, L1.1, L1.2, L2.1, the TD-AUTHZ-2 identity chain, the validator-model fix and the L3.4 host-path confinement shipped (table below); open: cross-tenant grant-aware catalog seam (item 1), L0.2/L0.4–L0.6, L1.3/L1.4, L2.2/L2.4/L2.5, L3.1–L3.5.**
+| Component | `src/security/rls/abac_adapter.rs`; `src/services/operations/vectors/legacy.rs`; `crates/control/proximadb-catalog` (grants, principal registry); `crates/platform/proximadb-runtime` (`CollectionPort`)
+| Relates to | link:../../12-design/adr/ADR-090-identity-grants-and-byob-storage.adoc[ADR-090], link:TD-TENANT-2-retire-per-row-tenant-predicate.adoc[TD-TENANT-2] (overlap: cross-tenant sequencing — canonical here), link:TD-SEC-2-security-pressure-test-register.adoc[TD-SEC-2], link:TD-AUTHZ-2-xcatalog-relational-object-id-empty.adoc[TD-AUTHZ-2], link:TD-ABAC-6-unified-identity-seam.adoc[TD-ABAC-6] (L0.3 overlap), link:TD-SECSCAN-1-v0.4.0-security-alert-triage.adoc[TD-SECSCAN-1] (L3.4 overlap), link:TD-AUTH-FC-listener-admission.adoc[TD-AUTH-FC] (L0.4 overlap)
+|===
 
-The dated sections that follow are a CHRONOLOGICAL INVESTIGATION LOG. Several of them were
-overturned by later work, and a reader going top-down would absorb superseded claims as
-current. This section is the state of truth; the log is kept for its reasoning trail, not as
-a status report.
+== CURRENT STATE (2026-08-17, re-verified 2026-10-15) — read this first
+
+The investigation log that originally followed was CHRONOLOGICAL and several entries were overturned
+by later work. Superseded entries are compacted into "History (investigation log)" at the end; the
+entries that still specify open work are kept verbatim.
 
 === Shipped
 
@@ -25,34 +31,38 @@ a status report.
 | — | Escalation-safe `cross_tenant_open_decision` (a Read grant can never admit a Write open) | #1562
 | — | Owner-keyed grant lookup; non-truncating `Target`; dead fail-open surface deleted | #1575
 | — | Resolver failures DENY instead of degrading to an unfiltered read | #1582
+| — | Tenant-label check corroborates isolation, does not perform it (validator-model fix, L2.2 step 1) | #1597
+| — | Unmounted duplicate graph/RAG router deleted; docs that called graph-RAG shipped corrected | #1598
 | — | `object_id` minted on the LIVE catalog (`SystemCatalog`), durable across restart | #1607
 | — | `Target::try_from_typed_triple` — ADR-0083-canonical, fail-closed on overflow | #1630
 | L1/L2 | **Typed identity re-landed ⇒ relational ABAC ENFORCES live** across pgwire/gRPC/REST-SQL/Flight; the 3 `#[ignore]`s lifted (suite 7 passed, 0 ignored) | #1636
+| — | Catalog/ABAC claims the code does not back fail loudly; `xcatalog` renders absent `object_id` as `NULL` (TD-CAT-7) | #1680, #1684
+| L2.1 | `$subject.<attr>` row predicates (`compile_security_filter` takes required `&SubjectAttributes`) | #1689
+| L0.4 (part) | pgwire SCRAM-SHA-256 authentication with tenant-bound verifiers (TD-PGWIRE-AUTH-1); admission still contains pgwire in authenticated deployments (TD-AUTH-FC) | 2ef6cb577
+| L3.4 (part) | External-collection locations confined to the `PROXIMADB_EXTERNAL_TABLE_ROOTS` allowlist + canonicalisation (host-path read closed; per-tenant policy still open) | #1992
 |===
 
 === Open, in dependency order
 
 . **Cross-tenant sharing is authorized but NOT observable.** The catalog seam must resolve
   grant-admitted foreign collections before the per-row predicate change (TD-TENANT-2 step 2)
-  has any visible effect. Blocked on nothing but the work itself.
-. ~~**TD-AUTHZ-2**~~ — **RESOLVED** (#1607 + #1636). Correcting this entry's own diagnosis: it
-  said the defect lay "in the wiring between `NativeCatalog` and the introspection projection."
-  It did not. The live catalog (`SystemCatalog`) simply **never minted the ids** — neither
-  `object_id` nor `stable_namespace_id` — so `dml/mod.rs:1466`'s two-field gate could not be
-  satisfied and `introspection/lib.rs:424` rendered `None` as an empty string via
-  `unwrap_or_default()`. Both halves were needed and neither subsumed the other, proven by the
-  e2e failure MOVING (`:285` parse → `:786/:904/:1023` enforcement). Still latent and filed
-  separately: that `unwrap_or_default()` rendering turns a missing identity into a value
-  indistinguishable from an empty column.
-. **L2** — `$subject.attr` substitution, the remaining `System` bypasses, predicate-store
-  tenant partitioning.
+  has any visible effect. Blocked on nothing but the work itself. (Verified 2026-10-15:
+  `CollectionPort::get_collection(identifier, tenant_id: Option<&str>)` still takes a bare tenant;
+  the per-row predicate is still at three `legacy.rs` sites.) Spec: "Item 3" sections below.
+. ~~**TD-AUTHZ-2**~~ — **RESOLVED** (#1607 + #1636). The live catalog (`SystemCatalog`) simply
+  **never minted the ids** — neither `object_id` nor `stable_namespace_id`; both halves were needed,
+  proven by the e2e failure MOVING. The `unwrap_or_default()` rendering it left latent was hardened
+  to `NULL` under TD-CAT-7 (#1680).
+. **L2** — the remaining `System` reads (L2.2), vector-path namespace (L2.4), parallel channels /
+  `FieldMask` / durable epochs (L2.5). (`$subject.attr` substitution shipped as L2.1; predicate-store
+  partitioning re-ranked as not a security gap, L2.3.)
 . **L3** — BYOB storage bindings.
 
 === Closed by deletion rather than by fixing
 
 L2.2 item 1 ("the graph/RAG surface has no identity") turned out to be an **unmounted
-duplicate** left by the decomposition; deleting it removed the gap and corrected three
-documents that called graph-RAG shipped. Ref the 2026-08-12 sections and the deletion PR.
+duplicate** left by the decomposition; deleting it (#1598) removed the gap and corrected three
+documents that called graph-RAG shipped.
 
 == 🔍 Rationalization audit — claims made, and how they held up
 
@@ -135,15 +145,15 @@ slices file as TD-AUTHZ-2, -3, … referencing this tracker.
 
 == Layer L0 — identity (prerequisite for everything)
 
-. **L0.1** Catalog user + API-key registries (hashed keys, mint/revoke/rotate admin API);
+. **[SHIPPED #1514]** **L0.1** Catalog user + API-key registries (hashed keys, mint/revoke/rotate admin API);
   collapse the three key tables (`security/auth_service.rs:30`,
   `network/middleware/auth.rs:35`, `network/auth/mod.rs:239`) onto it.
 . **L0.2** `key→user` and `user→tenant` become required; mTLS/JWT must resolve a tenant
   or reject under `MultiTenant`; `X-Tenant-ID` demoted to cross-check.
-. **L0.3** All four surfaces adopt `resolve_request_identity` (finishes TD-ABAC-6 PR-B);
+. **[PARTIAL — gRPC bridge shipped #1516; REST/gRPC orchestrator adoption open, see TD-ABAC-6 §6]** **L0.3** All four surfaces adopt `resolve_request_identity` (finishes TD-ABAC-6 PR-B);
   gRPC gets a `From<&GrpcAuthContext> for PortIdentity` bridge (kills the 4 hand-built
   sites in `grpc/v2/record_service.rs`).
-. **L0.4** pgwire authenticates (password/SCRAM mapped to keys) or is a registry-gated
+. **[PARTIAL — SCRAM shipped (TD-PGWIRE-AUTH-1); admission/conformance open (TD-AUTH-FC)]** **L0.4** pgwire authenticates (password/SCRAM mapped to keys) or is a registry-gated
   dev surface; retire the DEFAULT_TENANT pre-gate short-circuit (`protocol.rs:653-658`).
 . **L0.5** Delete the dead `account_id` string tier (`middleware/tenant.rs:73`);
   document account ≡ tenant (`tenant_stable_id`) as final (ADR-0083 P5).
@@ -152,10 +162,10 @@ slices file as TD-AUTHZ-2, -3, … referencing this tracker.
 
 == Layer L1 — catalog-seam authorization + grants (sharing)
 
-. **L1.1** `Grant` catalog object (model: the dead `tenant_access::CollectionSharing`,
+. **[SHIPPED #1517]** **L1.1** `Grant` catalog object (model: the dead `tenant_access::CollectionSharing`,
   `services/tenant_access/mod.rs:44-49`) — durable, tenant-partitioned, serde-compat
   shim + legacy round-trip test per ADR-024 rollout doctrine.
-. **L1.2** Collection-open gate enforces (replace the TODO log at
+. **[SHIPPED #1529/#1537/#1544]** **L1.2** Collection-open gate enforces (replace the TODO log at
   `vectors/legacy.rs:838-845`); LIST filters to authorized resources; DDL actions
   evaluated. Default-OFF gate + provision/permit/deny/revoke e2e ratchet (pattern:
   the TD-ABAC-11 live-transport ratchets).
@@ -184,6 +194,7 @@ re-invented — one spelling, not two.
 +
 Retiring `rls/policy.rs` + `secure_operations.rs` remains open and is tracked under L2.5.
 . **L2.2** Close the `System` reads that stand in for a missing client context.
+  (2026-10-15 recount: `grep -r 'CLIENT-PLACEHOLDER' src` excluding `::tests` origins → 20 sites.)
   **Re-surveyed 2026-08-20 — the original entry was wrong in three ways**, so it is restated here
   rather than patched.
 +
@@ -259,7 +270,7 @@ dimension cannot be added without someone re-reading the scope note.
 . **L3.3** Placement policy: collection create resolves `base_location` from tenant
   bindings; `StoragePoolClass::Dedicated` routes; replace `choose(rng)`
   (`engine.rs:826-833`).
-. **L3.4** Per-tenant location policy replaces `PROXIMADB_EXTERNAL_TABLE_ROOTS`;
+. **[PARTIAL — #1992 confines external-collection locations to the process-wide allowlist + canonicalisation; per-tenant policy, read-time revalidation, SSRF guard still open; see TD-SECSCAN-1 §6]** **L3.4** Per-tenant location policy replaces `PROXIMADB_EXTERNAL_TABLE_ROOTS`;
   add **read-time revalidation** of layout URIs (closes the read/write asymmetry at
   `object_store_parquet_reader.rs:557-560`); SSRF guard (deny `file://`/`http://` for
   tenant-supplied URLs on network surfaces).
@@ -284,27 +295,11 @@ the cloud-emulator suite (Azurite/MinIO); recall unaffected (the standing
 * The 53-gap inventory: ADR-090 appendices A–C.
 
 
-== Sequencing update (2026-08-07) — verified blocker on the cross-tenant ratchet
 
-NOTE: SUPERSEDED — the blocker named here (WAL tenant-keying) was wrong; the gate is the
-catalog seam. See the 2026-08-08 correction below and the CURRENT STATE section at the top.
+== Item 3 (cross-tenant open) — the open specification, kept verbatim
 
-Tracing the cross-tenant read path for the L1.2 e2e ratchet found that
-`src/services/operations/vectors/legacy.rs:1123/:1175/:1346` retain rows by
-`record.tenant_id == tenant_context.tenant_id`, so a foreign grantee is admitted by the
-catalog and then filtered to zero rows. See the 2026-08-07 addendum in TD-TENANT-2.
-
-Revised order for the remaining L1/L2 work:
-
-. **Same-tenant e2e ratchet** (provision → permit → deny → revoke over live transports) —
-  reachable now that the grants admin surface has landed (#1534); this is the flip-precondition
-  for arming enforcement, whether via the env default or a tenant `Enforce` posture (#1537).
-. **TD-TENANT-2** — retire the per-row tenant predicate. Promoted to the critical path: until
-  it lands, cross-tenant sharing is authorized but not observable.
-. **Cross-tenant e2e ratchet** — only meaningful after (2); writing it earlier yields a test
-  that fails for reasons unrelated to grants.
-. Then L2 (`$subject.attr`, the six `System` bypasses, predicate-store tenant partitioning).
-
+The sections below specify the still-open cross-tenant seam work. They are kept as written; dated
+annotations mark what later PRs changed.
 
 == Sequencing correction (2026-08-08)
 
@@ -347,13 +342,6 @@ Shape of the slice:
   collection. Absent or revoked grant ⇒ unchanged rejection (fail-closed preserved).
 * Then, and only then, TD-TENANT-2 step 2 (the per-row predicate comparing against the OWNING
   tenant) becomes observable — and the cross-tenant ratchet can be written.
-
-Open question to settle first: `validate_tenant_collection_access` returns the resolved
-collection id used for the subsequent WAL read, so a grant-admitted foreign collection must
-resolve to the OWNER's id. Confirm that downstream readers key off the returned id rather than
-re-deriving one from the acting tenant, or the read will still miss.
-
-
 == Item 3 prerequisite SETTLED (2026-08-09)
 
 The open question from the 2026-08-08 design note — *does a grant-admitted foreign collection's
@@ -399,38 +387,12 @@ asserting an absence.
 
 == Item 3 wiring — the identity constraint at the seam (2026-08-10)
 
-NOTE: PARTLY SUPERSEDED — the interim proposed here (tenant-wide grants only) was made moot
-by the 2026-08-11 gate finding; the seam work is scoped differently now. See CURRENT STATE.
-
-The decision core (`cross_tenant_open_decision`) is merged and escalation-safe. Wiring it into
-`validate_tenant_collection_access` runs into a constraint that determines the shape of the
-remaining work, and it is NOT the one the earlier notes anticipated.
-
-**`TenantContext` carries only `tenant_id: String`.** No subject, no stable id
-(`crates/platform/proximadb-api/src/rest/state.rs:16`). But:
-
-* grants may be per-user — `Grantee::User { tenant_stable_id, subject }`;
-* `evaluate_grants` needs a `TenantStableId` (u64) for the acting tenant;
-* the grant store is partitioned by the OWNER's stable id, so even finding the candidate
-  grants requires resolving a string tenant to its stable id.
-
-So the seam cannot evaluate a per-user grant, and cannot even load the owner's grant slice,
-from what it is handed today.
-
-=== Safe interim: tenant-wide grants only, per-user FAIL-CLOSED
-
-`evaluate_grants` already gives the correct answer if the acting subject is a value that can
-never match a `Grantee::User`: `Grantee::Tenant(t)` matches on tenant alone and admits, while
-`Grantee::User { .. }` requires a subject equality that fails. That yields exactly the right
-partial capability:
-
-* tenant-to-tenant sharing works at the seam;
-* user-scoped sharing stays CLOSED until identity is threaded — it must never widen to "any
-  subject of the grantee tenant", which would be a second escalation of the same family as the
-  read-grant-admits-write case the decision core already rules out.
-
-This has to be asserted, not assumed: a spec test must pin that a `Grantee::User` grant does
-NOT admit at the seam while identity is missing.
+NOTE: PARTLY SUPERSEDED — the interim proposed here (tenant-wide grants only, per-user grants
+fail-closed while identity is missing) was made moot by the 2026-08-11 gate finding. Still current:
+`TenantContext` carries only `tenant_id: String` (no subject, no stable id), so the seam cannot
+evaluate a per-user `Grantee::User` grant or even load the owner's grant slice from what it is handed.
+If an interim ever ships, a spec test must pin that a `Grantee::User` grant does NOT admit at the seam
+while identity is missing — it must never widen to "any subject of the grantee tenant".
 
 === Plumbing the wiring still needs
 
@@ -490,14 +452,12 @@ written.
 paths with a proven subject-level backstop — never a blanket change to
 `validate_tenant_collection_access`. Same discipline as the action parameter: no defaulting.
 
-=== Independent security finding (worse than the above)
-
-`unified_search_with_tenant_context`'s only isolation is
-`validate_search_results_tenant_isolation` (:2781-2860), which matches tenant strings in result
-metadata and **explicitly admits any result carrying no `tenant_id` metadata** (:2818-2824, "No
-tenant metadata - allow by default"). That is fail-OPEN isolation on a production-reachable
-path, independent of grants or this feature. It belongs with the L2.2 `System`-bypass work and
-should be treated as higher priority than the sharing capability.
+NOTE (status of the five rows, verified 2026-10-15): `search_v1_with_tenant_context` was deleted
+(#1575); `unified_search_with_tenant_context`'s RAG entry point was unmounted and deleted (#1598) and
+its validator fixed (#1597); the `VectorOpsPort::unified_search_native` port impl now resolves
+`records_read_context` from the caller's `PortIdentity` before searching (the UDTF path is enforced);
+**still open:** `src/services/record_store.rs` `get_by_key` passes `PortIdentity::anonymous()` and
+discards its `_read_context`. The per-call-site opt-in design correction above stands.
 
 == Item 3 findings that make the wiring EASIER than planned
 
@@ -512,244 +472,34 @@ should be treated as higher priority than the sharing capability.
   `resolve_vector_read_context` (:670-688) just parses it. TD-AUTHZ-2's empty-object_id defect is
   a *relational SQL-DDL* schema-population gap and does not affect this path.
 
-== 🔴 Two defects found while verifying
 
-. **`grant_admits_read` loads the WRONG grant slice.** `src/security/rls/abac_adapter.rs:981`
-  does `store.grants_for_owner(tenant)` where `tenant` is the **acting** subject's stable id, not
-  the resource owner's. Harmless today because L1.2 only enforces same-tenant (owner == acting),
-  but it means a cross-tenant grant would never be found — the owner's slice is never loaded. Must
-  be fixed as part of item 3, with a test that would fail today.
-. **`Target.table` truncates `u64` → `u32`** (`legacy.rs:685`, `src/services/dml/mod.rs:1478`)
-  while collection object_ids come from a global monotonic `u64` allocator. Two collections whose
-  ids differ by exactly 2^32 alias to the **same grant target** — a silent authorization-aliasing
-  hazard. Not reachable at today's id magnitudes; record it before this seam is formalized.
+== History (investigation log, compacted)
 
+Superseded or since-fixed log entries, one line each; the reasoning that still applies is kept.
 
-== 🔴 `resolve_vector_read_context` degrades to UNFILTERED on any resolution failure (2026-08-11)
-
-Found while wiring the B3 Target guard. `records_read_context`
-(`src/services/operations/vectors/legacy.rs:~734`) maps the resolver's outcome as:
-
-[source,rust]
-----
-Some(Ok(ctx))  => ReadContext::Client(ctx),      // enforced
-Some(Err(_))   => None,                          // deny => fail-closed  ✔
-None           => ReadContext::system(Statistics) // UNFILTERED          ✘
-----
-
-So **every `?` early-return inside `resolve_vector_read_context` is a fail-OPEN path**, not a
-neutral "couldn't decide". Two already exist and predate this work:
-
-* `self.get_or_load_collection(collection_id).await.ok()?` — a collection that fails to load
-  yields an unfiltered System read.
-* `collection.id.parse().ok()?` — a collection whose id does not parse as a `u64` likewise
-  yields an unfiltered System read.
-
-(`self.abac_enforcer.as_ref()?` is legitimate: no enforcer configured genuinely means ABAC is
-off. The other two are failures being reported as absence.)
-
-This is the same defect family TD-SEC-2 catalogues — a mechanism whose FAILURE mode is
-indistinguishable from its "not applicable" mode, so it reads as coverage. The B3 guard added
-here deliberately returns `Some(Err(NoApplicablePolicy))` rather than `None` for exactly this
-reason, and says so at the call site.
-
-**Not fixed here** — changing the two pre-existing `?`s to denials is a behavior change on the
-live read path (a transient collection-load failure would begin denying instead of returning
-unfiltered results) and deserves its own slice with its own ratchet. Sequence it with the L2.2
-`System`-bypass work, which is already the owner of "client-facing reads must not run as
-System".
-
-
-== L2.2 item 1 RE-SCOPED (2026-08-11): the graph/RAG REST surface extracts no identity
-
-NOTE: SUPERSEDED — the surface is an UNMOUNTED duplicate, since deleted. The identity gap
-was real but the code was never served. See the 2026-08-12 correction and CURRENT STATE.
-
-The tracker framed this as "`unified_search_with_tenant_context` has no ABAC". Tracing its
-production caller shows the fix is not where that framing points.
-
-* `unified_search` ← `src/graph/rag/engine_impls.rs:53`, on `VectorNodeRetriever`, whose fields
-  are only `{ vector_ops, collection, limit }` — no identity.
-* `VectorNodeRetriever` is constructed at `src/network/rest/canonical/graph.rs:1348`, inside
-  `pub async fn rag_query(State(app_state), Path(graph_id), Json(request))` — **no identity
-  extractor in the signature**.
-
-VERIFIED (by mechanism, not by pattern-guessing): `src/network/rest/v2/records.rs` obtains
-identity as `Extension(tenant): Extension<TenantContext>` (`:1107`, importing
-`crate::network::middleware::tenant::TenantContext`). `src/network/rest/canonical/graph.rs`
-contains **zero** occurrences of `Extension`, `TenantContext`, or `PortIdentity` across its
-**33** handlers.
-
-So there is no identity at the graph REST boundary to thread anywhere. Adding a `ReadContext`
-parameter to `unified_search` would produce a parameter with nothing to put in it. **The fix is
-identity extraction at the graph surface**, mirroring the records surface — then ABAC on the
-search path, then the RAG retriever carrying it.
-
-=== NOT verified — do not conclude the surface is unisolated
-
-Whether `graph_operations_service` enforces tenancy internally by some other route was NOT
-checked. The verified claim is narrow and specific: *the handlers do not extract the
-middleware's `TenantContext`*. Establish the internal behavior before characterising the graph
-surface's isolation posture — the B1 entry in this tracker is a standing reminder of what
-overclaiming here costs.
-
-=== Method note (third occurrence this session)
-
-The first pass used `grep -A 6 "^pub async fn" | grep -c Extension...` and reported **0 for
-`records.rs` too** — a file that demonstrably does thread identity. The pattern was wrong, not
-the code. A search that returns zero is evidence about the SEARCH until the same search is shown
-to return non-zero on a known-positive control. Two earlier instances this session: a
-`grep | head -6` that made a guarded read path look unguarded, and a regex that matched zero
-blocks while an assertion caught it.
-
-
-== L2.2 item 1 — VERIFIED ordering constraint: do NOT thread identity first (2026-08-12)
-
-NOTE: SUPERSEDED — the ordering was correct for a surface that is served; this one is not.
-The validator-model fix landed on its own merits. See CURRENT STATE.
-
-The obvious next slice is "extract identity in `rag_query` and pass `Some(tenant_context)`
-instead of the hardcoded `None`". **That would break RAG reads**, and the reason is verified:
-
-* Passing `Some(..)` activates `validate_search_results_tenant_isolation`
-  (`legacy.rs:2765`), which is currently unreachable because all 6 callers pass `None`.
-* That validator DROPS any result whose metadata lacks a `tenant_id`
-  (`legacy.rs:2826`, "Vector result without tenant_id found!").
-* **No ordinary vector write path stamps `tenant_id` into record metadata.** Searching for the
-  write is decisive: the only occurrences are an audit-details map
-  (`security_coordinator.rs:605`) and a bulk-load SPOOF fixture
-  (`bulk_load.rs:490`). Result metadata is otherwise copied verbatim from the user's own
-  record metadata (`legacy.rs:~5040`).
-
-So ordinary records carry no tenant metadata, and the validator would drop all of them: RAG
-would return EMPTY rather than leaking. Fail-closed, but an outage.
-
-=== Required order
-
-. **Fix the validator's model first.** Metadata-string matching is the wrong mechanism —
-  isolation here should come from the same `ReadContext`/ABAC path the other read surfaces use
-  (`records_read_context`), not from comparing a `tenant_id` string that the write path never
-  writes. While it exists, it must also stop treating "no metadata" as a security verdict in
-  either direction: today absent ⇒ drop, and a non-`StringValue` variant matches no arm and is
-  dropped with NO log at all.
-. **Then** extract identity at the graph surface and thread it.
-. **Then** ABAC on the search path, and the retriever carrying the context.
-
-Reversing steps 1 and 2 produces an immediate regression that looks like a security fix.
-
-=== Status of the surrounding claims
-
-VERIFIED: the handlers extract no identity (33 handlers, zero `Extension`/`TenantContext`/
-`PortIdentity`); the write path does not stamp tenant metadata; the validator drops unlabeled
-results. NOT VERIFIED and still open: whether `graph_operations_service` enforces tenancy
-internally by another route — establish that before characterising the graph surface's
-isolation posture.
-
-
-== 🔴 CORRECTION (2026-08-12): the graph/RAG surface is NOT production-reachable
-
-Earlier entries in this tracker — and the merged PRs #1585 and #1588 — state that
-`unified_search_with_tenant_context` is "production-reachable via
-`src/graph/rag/engine_impls.rs:53`". **That is wrong**, and it inflated the priority of L2.2
-item 1. Verifying the *route mounting* (rather than the call chain) before writing step-2 code
-established:
-
-* `src/network/rest/canonical/graph.rs:819` defines `create_graph_router()` containing
-  `rag_query` (`:1319`) and its `/graphs/{graph_id}/rag` route (`:852`).
-  **Nothing references that function.** The only mount site,
-  `src/network/rest/canonical/handlers.rs:1690-1694`, imports a DIFFERENT
-  `create_graph_router` — from `proximadb_api::rest`
-  (`crates/platform/proximadb-api/src/rest/canonical/graph.rs:697`).
-* The router that IS mounted routes `/graphs/{graph_id}/rag` to **`not_implemented_handler`**
-  (`crates/platform/proximadb-api/src/rest/canonical/graph.rs:731`).
-
-So the call chain is real but its entry point is not served: `rag_query` — and with it
-`VectorNodeRetriever`, its only constructor — is unmounted dead code. `unified_search`'s six
-callers all pass `tenant_context: None`, and no live route reaches them.
-
-=== What this changes
-
-. **L2.2 item 1 is dead surface, not a live exposure.** It belongs in the same category as B4
-  (`search_v1_with_tenant_context`, deleted in #1575): an unmounted handler with no identity
-  and no authorization. The disposition should be *delete*, not *thread identity through it* —
-  fixing dead code implies it has a purpose.
-. **Step 2 as planned is moot.** There is no live RAG path to extract identity into. Any future
-  RAG implementation must build identity in from the start rather than inherit this handler.
-. The two same-named `create_graph_router` functions are themselves a hazard: one is live, one
-  is dead, and the dead one is the one with the security gap. Worth resolving when the dead
-  router is removed.
-
-=== What is unaffected
-
-The validator-model fix (L2.2 step 1) stands on its own merits: it removed a silent
-no-log drop for non-string labels, and corrected a rule that could not distinguish "unlabelled"
-from "foreign". Those are real defects in reachable code paths regardless of RAG's status — the
-function is called by `unified_search_with_tenant_context`, which is reachable from
-`unified_search` even though the RAG *route* is not.
-
-=== Method note
-
-The original claim came from tracing a CALL CHAIN (`engine_impls.rs` → `unified_search`) without
-checking whether the chain's entry point is ROUTED. A caller existing is not the same as a
-caller being reachable. Verify mounting, not just call sites, before assigning production
-severity.
-
-
-== ADR-0083 vs the u64 ABAC key — RECONCILED (2026-08-13)
-
-The catalog-consolidation gate asked whether ADR-0083 (Accepted: *"the composite is the sole
-canonical identity; the global `object_id` u64 is RETIRED as an identity ... never a key"*)
-conflicts with the ABAC path keying on `object_id` (`dml/mod.rs:1467`, hardened by `c6bdf066b`).
-
-**They do not conflict. ABAC already keys on the composite.** ADR-0083's own ABAC addendum
-states it: `tenant_stable_id: u64` is *"the ADR-0083 account u32 widened — the composite's
-tenant component"*, and the catalog mints no separate tenant u64.
-
-So the enforcement key today is:
-
-----
-tenant_stable_id (= account u32, widened)   <- composite component 1
-Target.namespace : NamespaceId  (u16)       <- composite component 2
-Target.table     : CollectionId (u32)       <- composite component 3
-----
-
-That is `{account, namespace, collection}` — the composite — merely split across two structures
-(`GrantSubject` carries the account component; `Target` carries the other two). **No re-keying is
-required, and ADR-0083 needs no amendment.**
-
-=== The one real discrepancy: sourcing, not keying
-
-`Target.table` is *derived from* `schema.object_id` — the retired u64, truncated to u32
-(`legacy.rs:685`, `dml/mod.rs:1478`) — instead of from the composite's `collection_id`
-(`StorageAssignment.typed_collection_id`). Today the two are numerically identical only because
-ADR-031 unified them (`create_table` adopts `collection.id` as `object_id`). **It works by
-coincidence of that unification, not by design**, and ADR-0083 explicitly permits `object_id`
-only as an ordering sequence — never a key.
-
-=== The fix, and what it dissolves
-
-Source `Target`'s components from the typed triple
-(`typed_account_id` / `typed_namespace_id` / `typed_collection_id` on `StorageAssignment`) rather
-than from `schema.object_id`. That is ADR-0083-conformant by construction, and it dissolves
-several problems currently being fought separately:
-
-* **The u64→u32 truncation hazard disappears.** `collection_id` is natively `u32`; there is
-  nothing to truncate. The `Target::try_from_object_ids` guard added in #1575 becomes a
-  belt-and-braces check rather than the load-bearing defense.
-* **`SystemCatalog`'s object_id minting stops being load-bearing for ABAC.** `c6bdf066b` remains
-  correct and useful (ordering sequence, `xcatalog` projection) but it is **not** the fix for
-  relational ABAC — which is why the e2e stayed red after it. Verified: `c6bdf066b` IS an
-  ancestor of the tree the e2e ran on (`91eb1e632`), so that observation was sound.
-* **The two-field gate becomes one composite check.** `dml/mod.rs:1466` currently requires
-  `stable_namespace_id` AND `object_id` from two different mint paths; sourcing from the triple
-  makes it one lookup with one failure mode.
-* **`SystemCatalog` never setting `stable_namespace_id`** stops being a separate bug to fix and
-  becomes part of one requirement: the catalog must stamp the typed triple.
-
-=== Consequence for the consolidation design
-
-The gate is cleared, and the answer narrows the consolidation rather than widening it: the
-invariant every internal catalog must be unable to omit is **"stamp the typed triple"**, not
-"mint a u64". That is a better invariant to enforce — it is the identity ADR-0083 already
-declares canonical, it is what the object-store path is built from (structural isolation by
-construction, D3), and it removes the u64 from the authorization surface entirely.
+* **2026-08-07 sequencing (SUPERSEDED by 2026-08-08):** claimed the cross-tenant blocker was
+  tenant-keying the WAL read. Wrong — `validate_tenant_collection_access` does a tenant-scoped
+  catalog lookup first, so the catalog seam is the gate (see "Sequencing correction" above).
+* **Item 3 GATE independent finding (FIXED #1597):** `validate_search_results_tenant_isolation`
+  admitted results with no `tenant_id` metadata. The validator now *corroborates* isolation (four
+  exhaustive arms; foreign-labelled ⇒ drop + alert, non-string ⇒ keep + log) instead of performing it.
+  Ordering lesson: fixing the validator model had to precede threading identity, because no ordinary
+  write path stamps `tenant_id` into metadata — the old "absent ⇒ drop" arm would have emptied every
+  read (an outage shipped as a hardening fix).
+* **Two defects found while verifying (FIXED #1575):** `grant_admits_read` loaded the ACTING tenant's
+  grant slice instead of the OWNER's (invisible same-tenant, fatal cross-tenant); `Target.table`
+  truncated `u64 → u32` (two ids 2^32 apart aliased to one grant target).
+* **`resolve_vector_read_context` fail-open `?`s (FIXED #1582):** `None` meant "skip authorization",
+  so a collection that failed to load or whose id did not parse yielded an unfiltered System read.
+  Every failure now returns `Some(Err(NoApplicablePolicy))`; only "no enforcer configured" is `None`.
+* **L2.2 item 1 graph/RAG (CLOSED BY DELETION #1598):** the 2026-08-11 re-scope (handlers extract no
+  identity) and the 2026-08-12 ordering note were analyses of an **unmounted** router — the mounted
+  `/graphs/{graph_id}/rag` is `not_implemented_handler` in `proximadb-api`. Any future RAG route must
+  build identity in from the start. Method lesson: **verify route mounting, not just call chains**,
+  before assigning production severity; and a search returning zero is evidence about the search
+  until a known-positive control returns non-zero through the *same* filter.
+* **ADR-0083 vs the u64 ABAC key (RECONCILED 2026-08-13, implemented #1630/#1636):** no conflict —
+  ABAC already keys on the composite `{account (= tenant_stable_id), namespace, collection}` split
+  across `GrantSubject` and `Target`. The real discrepancy was *sourcing* `Target.table` from the
+  retired `schema.object_id`; sourcing from the typed triple dissolved the truncation hazard and made
+  "stamp the typed triple" (not "mint a u64") the invariant every internal catalog must keep.

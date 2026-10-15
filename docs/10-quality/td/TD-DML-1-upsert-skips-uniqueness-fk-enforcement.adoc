@@ -9,7 +9,7 @@
 
 [cols="1,3"]
 |===
-| Status | Open — silent integrity violation on the UPSERT path
+| Status | Open — silent integrity violation on the UPSERT path (re-verified 2026-10-15: `execute_upsert`, now at `src/services/dml/mod.rs:4146`, still calls no UNIQUE probe, CKS claim or FK check)
 | Severity | High — a declared UNIQUE or FK can be violated by any UPSERT
 | Lane | `src/services/dml/mod.rs` (the F5 / OLTP write-path owner)
 |===

@@ -10,6 +10,7 @@
 an earlier revision of this file claimed two pieces of drift evidence and both were measurement
 artifacts (see "Measurement notes"). The cost is maintenance surface: a fix to one engine's copy
 does not reach the others, and 41 copies sit where one shared definition would do.
+| Relates to | link:TD-VIPER-1-staged-retirement.adoc[TD-VIPER-1] and link:TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-ENGINE-1] (overlap: retiring VIPER/RAPTOR/SWIFT removes many of these copies; dedupe only across engines that stay)
 | Owner | unassigned
 |===
 

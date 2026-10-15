@@ -2,6 +2,13 @@
 :toc: macro
 :icons: font
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** D0/D1 are done (#370, #377, #379). D2 is partial: `CollectionMetadataPort`, `StorageEventLogPort`, `QuantizationEnginePort` (#822), `StorageQuantizationEnginePort` (#845) and `FilesystemPort` (#943); `IndexPort` is open (`proximadb-index-traits` defines `IndexQuery`/`IndexIngest`/`IndexMaintenance`). D3 is partial (metadata side, tenant resolver, catalog↔Collection mapping). D4/D5 are open. Ratchet today: **183** storage up-edges (compute 145, index 15, query 10, services 13) against a CI ceiling of 197.
+| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:STORAGE_INDEX_COMPUTE_DECOUPLING_CONTRACTS_2026_06_21.adoc[decoupling contracts] (overlap: index/compute port shapes — contracts canonical for the trait design, this doc for sequencing), link:QUANTIZATION_KERNEL_SPLIT_2026_06_22.adoc[quantization split]
+|===
+
 [abstract]
 Slice D is the linchpin of the root-crate decomposition: it inverts the storage→up
 dependency edges so the large storage *engines* (Slices E/F — `sst`/`nova`/`viper`/… plus
@@ -281,17 +288,13 @@ orchestrator, and the composition root, so they need the **announced coordinatio
   `engine` submodules are kernel math or runtime policy — measure (call-site analysis) in D2
   before committing to invert-vs-redirect.
 
-== Next action
+== Next action — History (D0)
 
-**D0 is implemented in this PR:** storage's `crate::compute::distance_computation::*`
-references are redirected to `proximadb-distance-kernel` (whole-namespace path rewrite, 403
-refs / 129 files) and `crate::core::search::{FilterExpression, ComparisonOperator}` to
-`proximadb-filter-expression` (61 refs / 31 files, grouped imports split so non-filter
-`core::search` symbols stay put). Both root paths were confirmed re-exports; both target
-crates were already root deps. Behaviour-neutral; the storage→`compute::distance_computation`
-and storage→`core::search::{FilterExpression,ComparisonOperator}` edge counts are now **0**
-(ratchet). The remaining redirects (quantization/config/hardware-caps/index-types), the
-`search-types`/`bloom` leaf extractions (D1), and the port inversions (D2–D5) follow.
+D0 shipped (#370). Storage's `crate::compute::distance_computation::*` references were redirected
+to `proximadb-distance-kernel` (403 refs / 129 files), and `crate::core::search::{FilterExpression,
+ComparisonOperator}` to `proximadb-filter-expression` (61 refs / 31 files). Both root paths were
+confirmed re-exports first. Both edge classes now count 0. Current next actions are in the
+2026-07-10 refresh below (D2b landed as #845; D3/D4/D5 remain).
 
 Ref: `ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` (Slice D row), TD-104.
 

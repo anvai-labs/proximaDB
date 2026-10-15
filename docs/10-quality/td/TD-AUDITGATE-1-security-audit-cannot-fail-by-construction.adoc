@@ -1,148 +1,31 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-AUDITGATE-1: the Security Audit job cannot fail, so a reintroduced advisory stays green
-:toc: macro
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **BOTH FAILURES FIXED.** Failure 2: `scripts/check_lockfile_no_downgrade.py` gates every PR touching `Cargo.lock`, validated against the real #2003 -> #2004 regression. Failure 1 (2026-10-13): both audit steps now run `cargo audit -D warnings --no-yanked` with a committed, per-entry-rationale baseline in `.cargo/audit.toml` — option 2 as written below. Running the gate for real surfaced **9 live vulnerabilities** that had sat silently green behind it; 6 were fixed in-lock the same day, 3 baseline-ignored with reasons (see `.cargo/audit.toml`).
-| Severity | High — a known advisory can be reintroduced into `Cargo.lock` and every one of ~83 checks still passes. The gate that exists to catch exactly this is incapable of going red.
-| Component | `.github/workflows/ci.yml` (`security-audit`), `.github/workflows/tdd.yml`
+| Status | **Done (2026-10-13).** `cargo audit -D warnings --no-yanked` now gates both `ci.yml` and `tdd.yml` against a committed, per-entry-rationale baseline (`.cargo/audit.toml`), and `scripts/check_lockfile_no_downgrade.py` fails any PR that moves a `Cargo.lock` package backwards (#2010, #2012, #2015).
+| Component | `.github/workflows/ci.yml` (`security-audit`), `.github/workflows/tdd.yml`, `.cargo/audit.toml`, `scripts/check_lockfile_no_downgrade.py`
 | Pillar | SECURITY / CI
 | Found | 2026-10-13
 |===
 
-toc::[]
+== History
 
-== The defect
+The audit step was doubly unfailable (`continue-on-error: true` plus `cargo audit || echo ::warning`). Proven by a same-day
+regression: #2003 bumped `rustls` to 0.23.45 (closing RUSTSEC-2026-0285), and #2004 regenerated `Cargo.lock` back to 0.23.44
+and passed 83/83 checks. Only an unrelated human review noticed.
 
-Both workflows run the audit like this:
-
-[source,yaml]
-----
-- name: Run security audit
-  continue-on-error: true
-  run: cargo audit || echo "::warning::Security audit found vulnerabilities - review required"
-----
-
-It is **doubly** unfailable. The `|| echo` alone guarantees exit 0 regardless of
-what `cargo audit` finds; `continue-on-error: true` would mask a failure even
-without it. So the step is a no-op as a *gate* — it emits an annotation nobody
-is required to read.
-
-== The regression that proved it
-
-Same day, two PRs, both mine:
-
-* **#2003** bumped `rustls` 0.23.44 -> **0.23.45**, closing
-  **RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc** (TLS 1.3 handshake messages
-  accepted across encryption-level boundaries).
-* **#2004** regenerated `Cargo.lock` and silently moved it **back to 0.23.44**,
-  reopening the advisory. It passed **83/83 checks**.
-
-----
-72092668f (#2003)  rustls 0.23.45
-61de80dd8 (#2004)  rustls 0.23.44   <- reverted, CI green
-----
-
-It was caught by an **independent human review** of an unrelated Dependabot PR,
-and fixed when #2008's rebased group happened to carry 0.23.45 again. Nothing
-automated noticed at any point.
-
-== Two separate failures, both worth fixing
-
-**1. The gate cannot fail (this TD). FIXED 2026-10-13.** Both `ci.yml`
-(`rust-security`) and `tdd.yml` now run:
-
-[source,yaml]
-----
-cargo audit -D warnings --no-yanked
-----
-
-with the tolerated set committed as `.cargo/audit.toml` — every ignore carries
-a rationale naming the pulling dependency and the condition under which it must
-be re-reviewed. Option 2 from the list below ("the list becomes the baseline,
-and adding to it is a visible decision"). `--no-yanked` because cargo-audit has
-no per-crate ignore for yanked crates (they carry no advisory ID) and the two
-current yanks (spin 0.9.8 via flume 0.12, wide 1.6.0 via simba 0.10) have no
-parent bump that clears them; a yank is a withdrawal signal, not a
-vulnerability. The original options, for the record:
-
-  * drop the `|| echo` and `continue-on-error` and accept world-changes-break-CI;
-  * `cargo audit --deny warnings` with an `audit.toml` ignore list, reviewed
-    deliberately (the list becomes the baseline, and adding to it is a visible
-    decision); **← chosen, plus `--no-yanked`**
-  * compute the advisory set before/after and fail only on the delta.
-
-**What the gate found the first time it ran for real.** 9 vulnerabilities
-across 4 crates, all invisible until this fix:
-
-* `quinn-proto` 0.11.15 — 5 advisories (RUSTSEC-2026-0338/0339/0340/0341/0342);
-  fixed in-lock to 0.11.19.
-* `h2` 0.4.15 (RUSTSEC-2026-0258); fixed in-lock to 0.4.20. The second h2
-  finding, 0.3.27, is **production-reachable** via the root crate's
-  unconditional `reqwest = "0.11"` → reqwest 0.11.27 → hyper 0.14.32 →
-  h2 0.3.27 (the httpmock → hyper 0.14 copy is dev-only, but that is not the
-  only copy) — no lock-only fix exists (whole 0.3 line unpatched), so it is
-  baseline-ignored pending the reqwest 0.12 major bump.
-* `quick-xml` 0.39.4 — 2 denial-of-service advisories
-  (RUSTSEC-2026-0194/0195); pinned by `object_store` 0.13.2 (^0.39), unfixable
-  without an object_store 0.14 major bump — baseline-ignored with that note.
-* Plus warnings now denied: `event-listener` unsound (fixed to 5.4.2), `lru`
-  unsound (unfixed upstream, baseline-ignored), 5 unmaintained crates
-  (baseline-ignored), 3 yanked crates (one fixed in-lock: chacha20 0.10.2;
-  two excluded as a class via `--no-yanked`).
-
-The "newly published advisory breaks unrelated PRs" cost of a blocking gate is
-accepted deliberately: it now lands as a red CI run whose fix is "update the
-lock or add a reasoned ignore", both of which are visible decisions instead of
-silence.
-
-**2. A lockfile regression is invisible to review.** A `Cargo.lock` conflict is
-exactly where content can regress while the file list looks correct — the
-author's own verification checked *which files* changed and that the expected
-docs were present, never the dependency **versions inside** the lock. A cheap
-guard: on any PR touching `Cargo.lock`, assert no package moves **backwards**
-versus the base branch, listing any that do. That catches this whole class
-(reverted security bumps, accidental downgrades from stale-base conflict
-resolution) without needing an advisory database.
-
-**DONE** — `scripts/check_lockfile_no_downgrade.py`, wired into the `changes` job
-(which already has `fetch-depth: 0`). Validated by replay against real commits,
-not synthetic fixtures:
-
-* `72092668f` (#2003) -> `61de80dd8` (#2004) yields exactly one finding,
-  `rustls: 0.23.45 -> 0.23.44` — the regression this TD was filed for.
-* `e4969ee15` (#2011), which legitimately dropped the whole `rustls 0.21` line,
-  yields **zero** findings. Avoiding that false positive is the difference
-  between a guard that survives and one that gets disabled in a week, so
-  comparison is per MAJOR line (and per 0.x minor, since Cargo treats those as
-  breaking).
-
-`--require-base` makes an unfetched base a FAILURE rather than a silent skip —
-a guard that quietly skips is the same defect class it exists to catch. 9 unit
-tests in `tests/scripts/test_lockfile_no_downgrade.py`.
-
-== The mechanism to avoid repeating (process note)
-
-The regression came from resolving the conflict with `git checkout --theirs
-Cargo.lock`. **During a rebase, `--theirs` is the commit being replayed, not the
-upstream branch** — so it restored the author's pre-#2003 lock. The intended
-fallback (`|| git checkout origin/develop -- Cargo.lock`) never ran, because
-`--theirs` had succeeded.
-
-Resolve lockfile conflicts by taking the BASE branch's lock and re-resolving
-from the manifest (`cargo metadata`), then verify by diffing **versions**, not
-filenames. Guard (2) above makes this mechanical instead of a habit.
-
-== Verification for the fix
-
-* Failure 1 verified by construction: the enforcing command exits 1 on the
-  pre-fix lock (it did — 9 findings) and 0 on the fixed lock + baseline
-  (`cargo audit -D warnings --no-yanked`, run locally in the fixing PR).
-* Failure 2 verified by replay (see DONE above) and by the negative case
-  (#2011's legitimate whole-line drop yields zero findings).
-* Ongoing: an advisory published against an unchanged dependency WILL break
-  unrelated PRs — accepted, because the resolution is now visible (lock bump
-  or reasoned baseline addition) rather than silence.
+* **Fix 1 (gate can fail):** option "deny warnings + reviewed ignore list" chosen; adding to `.cargo/audit.toml` is now a visible
+  decision with a rationale naming the pulling dependency. `--no-yanked` because cargo-audit has no per-crate ignore for yanks.
+  Its first real run surfaced **9 live vulnerabilities** (quinn-proto x5, h2, quick-xml x2, plus unsound/unmaintained warnings);
+  6 fixed in-lock, the rest baseline-ignored with reasons. Note h2 0.3.27 is production-reachable via root `reqwest = "0.11"` and
+  stays ignored until the reqwest 0.12 bump; quick-xml waits on object_store 0.14.
+* **Fix 2 (lockfile regressions):** compares per MAJOR line (per minor for 0.x) so a legitimate whole-line drop (#2011, rustls 0.21)
+  yields zero findings; `--require-base` makes an unfetched base a failure, never a silent skip. Replays #2003 -> #2004 to exactly
+  one finding. 9 tests in `tests/scripts/test_lockfile_no_downgrade.py`.
+* **Lesson:** during a rebase, `git checkout --theirs Cargo.lock` is the commit being *replayed*, not upstream, so it restored the
+  pre-bump lock. Resolve lock conflicts by taking the base lock and re-resolving, then diff **versions**, not filenames.
+* **Accepted cost:** a newly published advisory against an unchanged dependency breaks unrelated PRs; the fix (lock bump or
+  reasoned ignore) is visible rather than silent.

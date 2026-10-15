@@ -5,13 +5,14 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Proposed.** Found 2026-07-23 during the restart/recovery pressure tests (develop @ 02725d81a) while trying to drive L0→L1 compaction externally.
+| Status | **Partial: S1 shipped (#1325) — `SstEngine::do_compact` now enqueues the real L0→L1 path (`enqueue_due_compaction`, honoring memory admission) and, when `synchronous` is set, waits for quiescence; open: S2 (the Flight action still answers `success: true` with no job id / completion surface, and input/output counts are `None`) and S3 (error-level audit of flush-path compaction failures).** Found 2026-07-23 during the restart/recovery pressure tests (develop @ 02725d81a) while trying to drive L0→L1 compaction externally.
 | Priority | **P1** — compaction is the 3.2× query-latency lever (TD-COMPACT-1) and the only external trigger silently does nothing, while returning `success: true`. Operators (and test harnesses) believe they compacted and did not.
 | Component | `src/storage/engines/sst/trait_impl.rs:137–180` (`do_compact` stub); `src/network/arrow_ipc/service.rs:2236–2276` (`compact_collection` action); `src/storage/trait_components/compactor.rs:81–95`.
-| Evidence | Flight `compact_collection {"collection_id":"sift1m"}` on a 6-L0-file 1M collection returns `{"success":true,...}` in 0.24 s; server logs `🔄 SST: Starting compaction operation` then `✅ Compacted collection sift1m: 0 files created, 0 files processed`; the 6 L0 files are untouched. The real pipeline (`perform_unified_vectorrecord_compaction`) only fires inline from the flush path.
+| Relates to | link:TD-COMPACT-10-l2-segment-consolidation-gap.adoc[TD-COMPACT-10] (its fix item 4 wired the explicit-compaction path), link:TD-COMPACT-2-compaction-memory-amplification-oom.adoc[TD-COMPACT-2]
+| Evidence (2026-07-23, pre-fix) | Flight `compact_collection {"collection_id":"sift1m"}` on a 6-L0-file 1M collection returns `{"success":true,...}` in 0.24 s; server logs `🔄 SST: Starting compaction operation` then `✅ Compacted collection sift1m: 0 files created, 0 files processed`; the 6 L0 files are untouched. The real pipeline (`perform_unified_vectorrecord_compaction`) only fires inline from the flush path.
 |===
 
-== The finding
+== The finding (historical — S1 resolved the stub)
 
 The Arrow Flight `do_action` surface exposes `compact_collection` /
 `flush_and_compact` as the documented operator way to trigger compaction. The
@@ -37,9 +38,11 @@ Consequences:
 
 == Direction
 
-S1 — Wire `SstEngine::do_compact` to the real L0→L1 path
-(`check_compaction_needed` + `compact_level_tiered`), honoring the
-TD-COMPACT-2 input-size budget, and return real input/output file counts.
+S1 — **Shipped (#1325).** `SstEngine::do_compact` enqueues the real L0→L1 path
+under memory admission (`force` lowers the L0 threshold to 1; `synchronous` awaits
+`await_compaction_quiescence`). Residual: it still returns `input_files`/`output_files`
+as `None` (only `task_enqueued` in `engine_metrics`), so "return real input/output
+file counts" is not met.
 
 S2 — Make the action's response honest: if compaction is intentionally
 asynchronous, return a job id and expose completion via the diagnostics

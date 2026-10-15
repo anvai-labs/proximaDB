@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **first phase implemented** (reconciled 2026-10-15): TD-165 Resolved — typed `IndexPolicy` end-to-end (stored as `index_policy`, `src/storage/metadata/catalog_config.rs`), 3-layer precedence, env-gated auto-router, IVF Defect B fix. Open: the serverless follow-up in Phasing (TD-158 done; TD-159 open — measured byte budget, `rehydrate` semantics, `PROXIMADB_AUTOROUTE_QUANT_HELIX` default-ON after bake).
 |Date|2026-06-26
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-011 (Filtered ANN Routing Modes — per-collection policy precedent), ADR-023 (F2 Cold-Load Ordering — `ColdPathLoadPolicy`), ADR-026 (PAX Canonical Vector Path — user/adaptive/learned tuning hierarchy), ADR-027 (Unified Storage + Metering — two-class trace), `EXACT_VS_ANN_ROUTING_COST_MODEL_2026_06_26.adoc`, `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`

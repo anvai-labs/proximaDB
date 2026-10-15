@@ -5,16 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export
+| Status | **Done (2026-08-10).** Moved `connectors/types.rs` (7 tests: `TableInfo`, `Statistics`, `WriteResult`, …) into a new horizontal crate (#1561).
 | Component | `crates/horizontal/proximadb-connectors-types`; root `src/connectors/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe)
 |===
 
-== What moved
-`src/connectors/types.rs` (7 tests) → new horizontal crate `proximadb-connectors-types`.
-Root `connectors/mod.rs` re-exports it (`pub use proximadb_connectors_types::types;`), so the
-existing `pub use types::{ColumnStatistics, Statistics, TableInfo, TableStatistics, WriteResult};`
-resolves unchanged for every connector impl (DuckDB, Spark, …). Deps: arrow + serde only
-(zero `proximadb_*` deps, zero `crate::` climb-out, `super::` test-only). Verified: standalone +
-clippy -D warnings + root lib all pass. SIFT recall ratchet SKIPS (connectors/** is not
-storage_changes).
+== History
+
+arrow + serde only; every connector impl (DuckDB, Spark, …) resolves through the root shim.

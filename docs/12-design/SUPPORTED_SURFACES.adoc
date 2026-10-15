@@ -5,6 +5,9 @@
 
 == Purpose
 
+_Status cells reconciled 2026-10-15 (gRPC fusion + v2 entity facade, CEDAR, engine tiers). The
+customer-facing maturity contract is `docs/SUPPORTED_SURFACE.adoc`, which wins on any conflict._
+
 This is a technical companion to the product support contract at
 `docs/SUPPORTED_SURFACE.adoc`. It is not the customer-facing maturity
 contract by itself; it records API reachability, physical projection
@@ -50,7 +53,7 @@ Current relational/pgwire DML and compute-routing implementation tracker:
 | Full-text index | ✅ Retained (rebuildable) | `ProjectionDirective::FullTextIndex`. Cost rule in `optimizer_support::fulltext_access_path` governs when it is consulted vs. canonical scan.
 | Columnar variation projection | ✅ Retained (rebuildable) | `ProjectionDirective::ColumnarVariation`. Used when field projection ratio < 0.5 (see `optimizer_support::variation_projection_access_path`).
 | Legacy `DocumentRecord` durable path | ⚠️ Compatibility only | `DocumentOperation::InsertDocument` in `src/storage/persistence/write_ahead_log/wal_operations.rs` kept for in-flight migration. New writes MUST use `UpsertCanonicalDocumentRecord`. Retirement target: Phase 6 completion.
-| CEDAR document engine (if instantiated) | 🔴 Retirement candidate | Any standalone CEDAR instances that maintain separate WAL/recovery semantics independent of canonical records must be migrated to projection mode or removed. ADR required before removal.
+| CEDAR document engine (if instantiated) | ⚠️ Compatibility projection (Beta per `docs/SUPPORTED_SURFACE.adoc`; reports `authority_role=rebuildable_projection`) | Any standalone CEDAR instances that maintain separate WAL/recovery semantics independent of canonical records must be migrated to projection mode or removed. ADR required before removal.
 |===
 
 ---
@@ -69,7 +72,7 @@ Current relational/pgwire DML and compute-routing implementation tracker:
 | Path expansion (k-hop) | ✅ | ✅ | — | ✅
 | Cypher query | ✅ | ✅ | — | ✅ (PGQ extension)
 | PageRank / centrality | ✅ (async) | ✅ (async) | — | —
-| Mixed vector + graph hybrid | ✅ (`/api/v2/graphs/{id}/fusion-search`) | ⚠️ v1 compat/deferred | — | —
+| Mixed vector + graph hybrid | ✅ (`/api/v2/graphs/{id}/fusion-search`) | ✅ (v2 `ProximaFusionService.FusionSearch`) | — | —
 |===
 
 === Physical Projection Status
@@ -97,7 +100,7 @@ Current relational/pgwire DML and compute-routing implementation tracker:
 | ANN / top-K search | ✅ | ✅ | ✅ | ✅
 | Filtered vector search | ✅ | ✅ | ✅ | ✅
 | Hybrid BM25 + dense | ✅ | ✅ | — | —
-| Vector + graph hybrid | ✅ (`/api/v2/graphs/{id}/fusion-search`) | ⚠️ v1 compat/deferred | — | —
+| Vector + graph hybrid | ✅ (`/api/v2/graphs/{id}/fusion-search`) | ✅ (v2 `ProximaFusionService.FusionSearch`) | — | —
 |===
 
 === Physical Projection Status
@@ -107,7 +110,7 @@ Current relational/pgwire DML and compute-routing implementation tracker:
 | Projection | Status | Notes
 | HNSW index | ✅ Retained (rebuildable) | `ProjectionDirective::HnswIndex`. Rebuilt from canonical `ProximaRecord::embeddings` fields. Predicate-aware ACORN construction per spec §6.1.
 | IVF / PQ quantized index | ✅ Retained (rebuildable) | Quantization lives in `proximadb-vector` modality crate. Foundation types from `proximadb-quantization-types`.
-| Storage engine vector layouts (SST/HELIX/VIPER/NOVA/SWIFT) | ✅ Retained (canonical record layouts/access methods) | Flush, compaction, ProximaBlocks/columnar serialization, filtering, and search result shaping are migrating to `ProximaRecord::embeddings` + `props`. Legacy `VectorRecord` is allowed only in explicit v1 compatibility helpers while client/proto migration completes.
+| Storage engine vector layouts (SST/HELIX/VIPER/NOVA/SWIFT) | ✅ Retained (canonical record layouts/access methods); engine tiers per `docs/SUPPORTED_SURFACE.adoc` — VIPER Deprecated (ADR-093), SWIFT Experimental | Flush, compaction, ProximaBlocks/columnar serialization, filtering, and search result shaping are migrating to `ProximaRecord::embeddings` + `props`. Legacy `VectorRecord` is allowed only in explicit v1 compatibility helpers while client/proto migration completes.
 |===
 
 ---
@@ -119,11 +122,11 @@ Current relational/pgwire DML and compute-routing implementation tracker:
 [cols="2,1,1,1,1", options="header"]
 |===
 | Operation | REST | gRPC | Arrow Flight | pgwire
-| Upsert entity-shaped view | ⚠️ v1 compat only | ⚠️ v1 compat only (`proximadb.v1.EntityService`) | — | —
-| Get entity-shaped view | ⚠️ v1 compat only | ⚠️ v1 compat only (`proximadb.v1.EntityService`) | — | —
-| Delete entity-shaped view | ⚠️ v1 compat only | ⚠️ v1 compat only (`proximadb.v1.EntityService`) | — | —
-| Search entity-shaped view | ⚠️ v1 compat only | ⚠️ v1 compat only (`proximadb.v1.EntityService`) | — | Use vector/document/graph SQL extensions instead
-| v2 entity orchestration facade | Planned | Planned | — | —
+| Upsert entity-shaped view | ✅ v2 (`POST /api/v2/collections/{id}/entities`) | ✅ v2 (`ProximaEntityService`) | — | —
+| Get entity-shaped view | ✅ v2 | ✅ v2 (`ProximaEntityService`) | — | —
+| Delete entity-shaped view | ✅ v2 | ✅ v2 (`ProximaEntityService`) | — | —
+| Search entity-shaped view | ✅ v2 (`…/entities/search`; seam facade, TD-146) | ✅ v2 (`ProximaEntityService.SearchEntities`) | — | Use vector/document/graph SQL extensions instead
+| v2 entity orchestration facade | ✅ (`src/network/rest/v2/entities.rs`) | ✅ (`src/network/grpc/v2/entity_service.rs`) | — | —
 |===
 
 === Physical Projection Status

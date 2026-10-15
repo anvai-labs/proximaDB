@@ -1,77 +1,34 @@
+// Copyright (C) 2025 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
 = TD-DECOMP-80: Extract columnar serialization + common pair → engine-core
 :id: TD-DECOMP-80
-:status: implemented
+:status: partial
 :date: 2026-08-16
 :phase: root-crate decomposition — phase 6, PR A
 
-== Problem
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial: `columnar/serialization.rs` + `common.rs` (~2.6K LOC, 7 tests) moved to engine-core via `StorageQuantizationEnginePort` (#1656); open: the phase-7 columnar residue (query engine, IO layers, hybrid writer, metadata collectors).**
+| Severity | Low — behavior-neutral move behind existing ports
+| Component | `crates/storage/proximadb-engine-core/src/proximablocks/{columnar_serialization,columnar_common}.rs`; root `columnar/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-78-extract-parquet-write-engine.adoc[TD-DECOMP-78]; link:TD-DECOMP-75-extract-sst-swift-metadata-via-filesystem-port.adoc[TD-DECOMP-75]
+|===
 
-`src/storage/engines/core/formats/columnar/` still owns its two largest remaining
-files root-side: `serialization.rs` (1,207 LOC, 3 tests) and `common.rs` (1,389
-LOC, 4 tests) — the columnar format's serializer and the shared VIPER/NOVA
-operations layer. Both were previously blocked on the modality-tier quantization
-engine (`StorageQuantizationEngine`) and the root `FilesystemFactory`.
+== History (shipped)
 
-== Discovery
+The survey found both blockers already dissolved: `proximadb-quantization-kernel` already implemented
+`StorageQuantizationEnginePort` (the serializer calls only `quantize_batch`), and `crate::compute::quantization`
+was already a shim. The serializer now takes `Option<Arc<dyn StorageQuantizationEnginePort>>` via
+`with_quantization_engine`; root NOVA builds the concrete engine through `root_storage_quantization_engine()`;
+`common.rs` filesystem fields became `Arc<dyn FilesystemPort>`.
 
-The coupling survey (phase 6) found the blockers already dissolved:
+* Behavior note that still applies: the old serializer built an engine whenever `config.quantization` was
+  set and computed quantization *stats* even with enable-flags off; the injection seam preserves that.
+* Evidence: engine-core nextest 190/190.
 
-1. `proximadb-quantization-kernel` **already impls
-   `StorageQuantizationEnginePort`** (`storage_engine.rs:1490` — landed for the
-   raptor writer extraction). `serialization.rs` calls exactly one engine
-   method, `quantize_batch(&vectors, Some(&ids))` — port method #1. No new port
-   surface is needed.
-2. `crate::compute::quantization::*` is a `proximadb_quantization_kernel::*`
-   re-export shim, so the remaining imports resolve to extracted crates already.
+== Open: phase-7 residue
 
-== Change
-
-* `git mv` both files → `proximadb-engine-core/src/proximablocks/`
-  (`columnar_serialization.rs`, `columnar_common.rs`); root `columnar/mod.rs`
-  keeps `pub use … as {common, serialization}` shims — zero consumer-path changes.
-* **Serializer port conversion** (TD-78 pattern):
-  `quantization_engine: Option<Arc<StorageQuantizationEngine>>` →
-  `Option<Arc<dyn StorageQuantizationEnginePort>>`. `new()` no longer constructs
-  the engine (it named modality-kernel concrete types); a
-  `with_quantization_engine` builder injects it. `quantize_vectors` takes
-  `&dyn StorageQuantizationEnginePort`.
-* **Common operations injection seam**: `CommonColumnarOperations::new` keeps its
-  signature (delegates with `None`); new `with_quantization_engine` variant
-  threads the port into the serializer. Root NOVA integration
-  (`nova/columnar_integration.rs:393`) constructs the concrete
-  `StorageQuantizationEngine` root-side (composition root — the root may name
-  modality types) via a new `root_storage_quantization_engine()` helper beside
-  TD-78's `root_quantization_engine()`.
-* **Filesystem port swap** in `common.rs`: both `Arc<FilesystemFactory>` fields →
-  `Arc<dyn FilesystemPort>` (TD-75/76/78 pattern); the sole root caller (NOVA)
-  coerces implicitly.
-* Type-collision fix: `common.rs` defines its own `CompressionStrategy`
-  (algorithm-selection config); the schema-side `CompressionStrategy` is imported
-  via `use … as schema_full` qualification. `CompressionMetadata` resolves to the
-  `columnar_schema_full` alias (TD-74 home).
-
-== Behavior notes
-
-The old `ColumnarSerializer::new` built an engine whenever
-`config.quantization.is_some()` (always, via `common.rs`'s `.into()`), and
-`serialize_vectors` runs `quantize_vectors` unconditionally in that branch —
-quantization *stats* are computed even when enable-flags are off. The injection
-seam preserves this: the root injects the engine, the serializer runs as before.
-The serializer's own unit tests use `quantization: None` — unaffected.
-
-== Verification
-
-* `cargo check -p proximadb-engine-core --all-targets` clean
-* `cargo check -p proximadb --lib` clean (shim catcher)
-* `cargo check --workspace --lib --bins --tests` clean (CI Rust Compile replica)
-* `cargo clippy --lib --bins -p proximadb-engine-core -p proximadb -- -D warnings` clean
-* `check_workspace_boundaries.py --strict` — no findings
-* `nextest -p proximadb-engine-core`: 190/190 pass
-* `cargo fmt --check` clean; TD-unique guard pass
-
-== Impact
-
-~2,596 LOC out of the root crate. Columnar core quartet (schema, config,
-serialization, common) now fully lives in engine-core/storage-common. Root's
-columnar dir is down to the query engine, IO layers, hybrid writer, and metadata
-collectors — all phase-7 candidates.
+Columnar core quartet (schema, config, serialization, common) now fully lives in
+engine-core/storage-common. Root's columnar dir is down to the query engine, IO layers, hybrid writer,
+and metadata collectors — all phase-7 candidates.

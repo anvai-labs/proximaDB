@@ -5,7 +5,7 @@
 
 [cols="1,3"]
 |===
-|Status |Proposed active implementation blueprint
+|Status |**Partial (reconciled 2026-10-15).** Admitted flushes and the persistent cache landed (#1325). TD-COMPACT-7 L0 watermarks are done (#1253, #1294); TD-COMPACT-8 training-arm flag is done (#1241). TD-COMPACT-4 admission S1–S3 shipped (#1384). TD-IVF-2 S1/S2 shipped. TD-RDSTRAT-11 was superseded: its mechanism already existed. Batched IVF probe cold reads landed (TD-RDSTRAT-12, #1742). Open: TD-RDSTRAT-9 (collection read-cost controller), the P2 range-planning / P3 economics slices, and the SIFT1M promotable-evidence run under the §"Correct benchmark contract".
 |Owner |Storage / SST maintainers
 |Last updated |2026-07-29
 |Scope |SST/PAX flush, compaction, clustering, cold-read amplification, and SIFT1M evidence

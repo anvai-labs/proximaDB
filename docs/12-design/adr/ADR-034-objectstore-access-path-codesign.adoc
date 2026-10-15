@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **partially implemented** (reconciled 2026-10-15): TD-167 (read-path depth collapse) Resolved; TD-168 Partial; TD-169, TD-171 Open; TD-170 Open (hard gate landed in the override path). TD-162a-2 is now evolved by TD-USUB-6 under ADR-094 (which re-justifies it on unification grounds, not < 2× scan speed).
 |Date|2026-06-27
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-033 (primary-format strategy + the first-principles cost spine — this ADR *applies* it to the access path), ADR-026 (PAX canonical vector path), ADR-027 (unified storage + metering), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`

@@ -111,19 +111,21 @@ previously skipped every Rust job).
 == Exit Criteria
 
 1. ✅ **Decision:** Option A — PR-time job, same shape as the benches sibling
-2. ✅ **Implement** — job wired into `ci-success` + `examples/**` path filter
+2. ❌ **Implement** — job wired into `ci-success` + `examples/**` path filter (landed #1725, lost in `a5d4833e6`; re-apply)
 
 == Status
 
-**IMPLEMENTED** — job live in this PR; wired into the `ci-success` aggregator and the `compile` path filter (adversarial-review fixes 2026-09-01)
+**OPEN (regressed) — corrected 2026-10-15.** The job was implemented in #1725 (2026-09-01), wired into the `ci-success` aggregator and the `compile` path filter (adversarial-review fixes 2026-09-01). It was then **silently removed on 2026-09-02** by the recovery commit `a5d4833e6` ("re-land #1724 + #1721"). That commit restored `ci.yml` from an orphaned pre-#1725 merge tree and deleted the `rust-compile-benches-examples` job, its `ci-success` `needs` entry and the `'examples/**'` path-filter line. Its message says "TD-CI-4 also excluded (already on develop via #1725's surviving ancestry)", which is the reverse of what its diff does. As of 2026-10-15, `ci.yml` has no `--examples` step and no `examples/**` filter, and benches still compile only on `medium_tier`. The Problem Statement below is accurate again. The fix is to re-apply the Option A job as specified.
 
 == Next Steps
 
 1. ✅ Choose solution — Option A (PR-time job)
-2. ✅ Implement — `rust-compile-benches-examples` job in `.github/workflows/ci.yml`
+2. ❌ Implement — `rust-compile-benches-examples` job in `.github/workflows/ci.yml` (lost in `a5d4833e6`; re-apply)
 3. ✅ Adversarial review pass — aggregator wiring, path filter, evidence correction
 
 == Related
 
+* link:TD-BENCH-1-rotted-criterion-benches-no-compile-gate.adoc[TD-BENCH-1]: the original `--benches` gate and the 2 disabled benches (overlap: bench compile gating; this TD is canonical for the PR-time examples/benches job)
+* link:TD-CI-1-rust-test-compile-bottleneck.adoc[TD-CI-1]: this TD was first filed under that id (#1725)
 * CLAUDE.md mandate #7: "PR Sizing for CI Efficiency" — CI runners are a shared resource
 * .github/workflows/ci.yml — existing `rust-compile-benches` job (medium-tier only)

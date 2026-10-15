@@ -5,46 +5,19 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | High — resolves the last 4th grandfathered control-layer coupling edge; achieves pristine architectural enforcement
-| Component | `crates/foundation/proximadb-catalog-schema` (new); `crates/control/proximadb-catalog`; `crates/storage/proximadb-storage-common`; `scripts/check_workspace_boundaries.py`
+| Status | **Done (2026-08-12).** Catalog schema types moved to a new foundation crate `proximadb-catalog-schema`, resolving the last upward edge; the boundary checker enforces control-layer rules at error with zero exceptions (#1609).
+| Component | `crates/foundation/proximadb-catalog-schema`; `crates/control/proximadb-catalog`; `crates/storage/proximadb-storage-common`; `scripts/check_workspace_boundaries.py`
+| Relates to | link:TD-DECOMP-63-boundary-checker-control-blindspot.adoc[TD-DECOMP-63]; link:TD-DECOMP-66-resolve-grandfathered-coupling-edges.adoc[TD-DECOMP-66]; link:TD-DECOMP-68-extract-multimodel-codec.adoc[TD-DECOMP-68] (first consumer)
 |===
 
-== Problem
-The last grandfathered control-layer coupling edge: `proximadb-storage-common → proximadb-catalog`
-(storage→control). TD-DECOMP-63 closed the boundary checker blind spot; TD-DECOMP-66 resolved 3 of
-4 edges via port-traits. This TD resolves the final edge.
+== History
 
-== What moved
-Created new foundation crate `proximadb-catalog-schema` (~2500 lines) with:
-- **CatalogColumn** + **CatalogTableSchema** (the anchor types) — struct definitions + pure impl blocks
-- **16 Tier B types** (CatalogEmbeddingConfig, CatalogStorageLayout, CatalogProjection, etc.)
-- **~19 Tier C transitive types** (CatalogAuthorityMode, CatalogPhysicalFormat, etc.)
-- **3 embedding-precision-policy types** (RecallSlo, RecallTargets, PrecisionMigrationState)
-- **object_store_bridge module** (307 lines, fully pure)
-- Pure helpers: `same_column_set`, `catalog_arrow_type`, `validate_contract_digest`
+`CatalogColumn` / `CatalogTableSchema` plus their transitive Tier B/C types, the embedding-precision-policy
+types, `object_store_bridge` and pure helpers moved (~2.5K lines; catalog `lib.rs` 4,917 → 2,578 lines),
+all re-exported so ~31 consumers compile unchanged. `KNOWN_CONTROL_UP_EDGES` was deleted and
+storage → control upgraded to `error`.
 
-Catalog lib.rs shrank from **4917 → 2578 lines**. All moved types are re-exported so the ~31
-external consumers keep compiling unchanged.
-
-== The mlops_asset field
-Changed `Option<mlops::CatalogMlopsAsset>` → `Option<serde_json::Value>` on the foundation struct
-(wire-compatible). Catalog provides a `CatalogMlopsAssetExt` extension trait with typed accessors
-(`mlops_asset_as_typed`/`set_mlops_asset_typed`). 3 internal call sites + 1 test updated.
-
-== Pristine enforcement achieved
-- Deleted `KNOWN_CONTROL_UP_EDGES` allowlist entirely (all 4 edges resolved).
-- Upgraded storage→control rule from `"warning"` to `"error"`.
-- `python3 scripts/check_workspace_boundaries.py --strict` → **"No boundary findings"** with zero
-  warnings or errors.
-
-== Verification
-- `cargo check --workspace --lib` — clean (all 152 crates)
-- `cargo fmt --check` — passes
-- Boundary checker `--strict` — pristine (0 findings)
-
-== Session milestone
-This completes the remodularization plan's Phase 0 (fix wrong integrations) — all 4 control-layer
-upward coupling edges resolved, boundary checker at pristine ERROR enforcement with zero exceptions.
-TD-DECOMP-63 (blindspot) → TD-DECOMP-66 (3 port-traits) → TD-DECOMP-67 (schema extraction) = the
-full architectural governance arc.
+* Decision: the foundation struct holds `mlops_asset` as `Option<serde_json::Value>` (wire-compatible);
+  catalog's `CatalogMlopsAssetExt` trait gives typed accessors.
+* Completed the remodularization Phase 0 arc: link:TD-DECOMP-63-boundary-checker-control-blindspot.adoc[TD-DECOMP-63] → link:TD-DECOMP-66-resolve-grandfathered-coupling-edges.adoc[TD-DECOMP-66] → TD-DECOMP-67.
+* Evidence: `check_workspace_boundaries.py --strict` → "No boundary findings".

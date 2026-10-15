@@ -3,29 +3,18 @@
 :dim: D5
 :pillar: SEC
 
-Problem: `tenant_stable_id` (the ABAC policy key) is stamped per-surface by
-optional resolvers (REST middleware, `GrpcAuthContext`, Flight inline
-`stable_id_of`) — N resolution points, N drift seams, and consumers below the
-network layer cannot see the foundation identity at all (the REST identity
-Extension is the root-crate `MiddlewareTenantContext`, invisible to
-`proximadb-api` handlers by layering).
+[cols="1,3"]
+|===
+| Status | **Done (2026-08-02).** `proximadb_tenant::ResolvedRequestIdentity` carries `tenant_stable_id`, is stamped once per surface, rides REST as a foundation `Extension`, and converts into `PortIdentity` (with `auth_class`) (#1397, ADR-087 #1393).
+| Component | `crates/foundation/proximadb-tenant` (`identity_trust.rs`); `src/security/request_identity.rs`; `src/network/middleware/tenant.rs`; `crates/platform/proximadb-runtime`
+| Relates to | link:TD-ABAC-9-api-crate-identity-consumers.adoc[TD-ABAC-9], link:TD-ABAC-10-pgwire-identity-constructor.adoc[TD-ABAC-10], link:TD-ABAC-7-port-identity-struct-consolidation.adoc[TD-ABAC-7]
+|===
 
-Next action (per ADR-087 §Decision 1–3):
-1. Add `tenant_stable_id: Option<u64>` to
-   `proximadb_tenant::ResolvedRequestIdentity`; stamp it in the single
-   resolution point per surface (`resolve_request_identity` orchestrator /
-   auth layer), retiring the per-surface hand-stamps.
-2. REST tenant middleware inserts `Extension<ResolvedRequestIdentity>`
-   (foundation type ⇒ visible to every crate); `MiddlewareTenantContext`
-   keeps surface-local extras and derives its identity core from it.
-3. `proximadb_runtime::PortIdentity<'a>` gains
-   `From<&ResolvedRequestIdentity>` and an `auth_class` field (audit-only at
-   the seam for now).
+== History
 
-Key locations: `crates/foundation/proximadb-tenant/src/identity_trust.rs`,
-`src/security/request_identity.rs`, `src/network/middleware/tenant.rs`,
-`src/network/grpc/auth.rs`, `src/network/arrow_ipc/service.rs`,
-`crates/platform/proximadb-runtime/src/service_ports.rs`.
-
-Deps: after #1391. Enables [[TD-ABAC-9]] (api-crate consumers) and
-[[TD-ABAC-10]] (pgwire) as mechanical constructors.
+The ABAC policy key was stamped per-surface by optional resolvers (REST middleware,
+`GrpcAuthContext`, Flight inline `stable_id_of`) — N resolution points, N drift seams — and crates
+below the network layer could not see the identity at all (the REST Extension was the root-crate
+`MiddlewareTenantContext`). Making the **foundation** type the carrier (visible to every crate) is
+what turned TD-ABAC-9 (api-crate consumers) and TD-ABAC-10 (pgwire) into mechanical constructors.
+`MiddlewareTenantContext` keeps surface-local extras and derives its identity core from it.

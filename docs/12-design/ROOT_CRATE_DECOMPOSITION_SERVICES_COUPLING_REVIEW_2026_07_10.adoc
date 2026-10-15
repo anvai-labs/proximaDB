@@ -2,6 +2,13 @@
 :toc: macro
 :icons: font
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** Finding 1 is done: the `dml/mod.rs` tests were extracted to `dml/tests.rs` (#871). Findings 2–7 are open: the `dml` production body is unsplit (`src/services/dml/` has only `mod.rs` + `tests.rs`), there is no `RecordStorePort`, and `operations/vectors/legacy.rs` is still present. Root-handler retirement (TD-104, #761) removed the `request_handlers.rs` consumers cited in Finding 4.
+| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_NETWORK_COUPLING_REVIEW_2026_07_10.adoc[network review], link:ROOT_CRATE_DECOMPOSITION_STORAGE_REVIEW_2026_07_10.adoc[storage review]
+|===
+
 [abstract]
 Evidence-driven coupling/cohesion/duplication review of `src/services/` — the #1
 god-module concentration in the root crate. This is a *companion* to

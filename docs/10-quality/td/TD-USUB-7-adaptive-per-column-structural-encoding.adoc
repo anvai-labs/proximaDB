@@ -9,7 +9,7 @@
 | Priority | MEDIUM — targets the random-access path where ADR-033 measured the custom format's ~100× advantage.
 | Component | `crates/storage/proximadb-block-format/src/{header,stripe,writer,reader,coalesced_rabitq,coalesced_sq8}.rs`
 | Relates to | ADR-094 (spec §2.2), ADR-062 (coalesced RaBitQ — the ad-hoc form this generalizes), ADR-026 (recall ratchet), Lance 2.1 structural encodings
-| Blocked by | TD-USUB-6 (shares the PAX v3 version byte).
+| Blocked by | TD-USUB-6 (shares the PAX v3 version byte) — the version-dispatching header landed in TD-USUB-6 slice 1 (#1925) and v3 is stamped by its residual tail (#1930), so the byte now exists.
 |===
 
 == The finding

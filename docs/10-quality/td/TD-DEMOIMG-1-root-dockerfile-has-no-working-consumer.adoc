@@ -8,6 +8,7 @@ guard for shipped image features had to decide which Dockerfile it was guarding.
 | Severity | Low. Nothing in CI or the release path depends on either file; the cost is a demo
 that fails for anyone who follows it, and a tracked file that reads as production.
 | Owner | unassigned
+| Relates to | link:TD-DOCKCI-1-docker-path-filter-watches-files-ci-never-builds.adoc[TD-DOCKCI-1] (overlap: the root `Dockerfile` is built by no CI job; DOCKCI-1 removed it from the `docker` filter), link:TD-HELMDUP-1-second-helm-chart-is-unrenderable-and-unwatched.adoc[TD-HELMDUP-1] (same class: a tracked deploy artifact with no working consumer)
 |===
 
 == What

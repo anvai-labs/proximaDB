@@ -7,7 +7,7 @@
 
 [cols="1,3"]
 |===
-| Status | Accepted
+| Status | Accepted — implemented (#1332; `no-axis` CI feature-matrix variant guards cfg drift).
 | Date | 2026-07-30
 | Deciders | Vijaykumar Singh
 | Relates to | TD-AXIS-4 (Superseded — AXIS winds down for PAX exact-scan), ADR-052 / `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (PAX-layout exact-scan path), ADR-070 (co-design default — collections don't pay for indexes they never query), ADR-078 (flush→AXIS single mechanism)

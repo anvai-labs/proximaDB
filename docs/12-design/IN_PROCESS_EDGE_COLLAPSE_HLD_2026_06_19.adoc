@@ -19,7 +19,7 @@ configured.
 [IMPORTANT]
 ====
 Owner: Architecture / Network. Scope: refinement of the co-design Network dimension; HLD + sequenced
-roadmap. Status: *Accepted direction; phased*. Subordinate to
+roadmap. Status: *Accepted direction; phased* — **Partial (verified 2026-10-15): E0 shipped, E1 partial (no `proximadb-edge` crate / `EdgeRequest` envelope yet), E2–E3 open; E4's ABAC backend has since shipped separately (relational + REST ABAC enforcement, ADR-090 / TD-ABAC-*) but not as an edge-plane stage.** Subordinate to
 link:CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc[the co-design spec] and the 2026-06-04 course
 correction. Builds directly on the *existing* in-process edge (`src/network/multiplex/**`,
 `src/network/middleware/**`, `src/network/tls/**`) and the C0 trace substrate

@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Open — Phase 1 (deprecation markers) landing. After the ADR-055 default-ON cutover
+|Status|**Partial: P1 deprecation markers shipped (#817); open: P2 feature-gate + server rewire (the server still calls the deprecated `DocumentService::new_with_wal` in `src/network/shared_services.rs`), P3 migration, P4 verify, P5 hard-remove (v0.4).** After the ADR-055 default-ON cutover
 (TD-DOC-CONV-2, #726) + universal canonical provisioning (P-Provision, #765), the legacy
 `document_wal`/`DashMap` document path is **fallback-only**: the canonical `ProximaRecord` store is
 the primary durable authority for every new/converged collection. This TD phases the legacy path out
@@ -12,7 +12,7 @@ across five reversible-until-the-end steps (P1 markers → P5 hard-remove in v0.
 |Priority|MEDIUM (operational simplification — one fewer durable write path to maintain)
 |Scope|FEAT
 |Date|2026-07-09
-|Relates to|ADR-055 (canonical document format = ProximaRecord-in-PAX), TD-DOC-CONV-2 (default-ON
+|Relates to|link:TD-DOC-CONV-2-canonical-vector-default-on-cutover-bake.adoc[TD-DOC-CONV-2] (cutover step 4 is owned here). ADR-055 (canonical document format = ProximaRecord-in-PAX), TD-DOC-CONV-2 (default-ON
 cutover), P-Provision (#765, doc-collection create provisions the canonical collection). The final
 phase of the ADR-055 rollout.
 |===
@@ -60,7 +60,7 @@ The real server still constructs `DocumentService::new_with_wal`
 |===
 |Phase |Work |Reversible?
 
-|P1 (this PR)
+|P1 — DONE (#817)
 |**Deprecation markers.** `#[deprecated]` on `new_with_wal` / `new_with_wal_and_metrics` (+ a runtime
 `tracing::warn!`); `#[allow(deprecated)]` at the internal call sites that still use them
 (`service.rs` wrapper, `shared_services.rs` server wiring) so `clippy -D warnings` stays green. NO

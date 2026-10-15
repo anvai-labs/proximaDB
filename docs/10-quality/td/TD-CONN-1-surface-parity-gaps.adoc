@@ -38,7 +38,12 @@ Envelope rule (rule seed).
 
 == Slices (each begins with anchor re-verification)
 
-C1 — **REST graph-write parity.** Add graph node/edge upsert + delete REST v2 endpoints that lower to
+C1 — **REST graph-write parity.** _Anchor re-verification note (2026-10-15 consolidation): the
+generated OpenAPI spec already lists canonical `POST /api/v2/graphs/{graph_id}/nodes`, `…/edges`,
+`…/nodes/batch`, `…/edges/batch` and `PUT`/`DELETE` on `…/nodes/{node_id}` / `…/edges/{edge_id}`
+(`docs/openapi/proximadb-openapi.yaml`), so the sweep's "REST is read-only for graph" anchor (which read
+only `rest/v2/graphs.rs`) may be stale. C1's first step is to confirm whether those handlers lower to the
+same graph write path gRPC uses; if so, C1 reduces to a parity test._ Add graph node/edge upsert + delete REST v2 endpoints that lower to
 the *same* graph write path gRPC uses (reuse `ProximaGraphService` internals via the shared port; do
 not re-implement graph mutation in the REST layer). OpenAPI spec regenerated in the same PR
 (`make verify-openapi-spec`), SDKs regenerated (mandate #15).

@@ -7,7 +7,12 @@
 
 == Status
 
-Proposed
+Proposed — **never formally accepted, but implemented** (status reconciled 2026-10-15): T-A…T-H
+and R1, R2, R3 (a)(b)(c), R3-bis all shipped (2026-05-31 → 2026-06-02; commits cited inline;
+`1a041d5c4` wired warm-tier cold-load serving into the ANN advisor). **Open residuals:** R3(c)
+LIOS `io_uring` overlap of the fetch with serving (throughput only); the informational cold-start
+latency bench against a real object-store tier; R4 2-bit MID tier stays *optional* (build only
+if a deployment's cold-window recall SLA exceeds ~0.6). Owner decision needed: mark Accepted.
 
 Scope: TD-087 / Phase 8 F2 (`docs/12-design/PHASE8_CONTINUOUS_LOOP_HLD_LLD_2026_05_28.adoc` §F2). Closes F2 success criterion #1 (and #4); criteria #2/#3 are already met (recall envelope via the `RecallProbeGate`; degraded-route disclosure shipped as the `QUANTIZED_ROUTE_DOWNGRADED` EXPLAIN hint, 2026-05-30).
 
@@ -122,12 +127,7 @@ The gate + EXPLAIN surfaces already exist:
 . *Gate FAIL → non-quantized fallback + EXPLAIN reason* → already shipped (2026-05-30).
 . *Cold-start latency seconds-class* → T-F (bytes proxy). Cold-start latency is **I/O-bound** — the COLD blob is loaded from disk/object-store before serving, so time-to-first-serve is proportional to *bytes before serving*, already verified `cold_tier_bytes·4 < warm_tier_bytes` (~1/32 per-vector asymptotically). A local in-memory wall-clock bench would measure CPU restore time, not the I/O win, and would *understate* the benefit — so it is deliberately not added; the bytes ratio is the faithful latency proxy. A representative end-to-end number belongs in a deployment benchmark against a real object-store tier (gated on the same `UniversalIndexStorage` S3 wiring as R3 (b)/(c)), not a unit test.
 
-== Risks
-
-* **Stage-1-only recall floor — MEASURED (synthetic), marginal.** `recall@10 = 0.512` at the best config (`n_probe=1`) on a deterministic 16-cluster corpus (commit `9c86b2a25`); below the ~0.75 naive-1-bit prior. The disclosed envelope is honest (`COLD_STAGE1_ONLY` hint) but the recall is low enough that the R4 MID tier or a `FullEager` fallback is the safer default for recall-sensitive collections until a real-corpus rerun. **Open:** rerun over a real corpus (less pathologically tight clusters may lift or lower it).
-* **`n_probe` inverts in the cold path (NEW, from T-F).** Stage-1-only recall *decreases* as `n_probe` rises (0.512→0.145 over 1→16) — the opposite of the warm two-stage path. Cause: Hamming over rotated residuals is comparable only *within one cluster's frame*; merging probed clusters drops the coarse centroid-distance term and mis-ranks across frames. **Mitigation:** clamp `n_probe→1` (or a small constant) while `ColdBinaryOnly`, OR compose `coarse_centroid_distance + residual_estimate` (the RaBitQ/IVF-TQ estimator) so multi-probe is meaningful. Tracked as **R3-bis** below.
-* **Warm-tier load latency dominates.** If the fp32 tier load is slow, queries spend a long time in `ColdBinaryOnly`. Mitigation: per-cluster lazy load (load only the fp32 of probed clusters first) — a T-E refinement, not a blocker.
-* **Calibration coupling with F1.** The `RecallObserver` interval (default 300s) gates when two-stage becomes "verified"; a freshly warmed index may serve Stage-1-only longer than necessary. Trigger an immediate probe on warm-tier completion.
+(The original Risks list was superseded by the post-measurement Risks section below.)
 
 == Literature review (2026-05-31) — revisions from the arxive corpus
 

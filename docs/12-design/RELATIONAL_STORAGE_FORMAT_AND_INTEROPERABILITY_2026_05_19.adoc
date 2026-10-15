@@ -3,7 +3,7 @@
 :toclevels: 3
 :sectnums:
 
-Status: Accepted architecture refinement +
+Status: Accepted architecture refinement — **implementation Partial (reconciled 2026-10-15)**; see "Initial Implementation Checklist". The live implementation tracker is the pgwire/DML blueprint (overlap: this checklist duplicates its T1–T7 rows; canonical = blueprint). +
 Date: 2026-05-19 +
 Scope: SQL/pgwire, relational DDL/DML, catalog tables, PAX/SST storage layouts, MVCC, open-format external tables, and future vector/document/graph/observability records
 
@@ -1181,47 +1181,16 @@ For source formats:
 
 === Initial Implementation Checklist
 
-* [x] Add reserved `__proxima_*` system-column registry in `proximadb-catalog`.
-* [x] Reject user columns that collide with reserved system-column namespace.
-* [x] Add explicit open-format physical formats: CSV, JSON, XML, Avro, Parquet, ORC, Iceberg,
-  Delta, Hudi, Arrow, GraphAr.
-* [x] Add explicit ownership/authority modes for Proxima-authoritative tables, projection
-  publications, imported snapshots, external authorities, and federated reads.
-* [x] Add typed workload profiles for OLTP, OLAP, HTAP, vector, document, graph, observability, and
-  mixed multimodal tables.
-* [x] Add storage specialization metadata for PAX row-family, PAX OLTP, PAX OLAP, SST/LSM,
-  columnar, vector ANN, document JSON, graph topology, observability time-series, and external
-  open-table layouts.
-* [x] Add relational mutation projection helpers for insert/upsert/update/delete records.
-* [x] Add shared `ProximaRecord` MVCC/tombstone visibility helpers.
-* [x] Make PAX row-directory upper-bound visibility exclusive.
-* [x] Route pgwire DDL `WITH (...)` options into xCatalog workload/layout/open-table descriptors.
-* [x] Route pgwire DDL into xCatalog table assets with PAX/SST primary layout metadata.
-* [x] Route pgwire INSERT/UPSERT into `CatalogRow` validation and explicit canonical mutation
-  record projection.
-* [x] Route pgwire primary-key DELETE into catalog-validated canonical tombstone records.
-* [x] Route pgwire UPDATE into `CatalogRow` validation and explicit canonical update mutation
-  record projection.
-* [x] Introduce a canonical `TableRecordStore` service boundary for pgwire DML.
-* [x] Route pgwire DML through xCatalog-selected `TableRecordStore` branches, with a
-  `VectorOpsTableRecordStore` compatibility adapter for legacy/vector-specialized tables.
-* [x] Lower pgwire parser output for `INSERT INTO ... SELECT` and `INSERT OVERWRITE ... SELECT`
-  into syntax-level `CopyIntoPlan` objects without giving the parser catalog/routing authority.
-* [x] Add a catalog-aware `DmlWritePlanner` boundary that validates resolved target columns and
-  routes table-to-table write plans through `TableWriteRouter`.
-* [x] Add the first rule-based compute/write router for native, DataFusion local/distributed, and
-  open-format external delegation candidates.
-* [x] Add a replaceable `TableWriteExecutor` boundary so DML depends on routed execution contracts,
-  not parser-specific or DataFusion-specific implementation details. The current executor is
-  planned-only and validates core execution guards before returning an explicit unsupported error.
-* [x] Add `TableRecordSourceReader` and `NativeTableWriteExecutor` so native routed writes can
-  consume canonical `ProximaRecord` batches and commit them through `TableRecordStore`.
-* [x] Route pgwire full-table SELECT smoke through `DmlService::scan_table_records` and
-  `TableRecordStore::scan_records`, using the VectorOps compatibility current-state scan until the
-  direct record/PAX scanner is the default.
-* [x] Route simple pgwire non-primary-key predicate SELECT smoke through the same scan path with
-  catalog-column `AND` comparison filtering.
-* [x] Extend pgwire scan predicate smoke for `IN` and `LIKE` compatibility filters.
+*Shipped (history):* the reserved `__proxima_*` system-column registry and collision rejection;
+explicit open-format physical formats, authority modes, workload profiles and storage-specialization
+metadata; mutation projection helpers and shared MVCC/tombstone visibility (exclusive row-directory
+upper bound). pgwire DDL `WITH (...)` and PAX/SST layout metadata go into xCatalog. pgwire
+INSERT/UPSERT/UPDATE/DELETE produce catalog-validated canonical mutation records through
+xCatalog-selected `TableRecordStore` branches. `INSERT … SELECT` / `INSERT OVERWRITE … SELECT` lower
+to `CopyIntoPlan` → `DmlWritePlanner` → rule-based `TableWriteRouter` → `TableWriteExecutor`, and
+`NativeTableWriteExecutor` is native. pgwire SELECT scan smoke runs through `scan_table_records`
+with AND/IN/LIKE compatibility filters.
+
 * [ ] Replace the `VectorOpsTableRecordStore` adapter with a direct WAL/table-record
   implementation.
 * [ ] Close prior visible row versions for UPDATE/UPSERT in the table-record writer.
@@ -1234,6 +1203,8 @@ For source formats:
   and open-format/external engine delegation.
 * [ ] Add external-table DDL parsing and xCatalog ownership descriptors.
 * [ ] Add BenchBase/TPC-H/TPC-DS conformance profiles over the canonical path.
+  *(Reconciled 2026-10-15: TPC-H 22/22 and TPC-DS pgwire suites exist and are ratcheted —
+  `tests/tpch_pgwire_e2e.rs`, `tests/tpcds_pgwire_e2e.rs`. BenchBase OLTP profiles remain open.)*
 
 == Non-Goals
 

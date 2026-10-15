@@ -12,8 +12,17 @@ the same immutable contract pinned by collections and deployments.
 
 Status: *core contract, NativeCatalog and SystemCatalog persistence, tenant-scoped lifecycle
 service, fail-closed collection-binding resolution, public REST/gRPC lifecycle APIs, and generated
-SDK contracts implemented; MLflow compatibility is the next adapter slice*. The shape is additive
-and legacy-read-safe.
+SDK contracts implemented*. **Reconciled 2026-10-15:** the MLflow compatibility adapter has also
+shipped, default-OFF (TD-MLOPS-1 slices 1–4: tracking core #1847, tracking wire #1850 + real-client
+conformance lane #1851, registry wire #1854, artifacts proxy #1855). Still open:
+
+* the MLflow default-ON flip assessment;
+* alias DELETE plus server-side compare-and-retry (needs a `RemoveAlias` command);
+* the offline ownership audit of legacy artifact bytes;
+* the rollout items below: collection binding to approved snapshots, OpenLineage, OLTP-catalog
+  overrides, and per-contract-hash quality/economics ratchets.
+
+The shape is additive and legacy-read-safe.
 
 == First principles
 

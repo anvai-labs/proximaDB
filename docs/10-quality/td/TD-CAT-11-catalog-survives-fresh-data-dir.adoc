@@ -3,6 +3,12 @@
 :dim: D1
 :pillar: REL
 
+NOTE: Probable root cause (not yet confirmed by this TD's step 1): `Config::default()` sets a
+CWD-relative `storage.metadata_url = "file://./metadata"`, so the default SystemCatalog WAL lands at
+`<process-cwd>/metadata/system-catalog.wal` regardless of `server.data_dir`. See the residual in
+link:TD-CONV-1-native-tpch-ddl-regression.adoc[TD-CONV-1] (overlap: same leak; the production fix is
+anchoring a relative `metadata_url` to `server.data_dir` in `resolve_default_catalog_backend`).
+
 == Problem
 
 A **freshly booted server process with a brand-new `config.server.data_dir`**

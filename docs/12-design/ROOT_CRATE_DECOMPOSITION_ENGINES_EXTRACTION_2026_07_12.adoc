@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 = Root-Crate Decomposition — `src/storage/engines` Extraction (2026-07-12)
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** The raptor clean-leaf track is done: `raptor/common`+`config`+`constants` → `proximadb-raptor-common` (#955, #958); `consolidated_reader` (#962) and `writer`+`matrix_builder` (#985) → `proximadb-raptor-engine`; `viper/pipeline.rs` deleted as dead. The three DI ports landed (`FilesystemPort` #943, `CacheAccessPatternPort` #948, `AxisClusteringPort` + writer DI #977). The engine-core and sst-engine waves landed (TD-DECOMP-69..82). Open: Engines Slice 2 (cycle-hub cores: `raptor/engine.rs`, `viper/engine.rs`, `sst/object_economy_directory.rs`, `columnar_query_reader`), the rest of storage, and the stated goal of `CARGO_BUILD_JOBS=2` (CI still `=1`).
+| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D]
+|===
+
 [NOTE]
 ====
 **📣 ANNOUNCED — new parallel track. Re-orient here.** Fresh code-graph metrics
@@ -194,54 +201,16 @@ slices MUST NOT start until the FS-port lands (they all inject it). Recon done
 2026-07-13 via 4 parallel read-only agents (VectorProcessor dup, FS-port design,
 consolidated_reader deps, writer gap-analysis).
 
-== Writer extraction — handoff (2026-07-14)
+== Writer extraction — History (shipped)
 
-[NOTE]
-====
-The raptor extraction is mid-flight. The first leaf (`consolidated_reader`,
-~4,176 LOC) landed in `proximadb-raptor-engine` (#962). The next — `writer`
-(~5,800 LOC, the biggest + most DI-heavy raptor leaf) — is a multi-slice effort.
-This section is the handoff for the next session.
-====
-
-=== Landed (develop)
-
-* `raptor/common` + `config` + `constants` → `proximadb-raptor-common` crate (#955, #958).
-* `consolidated_reader` (~4,176 LOC) → `proximadb-raptor-engine` crate (#962) — the first raptor leaf (pattern: move + re-export shim + DI).
-* 3 DI port enablers in `proximadb-storage-ports`: `FilesystemPort` (#943), `CacheAccessPatternPort` (#948), `AxisClusteringPort` (#968).
-
-=== Writer extraction plan (4 slices)
-
-`writer.rs` constructs **3 root-type categories** internally (vs `consolidated_reader`'s
-1 dead-param) — this is the "more involved" adoption:
-
-[cols="1,3,1",options="header"]
-|===
-| slice | what | gate
-| **1. Axis DI** | `IvfClusteringBuilder` (writer.rs:381) + `RaptorWriter::new` → inject `Arc<dyn AxisClusteringPort>`; the 2 `RaptorWriter::new` callers (engine.rs:515, 2225) construct `AxisClusteringEngine` + inject. | #968 (verify merged)
-| **2. Filesystem DI** | writer (writer.rs:2581) → inject `Arc<dyn FileSystem>` instead of constructing `LocalFileSystem`. | slice 1
-| **3. Quant DI** | writer (writer.rs:2607-2629) → inject quant ports instead of constructing `UnifiedQuantizationEngine`/`StorageQuantizationEngine`/`InMemoryCodebookStore`. | slice 2
-| **4. The move** | `writer.rs` → `proximadb-raptor-engine` crate + re-export shim + import free-swaps. Same pattern as `consolidated_reader` (#962). | slices 1-3
-|===
-
-=== Writer's dep surface (measured, post-ports)
-
-`crate::proto` (10, free) · `crate::compute` (5, quant → ports) · `crate::storage` (4,
-filesystem + proximacodec) · `crate::index` (1, axis → port #968) · `crate::core` (1,
-bloom → free). All crate-accessible after the 3 DI slices.
-
-=== Key files
-
-* `src/storage/engines/raptor/writer.rs` — the target (~5,800 LOC).
-* `src/storage/engines/raptor/engine.rs` — the 2 `RaptorWriter::new` callers (515, 2225) — the composition root that constructs + injects.
-* `crates/storage/proximadb-raptor-engine/` — the destination crate (has `consolidated_reader`).
-* `crates/storage/proximadb-storage-ports/` — the 3 DI ports (`FilesystemPort`, `CacheAccessPatternPort`, `AxisClusteringPort`).
-
-=== Workflow
-
-Worktree off `origin/develop`; verify locally (`cargo check --lib`, `clippy --lib --bins`,
-`fmt`, layering, up-edges ≤181, `work-commit-check`); PR → develop, auto-merge --squash.
-develop is ACTIVE — rebase before merge. No agent attribution in commits.
+The `writer` (~5,800 LOC, the most DI-heavy raptor leaf) moved in four slices. Slices 1–3
+(#977) injected `AxisClusteringPort`, `Arc<dyn FileSystem>` and the quant ports instead of
+constructing `IvfClusteringBuilder`, `LocalFileSystem` and `UnifiedQuantizationEngine` internally.
+Slice 4 (#985) moved `writer.rs` + `matrix_builder` into `proximadb-raptor-engine` behind a
+re-export shim. *Lesson:* a Ca=0 leaf can still be the hardest mover. Movability is gated by
+**efferent** dependencies, which here meant three internally constructed root types. Afferent
+callers did not matter. *Follow-up filed:* TD-RAPTOR-GPU-1 (the RAPTOR P² GPU path went dormant
+after the `matrix_builder` extraction).
 
 == Refs
 link:ROOT_CRATE_DECOMPOSITION_CI_BUILD_OPTIMIZATION_2026_07_11.adoc[CI-build-opt (#876)],

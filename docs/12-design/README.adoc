@@ -16,9 +16,9 @@ Gate in link:CONVERGENCE_AUDIT_2026_05_30.adoc[CONVERGENCE_AUDIT_2026_05_30].
 
 [TIP]
 ====
-**For a bookkeeping snapshot** (every doc here + every ADR, with status / wired-vs-not / consolidation cluster columns), see
-link:DESIGN_DOC_STATUS_INDEX_2026_05_26.adoc[DESIGN_DOC_STATUS_INDEX_2026_05_26].
-Updated with a 2026-06-04 HTAP delta for TD-110 and the tiered OLTP/OLAP storage model.
+**For current status across the whole corpus** — completed / in progress / pending work by area, the highest-priority open items, the canonical document for every overlapping topic, and the governance decisions pending — see
+link:WORK_LEDGER_2026_10_15.adoc[WORK_LEDGER_2026_10_15] (reconciled against git and code on 2026-10-15).
+It supersedes the older bookkeeping snapshot link:DESIGN_DOC_STATUS_INDEX_2026_05_26.adoc[DESIGN_DOC_STATUS_INDEX_2026_05_26], kept only for history.
 ====
 
 == Canonical Architecture Path

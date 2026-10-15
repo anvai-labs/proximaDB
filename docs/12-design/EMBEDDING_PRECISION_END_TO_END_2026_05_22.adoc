@@ -3,7 +3,7 @@
 :toclevels: 3
 :sectnums:
 
-Status: Design proposal +
+Status: Design proposal (HLD) — **Partial (verified 2026-10-15)**: HLD Phases 1–3 (fp16 inference compat, `EmbeddingScalarType`/`EmbeddingValues` + catalog policy, fp16 canonical storage default-OFF behind `PROXIMADB_EMBED_PRECISION_SCHEMA_V2`) shipped per link:EMBEDDING_PRECISION_LLD_2026_05_22.adoc[the LLD] Phase 2 and link:EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[the integration mini-phase]; Phases 4–6 (derived-quantization policy enforcement, adaptive tier transitions, native kernels / lossy int8 canonical) open. The §Open Questions below were all answered by the LLD's Decision Index (canonical for decisions). +
 Date: 2026-05-22 +
 Scope: Make embedding precision and quantized search representations explicit,
 cataloged, tier-policy-driven, and explainable from inference through WAL,

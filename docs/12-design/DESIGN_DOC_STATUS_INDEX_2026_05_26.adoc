@@ -1,8 +1,22 @@
 = Design Doc Status Index — Bookkeeping Audit (2026-05-27, reconciled 2026-06-24)
+
+[WARNING]
+====
+**Superseded (2026-10-15) by link:WORK_LEDGER_2026_10_15.adoc[WORK_LEDGER_2026_10_15].** This snapshot was last reconciled 2026-06-24 and contradicts current per-document statuses; it is kept for history only. Do not update it.
+====
 :toc: left
 :toclevels: 3
 :icons: font
 :last-updated: 2026-06-24
+
+[WARNING]
+====
+*Stale snapshot (2026-10-15).* This index was last reconciled on 2026-06-24 and its "next 4–6 week
+refresh" never happened. Its per-row status/wired columns are out of date for many rows (e.g. the
+DR engine contract, catalog OID migration, agent-memory layer and Ballista blueprint all moved since).
+The 2026-10-15 design-corpus consolidation refreshed the `Status` header of each design doc in place —
+**treat each doc's own Status line as authoritative**, and this index as history.
+====
 
 [NOTE]
 ====

@@ -2,7 +2,7 @@
 :toc:
 :toclevels: 3
 
-Status: implemented SDK foundation; xCatalog persistence is a separately gated catalog evolution.
+Status: implemented SDK foundation; xCatalog persistence was a separately gated catalog evolution and has since landed as the typed `CatalogMlopsAsset::EmbeddingModel` facet + model registry service (`crates/control/proximadb-catalog/src/{mlops,model_registry_service}.rs`; see link:XCATALOG_MLOPS_MODEL_REGISTRY_2026_08_12.adoc[the xCatalog MLOps registry co-design], canonical for the registry). **Partial (verified 2026-10-15):** the BGE migration gate and the hybrid-quality default claim below remain open.
 
 == Outcome
 

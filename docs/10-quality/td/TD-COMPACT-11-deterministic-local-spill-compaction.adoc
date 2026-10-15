@@ -5,10 +5,11 @@
 [cols="1,3", options="header"]
 |===
 |Field |Value
-|Status |**Open — implementation in progress**
+|Status |**Partial: the default-OFF local-spill executor + disk-cache promotion landed (#1417) and the 3.3M functional/economic slice is measured (2026-08-03); open: whole-process RSS evidence, the injected-failure/determinism matrix, and the 10M recall/GET/latency rerun on the direct local-file upload path (see S6 and Exit criteria).**
 |Priority |**P0** — stability is protected, but a memory-constrained serving node can never consolidate an oversized pair and therefore pays permanently higher query GET fanout.
 |Component |`src/storage/common/compaction_memory.rs`; `src/storage/engines/sst/compaction.rs`; `src/storage/engines/sst/block_cluster.rs`; `crates/storage/proximadb-storage-common/src/pax_block.rs`
 |Governing ADR |link:../../12-design/adr/ADR-088-deterministic-local-spill-compaction.adoc[ADR-088]
+|Relates to |link:TD-COMPACT-2-compaction-memory-amplification-oom.adoc[TD-COMPACT-2] (overlap: streaming k-way merge), link:TD-COMPACT-4-memory-aware-compaction-admission-control.adoc[TD-COMPACT-4] (S5), link:TD-COMPACT-12-budget-refused-compaction-is-silent.adoc[TD-COMPACT-12] (detecting the refusal)
 |Evidence |link:../../_internal/status/COMPACTION_MEMORY_3M3_BOUNDED_WRITER_2026_08_02.adoc[3.3M release/Azurite bounded-writer evidence] +
 link:../../_internal/status/COMPACTION_SPILL_CACHE_3M3_2026_08_03.adoc[3.3M spill + disk-cache release/Azurite verification]
 |===

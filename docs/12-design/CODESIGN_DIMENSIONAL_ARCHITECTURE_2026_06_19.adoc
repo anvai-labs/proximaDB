@@ -364,8 +364,9 @@ once the concurrent fetch scheduler lands.
 a real S3-compatible (MinIO/Wasabi) run of `bench_vector_object_economy_e2e.rs` — today only local-FS
 cold/warm is MEASURED, so the S3 latency floor that dominates cold ANN stays unverified.
 . *Wire OTel to a backend.* [*DEP-GATED*] `IoTraceSnapshot` is `serde`-serializable (export-ready
-payload). Full OTLP-collector export is a deliberate dependency decision not yet taken — the tree
-lacks `opentelemetry`/`opentelemetry-otlp`/`tracing-opentelemetry`. When approved: attach a
+payload). Full OTLP-collector *trace* export is a deliberate dependency decision not yet taken — the tree
+lacks `tracing-opentelemetry` (`opentelemetry`/`opentelemetry-otlp` are now present only behind the
+`otlp-metering` feature for the TD-161 metering push, runtime-gated by `PROXIMADB_OTLP_ENDPOINT`, #407; the io_trace ETL sink is ADR-066). When approved: attach a
 `tracing_opentelemetry::layer()` to the `src/bin/server.rs` subscriber registry gated on
 `OTEL_EXPORTER_OTLP_ENDPOINT` and point `src/monitoring/opentelemetry.rs` at the collector. Interim
 persistence needs zero new deps (route the `proximadb::io_trace` target to a `tracing-appender` JSON

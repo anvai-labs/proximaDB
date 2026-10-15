@@ -1,34 +1,17 @@
 = TD-ENVGATE-1: env-gate rename/backfill/prune program (registry-governed, phased — NOT a mass rename)
-:status: S1 shipped (2026-07-25); S2 on-touch; S3 scheduled per-area
+:status: Partial — S1 shipped (2026-07-25); open: S2 backfill-on-touch (continuous), S3 per-area prune (scheduled)
 :filed: 2026-07-25
 :priority: P2 (cognitive load / operational safety)
 
-== Decision: why NOT one rename PR
+== History (shipped)
 
-221 shipped `PROXIMADB_*` names are operational API (deploy scripts, CI,
-ledger `bench_command`s, cross-session harnesses, runbooks). Registry rule 5
-makes every rename a permanent alias, so a mass rename yields 221 aliases +
-221 new names — MORE catalog, not less. It is also the maximum-conflict PR
-across concurrent sessions (env reads touch everything; SOLID mandate d).
-Confusion concentrates in near-miss PAIRS and undocumented defaults; those
-are attacked surgically.
+*Decision: NOT one rename PR.* 221 shipped `PROXIMADB_*` names are operational API. A mass rename would be the maximum-conflict PR
+across concurrent sessions, and once aliases are mandatory it yields *more* catalog, not less. Confusion concentrates in near-miss
+pairs and undocumented defaults, so those are attacked surgically. *Policy (2026-07-25, user decision):* pre-GA renames are CLEAN
+breaks (old name deleted, moved to the registry's "Retired names", reserved forever); the alias-forever rule 5 ACTIVATES AT GA.
 
-== Policy revision (2026-07-25, user decision): pre-GA = CLEAN renames
-
-There are no external operators pre-release, so renames until GA are clean
-breaks: old name deleted from code, moved to the registry's "Retired names"
-section (reserved forever). The alias-forever discipline (registry rule 5)
-ACTIVATES AT GA. A stale name in a local harness fails loudly (gate
-defaults OFF → behavior visibly untrained/unprobed).
-
-== S1 (shipped): the canonical offender pair (clean rename)
-
-`env_gate_on(name)` (block_cluster.rs) single-name truthy reads:
-
-- `PROXIMADB_PAX_WRITE_A0_TRAIN` — WRITE: compaction trains + emits A0
-  (retired: `PROXIMADB_IVF2`).
-- `PROXIMADB_PAX_READ_COARSE_PROBE` — READ: search probes via A0 (retired:
-  `PROXIMADB_IVF2_PROBE`).
+*S1 (shipped):* `PROXIMADB_IVF2` -> `PROXIMADB_PAX_WRITE_A0_TRAIN` (compaction trains + emits A0), and `PROXIMADB_IVF2_PROBE` ->
+`PROXIMADB_PAX_READ_COARSE_PROBE` (search probes via A0).
 
 == S2 (continuous, guard-enforced): documentation backfill on-touch
 

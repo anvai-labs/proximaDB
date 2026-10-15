@@ -33,6 +33,13 @@ of this blueprint — §2 substrate capabilities, §4 P0–P2, and the TD-154/TD
 prerequisites — **remains authoritative**.
 ====
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial; P3 superseded (verified 2026-10-15).** P0 is past "UNWIRED": DataFusion serves Parquet-backed tables live behind the default-on `datafusion-integration` feature. P1/P2 scan work is owned by link:../10-quality/td/TD-OLAP-1-pax-native-vectorized-scan-feeds-datafusion.adoc[TD-OLAP-1] (its file says Partial — slice-2 route flip open — while #1762 is titled "TD-OLAP-1 completion"; reconcile there) with the `RecordReader` seam landed under TD-USUB-5 (#1921). The TD-154 / TD-151 / TD-162a ledger rows still read Open. P3 (promote native over DataFusion) is superseded by ADR-052.
+| Relates to | link:NATIVE_OLAP_8ENGINE_COMPARATIVE_STUDY_2026_06_22.adoc[NATIVE_OLAP_8ENGINE_COMPARATIVE_STUDY] (overlap: native OLAP end state; both superseded in verdict by ADR-052; canonical for the remaining scan scope = this blueprint + TD-OLAP-1), link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094]
+|===
+
 toc::[]
 
 == 1. Why a native engine (and why PAX-columnar, not Parquet)
