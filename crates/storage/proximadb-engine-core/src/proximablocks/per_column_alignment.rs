@@ -927,8 +927,8 @@ mod tests {
         assert_eq!(slices[0].len(), 24);
 
         let mut got = Vec::with_capacity(12);
-        for chunk in slices[0].chunks_exact(2) {
-            got.push(half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+        for chunk in slices[0].as_chunks::<2>().0 {
+            got.push(half::f16::from_le_bytes(*chunk).to_f32());
         }
         assert_eq!(
             got,
@@ -999,15 +999,19 @@ mod tests {
         // Column 0: 4 fp32 elements
         assert_eq!(slices[0].len(), 16);
         let fp32_got: Vec<f32> = slices[0]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(fp32_got, vec![1.0, 2.0, 3.0, 4.0]);
         // Column 1: 2 fp16 elements
         assert!(slices[1].len() >= 4);
         let fp16_got: Vec<f32> = slices[1][..4]
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::f16::from_le_bytes(*c).to_f32())
             .collect();
         assert_eq!(fp16_got, vec![7.0, 8.0]);
     }

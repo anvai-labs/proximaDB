@@ -235,10 +235,21 @@ jobs:
               - '.github/workflows/ci.yml'
               - third_party/mlflow-ui/**
 
+            # TD-DOCKCI-1: watch the Dockerfile CI actually BUILDS
+            # (deploy/docker/Dockerfile -- the `file:` target of docker-build
+            # and publish-image.yml), not the three top-level paths nothing
+            # builds. The old patterns contained no `/`, so picomatch matched
+            # top-level paths only: `deploy/docker/**` edits SKIPPED
+            # docker-build entirely, while root `Dockerfile` /
+            # `Dockerfile.prebuilt` edits (demo compose / a local OOM
+            # workaround; no CI consumer) burned a ~38-minute build of a
+            # different Dockerfile. `.github/workflows/ci.yml` keeps the gate
+            # able to see changes to itself. `rust` stays in the `||` at the
+            # docker-build gate -- a source change still rebuilds the image.
             docker:
-              - 'Dockerfile*'
-              - 'docker-compose*.yml'
+              - 'deploy/docker/**'
               - '.dockerignore'
+              - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
               - '*.adoc'
@@ -520,7 +531,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt
       - name: Install System Dependencies
@@ -581,7 +592,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.proto == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           # Match rust-toolchain.toml's declared components + target so `cargo
           # check` doesn't trigger a rustup re-sync that collides installing
@@ -633,7 +644,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -723,7 +734,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt
       - name: Install System Dependencies
@@ -808,7 +819,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -952,7 +963,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       - name: Install System Dependencies
@@ -1000,7 +1011,8 @@ jobs:
     name: Feature Matrix (${{ matrix.label }})
     runs-on: ubuntu-24.04
     timeout-minutes: 110
-    # max 53 min over 14 runs, 2026-10-09..11, 14 legs. An earlier comment said 15: GitHub
+    # max 53 min over 14 runs, 2026-10-09..11. 15 legs since 2026-10-14
+    # (bert-tokenizer added; ~1min leg). An earlier comment said 15: GitHub
     # reports a SKIPPED matrix job under its raw un-expanded name, which the
     # sample counted as a leg.
     needs: changes
@@ -1021,6 +1033,13 @@ jobs:
           # Ledger modality gRPC service (S3, ADR-071) — the ProximaLedgerService + its port wiring
           # are behind the non-default `experimental-ledger` feature on the root crate.
           - { label: "experimental-ledger", pkg: proximadb,        args: "--features experimental-ledger" }
+          # rank-onnx BERT tokenizer surface (bert_pair_tokenizing_extractor):
+          # the feature is non-default, so two of its tests rotted silently for
+          # months (still asserting the pre-#1741 pad-to-max_seq_len contract;
+          # found 2026-10-14 while bumping tokenizers — CI never compiled them).
+          # Compile AND serve: the suite is small (<1s) and is the only guard on
+          # the padding/truncation contract the reranker depends on.
+          - { label: "bert-tokenizer",       pkg: proximadb-rank-onnx, args: "--features bert-tokenizer" }
           # F2 (ADR-072 D3/D5): the fenced ConditionalKeyStore in the relational insert
           # path is behind the non-default `oltp-integrity` feature; check it compiles so
           # cfg drift in that path is caught (the feature-gated test executes locally).
@@ -1052,7 +1071,7 @@ jobs:
           - { label: "small-crates",         pkg: "proximadb-mongodb-parser proximadb-catalog-introspection", args: "" }
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install System Dependencies
         # g++ provides libstdc++ for the onnxruntime (ort) build script.
         run: |
@@ -1097,6 +1116,18 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
         run: cargo clippy -p proximadb --lib --features enterprise-catalogs -- -D warnings
+      # Same compile-is-not-verification rule as enterprise-catalogs above: the
+      # bert-tokenizer leg serves the feature's tests, not just compiles them.
+      - name: serve bert-tokenizer tests (compile is not verification)
+        if: matrix.label == 'bert-tokenizer'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: |
+          if cargo nextest --version >/dev/null 2>&1; then
+            cargo nextest run -p proximadb-rank-onnx --features bert-tokenizer
+          else
+            cargo test -p proximadb-rank-onnx --features bert-tokenizer
+          fi
 
   rust-security:
     name: Security Audit
@@ -1106,12 +1137,17 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+      # TD-AUDITGATE-1: this job used to be doubly unfailable (`|| echo` under
+      # `continue-on-error`), which is how 9 vulnerabilities sat silently green
+      # until 2026-10. Now it fails the lane. The tolerated set lives in
+      # .cargo/audit.toml with per-entry rationale — a finding not in that list
+      # (or a yank, which the gate does not track as a class — see the file
+      # header) turns this red and blocks the PR.
       - name: Run security audit
-        continue-on-error: true
-        run: cargo audit || echo "::warning::Security audit found vulnerabilities - review required"
+        run: cargo audit -D warnings --no-yanked
 
   python-lint:
     name: Python Lint
@@ -1223,7 +1259,7 @@ jobs:
     if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.rust_sdk == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - name: Check formatting
@@ -1278,7 +1314,7 @@ jobs:
 
       # Toolchain setup — one branch per matrix cell
       - if: matrix.setup == 'rust'
-        uses: dtolnay/rust-toolchain@1.95.0
+        uses: dtolnay/rust-toolchain@1.99.0
       - if: matrix.setup == 'rust'
         uses: Swatinem/rust-cache@v2
         with:
@@ -1347,7 +1383,7 @@ jobs:
         kind: [rest, flight]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -1397,7 +1433,7 @@ jobs:
     if: needs.changes.outputs.spark_jni == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -1593,7 +1629,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1636,7 +1672,7 @@ jobs:
       SCCACHE_DIR: /home/runner/.cache/sccache
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-compile-benches"
@@ -1698,7 +1734,7 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1733,6 +1769,14 @@ jobs:
         # Subprocess isolation is owned by this suite. Reuse the dev server
         # build; serialize its process fixtures on memory-constrained runners.
         run: cargo test -p proximadb-server --test drainer_lifecycle_integration_test -- --test-threads=1
+
+      - name: Verify cold backup/restore round trip (real server)
+        if: matrix.profile == 'dev'
+        env:
+          RUST_MIN_STACK: "8388608"
+        # Backup refuses under a live server (ownership lease), then a stopped
+        # server's roots round-trip byte-identical through wipe + restore.
+        run: cargo test -p proximadb-server --test cold_backup_restore -- --test-threads=1
 
       - name: Upload Server Binary
         if: matrix.profile == 'release' && needs.changes.outputs.medium_tier == 'true'
@@ -1793,7 +1837,7 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1900,7 +1944,7 @@ jobs:
           # (three-dot, merge-base) resolves across a large develop→main gap.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1970,7 +2014,7 @@ jobs:
       needs.changes.outputs.object_store_cloud_changes == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -2062,7 +2106,7 @@ jobs:
           sudo swapon /mnt/swapfile-ci
           free -h
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -2124,7 +2168,7 @@ jobs:
        needs.changes.outputs.core_changes == 'true')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-dev"
@@ -2163,7 +2207,7 @@ jobs:
       PROXIMADB_MLFLOW_COMPAT_ENABLE: "1"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-dev"
@@ -2283,7 +2327,7 @@ jobs:
       needs.changes.outputs.authz_changes == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-dev"
@@ -2327,7 +2371,7 @@ jobs:
       RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-dev"
@@ -2364,7 +2408,7 @@ jobs:
       RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-dev"
@@ -2455,7 +2499,7 @@ jobs:
        needs.changes.outputs.core_changes == 'true')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-dev"
@@ -2488,7 +2532,7 @@ jobs:
        needs.changes.outputs.core_changes == 'true')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-dev"
@@ -2531,7 +2575,7 @@ jobs:
        needs.changes.outputs.core_changes == 'true')
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-dev"
@@ -2594,7 +2638,7 @@ jobs:
           sudo swapon /mnt/swapfile-ci
           free -h
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-coverage"
@@ -3073,7 +3117,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -3114,7 +3158,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -3215,7 +3259,7 @@ jobs:
       needs.changes.outputs.core_changes == 'true'
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Install system deps
         run: |
           sudo apt-get update

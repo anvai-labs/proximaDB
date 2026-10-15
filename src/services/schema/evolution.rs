@@ -712,7 +712,7 @@ impl SchemaEvolutionService {
 
         // If strict mode, convert warnings to errors
         if self.config.strict_mode && !result.warnings.is_empty() {
-            let warnings: Vec<String> = result.warnings.drain(..).collect();
+            let warnings = std::mem::take(&mut result.warnings);
             for warning in warnings {
                 result.add_error(format!("Strict mode: {}", warning));
             }

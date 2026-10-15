@@ -78,7 +78,7 @@ impl OidResolverCache {
     fn sub_bytes(&self, n: usize) {
         let _ = self
             .bytes_used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(n))
             });
     }

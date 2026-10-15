@@ -10,7 +10,7 @@ repository = "https://github.com/anvai-labs/proximaDB"
 homepage = "https://github.com/anvai-labs/proximaDB"
 keywords = ["vector", "database", "ai", "ml", "proximity", "similarity-search"]
 categories = ["database-implementations", "science"]
-rust-version = "1.88"
+rust-version = "1.95"
 
 [lints]
 workspace = true
@@ -175,7 +175,7 @@ members = [
 [workspace.package]
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "Apache-2.0"
 authors = ["Vijaykumar Singh <vijay@anvaiops.com>"]
 repository = "https://github.com/anvai-labs/proximaDB"
@@ -200,6 +200,10 @@ needless_range_loop = "allow"
 
 [workspace.dependencies]
 anyhow = "1.0"
+# TLS implementation (unified with axum-server 0.7). Workspace-level so the
+# server binary can install the process-default CryptoProvider at boot
+# (rustls 0.23.46 panics on ambiguous provider features — #2032 follow-up).
+rustls = { version = "0.23" }
 # R-5b.1.3 workaround: an auto-refactor commit added
 # crates/query/proximadb-relational-frontend referencing
 # `sqlparser = { workspace = true }` without first declaring the
@@ -386,7 +390,7 @@ numpy = { version = "0.29" }
 
 # TurboQuant numerics (ADR-021, gated by `experimental-turboquant`).
 # Kept here so future modality + benchmark consumers share a single version.
-faer = { version = "0.20", default-features = false, features = ["std"] }
+faer = { version = "0.24", default-features = false, features = ["std"] }
 statrs = "0.19"
 
 # Python embedded library (cdylib for PyO3)
@@ -679,7 +683,21 @@ object_store = { workspace = true }
 # the XML API, which fake-gcs-server (our test emulator) does not serve, so it
 # is unverifiable locally; this SDK uses the JSON API (fake-gcs-compatible) and
 # still issues true ranged object downloads (bandwidth-optimal). Feature `gcp`.
-google-cloud-storage = { version = "0.15", optional = true }
+google-cloud-storage = { version = "1.20", optional = true }
+# Direct deps of the GCS backend (transitive via google-cloud-storage, pinned
+# to the same majors): ADC credentials (shared by the data client and the
+# JSON-API metadata layer) + `http::Extensions` for the credential headers.
+google-cloud-auth = { version = "1.17", optional = true, default-features = false }
+http = { version = "1", optional = true }
+# CRC32C of each uploaded payload is computed client-side and passed via
+# `with_known_crc32c` (already a transitive dep of google-cloud-storage). The
+# 1.x SDK's default single-shot upload appends a trailing `checksums` multipart
+# part that fake-gcs-server (our test emulator) does not understand — it
+# concatenates the part into the stored object, corrupting it. A known CRC32C
+# switches the SDK to the upfront-metadata protocol (no trailing part), keeps
+# end-to-end checksum verification, and lets real GCS validate the upload
+# server-side.
+crc32c = { version = "0.6", optional = true }
 
 # Vector operations & SIMD
 nalgebra = { version = "0.32", features = ["serde-serialize"] }  # For PCA eigendecomposition, with serde for model persistence
@@ -703,7 +721,7 @@ aes-gcm = "0.10"  # AEAD encryption for field-level encryption
 # TLS/mTLS certificate management
 rcgen = "0.12"                   # Certificate generation
 x509-parser = "0.18"             # Certificate parsing and validation
-rustls = { version = "0.23" }    # TLS implementation (unified with axum-server 0.7)
+rustls.workspace = true          # TLS implementation (unified with axum-server 0.7)
 rustls-pemfile = "2.0"           # PEM file parsing (CertificateDer/PrivateKeyDer)
 tokio-rustls = "0.26"            # Async TLS streams (rustls 0.23)
 webpki-roots = "0.25"            # Mozilla root certificates
@@ -810,7 +828,6 @@ proptest = "1.0"
 # same pin as the root [dependencies] entry).
 prometheus.workspace = true
 # tempdir = "0.3"  # REMOVED: Deprecated since 2018, has TOCTOU vulnerability (RUSTSEC-2023-0018). Use tempfile instead.
-env_logger = "0.10"
 walkdir = "2"
 # Real Postgres wire-protocol client for the pgwire transport e2e tests
 # (tests/fp16_pgwire_e2e.rs). Same major as the optional CDC dep but
@@ -924,7 +941,7 @@ onnx = [
 # Cloud storage features (optional to avoid linking issues during testing)
 aws = ["object_store/aws", "proximadb-catalog/aws"]
 azure = ["object_store/azure"]
-gcp = ["dep:google-cloud-storage"]
+gcp = ["dep:google-cloud-storage", "dep:google-cloud-auth", "dep:http", "dep:crc32c"]
 
 # TD-161 external OTLP metering push (default-OFF). Compiles the OTLP exporter that
 # ships the per-tenant metering snapshot to a collector; runtime-gated additionally by

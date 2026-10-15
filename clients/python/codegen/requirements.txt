@@ -8,6 +8,9 @@ openapi-python-client==0.29.1
 # openapi-python-client's Typer CLI breaks on click >= 8.2 ("Secondary flag is
 # not valid for non-boolean flag"); pin below that boundary.
 click<8.6
-# openapi-python-client 0.24.x's own internal models fail to build under
-# pydantic >= 2.11 ("`Parameter` is not fully defined"); pin below that.
-pydantic<2.14
+# Conservative generator-compat pin: openapi-python-client's internal models
+# have repeatedly broken on newer pydantic majors ("`Parameter` is not fully
+# defined" class of errors). Keep the cap one minor above the version the
+# generator is currently verified against; raise it only with a green
+# make gen-python-sdk run in this venv.
+pydantic<2.15

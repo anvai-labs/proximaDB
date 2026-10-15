@@ -441,12 +441,13 @@ impl PersistentByteStore {
         let Some((_, meta)) = self.inner.entries.remove(key) else {
             return false;
         };
-        let _ = self.inner.resident_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(meta.file_len)),
-        );
-        let _ = self.inner.class_resident_bytes[meta.class as usize].fetch_update(
+        let _ =
+            self.inner
+                .resident_bytes
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(meta.file_len))
+                });
+        let _ = self.inner.class_resident_bytes[meta.class as usize].try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_sub(meta.file_len)),
@@ -737,13 +738,8 @@ fn read_entry_metadata(path: &Path) -> std::io::Result<(String, EntryMeta)> {
     let mut encoded_crcs = vec![0u8; crc_table_bytes];
     file.read_exact(&mut encoded_crcs)?;
     let mut chunk_crcs = Vec::with_capacity(chunk_count as usize);
-    for encoded in encoded_crcs.chunks_exact(4) {
-        chunk_crcs.push(u32::from_le_bytes(encoded.try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid persistent cache chunk checksum",
-            )
-        })?));
+    for encoded in encoded_crcs.as_chunks::<4>().0 {
+        chunk_crcs.push(u32::from_le_bytes(*encoded));
     }
     let value_offset = HEADER_LEN + key_len as u64 + crc_table_len;
     Ok((

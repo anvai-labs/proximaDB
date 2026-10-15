@@ -26,6 +26,30 @@ fn openapi_spec_matches_handlers() {
     let generated = openapi_yaml().expect("generate OpenAPI document from handlers");
     let path = spec_path();
 
+    // TD-SPECORD-1: name the cause instead of printing a 9k-line diff. The
+    // document's top-level key order rode on serde_json/preserve_order being
+    // enabled transitively (DataFusion supplied it until 55.2 deliberately
+    // stopped); when the feature drops, every map serialises alphabetically
+    // and the committed spec (`openapi:` first) disagrees wholesale. The drift
+    // below is semantically empty, so catch its fingerprint first.
+    let first_key = generated
+        .lines()
+        .find(|line| !line.trim_start().is_empty() && !line.trim_start().starts_with('#'))
+        .and_then(|line| line.split(':').next());
+    assert!(
+        first_key == Some("openapi"),
+        "the generated OpenAPI document does not start with the `openapi` key \
+         (first top-level line: {first_key:?}).\n\
+         This is the TD-SPECORD-1 fingerprint of a serde_json `preserve_order` \
+         feature flip, not a handler change: without the feature serde_json's \
+         map is a BTreeMap and every key serialises alphabetically \
+         (`components:` first).\n\
+         Fix: keep `serde_json = {{ version = \"1.0\", features = \
+         [\"preserve_order\"] }}` in BOTH the root `[dependencies]` and \
+         `[workspace.dependencies]` (guarded by \
+         scripts/check_deterministic_commit_contract.py)."
+    );
+
     if std::env::var_os("UPDATE_OPENAPI_SPEC").is_some() {
         std::fs::write(&path, generated.as_bytes())
             .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));

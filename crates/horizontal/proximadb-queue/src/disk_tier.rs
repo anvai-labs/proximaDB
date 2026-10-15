@@ -185,7 +185,7 @@ impl PartitionDiskWriter {
     pub async fn append(self: &Arc<Self>, message: &Message) -> Result<AppendOutcome> {
         let offset = self
             .next_offset
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| QueueError::Persistence("queue disk offset exhausted".into()))?;

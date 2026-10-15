@@ -152,8 +152,7 @@ impl AcceleratedQuantization {
                 let mut min_vec = _mm256_set1_ps(f32::INFINITY);
                 let mut max_vec = _mm256_set1_ps(f32::NEG_INFINITY);
 
-                let chunks = values.chunks_exact(8);
-                let remainder = chunks.remainder();
+                let (chunks, remainder) = values.as_chunks::<8>();
 
                 for chunk in chunks {
                     let v = _mm256_loadu_ps(chunk.as_ptr());
@@ -171,7 +170,7 @@ impl AcceleratedQuantization {
                 let min_vec = _mm256_set1_ps(min);
 
                 let mut quantized = Vec::with_capacity(values.len());
-                for chunk in values.chunks_exact(8) {
+                for chunk in values.as_chunks::<8>().0 {
                     let v = _mm256_loadu_ps(chunk.as_ptr());
                     let normalized = _mm256_mul_ps(_mm256_sub_ps(v, min_vec), scale);
                     let i32_vals = _mm256_cvtps_epi32(normalized);
@@ -208,8 +207,7 @@ impl AcceleratedQuantization {
                 let mut min_vec = _mm_set1_ps(f32::INFINITY);
                 let mut max_vec = _mm_set1_ps(f32::NEG_INFINITY);
 
-                let chunks = values.chunks_exact(4);
-                let remainder = chunks.remainder();
+                let (chunks, remainder) = values.as_chunks::<4>();
 
                 for chunk in chunks {
                     let v = _mm_loadu_ps(chunk.as_ptr());
@@ -227,7 +225,7 @@ impl AcceleratedQuantization {
                 let min_vec = _mm_set1_ps(min);
 
                 let mut quantized = Vec::with_capacity(values.len());
-                for chunk in values.chunks_exact(4) {
+                for chunk in values.as_chunks::<4>().0 {
                     let v = _mm_loadu_ps(chunk.as_ptr());
                     let normalized = _mm_mul_ps(_mm_sub_ps(v, min_vec), scale);
                     let i32_vals = _mm_cvtps_epi32(normalized);
@@ -262,8 +260,7 @@ impl AcceleratedQuantization {
             let mut min_vec = vdupq_n_f32(f32::INFINITY);
             let mut max_vec = vdupq_n_f32(f32::NEG_INFINITY);
 
-            let chunks = values.chunks_exact(4);
-            let remainder = chunks.remainder();
+            let (chunks, remainder) = values.as_chunks::<4>();
 
             for chunk in chunks {
                 let v = vld1q_f32(chunk.as_ptr());
@@ -281,7 +278,7 @@ impl AcceleratedQuantization {
             let min_vec = vdupq_n_f32(min);
 
             let mut quantized = Vec::with_capacity(values.len());
-            for chunk in values.chunks_exact(4) {
+            for chunk in values.as_chunks::<4>().0 {
                 let v = vld1q_f32(chunk.as_ptr());
                 let normalized = vmulq_f32(vsubq_f32(v, min_vec), scale);
                 let u32_vals = vcvtq_u32_f32(normalized);

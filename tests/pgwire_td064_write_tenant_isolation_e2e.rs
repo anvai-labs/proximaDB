@@ -26,6 +26,7 @@ fn free_port() -> u16 {
 
 struct PgwireTestServer {
     pg_port: u16,
+    rest_port: u16,
     db: Option<ProximaDB>,
     _tmp_data: TempDir,
 }
@@ -76,6 +77,7 @@ impl PgwireTestServer {
 
         Ok(Self {
             pg_port,
+            rest_port,
             db: Some(db),
             _tmp_data: tmp_data,
         })
@@ -231,5 +233,207 @@ async fn pgwire_relational_writes_and_reads_are_tenant_isolated() {
         scalar(&acme_after, "note").as_deref(),
         Some("acmecorp-one"),
         "acme's row must survive globex's delete of the same PK"
+    );
+}
+
+/// One backend message: (type byte, body).
+async fn read_message(stream: &mut tokio::net::TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+    let kind = stream.read_u8().await?;
+    let len = stream.read_i32().await?;
+    let mut body = vec![0u8; (len as usize).saturating_sub(4)];
+    stream.read_exact(&mut body).await?;
+    Ok((kind, body))
+}
+
+/// Drive `COPY … FROM STDIN` over the SIMPLE query protocol — what `psql \copy`
+/// and most bulk loaders use, and the only COPY path this server implements
+/// (tokio-postgres's `copy_in` goes through the extended protocol instead).
+/// Returns the CommandComplete tag, or the server's error message.
+async fn copy_csv_simple(
+    server: &PgwireTestServer,
+    database: &str,
+    table: &str,
+    rows: &str,
+) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.pg_port))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // StartupMessage (protocol 3.0) — trust auth on this test server.
+    let mut startup = Vec::new();
+    startup.extend_from_slice(&196_608_i32.to_be_bytes());
+    for (key, value) in [("user", "postgres"), ("database", database)] {
+        startup.extend_from_slice(key.as_bytes());
+        startup.push(0);
+        startup.extend_from_slice(value.as_bytes());
+        startup.push(0);
+    }
+    startup.push(0);
+    let mut frame = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&startup);
+    stream.write_all(&frame).await.map_err(|e| e.to_string())?;
+    loop {
+        let (kind, body) = read_message(&mut stream).await.map_err(|e| e.to_string())?;
+        match kind {
+            b'Z' => break,
+            b'E' => return Err(String::from_utf8_lossy(&body).into_owned()),
+            _ => {}
+        }
+    }
+
+    let query = format!("COPY {table} FROM STDIN WITH (FORMAT csv)\0");
+    let mut frame = vec![b'Q'];
+    frame.extend_from_slice(&((query.len() + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(query.as_bytes());
+    stream.write_all(&frame).await.map_err(|e| e.to_string())?;
+    let (kind, body) = read_message(&mut stream).await.map_err(|e| e.to_string())?;
+    if kind != b'G' {
+        return Err(format!(
+            "expected CopyInResponse, got {:?}: {}",
+            kind as char,
+            String::from_utf8_lossy(&body)
+        ));
+    }
+
+    let mut frame = vec![b'd'];
+    frame.extend_from_slice(&((rows.len() + 4) as i32).to_be_bytes());
+    frame.extend_from_slice(rows.as_bytes());
+    frame.push(b'c');
+    frame.extend_from_slice(&4_i32.to_be_bytes());
+    stream.write_all(&frame).await.map_err(|e| e.to_string())?;
+
+    let mut outcome = Err("connection closed before CommandComplete".to_string());
+    loop {
+        let (kind, body) = read_message(&mut stream).await.map_err(|e| e.to_string())?;
+        match kind {
+            b'C' => {
+                outcome = Ok(String::from_utf8_lossy(&body)
+                    .trim_end_matches('\0')
+                    .to_string())
+            }
+            b'E' => outcome = Err(String::from_utf8_lossy(&body).into_owned()),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    outcome
+}
+
+/// TD-PGWIRE-COPY-1: `COPY … FROM STDIN` is pgwire's bulk ingest for VECTOR
+/// collections (rows are `id,<vector>`). It had no end-to-end coverage at all.
+/// Now that it routes through the tenant-context insert and the primary-pod
+/// gate, pin that an ordinary COPY still lands every parseable row (an
+/// unparseable vector is skipped, as before) and that the rows are readable.
+///
+/// The collection is created over REST: a pgwire `CREATE TABLE … VECTOR(n)`
+/// now parses as a RELATIONAL table whose backing collection is not an n-dim
+/// vector collection, so COPY into it fails with a dimension mismatch — a
+/// pre-existing gap recorded on TD-PGWIRE-COPY-1, not exercised here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pgwire_copy_from_stdin_ingests_vector_rows() {
+    let server = PgwireTestServer::start().await.expect("server start");
+    let collection = format!("embeds_coll_{}", server.pg_port);
+    let rest = format!("http://127.0.0.1:{}", server.rest_port);
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("http client");
+
+    let created = http
+        .post(format!("{rest}/api/v2/collections"))
+        .json(&serde_json::json!({
+            "name": collection,
+            "dimension": 3,
+            "engine": "sst",
+            "distance_metric": "cosine",
+            "canonical_embedding_precision": "fp32",
+            "enable_proxima_record": false
+        }))
+        .send()
+        .await
+        .expect("create collection");
+    assert!(
+        created.status().is_success(),
+        "create collection: {}",
+        created.text().await.unwrap_or_default()
+    );
+
+    // REST collections without a tenant header live in the default tenant;
+    // COPY as that same tenant (startup database).
+    let tag = copy_csv_simple(
+        &server,
+        proximadb_tenant::DEFAULT_TENANT,
+        &collection,
+        "v1,[0.1,0.2,0.3]\nv2,[0.4,0.5,0.6]\nbad,not-a-vector\n",
+    )
+    .await
+    .expect("COPY must succeed");
+    assert_eq!(
+        tag, "COPY 2",
+        "COPY must report the two parseable vector rows (the unparseable one is skipped)"
+    );
+
+    let read_vector = |id: &'static str| {
+        let http = http.clone();
+        let url = format!("{rest}/api/v2/collections/{collection}/records/{id}");
+        async move {
+            let read = http.get(url).send().await.expect("read record");
+            if !read.status().is_success() {
+                return None;
+            }
+            let body: serde_json::Value = read.json().await.expect("record json");
+            Some(body["vector"].clone())
+        }
+    };
+    let original = read_vector("v1")
+        .await
+        .expect("COPY row v1 must be readable");
+    assert!(
+        read_vector("v2").await.is_some(),
+        "COPY row v2 must be readable"
+    );
+
+    // Insert-only, like INSERT: re-running a COPY that carries an existing id
+    // must be REJECTED (an error, never a false `COPY n`) and must not
+    // overwrite the stored row — an upsert path would silently replace v1.
+    let rerun = copy_csv_simple(
+        &server,
+        proximadb_tenant::DEFAULT_TENANT,
+        &collection,
+        "v1,[0.9,0.9,0.9]\n",
+    )
+    .await;
+    assert!(
+        rerun
+            .as_ref()
+            .is_err_and(|error| error.contains("INSERT_CONFLICT")),
+        "COPY of an existing id must be rejected as an insert conflict (not a dropped \
+         connection), got {rerun:?}"
+    );
+    assert_eq!(
+        read_vector("v1").await,
+        Some(original),
+        "a rejected COPY must leave the existing row unchanged"
+    );
+
+    // A duplicate id WITHIN one payload rejects the whole batch.
+    let dup = copy_csv_simple(
+        &server,
+        proximadb_tenant::DEFAULT_TENANT,
+        &collection,
+        "v3,[0.1,0.1,0.1]\nv3,[0.2,0.2,0.2]\n",
+    )
+    .await;
+    assert!(
+        dup.as_ref()
+            .is_err_and(|error| error.contains("INSERT_CONFLICT")),
+        "in-payload duplicate ids must be rejected as an insert conflict, got {dup:?}"
+    );
+    assert!(
+        read_vector("v3").await.is_none(),
+        "a rejected batch must write none of its rows"
     );
 }
