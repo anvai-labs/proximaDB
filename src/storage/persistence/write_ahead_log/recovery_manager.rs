@@ -774,7 +774,8 @@ impl RecoveryManager {
     }
 
     /// Issue #1125: assemble the ordered, deduplicated list of WAL base URLs a
-    /// collection's files may live under. Priority: the catalog-assigned
+    /// collection's files may live under. Priority: the resolved local WAL
+    /// root (ADR-069 S1 / TD-WAL-5), then the catalog-assigned
     /// base_location (what the write path uses), then every distinct manifest
     /// storage_url (where files were actually recorded), then the configured
     /// primary base (this recovery manager's disk_manager root). Trailing
@@ -796,8 +797,8 @@ impl RecoveryManager {
         // caller passes the value resolved by the write path's own resolver,
         // TD-WAL-5), the write path roots the WAL there — prepend it as a
         // candidate base so replay lists it (otherwise the .bcwal on /waldisk is
-        // missed → restart data loss). Listed FIRST so a present local WAL
-        // short-circuits the union.
+        // missed → restart data loss). Every base is listed and unioned; the
+        // order only decides which duplicate URL is kept.
         if let Some(local) = local_wal_dir {
             push_base(&mut bases, local);
         }
