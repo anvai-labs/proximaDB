@@ -101,5 +101,6 @@ UPSERT), so fixing it there fixes both statements. Exactly the suggested fix:
 duplicate, re-inserts after DELETE, and proves an UPSERTed composite key is
 claimed.
 
-Still open (pre-existing, not composite-specific): ON DELETE CASCADE child
-tombstones and the INSERT … SELECT bulk path do not touch the CKS.
+Pre-existing scope of other TDs (not composite-specific, tracked for
+follow-up): ON DELETE CASCADE child tombstones and the INSERT … SELECT bulk
+path do not touch the CKS.

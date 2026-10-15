@@ -136,16 +136,17 @@ update arm:
 Unit (`src/services/dml/tests.rs`): `upsert_enforces_unique_with_typed_sqlstates`
 and, under `oltp-integrity`, `upsert_claims_and_releases_pk_in_fenced_store`.
 
-=== Out of scope (still open)
+=== Out of scope (tracked in other TDs)
 
-* `ON CONFLICT` target and action are still not honoured: the conflict is
+* `ON CONFLICT` target and action are not honoured (pre-existing scope of
+  this TD, tracked for a follow-up): the conflict is
   always resolved on the primary key, `DO UPDATE SET …` assignments are not
   evaluated (the whole proposed row replaces the existing one), and `DO NOTHING`
   replaces instead of skipping. With this fix a conflict on a non-PK target
   (`ON CONFLICT (email)`) fails closed with `23505` instead of silently
   duplicating.
 * A constraint violation raised while replaying a buffered transaction at
-  COMMIT still surfaces as `25P02`.
+  COMMIT surfaces as `25P02`.
 * REST/gRPC record upserts and pgwire COPY (insert-only since #2036) do not
   reach `execute_upsert`; they are collection/record paths, not relational
   DML, and were not changed.
