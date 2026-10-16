@@ -26,11 +26,19 @@ far too slow under it.
 | Trigger | Tags |
 |---|---|
 | Push tag `v<X.Y.Z>` | `<X.Y.Z>`, `sha-<short>`, `latest` |
-| Push to `develop` | `develop`, `sha-<short>` (no `latest`) |
+| Push to `qa` (develop→qa promotion) | `qa`, `sha-<short>`, `tree-<git tree hash>` (no `latest`) |
 | `workflow_dispatch` | `<version-from-Cargo.toml>`, `sha-<short>`, `latest` (if `tag_latest=true`) |
 
-The `runtime-full` target (ONNX + baked bge-small) publishes a parallel
-`-full`-suffixed tag namespace when selected via dispatch.
+Every trigger publishes both targets: `runtime` and `runtime-full` (ONNX +
+baked bge-small), the latter under a parallel `-full`-suffixed tag namespace.
+
+**A release tag reuses the qa image of the same tree.** The `resolve` job
+computes `git rev-parse HEAD^{tree}` for the tagged commit and looks up
+`tree-<tree>` and `tree-<tree>-full`. When both exist (qa built exactly this
+source), `merge` points the release tags at those manifest lists with
+`docker buildx imagetools create` and no image is rebuilt; the image's
+`org.opencontainers.image.revision` label then names the qa commit that built
+it. When either is missing, the tag builds its images as before.
 
 ## One-time setup
 
@@ -46,10 +54,10 @@ Repository **variables** (all optional):
 | Variable | Default | Purpose |
 |---|---|---|
 | `DOCKERHUB_IMAGE` | `vjsingh1984/proximadb` | Override the published repo |
-| `DOCKERHUB_PRUNE_KEEP` | `10` | Number of newest `sha-*` tags to retain |
+| `DOCKERHUB_PRUNE_KEEP` | `10` | Number of newest `sha-*` tags, and of `tree-*` tags, to retain |
 
 The `DOCKERHUB_TOKEN` needs **delete** scope for the prune job to remove stale
-`sha-*` tags.
+`sha-*` and `tree-*` tags.
 
 ## Downstream consumption (AnvaiOps commercial overlay)
 
@@ -63,8 +71,9 @@ AKS pulls the public image directly (no imagePullSecret needed).
 ## Cost control
 
 The `prune` job runs after every successful push and deletes superseded rolling
-`sha-*` tags via the Docker Hub API, keeping the newest `DOCKERHUB_PRUNE_KEEP`.
-It **never** touches semver tags, `latest`, or `develop`.
+`sha-*` and `tree-*` tags via the Docker Hub API, keeping the newest
+`DOCKERHUB_PRUNE_KEEP` of each family. It **never** touches semver tags,
+`latest`, `qa`, or `develop`.
 
 ## Local build (parity check)
 

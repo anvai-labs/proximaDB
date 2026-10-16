@@ -792,3 +792,298 @@ class SerdeJsonPreserveOrderContractTest(unittest.TestCase):
         )
         findings = self.findings_for(cargo)
         self.assertEqual(len(findings), 2, findings)
+
+
+class RustCachePolicyContractTest(unittest.TestCase):
+    """CI redesign PR1: ci.yml rust-cache steps share one key per build shape,
+    never key on the job id, and only a develop push (one writer per key) saves.
+
+    Before: per-job keys, saved on every PR ref (readable by nothing else), and
+    develop -- the one scope every run can read -- saved almost nothing. 0 of 15
+    heavy jobs hit cache on the v0.4.1 release.
+    """
+
+    DEVELOP = "${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}"
+
+    def findings_for(self, workflow: str) -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wf_dir = root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "ci.yml").write_text(workflow, encoding="utf-8")
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_rust_cache_policy(findings)
+                return findings
+
+    @staticmethod
+    def _job(name: str, cache: str, env: str = "", matrix: str = "") -> str:
+        return (
+            f"  {name}:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    timeout-minutes: 15\n"
+            f"{env}{matrix}"
+            "    steps:\n"
+            "      - uses: actions/checkout@v7\n"
+            "      - uses: Swatinem/rust-cache@v2\n"
+            "        with:\n"
+            f"{cache}"
+            "      - run: cargo check\n"
+        )
+
+    def _cache(self, key: str = '"dev-test"', save: str | None = None, job_id: bool = True) -> str:
+        text = '          prefix-key: "v2-rust"\n'
+        if key:
+            text += f"          shared-key: {key}\n"
+        if job_id:
+            text += "          add-job-id-key: false\n"
+        if save is not None:
+            text += f"          save-if: {save}\n"
+        return text
+
+    def wf(self, *jobs: str) -> str:
+        return "name: CI\non:\n  push:\njobs:\n" + "".join(jobs)
+
+    def test_writer_plus_reader_is_accepted(self) -> None:
+        findings = self.findings_for(
+            self.wf(
+                self._job("writer", self._cache(save=self.DEVELOP)),
+                self._job("reader", self._cache(save="false")),
+            )
+        )
+        self.assertEqual(findings, [], [f.message for f in findings])
+
+    def test_missing_save_if_is_rejected(self) -> None:
+        # rust-cache's default is save-if: true -- every PR saved.
+        findings = self.findings_for(self.wf(self._job("j", self._cache(save=None))))
+        self.assertTrue(any("save-if" in f.message for f in findings), findings)
+
+    def test_save_on_every_push_is_rejected(self) -> None:
+        findings = self.findings_for(
+            self.wf(self._job("j", self._cache(save="${{ github.event_name == 'push' }}")))
+        )
+        self.assertTrue(any("save-if" in f.message for f in findings), findings)
+
+    def test_widening_the_develop_condition_is_rejected(self) -> None:
+        widened = (
+            "${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' "
+            "|| github.event_name == 'pull_request' }}"
+        )
+        findings = self.findings_for(self.wf(self._job("j", self._cache(save=widened))))
+        self.assertTrue(any("save-if" in f.message for f in findings), findings)
+
+    def test_narrowing_the_develop_condition_is_accepted(self) -> None:
+        narrowed = (
+            "${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' "
+            "&& matrix.shape == 'test' }}"
+        )
+        self.assertEqual(self.findings_for(self.wf(self._job("j", self._cache(save=narrowed)))), [])
+
+    def test_job_id_key_is_rejected(self) -> None:
+        findings = self.findings_for(
+            self.wf(self._job("j", self._cache(save="false", job_id=False)))
+        )
+        self.assertTrue(any("add-job-id-key" in f.message for f in findings), findings)
+
+    def test_missing_shared_key_is_rejected(self) -> None:
+        findings = self.findings_for(self.wf(self._job("j", self._cache(key="", save="false"))))
+        self.assertTrue(any("shared-key" in f.message for f in findings), findings)
+
+    def test_two_writers_of_one_key_are_rejected(self) -> None:
+        findings = self.findings_for(
+            self.wf(
+                self._job("a", self._cache(save=self.DEVELOP)),
+                self._job("b", self._cache(save=self.DEVELOP)),
+            )
+        )
+        self.assertTrue(any("2 writers" in f.message for f in findings), findings)
+
+    def test_matrix_key_writers_of_different_shapes_are_distinct(self) -> None:
+        matrix = (
+            "    strategy:\n"
+            "      matrix:\n"
+            "        include:\n"
+            "          - cache: dev-test\n"
+            "          - cache: release\n"
+        )
+        findings = self.findings_for(
+            self.wf(
+                self._job("m", self._cache(key="${{ matrix.cache }}", save=self.DEVELOP), matrix=matrix),
+                self._job("r", self._cache(save="false")),
+            )
+        )
+        self.assertEqual(findings, [], [f.message for f in findings])
+
+    def test_matrix_key_writer_colliding_with_another_writer_is_rejected(self) -> None:
+        matrix = (
+            "    strategy:\n"
+            "      matrix:\n"
+            "        include:\n"
+            "          - cache: dev-test\n"
+            "          - cache: release\n"
+        )
+        findings = self.findings_for(
+            self.wf(
+                self._job("m", self._cache(key="${{ matrix.cache }}", save=self.DEVELOP), matrix=matrix),
+                self._job("w", self._cache(key='"release"', save=self.DEVELOP)),
+            )
+        )
+        self.assertTrue(any("'release' has 2 writers" in f.message for f in findings), findings)
+
+    def test_job_level_rust_env_on_a_shared_key_is_rejected(self) -> None:
+        env = '    env:\n      RUST_MIN_STACK: "8388608"\n'
+        findings = self.findings_for(
+            self.wf(
+                self._job("writer", self._cache(save=self.DEVELOP)),
+                self._job("reader", self._cache(save="false"), env=env),
+            )
+        )
+        self.assertTrue(any("RUST_MIN_STACK" in f.message for f in findings), findings)
+
+    def test_job_level_non_cargo_env_is_accepted(self) -> None:
+        env = '    env:\n      REQUIRE_PROTOC: "1"\n'
+        findings = self.findings_for(
+            self.wf(
+                self._job("writer", self._cache(save=self.DEVELOP), env=env),
+                self._job("reader", self._cache(save="false")),
+            )
+        )
+        self.assertEqual(findings, [], [f.message for f in findings])
+
+    def test_step_under_an_if_bullet_is_checked(self) -> None:
+        workflow = self.wf(
+            "  j:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    steps:\n"
+            "      - if: matrix.setup == 'rust'\n"
+            "        uses: Swatinem/rust-cache@v2\n"
+            "        with:\n"
+            '          prefix-key: "v2-rust"\n'
+            '          shared-key: "sdk"\n'
+        )
+        findings = self.findings_for(workflow)
+        self.assertTrue(any("add-job-id-key" in f.message for f in findings), findings)
+
+    def test_no_rust_cache_step_is_a_finding(self) -> None:
+        findings = self.findings_for(self.wf("  j:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: 'true'\n"))
+        self.assertTrue(any("vacuously" in f.message for f in findings), findings)
+
+    def test_the_pre_redesign_ci_yml_is_rejected(self) -> None:
+        """The ci.yml this policy replaced: per-job keys, saved everywhere."""
+        old = self.wf(
+            self._job("rust-clippy", '          prefix-key: "v1-clippy-nightly"\n'),
+            self._job(
+                "rust-test",
+                '          prefix-key: "v1-rust-nightly-dev"\n          shared-key: "build"\n',
+            ),
+            self._job(
+                "rust-integration-test-query",
+                '          prefix-key: "v1-rust-nightly-dev"\n          shared-key: "build"\n',
+                env='    env:\n      RUST_MIN_STACK: "8388608"\n',
+            ),
+        )
+        messages = " ".join(f.message for f in self.findings_for(old))
+        for needle in ("add-job-id-key", "shared-key", "save-if"):
+            self.assertIn(needle, messages)
+
+    @staticmethod
+    def _gated(name: str, job_if: str, cache: str) -> str:
+        return (
+            f"  {name}:\n"
+            "    runs-on: ubuntu-24.04\n"
+            f"    if: {job_if}\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@v2\n"
+            "        with:\n"
+            f"{cache}"
+            "      - run: cargo check\n"
+        )
+
+    def test_writer_that_never_runs_on_a_develop_push_is_rejected(self) -> None:
+        """Review M1: rust-coverage (`extensive`) and the emulator job
+        (`test_tier`) each 'wrote' their own key, and neither runs on a
+        develop push, so the keys were never written."""
+        for gate in (
+            "needs.changes.outputs.extensive == 'true'",
+            "needs.changes.outputs.test_tier == 'true' && needs.changes.outputs.rust == 'true'",
+            "needs.changes.outputs.medium_tier == 'true'",
+        ):
+            with self.subTest(gate=gate):
+                findings = self.findings_for(
+                    self.wf(self._gated("cov", gate, self._cache(key='"coverage"', save=self.DEVELOP)))
+                )
+                self.assertTrue(any("never written" in f.message for f in findings), findings)
+
+    def test_block_scalar_if_is_read(self) -> None:
+        cache = self._cache(key='"objstore-fast"', save=self.DEVELOP)
+        job = (
+            "  cov:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    if: |\n"
+            "      !inputs.skip_tests &&\n"
+            "      needs.changes.outputs.test_tier == 'true'\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@v2\n"
+            "        with:\n"
+            f"{cache}"
+        )
+        findings = self.findings_for(self.wf(job))
+        self.assertTrue(any("never written" in f.message for f in findings), findings)
+
+    def test_tier_gated_writer_admitting_warm_or_sweep_is_accepted(self) -> None:
+        for gate in (
+            "(needs.changes.outputs.test_tier == 'true' || needs.changes.outputs.warm == 'true')",
+            "needs.changes.outputs.sweep == 'true' || needs.changes.outputs.medium_tier == 'true'",
+            "needs.changes.outputs.compile == 'true'",
+        ):
+            with self.subTest(gate=gate):
+                findings = self.findings_for(
+                    self.wf(self._gated("w", gate, self._cache(save=self.DEVELOP)))
+                )
+                self.assertEqual(findings, [], [f.message for f in findings])
+
+    def test_the_real_tree_passes(self) -> None:
+        findings: list[contract.Finding] = []
+        contract.check_rust_cache_policy(findings)
+        self.assertEqual(findings, [], [f.message for f in findings])
+
+    def test_the_tdd_warning_check_is_gone_with_tdd_yml(self) -> None:
+        self.assertFalse((REPO_ROOT / ".github/workflows/tdd.yml").exists())
+        self.assertFalse(hasattr(contract, "check_tdd_rust_warning_contract"))
+
+
+class CiConcurrencyPerEventContractTest(unittest.TestCase):
+    """CI redesign PR1: a PR must never queue behind the push of its head."""
+
+    def findings_for(self, group: str) -> list[contract.Finding]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            wf_dir = root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            (wf_dir / "ci.yml").write_text(
+                f"name: CI\non:\n  push:\nconcurrency:\n  group: {group}\n"
+                "  cancel-in-progress: false\njobs:\n",
+                encoding="utf-8",
+            )
+            with patch.object(contract, "ROOT", root):
+                findings: list[contract.Finding] = []
+                contract.check_ci_concurrency_per_event(findings)
+                return findings
+
+    def test_the_pre_redesign_group_is_rejected(self) -> None:
+        findings = self.findings_for("${{ github.workflow }}-${{ github.head_ref || github.ref_name }}")
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("github.event_name", findings[0].message)
+
+    def test_a_per_event_group_is_accepted(self) -> None:
+        self.assertEqual(
+            self.findings_for(
+                "${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}"
+            ),
+            [],
+        )
+
+    def test_the_real_tree_passes(self) -> None:
+        findings: list[contract.Finding] = []
+        contract.check_ci_concurrency_per_event(findings)
+        self.assertEqual(findings, [], [f.message for f in findings])

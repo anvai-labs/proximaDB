@@ -168,16 +168,15 @@ git commit -m "feat: Add full-text search support to SST engine"
 
 ## CI Integration
 
-The `.github/workflows/capability-contract-tests.yml` workflow automatically:
+The `Capability Matrix` job in `.github/workflows/ci.yml` runs
+`scripts/validate_capability_matrix.py` on every PR that touches Rust or docs,
+and it is part of the required `CI Success` gate.
 
-1. **On every PR**:
-   - Runs capability contract tests
-   - Checks snapshot consistency
-   - Validates docs/SUPPORTED_SURFACE.adoc updates
-
-2. **On main branch push**:
-   - Generates and uploads capability matrix artifact
-   - Archives snapshot for version tracking
+The former `.github/workflows/capability-contract-tests.yml` (contract tests,
+snapshot consistency, matrix artifact) had every job disabled (`if: false`)
+and was deleted in the CI redesign (PR1, 2026-10). Run the snapshot and
+contract checks locally (`./scripts/generate_capability_snapshots.sh`) until a
+gated job replaces them.
 
 ## Troubleshooting
 

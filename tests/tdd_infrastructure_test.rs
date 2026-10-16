@@ -15,9 +15,6 @@ mod infrastructure_tests {
         assert!(std::path::Path::new("tests/tdd").exists());
         assert!(std::path::Path::new("tests/tdd/test_utils").exists());
 
-        // Verify CI/CD configuration exists
-        assert!(std::path::Path::new(".github/workflows/tdd.yml").exists());
-
         // Verify pre-commit hook exists
         assert!(std::path::Path::new(".git/hooks/pre-commit.tdd").exists());
 

@@ -18,6 +18,9 @@
 # (`if: !(push && ref_name == 'qa')`), so that run concludes `success` in ~15 s
 # having verified nothing, and it must not satisfy this gate.
 #
+# On success, when GITHUB_OUTPUT is set, writes `run_id=<id>` of the newest
+# successful building run, so release.yml can reuse that run's binaries.
+#
 # Usage: await_prerelease_ci.sh <repo> <sha> [deadline_minutes] [grace_minutes]
 # Needs GH_TOKEN with actions:read. Poll interval: PRERELEASE_POLL_SECONDS (60).
 set -euo pipefail
@@ -57,7 +60,13 @@ while :; do
   total=$(jq 'length' <<<"$runs")
 
   if [ "$succeeded" -ge 1 ]; then
-    echo "Pre-Release CI passed on ${SHA} (${succeeded} successful run(s))."
+    # Newest successful building run: release.yml downloads its binaries
+    # instead of rebuilding them (CI redesign PR1).
+    run_id=$(jq -r '[.[] | select(.status == "completed" and .conclusion == "success")][0].id' <<<"$runs")
+    echo "Pre-Release CI passed on ${SHA} (${succeeded} successful run(s); newest ${run_id})."
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then
+      echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+    fi
     exit 0
   fi
 

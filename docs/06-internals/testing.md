@@ -466,16 +466,14 @@ mod mock_tests {
 
 ## Flaky Test Detection
 
-### TDD Workflow
+### In CI
 
-```yaml
-# .github/workflows/tdd.yml
-- name: Run tests 3x
-  run: |
-    for i in {1..3}; do
-      cargo test --features test-full || exit 1
-    done
-```
+Flaky tests are detected by nextest's bounded retries: the `unit` and default
+profiles in `.config/nextest.toml` retry a failing test and report a pass on
+retry as FLAKY (the deterministic commit contract pins that budget). The
+former `.github/workflows/tdd.yml`, which re-ran the unit suite three times,
+was deleted in the CI redesign (PR1, 2026-10): it duplicated `ci.yml` on an
+unpinned toolchain and gated nothing.
 
 ---
 
