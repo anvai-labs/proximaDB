@@ -656,7 +656,7 @@ pub(crate) fn pax_spill_compaction_writer(
     )
     .with_quant(VectorQuant::RaBitQ)
     // TD-PAXRG-1: exact tier from the INTERSECTION rule — the caller resolves
-    // `pax_inputs_have_f32_tier(&task.input_files)`; under rg_layout the tier
+    // `pax_compaction_input_tiers(&port, &task.input_files)`; under rg_layout the tier
     // emits as Region C on the spill twin (f32 spool + header/copy).
     .with_f32_tier(f32_tier)
     .with_rerank_quant(rerank_quant)
@@ -833,34 +833,178 @@ fn pax_write_trace() -> bool {
     std::env::var_os("PROXIMADB_TRACE_PAX_WRITE").is_some()
 }
 
-/// True only when every vector row in every input `.pax` segment has an exact
-/// f32 authority. Compaction uses this to decide whether its rewritten RaBitQ
-/// output may retain an exact tier. A raw-f32 `EMBED_BASE` is authoritative;
-/// otherwise every non-null base vector must have a matching raw
-/// `F32_TIER_BASE` row. One exact input never upgrades lossy siblings.
+/// The vector tiers compaction must carry from its input segments into the
+/// merged output (P3 Phase D exact tier + tier-2 rerank quant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaxCompactionInputTiers {
+    /// True only when every vector row in every input `.pax` segment has an
+    /// exact f32 authority (the intersection rule): a raw-f32 `EMBED_BASE`, or a
+    /// matching `F32_TIER_BASE` / Region C exact tier. One exact input never
+    /// upgrades lossy siblings. Legacy ProximaBlocks (`.sst` or no extension)
+    /// are exact authorities; other physical formats are not assumed exact. At
+    /// least one PAX input must carry exactness, so the optional tier stays
+    /// default-OFF for legacy-only compactions.
+    pub f32_tier: bool,
+    /// The first `.pax` input's co-located `RERANK_BASE` quant (SQ8/FP16/f32),
+    /// so compaction never silently downgrades a configured FP16/f32 rerank to
+    /// SQ8. Defaults to [`VectorQuant::Sq8`] when no input carries a block-level
+    /// rerank column (coalesced segments hoist it to Region B, which is SQ8).
+    pub rerank_quant: VectorQuant,
+}
+
+/// What one `.pax` compaction input declares about its vector tiers.
+struct PaxInputTierProbe {
+    exact: bool,
+    rerank_quant: Option<VectorQuant>,
+}
+
+/// Resolve [`PaxCompactionInputTiers`] for a compaction task's inputs.
 ///
-/// Legacy ProximaBlocks (`.sst` or no extension) are exact authorities. Other
-/// physical formats are not assumed exact without an explicit contract. At
-/// least one PAX input must request/preserve exactness; this keeps the optional
-/// tier default-OFF for legacy-only compactions. Read/parse/decode failures fail
-/// closed to `false`.
-pub fn pax_inputs_have_f32_tier(input_files: &[std::path::PathBuf]) -> bool {
+/// TD-READFID-2: inputs arrive as storage URLs (`file://{abs}` from
+/// `LocalFileSystem::list`, `s3://…`/`az://…`/`gs://…` from object stores) or
+/// bare paths, so every read goes through the filesystem port, never
+/// `std::fs::read` (which cannot open a URL and made the intersection false on
+/// every real deployment — the exact tier was dropped at the first compaction).
+///
+/// Co-design (I/O round-trips): a coalesced segment declares `has_f32_tier` in
+/// its footer, so it is answered from three small ranged reads (header magic,
+/// tail, footer) instead of a whole-object GET. Legacy block-layout PAX (whose
+/// exactness is per block) and anything the ranged probe cannot classify (e.g.
+/// an encrypted object, whose ranged bytes are ciphertext) fall back to ONE
+/// whole read through the port that answers both questions. Unreadable inputs
+/// fail closed (no exact tier) and are logged.
+pub async fn pax_compaction_input_tiers(
+    port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
+    input_files: &[std::path::PathBuf],
+) -> PaxCompactionInputTiers {
     let mut saw_pax = false;
+    let mut all_exact = true;
+    let mut rerank_quant: Option<VectorQuant> = None;
     for f in input_files {
         match f.extension().and_then(|e| e.to_str()) {
             Some("pax") => {}
             Some("sst") | None => continue,
-            Some(_) => return false,
+            Some(_) => {
+                all_exact = false;
+                continue;
+            }
         }
         saw_pax = true;
-        let Ok(bytes) = std::fs::read(f) else {
-            return false;
-        };
-        if !pax_segment_has_exact_vector_authority(&bytes) {
-            return false;
+        // Once the intersection is false and a rerank quant is known, the
+        // remaining inputs cannot change the answer — skip their I/O.
+        if !all_exact && rerank_quant.is_some() {
+            continue;
+        }
+        let url = f.to_string_lossy();
+        let probe = probe_pax_input_tiers(port, &url).await;
+        all_exact &= probe.exact;
+        if rerank_quant.is_none() {
+            rerank_quant = probe.rerank_quant;
         }
     }
-    saw_pax
+    PaxCompactionInputTiers {
+        f32_tier: saw_pax && all_exact,
+        rerank_quant: rerank_quant.unwrap_or(VectorQuant::Sq8),
+    }
+}
+
+async fn probe_pax_input_tiers(
+    port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
+    url: &str,
+) -> PaxInputTierProbe {
+    match read_coalesced_segment_footer(port, url).await {
+        // Coalesced: the footer is the authoritative tier declaration and the
+        // rerank column is hoisted out of blocks (Region B, SQ8) — identical to
+        // what `pax_segment_has_exact_vector_authority` and a block-0 probe of
+        // the whole object would conclude.
+        Ok(Some(footer)) => {
+            return PaxInputTierProbe {
+                exact: footer.has_f32_tier,
+                rerank_quant: None,
+            };
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(
+                url,
+                %error,
+                "compaction tier probe: ranged footer read failed; falling back to a whole read"
+            );
+        }
+    }
+    match crate::storage::engines::sst::staged_write::read_object_bytes(port, url).await {
+        Ok(bytes) => PaxInputTierProbe {
+            exact: pax_segment_has_exact_vector_authority(&bytes),
+            rerank_quant: pax_segment_rerank_quant(bytes),
+        },
+        Err(error) => {
+            tracing::warn!(
+                url,
+                %error,
+                "compaction tier probe: input segment unreadable; treating it as lossy \
+                 (the merged segment will not carry the exact-f32 tier)"
+            );
+            PaxInputTierProbe {
+                exact: false,
+                rerank_quant: None,
+            }
+        }
+    }
+}
+
+/// Read a coalesced segment's footer index through the filesystem port with
+/// ranged reads only: `Ok(None)` when the object is not a coalesced segment
+/// (legacy block layout, encrypted ciphertext, too small), so the caller can
+/// fall back to a whole read.
+async fn read_coalesced_segment_footer(
+    port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
+    url: &str,
+) -> anyhow::Result<Option<proximadb_storage_common::segment_layout::SegmentFooterIndex>> {
+    use proximadb_storage_common::pax_block::SEGMENT_MAGIC;
+    use proximadb_storage_common::segment_layout::{
+        SEG_HEADER_MAGIC, SEG_TAIL_LEN, SegmentFooterIndex, is_coalesced_segment,
+    };
+    let fs = port
+        .get_filesystem(url)
+        .map_err(|e| anyhow::anyhow!("filesystem for {url}: {e}"))?;
+    let size = fs
+        .metadata(url)
+        .await
+        .map_err(|e| anyhow::anyhow!("metadata for {url}: {e}"))?
+        .size;
+    let header_len = SEG_HEADER_MAGIC.len() as u64;
+    let tail_len = SEG_TAIL_LEN as u64;
+    if size < header_len + tail_len {
+        return Ok(None);
+    }
+    let header = fs
+        .read_range(url, 0, header_len)
+        .await
+        .map_err(|e| anyhow::anyhow!("header read for {url}: {e}"))?;
+    if !is_coalesced_segment(&header) {
+        return Ok(None);
+    }
+    let tail_off = size - tail_len;
+    let tail = fs
+        .read_range(url, tail_off, tail_len)
+        .await
+        .map_err(|e| anyhow::anyhow!("tail read for {url}: {e}"))?;
+    if tail.len() != SEG_TAIL_LEN || tail[8..] != SEGMENT_MAGIC[..] {
+        return Ok(None);
+    }
+    let mut footer_len_bytes = [0u8; 8];
+    footer_len_bytes.copy_from_slice(&tail[..8]);
+    let footer_len = u64::from_le_bytes(footer_len_bytes);
+    if footer_len == 0 || footer_len > tail_off.saturating_sub(header_len) {
+        anyhow::bail!("coalesced footer length {footer_len} overruns segment {url}");
+    }
+    let footer = fs
+        .read_range(url, tail_off - footer_len, footer_len)
+        .await
+        .map_err(|e| anyhow::anyhow!("footer read for {url}: {e}"))?;
+    SegmentFooterIndex::parse(&footer)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("footer parse for {url}: {e}"))
 }
 
 /// True only when every vector row in this PAX segment has an authoritative
@@ -911,7 +1055,7 @@ pub fn pax_segment_has_exact_vector_authority(bytes: &[u8]) -> bool {
 ///
 /// Pure over `bytes` so it's unit-testable; the engine reads bytes via the
 /// filesystem trait (object-store-safe) and calls this. Mirrors
-/// [`pax_inputs_have_f32_tier`]'s `PaxSegmentScanner` block-0 metadata read.
+/// [`pax_segment_rerank_quant`]'s `PaxSegmentScanner` block-0 metadata read.
 pub fn pax_segment_is_coarse_rabitq_without_f32_tier(bytes: &[u8]) -> bool {
     use proximadb_block_format::vparam::QUANT_RABITQ;
     if SegmentFormat::detect(bytes) != SegmentFormat::Pax {
@@ -919,7 +1063,7 @@ pub fn pax_segment_is_coarse_rabitq_without_f32_tier(bytes: &[u8]) -> bool {
     }
     // A `.pax` SEGMENT is `[block(s)][segment_index][SEGMENT_MAGIC]`; the scanner
     // parses the trailing index + magic and yields block 0 (see
-    // [`pax_inputs_have_f32_tier`]).
+    // [`pax_segment_rerank_quant`]).
     let Ok(mut scanner) = PaxSegmentScanner::from_bytes(bytes.to_vec(), ScanPredicate::default())
     else {
         return false;
@@ -934,46 +1078,27 @@ pub fn pax_segment_is_coarse_rabitq_without_f32_tier(bytes: &[u8]) -> bool {
     embed.quant_kind == QUANT_RABITQ && vparams.get(col_id::F32_TIER_BASE).is_none()
 }
 
-/// Detect the tier-2 rerank quant strategy of the source `.pax` segments, so
-/// compaction PRESERVES it when re-encoding (mirrors [`pax_inputs_have_f32_tier`]
-/// for the f32 tier). Returns the first detected strategy from the co-located
-/// `RERANK_BASE` column; defaults to [`VectorQuant::Sq8`] (the validated
-/// tier-2) when no `.pax` input carries a rerank column. Correct for both env-
-/// and tag-opt-in: the source segment reflects whatever the collection wrote,
-/// so preserving it keeps a configured FP16/f32 rerank from being silently
-/// downgraded to SQ8 on the first compaction.
-pub fn pax_inputs_rerank_quant(
-    input_files: &[std::path::PathBuf],
-) -> proximadb_block_format::VectorQuant {
+/// The tier-2 rerank quant of one `.pax` segment: block 0's co-located
+/// `RERANK_BASE` column kind (SQ8/FP16/f32), or `None` when the segment has no
+/// block-level rerank column (coalesced layouts hoist it to Region B, SQ8) or
+/// does not parse. Pure over `bytes`; [`pax_compaction_input_tiers`] uses it so
+/// compaction PRESERVES a configured FP16/f32 rerank instead of silently
+/// downgrading it to SQ8.
+pub fn pax_segment_rerank_quant(bytes: Vec<u8>) -> Option<VectorQuant> {
     use proximadb_block_format::vparam::{QUANT_FP16, QUANT_RAW_F32};
-    for f in input_files {
-        if f.extension().and_then(|e| e.to_str()) != Some("pax") {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(f) else {
-            continue;
-        };
-        // Read block 0's column metadata via the segment scanner — a `.pax`
-        // SEGMENT file is `[block(s)][segment_index][SEGMENT_MAGIC]`, so opening
-        // the whole file as a single block misreads the footer (see
-        // [`pax_inputs_have_f32_tier`]). The rerank column is co-located in every
-        // block, so block 0 suffices to detect the segment's tier-2 strategy.
-        let Ok(mut scanner) = PaxSegmentScanner::from_bytes(bytes, ScanPredicate::default()) else {
-            continue;
-        };
-        let Some(reader) = scanner.next_block() else {
-            continue;
-        };
-        if let Some(entry) = reader.vector_params().get(col_id::RERANK_BASE) {
-            return match entry.quant_kind {
-                QUANT_FP16 => VectorQuant::Fp16,
-                QUANT_RAW_F32 => VectorQuant::RawF32,
-                // SQ8 (the default) or any unknown/reserved kind → Sq8.
-                _ => VectorQuant::Sq8,
-            };
-        }
-    }
-    VectorQuant::Sq8
+    // Read block 0's column metadata via the segment scanner — a `.pax`
+    // SEGMENT file is `[block(s)][segment_index][SEGMENT_MAGIC]`, so opening
+    // the whole file as a single block misreads the footer. The rerank column
+    // is co-located in every block, so block 0 suffices.
+    let mut scanner = PaxSegmentScanner::from_bytes(bytes, ScanPredicate::default()).ok()?;
+    let reader = scanner.next_block()?;
+    let entry = reader.vector_params().get(col_id::RERANK_BASE)?;
+    Some(match entry.quant_kind {
+        QUANT_FP16 => VectorQuant::Fp16,
+        QUANT_RAW_F32 => VectorQuant::RawF32,
+        // SQ8 (the default) or any unknown/reserved kind → Sq8.
+        _ => VectorQuant::Sq8,
+    })
 }
 
 /// One scored hit from the coalesced RaBitQ segment scan, reranked against the
@@ -6585,8 +6710,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mixed_exact_and_lossy_inputs_do_not_claim_exact_output() {
+    #[tokio::test]
+    async fn mixed_exact_and_lossy_inputs_do_not_claim_exact_output() {
         disable_coalesced_rabitq();
         let dir = tempfile::tempdir().unwrap();
         let exact = dir.path().join("exact.pax");
@@ -6619,12 +6744,12 @@ mod tests {
         )
         .unwrap();
 
-        assert!(pax_inputs_have_f32_tier(std::slice::from_ref(&exact)));
+        assert!(input_tiers(std::slice::from_ref(&exact)).await.f32_tier);
         assert!(pax_segment_has_exact_vector_authority(
             &std::fs::read(&exact).unwrap()
         ));
         assert!(
-            !pax_inputs_have_f32_tier(&[exact.clone(), lossy.clone()]),
+            !input_tiers(&[exact.clone(), lossy.clone()]).await.f32_tier,
             "one exact input must not make a mixed compacted output exact"
         );
         assert!(
@@ -6632,13 +6757,15 @@ mod tests {
             "lossy PAX must not satisfy an exact-search contract"
         );
         assert!(
-            !pax_inputs_have_f32_tier(&[exact, dir.path().join("unknown.arrow")]),
+            !input_tiers(&[exact, dir.path().join("unknown.arrow")])
+                .await
+                .f32_tier,
             "an unrelated physical format must not be assumed exact"
         );
     }
 
-    #[test]
-    fn coalesced_lossy_segment_does_not_claim_exact_authority_vacuously() {
+    #[tokio::test]
+    async fn coalesced_lossy_segment_does_not_claim_exact_authority_vacuously() {
         enable_coalesced_rabitq();
         let dir = tempfile::tempdir().unwrap();
         let lossy = dir.path().join("coalesced-lossy.pax");
@@ -6671,8 +6798,407 @@ mod tests {
             );
         }
         assert!(
-            !pax_inputs_have_f32_tier(&[lossy]),
+            !input_tiers(&[file_url(&lossy)]).await.f32_tier,
             "compaction must not upgrade a lossy coalesced input to exact"
+        );
+    }
+
+    /// Resolve compaction input tiers through the real local filesystem port —
+    /// the same port compaction hands `pax_compaction_input_tiers`.
+    async fn input_tiers(inputs: &[std::path::PathBuf]) -> PaxCompactionInputTiers {
+        let factory = crate::storage::persistence::filesystem::FilesystemFactory::create_default()
+            .await
+            .expect("filesystem factory");
+        let port: std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort> =
+            std::sync::Arc::new(factory);
+        pax_compaction_input_tiers(&port, inputs).await
+    }
+
+    fn file_url(path: &std::path::Path) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("file://{}", path.display()))
+    }
+
+    fn tier_records() -> Vec<ProximaRecord> {
+        vec![
+            rec("a", 1, vec![-1.0, 0.123_456_7, 7.0]),
+            rec("b", 2, vec![3.0, 4.765_432, -2.0]),
+        ]
+    }
+
+    /// TD-READFID-2: compaction hands the tier probe its inputs as
+    /// `file://{abs}` URLs (`GenericFileMetadata.path = entry.url`). The old
+    /// `std::fs::read` predicates could not open them, so the exact tier was
+    /// dropped at the first compaction on every real deployment. Covers the
+    /// production default (coalesced, row-group layout => Region C) and the
+    /// legacy in-block tier, for `file://` URLs and bare paths alike.
+    #[tokio::test]
+    async fn file_url_compaction_inputs_keep_the_f32_tier() {
+        enable_coalesced_rabitq();
+        let dir = tempfile::tempdir().unwrap();
+        for (name, rg_layout) in [("region-c.pax", true), ("in-block.pax", false)] {
+            let exact = dir.path().join(name);
+            write_pax_segment_full_with_layout(
+                &exact,
+                &tier_records(),
+                "col",
+                1,
+                VectorQuant::RaBitQ,
+                VectorQuant::Sq8,
+                true,
+                None,
+                rg_layout,
+                &[],
+                None,
+            )
+            .unwrap();
+            assert!(
+                input_tiers(std::slice::from_ref(&exact)).await.f32_tier,
+                "{name}: bare path"
+            );
+            assert!(
+                input_tiers(&[file_url(&exact)]).await.f32_tier,
+                "{name}: a file:// compaction input must still report its exact tier"
+            );
+        }
+        let both = [
+            file_url(&dir.path().join("region-c.pax")),
+            file_url(&dir.path().join("in-block.pax")),
+        ];
+        assert!(
+            input_tiers(&both).await.f32_tier,
+            "every input exact => the merged output keeps the tier"
+        );
+    }
+
+    /// TD-READFID-2 (rerank half): a configured FP16 rerank column must survive
+    /// compaction for `file://` inputs too (it used to silently fall to SQ8).
+    #[tokio::test]
+    async fn file_url_compaction_inputs_keep_the_fp16_rerank() {
+        disable_coalesced_rabitq();
+        let dir = tempfile::tempdir().unwrap();
+        let seg = dir.path().join("fp16.pax");
+        write_pax_segment_full(
+            &seg,
+            &tier_records(),
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            VectorQuant::Fp16,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            input_tiers(std::slice::from_ref(&seg)).await.rerank_quant,
+            VectorQuant::Fp16
+        );
+        let url_tiers = input_tiers(&[file_url(&seg)]).await;
+        assert_eq!(
+            url_tiers.rerank_quant,
+            VectorQuant::Fp16,
+            "a file:// compaction input must keep its FP16 rerank tier"
+        );
+        assert!(
+            !url_tiers.f32_tier,
+            "an FP16 rerank is not an exact authority for a RaBitQ base"
+        );
+        // No `.pax` input carrying a rerank column => the validated SQ8 default.
+        assert_eq!(
+            input_tiers(&[dir.path().join("legacy.sst")])
+                .await
+                .rerank_quant,
+            VectorQuant::Sq8
+        );
+    }
+
+    /// An input the port cannot read fails CLOSED (no exact tier, logged),
+    /// never open: a vanished input must not let a merged segment claim exactness.
+    #[tokio::test]
+    async fn unreadable_compaction_input_fails_closed() {
+        enable_coalesced_rabitq();
+        let dir = tempfile::tempdir().unwrap();
+        let exact = dir.path().join("exact.pax");
+        write_pax_segment_full_with_layout(
+            &exact,
+            &tier_records(),
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            VectorQuant::Sq8,
+            true,
+            None,
+            true,
+            &[],
+            None,
+        )
+        .unwrap();
+        let tiers =
+            input_tiers(&[file_url(&exact), file_url(&dir.path().join("missing.pax"))]).await;
+        assert!(!tiers.f32_tier, "an unreadable input must fail closed");
+        assert_eq!(tiers.rerank_quant, VectorQuant::Sq8);
+    }
+
+    /// In-memory object store keyed by full URL, counting whole vs ranged
+    /// reads — stands in for an `s3://`/`az://` backend behind the port.
+    #[derive(Debug, Default)]
+    struct CountingObjectStore {
+        objects: std::collections::HashMap<String, Vec<u8>>,
+        whole_reads: std::sync::atomic::AtomicUsize,
+        ranged_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingObjectStore {
+        fn object(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<&Vec<u8>> {
+            self.objects.get(path).ok_or_else(|| {
+                proximadb_storage_filesystem_types::FilesystemError::NotFound(path.to_string())
+            })
+        }
+    }
+
+    fn unsupported<T>() -> proximadb_storage_filesystem_types::FsResult<T> {
+        Err(
+            proximadb_storage_filesystem_types::FilesystemError::UnsupportedScheme(
+                "test object store is read-only".to_string(),
+            ),
+        )
+    }
+
+    #[async_trait::async_trait]
+    impl proximadb_storage_filesystem_types::FileSystem for CountingObjectStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+            self.whole_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.object(path).cloned()
+        }
+        async fn read_range(
+            &self,
+            path: &str,
+            offset: u64,
+            length: u64,
+        ) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+            self.ranged_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let bytes = self.object(path)?;
+            let start = (offset as usize).min(bytes.len());
+            let end = (offset.saturating_add(length) as usize).min(bytes.len());
+            Ok(bytes[start..end].to_vec())
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<proximadb_storage_filesystem_types::FileOptions>,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn append(
+            &self,
+            _: &str,
+            _: &[u8],
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn delete(&self, _: &str) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn exists(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<bool> {
+            Ok(self.objects.contains_key(path))
+        }
+        async fn metadata(
+            &self,
+            path: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            proximadb_storage_filesystem_types::FsFileMetadata,
+        > {
+            Ok(proximadb_storage_filesystem_types::FsFileMetadata {
+                path: path.to_string(),
+                size: self.object(path)?.len() as u64,
+                ..Default::default()
+            })
+        }
+        async fn list(
+            &self,
+            _: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            Vec<proximadb_storage_filesystem_types::DirEntry>,
+        > {
+            unsupported()
+        }
+        async fn create_dir(&self, _: &str) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn create_dir_all(
+            &self,
+            _: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn copy(&self, _: &str, _: &str) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn move_file(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        fn filesystem_type(&self) -> &'static str {
+            "counting-object-store"
+        }
+        async fn sync(&self) -> proximadb_storage_filesystem_types::FsResult<()> {
+            Ok(())
+        }
+        async fn open_file(
+            &self,
+            _: &str,
+            _: bool,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            Box<dyn proximadb_storage_filesystem_types::FilesystemFile>,
+        > {
+            unsupported()
+        }
+    }
+
+    struct CountingPort(std::sync::Arc<CountingObjectStore>);
+
+    #[async_trait::async_trait]
+    impl proximadb_storage_ports::FilesystemPort for CountingPort {
+        fn get_filesystem(
+            &self,
+            _url: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            std::sync::Arc<dyn proximadb_storage_filesystem_types::FileSystem>,
+        > {
+            Ok(self.0.clone())
+        }
+        async fn create_dir_all(
+            &self,
+            _: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn write(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<proximadb_storage_filesystem_types::FileOptions>,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn move_atomic(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn delete(&self, _: &str) -> proximadb_storage_filesystem_types::FsResult<()> {
+            unsupported()
+        }
+        async fn read(&self, url: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+            proximadb_storage_filesystem_types::FileSystem::read(self.0.as_ref(), url).await
+        }
+        async fn list(
+            &self,
+            _: &str,
+        ) -> proximadb_storage_filesystem_types::FsResult<
+            Vec<proximadb_storage_filesystem_types::DirEntry>,
+        > {
+            unsupported()
+        }
+    }
+
+    /// Object-store inputs resolve through the port (no local path exists for
+    /// them at all), and the co-design contract holds: a coalesced segment is
+    /// answered from ranged footer reads with ZERO whole-object GETs; only a
+    /// legacy block-layout segment (per-block exactness) costs one whole read.
+    #[tokio::test]
+    async fn object_store_inputs_resolve_through_the_port_footer_first() {
+        use std::sync::atomic::Ordering;
+        enable_coalesced_rabitq();
+        let dir = tempfile::tempdir().unwrap();
+        let coalesced = dir.path().join("coalesced.pax");
+        write_pax_segment_full_with_layout(
+            &coalesced,
+            &tier_records(),
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            VectorQuant::Sq8,
+            true,
+            None,
+            true,
+            &[],
+            None,
+        )
+        .unwrap();
+        disable_coalesced_rabitq();
+        let legacy = dir.path().join("legacy.pax");
+        write_pax_segment_full(
+            &legacy,
+            &tier_records(),
+            "col",
+            1,
+            VectorQuant::RaBitQ,
+            VectorQuant::Fp16,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        let coalesced_url = "s3://bucket/data/t/n/c/L0_a.pax".to_string();
+        let legacy_url = "s3://bucket/data/t/n/c/L0_b.pax".to_string();
+        let mut store = CountingObjectStore::default();
+        store
+            .objects
+            .insert(coalesced_url.clone(), std::fs::read(&coalesced).unwrap());
+        store
+            .objects
+            .insert(legacy_url.clone(), std::fs::read(&legacy).unwrap());
+        let store = std::sync::Arc::new(store);
+        let port: std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort> =
+            std::sync::Arc::new(CountingPort(store.clone()));
+
+        let tiers =
+            pax_compaction_input_tiers(&port, &[std::path::PathBuf::from(&coalesced_url)]).await;
+        assert!(
+            tiers.f32_tier,
+            "object-store coalesced input keeps the tier"
+        );
+        assert_eq!(
+            store.whole_reads.load(Ordering::SeqCst),
+            0,
+            "a coalesced input must be classified from its footer alone"
+        );
+        assert_eq!(
+            store.ranged_reads.load(Ordering::SeqCst),
+            3,
+            "header magic + tail + footer"
+        );
+
+        let tiers = pax_compaction_input_tiers(
+            &port,
+            &[
+                std::path::PathBuf::from(&coalesced_url),
+                std::path::PathBuf::from(&legacy_url),
+            ],
+        )
+        .await;
+        assert!(tiers.f32_tier, "both object-store inputs carry the tier");
+        assert_eq!(
+            tiers.rerank_quant,
+            VectorQuant::Fp16,
+            "the legacy input's FP16 rerank is preserved"
+        );
+        assert_eq!(
+            store.whole_reads.load(Ordering::SeqCst),
+            1,
+            "only the legacy block-layout input needs a whole read"
         );
     }
 

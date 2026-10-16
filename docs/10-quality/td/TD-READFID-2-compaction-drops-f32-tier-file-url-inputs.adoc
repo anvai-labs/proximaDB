@@ -5,9 +5,9 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Reproduced at the unit level (`std::fs::read` on a `file://` path errors); end-to-end compaction repro not yet run.
+| Status | **Resolved (fix/readfid2-compaction-f32-tier).** Reproduced end to end through the production compaction trigger, then fixed: compaction now reads its inputs' tier declarations through the filesystem port. See <<evidence>>.
 | Priority | **HIGH** for TD-READFID-1's guarantee: an `fp32` collection's exact tier is silently dropped at the FIRST compaction, and the collection re-lossifies with no signal.
-| Component | `src/storage/engines/sst/segment_format.rs`: `pax_inputs_have_f32_tier` / `pax_inputs_rerank_quant` (both `std::fs::read` raw `PathBuf`s); input provenance: `src/storage/common/compaction_orchestrator.rs` (`GenericFileMetadata.path = entry.url`), `src/storage/persistence/filesystem/local.rs` (`file://{abs}` URLs), `src/storage/engines/sst/compaction.rs` (`task.input_files` → `PathBuf` unmodified).
+| Component | `src/storage/engines/sst/segment_format.rs`: formerly `pax_inputs_have_f32_tier` / `pax_inputs_rerank_quant` (both `std::fs::read` raw `PathBuf`s), now `pax_compaction_input_tiers`; input provenance: `src/storage/common/compaction_orchestrator.rs` (`GenericFileMetadata.path = entry.url`), `src/storage/persistence/filesystem/local.rs` (`file://{abs}` URLs), `src/storage/engines/sst/compaction.rs` (`task.input_files` → `PathBuf` unmodified).
 | Relates to | TD-READFID-1 (this defect silently undoes its fix after one compaction); TD-RDSTRAT-7; the same defect also breaks `pax_inputs_rerank_quant`'s FP16-preservation claim.
 | Found | 2026-10-15, adversarial review of PR #2048 (fix/readfid1-point-read-fidelity)
 |===
@@ -22,6 +22,21 @@
 
 Net effect: flush writes the exact tier (TD-READFID-1) → compaction fires (L0 threshold or the >32 MB untrained-training arm) → merged segment has no tier → point reads fall back to SQ8 reconstructions again.
 
-== Fix direction
+== Fix
 
-Strip the scheme before the predicate reads (mirroring `compaction.rs`'s existing output-path `file://` strip), or route the reads through the filesystem port so object-store compaction works too. Then: end-to-end repro — create an `fp32` collection, flush, force a compaction, assert the merged `.pax` still has `has_f32_tier` and a point read stays byte-exact. Also add the mixed-input case (tier'd + legacy no-tier inputs still drop, by design).
+`pax_inputs_have_f32_tier` and `pax_inputs_rerank_quant` are replaced by one async resolver, `segment_format::pax_compaction_input_tiers(port, inputs) -> PaxCompactionInputTiers { f32_tier, rerank_quant }`. All three live compaction write sites in `compaction.rs` (the local-spill executor and both canonical PAX arms) call it with `self.filesystem_port()`.
+
+* **No string surgery.** Each input URL (`file://…`, `s3://…`/`az://…`/`gs://…`, or a bare path) is routed by `FilesystemPort::get_filesystem`, the same scheme routing compaction already uses to read the segment bytes.
+* **Footer first (I/O round-trips).** A coalesced segment declares `has_f32_tier` in its footer, so it is classified from three small ranged reads (header magic, tail, footer) with no whole-object GET. A legacy block-layout PAX segment, whose exactness is per block, or anything the ranged probe cannot classify (for example an encrypted object, whose ranged bytes are ciphertext) falls back to one whole read through `read_object_bytes`. That one read answers both the exactness and the rerank question; the old code would have read the object twice.
+* **Fail closed, logged.** An unreadable input yields no exact tier and a `warn!` naming the URL.
+* **Semantics unchanged.** It is still the intersection rule: every `.pax` input must be exact, legacy `.sst` inputs are exact, unknown formats are not, and at least one PAX input is required. The rerank quant is still the first block-level `RERANK_BASE` kind found, defaulting to SQ8. A mixed tier'd plus lossy compaction still drops the tier by design (`mixed_exact_and_lossy_inputs_do_not_claim_exact_output`).
+
+[[evidence]]
+== Evidence
+
+* **End to end, production path:** `tests/v2_post_flush_search_e2e.rs::v2_fp32_point_read_is_byte_exact_after_compaction`. It creates an fp32 SST collection over REST v2, does five insert + `force_flush_collection` rounds (the default L0 threshold of 5, so the flush itself enqueues compaction; there is no test-only compaction entry point), waits for the background worker to leave one merged `.pax`, then checks `pax_segment_has_exact_vector_authority` on it and does GET-by-id with `f32::to_bits` comparison for all 15 records.
+** Unfixed code (`origin/develop` 65eb306f9): **FAIL**. Merged segment `L1_….pax` `has_exact_authority=false`; **15 of 15** records differ, e.g. `rec-0` got `[0.6145521, 0.6251966, …]`, written `[0.613, 0.62390834, …]`. That is the SQ8 grid, so the collection re-lossified at its first compaction exactly as described above.
+** Fixed: **PASS**. The merged segment is exact and all 15 records are bit-exact.
+* **Unit, `segment_format.rs` tests:** `file_url_compaction_inputs_keep_the_f32_tier` (Region C and in-block tier, `file://` and bare paths) and `file_url_compaction_inputs_keep_the_fp16_rerank`. Before the fix, the equivalent assertions against the old predicates failed: f32 tier `false` for a `file://` input, and rerank `Sq8` instead of `Fp16`.
+* `object_store_inputs_resolve_through_the_port_footer_first` uses an in-memory `s3://` backend behind the port. A coalesced input is classified with **0 whole GETs and 3 ranged reads**; a legacy block-layout input costs exactly one whole read and keeps its FP16 rerank.
+* `unreadable_compaction_input_fails_closed`: a missing input means no tier.

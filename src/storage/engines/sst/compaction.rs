@@ -1861,9 +1861,15 @@ impl Compaction {
             // TD-PAXRG-1: the exact tier follows the INTERSECTION rule — the
             // spill executor must not silently drop it when every input is
             // exact (same resolution the non-spill arms perform).
-            let f32_tier = crate::storage::engines::sst::segment_format::pax_inputs_have_f32_tier(
-                &task.input_files,
-            );
+            // TD-READFID-2: inputs are storage URLs (`file://…`, object-store),
+            // so the tier probe reads through the filesystem port.
+            let f32_tier =
+                crate::storage::engines::sst::segment_format::pax_compaction_input_tiers(
+                    &self.filesystem_port(),
+                    &task.input_files,
+                )
+                .await
+                .f32_tier;
             let mut writer =
                 crate::storage::engines::sst::segment_format::pax_spill_compaction_writer(
                     Path::new(staged.local_path()),
@@ -2445,16 +2451,18 @@ impl Compaction {
                         std::fs::create_dir_all(parent)
                             .map_err(crate::core::StorageError::DiskIO)?;
                     }
-                    let f32_tier =
-                        crate::storage::engines::sst::segment_format::pax_inputs_have_f32_tier(
-                            &task.input_files,
-                        );
-                    // Preserve the source segments' tier-2 rerank quant (SQ8/FP16/f32)
-                    // through compaction — see `pax_inputs_rerank_quant`.
-                    let rerank_quant =
-                        crate::storage::engines::sst::segment_format::pax_inputs_rerank_quant(
-                            &task.input_files,
-                        );
+                    // TD-READFID-2: the exact tier (intersection rule) and the
+                    // source tier-2 rerank quant (SQ8/FP16/f32) are read from the
+                    // inputs through the filesystem port — inputs are storage
+                    // URLs, which `std::fs` cannot open.
+                    let crate::storage::engines::sst::segment_format::PaxCompactionInputTiers {
+                        f32_tier,
+                        rerank_quant,
+                    } = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers(
+                        &self.filesystem_port(),
+                        &task.input_files,
+                    )
+                    .await;
                     // TD-COMPACT-2 root cause: this argument is the collection's
                     // embedding-MODALITY count, not the record count. Passing
                     // `records.len()` made the block writer allocate one embedding
@@ -2612,16 +2620,18 @@ impl Compaction {
                         std::fs::create_dir_all(parent)
                             .map_err(crate::core::StorageError::DiskIO)?;
                     }
-                    let f32_tier =
-                        crate::storage::engines::sst::segment_format::pax_inputs_have_f32_tier(
-                            &task.input_files,
-                        );
-                    // Preserve the source segments' tier-2 rerank quant (SQ8/FP16/f32)
-                    // through compaction — see `pax_inputs_rerank_quant`.
-                    let rerank_quant =
-                        crate::storage::engines::sst::segment_format::pax_inputs_rerank_quant(
-                            &task.input_files,
-                        );
+                    // TD-READFID-2: the exact tier (intersection rule) and the
+                    // source tier-2 rerank quant (SQ8/FP16/f32) are read from the
+                    // inputs through the filesystem port — inputs are storage
+                    // URLs, which `std::fs` cannot open.
+                    let crate::storage::engines::sst::segment_format::PaxCompactionInputTiers {
+                        f32_tier,
+                        rerank_quant,
+                    } = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers(
+                        &self.filesystem_port(),
+                        &task.input_files,
+                    )
+                    .await;
                     // TD-COMPACT-2 root cause: embedding-MODALITY count, not the
                     // record count — see the atomic-path call above.
                     let embedding_count = records

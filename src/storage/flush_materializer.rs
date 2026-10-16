@@ -84,6 +84,16 @@ pub struct CollectionFlushPlan {
     /// tier from it; without it the transitional DTO below dropped the declaration
     /// and an `fp32` collection flushed only lossy RaBitQ/SQ8 columns.
     pub canonical_embedding_precision: Option<i32>,
+    /// TD-READFID-1 residual: the collection's `CollectionConfig.tags`. Every
+    /// per-collection SST knob is a tag — `pax_f32_tier:`, `pax_vector_format:`,
+    /// `pax_rg_layout:`, `pax_rerank_quant:`, `compaction:`, `l0_threshold:`,
+    /// `workload_profile:` — and the transitional DTO used to drop them, so on
+    /// the production flush only the env vars applied (e.g. `pax_f32_tier:off`
+    /// could not opt an fp32 collection out of the exact tier).
+    pub tags: Vec<String>,
+    /// TD-READFID-1 residual: the per-collection base vector quant
+    /// (`rabitq`/`sq8`/`raw_f32`); previously dropped by the DTO like `tags`.
+    pub pax_vector_quant: Option<String>,
 }
 
 /// Build a [`CollectionFlushPlan`] from a collection's catalog metadata. The single
@@ -149,6 +159,8 @@ pub fn flush_plan_from_collection_meta(
             .unwrap_or_default(),
         enable_proxima_record: config.and_then(|c| c.enable_proxima_record),
         canonical_embedding_precision: config.and_then(|c| c.canonical_embedding_precision),
+        tags: config.map(|c| c.tags.clone()).unwrap_or_default(),
+        pax_vector_quant: config.and_then(|c| c.pax_vector_quant.clone()),
     })
 }
 
@@ -602,6 +614,11 @@ async fn materialize_collection_with_coordinator_mode(
             filterable_columns: plan.filterable_columns.clone(),
             enable_proxima_record: plan.enable_proxima_record,
             canonical_embedding_precision: plan.canonical_embedding_precision,
+            // TD-READFID-1 residual: per-collection PAX/compaction knobs. All are
+            // footer/magic-detected optional sections or writer choices the
+            // mixed-format reader already handles (see the per-knob tests).
+            tags: plan.tags.clone(),
+            pax_vector_quant: plan.pax_vector_quant.clone(),
             ..Default::default()
         }),
         ..Default::default()
@@ -800,6 +817,7 @@ mod tests {
         release_flush: Notify,
         last_storage_assignment: Mutex<Option<StorageAssignment>>,
         last_precision: Mutex<Option<i32>>,
+        last_config: Mutex<Option<CollectionConfig>>,
     }
 
     impl RecordingEngine {
@@ -818,6 +836,7 @@ mod tests {
                 release_flush: Notify::new(),
                 last_storage_assignment: Mutex::new(None),
                 last_precision: Mutex::new(None),
+                last_config: Mutex::new(None),
             }
         }
 
@@ -873,6 +892,10 @@ mod tests {
                 .as_ref()
                 .and_then(|collection| collection.config.as_ref())
                 .and_then(|config| config.canonical_embedding_precision);
+            *self.last_config.lock().expect("test config lock") = params
+                .collection_config
+                .as_ref()
+                .and_then(|collection| collection.config.clone());
             let active = self.active_flushes.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active_flushes.fetch_max(active, Ordering::SeqCst);
             let _active_guard = ActiveFlush(&self.active_flushes);
@@ -938,6 +961,8 @@ mod tests {
             filterable_columns: Vec::new(),
             enable_proxima_record: None,
             canonical_embedding_precision: None,
+            tags: Vec::new(),
+            pax_vector_quant: None,
         }
     }
 
@@ -1273,6 +1298,419 @@ mod tests {
             *engine.last_precision.lock().expect("test precision lock"),
             Some(EmbeddingPrecision::Fp32 as i32),
             "the engine flush DTO must carry the declared canonical precision"
+        );
+    }
+
+    /// TD-READFID-1 residual: the per-collection PAX/compaction knobs live in
+    /// `CollectionConfig.tags` and `pax_vector_quant`. The transitional engine
+    /// DTO used to drop both, so every per-collection knob was dark on the
+    /// production flush (only env vars applied) and `pax_f32_tier:off` could not
+    /// opt an fp32 collection out of the exact tier.
+    #[tokio::test]
+    async fn tags_and_pax_vector_quant_reach_the_engine_flush_boundary() {
+        let tags: Vec<String> = [
+            "pax_f32_tier:off",
+            "pax_vector_format:on",
+            "pax_rg_layout:off",
+            "pax_rerank_quant:fp16",
+            "compaction:off",
+            "l0_threshold:3",
+        ]
+        .iter()
+        .map(|tag| tag.to_string())
+        .collect();
+        let meta = Collection {
+            id: "116".to_string(),
+            config: Some(CollectionConfig {
+                name: "knob-collection".to_string(),
+                dimension: 2,
+                storage_engine: Some(ProtoStorageEngine::Sst as i32),
+                tags: tags.clone(),
+                pax_vector_quant: Some("sq8".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut knob_plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        knob_plan.base_location = "file:///tmp/readfid1-knob-tests".to_string();
+
+        let coordinator = FlushExecutionCoordinator::new(1);
+        let write_buffer = Arc::new(WALBehaviorWrapper::new(MemtableConfig::default()));
+        add_batch(&write_buffer, 116, "v0").await;
+        let engine = Arc::new(RecordingEngine::new());
+        coordinator
+            .register_engine(ProtoStorageEngine::Sst, engine.clone())
+            .await;
+        materialize_collection_with_coordinator(
+            &coordinator,
+            &write_buffer,
+            &knob_plan,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
+        .expect("flush must succeed")
+        .expect("flush must publish its batch");
+
+        let config = engine
+            .last_config
+            .lock()
+            .expect("test config lock")
+            .clone()
+            .expect("the engine flush DTO must carry a collection config");
+        assert_eq!(
+            config.tags, tags,
+            "the engine flush DTO must carry the collection's tags verbatim"
+        );
+        assert_eq!(
+            config.pax_vector_quant.as_deref(),
+            Some("sq8"),
+            "the engine flush DTO must carry the per-collection pax_vector_quant"
+        );
+    }
+
+    // ---- TD-READFID-1 residual: per-collection knobs on the PRODUCTION flush ----
+    //
+    // Each test drives `materialize_collection_with_coordinator` (the recipe
+    // every flush trigger uses) into a REAL `SstEngine` and inspects the segment
+    // it wrote, so a knob only passes if it survives catalog meta -> plan ->
+    // transitional DTO -> SST flush resolver -> writer.
+
+    struct KnobFlush {
+        _dir: tempfile::TempDir,
+        root: std::path::PathBuf,
+        engine: Arc<crate::storage::engines::sst::SstEngine>,
+    }
+
+    impl KnobFlush {
+        fn pax_files(&self) -> Vec<std::path::PathBuf> {
+            fn visit(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                let Ok(entries) = std::fs::read_dir(path) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        visit(&path, out);
+                    } else if path.extension().is_some_and(|ext| ext == "pax") {
+                        out.push(path);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            visit(&self.root, &mut out);
+            out.sort();
+            out
+        }
+
+        fn only_segment(&self) -> Vec<u8> {
+            let files = self.pax_files();
+            assert_eq!(
+                files.len(),
+                1,
+                "expected exactly one flushed segment: {files:?}"
+            );
+            std::fs::read(&files[0]).expect("read flushed segment")
+        }
+    }
+
+    fn knob_record(oid: &str, seed: usize) -> proximadb_records::ProximaRecord {
+        let values: Vec<f32> = (0..4)
+            .map(|j| ((seed * 4 + j) as f32 * 0.031_7).sin() * 0.77 + j as f32 * 0.013)
+            .collect();
+        proximadb_records::ProximaRecord {
+            oid: oid.to_string(),
+            created_at_ns: 1_000 + seed as i64,
+            updated_at_ns: 1_000 + seed as i64,
+            record_version: 1,
+            embeddings: vec![proximadb_records::EmbeddingCell {
+                model_id: "test".to_string(),
+                modality: "dense_vector".to_string(),
+                dim: 4,
+                values: proximadb_records::EmbeddingValues::Fp32(values),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Flush `flushes` WAL batches of a collection declared by `config` through
+    /// the production materializer into a real SST engine.
+    async fn flush_via_materializer(
+        collection_object_id: u64,
+        mut config: CollectionConfig,
+        flushes: usize,
+    ) -> KnobFlush {
+        let dir = tempfile::tempdir().expect("knob tempdir");
+        let root = dir.path().to_path_buf();
+        config.name = format!("knob-{collection_object_id}");
+        config.dimension = 4;
+        config.storage_engine = Some(ProtoStorageEngine::Sst as i32);
+        let meta = Collection {
+            id: collection_object_id.to_string(),
+            config: Some(config),
+            storage_assignment: Some(StorageAssignment {
+                base_location: format!("file://{}", root.display()),
+                engine: ProtoStorageEngine::Sst as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+
+        let filesystem = Arc::new(
+            crate::storage::persistence::filesystem::FilesystemFactory::create(
+                crate::storage::persistence::filesystem::FilesystemConfig::default(),
+            )
+            .await
+            .expect("filesystem factory"),
+        );
+        let engine = Arc::new(
+            crate::storage::engines::sst::SstEngine::new_with_config(
+                crate::core::SstConfig::default(),
+                filesystem,
+                Arc::new(proximadb_distance_kernel::engine::UnifiedDistanceCompute::default()),
+            )
+            .await
+            .expect("sst engine"),
+        );
+        let coordinator = FlushExecutionCoordinator::new(1);
+        coordinator
+            .register_engine(ProtoStorageEngine::Sst, engine.clone())
+            .await;
+        let write_buffer = Arc::new(WALBehaviorWrapper::new(MemtableConfig::default()));
+        for flush in 0..flushes {
+            let records = (0..3)
+                .map(|i| knob_record(&format!("r{flush}-{i}"), flush * 3 + i))
+                .collect();
+            add_records_batch(&write_buffer, collection_object_id, records).await;
+            materialize_collection_with_coordinator(
+                &coordinator,
+                &write_buffer,
+                &plan,
+                None,
+                None,
+                true,
+                None,
+            )
+            .await
+            .expect("production flush must succeed")
+            .expect("production flush must publish its batch");
+        }
+        KnobFlush {
+            _dir: dir,
+            root,
+            engine,
+        }
+    }
+
+    fn fp32_config(tags: &[&str]) -> CollectionConfig {
+        CollectionConfig {
+            canonical_embedding_precision: Some(
+                crate::proto::proximadb_v1::EmbeddingPrecision::Fp32 as i32,
+            ),
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Block 0's `(EMBED_BASE, RERANK_BASE)` quant kinds, when present.
+    fn block0_vector_quants(bytes: &[u8]) -> (Option<u8>, Option<u8>) {
+        use proximadb_block_format::col_id;
+        use proximadb_storage_common::pax_block::{PaxSegmentScanner, ScanPredicate};
+        let mut scanner = PaxSegmentScanner::from_bytes(bytes.to_vec(), ScanPredicate::default())
+            .expect("segment scanner");
+        let block = scanner.next_block().expect("segment has a block");
+        let params = block.vector_params();
+        (
+            params.get(col_id::EMBED_BASE).map(|entry| entry.quant_kind),
+            params
+                .get(col_id::RERANK_BASE)
+                .map(|entry| entry.quant_kind),
+        )
+    }
+
+    fn footer(bytes: &[u8]) -> proximadb_storage_common::segment_layout::SegmentFooterIndex {
+        proximadb_storage_common::segment_layout::SegmentFooterIndex::locate_in_segment(bytes)
+            .expect("footer parses")
+            .expect("coalesced segment has a footer")
+    }
+
+    /// `pax_f32_tier:off` must opt a declared-fp32 collection OUT of the exact
+    /// tier (it outranks the declaration), and `pax_f32_tier:on` must opt an
+    /// undeclared one IN. The untagged fp32 control proves the tier is otherwise on.
+    #[tokio::test]
+    async fn pax_f32_tier_tag_takes_effect_on_the_production_flush() {
+        use crate::storage::engines::sst::segment_format::pax_segment_has_exact_vector_authority;
+        let control = flush_via_materializer(201, fp32_config(&["compaction:off"]), 1).await;
+        assert!(
+            pax_segment_has_exact_vector_authority(&control.only_segment()),
+            "control: a declared-fp32 collection flushes the exact tier"
+        );
+        let opted_out =
+            flush_via_materializer(202, fp32_config(&["compaction:off", "pax_f32_tier:off"]), 1)
+                .await;
+        assert!(
+            !pax_segment_has_exact_vector_authority(&opted_out.only_segment()),
+            "pax_f32_tier:off must opt a declared-fp32 collection out of the exact tier"
+        );
+        let opted_in = flush_via_materializer(
+            203,
+            CollectionConfig {
+                tags: vec!["compaction:off".into(), "pax_f32_tier:on".into()],
+                ..Default::default()
+            },
+            1,
+        )
+        .await;
+        assert!(
+            pax_segment_has_exact_vector_authority(&opted_in.only_segment()),
+            "pax_f32_tier:on must emit the exact tier for an undeclared collection"
+        );
+    }
+
+    /// `pax_rg_layout:off` keeps the exact tier in-block (no Region C); the
+    /// default (row-group layout ON) hoists it into Region C.
+    #[tokio::test]
+    async fn pax_rg_layout_tag_takes_effect_on_the_production_flush() {
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_RG_LAYOUT") };
+        let default_layout = flush_via_materializer(211, fp32_config(&["compaction:off"]), 1).await;
+        let default_footer = footer(&default_layout.only_segment());
+        assert!(default_footer.has_f32_tier);
+        assert!(
+            default_footer.c_len > 0,
+            "control: the default row-group layout hoists the exact tier into Region C"
+        );
+        let legacy_layout = flush_via_materializer(
+            212,
+            fp32_config(&["compaction:off", "pax_rg_layout:off"]),
+            1,
+        )
+        .await;
+        let legacy_footer = footer(&legacy_layout.only_segment());
+        assert!(legacy_footer.has_f32_tier);
+        assert_eq!(
+            legacy_footer.c_len, 0,
+            "pax_rg_layout:off must keep the exact tier in-block (no Region C)"
+        );
+    }
+
+    /// `pax_vector_format:off` selects the recall-exact RawF32 base quant, and
+    /// the typed `pax_vector_quant` field selects the base quant.
+    #[tokio::test]
+    async fn pax_vector_format_and_quant_take_effect_on_the_production_flush() {
+        use proximadb_block_format::vparam::{QUANT_RAW_F32, QUANT_SQ8};
+        let format_off = flush_via_materializer(
+            221,
+            CollectionConfig {
+                tags: vec!["compaction:off".into(), "pax_vector_format:off".into()],
+                ..Default::default()
+            },
+            1,
+        )
+        .await;
+        assert_eq!(
+            block0_vector_quants(&format_off.only_segment()).0,
+            Some(QUANT_RAW_F32),
+            "pax_vector_format:off must write a RawF32 base column"
+        );
+        let sq8 = flush_via_materializer(
+            222,
+            CollectionConfig {
+                tags: vec!["compaction:off".into()],
+                pax_vector_quant: Some("sq8".into()),
+                ..Default::default()
+            },
+            1,
+        )
+        .await;
+        assert_eq!(
+            block0_vector_quants(&sq8.only_segment()).0,
+            Some(QUANT_SQ8),
+            "pax_vector_quant = sq8 must write an SQ8 base column"
+        );
+    }
+
+    /// `pax_rerank_quant:fp16` selects the FP16 tier-2 rerank column. The rerank
+    /// column only exists in-block for the non-coalesced RaBitQ layout (the
+    /// coalesced layout hoists rerank to Region B, which is SQ8), so this pins
+    /// that layout via its env gate.
+    #[tokio::test]
+    async fn pax_rerank_quant_tag_takes_effect_on_the_production_flush() {
+        use proximadb_block_format::vparam::QUANT_FP16;
+        unsafe { std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "0") };
+        let fp16 = flush_via_materializer(
+            231,
+            CollectionConfig {
+                tags: vec!["compaction:off".into(), "pax_rerank_quant:fp16".into()],
+                ..Default::default()
+            },
+            1,
+        )
+        .await;
+        assert_eq!(
+            block0_vector_quants(&fp16.only_segment()).1,
+            Some(QUANT_FP16),
+            "pax_rerank_quant:fp16 must write an FP16 rerank column"
+        );
+    }
+
+    /// `l0_threshold:N` arms compaction at N segments; `compaction:off` disarms
+    /// it even past that threshold. Before the DTO carried tags both were dark
+    /// (the default threshold of 5 applied), so two flushes never compacted.
+    #[tokio::test]
+    async fn compaction_tags_take_effect_on_the_production_flush() {
+        let armed = flush_via_materializer(
+            241,
+            CollectionConfig {
+                tags: vec!["l0_threshold:2".into()],
+                ..Default::default()
+            },
+            2,
+        )
+        .await;
+        let compaction = armed
+            .engine
+            .compaction_manager()
+            .expect("sst compaction manager")
+            .clone();
+        assert!(
+            compaction
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await,
+            "armed compaction must quiesce"
+        );
+        assert_eq!(
+            armed.pax_files().len(),
+            1,
+            "l0_threshold:2 must compact the two flushed segments into one"
+        );
+
+        let disarmed = flush_via_materializer(
+            242,
+            CollectionConfig {
+                tags: vec!["l0_threshold:2".into(), "compaction:off".into()],
+                ..Default::default()
+            },
+            2,
+        )
+        .await;
+        let compaction = disarmed
+            .engine
+            .compaction_manager()
+            .expect("sst compaction manager")
+            .clone();
+        assert!(
+            compaction
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await
+        );
+        assert_eq!(
+            disarmed.pax_files().len(),
+            2,
+            "compaction:off must keep both segments uncompacted"
         );
     }
 
