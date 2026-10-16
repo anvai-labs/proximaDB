@@ -310,6 +310,24 @@ parse) and the cold-tier id-batch lookup are not `top_k`-capped boundaries, so
 there a value > 65,535 wraps silently — a result-correctness wart, not a
 memory one. Fix by routing through `optimizer_top_k_hint`-style saturating
 clamping when the `u16` field is next touched.
+Residual (non-blocking review findings on the query-vector fix, 2026-10-16;
+none can abort the process — they are error-quality gaps):
+
+* An invalid query vector still returns HTTP 500, not 400, on v1 progressive
+  search, hybrid search (`unified_search_native`), v1/v2 entity search and
+  graph fusion-search: the typed `InvalidQueryVector` reaches those handlers,
+  but they do not map it through `is_client_argument_error`.
+* Client-facing dimension errors name the collection by its internal numeric
+  object id (e.g. `'16'`) rather than the user-facing name, because the
+  validator runs after catalog resolution in `unified_search_v1_inner` /
+  `unified_search_native`.
+* Graph fusion's error ("vector search failed for fusion") hides the
+  dimension cause.
+* AQL consumed-predicate edge case: the executor treats a vector-valued
+  `Equals` on `vector` / `embedding` / `query_vector` as satisfied, so
+  `Not { Equals vector }` drops every row and `Or { Equals vector, X }` is
+  always true. Unrealistic query shapes; noted only.
+
 Also noted (not a defect today): `calculate_pq_distance` in the same kernel
 calls the SIMD kernels directly rather than through `compute_distance_simd`,
 so it does not get the mismatch backstop. Both slices it passes are
