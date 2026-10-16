@@ -8,7 +8,7 @@
 | Status | Open — read-side dedup landed as mitigation (PR #738); the write-side source fix is the remaining work tracked here.
 | Severity | Medium — every SQL table appears twice in `pg_catalog`/`information_schema` probes; cosmetic for `\dt` but doubles `\d` column rows and confuses clients that count relations.
 | Component | `src/services/catalog_introspection.rs` (`cataloged_tables`, `identity_namespace`); the DDL `create_table` registration path; `CatalogManager` + the collection≡table mapping (ADR-047).
-| Relates to | PR #738 (read-side dedup), ADR-047 (collection≡table), link:TD-PGW-2-pg-catalog-as-relational-views.adoc[TD-PGW-2]
+| Relates to | PR #738 (read-side dedup), ADR-047 (collection≡table), link:TD-PGW-2-pg-catalog-as-relational-views.adoc[TD-PGW-2]; link:TD-OLAP-16-catalog-location-model-first-principles.adoc[TD-OLAP-16] (overlap: the same `proximadb.` / `public.` dual registration made `cataloged_tables` keep a stale layout — fixed read-side there, #872)
 |===
 
 == Symptom

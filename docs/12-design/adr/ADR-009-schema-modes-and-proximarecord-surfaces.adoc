@@ -189,74 +189,49 @@ Negative / migration cost:
 
 == Implementation Trajectory
 
+Status reconciled 2026-10-15. Open items keep their original wording; shipped detail is
+compacted into <<_history_shipped>>. Later decisions that carry these threads:
+ADR-047 (catalog schema authority), ADR-049 (v1→v2 migration), TD-V1SUNSET-1 (REST/gRPC v1
+sunset — resolved 2026-08-29), TD-V1SUNSET-2 (`VectorRecord`→`ProximaRecord`, scoped, not
+started), TD-V1SUNSET-3 (`SqlValue`→`ProximaValue`, sequenced behind V1SUNSET-2).
+
 1. [ ] Make WAL and storage flush paths `ProximaRecord`-native. Status: in progress.
-   Completed: canonical storage-format write/read paths for ProximaBlocks, columnar writers/readers, SST/NOVA/SWIFT/VIPER/HELIX adapters, and direct search result shaping now operate on `ProximaRecord` without rehydrating legacy vector envelopes internally.
    Remaining: quarantine legacy v1 `VectorRecord` helper APIs and WAL compatibility readers that still exist for client/proto migration.
 2. [ ] Replace REST/gRPC insert/search payloads with record/table APIs and modality facades over records.
    v2 `ProximaRecord` services exist, but remaining v1 REST/gRPC/streaming shims must be reduced to compatibility adapters.
-   Completed: Python REST SDK insert methods now build v2 record batch payloads and post to the record endpoint; vector-named methods are aliases during SDK migration, not separate v1 writers.
-   Completed: Python SDK adapters are transport adapters only; their canonical write methods are typed around `ProximaRecord` or record-shaped dictionaries, with `VectorRecord` limited to vector-named compatibility aliases.
-   Completed: Python unified client now exposes native `insert_records` / `upsert_records` and routes vector-named insert/upsert helpers through those record methods.
-   Completed: Python sync gRPC client now uses generated v2 `ProximaRecordService` stubs for `insert_records` / `upsert_records` instead of lowering record writes through the v1 vector RPC.
-   Completed: Python embedded HTTP wrapper now targets the v2 record batch endpoint via `_insert_records`; `_insert_vectors` remains only a compatibility alias.
-   Completed: Python batching helpers now expose/export `batch_insert_records`; `batch_insert_vectors` delegates to that native record helper.
-   Completed: Python `InsertBuilder` now builds record-shaped dictionaries natively; vector-named builder methods are compatibility aliases over the record store.
-   Completed: Python chunking helpers now expose/export `create_records`, `prepare_records`, and `chunk_and_embed_records`; vector-named helpers wrap those native record functions.
-   Completed: Python optional integrations now share a record-native payload helper and prefer `insert_records` for writes; vector write calls are compatibility fallbacks.
-   Completed: Python Victor, Victor multi-model indexing, dual-use embedding store, and agentic vector memory helpers now write record-shaped payloads through `insert_records`.
-   Completed: Python embedded multi-model code indexing now writes vector-bearing chunks as record-shaped payloads through `insert_records`.
-   Completed: Python legacy unified client facade now exposes `insert_records` / `upsert_records`, and vector-named insert/upsert methods prefer that record-native path before compatibility fallback.
-   Completed: Python CLI and code-knowledge indexing helpers now build record-shaped payloads and call record-native insert surfaces.
-   Completed: Python `client_v1` insert compatibility now routes through the record batch API; REST uses `/api/v2/collections/{collection}/records/batch` and gRPC uses v2 `ProximaRecordService` stubs when available.
-   Completed: Rust SDK insert builders now write `ProximaRecord` batches to `/api/v2/collections/{collection}/records/batch`; `VectorRecord` is a deprecated compatibility alias.
-   Completed: Node embedded insert builders now write record batches to `/api/v2/collections/{collection}/records/batch`; `VectorRecord` is a deprecated alias over `ProximaRecord`.
-   Completed: Go REST adapter insert/upsert now translates compatibility `VectorRecord` inputs into canonical record batches at `/api/v2/collections/{collection}/records/batch`, with public `ProximaRecord` available for new code.
-   Completed: REST `/api/v1/*` now emits deprecation metadata, and unified-mode gRPC registers `proximadb.v2.ProximaRecordService` alongside v1 compatibility services so canonical record writes/search are available on both server modes.
-   Completed: Platform REST v1 router builders and gRPC v1 success/error responses now apply deprecation metadata when used directly, and runtime/support-surface docs label v1 REST/gRPC as compatibility adapters rather than primary product APIs.
-   Completed: Active quick-start/vector/SDK guides now lead with `/api/v2` and `ProximaRecord`; Go SDK exposes `InsertRecords`/`UpsertRecords` over the existing `ProximaRecord` type while marking `VectorRecord` entry points as deprecated compatibility.
    Direction: no permanent dual endpoint strategy. The record-native implementation is the only maintained write contract; old v1 vector-shaped routes and clients are migration aliases until the final rename/removal phase promotes the record API as stable.
 3. [ ] Make Arrow Flight use xCatalog-derived `ProximaType` schemas and record batches. Status: in progress.
-   Completed: catalog-backed relational Arrow schema derivation and multimodal schema facade exports.
-   Completed: catalog-aware bulk write preparation now returns `ProximaRecord` and uses canonical-record batch sizing.
-   Completed: Flight `GetSchema` can resolve relational/table descriptors through xCatalog when a catalog manager is supplied.
-   Completed: server composition injects the shared `SharedServices` xCatalog manager into REST state and Arrow Flight service instances.
-   Completed: DoPut/DoExchange relational/table descriptors call the catalog-aware record preparation path before storage handlers.
+   (Shipped slices in History; no residual was itemized at filing — re-verify before closing.)
 4. [x] Make SQL lowering produce `ProximaValue` expressions and `ProximaRecord` writes for cataloged inserts.
    `CatalogRow` validates against `CatalogTableSchema`, stores rich `ProximaValue` props, extracts vector embeddings, and projects inserts to canonical `ProximaRecord`.
 5. [ ] Add `CREATE EXTERNAL TABLE` and external table registration metadata.
+   (An external-collection reader exists at `src/services/external_collection/`; whether it
+   satisfies this item was not verified.)
 6. [ ] Migrate SDK and embedded helpers to accept dict/pandas/Arrow/numpy inputs that normalize to records.
-   Completed: embedded Python now has pure `ProximaRecord` normalization helpers for mapping/dict, NumPy matrix, pandas DataFrame, pyarrow Table, document, graph node, and observability event inputs. `insert_records` / `upsert_records` expose that shape as the embedded write API while native vector-shaped calls remain a lower-level migration boundary.
-   Completed: embedded Python now exposes explicit `ProximaRecord` / `ProximaValue` public types and `insert_proxima_records` / `upsert_proxima_records`; legacy `metadata` inputs lower to canonical `props` immediately.
+   (Embedded Python normalization shipped — see History; other SDKs not itemized.)
 7. [ ] Remove or quarantine v1 vector-shaped APIs as deprecated compatibility code.
 
-Progress ledger:
+=== History (shipped)
 
-* 2026-05-18: SQL DML insert path aligned with xCatalog row validation and `CatalogRow -> ProximaRecord` projection.
-* 2026-05-18: Arrow multimodel relational schema builder aligned with `CatalogTableSchema -> Arrow Schema`.
-* 2026-05-18: Arrow multimodal facade now exposes relational, document, graph, and observability schema builders through one surface.
-* 2026-05-18: Catalog-aware Arrow bulk write preparation now emits `ProximaRecord` and uses canonical-record direct-write routing.
-* 2026-05-18: Arrow Flight `GetSchema` gained xCatalog relational/table descriptor resolution with vector-schema fallback.
-* 2026-05-18: Shared server composition now injects one xCatalog manager into REST app state, standalone Arrow Flight servers, and unified-mode internal Flight services.
-* 2026-05-18: Arrow Flight DoPut/DoExchange relational/table descriptors now prepare records through `CatalogBulkWriteService` before invoking live write handlers.
-* 2026-05-19: Storage-format migration advanced: ProximaBlocks/columnar/SST/NOVA/SWIFT/VIPER/HELIX paths use `ProximaRecord` for flush, compaction, block serialization, filtering, and search result shaping; legacy `VectorRecord` remains only in explicit v1 compatibility helpers.
-* 2026-05-19: v1 vector ingestion conversion centralized in the proto compatibility adapter; REST batch, service-level v1 batch, and gRPC streaming ingestion now apply one `VectorRecord` -> `ProximaRecord` defaulting path before lower service/storage code.
-* 2026-05-19: Embedded Python gained `ProximaRecord` normalization helpers and tests for dict/object, NumPy, pandas, Arrow, document, graph, and observability inputs; this is the forward SDK/embedded shape and not a v1 `VectorRecord` compatibility extension.
-* 2026-05-19: Embedded Python `insert_records` / `upsert_records` now accept normalized record batches and route them through the canonical normalizer before the current native batch boundary.
-* 2026-05-19: Embedded Python added explicit `ProximaRecord` / `ProximaValue` public API types, `insert_proxima_records` / `upsert_proxima_records`, metadata-to-props lowering, and preservation of text/source/schema fields through the current native batch boundary.
-* 2026-05-19: Python REST SDK `insert_records`, `insert_vector`, and `insert_vectors` now target the v2 record batch endpoint with `ProximaRecord`/`ProximaValue`-style payloads instead of maintaining `/api/v1/vectors/batch` as the write path.
-* 2026-05-19: API migration policy clarified: keep building the record-native implementation as the sole target, avoid permanent v1/v2 dual maintenance, and use finalization to remove vector-shaped v1 routes/clients and promote/rename the record API.
-* 2026-05-19: Python REST SDK delete aliases now target the v2 record delete endpoint; `/api/v1/vectors/batch` is no longer used by REST SDK writes.
-* 2026-05-19: Python SDK REST/gRPC/embedded transport adapters gained canonical `insert_records` / `upsert_records` methods typed around `ProximaRecord` or record dictionaries; vector-named adapter writes now route through those methods as migration aliases.
-* 2026-05-19: Python unified client gained native `insert_records` / `upsert_records`; vector-named insert/upsert helpers now delegate through the record methods.
-* 2026-05-19: Python v2 `ProximaRecordService` gRPC stubs were generated and Python sync gRPC record writes now call `InsertRecords` / `UpsertRecords` directly.
-* 2026-05-19: Python embedded HTTP wrapper record writes now post to `/api/v2/collections/{collection}/records/batch`; the old `_insert_vectors` helper delegates to that path.
-* 2026-05-19: Python batching helpers gained/export native `batch_insert_records`; vector-named batching is now a compatibility alias.
-* 2026-05-19: Python `InsertBuilder` migrated to record-native internal storage and output, leaving `build_vectors` as a compatibility shim.
-* 2026-05-19: Python chunking helpers gained record-native outputs for chunk/embedding pipelines; vector-named helpers now wrap those outputs for compatibility.
-* 2026-05-19: Python optional integration write paths for LangChain, LlamaIndex, Haystack, CrewAI, AutoGen, and Agentic IO now build record-shaped payloads and prefer `insert_records`.
-* 2026-05-19: Python embedded multi-model code indexing writes chunk vectors through the record-native helper path.
-* 2026-05-19: Python optional integration write paths for Victor, Victor multi-model indexing, dual-use embeddings, and agentic store vector memory now build record-shaped payloads and prefer `insert_records`.
-* 2026-05-19: Python legacy unified client insert/upsert, CLI, and code-knowledge ingestion paths now prefer record-native writes; stale DSPy write imports were removed.
-* 2026-05-19: Python `client_v1` insert compatibility now writes through the record batch API instead of REST `/api/v1/vectors/batch`.
-* 2026-05-19: Rust SDK and Node embedded write builders now target record batch inserts and expose `ProximaRecord` as the canonical SDK record shape.
-* 2026-05-19: Go REST adapter writes now target record batch inserts and expose `ProximaRecord` as the canonical SDK record shape.
+Progress ledger 2026-05-18/19 (detail compacted 2026-10-15):
+
+* Storage: ProximaBlocks / columnar / SST / NOVA / SWIFT / VIPER / HELIX flush, compaction, block
+  serialization, filtering and search-result shaping operate on `ProximaRecord`; v1 ingestion
+  conversion centralized in one proto compatibility adapter (`VectorRecord`→`ProximaRecord`
+  defaulting) for REST batch, service-level batch and gRPC streaming.
+* Surfaces: REST `/api/v1/*` emits deprecation metadata; unified-mode gRPC registers
+  `proximadb.v2.ProximaRecordService` beside v1; quick-start/SDK guides lead with `/api/v2`.
+* SDKs: Python (REST, sync gRPC via v2 stubs, embedded HTTP, batching, `InsertBuilder`, chunking,
+  integrations — LangChain/LlamaIndex/Haystack/CrewAI/AutoGen/Victor/agentic, CLI, `client_v1`),
+  Rust SDK, Node embedded and Go REST all write to `/api/v2/collections/{collection}/records/batch`;
+  vector-named methods are compatibility aliases. Delete aliases target the v2 record endpoint.
+* Embedded Python: `ProximaRecord` normalization for dict/NumPy/pandas/Arrow/document/graph/
+  observability inputs; public `ProximaRecord`/`ProximaValue` types, `insert_proxima_records` /
+  `upsert_proxima_records`; `metadata` lowers to `props`.
+* Arrow Flight: catalog-backed relational Arrow schema derivation + multimodal schema facade;
+  `CatalogBulkWriteService` record preparation for DoPut/DoExchange; `GetSchema` resolves
+  relational/table descriptors through xCatalog; one shared xCatalog manager injected into REST
+  and Flight.
+* SQL: DML insert aligned with xCatalog row validation and `CatalogRow -> ProximaRecord`.
+* Policy (2026-05-19): build the record-native implementation as the sole target; no permanent
+  v1/v2 dual maintenance; finalize by removing v1 routes/clients and promoting the record API.

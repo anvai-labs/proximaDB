@@ -5,41 +5,27 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
+| Status | **Partial: fulltext/text-storage/SDP cluster (~4.4K LOC, 51 tests) moved to `storage-common::text_search` (#1629); open: the duplicate `TextStorageStrategy` enum.**
 | Severity | Medium — behavior-neutral cluster move (4 files + 1 enum, 3 shims)
-| Component | `crates/storage/proximadb-storage-common/src/text_search`; root `src/storage/engines/core/formats/columnar`, `src/storage/document`, `src/core/types`
+| Component | `crates/storage/proximadb-storage-common/src/text_search`; root columnar / document / core-types shims
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-73-extract-text-filter-metadata-filter-strategy.adoc[TD-DECOMP-73] (completed the text_search cluster); link:TD-DECOMP-74-extract-columnar-schema-dead-strategy.adoc[TD-DECOMP-74] (moved `schema.rs`, which holds the duplicate)
 |===
 
-== What moved
-Phase 3 Step 2 — the fulltext hub-and-dependents cluster (~4.4K LOC, 51 tests) into the
-EXISTING storage crate `proximadb-storage-common`, as a new `text_search` module:
+== History (shipped)
 
-* `formats/columnar/fulltext_index.rs` (1,660 LOC, 12 tests) — the HUB: BM25 inverted index,
-  tokenizer, posting lists. Zero `crate::` refs, deps `std::collections` + `thiserror` only.
-* `formats/columnar/text_storage.rs` (1,818 LOC) — TEXT column storage strategies, chunker,
-  reader/writer. 2 crate:: refs, both intra-cluster.
-* `formats/columnar/text_storage_tests.rs` (749 LOC, 39 tests) — `#[path]`-included test module.
-* `storage/document/sdp.rs` (200 LOC) — SDP chunking (SdpConfig/SdpChunk/SdpChunker), hermetic.
+Moved: `fulltext_index.rs` (the hub — BM25 inverted index, tokenizer, posting lists), `text_storage.rs`
+(+ its `#[path]` test file), and `document/sdp.rs`. Carry-along: the `TextStorageStrategy` enum moved from
+root `core/types/mod.rs` into `text_search/mod.rs`, because storage cannot depend upward on root types.
+All 6 external consumers keep their import paths through 3 root shims.
 
-Carry-along: the `TextStorageStrategy` enum (+ `for_size`, size consts) moved from root
-`core/types/mod.rs` into `text_search/mod.rs` — storage cannot depend upward on root types.
+* Evidence: storage-common nextest 486 → 537.
 
-== Shims (behavior-neutral)
-* `columnar/mod.rs`: `pub mod fulltext_index;` / `pub mod text_storage;` → `pub use
-  proximadb_storage_common::text_search::{fulltext_index, text_storage};` (existing
-  `pub use` re-export blocks in the parent unchanged — all 6 external consumers
-  [hybrid_search, rank_backend, handlers, external_collection, fusion_service, columnar/mod]
-  keep their import paths).
-* `document/mod.rs`: `pub mod sdp;` → `pub use ...text_search::sdp;`.
-* `core/types/mod.rs`: enum definition → `pub use ...text_search::TextStorageStrategy;`
-  (consumers: text_validator, columnar/schema.rs, block_structures, sst/text_column_support).
+== Open: known duplication
 
-== Known duplication (pre-existing, unchanged)
 `columnar/schema.rs:211` carries its OWN `TextStorageStrategy` copy (sans serde derives).
 It does not import either moved definition; deduplicating it is future work (needs schema.rs
 extraction first — it is not part of this cluster).
 
-== Verified
-storage-common standalone `--all-targets` ✓ + nextest **537/537** ✓ (was 486; +51);
-root `cargo check -p proximadb --lib` ✓; boundary checker `--strict` No findings;
-`cargo fmt --check` ✓. SIFT RUNS (storage_changes) under the 45m cap.
+Update (verified 2026-10-15): the precondition is now met — link:TD-DECOMP-74-extract-columnar-schema-dead-strategy.adoc[TD-DECOMP-74] moved `schema.rs` into
+storage-common as `columnar_schema_full.rs`, where the duplicate enum still sits (~line 209), in the same
+crate as `text_search::TextStorageStrategy`.

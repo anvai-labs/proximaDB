@@ -342,23 +342,20 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
     assert!(!refused_to.join("manifest.json").exists());
 
     // 3. Baseline = what a PLAIN restart serves. A graceful stop flushes the
-    //    memtable to segments, and reads may then come from a different tier
-    //    than before the stop; comparing the restored server against the
-    //    pre-stop read would conflate backup fidelity with that tier change.
-    //    Backup must reproduce exactly what a restart without it serves.
+    //    memtable to segments, so reads now come from the segment tier. On an
+    //    `fp32` collection that tier must still serve the written f32 exactly
+    //    (TD-READFID-1: the flush used to keep only the SQ8/RaBitQ columns).
     server.graceful()?;
     let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;
     let mut expected = Vec::new();
     for id in &ids {
         expected.push(read_vector(&server.base_url, collection, id).await?);
     }
-    if expected != written {
-        eprintln!(
-            "NOTE: point reads changed across a plain restart (memtable -> segment tier); \
-             rec-0 written={} restarted={}",
-            written[0], expected[0]
-        );
-    }
+    assert_eq!(
+        expected, written,
+        "TD-READFID-1: point reads on an fp32 collection changed across a plain restart \
+         (memtable -> segment tier)"
+    );
 
     // 4. Stop cleanly, back up.
     server.graceful()?;
@@ -422,9 +419,8 @@ async fn cold_backup_round_trip_restores_identical_rows() -> anyhow::Result<()> 
 /// leased nor backed up, and backup + restore reported success while every
 /// acknowledged-but-unflushed write was lost. Crash (no flush) so the data
 /// lives ONLY in that WAL, back up, lose every root, restore: it must all come
-/// back via replay. (A config-file `wal_local_dir` is NOT exercised here: the
-/// engine itself loses writes across a plain crash with it — TD-WALDIR-1 — so
-/// no backup could preserve them; `crash_restart_control` pins the baseline.)
+/// back via replay. (The config-file `wal_local_dir` crash case is pinned by
+/// `crash_restart_with_config_file_wal_local_dir`, TD-WAL-5.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_consistent_backup_includes_the_wal_when_enable_wal_is_false() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
@@ -519,6 +515,19 @@ async fn crash_consistent_backup_includes_the_wal_when_enable_wal_is_false() -> 
 /// from a backup gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_restart_control() -> anyhow::Result<()> {
+    crash_restart_round_trip(false).await
+}
+
+/// TD-WAL-5 regression: the same immediate SIGKILL-after-ack scenario with
+/// `wal_local_dir` set in the CONFIG FILE (no env override). The write path
+/// honoured the TOML field while replay read only the env, so every
+/// acknowledged write was lost (all 6 reads 404) before the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_restart_with_config_file_wal_local_dir() -> anyhow::Result<()> {
+    crash_restart_round_trip(true).await
+}
+
+async fn crash_restart_round_trip(config_wal_local_dir: bool) -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let live = temp.path().join("live");
     std::fs::create_dir_all(&live)?;
@@ -526,9 +535,13 @@ async fn crash_restart_control() -> anyhow::Result<()> {
     let data_dir = live.join("server_data");
     let config = temp.path().join("server.toml");
     let collection = "crash_control";
+    let wal_local_dir = config_wal_local_dir.then(|| live.join("waldisk"));
+    if let Some(dir) = &wal_local_dir {
+        std::fs::create_dir_all(dir)?;
+    }
     let scenario = Scenario {
-        enable_wal: false,
-        wal_local_dir: None,
+        enable_wal: config_wal_local_dir,
+        wal_local_dir,
         cwd: temp.path().join("cwd"),
         server_env: Vec::new(),
     };
@@ -545,6 +558,8 @@ async fn crash_restart_control() -> anyhow::Result<()> {
         })
         .collect();
     insert_batch(&server.base_url, collection, &records).await?;
+    // Kill IMMEDIATELY after the ack: TD-WAL-5 only reproduced inside this
+    // window (before a manifest entry recorded the local WAL base).
     server.crash()?;
 
     let server = ServerProcess::start(&root, &data_dir, &config, &scenario).await?;

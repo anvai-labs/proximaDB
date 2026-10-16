@@ -1,80 +1,42 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-IOBUDGET-2: follow-up verdicts after first-principles review — TD-IVF-4 closed, chooser flip NOT evidence-complete, A/B invalidated
-:icons: font
 
-**Status:** RESOLVED (as a decision record + evidence repair). TD-IVF-4 shipped in this
-batch; the read-strategy-chooser default flip is **refused on evidence** and its enablement
-path (harness flag) is fixed; the AZURE-profile default raise is **refused on guard
-strikes**. The A/B that claimed to support the chooser flip is **invalidated**.
-**Origin:** TD-IOBUDGET-1's review round deferred two follow-ups. Working backwards from
-each decision through fresh terrain exploration produced three verdicts; two of them are
-refusals, which is the point of recording them.
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial: Verdict 1 (destination-aware writer geometry, closes TD-IVF-4) shipped (#1820); the invalid chooser A/B was repaired and re-run with engagement attested (#1820, #1827). Open: the read-strategy-chooser default flip PR (env re-tier + default-OFF test update + logging-target fix); the AZURE 4→16 MiB profile raise stays refused pending named evidence.** (Previous status line said RESOLVED; the chooser gate `PROXIMADB_STORAGE_READ_STRATEGY_CHOOSER` is still default-OFF on develop.)
+| Component | `src/storage/engines/sst/block_cluster.rs`, `segment_format.rs`, `scripts/bench/sift1m_get_reduction.py`
+| Relates to | link:TD-IOBUDGET-1-toml-per-location-io-budget.adoc[TD-IOBUDGET-1]; link:TD-IVF-4-cell-geometry-hardcodes-cloud-iop-target.adoc[TD-IVF-4] (overlap: Verdict 1 = TD-IVF-4's resolution; canonical detail there); link:TD-RDSTRAT-13-object-cold-probe-rank-morsels-and-round-collapse.adoc[TD-RDSTRAT-13]; link:TD-SEARCH-3-per-operation-read-coalescing.adoc[TD-SEARCH-3]; `IOBUDGET2_CAMPAIGN_2026_09_03.adoc`
+|===
 
-== Verdict 1 — plumb the destination URL (SHIPPED, closes TD-IVF-4)
+== History (shipped)
 
-The TD-IVF-4 premise ("destination unknown at clustering time") was narrower than filed.
-The default flush never reaches `ivf_fine_cell_count` (flush IVF clustering is the eval
-knob `PROXIMADB_PAX_FLUSH_CLUSTER=ivf`, default OFF); the live path is compaction, which
-always knew its output object (`SstCompactionTask.output_file`). The fix threads
-`destination_url` from the seven production writer call sites into
-`write_target_block_bytes(destination)`, so writer cell geometry resolves the SAME
-per-location budget (TD-IOBUDGET-1 registry) the reader resolves for that path — the
-ADR-065 "one cell ≈ one IOP" premise now holds on both sides of the storage boundary.
-Details in the TD-IVF-4 Resolution section. Red→green:
-`destination_url_resolves_the_iop_target` (block_cluster).
+*Verdict 1 — destination URL plumbed (closes TD-IVF-4).* The live writer path is compaction, which always
+knew its output object; `destination_url` now reaches `write_target_block_bytes`, so writer cell geometry
+resolves the same per-location budget the reader does (ADR-065 "one cell ≈ one IOP" holds on both sides).
+With an empty registry `file://` now derives LOCAL 1 MiB instead of hard-coded CLOUD 4 MiB (k ×4 on new
+compaction segments; self-describing per segment, mixed-read-safe). *Measured (`iobudget2_file_geometry_sift1m`):*
+object-cold bytes/q −51.1%, GETs/q −13.3%, recall 0.9835→0.9794; the product owner accepted the trade and the
+recall floor dropped 0.98 → 0.975 repo-wide (2026-09-03). Rollback: `PROXIMADB_DISK_CLASS=hdd` or per-location `disk_class = "hdd"`.
 
-Co-design note: this also removes a silent divergence — with an empty registry the writer
-now derives the SCHEME default (s3:// → S3 8 MiB; **file:// → LOCAL 1 MiB — the DEFAULT
-deployment's k ×4 on new compaction segments, reader nprobe ≈ ×2, self-adapting via each
-segment's stored k_c**) where it previously hard-coded CLOUD (4 MiB), which is exactly
-what the reader already assumed for that path. **MEASURED 2026-09-03 (`iobudget2_file_geometry_sift1m`)**: object-cold bytes/q −51.1%,
-GETs/q −13.3%, recall 0.9835→0.9794 — which FAILED the then-0.98 floor, and the product
-owner accepted the trade: the recall floor drops 0.98 → 0.975 repo-wide (product decision
-2026-09-03), making the operating point shippable. Rollback levers remain
-(`PROXIMADB_DISK_CLASS=hdd` pod-wide or per-location TOML `disk_class = "hdd"`). Full
-tables in the TD-IVF-4 Resolution and `IOBUDGET2_CAMPAIGN_2026_09_03.adoc`. New segments only; cell counts are per-segment
-self-describing metadata (no format change, mixed-read-safe by construction); cross-host
-byte-determinism is a pre-existing config-driven class (cf. `PROXIMADB_IVF_K`).
+*Verdict 2 — the original chooser A/B was invalid.* The harness popped `PROXIMADB_STORAGE_READ_STRATEGY_CHOOSER`
+from the server env and the constructor parameter had no CLI flag, so the "ON" arm ran chooser-OFF (byte-identical
+GET/q 20.05 in both arms). *Lesson:* an A/B whose arms produce byte-identical physical counters is not evidence;
+attest engagement. `--adaptive-read-strategy` now exists and the OFF arm fails fast if the gate leaks into its env.
+TD-RDSTRAT-13's Chooser A/B section (unmerged worktree commit 188787302) must NOT be cherry-picked as-is.
+*Re-run (`read_strategy_chooser_sift1m_minio`, flip-checklist steps 1+2 DONE):* object-cold GETs 21.95 → 12.82
+(−41.6%) at byte-identical recall; warm phase −29.3% GETs, −6.9% p50; the ON arm passes every gate the OFF arm fails.
 
-== Verdict 2 — the chooser default flip is REFUSED on evidence; the supporting A/B is INVALIDATED
+== Open: chooser default-flip PR
 
-The only chooser A/B ever run (TD-RDSTRAT-13 campaign, 2026-08-31, Mac→dataserver2 MinIO)
-is invalid:
-
-* The bench harness (`scripts/bench/sift1m_get_reduction.py`) POPS
-  `PROXIMADB_STORAGE_READ_STRATEGY_CHOOSER` from the spawned server's env and re-sets it
-  only via the `adaptive_read_strategy` constructor parameter — which had **no CLI flag
-  and no caller**. The "ON" arm ran chooser-OFF.
-* Corroborating evidence: both arms reported byte-identical GET/q (20.05) and bytes/q
-  (62,087,166.41); zero `pax.range_estimator` observe lines in either server log; the
-  p50 delta (4271→4194 ms, −1.8%) is noise-consistent.
-* Both arms also FAILED the harness's own `object_cold GET/q ≤ 20.00` gate; the campaign
-  never produced a gate-passing pair at any arm.
-
-An earlier session recorded the A/B as "evidence-backed" for a default flip. That record
-was wrong; this TD supersedes it. The invalidation also means TD-RDSTRAT-13's Chooser A/B
-section (unmerged worktree commit 188787302) must NOT be cherry-picked to develop as-is.
-
-**Enablement shipped in this batch:** `--adaptive-read-strategy` now exists as a real CLI
-flag wired to the constructor param at all three harness construction sites, and the
-OFF arm now FAILS FAST if the gate leaks into its server env (the original defect class —
-an operator-exported gate silently engaging the "baseline").
-
-**Flip checklist — steps 1 and 3 DONE 2026-09-03 (`read_strategy_chooser_sift1m_minio`):**
-the A/B re-ran on dataserver2-local MinIO with the fixed flag; engagement attested by the
-wiring print (x3 ON, x0 OFF) and a −41.6% object-cold GET delta (21.95 → 12.82) with
-byte-identical recall; the ON arm passes every gate the OFF arm fails; the warm-phase
-(cache-present) pair degrades nothing (−29.3% GETs, −6.9% p50) — the cache-tier evidence
-the estimator's ledger note names. The ledger claim exists. One logging follow-up: the
+One logging follow-up: the
 `pax.range_estimator` tracing target emitted nothing at info level on the 2b binary —
 route it to a visible level in the flip PR so future runs self-attest.
 
-**Flip checklist — the two steps the flip PR executes (this TD records them; execution is gated on product review of the campaign claim):**
+The two steps the flip PR executes (execution is gated on product review of the campaign claim):
 
-. (DONE — see above) Re-run the A/B with the flag; engagement attested; both-arm gate
-   outcomes recorded; ledger claim added.
-. (DONE — see above) Cache-tier paired evidence satisfied by the warm-phase pair.
+[start=3]
 . Re-tier the env row (`ENV_GATE_REGISTRY.adoc:250`, tier `eval`) to a kill-switch named
    for what it DISABLES (`PROXIMADB_STORAGE_READ_STRATEGY_CHOOSER_DISABLE`), keeping the
    old name as deprecated alias — copy the `PROXIMADB_PAX_READ_COARSE_PROBE` flip shape.

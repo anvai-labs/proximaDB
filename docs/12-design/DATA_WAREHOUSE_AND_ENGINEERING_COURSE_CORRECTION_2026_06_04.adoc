@@ -127,7 +127,7 @@ are unwired. The roadmap is therefore *gap closure + a deliberate multi-engine s
 not a green-field build.
 
 **Target storage decomposition (per the revised LLD + storage-format docs,
-2026-06-04 — aspirational, not yet coded):** the relational storage model is tiered, not
+2026-06-04 — aspirational at the time; status 2026-10-15: both `crates/storage/proximadb-object-store` and `crates/storage/proximadb-iceberg-engine` now exist and DataFusion serves Parquet-backed tables):** the relational storage model is tiered, not
 Parquet-only. xCatalog owns schemas, constraints, workload profiles, authority modes, and
 freshness. WAL plus `RecordStorage`/the OLTP row-delta tier is the **write-ahead +
 strong-freshness authority** for PostgreSQL-style DML, primary keys, unique checks, check
@@ -207,12 +207,16 @@ yet; WIRE = code exists but unwired; LIVE = extend an existing live path).
   the contract before any second executor exists. _(scheduler = NEW; route fields reuse
   the existing typed route surface.)_ +
   Update 2026-06-05: the read-side typed route/explain artifact now exists as
-  `src/query/read_route.rs`; live read paths still need to emit it.
+  `src/query/read_route.rs`; live read paths still need to emit it. +
+  Status 2026-10-15: *done* — `ComputeScheduler::route_select_plan` materializes `RoutedReadPlan` and
+  pgwire `EXPLAIN` carries the nested `ReadRouteExplanation`.
 . **P1 — First LIVE DataFusion OLAP read.** Teach the scheduler one real OLAP rule
   (e.g. multi-table join / large aggregate over a Parquet-backed table) and route it to
   a DataFusion `SessionContext` over the existing `FilesystemParquetSplitReader` —
   turning `src/datafusion/**` into a real query path for the first time. pgwire
-  smoke-test; default stays Volcano, opt-in by table/feature. _(WIRE.)_
+  smoke-test; default stays Volcano, opt-in by table/feature. _(WIRE.)_ +
+  Status 2026-10-15: *done* — OLAP-shape queries over Parquet-backed tables route to
+  `DataFusionLocal` behind the default-on `datafusion-integration` feature.
 . **P2 — Polars local-analytics seam (OPTIONAL / benchmark-gated — see §5.1 note).**
   DEFERRED until profiling shows DataFusion's small/single-partition OLAP overhead is a
   measured problem. When justified: a `partitions == 1 && join_count == 0` rule routes
@@ -237,7 +241,7 @@ yet; WIRE = code exists but unwired; LIVE = extend an existing live path).
 . **P4 — Shared logical lowering. DONE + WIRED.** `lower_logical_node`
   (`src/datafusion/logical_lowering.rs`, `30a906bd7`) lowers
   `proximadb-relational-algebra::LogicalNode` → DataFusion `LogicalPlan`
-  (Scan/Filter/Project/Aggregate/Sort/Limit; Join/Union/Distinct pending). **Wired into
+  (Scan/Filter/Project/Aggregate/Sort/Limit; Join/Union/Distinct pending — status 2026-10-15: Join/Union/Distinct now lowered too, per `src/datafusion/logical_lowering.rs` module doc). **Wired into
   the live P1 route `2cc16aa44`**: `run_datafusion_select` now lowers via the SHARED
   relational frontend (`lower_sql`→`LogicalNode`→`lower_logical_node`) instead of
   re-parsing with `ctx.sql` — the "shared logical plane, split physical plane" §5
@@ -248,14 +252,19 @@ yet; WIRE = code exists but unwired; LIVE = extend an existing live path).
   `LocalComputeProvider::execute` stub with a real DataFusion-backed `ExecutionEngine`
   + the notebook blueprint's coordinator/worker model (multi-process/thread). Async
   Tokio object-store fetch + footer/manifest caches + predicate pushdown. _(replaces a
-  STUB.)_
+  STUB.)_ +
+  Status 2026-10-15: the dead `LocalComputeProvider` scaffold was *deleted* (see `src/compute/mod.rs`
+  note); a real coordinator/worker model remains *open* — see
+  link:DATAFUSION_BALLISTA_DISTRIBUTED_EXECUTION_2026_06_05.adoc[the Ballista blueprint] (P2/P3 open).
 . **P6 — Python DataFrame API (PySpark-like).** PyO3 DataFrame that lowers to the SAME
   logical plan as SQL, scheduled by the same `ComputeScheduler`. _(NEW.)_
 . **P7 — RL-driven routing (§5.2 Phase 2).** Feed the policy scheduler's observed
   latency/throughput/I-O into the existing `RLPlanner` (Thompson sampling / contextual
   bandits) so it learns cost models and autonomously tunes the Volcano/Polars/
   DataFusion/Specialized equilibrium for HTAP. _(extends an existing component;
-  policy rules remain the safe fallback + the RL action space.)_
+  policy rules remain the safe fallback + the RL action space.)_ +
+  Status 2026-10-15: the trace-driven route cost model with observe→override→explore shipped;
+  the RL planner itself is *deferred* (see the co-design spine §5 C4).
 
 **SaaS MVP cut (§9):** P0, P1, P3, P5 deliver the §9.1 MVP scope — single-node
 pseudo-distributed execution, object-store persistence, **Volcano + DataFusion** +

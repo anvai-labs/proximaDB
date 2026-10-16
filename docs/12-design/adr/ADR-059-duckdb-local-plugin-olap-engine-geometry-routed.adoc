@@ -5,7 +5,7 @@
 [cols="1,3",options="header"]
 |===
 | Field | Value
-| Status | **Proposed / evidence-only** (filed 2026-07-10; causal account corrected 2026-07-14). The original NDV/CBO diagnosis was superseded by TD-OLAP-17: the dominant measured floor was a per-table, per-query WAL change scan during table open. Decider sign-off pending.
+| Status | **Proposed / evidence-only** (filed 2026-07-10; causal account corrected 2026-07-14; *reconciled 2026-10-15: `DuckDbLocalEngine` + harness (#872) and step-2 production routing for join/agg parquet OLAP, default-OFF (`4a80c79dc`), are in-tree; TD-OLAP-17 (the re-rooted floor) is Done*). The original NDV/CBO diagnosis was superseded by TD-OLAP-17: the dominant measured floor was a per-table, per-query WAL change scan during table open. Decider sign-off pending.
 | Decider | Vijaykumar Singh (2026-07-10)
 | Date | 2026-07-10
 | Relates to | link:ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (bytes-scanned is the dominant cloud-OLAP cost term; the seam is swappable), link:ADR-039-olap-engine-boundary-swappable-physical-backend.adoc[ADR-039] (the backend leakage boundary / seam), link:ADR-058-engine-routing-eligibility-selection-stats-trust.adoc[ADR-058] (eligibility-vs-selection routing; D2 keeps `ComputeBackend` an enum), link:ADR-054-native-execution-engine-progressive-cutover.adoc[ADR-054] (the native engine — orthogonal PAX wedge), link:../../10-quality/td/TD-OLAP-15-native-engine-measured-posture-sf001.adoc[TD-OLAP-15] (the measured gap), link:../../10-quality/td/TD-OLAP-2-statistics-fed-cbo-cardinality.adoc[TD-OLAP-2] (the DF-CBO fix this partly defers), link:../../10-quality/td/TD-EXEC-2-plan-geometry-resource-model.adoc[TD-EXEC-2] (plan-geometry → engine routing).

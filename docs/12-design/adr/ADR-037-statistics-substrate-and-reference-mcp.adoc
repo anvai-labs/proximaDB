@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed (amended 2026-08-19 — tier-config delivery ladder, minimal-projection rule, tier-claim trust gate; see the amendment section)
+|Status|Proposed (amended 2026-08-19 — tier-config delivery ladder, minimal-projection rule, tier-claim trust gate; see the amendment section). *Reconciled 2026-10-15 — partially implemented:* TD-174 producer (sketches + flush hook + envelope, #412) In Progress; TD-175 In Progress; reference-MCP foundation (Decision 5, #470) landed, TD-176 Open.
 |Date|2026-06-26
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-004 (Unified Explain Contract — the `estimated_selectivity`/`estimated_rows`/`FilterDiagnostics` slots this ADR *fills*), ADR-027 (Unified Storage + Metering — PAX zone maps + coalesced write path + "OSS=mechanism, $=AnvaiOps policy"), ADR-030 (Hot-path trace+meter seam — "one seam, N readers" co-design; KSU write-path sibling), ADR-003 (MultiModelPlanV1 — the plan stats annotate), ADR-009/024 (schema + canonical type — the surface stats hang off), ADR-022 (agent memory layer — the agentic primitives the reference MCP projects), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (vertical-inside/standard-outside)

@@ -71,13 +71,13 @@ Search follows a three-stage path: memtable (in-memory, latest data) -> L0 SSTab
 
 **Reference implementations**: Apache Parquet, Apache Arrow, DuckDB
 
-=== Time-Partitioned Storage (Planned)
+=== Time-Partitioned Storage
 
-**Used by**: TST Engine (planned)
+**Used by**: TST Engine (`src/storage/engines/tst/` — partitions, ASOF join, OHLC, downsampling, recovery; implemented, status corrected 2026-10-15)
 
 **When to use**: Time-series data with natural time ordering. OHLC bars, sensor readings, metrics, and any data with a dominant time dimension.
 
-**Planned implementation**:
+**Implementation** (originally planned shape):
 
 * Time-partitioned columnar segments where each partition covers a fixed time window (e.g., 1 day)
 * Automatic partition pruning on time-range queries eliminates scanning irrelevant data

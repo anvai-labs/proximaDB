@@ -2,7 +2,7 @@
 :toc:
 :toclevels: 3
 
-Status: active consolidation plan +
+Status: active consolidation plan — **Partial (verified 2026-10-15)**: Batches 1–3 done; Batch 4 partial (`docs/_archive/design/2026-05/` exists; per-ADR `== Governs` backfill covers 12 of 94 ADRs; the `vision` duplicate `docs/05-concepts/vision.adoc` vs `docs/00-product/VISION.adoc` remains). The *Archive Rules*, *Public Navigation Standard*, *SaaS/Core Boundary* and *Maintenance Checklist* sections are the standing rules. The "Current Findings" inventory below is a 2026-05-22 snapshot (e.g. `docs/12-design` then held 11 files). +
 Date: 2026-05-22 (last audit 2026-05-26) +
 Scope: OSS repository documentation, SaaS/core boundary documentation, active design docs, and
 archive rules.

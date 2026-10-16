@@ -4,14 +4,32 @@
 :toc: left
 :toclevels: 3
 :icons: font
-:last-updated: 2026-09-21
+:last-updated: 2026-10-15
 
 *Normative authority:* ADR-094 (unified storage substrate and compute seam).
 This document is the implementation specification for that decision. Where this
 document and ADR-094 disagree, ADR-094 governs.
 
-*Status:* Draft, tracking ADR-094 (`Proposed`). No clause here is implemented until
-its owning TD (`TD-USUB-*`) lands, default-OFF.
+*Status:* **Partial (reconciled 2026-10-15).** The spec tracks ADR-094, which is still `Proposed`.
+Each clause is implemented only when its owning TD (`TD-USUB-*`) lands, and new behaviour lands
+default-OFF. Per-clause state:
+
+[cols="1,1,3", options="header"]
+|===
+| Clause | Owning TD | State
+| §1.3 additive layouts | link:../10-quality/td/TD-USUB-4-storage-layouts-clobber-so-multi-representation-is-inexpressible.adoc[TD-USUB-4] | **Shipped** (#1920). Publication upserts by layout `name`. The `MATERIALIZE`-destroys-native-layout defect was fixed with it.
+| §2.1 typed columns authoritative | link:../10-quality/td/TD-USUB-6-typed-user-columns-authoritative-not-duplicated.adoc[TD-USUB-6] | **Partial.** Version dispatch, shred directory, declared types and the residual tail landed default-OFF (#1925, #1926, #1929, #1930). Write amplification was measured (#1931, #1934). Open: the default flip, and convergence with the segment-level `shred_field_map`.
+| §2.2 adaptive structural encoding | link:../10-quality/td/TD-USUB-7-adaptive-per-column-structural-encoding.adoc[TD-USUB-7] | **Open.**
+| §3 catalog-resident Layer B | link:../10-quality/td/TD-USUB-8-catalog-resident-serving-metadata-collapses-cold-read-depth.adoc[TD-USUB-8] | **Partial.** Slices 0–2 (#1936, #1941, #1943) took warm-read depth 3 → 0 via the segment-index cache, ratcheted. Open: slice 3, which must be argued on cold start, cross-node sharing or planner-time pruning, not on depth.
+| §4.1 `RecordReader` + `PAR1` detect | link:../10-quality/td/TD-USUB-5-record-reader-trait-and-parquet-detect-arm.adoc[TD-USUB-5] | **Shipped** (#1921).
+| §4.3 capability storage-independent | link:../10-quality/td/TD-USUB-2-sql-capability-must-not-depend-on-storage-format.adoc[TD-USUB-2] / link:../10-quality/td/TD-USUB-3-abac-silently-removes-sql-capability.adoc[TD-USUB-3] | **Partial.** ABAC in-plan enforcement shipped (TD-USUB-3, #1919). The native table provider landed default-OFF behind `PROXIMADB_NATIVE_TABLE_PROVIDER` (TD-USUB-2, #1917). Open: making provider registration, not `parquet_backed`, the gate by default.
+| §5 route-stamp integrity | link:../10-quality/td/TD-USUB-9-route-stamp-integrity-and-dead-interop-code.adoc[TD-USUB-9] | **Shipped** (#1924). Open: cost-only routing over enumerated layouts.
+| §6 interop defects | TD-USUB-9 | **Shipped** (#1924). Iceberg publish failure is surfaced, and the dead `src/storage/formats/open/iceberg.rs` was deleted.
+| §6 Iceberg v3 / incremental publication | link:../10-quality/td/TD-USUB-10-incremental-publication-before-any-automation.adoc[TD-USUB-10] | **Partial.** Slice 0 (manifest-driven file selection) landed. Slices 1–3 are open.
+|===
+
+Paragraphs below that say "today" describe the pre-ADR-094 state that motivated each clause. The
+table above is the current state.
 
 == §1 Substrate model
 
@@ -46,9 +64,9 @@ A table MAY carry more than one layout. Additional representations are an
 optimization selected on cost, never a capability requirement, and never created
 implicitly by a user-visible DDL side effect.
 
-**Prerequisite:** `set_storage_layouts` currently *replaces* the list
-(`src/services/dml/mod.rs:2052`), making multi-representation inexpressible. TD-USUB-4
-makes it additive. Until then §5 routing is not implementable.
+**Prerequisite (met, #1920):** `set_storage_layouts` used to *replace* the list, which
+made multi-representation inexpressible. TD-USUB-4 made it additive, so §5 routing is now
+implementable.
 
 == §2 PAX v3 block format (vector / multimodal arm)
 
@@ -217,11 +235,10 @@ Under this spec:
 . The router enumerates the table's **available layouts** (§1.3) and scores each using the
   existing `CostQuantities` (`get_ops`, `bytes_read`, `egress_bytes`, `bytes_written`,
   `compute_ms` — `src/query/route_cost_model.rs:624-637`).
-. Route stamping must reflect what **actually executed**. Today, enabling
-  `PROXIMADB_DF_PAX_READER` changes only the stamp while Volcano still serves
-  (`compute_scheduler.rs:392-396`, `pax_adapter.rs:73-82`), poisoning cost cells with
-  mis-attributed samples. That is a correctness bug in the cost loop and is fixed before
-  any cost-based flip (TD-USUB-9).
+. Route stamping must reflect what **actually executed**. Enabling
+  `PROXIMADB_DF_PAX_READER` used to change only the stamp while Volcano still served,
+  which poisoned cost cells with mis-attributed samples. That cost-loop correctness bug
+  was fixed by TD-USUB-9 (#1924), a prerequisite for any cost-based flip.
 
 == §6 Interop seam
 
@@ -229,17 +246,15 @@ Parquet/Iceberg is the **export and external-read** seam. Target Iceberg **v3**:
 deletion vectors (Roaring bitmaps in Puffin sidecars), row lineage, and Variant with
 shredding — the last mapping directly onto §2.1.
 
-Two live defects to fix as part of this work:
+Two live defects were fixed as part of this work (TD-USUB-9, #1924):
 
-* **Silent publish failure.** `publish_iceberg_table` failure is swallowed with a
-  `tracing::warn!` (`src/services/dml/mod.rs:2107-2111`), so Iceberg metadata can be
-  absent while the table still reads fine locally. An interop seam that fails silently is
-  worse than one that fails closed.
-* **Dead parallel implementation.** `src/storage/formats/open/iceberg.rs` (1507 lines,
-  `IcebergFormat`/`IcebergConfig`) has **zero non-doc references** — it is exported but
-  never constructed. Delete it, or merge it into the live
-  `crates/storage/proximadb-iceberg-engine` path. Two implementations of one seam is the
-  drift this spec exists to remove.
+* **Silent publish failure (fixed).** A `publish_iceberg_table` failure used to be swallowed
+  with a `tracing::warn!`, so Iceberg metadata could be absent while the table still read
+  fine locally. The failure is now surfaced. An interop seam that fails silently is worse
+  than one that fails closed.
+* **Dead parallel implementation (deleted).** `src/storage/formats/open/iceberg.rs` (1507
+  lines) had zero non-doc references and was removed. The live path is
+  `crates/storage/proximadb-iceberg-engine`.
 
 == §7 Invariant compliance matrix
 

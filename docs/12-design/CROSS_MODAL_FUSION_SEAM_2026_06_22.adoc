@@ -3,7 +3,7 @@
 :sectnums:
 :icons: font
 
-Status: Draft +
+Status: Draft design — **Partial in execution (verified 2026-10-15 against `TECHNICAL_DEBT.adoc`)**: F-A TD-136 and F-B TD-137 In Progress; F-G TD-142 and F-H TD-143 Partial; F-C/F-D/F-E/F-F (TD-138..141) Open. The fusion core was extracted to its own crate under link:../10-quality/td/TD-DECOMP-19-extract-cross-modal-fusion.adoc[TD-DECOMP-19]. +
 Date: 2026-06-22 +
 Owner: Query / Search +
 Related: `CODE_GRAPH_CORRELATED_SUBSTRATE_2026_06_22.adoc`, `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`, `RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc`, `TD_064_PREDICATE_AWARE_VECTOR_SEARCH_DESIGN_2026_05_27.adoc`
@@ -127,14 +127,14 @@ Each stage moves the dominant cost term, not CPU:
 |===
 | Item | Scope | TD
 
-| F-A | Neutral `Fuser` core + PIT calibration + calibrated-linear/RRF + consensus + skip-gates (Phase 1) | TD-136
-| F-B | `GraphExpander` (oid-keyed percentile-rank, bounded k-hop) + vector seed + REST v2 `fusion-search` endpoint (Phase 1) | TD-137
-| F-C | Converge `DocumentExpander` (fold `HybridFusionEngine` onto the seam) | TD-138
-| F-D | `RelationalExpander` prefilter (reuse TD-127/128; NaviX semimask) | TD-139
-| F-E | Edge-grain fusion (HELIOS) | TD-140
-| F-F | `ComputeScheduler` fusion routing (UNIFY cardinality + BoomHQ local pre-probe; measured threshold router) | TD-141
-| F-G | `oid` / entity alias resolution (synonym linking) | TD-142
-| F-H | Retire the weak proto path; collapse the 12-strategy engine to D4 | TD-143
+| F-A | Neutral `Fuser` core + PIT calibration + calibrated-linear/RRF + consensus + skip-gates (Phase 1) | TD-136 (In Progress)
+| F-B | `GraphExpander` (oid-keyed percentile-rank, bounded k-hop) + vector seed + REST v2 `fusion-search` endpoint (Phase 1) | TD-137 (In Progress)
+| F-C | Converge `DocumentExpander` (fold `HybridFusionEngine` onto the seam) | TD-138 (Open)
+| F-D | `RelationalExpander` prefilter (reuse TD-127/128; NaviX semimask) | TD-139 (Open)
+| F-E | Edge-grain fusion (HELIOS) | TD-140 (Open)
+| F-F | `ComputeScheduler` fusion routing (UNIFY cardinality + BoomHQ local pre-probe; measured threshold router) | TD-141 (Open)
+| F-G | `oid` / entity alias resolution (synonym linking) | TD-142 (Partial)
+| F-H | Retire the weak proto path; collapse the 12-strategy engine to D4 | TD-143 (Partial)
 |===
 
 Phase 1 (F-A, F-B) is the reference implementation: the graph modality as the first instance on the seam,

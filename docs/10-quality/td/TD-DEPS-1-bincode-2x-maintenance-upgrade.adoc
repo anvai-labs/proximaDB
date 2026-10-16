@@ -106,10 +106,12 @@ Treat as **maintenance, low priority** — not a perf or compression win:
 . Keep `bincode 3.0.0` permanently out. Consider an `ignore` entry in
   `.github/dependabot.yml` if it is proposed again — noting that config only
   takes effect once it reaches the default branch `main` (see TD-SDK-2's
-  sibling finding about dependabot config living on `main`).
+  sibling finding about dependabot config living on `main`). *Update
+  2026-10-15:* the default branch is now `develop` (TD-DEPSEC-1), so a
+  `develop` config change takes effect directly.
 
 == Deps
 
-* Related: mandate #8 (storage-format migration), mandate #6 (measure, don't
+* Related: link:TD-DEPS-2-breaking-cargo-upgrades-deferred.adoc[TD-DEPS-2] (other deferred cargo majors), mandate #8 (storage-format migration), mandate #6 (measure, don't
   assert), `BENCHMARK_EVIDENCE.toml`.
 * Closed as harmful: dependabot #1502 (bincode 3.0.0).

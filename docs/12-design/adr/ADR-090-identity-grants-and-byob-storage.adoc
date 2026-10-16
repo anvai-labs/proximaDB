@@ -11,6 +11,8 @@
 Proposed (2026-08-06). Layered rollout (L0→L3 below); each layer is independently
 landable and evidence-gated. Program tracker: TD-AUTHZ-1.
 
+*Reconciled 2026-10-15 — L0/L1 largely landed:* L0.1 principal + API-key registry (#1514), L0.3 one gRPC port-identity construction (#1516), L1.1 Grant catalog object + admin surface (#1517, #1534), L1.2 grant enforcement at read admission default-OFF (#1529), item 3 escalation-safe cross-tenant open (#1562), L2.1 subject-parameterized row predicates (#1689). TD-AUTHZ-1 In Progress; L2 remainder and L3 (BYOB storage) open.
+
 == Context — the target model
 
 The security/tenancy architecture is re-derived from first principles against the

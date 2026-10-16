@@ -50,6 +50,20 @@ const DEFAULT_TOP_K: u32 = 10;
 /// Reciprocal Rank Fusion constant (standard default).
 const RRF_K: u32 = 60;
 
+/// Semantic-leg recall pool: `top_k * RECALL_POOL_MULTIPLIER` (headroom for
+/// fusion / post-filter), at least `top_k` and at least 1.
+/// Clamped to the server cap (`max_top_k()`): the pool is an internal
+/// oversample, so an at-cap `top_k` must not trip the cap that
+/// `unified_search_v1` enforces (TD-SECSCAN-1 §5). `top_k` itself is checked
+/// against the cap before this is computed.
+fn recall_pool_size(top_k: u32) -> usize {
+    (top_k as usize)
+        .saturating_mul(RECALL_POOL_MULTIPLIER)
+        .max(top_k as usize)
+        .min(proximadb_search_types::top_k_limit::max_top_k())
+        .max(1)
+}
+
 /// Scope + query parameters extracted from the AQL predicate tree.
 #[derive(Default, Debug, PartialEq)]
 struct MemoryScope {
@@ -255,10 +269,11 @@ impl AqlSource for MemoryAqlSource {
                 )));
             }
         }
-        let recall_k = (scope.top_k as usize)
-            .saturating_mul(RECALL_POOL_MULTIPLIER)
-            .max(scope.top_k as usize)
-            .max(1);
+        // The client's top_k is checked against the shared cap BEFORE the
+        // internal oversample, so over-cap is a 400 and at-cap is served.
+        proximadb_search_types::top_k_limit::check_top_k(u64::from(scope.top_k))
+            .map_err(|e| ProximaDBError::InvalidInput(e.to_string()))?;
+        let recall_k = recall_pool_size(scope.top_k);
         let (scope_filter, filters_pushed) = Self::build_scope_filter(&scope);
 
         // ---- Semantic leg: scoped vector search (scope pushed down) ----------
@@ -276,7 +291,7 @@ impl AqlSource for MemoryAqlSource {
                 proximadb_tenant::AuthClass::Anonymous,
             )
             .await
-            .map_err(|e| ProximaDBError::Query(QueryError::VectorSearch(e.to_string())))?;
+            .map_err(VectorAqlSource::vector_search_error)?;
         let semantic_wall_us = start.elapsed().as_micros() as u64;
 
         // Build (id -> row) plus the ordered semantic candidate set. Rows carry
@@ -407,6 +422,20 @@ impl AqlSource for MemoryAqlSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-SECSCAN-1 §5 follow-up: the 5x recall oversample feeds
+    /// `unified_search_v1`, which enforces the server cap. An at-cap `top_k`
+    /// must yield a pool within the cap (clamped), never one that trips it.
+    #[test]
+    fn recall_pool_stays_within_the_top_k_cap() {
+        crate::services::top_k_env_test_support::with_max_top_k_override("10000", || {
+            let cap = proximadb_search_types::top_k_limit::max_top_k();
+            assert_eq!(recall_pool_size(10_000), cap);
+            assert_eq!(recall_pool_size(u32::MAX), cap);
+            assert_eq!(recall_pool_size(4), 4 * RECALL_POOL_MULTIPLIER);
+            assert_eq!(recall_pool_size(0), 1);
+        });
+    }
 
     fn vector_pred(v: Vec<f32>) -> AqlPredicate {
         AqlPredicate::Equals {

@@ -7,7 +7,7 @@
 
 [cols="1,3"]
 |===
-| Status | Proposed
+| Status | Proposed — **confirmed by link:ADR-0083-consolidated-catalog-identity-model.adoc[ADR-0083]** (reconciled 2026-10-15): the stable *composite* is authoritative. This ADR *amends ADR-031*, which ADR-0083 has since superseded (u64-as-identity) — read every "stable `object_id`" below as "the stable composite". The ABAC `tenant_stable_id` (u64) is the account u32 widened (ADR-0083 addendum), not a new mint. Threading slices: TD-NS-1 (Partial).
 | Date | 2026-07-26
 | Deciders | Vijaykumar Singh
 | Relates to | **ADR-031 (amends — stable `object_id` + typed base62 paths)**, **ADR-027 (amends — DrPath layout; the path contract keys on the stable id, not the display string)**, ADR-074 (namespace isolation — motivated this; its S1 seam threads the stable ids), ADR-036 (flat keys + per-object access tier), ADR-060 (metering — the stable id is the attribution unit)

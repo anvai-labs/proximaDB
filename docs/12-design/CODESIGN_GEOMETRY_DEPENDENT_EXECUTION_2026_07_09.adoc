@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 = Co-design: geometry-dependent, heterogeneous execution dispatch (2026-07-09)
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (proposal, verified 2026-10-15).** Design-only (#809); the sequenced slices below are not started as a program. Execution tracking lives in link:../10-quality/td/TD-OLAP-4-tpcds-performance-evidence-ledger.adoc[TD-OLAP-4] (Open). Any "native-operator" tier must respect link:adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (DataFusion kernels are the OLAP executor; no native HashAgg/HashJoin/Sort).
+| Relates to | link:adr/ADR-050-statistics-fed-datafusion-route-selection.adoc[ADR-050], link:adr/ADR-056-adaptive-execution-predicate-pushdown-first.adoc[ADR-056], link:NATIVE_OLAP_ENGINE_BLUEPRINT_2026_06_22.adoc[NATIVE_OLAP_ENGINE_BLUEPRINT] (overlap: native-vs-DataFusion engine dimension; canonical = ADR-052)
+|===
+
 TD-OLAP-4 co-design analysis. First-principles proposal: select the execution
 **engine and kernel per operation from the data geometry** — the way CUDA tiles a
 kernel to the matrix/arch geometry and llama.cpp dispatches a quant kernel per

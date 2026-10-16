@@ -5,47 +5,13 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Resolved 2026-07-14; retired scope reconciled 2026-07-21.** `Churn` forces Strong reads that merge the backpressure-bounded WAL/memtable delta, so re-embeds are visible before flush. The proposed dedicated mutable AXIS index is retired by ADR-061 D4 / TD-WLP-8; do not implement it from the historical scope below. ORION `oid` match-then-traverse already ships through TD-045 `/rag`; its residual is relevance evaluation, not this TD.
-| Priority | Resolved — Strong-read freshness is the shipped code-RAG payoff; no mutable-index follow-up remains.
-| Severity | Resolved — freshness and WAL authority hold by merging the already bounded delta.
-| Component | `StorageProfile::forces_strong_reads`, `churn_effective_freshness`, WAL/memtable Stage-1 merge, and profile-aware search observability
-| Governs | link:../../12-design/adr/ADR-061-per-collection-workload-profiles.adoc[ADR-061] (D4)
-| Relates to | ADR-044 (stable symbol OID / oid fusion), ORION (Beta in-memory CSR projection), TD-133 (opt-in cross-modal txn), the read-side dead-filter invariants (is_dead/valid_to_ns)
-| Pillar | PERF (immediate freshness on a bounded set), REL (WAL authority preserved), OE (memory guard)
+| Status | **Done (2026-07-14; retired scope reconciled 2026-07-21).** `Churn` forces Strong reads that merge the backpressure-bounded WAL/memtable delta, so re-embeds are visible before flush (#1000). The dedicated mutable AXIS index was retired by ADR-061 D4 / TD-WLP-8 (#1033); ORION `oid` match-then-traverse already ships through TD-045 `/rag`.
+| Component | `StorageProfile::forces_strong_reads`, `churn_effective_freshness`, WAL/memtable Stage-1 merge
+| Relates to | link:../../12-design/adr/ADR-061-per-collection-workload-profiles.adoc[ADR-061] (D4); link:TD-WLP-8-churn-mutable-index-orion-fusion-memory-guard.adoc[TD-WLP-8]; link:TD-WLP-10-churn-evidence-gated-flush-threshold.adoc[TD-WLP-10]; TD-ORION-1 (relevance eval residual); ADR-044
+| Pillar | PERF, REL, OE
 |===
 
-toc::[]
+== History
 
-== Why
-
-Agent-driven code-RAG is update-heavy and freshness-critical. The code review found the unflushed
-delta is already hard-bounded (about 2 MiB by default), so a Strong brute-force delta merge is the
-smallest correct mechanism. A second mutable index would add insert/evict/flush/replay coherence for
-a large-delta condition the bound excludes.
-
-== Shipped scope
-
-* `Churn` resolves requests to Strong freshness and merges the bounded unflushed delta.
-* Canonical durability stays WAL/`ProximaRecord`; compaction clustering stays off for `Churn`.
-* TD-WLP-8a supplies the working-set gauge/soft ceiling.
-
-== Retired proposal — do not implement
-
-The original dedicated mutable AXIS index, its flush-coherence machinery, and a new ORION fusion
-branch are superseded. Revisit an index only under a new evidence-backed TD if the bounded delta is
-measured to dominate latency. Use the existing TD-045 fusion seam for graph expansion.
-
-== TDD gate
-
-Integration test `tests/storage_wlp_churn_freshness.rs` (storage-integration CI job):
-
-* `test_churn_reembedded_symbol_immediately_visible`: insert a vector → query returns it; update
-  (re-embed) the SAME `oid`; query BEFORE any flush returns the NEW embedding's neighbours
-  (freshness); restart + WAL replay reconstructs identical state (authority invariant).
-* `test_append_collection_unaffected_by_churn_path`: an `AppendBulk` collection in the same process
-  still uses the durable path (mixed-read safety).
-
-== Gating
-
-Keyed on `workload_profile:churn`; `AppendBulk` remains unchanged. No new in-memory index or
-durability authority is authorized by this resolved TD.
+Agent-driven code-RAG is update-heavy and freshness-critical. *Decisive finding:* the unflushed delta is already hard-bounded (~2 MiB by default), so a Strong brute-force merge of it is the smallest correct mechanism; a second mutable index would add insert/evict/flush/replay coherence for a large-delta state the bound excludes. WAL/`ProximaRecord` stays the sole durable authority and compaction clustering stays off for `Churn`. Revisit an index only under a new evidence-backed TD showing the bounded delta dominates latency; use the existing TD-045 fusion seam for graph expansion.
+*Evidence:* `tests/storage_wlp_churn_freshness.rs` — `test_churn_reembedded_symbol_immediately_visible` (new embedding visible before flush; WAL replay reconstructs identical state) and `test_append_collection_unaffected_by_churn_path`.

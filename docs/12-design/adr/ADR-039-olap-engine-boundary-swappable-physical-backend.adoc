@@ -10,7 +10,7 @@
 |Relates to|ADR-018 (pgwire/SQL parity roadmap — the conformance driver), ADR-033 (own the vertical, keep the standard at the interop seam), ADR-024 (single canonical data type — `ProximaValue`), ADR-034 (route cost model / `ComputeScheduler`), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` ("vertical inside, standard outside")
 |Co-designed with|The "course-correction §5" guarantee — *shared logical plane, split physical plane* — which this ADR makes a frozen, ratcheted contract
 |Supersedes|—
-|Tracked under|TD-181 (no-DataFusion build CI guard + the leakage ratchet)
+|Tracked under|TD-181 (no-DataFusion build CI guard + the leakage ratchet). *Reconciled 2026-10-15:* **ID collision** — the register assigns TD-181 to the catalog-object OID migration (ADR-031), so these two guards have no TD of their own. A `no-default-features` build entry exists in the CI feature matrix; a dedicated `datafusion::` leakage grep ratchet and a Volcano-only *test* run were not found — treat both Verification items 1 and 3 as open until a TD is filed.
 |===
 
 == Context

@@ -9,7 +9,7 @@
 | Priority | MEDIUM — a correctness-adjacent scaling limit, and a hard prerequisite for any automated publication policy.
 | Component | `src/services/dml/mod.rs` (`materialize_table_to_parquet`), `crates/storage/proximadb-iceberg-engine/src/manifest.rs`
 | Relates to | ADR-094 (Decision 1 rationale), ADR-062 (fresh-name + atomic manifest advance), TD-USUB-4 (additive layouts), TD-USUB-9
-| Blocked by | TD-USUB-4 (a table must be able to hold more than one representation).
+| Blocked by | Nothing now — TD-USUB-4 (a table must be able to hold more than one representation) landed 2026-09-22 (#1920).
 |===
 
 == The finding

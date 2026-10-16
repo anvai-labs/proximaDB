@@ -2,6 +2,14 @@
 :toc: macro
 :icons: font
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial.** The OSS mechanism shipped: the neutral `KouLocality` enum, the `proximadb_kou_bytes_total{tenant_id, kou_locality, direction}` meter at the object-store read and pgwire/REST/Flight result boundaries, client-IP locality classification, and lossless Flight ZSTD shaping for chargeable clients (`37496b9bd`, `4716a59c7`). Open: the §4 pricing-layer re-pins, which are anvaiops policy, and deployment stages 2–4 (§3).
+| Component | `src/metrics/consumption_metrics.rs`, `src/network/middleware/metrics.rs`, `src/network/arrow_ipc/service.rs`, `src/network/postgres/protocol.rs`
+| Relates to | link:OSS_ENTERPRISE_BOUNDARY_2026_06_17.adoc[OSS boundary] (overlap: meter-vs-price split — canonical there), link:PAX_RANGED_READ_MULTICLOUD_COST_2026_06_25.adoc[PAX ranged-read cost] (storage-read side; KOU is result-egress only), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` §2.2
+|===
+
 Refines co-design Dimension 2 (Networking, `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`
 §2.2) into a *cloud-neutral, mistake-proof* outbound-data-movement model verified
 against AWS, Azure, and GCP primary pricing. The unit is **KOU (Outgress Unit)** —

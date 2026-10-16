@@ -6,7 +6,7 @@
 :sectnums:
 :last-updated: 2026-05-30
 
-Status: Draft, paired with link:adr/ADR-022-agent-memory-layer.adoc[ADR-022] +
+Status: **Partial** (verified 2026-10-15), paired with link:adr/ADR-022-agent-memory-layer.adoc[ADR-022] (still Proposed). P1 read surface shipped (TD-100 closed: `fb5f09e48`, `67b1373e5`); P2 write surface largely shipped (TD-101 In Progress: `fb5f09e48`, audit persistence `1fd31c80c`); P3 Slice A shipped (TD-102 Partial: `67b1373e5`, Slice B open); P4 open (TD-052/053/054). Phase table below carries the per-phase status. +
 Date: 2026-05-30 +
 Scope: Architecture, layering, capability-to-primitive mapping, and a phased plan for bringing mem0 /
 agentmemory in as first-class citizens of ProximaDB. +
@@ -191,19 +191,19 @@ The Phase-6 active-memory gates (TD-052/053/054) are pre-existing roadmap items 
 
 | P1 — Read surface
 | Wire AQL memory queries with tenant/session/`memory_type` scope over existing fusion + RERANK; emit RUBICON audit per query. Validate mem0 PGVector provider against pgwire 5433.
-| TD-100
+| TD-100 — *Done* (closed 2026-05-30)
 
 | P2 — Write surface
 | Extraction wrapper (`LLMIntegrationEngine` + AV-SQL pattern) → consolidation decision (retrieve + LLM `ADD/UPDATE/DELETE/NOOP`) → `ProximaRecord` write. `props["session_id"]` scope.
-| TD-101
+| TD-101 — *In Progress*
 
 | P3 — Framework adapters
 | mem0 `VectorStoreBase` provider + (optional) graph-store mapping to native graph; agentmemory pgvector path notes; conformance tests.
-| TD-102
+| TD-102 — *Partial* (Slice B open: Python mem0 `VectorStoreBase` provider, mem0g graph mapping, binary param decode)
 
 | P4 — Active memory (Phase 6 align)
 | Encoding gates (Novelty/Salience/Error, TD-053), entropy-based lazy loading (TD-054), proactive retrieval (TD-052).
-| TD-053/054/052
+| TD-053/054/052 — *Open*
 |===
 
 == Open questions

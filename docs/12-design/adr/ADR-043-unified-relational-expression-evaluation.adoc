@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Accepted
+|Status|Accepted — *partially implemented (reconciled 2026-10-15):* Invariant 1 fail-loud pushed-down predicates (#502), Invariant 2 cast unification (#521, closed TD-183), Invariant 3 typed JSON functions (#507) shipped; open per TD-186: planning-time rejection of unknown scalar functions.
 |Date|2026-06-28
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-039 (OLAP engine boundary — DataFusion is a swappable physical binding), ADR-040 (accuracy ratchets — the harness that exposed this), ADR-024 (canonical `ProximaValue` — the evaluation type), CLAUDE mandate #13 ("set the bar at the eval, not the demo")

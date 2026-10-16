@@ -2,6 +2,13 @@
 :toc: macro
 2026-06-19
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (verified 2026-10-15).** Shipped: the B1 building block `ReadFreshnessSla::should_scan_delta` (`src/query/read_route.rs`, `c1499c02d`). Open: A1–A3 (relational `cluster_by` is still defined with no DDL parse or flush consumer), the B1 router signal (`QueryShape` carries no `freshness`; `route_select` is not freshness-aware), B2 (deferred). Note: *vector* block clustering shipped separately (TD-RDSTRAT-5 S1 sign-Gray sort + PCA/IVF re-cluster, default ON since TD-WLP-4) — that is not this plan's relational `CLUSTER BY`.
+| Relates to | link:FORMAT_STRATEGY_ICEBERG_DELTA_LANCE_2026_06.adoc[FORMAT_STRATEGY_ICEBERG_DELTA_LANCE] (origin of both gaps), link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] (overlap: DataFusion-route freshness via the native table provider / bound memtable — check before building B2)
+|===
+
 toc::[]
 
 == Context
@@ -17,7 +24,7 @@ gates and new targeted tests as the feature gates.
 
 *Clustering:*
 
-* `cluster_by: Vec<String>` exists on `RdbmsProperties` (`src/catalog/internal/mod.rs:548`) —
+* `cluster_by: Vec<String>` exists on `RdbmsProperties` (`crates/control/proximadb-catalog/src/internal/mod.rs:548`) —
   *defined, no reader, no DDL `CLUSTER BY` parse*.
 * `allow_zorder_pruning: bool` (`src/catalog/tenant_tier.rs:391`) — defined, test-only, no
   read-path consumer.
@@ -97,7 +104,7 @@ B1's routing covers the freshness requirement without it.
 [cols="2,3",options="header"]
 |===
 | Area | File:line
-| cluster_by / zorder flags | `src/catalog/internal/mod.rs:548`, `src/catalog/tenant_tier.rs:391`
+| cluster_by / zorder flags | `crates/control/proximadb-catalog/src/internal/mod.rs:548`, `src/catalog/tenant_tier.rs:391`
 | Flush sort | `src/storage/engines/sst/utils.rs:43-95`, `sst/flush/mod.rs:134`
 | Zone-map skip (reader) | block-format `column_range_overlaps_*` (reader.rs)
 | DDL parse (CLUSTER BY) | relational frontend / DDL handler

@@ -7,7 +7,7 @@
 
 [cols="1,3"]
 |===
-| Status | Proposed
+| Status | Proposed — *partially implemented (reconciled 2026-10-15):* TD-QUEUE-1 Q0 + Q1 shipped; Q2–Q4 open (TD-EVENTLOG-1 Partial).
 | Date | 2026-07-28
 | Deciders | Vijaykumar Singh
 | Relates to | ADR-072 (foundational contract consolidation — the ratified decision this executes), ADR-071 (WAL is the write-path durability floor; the queue is the async/coordination plane), ADR-078 (flush→AXIS convergence — the AXIS queue retirement folds into this), ADR-036 (object storage = flat keys, no HNS), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (I/O round-trips are the dominant cost term)

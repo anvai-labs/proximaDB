@@ -1,20 +1,20 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-QUEUE-1: Consolidate the siloed EventLog/queue constructs onto one segment-based queuing primitive
-:status: In Progress
+:status: Partial — Q0 + Q1 shipped; Q2–Q4 open
 :date: 2026-07-28
 :dim: D1 (object storage — one prefix-LIST recovery per topic) + D4 (compute-per-modality)
 :pillar: OE
 :realizes: ADR-079 ; executes ADR-072 / TD-FOUNDATION-1
-:relates-to: TD-EVENTLOG-1 (resolved by Q2/Q4), TD-AXIS-3 S2 (absorbed by Q3), ADR-078 (AXIS convergence), ADR-071 (WAL stays separate)
+:relates-to: TD-EVENTLOG-1 (restart recovery + entity-keyed layout shipped there directly, #1276/#1297; `put_if_absent` end-state still via Q2/Q4), TD-LEASE-INFRA-1 (queue ownership/ACK hardening), TD-AXIS-3 S2 (absorbed by Q3), ADR-078 (AXIS convergence), ADR-071 (WAL stays separate)
 
 [cols="1,3"]
 |===
 | Field | Value
 
 | Status
-| **In Progress** — Q0 (reposition + audit) landing first. Each phase is an independently
-  shippable PR; migrations are mixed-read-safe per mandate #8.
+| **Partial: Q0 reposition + audit (#1288) and Q1 group-scoped pub/sub (#1295) shipped; open: Q2 (audit log → `audit` topic), Q3 (AXIS coordination → `axis-index` topic), Q4 (`agent-state` topic + `ConditionalKeyStore`).** Each phase is an independently
+  shippable PR; migrations are mixed-read-safe per mandate #8. (Re-verified 2026-10-15: `src/storage/engines/eventlog/` and `src/index/axis/eventlog/` are still standalone.)
 
 | Priority
 | P2 — the silos are functional but three carry verified correctness defects (restart data
@@ -49,7 +49,7 @@ silos exist.
   member + dep, `clients/python-queue-embedded/{pyproject.toml,README.md}`). Reconcile the
   stale "Phase 1B scaffold" docs with what the 74 tests prove (disk/object/recovery/leases
   all work). File ADR-079 + this TD.
-| landing
+| done (#1288)
 
 | **Q1**
 | **Group-scoped pub/sub (Kafka consumer-group semantics).** Key leases + offsets by
@@ -59,7 +59,7 @@ silos exist.
   advance the other's offset; recovery resumes each group's cursor. Needed before Q2 (audit
   fan-out). On-disk format change ⇒ mandate #8 gating (low blast radius — no production
   consumers yet).
-| next
+| done (#1295)
 
 | **Q2**
 | **Migrate the audit log → `audit` topic.** Mixed-read-safe: read legacy `event_NNNN.bin`

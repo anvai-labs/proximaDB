@@ -6,7 +6,7 @@
 
 [cols="1,3"]
 |===
-|Status |**Accepted** — implementation tracked by TD-COMPACT-2 and TD-COMPACT-4
+|Status |**Accepted** — implementation tracked by TD-COMPACT-2 and TD-COMPACT-4 (both Partial as of 2026-10-15: S1 byte-weighted admission, S2 hybrid byte policy + whole-file morsels, S3 pressure-yield + metrics shipped).
 |Date |2026-08-01
 |Decider |Vijaykumar Singh
 |Amends |ADR-076 background compaction admission

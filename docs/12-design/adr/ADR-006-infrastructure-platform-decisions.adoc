@@ -9,6 +9,13 @@
 
 Accepted
 
+Reconciliation (2026-10-15): §1 done (`crate-type = ["rlib"]`). §3 was **not executed as
+written**: SWIFT/RAPTOR were not moved to `archive/`; they remain in-tree behind the
+`experimental-engines` feature (`src/storage/engines/{swift,raptor}`,
+`crates/*/proximadb-raptor-engine`), as ADR-093 records. §4 Pulsar is superseded (retired, ORION
+only — see the in-section note). §2/§5/§6/§7 not re-verified; `src/cdc/connectors/postgres/`
+named in the File Plan does not exist. File Plan paths below are historical.
+
 == Context
 
 Several infrastructure and platform decisions cut across multiple issues and affect the overall system reliability, developer experience, and production readiness. This ADR consolidates decisions for:

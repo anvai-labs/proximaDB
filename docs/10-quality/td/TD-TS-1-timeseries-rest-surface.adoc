@@ -4,53 +4,34 @@
 
 [cols="1,3"]
 |===
-|Status|In Progress
+|Status|**Partial: native REST v2 surface + `TimeSeriesService` + capability flag shipped (#651); OpenAPI registration shipped (TD-SPECRAT-1 wave 7, spec 74→79 paths); open: gRPC/proto service, richer engine ops (OHLC, downsample, as-of join), full collection config, SDK emulation-fallback retirement.**
 |Priority|MED
 |Scope|FEAT
 |Date|2026-07-03
-|Relates to|the TST storage engine (`src/storage/engines/tst/`), the Python SDK time-series client (`clients/python/src/proximadb_sdk/timeseries.py`), the v2 REST surface conventions (`src/network/rest/v2/`)
+|Relates to|the TST storage engine (`src/storage/engines/tst/`), `src/services/timeseries_service.rs`, `src/network/rest/v2/timeseries.rs`, the Python SDK time-series client (`clients/python/src/proximadb_sdk/timeseries.py`); link:TD-CONN-1-surface-parity-gaps.adoc[TD-CONN-1] (overlap: the gRPC timeseries service is CONN-1 slice C2 — CONN-1 defers timeseries REST ownership here)
 |===
 
-== Context
+== History (shipped)
 
-The `TimeSeriesEngine` (`src/storage/engines/tst/mod.rs`) is a full time-partitioned
-columnar engine — `insert_record`, `query_time_range`, `query_ohlc`, `asof_join`,
-downsampling, retention, WAL + 2PC — but its native methods sit on **no trait**, so
-they were unreachable from the network layer. There was **no `/api/v2/timeseries/*`
-route** and no `"timeseries"` capability. The Python SDK already defines the exact
-contract it expects (`POST /api/v2/timeseries/collections` + `ingest`/`query`/
-`aggregate`) and **silently falls back to in-memory emulation** when the server has
-none. Worse, `engine:"tst"` on a normal collection is a *trap*: records flow through
-the engine's stubbed vector-shaped trait methods (24h hardcoded window,
-`vector_by_id→None`, log-only flush), a degraded vector surface, not the time-series
-API. Co-design principle: **each modality is exposed through its own native contract,
-never forced through the vector-record path.**
-
-== Landed (this PR)
-
-* `TimeSeriesService` (`src/services/timeseries_service.rs`) — a process-global service
-  (like `statistics_registry()`) wrapping a `TimeSeriesEngine`, initialised at
-  bootstrap under `<data_dir>/timeseries` (`SharedServices::new`). It calls the
-  **TST-native** methods (`insert_record`/`query_time_range`), never the stubbed
-  vector methods. Maps SDK points `{timestamp, values, tags}` ↔ `VectorRecord`
-  (values/tags in metadata, timestamp partitioned); `aggregate` buckets by
-  `bucket_ms` with avg/sum/min/max/count/stddev.
-* v2 REST module `src/network/rest/v2/timeseries.rs` matching the SDK contract:
-  `POST /api/v2/timeseries/collections` (create), `.../{c}/ingest`, `.../{c}/query`,
-  `.../{c}/aggregate`, `GET .../collections` (list), `DELETE .../{c}`. Tenant isolation
-  is structural (`effective_collection`).
-* `"timeseries"` added to `/_meta/capabilities` `features`.
+* **Gap.** `TimeSeriesEngine` (time-partitioned columnar: `insert_record`, `query_time_range`,
+  `query_ohlc`, `asof_join`, downsampling, retention, WAL + 2PC) sat on no trait and was unreachable; the
+  SDK silently fell back to in-memory emulation. `engine:"tst"` on a normal collection was a *trap*:
+  records flowed through stubbed vector-shaped trait methods (24h hardcoded window, `vector_by_id→None`,
+  log-only flush). Principle that still applies: **each modality is exposed through its own native
+  contract, never forced through the vector-record path.**
+* **Fix (#651).** Process-global `TimeSeriesService` (under `<data_dir>/timeseries`) calls the TST-native
+  methods only; REST v2 `POST /api/v2/timeseries/collections`, `…/{c}/ingest|query|aggregate`, list,
+  delete; `"timeseries"` in `/_meta/capabilities`; aggregate buckets by `bucket_ms` with
+  avg/sum/min/max/count/stddev. Later registered in the OpenAPI spec (TD-SPECRAT-1 wave 7).
 
 == Remaining
 
 * **gRPC + proto service** — a `.proto` time-series service + gRPC handlers on the
-  multiplexed port (the deferred follow-on; REST-only for now).
-* **OpenAPI registration** — add `#[utoipa::path]` annotations + register in
-  `openapi.rs` so the endpoints appear in the spec (currently functional but
-  undocumented; no spec drift because the SDK already assumes them).
+  multiplexed port (the deferred follow-on; REST-only for now). Tracked jointly with TD-CONN-1 C2.
 * **Richer engine ops** — surface `insert_ohlc`/`query_ohlc` (OHLC), downsample, and
   `asof_join` endpoints so the REST surface reflects the full TST engine.
 * **A Rust `TimeSeriesCollectionConfig`** mapping the full SDK shape
   (`value_columns`/`tag_columns`/`retention`/`downsampling`) for validation +
-  round-trip; the MVP keeps a minimal resident config.
+  round-trip; the MVP keeps a minimal resident config (`TsCollectionConfig` today carries
+  value/tag columns + `retention_ms`, no downsampling).
 * Retire the SDK's in-memory emulation fallback once the surface is complete.

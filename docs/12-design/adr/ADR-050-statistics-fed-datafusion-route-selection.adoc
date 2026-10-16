@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — *partially implemented (reconciled 2026-10-15):* Decision 2's first slice landed (footer-derived stats + registry NDV overlay into the DataFusion provider, `54f897ed1`; TD-DFR-1 Partial). The register still lists TD-115 (`route_select` hardcodes Volcano) as Open although `ComputeScheduler::route_select` now routes parquet-backed tables to DataFusion — TD-115's status needs re-verification. Route selection is further governed by ADR-058 (eligibility vs selection) and ADR-064 (decision/dispatch).
 |Date|2026-07-02
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-039 (OLAP engine boundary — this ADR *activates* its declared-but-inert DataFusion arm), ADR-042 (Canonical SegmentStatistics contract — the statistics source), ADR-033 / TD-161 (Parquet+DataFusion is the interim scan arm; native PAX OLAP is the eventual second arm), ADR-034 (route cost model / `ComputeScheduler`), ADR-030 (unified hot-path trace+meter — the observed-cost calibration), ADR-038 (statistics freshness floor), ADR-043 (unified expression evaluation — pushdown *correctness*, out of scope here)

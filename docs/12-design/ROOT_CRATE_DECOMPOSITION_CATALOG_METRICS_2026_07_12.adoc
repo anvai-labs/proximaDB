@@ -2,6 +2,13 @@
 :toc: macro
 :icons: font
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** Catalog slices 1–4 shipped (#892, #894, #900, #927) and metrics slice 1 shipped (#907). Open: the storage-coupled metrics set behind a `MetricsStoragePort` (`src/metrics/{store,updater,query_service,metering_writer,consumption_metrics,collection_pin_metrics,tier_migration_metrics}.rs`, collectors `engine`/`graph`/`filesystem`), and the coupled catalog modules still in root (`index_location_resolver`, `tenant_tier`, `tier_recommendation`, `budget_guard`, `tier_transition`).
+| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_ENGINES_EXTRACTION_2026_07_12.adoc[engines track] (parallel)
+|===
+
 [abstract]
 Companion to `ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` and the CI-build
 optimization plan (#876). Scopes extraction of the two remaining non-storage
@@ -63,28 +70,10 @@ index|network|cluster|cdc|graph|observability|compute)::`):
   stays root until a later "facade" slice (the observability-Slice-3
   equivalent), possibly behind a port.
 
-== Catalog Slice 1 (this PR) — foundation-pure leaves
+== Catalog Slice 1 — foundation-pure leaves
 
-Move the 9 foundation-pure files into `proximadb-catalog`:
-
-- `corpus_version_fs_store.rs` (deps `corpus_version`, already in crate)
-- `internal/{mod,enforcement,information_schema,registry}.rs` (self-contained)
-- `partition_pruning.rs` (`core::search::{FilterExpression,ComparisonOperator}`
-  → `proximadb-filter-expression`, a foundation re-export)
-- `recall_probe.rs` (no deps)
-- `syscat_cache.rs`, `syscat_warm.rs` (need proto `Collection` → add
-  `proximadb-proto` dep + proto re-export module)
-
-Crate changes: add deps `proximadb-cache`, `proximadb-filter-expression`,
-`proximadb-proto`, `chrono`, `prost` + a `pub mod proto` re-export (mirrors the
-observability crate). Root `src/catalog/mod.rs` keeps `CatalogManager` + the
-deferred modules and re-exports the moved items (`pub use proximadb_catalog::X;`)
-so all `crate::catalog::*` import paths are unchanged.
-
-NOTE: `segment_registry` was *deferred* — it needs
-`storage_common::pax_block::SegmentMeta`, and `storage-common → catalog` is
-already a downward edge, so `catalog → storage-common` would form a cycle.
-It stays root until `SegmentMeta` is hoisted to a shared foundation crate.
+Shipped (#892); see "Live status → History" below. The `segment_registry` deferral recorded
+here was resolved in slice 4 by moving `SegmentMeta` down into `proximadb-block-format`.
 
 == Sequencing
 
@@ -114,56 +103,21 @@ This section is the durable status of the catalog/metrics track. It is committed
 (in-repo), so it is available on every machine/session. The "Recommended
 sequence" above was the original plan; what actually landed is here.
 
-=== Merged to `develop` (all green; storage up-edge ratchet held at 197)
+=== Merged to `develop` — History
 
-Catalog → `proximadb-catalog`:
-* **Slice 1 (#892, `ac541f188`)** — 9 foundation-pure files: `corpus_version_fs_store`,
-  `internal/{mod,enforcement,information_schema,registry}`, `partition_pruning`,
-  `recall_probe`, `syscat_cache`, `syscat_warm`. Crate +deps (cache,
-  filter-expression, proto, chrono, prost) + a `pub mod proto` re-export. Root
-  `src/catalog/mod.rs` re-exports moved modules (`pub use proximadb_catalog::X;`).
-* **Slice 2 (#894, `dc18d516d`)** — `CatalogManager` + `TableOpLockRegistry`
-  (the central runtime) → crate `manager.rs`, behind a new
-  `CatalogFilesystemResolver` port. `CatalogManager` holds
-  `Option<Arc<dyn CatalogFilesystemResolver>>`; the object-store catalog branch
-  (`s3://`/`gs://`/`az://`) calls the port instead of root `FilesystemFactory`.
-  Root half = `LazyFilesystemResolver` (`src/catalog/filesystem_resolver.rs`)
-  wrapping `FilesystemFactory` in a `tokio::OnceCell` (lazy — factory created on
-  first object-store URL, never for local). Injected at the composition root
-  `shared_services.rs` (~line 513) via `set_filesystem_resolver`;
-  `CatalogManager::new()` stays argless (zero caller/test signature ripple).
-  Recon: `mod.rs` had only ONE real up-edge (`FilesystemFactory`); the
-  `cluster::partition_lease` ref was doc-only.
-* **Slice 3 (#900, `8b3c8d873`)** — `federation/{mod,external,federated_catalog}`
-  → crate. Rewrite: `crate::catalog::traits::Catalog` → `crate::Catalog` (crate
-  exposes `Catalog` at root, no `traits` shim).
-* **Slice 4** — `iceberg_rest_service` + `segment_registry` → crate, unblocked
-  by moving the two cycle-causing items DOWN instead of hoisting a foundation
-  crate: (a) the `ObjectStoreBridge` contract module descended from
-  `proximadb-storage-common` into `proximadb-catalog` (the cross-layer contract
-  crate storage-common already depends on; the trait's `ProximaSchema` param is
-  in-crate `CatalogTableSchema`); (b) `SegmentMeta` descended into
-  `proximadb-block-format` next to the `BlockStats` it aggregates. Both old
-  paths re-exported (`storage_common::object_store_bridge::*`,
-  `storage_common::pax_block::SegmentMeta`) → zero reroutes for existing users.
-  Catalog crate +deps: object_store/futures/arrow-array/kernel/block-format;
-  `proximadb-iceberg-engine` as a **dev-dependency** (Cargo-legal dev cycle) for
-  the bridge test, which had to move from the lib `#[cfg(test)]` module to
-  `tests/iceberg_rest_service_bridge.rs` — inside a unit test, `crate::` trait
-  identity differs from the `proximadb_catalog` the engine implements against.
-  `CAPABILITY_MATRIX.toml` evidence path updated to the crate location.
-
-Metrics → NEW control crate `proximadb-metrics` (**#907, `f31940693`**):
-~25 foundation-pure files — collectors access/document/query/storage/system +
-`UnifiedMetricsCollector` + `MetricsCollector` trait + `MetricsSample` +
-`MetricsSummary`, `aggregator`, `exporters` (json/prometheus), `schema`,
-`*_metrics` types. Crate deps: catalog + foundation (kernel/proto/config/
-hardware) + chrono + extern (prometheus/lazy_static/dashmap/tokio/etc). Root
-`src/metrics/mod.rs` + `collectors/mod.rs` → re-export shims (re-export moved
-modules from crate; declare deferred modules; crate-root re-exports
-`pub use {schema::Alert, exporters::SystemMetrics, proximadb_config::MetricsConfig}`
-so cross-module `super::Type`/`crate::Type` refs resolve after the
-`crate::metrics::`→`crate::` sed).
+* **Catalog slices 1–4** (#892, #894, #900, #927). The foundation-pure leaves, then
+  `CatalogManager` + `TableOpLockRegistry` behind a new `CatalogFilesystemResolver` port (the root
+  half is a lazy `FilesystemFactory` wrapper injected at the composition root), then `federation/*`,
+  then `iceberg_rest_service` + `segment_registry`. All were re-exported from root, so no call-site
+  churn.
+* **Decisive finding (slice 4):** the planned "hoist to a new foundation crate" was infeasible.
+  `ProximaSchema` re-exports `CatalogTableSchema`, whose type closure is ~the whole catalog contract.
+  The cheap, correct unblock was to move the two cycle-causing items **down**: the `ObjectStoreBridge`
+  contract went into `proximadb-catalog`, and `SegmentMeta` went into `proximadb-block-format`.
+* **Lesson:** a unit test that names `crate::` trait identity breaks when the trait moves crates. The
+  bridge test had to move to `tests/iceberg_rest_service_bridge.rs`.
+* **Metrics slice 1** (#907): ~25 foundation-pure files moved to the new control crate
+  `proximadb-metrics`, with root `src/metrics` kept as re-export shims.
 
 === Next steps (by value/effort)
 
@@ -176,14 +130,6 @@ so cross-module `super::Type`/`crate::Type` refs resolve after the
   `cache::{CacheTier,CacheMetrics,CrossCacheOrchestrator}`,
   `tiering::{MigrationResult,PerformanceTier}`, WAL, `collection_pinning`,
   `path_resolver`, `background_flush_context`) like observability Slice 3 did.
-. **Catalog `iceberg_rest_service` + `segment_registry`** — DONE (Slice 4
-  above). NOTE the originally-planned foundation hoist was infeasible:
-  `ProximaSchema` is a re-export of `proximadb_catalog::CatalogTableSchema`,
-  whose field-type closure (`CatalogIndex`, `CatalogStorageLayout`,
-  `AnnFilteringPolicy`, `embedding_precision_policy::*`, …) is ~the whole
-  catalog contract surface — NOT "only proximadb-data-model". Moving the
-  contracts DOWN into the crates below (catalog / block-format) was the cheap
-  correct unblock.
 
 === Gotchas (all verified)
 
@@ -211,22 +157,8 @@ so cross-module `super::Type`/`crate::Type` refs resolve after the
 
 === Workflow reminders
 
-* Worktree off `origin/develop` (`eval "$(scripts/worktree.sh new refactor/<topic>)"`);
-  export the sccache env it prints. `develop` is ACTIVE (parallel
-  engines/sst/exec PRs land constantly) — expect to rebase before merge;
-  `git rebase origin/develop` (rename detection usually auto-applies develop's
-  changes to moved files — verify the crate still compiles after).
-* Verify BEFORE push (don't waste a runner cycle): crate + root
-  `cargo clippy --lib --bins --tests -- -D warnings`; `cargo fmt --check`;
-  `python3 scripts/check_workspace_boundaries.py` (no findings) +
-  `--storage-up-edges` (must stay ≤197); run the relevant nextest suites.
-* PR→`develop` (NOT main); NO agent attribution (the
-  `check_no_agent_attribution.py` hook rejects `Co-Authored-By`/🤖); arm
-  `gh pr merge <n> --auto --squash --delete-branch`.
-* CI ~75min; `Rust Tests (unit)` is the long pole (~50min compile-bound; root
-  single-compile RSS 12.8GB) and occasionally gets CANCELLED by runner
-  reclamation — a flake, not a code bug; rerun `gh run rerun <run-id> --failed`.
-  Poll ~every 10 min to conserve API credits.
-* Martin metrics (code graph): `.victor/project.db` `graph_module_metric` is
-  now FIXED (`instability = Ce/(Ca+Ce)`); use it to confirm a leaf is Ca=0-5
-  before moving. Open readonly.
+Follow the repo-wide workflow in `CLAUDE.md`: worktree off `origin/develop`, local clippy/fmt,
+`check_workspace_boundaries.py` plus `--storage-up-edges` (must not exceed the
+`scripts/check-layering.sh` ceiling), no agent attribution, PR → `develop`. Track-specific: the
+code-graph Martin metrics in `.victor/project.db` (`graph_module_metric`, opened read-only) confirm
+a leaf is Ca=0–5 before moving it.

@@ -1,7 +1,7 @@
 // Copyright (C) 2025 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-CTXCORR-1: context-corridor — from runnable instrument to co-design evidence
-:status: Partial
+:status: Partial: Slices 1, 2a, 2b-i, 2b-ii-A, 2b-ii-B shipped (#1439, #1440, #1441, #1442, #1444); open: Slice 2b-ii-C (five adapters descriptor-driven), Slice 3 (Inline-mode filtered runs), Slice 4 (trace -> cost wiring), Slice 5 (object-store backends + trials)
 :dim: D3/D4/D5 (compute-per-modality, network/egress, object-storage)
 :pillar: PERF
 
@@ -14,23 +14,22 @@ accuracy-before-latency-before-cost). That is the *instrument*. It does not yet
 produce a *measurement* that can rank systems or validate the co-design thesis.
 Four gaps, three of them latent until you read the code.
 
-== Finding 1 — recall was a liveness check, not a quality measure (Slice 1: FIXED)
+== History (shipped)
 
-The original harness searched each query with *its own inserted vector*
-(self-query, distance 0), so the target was always rank 1 and both
-`recall_at_10` and `filtered_recall_at_10` were **structurally 1.0 for any
-working index** — a broken engine returning garbage still "passed" filtered
-recall because the target was guaranteed present. This measured nothing.
-
-**Slice 1 (this PR)** replaces it with **exact cosine-kNN ground truth over
-held-out queries**: `make_query` draws queries from a separate RNG stream (not
-inserted); `GroundTruthAccumulator` computes each query's true top-k over the
-full corpus (unfiltered *and* within the query's partition) in a single
-streaming pass (memory `O(queries * top_k)`, so the corpus is never
-materialized); `recall_at_k` reports
-`|returned_topk intersect truth_topk| / |truth_topk|`. Recall is now real: an
-engine that misses true neighbours scores `< 1.0`, and a broken engine scores
-near 0 (unit-tested at 0.5 / 0.0 / 1.0).
+* **Slice 1 — ground-truth recall (#1439).** Finding 1: the original harness searched each query with its
+  own inserted vector (distance 0), so `recall_at_10` and `filtered_recall_at_10` were **structurally 1.0
+  for any working index** — a liveness check, not a quality measure. Replaced with held-out queries and
+  streaming exact cosine-kNN ground truth (`GroundTruthAccumulator`, memory `O(queries * top_k)`),
+  unfiltered and within-partition, with a `recall_methodology` block in the report.
+* **Slices 2a / 2b-i (#1440, #1441).** `DatasetProvider` seam: the dataset (not each adapter) owns corpus,
+  held-out queries, ground truth, distance and filter field via a `DatasetDescriptor`.
+  `scripts/bench/corpus_io.py` adds `.fvecs`/`.ivecs` readers and checksum-verified idempotent fetch;
+  vectors are never committed, and the checksum is the report `dataset_hash`.
+* **Slices 2b-ii-A / 2b-ii-B (#1442, #1444).** `SiftDatasetProvider` (L2, no filter; the harness is
+  filter-optional) and `WikipediaDatasetProvider` (cosine, `filter_field="lang"`, offline-precomputed
+  filtered + unfiltered ground truth). Qdrant is descriptor-driven with `supported_distances`; a distance
+  guard rejects unconverted adapters. Live-validated on Qdrant: recall@10 = 1.0 and filtered recall@10 =
+  1.0 vs exact ground truth — the seam needed zero further adapter change for a content-correlated filter.
 
 == Finding 2 — the default filtered path is a brute-force scan, not accelerated ANN
 
@@ -101,48 +100,7 @@ metadata) are what stress ANN recall and filtered pre/post-filter behaviour.
 
 == Phased plan
 
-* **Slice 1 — ground-truth recall (this PR, DONE).** Held-out queries + streaming
-  exact-kNN; unfiltered and filtered recall vs truth; honest `metric_scope` and a
-  `recall_methodology` block in the report. Unit-tested (TDD).
-* **Slice 2a — the `DatasetProvider` seam (DONE).** A provider owns its corpus,
-  held-out queries, and ground truth as one unit, exposing a `DatasetDescriptor`
-  (name, dimension, `distance`, `filter_field`, record count, checksum);
-  `ingest_stream` depends only on `corpus()`, `run_queries` only on `queries()`.
-  `SyntheticDatasetProvider` is the behaviour-preserving default; `sift1m` /
-  `wikipedia` reject clearly until 2b. The correct boundary: real datasets plug in
-  without touching the ingest/measurement machinery, and the dataset (not each
-  adapter) owns distance + filter field.
-* **Slice 2b-i — dataset-IO foundation (DONE).** `scripts/bench/corpus_io.py`:
-  SIFT-family `.fvecs`/`.ivecs` streaming readers, `sha256_file`/`verify_checksum`,
-  and an idempotent injectable-downloader `fetch_corpus` (downloads to a `.part`
-  sidecar, promotes only on checksum match). `scripts/bench/fetch_corpus.py` is
-  the operator CLI. `benches/context-corridor/data/.gitignore` keeps the corpus
-  dir but ignores the (large) vectors — never committed; the checksum is the
-  report `dataset_hash`. All TDD'd on byte fixtures (no download in tests).
-* **Slice 2b-ii-A — SIFT vertical (DONE).** `SiftDatasetProvider` reads local
-  `.fvecs`/`.ivecs` (via 2b-i `corpus_io`) → descriptor `distance=l2`,
-  `filter_field=None`, with unfiltered ground truth from the precomputed
-  neighbours. The harness is now **filter-optional**: `descriptor.filter_field`
-  may be None → `run_queries` runs unfiltered-only and reports
-  `filtered_recall_at_10` as unavailable (None). The **Qdrant** adapter is
-  descriptor-driven (distance cosine→Cosine / l2→Euclid; filter field from the
-  descriptor; no payload index when there is no filter field) with
-  backward-compatible cosine/`partition` defaults, and declares
-  `supported_distances`. `build_provider` wires `sift1m`; a distance guard rejects
-  a dataset whose distance an adapter does not yet support. Live-validated
-  end-to-end on Qdrant: SIFT fixture (L2, no filter) recall@10 = 1.0 vs exact-L2
-  ground truth; synthetic path byte-identical (cosine/partition, recall 1.0).
-* **Slice 2b-ii-B — Wikipedia filtered-corridor driver (DONE).**
-  `WikipediaDatasetProvider` reads local `.fvecs` base vectors + a parallel
-  metadata `.jsonl` (per-vector `lang`/`category`) + a `queries.jsonl` cache
-  (each query: vector, filter value, precomputed unfiltered AND within-filter
-  ground truth) → descriptor `distance=cosine`, `filter_field="lang"`. Ground
-  truth is precomputed offline (the cache file); the `dataset_hash` is the base
-  `.fvecs` checksum. `build_provider` wires `wikipedia`. Live-validated
-  end-to-end on the (already descriptor-driven) Qdrant with a cosine + `lang`
-  fixture: recall@10 = 1.0 AND filtered_recall@10 = 1.0 vs exact cosine ground
-  truth — the differentiating *filtered* measurement, and proof the seam needed
-  zero further adapter change for a content-correlated filter.
+* **Slices 1, 2a, 2b-i, 2b-ii-A, 2b-ii-B — DONE**; see History (shipped).
 * **Slice 2b-ii-C — the remaining five adapters, descriptor-driven.** Make
   pgvector / Milvus / Elasticsearch / SurrealDB / ProximaDB take distance +
   filter_field from the `DatasetDescriptor` (as Qdrant now does) so SIFT (L2) and

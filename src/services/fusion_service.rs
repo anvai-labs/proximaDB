@@ -509,6 +509,12 @@ impl FusionService {
 
         let started = Instant::now();
 
+        // Shared server top_k cap (TD-SECSCAN-1 §5): the fusion limit seeds the
+        // vector ANN leg and `max_seeds` bounds graph expansion. Handlers reject
+        // over-cap values with a client-facing error; this choke clamp keeps any
+        // internal caller from deriving an unbounded workload from `params`.
+        let (limit, max_seeds) = clamp_fusion_bounds(params.limit, params.max_seeds);
+
         // Structural tenant scope, composed ONCE and shared by both legs (TD-ENTITY-TENANT-1):
         // - the graph leg keys reads + canonical oids by `scoped_gid` (`{tenant}/{graph_id}`, bare
         //   for the default tenant) so it matches the graph write path (`for_tenant`);
@@ -526,7 +532,6 @@ impl FusionService {
         let vector = self.vector.clone();
         let collection = params.vector_collection.clone();
         let query_vector = params.query_vector.clone();
-        let limit = params.limit;
 
         #[cfg(feature = "abac-policy")]
         let read_ctx = match (&params.principal, params.tenant_stable_id) {
@@ -600,7 +605,7 @@ impl FusionService {
         // 2. Graph expand from the top seeds (bounded). A seed that is not a node in this graph simply
         //    contributes nothing (its traverse errors are skipped) rather than failing the query.
         // T1.2: Graceful degradation — individual seed failures are logged but don't abort fusion.
-        let seeds = seed_node_ids(&scoped_gid, &hits, params.max_seeds, params.oid_key);
+        let seeds = seed_node_ids(&scoped_gid, &hits, max_seeds, params.oid_key);
         let mut nodes: Vec<Node> = Vec::new();
         let mut edges: Vec<Edge> = Vec::new();
         let mut failed_seeds = 0;
@@ -614,7 +619,7 @@ impl FusionService {
                 node_labels: Vec::new(),
                 filters: Vec::new(),
                 algorithm: ALGORITHM_BFS,
-                limit: Some(params.limit as u32),
+                limit: Some(u32::try_from(limit).unwrap_or(u32::MAX)),
                 timeout_ms: None,
                 max_frontier: None,
             };
@@ -703,7 +708,7 @@ impl FusionService {
             let doc_source = self.document.expand(
                 collection,
                 &spec.text_query,
-                spec.k.unwrap_or(params.limit),
+                spec.k.unwrap_or(limit),
                 spec.weight,
             );
             sources.push(normalize_source_keys(doc_source, params.oid_key));
@@ -806,9 +811,28 @@ fn truncate_source_to_budget(source: &mut SourceCandidates, budget: usize) {
     }
 }
 
+/// Clamp the fusion `limit` (vector seed width) and `max_seeds` (graph
+/// expansion bound) to the server `top_k` cap (TD-SECSCAN-1 §5).
+fn clamp_fusion_bounds(limit: usize, max_seeds: usize) -> (usize, usize) {
+    let cap = proximadb_search_types::top_k_limit::max_top_k();
+    (limit.min(cap), max_seeds.min(cap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-SECSCAN-1 §5 follow-up: the clamp honours the CONFIGURED cap. With
+    /// `PROXIMADB_SEARCH_MAX_TOP_K` raised above the 10,000 default, a request
+    /// at the override (which the handler accepted) must not be silently
+    /// truncated to the default.
+    #[test]
+    fn fusion_clamp_honours_configured_cap_override() {
+        crate::services::top_k_env_test_support::with_max_top_k_override("50000", || {
+            assert_eq!(clamp_fusion_bounds(50_000, 50_000), (50_000, 50_000));
+            assert_eq!(clamp_fusion_bounds(50_001, 7), (50_000, 7));
+        });
+    }
 
     /// TD-ENTITY-TENANT-1: both fusion legs derive their tenant scope from `params.tenant`.
     /// The graph leg keys reads + canonical oids by `scoped_graph_id` (named →

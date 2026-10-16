@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 = Catalog identity research — how mature multi-modal/multi-tenant databases shape stable-id, display names, and hierarchy
 
-Companion to link:adr/ADR-0083-consolidated-catalog-identity-model.adoc[ADR-0083]. This is the industry survey + first-principles evaluation that grounds the three-layer decision. Survey date: 2026-07-30.
+Companion to link:adr/ADR-0083-consolidated-catalog-identity-model.adoc[ADR-0083]. This is the industry survey + first-principles evaluation that grounds the identity decision (Revision 1 proposed three layers; the Accepted Revision 2 collapses to one composite identity — see the Synthesis section). Survey date: 2026-07-30.
 
 == The question
 

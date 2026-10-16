@@ -3,7 +3,7 @@
 :toclevels: 4
 :sectnums:
 
-Status: Active implementation blueprint +
+Status: **Partial / largely superseded (reconciled 2026-10-15)** — implementation blueprint. This route targeted SST `ProximaDataBlock` segments, which are now superseded on the read path by the PAX cascade (link:adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026]): coalesced RaBitQ header + scan-then-rerank, default-ON (link:adr/ADR-062-coalesced-rabitq-header-self-describing-footer-pax-layout.adoc[ADR-062], #1019, #1024). The dead read-side prune/chooser config was removed (#1038). The VOE centroid directory, clustered compaction and recall ratchet landed under TD-RDSTRAT-4/5 and TD-WLP-7/9 (#1008, #1012, #1015). Coalesced range reads are in `read_ranges` (#1649). Open and still applicable: cache-affinity routing (Phase 7), the strong/stale-ok freshness disclosure contract (Phase 5) on the PAX path, and the Definition-of-Done benchmark publication (object GETs/query, bytes, cache hit, cost). The per-phase TDD plan below targets the pre-PAX reader and is historical. +
 Date: 2026-05-27 +
 Scope: vector search over object storage, SST/HELIX centroid block pruning, cataloged vector
 access-method projection boundaries, cache-affinity routing, WAL freshness, EXPLAIN visibility, and

@@ -9,7 +9,7 @@
 | Severity | Medium — Neon/Lakebase's flagship feature ("branch a large DB in seconds") is unbuilt
 | Component | catalog versioning, Iceberg snapshot refs, partition lease
 | Tracked-by | — (this TD is the tracker)
-| Relates to | link:../../12-design/adr/ADR-031-stable-object-id-physical-key.adoc[ADR-031] (stable ids), link:../../12-design/adr/ADR-032-durable-tenant-prefixed-object-store-catalog.adoc[ADR-032] (object-store catalog), link:TD-LTAP-1-pax-durable-core-serving-metadata-split.adoc[TD-LTAP-1] (immutable durable core)
+| Relates to | link:../../12-design/adr/ADR-031-stable-object-id-physical-key.adoc[ADR-031] (stable ids), link:../../12-design/adr/ADR-032-durable-tenant-prefixed-object-store-catalog.adoc[ADR-032] (object-store catalog), link:TD-LTAP-1-pax-durable-core-serving-metadata-split.adoc[TD-LTAP-1] (immutable durable core); TD-117 (overlap: agent branching via object-store `BranchRef` + manifest generation fence — foundation landed, Partial in link:../TECHNICAL_DEBT.adoc[TECHNICAL_DEBT]), TD-116 (WAL archival + `AS OF` time travel = the PITR half), TD-119 (Iceberg snapshot history)
 | Pillar | OE, COST
 |===
 

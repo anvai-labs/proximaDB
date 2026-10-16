@@ -1,7 +1,14 @@
 = TD-PATH-1: cwd-relative default paths cross-contaminate server instances (`-d` does not move storage/metadata)
-:status: S1 shipped (2026-07-25, this PR — `-d` rebases built-in defaults)
+:status: Partial — S1 shipped (2026-07-25, #1207); S2 open
 :filed: 2026-07-25
 :priority: P1 before any multi-node topology (ADR-073 prerequisite)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial: S1 shipped (2026-07-25, #1207) — `-d` rebases built-in cwd-relative defaults; open: S2 (data_dir-derived defaults at config load, and a CI guard against cwd-relative path literals).**
+| Relates to | link:TD-WAL-4-cwd-relative-write-buffer-breaks-instance-isolation.adoc[TD-WAL-4] (overlap: its S1 already anchors the WAL write buffer and SST/VIPER dirs under `server.data_dir`; `file://./data` storage and `file://./metadata` remain cwd-relative without `-d`), TD-CONV-1 (CWD-relative `metadata_url` test flake), ADR-073
+|===
 
 == The finding (observed 2026-07-25 during the recall adjudication)
 

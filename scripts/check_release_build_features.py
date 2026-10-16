@@ -247,6 +247,162 @@ def check_every_workflow_is_timed(msgs: list[str]) -> None:
         )
 
 
+# ---- TD-RELTAG-1: one tag `vX.Y.Z` releases every registry at one version ----------
+# The two PUBLISHING workflows. They stay separate files because npm's trusted
+# publisher is bound to `release.yml` and PyPI's to `release-python.yml` -- but
+# they must fire on the SAME tags and both gate tag == manifests before building.
+# Before this, release-python.yml fired on a separate `python-v*` family and PyPI
+# drifted to 0.3.0 / 0.2.2 while crates.io shipped 0.4.0.
+PUBLISH_WORKFLOWS = (
+    ".github/workflows/release.yml",
+    ".github/workflows/release-python.yml",
+)
+VERSION_SYNC = "scripts/version-sync.sh"
+VERSION_GATE = "scripts/version-sync.sh check-tag"
+# Every manifest whose version a registry publishes. `version-sync.sh check`
+# must cover each one, or the gate (tag == every checked manifest) has a hole
+# a package could ship through at a different version.
+PUBLISHED_MANIFESTS = (
+    "Cargo.toml:cargo",  # GitHub Release binaries (proximadb-server etc.)
+    "Cargo.toml:cargo_workspace",  # every workspace crate inheriting it
+    "clients/rust/Cargo.toml:cargo",  # crates.io proximadb-sdk
+    "clients/nodejs-embedded/package.json:package_json",  # npm
+    "clients/python/pyproject.toml:pyproject",  # PyPI proximadb
+    "pyproject.toml:pyproject",  # PyPI proximadb_embedded (root maturin)
+)
+LEGACY_TAG_RE = re.compile(r"python-v[0-9*]|tags/python-v")
+NEEDS_INLINE_RE = re.compile(r"^    needs:\s*(?P<rest>.*)$")
+
+
+def _live(line: str) -> bool:
+    return not line.lstrip().startswith("#")
+
+
+def _push_tags(lines: list[str]) -> list[str]:
+    """The `on: push: tags:` patterns, read from the text (no PyYAML needed)."""
+    tags: list[str] = []
+    in_on = in_push = in_tags = False
+    for line in lines:
+        if not line.strip() or not _live(line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            in_on = line.rstrip() in ("on:", '"on":', "'on':")
+            in_push = in_tags = False
+            continue
+        if not in_on:
+            continue
+        if indent == 2:
+            in_push = line.strip() == "push:"
+            in_tags = False
+        elif indent == 4 and in_push:
+            in_tags = line.strip() == "tags:"
+        elif in_tags and line.strip().startswith("- "):
+            tags.append(_scalar(line.strip()[2:]))
+    return tags
+
+
+def _jobs(lines: list[str]) -> dict[str, list[str]]:
+    try:
+        start = next(i for i, l in enumerate(lines) if l.rstrip() == "jobs:")
+    except StopIteration:
+        return {}
+    jobs: dict[str, list[str]] = {}
+    job = None
+    for line in lines[start + 1 :]:
+        m = JOB_RE.match(line)
+        if m is not None:
+            job = m.group("job").strip("\"'")
+            jobs[job] = []
+        elif job is not None:
+            jobs[job].append(line)
+    return jobs
+
+
+def _needs(body: list[str]) -> set[str]:
+    out: set[str] = set()
+    for i, line in enumerate(body):
+        m = NEEDS_INLINE_RE.match(line)
+        if m is None:
+            continue
+        # Strip a trailing comment; job ids cannot contain `#` or whitespace.
+        rest = re.split(r"(?:^|\s)#", m.group("rest"), maxsplit=1)[0].strip()
+        if rest.startswith("["):
+            out.update(x.strip().strip("\"'") for x in rest.strip("[]").split(",") if x.strip())
+        elif rest:
+            out.add(rest.strip("\"'"))
+        else:  # block list
+            for nxt in body[i + 1 :]:
+                if re.match(r"^      - ", nxt):
+                    out.add(_scalar(nxt.strip()[2:]))
+                elif nxt.strip() and _live(nxt):
+                    break
+    return out
+
+
+def check_unified_release_tag(msgs: list[str]) -> None:
+    patterns: dict[str, list[str]] = {}
+    for rel in PUBLISH_WORKFLOWS:
+        path = ROOT / rel
+        if not path.exists():
+            _fail(msgs, f"{rel}: missing (TD-RELTAG-1 names it explicitly; renaming it also breaks its trusted publisher)")
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines()
+        tags = _push_tags(lines)
+        patterns[rel] = tags
+        if not tags:
+            _fail(msgs, f"{rel}: no `on: push: tags:` patterns -- a release tag would not trigger it (TD-RELTAG-1)")
+        for t in tags:
+            if not t.startswith("v[0-9]"):
+                _fail(msgs, f"{rel}: tag pattern `{t}` is not the unified `v<semver>` family (TD-RELTAG-1)")
+        for n, line in enumerate(lines, 1):
+            if _live(line) and LEGACY_TAG_RE.search(line):
+                _fail(msgs, f"{rel}:{n}: live reference to the retired per-package `python-v` tag family (TD-RELTAG-1)")
+        jobs = _jobs(lines)
+        gates = [j for j, body in jobs.items() if any(_live(b) and VERSION_GATE in b for b in body)]
+        if not gates:
+            _fail(msgs, f"{rel}: no job runs `{VERSION_GATE}` -- a tag could publish packages at a different version (TD-RELTAG-1)")
+            continue
+        needs = {j: _needs(body) for j, body in jobs.items()}
+
+        def reaches_gate(job: str, seen: frozenset = frozenset()) -> bool:
+            if job in gates:
+                return True
+            return any(reaches_gate(d, seen | {job}) for d in needs.get(job, ()) if d not in seen)
+
+        for job in jobs:
+            if not reaches_gate(job):
+                _fail(
+                    msgs,
+                    f"{rel}: job `{job}` does not depend (directly or transitively) on the "
+                    f"version-gate job `{gates[0]}` -- it could build or publish before tag == "
+                    f"manifests is proven (TD-RELTAG-1)",
+                )
+    if len(patterns) == len(PUBLISH_WORKFLOWS):
+        a, b = (patterns[r] for r in PUBLISH_WORKFLOWS)
+        if a != b:
+            _fail(
+                msgs,
+                f"release tag patterns differ: {PUBLISH_WORKFLOWS[0]} {a} vs "
+                f"{PUBLISH_WORKFLOWS[1]} {b} -- ONE tag must release every registry (TD-RELTAG-1)",
+            )
+    vs = ROOT / VERSION_SYNC
+    if not vs.exists():
+        _fail(msgs, f"{VERSION_SYNC}: missing -- the release version gate has no implementation")
+        return
+    vs_lines = vs.read_text(encoding="utf-8").splitlines()
+    if not any(_live(l) and l.strip().startswith("check-tag)") for l in vs_lines):
+        _fail(msgs, f"{VERSION_SYNC}: no `check-tag` command -- both release workflows call it (TD-RELTAG-1)")
+    listed = {l.strip().strip('"') for l in vs_lines if _live(l) and l.strip().startswith('"')}
+    for entry in PUBLISHED_MANIFESTS:
+        if entry not in listed:
+            _fail(
+                msgs,
+                f"{VERSION_SYNC}: `check` no longer covers published manifest `{entry}` -- "
+                f"that package could ship at a version the tag gate never compared (TD-RELTAG-1)",
+            )
+
+
 def _dockerfile_instructions(text: str) -> list[tuple[int, str]]:
     """Logical instructions with line continuations joined and comments stripped.
 
@@ -538,6 +694,7 @@ def main() -> int:
     check_every_workflow_is_timed(msgs)
     check_dockerfiles(msgs)
     check_runtime_config_ownership(msgs)
+    check_unified_release_tag(msgs)
     if msgs:
         print("release-build-features: FAILED")
         for m in msgs:
@@ -547,7 +704,8 @@ def main() -> int:
         "release-build-features: OK "
         f"(both release workflows and {PUBLISHED_DOCKERFILE} build with "
         f"`{REQUIRED_FEATURE}`, every job in {len(TIMED_WORKFLOWS)} workflows "
-        "bounded, runtime config copied --chown)"
+        "bounded, runtime config copied --chown, one release tag gated "
+        "against every published manifest)"
     )
     return 0
 

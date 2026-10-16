@@ -5,7 +5,7 @@
 [cols="1,3",options="header"]
 |===
 | Field | Value
-| Status | **Open — piloting on proximaDB (2026-08-29).** Smoke-test workflow (`public-overflow-runner-smoke.yml`) merged; no real (non-smoke) job routed to the pool yet.
+| Status | **Open — piloting on proximaDB (2026-08-29).** Smoke-test workflow (`public-overflow-runner-smoke.yml`) merged (#1771, #1776); no real (non-smoke) job routed to the pool yet. *Re-checked 2026-10-15:* the smoke run on `develop` is green (2026-08-30), but Acceptance item 1 is **still unmet**: runner group 5 `public-overflow` reports `restricted_to_workflows: false` with no selected workflows. Since filing, `develop` gained a required review (1 approval, `enforce_admins` off), and the workflow's `push` trigger is scoped to `develop`, not `main` as point 2 below describes (see the workflow header comment). Point 2's table predates that change.
 | Dim | D5 (governance) -- self-hosted runner exposure on a public repo
 | Pillar | Security, secondary OE (CI throughput)
 | Blocks | Nothing directly. Extending real CI jobs onto this pool, or onboarding more public repos, should wait on the acceptance criteria below.

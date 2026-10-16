@@ -22,6 +22,13 @@ pub mod sources;
 mod executor_test;
 
 pub type Result<T> = std::result::Result<T, ProximaDBError>;
+
+/// Fields whose vector-valued `Equals` carries the search query vector. The
+/// vector / memory sources consume it; the executor's WHERE post-filter must
+/// treat it as satisfied (result rows carry no such field).
+pub(crate) fn is_query_vector_field(field: &str) -> bool {
+    matches!(field, "embedding" | "vector" | "query_vector")
+}
 pub type DataModel = crate::query::unified::ast::DataModel;
 
 // ---------------------------------------------------------------------------

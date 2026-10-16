@@ -1,0 +1,27 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-READFID-2: compaction drops the exact-f32 tier because its predicates cannot read `file://` input paths
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Reproduced at the unit level (`std::fs::read` on a `file://` path errors); end-to-end compaction repro not yet run.
+| Priority | **HIGH** for TD-READFID-1's guarantee: an `fp32` collection's exact tier is silently dropped at the FIRST compaction, and the collection re-lossifies with no signal.
+| Component | `src/storage/engines/sst/segment_format.rs`: `pax_inputs_have_f32_tier` / `pax_inputs_rerank_quant` (both `std::fs::read` raw `PathBuf`s); input provenance: `src/storage/common/compaction_orchestrator.rs` (`GenericFileMetadata.path = entry.url`), `src/storage/persistence/filesystem/local.rs` (`file://{abs}` URLs), `src/storage/engines/sst/compaction.rs` (`task.input_files` → `PathBuf` unmodified).
+| Relates to | TD-READFID-1 (this defect silently undoes its fix after one compaction); TD-RDSTRAT-7; the same defect also breaks `pax_inputs_rerank_quant`'s FP16-preservation claim.
+| Found | 2026-10-15, adversarial review of PR #2048 (fix/readfid1-point-read-fidelity)
+|===
+
+== Mechanism
+
+. `LocalFileSystem::list` returns entries whose `url` is `file://{abs}` (`src/storage/persistence/filesystem/local.rs`).
+. The compaction orchestrator copies that URL verbatim into `GenericFileMetadata.path` (`src/storage/common/compaction_orchestrator.rs`).
+. SST compaction converts `task.input_files` into `PathBuf`s without stripping the scheme (`src/storage/engines/sst/compaction.rs`; note that sibling code DOES strip `file://` for outputs and staging detection — the inconsistency is the tell).
+. `pax_inputs_have_f32_tier` and `pax_inputs_rerank_quant` call `std::fs::read(f)`. `std::fs::read` cannot open `file://` paths (verified by one-off: `read_ok=false`).
+. Both predicates fail closed (return `false` / continue), so the three live compaction write sites' intersection rule concludes "no input has the tier" and the merged segment is written WITHOUT it.
+
+Net effect: flush writes the exact tier (TD-READFID-1) → compaction fires (L0 threshold or the >32 MB untrained-training arm) → merged segment has no tier → point reads fall back to SQ8 reconstructions again.
+
+== Fix direction
+
+Strip the scheme before the predicate reads (mirroring `compaction.rs`'s existing output-path `file://` strip), or route the reads through the filesystem port so object-store compaction works too. Then: end-to-end repro — create an `fp32` collection, flush, force a compaction, assert the merged `.pax` still has `has_f32_tier` and a point read stays byte-exact. Also add the mixed-input case (tier'd + legacy no-tier inputs still drop, by design).

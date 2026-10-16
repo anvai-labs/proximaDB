@@ -394,28 +394,14 @@ let _stats = handle.await.unwrap();
   the operator's. The default-method pattern on `DrMetrics`
   ensures additions stay source-compatible.
 
-== Test Inventory
+== Implementation history
 
-For provenance, the engine surface ships with these test counts
-(passing as of this ADR's last-updated date):
-
-[cols="3,1"]
-|===
-| Module | Tests
-
-| `collection_dr_policy` | 28
-| `dr_reconciler` (decision + driver + shard + backoff + lease + metrics + runner + observe_lag) | 74
-| `dr_restore` | 18
-| `dr_policy_store` | 24
-| `CatalogNamespace` extension | 5
-| `DrPathBuilder` | 11
-| `PrometheusDrMetrics` bridge | 10
-| `dr_bridge` manifest converter | 9
-| `EngineRestoreReadinessChecker` (subset of `dr_restore`) | 10
-| *Total dedicated DR tests* | *189*
-|===
-
-Future contract refactors can use this inventory as a baseline.
+Shipped before the ADR (OSS DR engine P0..P6.1 + S14 + observability); ADR filed `4101e808c`,
+`EngineRestoreReadinessChecker` added to the inventory `bacf012da`. Baseline at filing: 189
+dedicated DR tests (`collection_dr_policy` 28, `dr_reconciler` 74, `dr_restore` 18,
+`dr_policy_store` 24, `DrPathBuilder` 11, Prometheus bridge 10, manifest bridge 9,
+`CatalogNamespace` extension 5, readiness checker 10) — use as the baseline for contract
+refactors.
 
 == References
 

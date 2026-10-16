@@ -50,7 +50,8 @@ impl BoundedPriorityQueue {
     /// Create a new bounded queue with specified capacity
     pub fn new(capacity: usize) -> Self {
         Self {
-            heap: BinaryHeap::with_capacity(capacity),
+            // Bounded up-front reservation; grows on demand (TD-SECSCAN-1 §5).
+            heap: BinaryHeap::with_capacity(crate::top_k_limit::bounded_prealloc(capacity)),
             capacity,
             min_score: f32::NEG_INFINITY,
         }
@@ -157,10 +158,16 @@ impl<E: Ord> TopKHeap<E> {
     /// Create a heap keeping the `k` greatest entries. `k == 0` is clamped to
     /// `1` (a zero-capacity heap would reject everything, which callers almost
     /// never want; `k` comes from `top_k` query parameters).
+    ///
+    /// Because `k` is client-controlled, only the logical capacity follows it:
+    /// the eager reservation is bounded by
+    /// [`crate::top_k_limit::bounded_prealloc`] and the heap grows on demand,
+    /// so `k = u32::MAX` no longer reserves hundreds of GB up front
+    /// (TD-SECSCAN-1 §5).
     pub fn with_capacity(k: usize) -> Self {
         Self {
             capacity: k.max(1),
-            inner: BinaryHeap::with_capacity(k),
+            inner: BinaryHeap::with_capacity(crate::top_k_limit::bounded_prealloc(k)),
         }
     }
 
@@ -535,5 +542,36 @@ mod tests {
         // Now full, only accepts > 0.5
         assert!(!queue.would_accept(0.4));
         assert!(queue.would_accept(0.6));
+    }
+
+    /// TD-SECSCAN-1 §5: `k` arrives from a client `top_k`. The logical
+    /// capacity must honour it, but the eager pre-allocation must not — a
+    /// `top_k = u32::MAX` request otherwise reserves hundreds of GB before a
+    /// single candidate is scored.
+    #[test]
+    fn topk_heap_preallocation_is_bounded_but_capacity_is_not() {
+        let huge = 1_000_000usize;
+        let mut heap: TopKHeap<u64> = TopKHeap::with_capacity(huge);
+        assert_eq!(heap.capacity(), huge, "logical top-k must be preserved");
+        assert!(
+            heap.inner.capacity() <= crate::top_k_limit::DEFAULT_MAX_TOP_K,
+            "pre-allocation must be clamped, got {}",
+            heap.inner.capacity()
+        );
+        // Grows on demand past the pre-allocation: nothing is truncated.
+        for i in 0..20_000u64 {
+            assert!(heap.try_push(i));
+        }
+        assert_eq!(heap.len(), 20_000);
+    }
+
+    #[test]
+    fn bounded_priority_queue_preallocation_is_bounded() {
+        let queue = BoundedPriorityQueue::new(1_000_000);
+        assert!(
+            queue.heap.capacity() <= crate::top_k_limit::DEFAULT_MAX_TOP_K,
+            "pre-allocation must be clamped, got {}",
+            queue.heap.capacity()
+        );
     }
 }

@@ -158,6 +158,9 @@ async fn get_collection_entanglement(
     })?;
 
     let limit = params.limit.unwrap_or(1000);
+    // Shared server top_k cap (TD-SECSCAN-1 §5).
+    proximadb_search_types::top_k_limit::check_top_k(limit as u64)
+        .map_err(|e| ApiError::InvalidArgument(format!("limit: {e}")))?;
 
     // Load records from collection.
     let records = vector_ops

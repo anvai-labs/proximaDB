@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **partially implemented** (reconciled 2026-10-15): TD-164 Resolved; TD-CAT-1 (D1 object-store persistence) Partial; TD-CAT-2 (D2 tenant-prefixed paths) Partial; TD-119 Partial. Identity references to ADR-031's `u64 object_id` are superseded by ADR-0083 (composite identity; ADR-0083 confirms this ADR's catalog-as-minting-authority).
 |Date|2026-06-26
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-027 (Unified Storage + Metering substrate — PAX + coalesced writer + `_metering/_trace` system subtrees; "OSS=mechanism, $=AnvaiOps policy"), `CATALOG_OBJECT_MODEL_2026_06_21.adoc` (account=tenant=catalog / schema=namespace; "isolation is structural, addressing is catalog-resolved"; gap G2 = "addressing is convention/env-derived, not catalog-resolved"), `COLLECTION_DR_CRR_ENGINE_CONTRACT.adoc` (physical path contract: `data/{tenant_id}/{namespace_id}/{collection_id}/` and the Phase-5 `accounts/{account_id}/…` two-tier render; `DrPathBuilder` the single validated emitter), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (treat the I/O boundary as the contract; isolation structural not per-query), `OSS_ENTERPRISE_BOUNDARY_2026_06_17.adoc` (operator catalog + billing live in AnvaiOps; OSS emits neutral telemetry)

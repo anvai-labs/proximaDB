@@ -363,6 +363,16 @@ impl TransactionBuffer {
     }
 }
 
+/// SQLSTATE for a failed DmlService statement: a typed relational integrity
+/// violation (TD-DML-1) maps to its PostgreSQL class (23505 unique, 23503
+/// foreign key, 23514 check, 21000 cardinality); anything else keeps the
+/// call site's historical `fallback`.
+fn dml_error_sqlstate(err: &anyhow::Error, fallback: &'static str) -> &'static str {
+    proximadb_catalog::relational::find_relational_constraint_violation(err)
+        .map(|violation| violation.sqlstate())
+        .unwrap_or(fallback)
+}
+
 /// Buffer-time CommandComplete summary for a DML statement: (kind, row hint,
 /// approximate serialized size for the buffer bound).
 fn dml_summary(
@@ -5509,7 +5519,11 @@ impl PostgresProtocol {
                             return self.send_error("ERROR", "55P03", &msg).await;
                         }
                         warn!("DmlService INSERT failed: {}", e);
-                        self.send_error("ERROR", "42P01", &format!("Insert failed: {}", e))
+                        // TD-DML-1: an integrity violation (INSERT or any UPSERT
+                        // spelling) carries its own SQLSTATE (23505/23503/23514/
+                        // 21000) so drivers can key on it.
+                        let code = dml_error_sqlstate(&e, "42P01");
+                        self.send_error("ERROR", code, &format!("Insert failed: {}", e))
                             .await
                     }
                 }
@@ -5672,7 +5686,8 @@ impl PostgresProtocol {
                             return self.send_error("ERROR", "55P03", &msg).await;
                         }
                         warn!("DmlService DELETE failed: {}", e);
-                        self.send_error("ERROR", "42P01", &format!("Delete failed: {}", e))
+                        let code = dml_error_sqlstate(&e, "42P01");
+                        self.send_error("ERROR", code, &format!("Delete failed: {}", e))
                             .await
                     }
                 }
@@ -5831,7 +5846,8 @@ impl PostgresProtocol {
                         // DmlService UPDATE returns error for not-implemented
                         // This is expected - UPDATE requires delete + insert pattern
                         warn!("DmlService UPDATE: {}", e);
-                        self.send_error("ERROR", "0A000", &format!("{}", e)).await
+                        let code = dml_error_sqlstate(&e, "0A000");
+                        self.send_error("ERROR", code, &format!("{}", e)).await
                     }
                 }
             }

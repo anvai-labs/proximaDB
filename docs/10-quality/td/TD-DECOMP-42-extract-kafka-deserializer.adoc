@@ -5,17 +5,12 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export
+| Status | **Done (2026-08-10).** Moved `streaming/kafka/deserializer.rs` (9 tests) into a new horizontal crate (#1556).
 | Component | `crates/horizontal/proximadb-kafka-deserializer`; root `src/streaming/kafka/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-40-extract-kafka-config.adoc[TD-DECOMP-40]
 |===
 
-== What moved
-`src/streaming/kafka/deserializer.rs` (9 tests) → new horizontal crate `proximadb-kafka-deserializer`.
-Root `streaming/kafka/mod.rs` re-exports it (`pub use proximadb_kafka_deserializer::deserializer;`),
-so the existing `pub use deserializer::{DeserializationError, MessageDeserializer, VectorMessage};`
-resolves unchanged. Deps: serde + serde_json + the sibling `proximadb-kafka-config` crate (for
-`DeserializationFormat`, extracted in TD-DECOMP-40); the `use super::config::DeserializationFormat`
-was rewritten to `use proximadb_kafka_config::config::DeserializationFormat`. The heavy `rdkafka`
-consumer impl stays root-side. Verified: standalone + clippy -D warnings + root lib all pass. SIFT
-recall ratchet SKIPS this PR (streaming/** is not in storage_changes).
+== History
+
+Depends on the sibling `proximadb-kafka-config` (link:TD-DECOMP-40-extract-kafka-config.adoc[TD-DECOMP-40]) for `DeserializationFormat`; the `rdkafka`
+consumer impl stays root-side.

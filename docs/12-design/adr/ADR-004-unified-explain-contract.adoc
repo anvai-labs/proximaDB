@@ -9,6 +9,12 @@
 
 Accepted
 
+Reconciliation (2026-10-15): **partially implemented.** Explain is `ExplainPlan` in
+`src/query/explain.rs` (+ `explain_schema.rs`, `proximadb.explain.v1` proto); no
+`UnifiedExplainPlan` type exists and the File Plan paths below are historical. The route/
+write-plan extension (2026-05 section) remains the contract; the route-decision trace that now
+carries much of it is ADR-064 (decision/dispatch/lowering trace).
+
 == Context
 
 ProximaDB's explain output is currently protocol-specific:

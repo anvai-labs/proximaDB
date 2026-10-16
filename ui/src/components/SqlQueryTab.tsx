@@ -1,5 +1,10 @@
 import React, { useState, useCallback, useRef } from 'react';
 import Editor, { loader, OnMount } from '@monaco-editor/react';
+// Type-only (erased at build; the runtime is the self-hosted `/vs` AMD bundle).
+// `@monaco-editor/react` types its `monaco` argument as the global `monaco`
+// namespace, which monaco-editor 0.57 no longer declares under bundler module
+// resolution, so it would silently degrade to `any`; type it from the package.
+import type * as MonacoApi from 'monaco-editor';
 import './SqlQueryTab.css';
 
 // TD-UICDN-1: resolve the Monaco runtime from our own origin (`public/vs`,
@@ -105,7 +110,7 @@ const SqlQueryTab: React.FC = () => {
   const [showSamples, setShowSamples] = useState<boolean>(true);
   const editorRef = useRef<unknown>(null);
 
-  const handleEditorDidMount: OnMount = (editor, monaco) => {
+  const handleEditorDidMount: OnMount = (editor, monaco: typeof MonacoApi) => {
     editorRef.current = editor;
 
     // Register ProximaDB SQL language features

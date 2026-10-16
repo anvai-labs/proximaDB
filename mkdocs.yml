@@ -149,6 +149,7 @@ nav:
   - API Reference: 03-api-reference/index.md
   - Operations:
       - Overview: 04-operations/index.md
+      - "Release procedure (one tag, every registry)": 04-operations/release/release-procedure.md
       - "Release: v0.2.1 macOS": 04-operations/release/v0.2.1-macos-support.md
 
 extra_css:

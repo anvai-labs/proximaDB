@@ -6474,3 +6474,264 @@ fn upsert_storage_layout_is_additive_and_idempotent() {
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].name, "parquet-snapshot");
 }
+
+/// TD-DML-1: build a members table (`id` PK, `email` UNIQUE) on a
+/// DirectWal record store, optionally with a fenced ConditionalKeyStore.
+#[cfg(test)]
+async fn dml1_members_fixture(
+    temp_dir: &tempfile::TempDir,
+    with_cks: bool,
+) -> (DmlService, crate::query::sql_frontend::SqlFrontendParser) {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    let ddl_stmt = parser
+        .parse_ddl(
+            "CREATE TABLE members (id TEXT NOT NULL, email TEXT, PRIMARY KEY (id), UNIQUE (email));",
+        )
+        .expect("parse create")
+        .expect("ddl");
+    ddl.execute(ddl_stmt).await.expect("create table");
+    let wal_appender = Arc::new(
+        FramedTableWalAppender::open(temp_dir.path().join("dml1.wal"))
+            .await
+            .expect("open WAL"),
+    );
+    let record_store = Arc::new(DirectWalTableRecordStore::new(
+        Arc::new(MemtableRecordStorage::new()),
+        wal_appender,
+    ));
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager,
+        record_store,
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    );
+    #[cfg(feature = "oltp-integrity")]
+    let dml = if with_cks {
+        use proximadb_cks_local::{LocalWalKeyStore, SyncPolicy};
+        let cks = Arc::new(
+            LocalWalKeyStore::open(temp_dir.path().join("dml1-cks.wal"), SyncPolicy::PerOp)
+                .expect("open cks"),
+        );
+        dml.with_conditional_key_store(cks)
+    } else {
+        dml
+    };
+    #[cfg(not(feature = "oltp-integrity"))]
+    let _ = with_cks;
+    (dml, parser)
+}
+
+/// TD-DML-1: UPSERT runs the shared INSERT enforcement — a secondary-UNIQUE
+/// collision is a typed 23505, a repeated conflict key in one statement is a
+/// typed 21000, and a self-replacing UPSERT is not a conflict.
+#[tokio::test]
+async fn upsert_enforces_unique_with_typed_sqlstates() {
+    use proximadb_catalog::relational::find_relational_constraint_violation;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml1_members_fixture(&temp_dir, false).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+
+    dml.execute(stmt(
+        "INSERT INTO members (id, email) VALUES ('m1', 'a@x.com');",
+    ))
+    .await
+    .expect("seed");
+
+    let err = dml
+        .execute(stmt(
+            "INSERT INTO members (id, email) VALUES ('m2', 'a@x.com') \
+             ON CONFLICT (id) DO UPDATE SET email = excluded.email;",
+        ))
+        .await
+        .expect_err("UPSERT colliding on a secondary UNIQUE must be rejected");
+    let violation = find_relational_constraint_violation(&err).expect("typed violation");
+    assert_eq!(violation.sqlstate(), "23505", "{err}");
+
+    let err = dml
+        .execute(stmt(
+            "INSERT INTO members (id, email) VALUES ('m3', 'b@x.com'), ('m3', 'c@x.com') \
+             ON CONFLICT (id) DO UPDATE SET email = excluded.email;",
+        ))
+        .await
+        .expect_err("one UPSERT may not affect the same row twice");
+    let violation = find_relational_constraint_violation(&err).expect("typed violation");
+    assert_eq!(violation.sqlstate(), "21000", "{err}");
+
+    // Replacing m1 with its own unique value is not a self-conflict.
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO members (id, email) VALUES ('m1', 'a@x.com') \
+             ON CONFLICT (id) DO UPDATE SET email = excluded.email;",
+        ))
+        .await
+        .expect("self-replacing UPSERT");
+    assert_eq!(result.rows_affected, 1);
+
+    // INSERT keeps its own 23505 for a PK duplicate (shared sequence, Insert mode).
+    let err = dml
+        .execute(stmt(
+            "INSERT INTO members (id, email) VALUES ('m1', 'z@x.com');",
+        ))
+        .await
+        .expect_err("duplicate PK INSERT");
+    assert!(
+        err.to_string()
+            .contains("duplicate key value violates primary key"),
+        "{err}"
+    );
+    let violation = find_relational_constraint_violation(&err).expect("typed violation");
+    assert_eq!(violation.sqlstate(), "23505");
+}
+
+/// TD-DML-1 CKS divergence: with the fenced ConditionalKeyStore wired, an
+/// UPSERT claims its new PK (so a later INSERT of that key is rejected by the
+/// fenced store, not only by the oid backstop), re-UPSERTing a live key is a
+/// replace, and a REJECTED UPSERT releases the claim it made.
+#[cfg(feature = "oltp-integrity")]
+#[tokio::test]
+async fn upsert_claims_and_releases_pk_in_fenced_store() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml1_members_fixture(&temp_dir, true).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+
+    dml.execute(stmt(
+        "INSERT INTO members (id, email) VALUES ('u1', 'a@x.com') \
+         ON CONFLICT (id) DO UPDATE SET email = excluded.email;",
+    ))
+    .await
+    .expect("UPSERT of a new key");
+    let err = dml
+        .execute(stmt(
+            "INSERT INTO members (id, email) VALUES ('u1', 'b@x.com');",
+        ))
+        .await
+        .expect_err("INSERT of an UPSERTed key must conflict");
+    assert!(
+        err.to_string()
+            .contains("duplicate key value violates primary key"),
+        "{err}"
+    );
+    dml.execute(stmt(
+        "INSERT INTO members (id, email) VALUES ('u1', 'c@x.com') \
+         ON CONFLICT (id) DO UPDATE SET email = excluded.email;",
+    ))
+    .await
+    .expect("re-UPSERT of a live key replaces it");
+
+    // u9 collides on UNIQUE email → rejected; its fresh PK claim is released.
+    dml.execute(stmt(
+        "INSERT INTO members (id, email) VALUES ('u9', 'c@x.com') \
+         ON CONFLICT (id) DO UPDATE SET email = excluded.email;",
+    ))
+    .await
+    .expect_err("UNIQUE collision");
+    dml.execute(stmt(
+        "INSERT INTO members (id, email) VALUES ('u9', 'd@x.com');",
+    ))
+    .await
+    .expect("a rejected UPSERT must not leave a claimed-but-rowless PK");
+}
+
+/// TD-DML-2: with the fenced ConditionalKeyStore wired, a composite PK is
+/// claimed on its FULL tuple — rows sharing the first PK column no longer
+/// collide; a true duplicate is still rejected; a DELETE releases the
+/// full-tuple claim (re-insert works); an UPSERTed composite key is claimed.
+#[cfg(feature = "oltp-integrity")]
+#[tokio::test]
+async fn composite_pk_is_fenced_on_full_tuple() {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+    use proximadb_cks_local::{LocalWalKeyStore, SyncPolicy};
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    let ddl_stmt = parser
+        .parse_ddl(
+            "CREATE TABLE accts (org TEXT NOT NULL, id BIGINT NOT NULL, note TEXT, PRIMARY KEY (org, id));",
+        )
+        .expect("parse create")
+        .expect("ddl");
+    ddl.execute(ddl_stmt).await.expect("create table");
+    let wal_appender = Arc::new(
+        FramedTableWalAppender::open(temp_dir.path().join("dml2.wal"))
+            .await
+            .expect("open WAL"),
+    );
+    let record_store = Arc::new(DirectWalTableRecordStore::new(
+        Arc::new(MemtableRecordStorage::new()),
+        wal_appender,
+    ));
+    let cks = Arc::new(
+        LocalWalKeyStore::open(temp_dir.path().join("dml2-cks.wal"), SyncPolicy::PerOp)
+            .expect("open cks"),
+    );
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager,
+        record_store,
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    )
+    .with_conditional_key_store(cks);
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+
+    dml.execute(stmt("INSERT INTO accts (org, id) VALUES ('acme', 1);"))
+        .await
+        .expect("first row");
+    dml.execute(stmt("INSERT INTO accts (org, id) VALUES ('acme', 2);"))
+        .await
+        .expect("same first PK column, distinct tuple — must NOT collide (TD-DML-2)");
+    let err = dml
+        .execute(stmt("INSERT INTO accts (org, id) VALUES ('acme', 1);"))
+        .await
+        .expect_err("a true composite duplicate is rejected");
+    assert!(
+        err.to_string()
+            .contains("duplicate key value violates primary key"),
+        "{err}"
+    );
+
+    dml.execute(stmt("DELETE FROM accts WHERE org = 'acme' AND id = 1;"))
+        .await
+        .expect("delete composite row");
+    dml.execute(stmt("INSERT INTO accts (org, id) VALUES ('acme', 1);"))
+        .await
+        .expect("re-insert after DELETE: the full-tuple claim was released");
+
+    dml.execute(stmt(
+        "INSERT INTO accts (org, id, note) VALUES ('acme', 3, 'n') \
+         ON CONFLICT (org, id) DO UPDATE SET note = excluded.note;",
+    ))
+    .await
+    .expect("UPSERT of a new composite key");
+    dml.execute(stmt("INSERT INTO accts (org, id) VALUES ('acme', 3);"))
+        .await
+        .expect_err("the UPSERTed composite key is claimed");
+}

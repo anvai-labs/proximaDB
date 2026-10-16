@@ -2,6 +2,13 @@
 :date: 2026-06-29
 :toc: left
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** Shipped and still valid: the io-trace substrate (per-query `IoTrace`, physical-read ownership at the leaf filesystems, always-on `record_*`), and the "format follows workload, scheduler routes, choice is measured" resolution. ADR-094 §1.2 now codifies that resolution normatively (see link:PAX_V3_UNIFIED_SUBSTRATE_SPEC_2026_09.adoc[PAX v3 §1.2], canonical). **Stale:** the "format profile" flag list predates PAX-always flush (ADR-049 M1-3). `PROXIMADB_PAX_VECTOR_SEGMENTS` is no longer the format switch, and `PROXIMADB_PAX_QUANT_DISABLE` now selects `RawF32` PAX. VIPER is deprecated (ADR-093). **Open:** the networked/spilled decision-loop measurement, and the "AXIS Stage-2 returns 0" issue, which was not re-verified (AXIS is winding down per TD-AXIS-4).
+| Relates to | link:PAX_RANGED_READ_MULTICLOUD_COST_2026_06_25.adoc[PAX ranged-read cost], link:SIFT1M_ADMISSION_FIRST_GET_REDUCTION_BLUEPRINT_2026_07_29.adoc[SIFT1M GET-reduction] (overlap: measured-GET methodology), link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094]
+|===
+
 == Why this doc
 
 TD-096 S2 (PR #543/#545) exposed that storage format/layout decisions were

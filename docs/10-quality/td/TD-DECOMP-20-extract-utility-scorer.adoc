@@ -5,39 +5,15 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export
+| Status | **Done (2026-08-04).** Moved the utility-aware final-evidence scorer (`UtilityScorer`, `LinearUtilityScorer`, `ArtifactUtilityScorer`; 12 tests) into a std-only horizontal crate (#1428).
 | Component | `crates/horizontal/proximadb-utility-scorer`; root `src/core/search/hybrid/mod.rs`
-| Relates to | [[TD-DECOMP-1]] (recipe); [[TD-DECOMP-19]] (preceding std-only search leaf)
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-19-extract-cross-modal-fusion.adoc[TD-DECOMP-19]
 |===
 
-== Why
+== History
 
-`src/core/search/hybrid/utility_scorer.rs` (LLD 8, **12 tests**) is the utility-aware final-evidence
-scorer: it blends vector similarity with operational utility (lexical, source-authority, freshness,
-diversity, tenant-local historical success) for final ranking, and ships the linear-blend default
-(`LinearUtilityScorer`) plus the pluggable `UtilityScorer` trait and path-based UAE-artifact wrapper
-(`ArtifactUtilityScorer`).
+Blends vector similarity with operational utility (lexical, source authority, freshness, diversity,
+tenant-local historical success).
 
-It is a textbook clean leaf:
-
-* **zero `crate::` climb-out**, single `super::` (the `#[cfg(test)]` block only);
-* **`std`-only** dependency (`PathBuf` for the artifact path) — no serde/tracing/anyhow/`proximadb_*`;
-* fully self-contained: 12 types/traits/fns (`UtilityFeatures`, `UtilityWeights`, `UtilityScorer`,
-  `LinearUtilityScorer`, `ArtifactUtilityScorer`, `rank`, ...) all defined in-file;
-* exactly **one** caller — `src/core/search/hybrid/mod.rs` (the `pub mod` declaration) — so the
-  re-export shim is trivial.
-
-== What moved (behavior-neutral)
-
-* Whole `src/core/search/hybrid/utility_scorer.rs` → `crates/horizontal/proximadb-utility-scorer/src/`.
-* Root `src/core/search/hybrid/mod.rs`: `pub mod utility_scorer;` →
-  `pub use proximadb_utility_scorer::utility_scorer;`.
-* New crate is horizontal-tier with an empty `[dependencies]` (`std`-only). No `CAPABILITY_MATRIX.toml`
-  evidence pointer referenced this file, so no matrix update was needed.
-
-== Follow-ups
-
-* **Running total once merged: ~652 tests out of root** (640 + 12).
-* The `ArtifactUtilityScorer` loads a tenant-registered UAE artifact by path at runtime; the
-  tenant-local `historical_success` invariant (no cross-tenant feedback bleed) travels with the module.
+* The tenant-local `historical_success` invariant (no cross-tenant feedback bleed) travels with the module;
+  `ArtifactUtilityScorer` loads a tenant-registered UAE artifact by path at runtime.

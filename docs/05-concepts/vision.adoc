@@ -20,23 +20,10 @@ relational data, and future media types.
 
 == Audience Focus
 
-Builder experience leads adoption; executive alignment follows from proven developer value.
-
-=== Builder-First Narrative
-
-* **One surface area**: vectors, documents, graphs, and relational data in a single API.
-* **Lower glue cost**: cross-model queries remove fragile ETL and app-side joins.
-* **Predictable performance**: storage engines and indexes are chosen per workload.
-* **Fast start, portable deployment**: local dev to object-store scale without rewrites.
-* **Clear primitives**: catalogs, schema, and indexes are explicit and inspectable.
-
-=== Executive Narrative
-
-* **Platform consolidation**: reduce database sprawl and duplicated pipelines.
-* **AI velocity**: faster iteration from data ingestion to model deployment.
-* **Governance at scale**: shared catalog, lineage, and access controls across models.
-* **Cost control**: format-first storage and elastic compute reduce long-term TCO.
-* **Avoid lock-in**: storage formats and catalogs protect data investments.
+Builder experience leads adoption; executive alignment follows from proven developer value. The
+builder-first and executive narratives that were here are carried, as a superset that adds
+time-series and events, by the canonical
+link:../00-product/VISION.adoc[VISION] "Builder-First Narrative" and "Executive Narrative" sections.
 
 == Vision Statement
 
@@ -52,22 +39,14 @@ duplicate data, manage inconsistent governance, and stitch together query workfl
 platform is needed to preserve best practices from domain-specific databases while providing a
 coherent, scalable, and evolvable data plane.
 
-== Design Principles
+== Design Principles and Adoption Strategy
 
-* **Format-first storage**: storage formats and metadata define the contract, not the compute
-  engine.
-* **Multi-engine by default**: specialized engines are modular and pluggable, not bolted on.
-* **Catalog-centric governance**: schema, lineage, and access control live in a shared catalog.
-* **Cross-model query**: SQL, graph traversal, vector similarity, and search share one planner.
-* **Deployment neutrality**: object store, local disk, or hybrid; compute can be embedded or
-  distributed.
-* **Operational simplicity**: single control plane and consistent tooling across models.
-
-== Adoption Strategy
-
-* **Start with builders**: win on developer experience and single-project outcomes.
-* **Expand to teams**: standardize catalogs, schema, and query patterns.
-* **Institutionalize**: align governance, cost, and reliability expectations for executives.
+The six principles listed here are restated, with expanded rationale, in the canonical
+link:../00-product/VISION.adoc[VISION] "Design Principles": format-first storage, multi-engine by
+default, catalog-centric governance, cross-model query, deployment neutrality, operational
+simplicity. VISION adds CS/CD, time-series-native, event-sourcing-native and compliance-ready. The
+three-step adoption strategy (builders → teams → institutionalize) is in VISION "Adoption
+Strategy", phases 1–3. Phase 0 there is the ibkrtrading dogfood.
 
 == Executive One-Pager (Talk Track)
 

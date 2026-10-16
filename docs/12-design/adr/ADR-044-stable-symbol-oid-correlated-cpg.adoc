@@ -149,3 +149,9 @@ new identity — which is the correct semantics (those *are* different symbols).
   line shift does not change it.
 * All gated **default-OFF** (`VICTOR_CODEGRAPH_STABLE_OID` / `ANVAIOPS_CODEGRAPH_STABLE_OID`).
 * **P2 cutover — TODO:** flip default-ON behind a correlation/recall parity ratchet.
+* *Reconciled 2026-10-15:* the **ProximaDB SDK cutover landed** (#529 — `_code_oid` default-ON,
+  opt-out `VICTOR_CODEGRAPH_STABLE_OID=0`, pins `victor-codegraph>=0.1.2`); keystone recorded
+  Accepted in #526. **Still open:** P2 substrate keying (vector + ORION node + relational row on
+  the canonical oid, verified here only for the SDK), the AnvaiOps default flip (other repo), and
+  P3 — drop the legacy alias one release after cutover. The ADR-031 "Relates to" analogy holds
+  in spirit; the catalog-identity scheme itself is now ADR-0083.

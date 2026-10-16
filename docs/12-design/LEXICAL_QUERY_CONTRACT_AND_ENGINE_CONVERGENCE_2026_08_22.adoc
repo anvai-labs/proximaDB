@@ -1,6 +1,13 @@
 = Lexical query contract and engine convergence — 2026-08-22
 :toc:
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (verified 2026-10-15).** The semantic contract shipped (#1713: explicit `NaturalLanguage` default / opt-in `AdvancedSyntax`, typed unsupported-mode error in canonical BM25). Open: a versioned public query-mode field with engine-capability reporting; the reranker citation-span, generator-quality and production ONNX latency gates (reranking stays opt-in).
+| Relates to | link:FORMAT_STRATEGY_ICEBERG_DELTA_LANCE_2026_06.adoc[FORMAT_STRATEGY] (Phase-2 BM25 inverted index item), link:CROSS_MODAL_FUSION_SEAM_2026_06_22.adoc[CROSS_MODAL_FUSION_SEAM] (F-C `DocumentExpander` / hybrid BM25 convergence)
+|===
+
 == Decision
 
 Lexical search has two explicit meanings:

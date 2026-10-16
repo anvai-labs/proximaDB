@@ -5,27 +5,24 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Resolved (root-caused + fixed).** Two independent defects stacked under the original "0.35% recall" symptom. (1) *Benchmark artifact:* the SIFT harness unpacked the whole `.fvecs` file as int32, shipping every f32 component's **bit pattern** as the vector value (`6.0` → `1086324736`) — the "corruption" chased through WAL/flush/PAX was garbage-in at the client; the server pipeline stored it faithfully (verified clean end-to-end with `PROXIMADB_CORRUPTION_DEBUG=1` dumps at WAL ingest + flush materialize + SQ8 encode). (2) *Real server defect:* with correct vectors, recall was still capped at the **memtable fraction** (12.7% with a 16k/100k unflushed tail) because `apply_delta_merge_with_explain` hardcoded `DistanceMetric::Cosine` for the WAL delta re-score — delta scores (~0.9 cosine scale) always displaced storage results (~0.005 on the Euclidean `1/(1+L2)` scale) in the score-descending merge.
+| Status | **Partial: root-caused and fixed — SIFT recall 0.35% → 0.989 (#1158, #1159). Open: the follow-up test gap — no co-design-PAX-scan e2e recall ratchet over the live REST route with a non-empty memtable on a non-cosine metric.**
 | Priority | **P1** — was THE blocker for usable recall on co-design (no-index_configs) collections whenever any unflushed writes exist (i.e. always, during ingest).
-| Component | `src/services/operations/vectors/legacy.rs` (`apply_delta_merge_with_explain` — the hardcoded metric; `optimized_to_proto_v1` — display fallback), `src/storage/engines/sst/search/mod.rs` (`try_pax_cascade` — `similarity: None`), `src/core/search/merge.rs` (score-desc merge that amplified the scale mismatch).
-| Evidence | Clean-parse SIFT 100k: storage-only search (empty memtable) returns EXACT brute-force top-5 for self-queries (v0/v10000/v50000) — the PAX cascade ranks correctly. Insert 50 unrelated records (true L2 ≈ 500 from the query) → they scored 0.86–0.93 (cosine) and displaced the exact match v0 (storage score 0.356 = 1/(1+1.8) SQ8-rerank). Server log: Stage-1/Stage-3 ran `metric=Euclidean`; the post-merge WAL re-scan ran `metric=Cosine` (`WAL: Enhanced search ... metric=Cosine`), proving the delta-merge was the only stage off-metric.
+| Component | `src/services/operations/vectors/legacy.rs` (delta merge), `src/storage/engines/sst/search/` (`try_pax_cascade`), `src/core/search/merge.rs`
+| Relates to | link:TD-SEARCH-1-search-path-score-scale-consolidation.adoc[TD-SEARCH-1] (score-scale consolidation follow-up); link:TD-WAL-3-flush-mechanism-consolidation.adoc[TD-WAL-3]; link:TD-RECALL-2-cross-tier-recall-regression-1406.adoc[TD-RECALL-2]; flush fixes #1150/#1155/#1158
 |===
 
-== The fixes (this PR)
+== History (shipped)
 
-* `apply_delta_merge_with_explain` now derives the metric from the collection config via the shared `collection_distance_metric` helper (also used by `execute_two_stage_search_with_mode`) — every stage (Stage-1 WAL, Stage-2 AXIS, Stage-3 storage, delta re-score) ranks on the collection's metric, so all normalized scores share one scale.
-* `try_pax_cascade` populates `similarity` (was `None` → the response boundary's `similarity.unwrap_or(0.0)` rendered every cascade hit as score 0.0).
-* `optimized_to_proto_v1` display falls back to `score` (the cross-engine normalized similarity) instead of 0.0.
-* The SIFT harness parses `.fvecs` as `[int32 dim][dim × f32]` and `.ivecs` as int32 (was: whole-file int32).
+Two independent defects stacked under one "0.35% recall" symptom:
 
-== Verification
-- SIFT 100k co-design collection over REST (fresh ingest → flush → search, memtable non-empty): recall@10 ≥ 0.90.
-- Self-query invariant: an exact base vector query returns itself top-1 regardless of memtable population.
-- Follow-up test gap remains: a co-design-PAX-scan e2e recall ratchet over the live REST route (the existing ratchets use direct-engine harnesses that bypass the delta merge — which is exactly where this bug lived).
+. *Benchmark artifact:* the SIFT harness unpacked the whole `.fvecs` file as int32, so every f32's bit pattern became the value (`6.0` → `1086324736`). The server stored the garbage faithfully. Fixed to `[int32 dim][dim × f32]`.
+. *Real server defect:* `apply_delta_merge_with_explain` re-scored the WAL delta with hardcoded `DistanceMetric::Cosine`, so delta scores (~0.9) always displaced storage scores (~0.005 on the Euclidean `1/(1+L2)` scale) and recall was capped at the memtable fraction. Every stage now derives the metric from the collection via `collection_distance_metric`; `try_pax_cascade` populates `similarity` (it was `None`, rendered as 0.0); the v1 display falls back to `score`.
 
-== Lessons
-* A score-scale contract ("`score` = normalized similarity, one metric per collection") spans FOUR producers; nothing enforced it. See TD-SEARCH-1 for the consolidation debt (duplicate `SimilarityResult` structs, three parallel memtable search implementations, internal `_v1` DTO plumbing).
-* Instrument-first paid off: env-gated value dumps at each pipeline stage (ingest → materialize → encode) bisected the "corruption" to the client in one run.
+*Lessons that still apply:* the score-scale contract ("`score` = normalized similarity, one metric per collection") spans four producers and nothing enforced it (TD-SEARCH-1). Instrument first: env-gated value dumps at ingest → materialize → encode (`PROXIMADB_CORRUPTION_DEBUG=1`) bisected the "corruption" to the client in one run. Direct-engine recall harnesses bypass the delta merge, which is exactly where this bug lived.
 
-== Related
-Flush fixes that preceded this: #1150/#1155/#1158; link:TD-WAL-3-flush-mechanism-consolidation.adoc[TD-WAL-3]; link:TD-SEARCH-1-search-path-score-scale-consolidation.adoc[TD-SEARCH-1] (consolidation follow-up).
+*Evidence:* clean-parse SIFT 100k storage-only search returns exact brute-force top-5 for self-queries; SIFT 100k over REST with a non-empty memtable reached recall@10 ≥ 0.90 (0.989 at fix time, #1159).
+
+== Open
+
+* Follow-up test gap (same ratchet as link:TD-SEARCH-1-search-path-score-scale-consolidation.adoc[TD-SEARCH-1] §Verification; canonical there): a co-design-PAX-scan e2e recall ratchet over the live REST route (the existing ratchets use direct-engine harnesses that bypass the delta merge; `tests/vector_ann_recall_e2e.rs` is REST but small-N cosine and does not pin a mixed memtable + storage merge on a Euclidean collection).
+* Self-query invariant to pin in that ratchet: an exact base vector query returns itself top-1 regardless of memtable population.

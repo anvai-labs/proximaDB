@@ -1,6 +1,13 @@
 = PAX Ranged-Read Economics + Per-Modality Geometry (S3 / ADLS-ABFS / GCS)
 :toc: macro
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (analysis; reconciled 2026-10-15).** The diagnosis holds: storage-read cost = GET-count × a locality-independent fee, so coalescing and pruning are the work. Coalescing and pruning have since landed through the RDSTRAT/ADR-062 track. The §6 per-modality geometry recommendation is **not implemented**. Block size is configurable only per process via `PROXIMADB_PAX_BLOCK_SIZE` (TD-156, #349). Per-collection quant config landed (TD-155, #388). Still open: per-modality and object-store-aware geometry defaults, adaptive trace-driven tuning (TD-157), and Hilbert pre-sort and hierarchical zone maps (TD-153/154). The doc's "TD-155 per-collection config" means the geometry follow-up recorded under TD-156, which is still open.
+| Relates to | link:OUTGRESS_KOU_MULTICLOUD_COST_MODEL_2026_06_21.adoc[KOU cost model] (result-egress, separate), link:adr/ADR-062-coalesced-rabitq-header-self-describing-footer-pax-layout.adoc[ADR-062], link:SIFT1M_ADMISSION_FIRST_GET_REDUCTION_BLUEPRINT_2026_07_29.adoc[SIFT1M GET-reduction blueprint] (overlap: GET-count as the cost term), link:STORAGE_FORMAT_DECISION_FRAMEWORK_2026_06_29.adoc[storage-format decision framework]
+|===
+
 [NOTE]
 ====
 *Correction (2026-06-26).* The first cut conflated the **storage-read** path

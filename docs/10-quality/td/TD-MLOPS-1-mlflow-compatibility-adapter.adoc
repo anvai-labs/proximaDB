@@ -1,17 +1,17 @@
 = TD-MLOPS-1: MLflow compatibility adapter — tracking + registry lowering onto xCatalog
 :toc: macro
-:status: Open
+:status: Partial
 :dim: D2
 :pillar: OE
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Implemented — all four slices (tracking core, tracking wire + conformance, registry wire, artifacts proxy); gate default-OFF, flip assessment pending
+| Status | **Partial: all four slices shipped — tracking core (#1847), tracking wire (#1850) + real-client conformance lane (#1851), registry wire (#1854), artifacts proxy (#1855); open: the default-ON flip assessment (preconditions below), alias DELETE + server-side compare-and-retry (needs a `RemoveAlias` command), and the offline ownership audit of legacy artifact bytes.** Gate `PROXIMADB_MLFLOW_COMPAT_ENABLE` remains default-OFF.
 | Severity | Medium — platform gap: the AI-native data platform cannot be driven by the ML tooling ecosystem (MLflow clients) without this adapter
 | Component | `src/network/rest/mlflow/` (new), `crates/control/proximadb-catalog` (registry lowering), RunStore port (new)
 | Design authority | `docs/12-design/XCATALOG_MLOPS_MODEL_REGISTRY_2026_08_12.adoc` ("one authority, several adapters")
-| Related | TD-SPECRAT-1 (spec program), ADR-053 (UnifiedQueryPort/connectivity core), mandate 18b (connectivity spine)
+| Related | link:TD-MLOPS-2-traces-logged-models.adoc[TD-MLOPS-2], link:TD-MLOPS-3-mlflow-ui-vendoring.adoc[TD-MLOPS-3], link:TD-MLOPS-4-artifact-seam-pushdown-v2.adoc[TD-MLOPS-4] (the S3-backed artifact repository follow-up landed there, #1896), TD-SPECRAT-1 (spec program), ADR-053 (UnifiedQueryPort/connectivity core), mandate 18b (connectivity spine)
 |===
 
 toc::[]
@@ -79,81 +79,45 @@ names MLflow compatibility as the next adapter slice. Without it:
 | Signature | Typed input/output contract | Embedding semantics beyond tensor schemas.
 |===
 
-== Slices (TDD; each ships tests + docs; wire slices ship behind the gate)
+== History (shipped)
 
-// Slice 0 note (review round 1): the design's rollout item 3 (typed
-// collection binding, data-plane) is INDEPENDENT of slices 1-4 — they need
-// only the already-implemented lifecycle service — so this wave may drive
-// in parallel with it.
+* **Slice 1 (#1847).** `RunStore` port + in-memory reference + `port_conformance` battery
+  (`crates/control/proximadb-catalog/src/run_store.rs`); `SubstrateRunStore` over the document substrate
+  (`src/services/mlflow_run_store.rs`) — one tenant-scoped collection, per-run seq counters for metric
+  ordering; concurrent metric appends all retained. Adversarial review removed a production panic on a
+  poisoned lock and made absent/non-string payloads fail as corruption instead of masquerading as unknown.
+* **Slice 2 (#1850, #1851).** 16 tracking endpoints at `/api/2.0/mlflow/*` with MLflow 2.x shapes and the
+  native `{error_code, message}` envelope; tenant from `Extension<TenantContext>`, cross-tenant probes
+  byte-identical to missing-id probes; search subset with unparseable filters → INVALID_PARAMETER_VALUE
+  (never silently ignored) and a pinned non-match negative control; `experiments/get-by-name` added
+  because real clients resolve `set_experiment` by name. The `mlflow-conformance` lane drives the real
+  pinned `mlflow-skinny==2.14.3` client against a ratchet (`mlflow_conformance_steps_2x.txt`, only up).
+* **Slice 3 (#1854).** Registry wire lowering to `CatalogModelRegistryService`. Deliberate rejections:
+  `model-versions/create` (version registration is a governance act via the native lifecycle API),
+  `transition-stage` (alias pointer, names the requested stage), registry tags/descriptions (explicit
+  error, never fabricated success). Lesson: `aliases` must serialize as `RegisteredModelAlias {alias,
+  version}` objects — bare strings parse into empty messages client-side.
+* **Slice 4 (#1855).** Real clients fetch artifacts via the `/api/2.0/mlflow-artifacts/*` proxy family,
+  not `/api/2.0/mlflow/*`, so `artifact_location`/`artifact_uri` are populated in every response. Local
+  storage under an injective, byte-encoded tenant root (`<data_dir>/mlflow_artifacts_v2/…`,
+  traversal-sanitized). Conformance 17 → 18 steps.
 
-=== Slice 1 — Tracking core (RunStore port + substrate impl) — no wire
+== Open items
 
-* `RunStore` port: experiments CRUD (soft delete), runs lifecycle
-  (create/get/update/delete/set-tag), params (immutable), metrics +
-  history, tags. Tenant-scoped by construction.
-* First implementation: system-namespaced document collection through the
-  document substrate; keys under `data/{tenant}/{ns}/…` via `DrPathBuilder`
-  only.
-* Tests: red→green port conformance (round-trip, tenant isolation, metric
-  ordering, param differing-value rejection + same-value idempotency,
-  soft-delete visibility, CONCURRENT metric appends to one run from
-  interleaved writers at the same step), positive shapes.
-
-=== Slice 2 — MLflow tracking wire (gate OFF)
-
-* Router under `/api/2.0/mlflow/*` (axum, mounted only when
-  `PROXIMADB_MLFLOW_COMPAT_ENABLE` is set): experiments create/get/search/
-  delete/restore, runs create/get/update/search/delete/restore,
-  log-parameter, log-metric, log-batch, set-tag/delete-tag.
-* MLflow-native error envelope (`{error_code, message}`) and REST shapes —
-  MLflow's spec is the external contract (pgwire-class compatibility, not
-  our OpenAPI); document this in ENV_GATE_REGISTRY + the surface docs.
-* Search endpoints implement MLflow's filter language for the subset the
-  canonical workflow exercises (`params.x = 'y'`, `metrics.k < v`,
-  `tags.t = 'v'`, `LIKE`), plus `run_view_type` (ACTIVE_ONLY vs ALL —
-  interacting with soft-deletes), `order_by`, and pagination. NEGATIVE
-  CONTROLS REQUIRED: a non-matching filter returns empty (a ratchet that
-  counts passing steps passes happily with an ignored filter).
-* **Conformance ratchet:** a test lane drives the REAL `mlflow` Python
-  client (`mlflow-skinny`, version PINNED in the lane's pip install —
-  unpinned latest makes a counts-only-up ratchet drift with upstream)
-  through the canonical workflow (create experiment → run →
-  params/metrics/batch → search → artifacts). The lane counts passing
-  workflow steps (only up). Lane + path-filter wiring named at slice-2
-  time (the repeated repo failure: new test files matching no lane glob).
-* **Cross-tenant wire negative:** foreign experiment_id/run_id returns a
-  uniform MLflow-native `RESOURCE_DOES_NOT_EXIST` — never a distinguishing
-  403 that confirms id existence; search silently excludes foreign tenants.
-* Fail-closed: gate off ⇒ 404 on every route (negative control test).
-
-=== Slice 3 — MLflow registry wire (gate OFF)
-
-* registered-models create/get/search/delete; model-versions
-  create/get/search/delete; aliases set/delete/get — lowering to
-  `CatalogModelRegistryService` (create_registry / apply_mutation /
-  resolve_alias_binding).
-* Stage transitions rejected with the alias pointer (mapping table).
-* Conformance: real-client registry workflow + the design's
-  duplicate-version-fails / alias-history-preserved assertions.
-
-=== Slice 4 — Artifacts + datasets
-
-* Real MLflow clients do NOT fetch artifacts via `/api/2.0/mlflow/*`:
-  the tracking server returns `artifact_location` (e.g.
-  `mlflow-artifacts:/<exp>`) in experiment/run payloads and the client
-  resolves it against the tracking host's *proxy* routes under
-  `/api/2.0/mlflow-artifacts/*`. Slice 4 therefore mounts that route
-  family too and populates `artifact_location`/`artifact_uri` in every
-  experiment/run response — without it the slice-2 conformance step
-  "artifacts listing" 404s by construction.
-* `log-artifact` / list-download as OCI descriptors under DrPathBuilder;
-  run dataset inputs recorded as name+digest lineage entries.
-* Conformance: artifact round-trip digest-stable across relocation.
-
-=== Later (separate TD if pulled forward)
-
-* OpenLineage import/export over the same producer/input lineage.
-* MLflow 3.x llm/datasets extensions; serving integrations (out of scope).
+* **Alias DELETE + concurrency.** Alias DELETE is honest-rejected pending a service-side `RemoveAlias`
+  command. KNOWN LIMIT: alias-set is a read-revision-then-mutate cycle — a concurrent registry
+  mutation surfaces as a typed 400 "revision conflict" (no lost update) that MLflow clients do NOT
+  auto-retry; one-shot failure is the documented behavior until a server-side compare-and-retry lands
+  with the RemoveAlias command.
+* **Legacy artifact bytes.** Legacy artifact bytes require an explicit offline ownership audit and
+  migration/quarantine; an automatic read fallback is forbidden because the prior lossy tenant mapping
+  cannot prove which tenant owns colliding bytes.
+* **XCATALOG amendment.** Law 0 requires an amendment note in the XCATALOG design doc recording the
+  TRACKING extension. Not present as of 2026-10-15: `XCATALOG_MLOPS_MODEL_REGISTRY_2026_08_12.adoc`
+  still says "MLflow compatibility is the next adapter slice" and covers the registry only.
+* **Later (separate TD if pulled forward).** OpenLineage import/export over the same producer/input
+  lineage; MLflow 3.x llm/datasets extensions (traces + logged models are TD-MLOPS-2); serving
+  integrations (out of scope).
 
 == Flip precondition (opt-in → default-ON)
 
@@ -165,100 +129,5 @@ pre-GA rules).
 
 == Out of scope
 
-MLflow UI proxying; MLflow file-store emulation; model serving; training
+MLflow UI proxying (later vendored separately under TD-MLOPS-3); MLflow file-store emulation; model serving; training
 execution; MLflow auth pass-through (tenant identity stays ours).
-
-== Implementation log
-
-* **Slice 2 (2026-09-07)**: the MLflow tracking wire at `/api/2.0/mlflow/*`
-  (`src/network/rest/mlflow/`) — 16 endpoints over the RunStore port:
-  experiments create/get/search/delete/restore, runs
-  create/get/update/search/delete/restore, log-parameter, log-metric,
-  log-batch, set-tag, delete-tag. MLflow REST 2.x shapes (string ids,
-  info/data split, `mlflow.runName` tag) and the native error envelope
-  (`{error_code, message}` — RESOURCE_DOES_NOT_EXIST / ALREADY_EXISTS /
-  INVALID_PARAMETER_VALUE / INVALID_STATE / INTERNAL_ERROR). Tenant from
-  the shared `Extension<TenantContext>` plane, never body fields;
-  cross-tenant probes are byte-identical to missing-id probes. Search
-  subset: params/tags = != LIKE, metrics < <= > >= = !=, ANDed;
-  unparseable filters are INVALID_PARAMETER_VALUE (never silently
-  ignored); non-matching filters return EMPTY (negative control pinned).
-  Gate `PROXIMADB_MLFLOW_COMPAT_ENABLE` (opt-in, default OFF; registry
-  row added) mounts the router in BOTH server modes. Wire tests in the
-  unit lane: full workflow, tenant-uniformity, gate default. The
-  real-client (mlflow-skinny, pinned) conformance lane follows as this
-  slice's closing commit.
-* **Slice 4 (2026-09-08)**: the artifacts PROXY family —
-  /api/2.0/mlflow-artifacts/artifacts/{*path} PUT/GET/DELETE plus the
-  bare-root LIST/DELETE via ?path= (listing a FILE path yields the empty
-  list, the convention the client download flow relies on);
-  artifact_location/artifact_uri populated (experiments default
-  mlflow-artifacts:/<id>; runs mlflow-artifacts:/<exp>/<run>/artifacts);
-  local-file storage under an injective, byte-encoded tenant root in
-  <data_dir>/mlflow_artifacts_v2/... (traversal-sanitized, verbatim filenames,
-  tenant-scoped; the ambiguous lossy legacy layout is not read; S3-backed
-  repository is the tracked follow-up). Conformance 17 -> 18:
-  log/list/download artifact round-trip through the real client. ALL
-  FOUR SLICES IMPLEMENTED — the wave's remaining item is the flip
-  assessment (conformance green across consecutive develop revisions +
-  SIFT-bed load measurement + product sign-off).
-  Legacy artifact bytes require an explicit offline ownership audit and
-  migration/quarantine; an automatic read fallback is forbidden because the
-  prior lossy tenant mapping cannot prove which tenant owns colliding bytes.
-* **Slice 3 (2026-09-08)**: the registry wire — registered-models
-  create/get/get-by-name/search and model-versions get/search lowering to
-  `CatalogModelRegistryService` (create_registry / get / list /
-  apply_mutation with SetAlias); aliases set/get (`model-versions/create`
-  REJECTED with the typed-contract pointer — version registration is a
-  governance act through the native lifecycle API; `transition-stage`
-  REJECTED with the alias pointer; registry tags/descriptions an explicit
-  error, never fabricated success; alias DELETE honest-rejected pending a
-  service-side RemoveAlias command). Real-client conformance extended to
-  17 steps (ratchet raised): model create/get/search through the actual
-  MLflow client, including the two documented rejections and the
-  model-versions search (clients pass `name='...'` as a FILTER string —
-  parsed; searches arrive GET+query like every read). Review round 1:
-  `aliases` serialize as MLflow `RegisteredModelAlias {alias, version}`
-  OBJECTS (bare strings parse into empty alias messages client-side) and
-  the version projection rides the proto's `latest_versions` field;
-  lowercase LIKE accepted; unsupported `order_by` explicitly rejected;
-  the transition-stage message names the REQUESTED stage. KNOWN LIMIT:
-  alias-set is a read-revision-then-mutate cycle — a concurrent registry
-  mutation surfaces as a typed 400 "revision conflict" (no lost update)
-  that MLflow clients do NOT auto-retry; one-shot failure is the
-  documented behavior until a server-side compare-and-retry lands with
-  the RemoveAlias command.
-* **Slice 2 closing (2026-09-07)**: the conformance lane shipped —
-  `clients/python/tests/mlflow_conformance.py` drives the canonical
-  workflow (experiment lifecycle incl. get-by-name, run lifecycle,
-  params/metrics/tags, log-batch, history order, search match AND
-  non-match, terminate semantics, soft delete/restore) through the REAL
-  `mlflow` client against a spawned gated server; the
-  `mlflow-conformance` CI lane (mlflow-skinny==2.14.3, pinned) counts
-  passing steps against the checked-in 2.x-generation ratchet
-  (`mlflow_conformance_steps_2x.txt`, counts only go up). The wire gained
-  `experiments/get-by-name` (real clients resolve set_experiment by
-  name). Follow-up hardening from the parallel-session round — latest-
-  metric projection semantics ((timestamp, value) ordering) and
-  quote-aware filter clause splitting — landed with the slice-2 merge.
-* **Slice 1 (2026-09-06)**: `RunStore` port + in-memory reference +
-  `port_conformance` battery (`crates/control/proximadb-catalog/src/run_store.rs`);
-  `SubstrateRunStore` over the document substrate
-  (`src/services/mlflow_run_store.rs`) — one tenant-scoped collection, indexed
-  fields + JSON payload docs, process-mutex serialization for mutations,
-  per-run seq counters for metric ordering. Tests: substrate passes the port
-  conformance battery; structural tenant isolation pinned; concurrent
-  metric appends all retained (`tests/mlflow_run_store_test.rs`, wired into
-  the storage integration lane's explicit list).
-* **Slice 1 adversarial review (2026-09-06)**: rebased onto current `develop`;
-  removed the production panic on a poisoned process-global lock; corrected
-  strict-Clippy doc/mutability failures; and made existing tracking documents
-  with absent or non-string payloads fail as corruption instead of masquerading
-  as unknown records or disappearing from indexed listings. Both regressions
-  are pinned by focused red-to-green tests.
-
-== Next action
-
-Slice 2: the MLflow tracking wire adapter (`/api/2.0/mlflow/*` behind
-`PROXIMADB_MLFLOW_COMPAT_ENABLE`) + env-gate registry row + real-client
-conformance lane.

@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — *P1 implemented* (#612, typed columns are the canonical schema; reconciled 2026-10-15). P2–P5 open. Overlaps ADR-047 Phase 1/5 and ADR-049 M2 (same schema-authority migration from three angles).
 |Date|2026-07-01
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-009 (schema modes), ADR-024 (single canonical `ProximaType`), ADR-028 (index policy), ADR-031 (stable object id), ADR-035 (per-tenant catalog cache), "ADR-047" (collection-as-table — in flight, see note)

@@ -5,17 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export
+| Status | **Done (2026-08-11).** Moved `ArrowBlockIndex` / `ArrowIndexEntry` (block-level secondary index; 5 tests) into a new horizontal crate (#1583).
 | Component | `crates/horizontal/proximadb-arrow-block-index`; root `src/storage/engines/core/formats/arrow_block/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-44-extract-type-validators.adoc[TD-DECOMP-44]
 |===
 
-== What moved
-`src/storage/engines/core/formats/arrow_block/index.rs` (5 tests: `ArrowBlockIndex` +
-`ArrowIndexEntry` block-level secondary index) → new horizontal crate `proximadb-arrow-block-index`.
-Root `arrow_block/mod.rs` re-exports it (`pub use proximadb_arrow_block_index::index;`), so the
-existing `pub use index::{ArrowBlockIndex, ArrowIndexEntry};` resolves unchanged. Deps: serde +
-bytes + bincode (zero `proximadb_*` deps, zero `crate::` climb-out, `super::` test-only). NOTE:
-`bytes` declared inline (`bytes = "1.5"`) — NOT in `[workspace.dependencies]`; serde + bincode are
-workspace deps. Verified: standalone + clippy -D warnings + root lib all pass. SIFT recall ratchet
-RUNS (storage_changes) under the 45m cap (#1555).
+== History
+
+Deps: serde + bincode + `bytes` (inline; see link:TD-DECOMP-44-extract-type-validators.adoc[TD-DECOMP-44]).

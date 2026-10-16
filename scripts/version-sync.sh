@@ -8,6 +8,15 @@
 #   bash scripts/version-sync.sh check          # Validate all files match Cargo.toml
 #   bash scripts/version-sync.sh set <version>  # Update all files to <version>
 #   bash scripts/version-sync.sh get            # Print current version from Cargo.toml
+#   bash scripts/version-sync.sh check-tag <tag> # Release gate: tag vX.Y.Z == every manifest
+#
+# ONE TAG, ONE VERSION (TD-RELTAG-1): every registry -- GitHub Release binaries,
+# crates.io (proximadb-sdk), npm (@anvailabs/proximadb-client) and PyPI
+# (proximadb + proximadb_embedded) -- is released from ONE tag `vX.Y.Z`, and every
+# package carries the IDENTICAL version X.Y.Z. Both release workflows
+# (release.yml, release-python.yml) run `check-tag` before building anything, so
+# a tag that disagrees with any manifest `check` covers fails before a single
+# artifact is produced. There is no per-registry tag and no per-package hold.
 # =============================================================================
 
 set -e
@@ -987,6 +996,35 @@ PYEOF
   echo "Done. Run 'bash scripts/version-sync.sh check' to verify."
 }
 
+# Release gate (TD-RELTAG-1). Accepts the tag as pushed (`v0.4.1`,
+# `v0.5.0-beta.1`) or a full ref (`refs/tags/v0.4.1`). Fails unless:
+#   1. the tag is spelled `v<semver>` -- the one nomenclature both release
+#      workflows trigger on (no `python-v*`, `sdk-v*`, ...);
+#   2. the tag's version is EXACTLY Cargo.toml [package].version (no prefix
+#      stripping of prerelease suffixes: a `v0.5.0-rc.1` tag needs manifests at
+#      `0.5.0-rc.1`, which `set` writes);
+#   3. `check` passes, i.e. every published manifest equals that same version.
+# Equality is transitive through the Cargo version, so (2)+(3) is
+# "tag == every manifest" without a second list of files to drift.
+cmd_check_tag() {
+  local tag="$1"
+  tag="${tag#refs/tags/}"
+  if ! printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+    echo "::error::release tag '$tag' is not of the form vX.Y.Z[-pre]. Every registry releases from one tag vX.Y.Z (TD-RELTAG-1)." >&2
+    exit 1
+  fi
+  local tag_version="${tag#v}"
+  local cargo_version
+  cargo_version=$(get_cargo_version || true)
+  if [ "$tag_version" != "$cargo_version" ]; then
+    echo "::error::tag $tag says $tag_version but Cargo.toml [package].version is '${cargo_version}'." >&2
+    echo "       Bump with 'bash scripts/version-sync.sh set $tag_version' in a PR, merge, then re-tag." >&2
+    exit 1
+  fi
+  echo "Tag $tag matches Cargo.toml ($cargo_version); checking every published manifest..."
+  cmd_check
+}
+
 # Main
 case "${1:-}" in
   get)
@@ -994,6 +1032,13 @@ case "${1:-}" in
     ;;
   check)
     cmd_check
+    ;;
+  check-tag)
+    if [ -z "${2:-}" ]; then
+      echo "Usage: $0 check-tag <tag>   (e.g. v0.4.1 or refs/tags/v0.4.1)"
+      exit 1
+    fi
+    cmd_check_tag "$2"
     ;;
   set)
     if [ -z "${2:-}" ]; then
@@ -1004,10 +1049,11 @@ case "${1:-}" in
     cmd_set "$2"
     ;;
   *)
-    echo "Usage: $0 {check|set <version>|get}"
+    echo "Usage: $0 {check|check-tag <tag>|set <version>|get}"
     echo ""
     echo "Commands:"
     echo "  check          Validate all version files match Cargo.toml"
+    echo "  check-tag <t>  Release gate: tag vX.Y.Z must equal every manifest"
     echo "  set <version>  Update all version files to <version>"
     echo "  get            Print current version from Cargo.toml"
     exit 1

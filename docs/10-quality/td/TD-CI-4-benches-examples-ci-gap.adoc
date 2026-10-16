@@ -1,5 +1,13 @@
 = TD-CI-4: Benches/Examples CI Gap (2026-08-23)
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-10-15).** The examples-compile coverage was restored by adding `--examples` to the existing `rust-compile-benches` job (develop→qa), and `examples/**` was restored to the `compile` path filter, which gates that job. On the same date `cargo check --workspace --benches --examples` was clean (exit 0) on develop `9dc2b033c`.
+| Regression history | The original fix added a per-PR `rust-compile-benches-examples` job. Commit `a5d4833e6` (2026-09-02) silently removed it and the `examples/**` filter line while recovering lost merges after a force-push rewind. That commit's message says the opposite: "TD-CI-4 also excluded (already on develop via #1725's surviving ancestry)". **Lesson:** a recovery re-land must diff the result against the pre-rewind tree, not trust its own exclusion list.
+| Tier choice | develop→qa, not per-PR. Examples rot slowly and are not shipped, and TD-CITIER-1 is removing long poles from feat→develop. One job covers both target kinds without an extra runner.
+|===
+
 == Problem Statement
 
 ProximaDB's CI does **not** compile the root crate's 50 bench files and 31 example files on every PR. These targets can rot without detection until develop→qa promotion.
@@ -44,7 +52,7 @@ rust-compile-benches:
 * **Delayed discovery** — breakage surfaces only at develop→qa promotion (late cycle)
 * **Developer friction** — developers must manually run `cargo check --benches --examples` before PR (easy to forget)
 
-== Proposed Solution: Option A (RECOMMENDED)
+== Proposed Solution: Option A (original proposal; superseded by the develop→qa restore, see Status)
 
 Add a PR-time CI job that compiles benches+examples with **constrained parallelism**:
 
@@ -110,20 +118,22 @@ previously skipped every Rust job).
 
 == Exit Criteria
 
-1. ✅ **Decision:** Option A — PR-time job, same shape as the benches sibling
-2. ✅ **Implement** — job wired into `ci-success` + `examples/**` path filter
+1. ✅ **Decision:** Option A — PR-time job, same shape as the benches sibling (original decision; the 2026-10-15 restore moved it to develop→qa, see Status)
+2. ✅ **Implement** — landed #1725, lost in `a5d4833e6`; restored 2026-10-15 as `--examples` on the develop→qa `rust-compile-benches` job + `examples/**` in the `compile` filter (#2044)
 
 == Status
 
-**IMPLEMENTED** — job live in this PR; wired into the `ci-success` aggregator and the `compile` path filter (adversarial-review fixes 2026-09-01)
+**Resolved 2026-10-15 (#2044).** History: implemented in #1725 (2026-09-01) as a per-PR job; silently removed on 2026-09-02 by the recovery commit `a5d4833e6`, whose message claimed the reverse. Restored not as the per-PR Option A job above but as `--examples` on the existing develop→qa `rust-compile-benches` job, with `examples/**` back in the `compile` filter: examples are not shipped and rot slowly, and TD-CITIER-1 is shortening the feat→develop path. The Option A section above is kept as the original proposal.
 
 == Next Steps
 
-1. ✅ Choose solution — Option A (PR-time job)
-2. ✅ Implement — `rust-compile-benches-examples` job in `.github/workflows/ci.yml`
+1. ✅ Choose solution — Option A (PR-time job; restored on develop→qa instead, see Status)
+2. ✅ Implemented (restored 2026-10-15, #2044; see Status)
 3. ✅ Adversarial review pass — aggregator wiring, path filter, evidence correction
 
 == Related
 
+* link:TD-BENCH-1-rotted-criterion-benches-no-compile-gate.adoc[TD-BENCH-1]: the original `--benches` gate and the 2 disabled benches (overlap: bench compile gating; this TD is canonical for the PR-time examples/benches job)
+* link:TD-CI-1-rust-test-compile-bottleneck.adoc[TD-CI-1]: this TD was first filed under that id (#1725)
 * CLAUDE.md mandate #7: "PR Sizing for CI Efficiency" — CI runners are a shared resource
 * .github/workflows/ci.yml — existing `rust-compile-benches` job (medium-tier only)

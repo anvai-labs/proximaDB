@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Accepted
+|Status|Accepted — *partially implemented (reconciled 2026-10-15):* document (#476), LDBC graph (#491), TSBS (#501) and TPC-DS value anchors (#511) converted; TD-182 P0 (orphaned accuracy suites wired into CI) complete 2026-09-09; P1 (row-exact anchored TPC-H/DS ratchets beyond Q1/INTERSECT) and P2 gap-fill open — see `TECHNICAL_DEBT.adoc` TD-182.
 |Date|2026-06-27
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-018 (pgwire/SQL parity roadmap — the conformance driver), ADR-039 (OLAP engine boundary — the dual-engine seam differential testing exercises), ADR-024 (canonical `ProximaValue` — the comparison type), GEMINI/CLAUDE mandates #10 (quality ratchets) + #12/#13 (tests cover the deterministic parts; "set the bar at the eval, not the demo")

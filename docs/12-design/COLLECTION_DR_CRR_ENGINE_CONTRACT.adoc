@@ -3,15 +3,15 @@
 :toclevels: 4
 :sectnums:
 
-Status: Active engine contract +
+Status: Active engine contract — **engine-side phases P0–P5 implemented, P6 partially (verified 2026-10-15; see the Implementation Tracker)** +
 Wiring: SaaS-pending — engine surface is captured here and in
-`adr/ADR-017-dr-engine-surface.adoc`; operator-side implementation lives
-in the private AnvaiOps repo. As of 2026-05-26 the distinctive
-engine-side symbol `DRPolicy` has 0 hits in this workspace's `*.rs`
-sources; the catalog-side hook (`xcatalog_collection_dr_policies`) and
-the `CollectionDrPolicy` + `DrPlacement` types are wired per ADR-017.
-See `docs/12-design/DESIGN_DOC_STATUS_INDEX_2026_05_26.adoc` for the
-audit row. +
+`adr/ADR-017-dr-engine-surface.adoc`; operator-side implementation (real
+provider adapters, tier mapping, runbook) lives in the private AnvaiOps repo.
+Engine code: `crates/control/proximadb-catalog/src/{collection_dr_policy,dr_policy_store,dr_reconciler,dr_restore}.rs`,
+`crates/control/proximadb-metrics/src/dr_metrics.rs`,
+`src/storage/persistence/write_ahead_log/manifest/dr_bridge.rs`. (The
+2026-05-26 audit note that `DRPolicy` has 0 hits is still literally true — the
+types are named `CollectionDrPolicy`/`DrPlacement`, not `DRPolicy`.) +
 Date: 2026-05-23 +
 Scope: Engine-side contract for collection-level disaster recovery and
 cross-region object replication. Defines the catalog metadata, physical path
@@ -1182,14 +1182,14 @@ Audit:
   ULIDs and assigns legacy rows to `tnt_legacy_system`. Update Iceberg-REST
   handler to project only federation fields. Prerequisite for every other
   phase.
-| Not started
+| Completed (code: `region_home`, `default_dr_region_pair_id`, `tnt_legacy_system` in `proximadb-catalog` + `path_resolver.rs`)
 
 | P1
 | xCatalog metadata
 | Add `xcatalog_collection_dr_policies`, `xcatalog_collection_dr_events`,
   typed Rust policy structs, and namespace/collection delete guards.
   Depends on P0.5.
-| Not started
+| Completed (`53908f7d7` P1 collection_dr_policy module; `7c8120771` `CollectionDrPolicyStore`)
 
 | P2
 | Storage path contract
@@ -1200,29 +1200,29 @@ Audit:
   `data/{tenant_id}/{namespace_id}/{collection_id}/...` from the extended
   `CatalogNamespace` and reject DR for legacy collections that cannot be
   prefix-scoped. Wire `StoragePoolClass` guard. Depends on P0.5.
-| Not started
+| Completed (code: `CollectionPathResolver`, `StoragePoolClass` guard in `src/storage/trait_components/path_resolver.rs`; canonical builder is `DrPathBuilder`)
 
 | P3
 | State machine + reconciler
 | Implement DR policy state machine, lease-based reconciler, drift events,
   and engine metrics.
-| Not started
+| Completed (`e81573dd7` P3a, `4b470905f` P3b, P3c1–c4 `97737ebe6`/`115ae722a`/`4763b4b6b`/`8962612f2`; Prometheus bridge `5f1e14476`)
 
 | P4
 | Provider adapter trait
 | Define `DrProviderAdapter` trait and reference test double. Wire metrics
   and audit hooks.
-| Not started
+| Completed (`bd5af45b4` `DrProviderAdapter` + `MockDrProviderAdapter`)
 
 | P5
 | Restore primitives
 | Implement restore-readiness checker against replicated objects.
-| Not started
+| Completed (`251980823` P5; `a2974e425` `EngineRestoreReadinessChecker`; `537390132` manifest `dr_bridge`)
 
 | P6
 | Engine test surface
 | Unit and integration tests covering the rules in the test plan section.
-| Not started
+| Partial — unit tests + public test doubles shipped (`061906fca`); full Test Plan coverage not re-audited, so treat the Test Plan's integration rows as open until verified
 |===
 
 Provider-specific adapter implementations (AWS S3, Azure Blob, worker) and
