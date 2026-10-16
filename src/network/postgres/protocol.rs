@@ -363,6 +363,23 @@ impl TransactionBuffer {
     }
 }
 
+/// An atomic COMMIT whose outcome is unknown (SQLSTATE 08007, sent as FATAL).
+/// Propagating it ends the connection (ADR-095 review F2).
+#[derive(Debug)]
+struct AtomicCommitFatal(String);
+
+impl std::fmt::Display for AtomicCommitFatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "atomic COMMIT outcome unknown; connection closed: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AtomicCommitFatal {}
+
 /// SQLSTATE for a failed DmlService statement: a typed relational integrity
 /// violation (TD-DML-1) maps to its PostgreSQL class (23505 unique, 23503
 /// foreign key, 23514 check, 21000 cardinality); anything else keeps the
@@ -2150,7 +2167,26 @@ impl PostgresProtocol {
         approx_bytes: usize,
         table: String,
         write_tenant: String,
-    ) -> Result<(), String> {
+    ) -> Result<(), (&'static str, String)> {
+        // ADR-095 review B1: INSERT…SELECT / INSERT OVERWRITE write through the
+        // table-write executor, which would bypass transaction staging and make
+        // them durable before COMMIT. Refuse them in an atomic transaction.
+        if crate::services::oltp_gate::atomic_commit_enabled()
+            && matches!(
+                statement,
+                crate::services::dml::DmlStatement::InsertSelect { .. }
+                    | crate::services::dml::DmlStatement::InsertOverwrite { .. }
+            )
+        {
+            self.session.write().await.fail_transaction();
+            self.transaction_buffer.clear();
+            return Err((
+                "0A000",
+                "INSERT … SELECT / INSERT OVERWRITE inside an atomic transaction is not supported yet; \
+                 the transaction has been aborted (ADR-095)"
+                    .to_string(),
+            ));
+        }
         if self.transaction_buffer.entries.len() >= TRANSACTION_MAX_ENTRIES
             || self
                 .transaction_buffer
@@ -2160,8 +2196,11 @@ impl PostgresProtocol {
         {
             self.session.write().await.fail_transaction();
             self.transaction_buffer.clear();
-            return Err(format!(
-                "transaction exceeds the in-memory write buffer limit ({TRANSACTION_MAX_ENTRIES} statements / {TRANSACTION_MAX_BYTES} bytes); the transaction has been aborted (ADR-018 P2.D)"
+            return Err((
+                "54000",
+                format!(
+                    "transaction exceeds the in-memory write buffer limit ({TRANSACTION_MAX_ENTRIES} statements / {TRANSACTION_MAX_BYTES} bytes); the transaction has been aborted (ADR-018 P2.D)"
+                ),
             ));
         }
         self.transaction_buffer.total_bytes = self
@@ -2256,6 +2295,10 @@ impl PostgresProtocol {
                             // for ROLLBACK. The error response is already on
                             // the wire.
                             error!("transaction COMMIT replay failed: {error:#}");
+                            if error.downcast_ref::<AtomicCommitFatal>().is_some() {
+                                // FATAL already sent: end the connection.
+                                return Err(error);
+                            }
                             // Only the single-statement path owns its RFQ here —
                             // batch/extended paths send exactly one RFQ at
                             // Sync/batch end; an extra one desyncs the wire.
@@ -2285,6 +2328,181 @@ impl PostgresProtocol {
         Ok(())
     }
 
+    /// ADR-095 D3 / TD-PGOLTP-1: COMMIT as ONE durable unit.
+    ///
+    /// 1. Hold the op-locks of every buffered table (+ cascade closure) for the
+    ///    whole commit.
+    /// 2. Re-execute the buffered statements against a staging store: same DML
+    ///    service, constraint checks and resolution, but nothing is written.
+    /// 3. Make every captured write durable with one WAL group frame, then apply.
+    ///
+    /// Any failure before step 3 leaves NOTHING durable. Step 3 runs in its own
+    /// task, outside the statement timeout, so a client disconnect or timeout
+    /// cannot cancel it between the durable append and the in-memory apply.
+    /// Crash atomicity + all-or-nothing, not isolation: concurrent readers can
+    /// observe a commit mid-apply until TD-PGOLTP-4.
+    async fn commit_buffer_atomically(
+        &mut self,
+        dml_service: Arc<crate::services::dml::DmlService>,
+        timeout_ms: Option<u64>,
+    ) -> Result<()> {
+        use crate::services::txn_staging::{
+            AtomicCommitUnsupported, CommitOutcomeUnknown, StagingTableRecordStore,
+            TxnSerializationConflict,
+        };
+        fn caused_by<E: std::error::Error + Send + Sync + 'static>(err: &anyhow::Error) -> bool {
+            err.chain().any(|cause| cause.downcast_ref::<E>().is_some())
+        }
+
+        let entries = std::mem::take(&mut self.transaction_buffer.entries);
+        self.transaction_buffer.total_bytes = 0;
+
+        let outcome: std::result::Result<(), (&'static str, String)> = async {
+            if dml_service.has_conditional_key_store() {
+                return Err((
+                    "0A000",
+                    "atomic COMMIT is not supported with the oltp-integrity key store yet \
+                     (TD-PGOLTP-3); nothing was committed"
+                        .to_string(),
+                ));
+            }
+            let tables: Vec<(
+                String,
+                Option<crate::storage::tenant::context::TenantContext>,
+            )> = entries
+                .iter()
+                .map(|entry| (entry.table.clone(), entry.tenant_ctx.clone()))
+                .collect();
+            let lock_set = dml_service
+                .transaction_op_lock_set(&tables)
+                .await
+                .map_err(|e| {
+                    (
+                        "25P02",
+                        format!("resolving the transaction's tables failed: {e:#}"),
+                    )
+                })?;
+            let permits = dml_service
+                .acquire_transaction_op_locks(&lock_set)
+                .await
+                .map_err(|e| {
+                    (
+                        "25P02",
+                        format!("acquiring transaction locks failed: {e:#}"),
+                    )
+                })?;
+
+            let base = dml_service.record_store();
+            let staging = Arc::new(StagingTableRecordStore::new(base.clone()));
+            let fork = dml_service.fork_for_transaction(staging.clone(), lock_set);
+            for (index, entry) in entries.iter().enumerate() {
+                let run = fork.execute_scoped(entry.statement.clone(), entry.tenant_ctx.as_ref());
+                let result = match timeout_ms {
+                    Some(ms) => {
+                        match tokio::time::timeout(std::time::Duration::from_millis(ms), run).await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                return Err((
+                                    "57014",
+                                    format!(
+                                        "canceling statement {} due to statement timeout at \
+                                         COMMIT; nothing was committed",
+                                        index + 1
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    None => run.await,
+                };
+                if let Err(e) = result {
+                    // Keep the statement's own SQLSTATE (23505 unique, 23503 FK,
+                    // …) — the failure happened at COMMIT, but it is that
+                    // statement's error.
+                    return Err((
+                        dml_error_sqlstate(&e, "25P02"),
+                        format!(
+                            "statement {} of the transaction failed at COMMIT: {e:#}; \
+                             nothing was committed",
+                            index + 1
+                        ),
+                    ));
+                }
+            }
+            drop(fork);
+            let staging = Arc::try_unwrap(staging).map_err(|_| {
+                (
+                    "XX000",
+                    "transaction staging store still shared at commit; nothing was committed"
+                        .to_string(),
+                )
+            })?;
+            let batches = staging.into_batches();
+            if batches.is_empty() {
+                return Ok(());
+            }
+
+            // Durable step: own task, so the caller's cancellation cannot split
+            // the append from the apply; the locks travel with it.
+            let committed = tokio::spawn(async move {
+                let result = base.commit_atomic(batches).await;
+                drop(permits);
+                result
+            })
+            .await
+            .map_err(|join| ("08007", format!("commit task did not complete: {join}")))?;
+            committed.map(|_| ()).map_err(|e| {
+                if caused_by::<CommitOutcomeUnknown>(&e) {
+                    ("08007", format!("{e:#}"))
+                } else if caused_by::<TxnSerializationConflict>(&e) {
+                    ("40001", format!("{e:#}; nothing was committed"))
+                } else if caused_by::<AtomicCommitUnsupported>(&e) {
+                    ("0A000", format!("{e:#}; nothing was committed"))
+                } else {
+                    (
+                        "25P02",
+                        format!("transaction commit failed: {e:#}; nothing was committed"),
+                    )
+                }
+            })
+        }
+        .await;
+
+        // Mandate #16b: invalidate whenever the commit may have reached the WAL
+        // — after success, and after an outcome-unknown failure too.
+        let maybe_durable = matches!(outcome, Ok(()) | Err(("08007", _)));
+        if maybe_durable {
+            let mut seen = std::collections::HashSet::new();
+            for entry in &entries {
+                if seen.insert((entry.write_tenant.clone(), entry.table.clone())) {
+                    super::relational_pipeline::invalidate_olap_result_cache_for(
+                        &entry.write_tenant,
+                        &entry.table,
+                    )
+                    .await;
+                }
+            }
+        }
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(("08007", message)) => {
+                // The commit may be durable. Like PostgreSQL, never let the
+                // client believe either outcome: FATAL and drop the connection,
+                // so no ROLLBACK tag can follow for a transaction that committed.
+                self.send_error("FATAL", "08007", &message).await?;
+                Err(AtomicCommitFatal(message).into())
+            }
+            Err((sqlstate, message)) => {
+                // Nothing was committed and the transaction is over: the session
+                // returns to idle, as after a failed COMMIT in PostgreSQL.
+                self.send_error("ERROR", sqlstate, &message).await?;
+                self.session.write().await.rollback_transaction();
+                Err(anyhow!("atomic transaction commit failed: {message}"))
+            }
+        }
+    }
+
     /// Drain the P2.D write buffer: sequential `execute_scoped` per entry.
     /// First failure → the error is sent, the transaction FAILS, and the
     /// already-replayed statements stay durable (documented divergence —
@@ -2308,6 +2526,9 @@ impl PostgresProtocol {
             .get("statement_timeout")
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|ms| *ms > 0);
+        if crate::services::oltp_gate::atomic_commit_enabled() {
+            return self.commit_buffer_atomically(dml_service, timeout_ms).await;
+        }
         let entries = std::mem::take(&mut self.transaction_buffer.entries);
         let mut replayed_bytes = 0usize;
         for (index, entry) in entries.iter().enumerate() {
@@ -5467,7 +5688,7 @@ impl PostgresProtocol {
                             .await;
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err(reason) = self
+                    if let Err((sqlstate, reason)) = self
                         .transaction_push(
                             statement,
                             tenant_ctx,
@@ -5477,7 +5698,7 @@ impl PostgresProtocol {
                         )
                         .await
                     {
-                        return self.send_error("ERROR", "54000", &reason).await;
+                        return self.send_error("ERROR", sqlstate, &reason).await;
                     }
                     let tag = if kind == "INSERT" {
                         format!("INSERT 0 {}", tag_rows.unwrap_or(0))
@@ -5634,7 +5855,7 @@ impl PostgresProtocol {
                             .await;
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err(reason) = self
+                    if let Err((sqlstate, reason)) = self
                         .transaction_push(
                             statement,
                             tenant_ctx,
@@ -5644,7 +5865,7 @@ impl PostgresProtocol {
                         )
                         .await
                     {
-                        return self.send_error("ERROR", "54000", &reason).await;
+                        return self.send_error("ERROR", sqlstate, &reason).await;
                     }
                     let tag = if kind == "INSERT" {
                         format!("INSERT 0 {}", tag_rows.unwrap_or(0))
@@ -5792,7 +6013,7 @@ impl PostgresProtocol {
                             .await;
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err(reason) = self
+                    if let Err((sqlstate, reason)) = self
                         .transaction_push(
                             statement,
                             tenant_ctx,
@@ -5802,7 +6023,7 @@ impl PostgresProtocol {
                         )
                         .await
                     {
-                        return self.send_error("ERROR", "54000", &reason).await;
+                        return self.send_error("ERROR", sqlstate, &reason).await;
                     }
                     let tag = if kind == "INSERT" {
                         format!("INSERT 0 {}", tag_rows.unwrap_or(0))

@@ -11,6 +11,17 @@
 | Pillar | REL, COST
 |===
 
+== Revisited 2026-10-16 (ADR-095)
+
+The revisit trigger fired: per-transaction Postgres-compatible OLTP is now a product goal.
+link:../../12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095] answers it
+**without** a quorum. The uncheckpointed WAL tail goes on a cloud-replicated, reattachable durable
+volume (EBS / Azure Disk / PD / EFS), fsync is the commit point, and an object-store writer epoch
+fences split-brain. Cross-zone RPO 0 comes from zone-redundant disks where the cloud offers them
+(Azure ZRS, GCP regional PD). On AWS it comes from the WAL archive lag (TD-PGOLTP-8). **This TD
+stays Won't Do.** A quorum WAL remains the option for AWS cross-AZ RPO 0, and ADR-084 D2 places it
+in the commercial layer.
+
 == History
 
 Question: does ProximaDB need a Lakebase/Neon-style SafeKeeper (Paxos quorum of local-disk nodes replicating

@@ -27,7 +27,9 @@ pub use conditional_key_store::{
     AtomicScope, ConditionalKeyStore, Generation, Identity, Oid, PutOutcome,
 };
 pub mod scan_strategy;
+pub mod writer_epoch;
 pub use scan_strategy::{ScanCostEstimate, ScanIterator, ScanStatistics, ScanStrategy};
+pub use writer_epoch::{EpochGrant, EpochStore, WriterClaim};
 pub mod path_resolver;
 pub use path_resolver::{
     CollectionPathResolver, StorageAssignment, collection_data_path_typed,

@@ -1,0 +1,41 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-6: OLTP conformance ratchet — pgbench invariant, isolation anomalies, ORM matrix, reattach crash matrix
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open (filed 2026-10-16). **Start first:** it measures the baseline (red rows included) before TD-PGOLTP-1..5 change anything.
+| Severity | Medium. No defect of its own, but without it no OLTP claim is admissible (mandates #6 and #10).
+| Component | `tests/` (new `pg_oltp_*_e2e.rs`), `scripts/`, `.config/nextest.toml` (serial group), `BENCHMARK_EVIDENCE.toml`, CI qa-gate
+| Realizes | ADR-095 D8
+| Relates to | TPC-H/TPC-DS pgwire ratchets (same pattern), TD-PGOLTP-1..5 (each flips rows green)
+|===
+
+== Design
+
+A counted ratchet, like the TPC-H 22 / TPC-DS 16 suites. Every row runs through **pgwire against
+the server binary**. No engine is called directly.
+
+[cols="2,3", options="header"]
+|===
+| Row family | Check
+| pgbench TPC-B | `pgbench -i -s 1`; `-c {1,8,32} -T 30` built-in script; **invariant** `sum(accounts.abalance) = sum(branches.bbalance) = sum(tellers.tbalance) = sum(history.delta)`; re-checked after SIGKILL + restart
+| Atomicity | Multi-statement transactions with injected failure: all-or-nothing after restart
+| Isolation | Hermitage-style anomaly tests per level (G0, G1a, G1b, G1c, OTV, PMP, P4 lost update, G-single, G2-item), expected outcome per PG level
+| Integrity | Concurrent duplicate PK/UNIQUE inserts → exactly one success + `23505`; FK `23503`
+| ORM | SQLAlchemy, Prisma, sqlx, JDBC/Hibernate: migrate, CRUD, `RETURNING`, a transaction with rollback
+| Reattach | The TD-PGOLTP-2 two-host matrix
+|===
+
+The ratchet file `tests/pg_oltp_ratchet.toml` records `passing = N`. CI fails if N decreases.
+Performance numbers (TPS, p99 commit latency, fsyncs per commit, RTO) go to
+`BENCHMARK_EVIDENCE.toml` with hardware and volume class. They are evidence, not gates.
+
+== Slices
+
+. S1: pgbench harness + invariant check; record the baseline (expected red: no sequences).
+. S2: atomicity and integrity rows.
+. S3: isolation rows.
+. S4: ORM matrix (Python/Node/Rust/Java lanes; qa tier).
+. S5: wire the counted ratchet into qa-gate; promote fast rows to the develop tier.
