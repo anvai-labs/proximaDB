@@ -234,11 +234,15 @@ pub async fn fusion_search_v2(
         .map_err(|error| {
             // The vector seed leg's wrong-dimension / empty / non-finite query
             // vector or over-cap top_k is the client's argument, reported with
-            // its cause (TD-SECSCAN-1 §5); anything else is a server fault,
-            // reported with its whole cause chain rather than the outer context.
+            // its cause (TD-SECSCAN-1 §5). Anything else is a server fault: the
+            // full cause chain is logged server-side and the client gets a
+            // stable generic message (internal detail stays out of the body).
             match crate::services::operations::vectors::client_argument_message(&error) {
                 Some(message) => ApiError::InvalidArgument(format!("fusion search: {message}")),
-                None => ApiError::Internal(format!("fusion search failed: {error:#}")),
+                None => {
+                    tracing::error!(error = %format!("{error:#}"), "v2 graph fusion-search failed");
+                    ApiError::Internal("fusion search failed".to_string())
+                }
             }
         })?;
 

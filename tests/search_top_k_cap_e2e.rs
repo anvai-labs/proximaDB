@@ -886,6 +886,13 @@ async fn wrong_dimension_is_a_client_error_on_every_search_route() {
         .await
         .expect("create");
     assert!(create.status().is_success(), "create {name} failed");
+    // The canonical object id the server assigned (create returns it).
+    let created: serde_json::Value = create.json().await.expect("create response json");
+    let object_id = created["collection_id"]
+        .as_str()
+        .filter(|id| !id.is_empty() && *id != name)
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("create must return the object id: {created}"));
     let records: Vec<serde_json::Value> = (0..3)
         .map(|i| {
             let mut v = vec![0.0f32; DIM];
@@ -975,31 +982,38 @@ async fn wrong_dimension_is_a_client_error_on_every_search_route() {
         }
     }
 
-    // A request that addresses a collection by object id gets an error built
-    // only from what it sent: the collection's name, which the request did
-    // not contain, must not appear in the response.
-    for object_id in 1..=4 {
-        let by_id = [
-            (
-                "REST v1 progressive search by object id",
-                format!("{base}/api/v2/progressive/search/{object_id}"),
-                json!({ "collection_id": object_id.to_string(), "queries": [{ "vector": short }], "top_k": 5 }),
-            ),
-            (
-                "REST v2 collection search by object id",
-                format!("{base}/api/v2/collections/{object_id}/search"),
-                json!({ "vector": short, "top_k": 5 }),
-            ),
-        ];
-        for (label, url, body) in by_id {
-            if let Ok(r) = http.post(url).json(&body).send().await {
+    // A request that addresses the collection by its object id reaches it and
+    // gets the dimension error, built only from what the request sent: the
+    // collection's name, which the request did not contain, must not appear.
+    let by_id = [
+        (
+            "REST v1 progressive search by object id",
+            format!("{base}/api/v2/progressive/search/{object_id}"),
+            json!({ "collection_id": object_id, "queries": [{ "vector": short }], "top_k": 5 }),
+        ),
+        (
+            "REST v2 collection search by object id",
+            format!("{base}/api/v2/collections/{object_id}/search"),
+            json!({ "vector": short, "top_k": 5 }),
+        ),
+    ];
+    for (label, url, body) in by_id {
+        match http.post(url).json(&body).send().await {
+            Ok(r) => {
+                let status = r.status();
                 let text = r.text().await.unwrap_or_default();
+                if status != reqwest::StatusCode::BAD_REQUEST || !text.contains("dimension") {
+                    failures.push(format!(
+                        "{label}: expected 400 with the dimension cause, got {status}: {text}"
+                    ));
+                }
                 if text.contains(name) {
                     failures.push(format!(
-                        "{label} ({object_id}): echoed a name the request did not contain: {text}"
+                        "{label}: echoed a name the request did not contain: {text}"
                     ));
                 }
             }
+            Err(e) => failures.push(format!("{label}: request failed ({e})")),
         }
     }
 

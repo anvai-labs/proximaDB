@@ -168,7 +168,11 @@ impl ProximaFusionService for ProximaFusionServiceImpl {
             // Same mapping as the REST fusion-search handler (TD-SECSCAN-1 §5).
             match crate::services::operations::vectors::client_argument_message(&e) {
                 Some(message) => Status::invalid_argument(format!("fusion search: {message}")),
-                None => Status::internal(format!("fusion search failed: {e:#}")),
+                // Server fault: log the cause chain, return a stable message.
+                None => {
+                    tracing::error!(error = %format!("{e:#}"), "v2 gRPC FusionSearch failed");
+                    Status::internal("fusion search failed")
+                }
             }
         })?;
 

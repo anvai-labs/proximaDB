@@ -205,8 +205,10 @@ pub async fn hybrid_search(
             {
                 return Err(RestError::InvalidArgument(message));
             }
+            // Server fault: log the cause chain, return a stable message (the
+            // response envelope carries the request id for correlation).
             error!("hybrid_search error: {:#}", e);
-            Err(RestError::Internal(format!("{e:#}")))
+            Err(RestError::Internal("hybrid search failed".to_string()))
         }
     }
 }

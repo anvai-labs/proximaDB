@@ -373,8 +373,10 @@ error quality. All are now closed.
    the last error into a string (losing the type) and retried client errors
    twice (≈300 ms of backoff for a guaranteed failure). It now returns a
    client-argument error at once and keeps the last server error's chain via
-   `.context(..)`. A 500 from fusion-search reports the full chain (`{:#}`)
-   instead of only "vector search failed for fusion".
+   `.context(..)`. A genuine server failure on fusion-search (REST and gRPC)
+   or hybrid search logs the full chain server-side and returns a stable
+   generic message ("fusion search failed" / "hybrid search failed"; the REST
+   envelope carries the request id). Internal detail is kept out of the body.
 4. **AQL consumed predicate.** `executor::post_filter_predicate` replaces the
    always-true special case in `evaluate_predicate`. A vector-valued `Equals`
    on `vector` / `embedding` / `query_vector` is stripped from the WHERE
@@ -442,6 +444,7 @@ Evidence (each new test FAILED on the unfixed tree, PASSES after):
   * `input_validation::tests::object_id_reference_never_echoes_the_catalog_name`;
   * `client_argument::tests::label_client_collection_fills_only_a_missing_label`;
   * `rank_backend::tests::vector_search_keeps_client_argument_errors_distinct`;
+  * `rank::tests::hybrid_adapter_maps_vector_leg_client_argument_to_400`;
   * `aql::executor_test` `query_vector_under_not_of_and_is_rejected_as_invalid_input`
     and `rejected_query_vector_never_runs_the_source`.
 
