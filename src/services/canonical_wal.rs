@@ -108,6 +108,23 @@ impl std::fmt::Display for WalAppendIndeterminate {
 
 impl std::error::Error for WalAppendIndeterminate {}
 
+/// An append was refused because an EARLIER append left the appender poisoned
+/// (see [`WalAppendIndeterminate`]). Nothing from THIS append was written, so
+/// callers report "nothing committed", not "outcome unknown".
+#[derive(Debug)]
+pub struct WalAppenderPoisoned;
+
+impl std::fmt::Display for WalAppenderPoisoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "canonical WAL appender is poisoned by an earlier indeterminate write; \
+             nothing was written; restart the server to recover",
+        )
+    }
+}
+
+impl std::error::Error for WalAppenderPoisoned {}
+
 /// Framed binary canonical WAL appender.
 ///
 /// Frame layout:
@@ -229,10 +246,7 @@ impl FramedTableWalAppender {
         // Checked under the append lock so no write races past a tripped fence.
         self.fence.ensure_owner()?;
         if self.poisoned.load(Ordering::SeqCst) {
-            bail!(WalAppendIndeterminate(
-                "the appender is poisoned by an earlier indeterminate write; restart to recover"
-                    .to_string()
-            ));
+            bail!(WalAppenderPoisoned);
         }
         // Test seams only exist in debug builds: a release server can never be
         // aborted through an environment variable.
@@ -1318,7 +1332,9 @@ mod tests {
             .await
             .err()
             .ok_or_else(|| anyhow!("a poisoned appender must refuse"))?;
-        assert!(later.downcast_ref::<WalAppendIndeterminate>().is_some());
+        // Refused before writing: "nothing written", not "outcome unknown".
+        assert!(later.downcast_ref::<WalAppenderPoisoned>().is_some());
+        assert!(later.downcast_ref::<WalAppendIndeterminate>().is_none());
         Ok(())
     }
 

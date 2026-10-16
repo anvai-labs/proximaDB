@@ -6801,7 +6801,7 @@ async fn transaction_fork_defers_statistics_until_commit() {
     // A transaction that never commits: its staged inserts move no stats.
     {
         let locks = dml
-            .transaction_op_lock_set(&[("txn_stats".to_string(), None)])
+            .transaction_op_lock_set(&[("txn_stats".to_string(), None, false)])
             .await
             .expect("lock set");
         let fork =
@@ -6819,7 +6819,7 @@ async fn transaction_fork_defers_statistics_until_commit() {
 
     // A transaction that commits: the queued bumps land exactly once.
     let locks = dml
-        .transaction_op_lock_set(&[("txn_stats".to_string(), None)])
+        .transaction_op_lock_set(&[("txn_stats".to_string(), None, false)])
         .await
         .expect("lock set");
     let staging = Arc::new(StagingTableRecordStore::new(base.clone()));
@@ -6836,4 +6836,121 @@ async fn transaction_fork_defers_statistics_until_commit() {
     base.commit_atomic(batches).await.expect("commit");
     dml.apply_deferred_stats(deferred).await;
     assert_eq!(row_count().await, 2, "committed rows are counted once");
+}
+
+/// Review S4a F5: a transaction fork must RETAIN the cross-pod DML lease a
+/// statement took, not release it when the statement finishes staging — the
+/// commit task releases it only after the durable write. Without this, another
+/// pod could write between staging and commit (TD-110 S1 guarantee).
+#[tokio::test]
+async fn transaction_fork_retains_dml_leases_until_released() -> Result<()> {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::txn_staging::StagingTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    let ddl_stmt = parser
+        .parse_ddl("CREATE TABLE leased (id TEXT NOT NULL, val TEXT, PRIMARY KEY (id));")
+        .expect("parse ddl")
+        .expect("ddl stmt");
+    ddl.execute(ddl_stmt).await.expect("create table");
+
+    let lease_url = format!("file://{}", temp_dir.path().join("leases").display());
+    let lease_manager = Arc::new(PartitionLeaseManager::new(
+        Arc::new(PartitionLeaseStore::from_url(
+            &lease_url,
+            "_operator/leases",
+        )?),
+        Arc::new(PrimaryPodRegistry::new()),
+        "pod-1",
+        10_000,
+    ));
+    let lock_service = Arc::new(DmlLockService::new(lease_manager, "pod-1"));
+    let wal = Arc::new(
+        FramedTableWalAppender::open(temp_dir.path().join("leased.wal"))
+            .await
+            .expect("open WAL"),
+    );
+    let base: Arc<dyn TableRecordStore> = Arc::new(DirectWalTableRecordStore::new(
+        Arc::new(MemtableRecordStorage::new()),
+        wal,
+    ));
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager.clone(),
+        base.clone(),
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    )
+    .with_dml_lock_service(lock_service);
+    let (_, table_id) = manager.resolve_table("leased").await.expect("resolve");
+
+    let locks = dml
+        .transaction_op_lock_set(&[("leased".to_string(), None, false)])
+        .await
+        .expect("lock set");
+    let fork = dml.fork_for_transaction(Arc::new(StagingTableRecordStore::new(base)), locks);
+    let insert = parser
+        .parse_dml("INSERT INTO leased (id, val) VALUES ('a', 'v');")
+        .expect("parse insert")
+        .expect("dml stmt");
+    fork.execute(insert).await.expect("staged insert");
+
+    let retained = fork.take_retained_dml_guards();
+    assert!(
+        !retained.is_empty(),
+        "the fork must retain the statement's DML lease"
+    );
+    // While retained, the table's write lease is still held: a writer on
+    // ANOTHER pod sharing the lease store cannot take it. (The same pod would
+    // just renew its own lease, so the competitor must be a second pod.)
+    let other_pod = DmlService::with_record_store_and_table_write_executor(
+        manager.clone(),
+        Arc::new(ExplainOnlyRecordStore),
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    )
+    .with_dml_lock_service(Arc::new(DmlLockService::new(
+        Arc::new(PartitionLeaseManager::new(
+            Arc::new(PartitionLeaseStore::from_url(
+                &lease_url,
+                "_operator/leases",
+            )?),
+            Arc::new(PrimaryPodRegistry::new()),
+            "pod-2",
+            10_000,
+        )),
+        "pod-2",
+    )));
+    let competing = other_pod
+        .acquire_table_dml_lock(&table_id, None, LockIntent::Write)
+        .await;
+    let conflict = competing
+        .err()
+        .expect("the retained lease must still block another pod");
+    assert!(
+        crate::errors::extract_dml_lock_conflict(&conflict).is_some(),
+        "expected a typed DML lock conflict, got: {conflict:#}"
+    );
+
+    for guard in retained {
+        guard.release().await;
+    }
+    let after = other_pod
+        .acquire_table_dml_lock(&table_id, None, LockIntent::Write)
+        .await?
+        .expect("the other pod gets the lease once it is released");
+    after.release().await;
+    Ok(())
 }

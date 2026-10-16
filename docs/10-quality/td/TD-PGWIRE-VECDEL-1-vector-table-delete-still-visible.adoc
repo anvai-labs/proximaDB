@@ -1,0 +1,46 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGWIRE-VECDEL-1: a deleted row on a pgwire vector-profile table is still returned by SELECT
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-16). Root cause not yet located.
+| Priority | **HIGH**: violates mandate #16a (every read boundary filters dead records) on a pgwire surface. The client is told `DELETE 1`, yet the row stays visible.
+| Component | `src/services/record_store.rs` (`VectorOpsTableRecordStore`), the pgwire SELECT path for vector-profile tables (`src/network/postgres/`), `src/services/operations/vectors/legacy.rs` (`delete_records_with_tenant_context`, `validate_tenant_collection_access`)
+| Relates to | link:TD-PGWIRE-VECTENANT-1-pgwire-vector-collections-outside-tenant-boundary.adoc[TD-PGWIRE-VECTENANT-1] (pgwire vector collections are created tenant-less and resolved by name: the likely cause), link:TD-PGWIRE-COPY-1-copy-and-write-gate-tenant-parity.adoc[TD-PGWIRE-COPY-1] (`VECTOR(n)` gets a 1-dimension collection), TD-PGOLTP-1 (found by its S4a follow-up tests)
+|===
+
+== Observed (reproduced 2026-10-16, gate on and off)
+
+----
+CREATE TABLE t (id VARCHAR PRIMARY KEY, embedding VECTOR(1));   -- vector-profile route
+INSERT INTO t (id, embedding) VALUES ('v1', '[1]'::vector);     -- ok, SELECT shows v1
+DELETE FROM t WHERE id = 'v1';                                  -- DELETE 1
+SELECT id FROM t;                                               -- still returns v1
+----
+
+Executable reproduction: `tests/pgwire_atomic_commit_e2e.rs::vector_table_delete_is_invisible_to_select`
+(`#[ignore]` until fixed).
+
+== What is known
+
+* DML resolves and processes the row (`DELETE 1`).
+* The DELETE reaches `VectorOpsTableRecordStore::write_mutations` with a DML-built tombstone
+  (`valid_to_ns = Some(0)`), which goes through the insert path. That path writes the tombstone, so
+  this is a delete expressed as an insert, not a missing write.
+* An attempt to route DELETE runs to `delete_records_with_tenant_context` instead was **reverted**
+  (2026-10-16 review). It did not change the outcome; the reproduction still failed. It also
+  altered every relational DELETE on surfaces built with `DmlService::new`, which route all tables
+  through this store.
+* So the SELECT path for vector-profile rows either does not apply `is_dead`, or reads a different
+  copy than the one the tombstone lands in.
+  link:TD-PGWIRE-VECTENANT-1-pgwire-vector-collections-outside-tenant-boundary.adoc[TD-PGWIRE-VECTENANT-1]
+  (tenant-less creation, by-name resolution) suggests the latter. **Not yet verified.**
+
+== Next step
+
+Trace one row through the pgwire vector SELECT path. Confirm which store or collection it reads
+and whether the canonical `is_dead` predicate is applied. Then fix it at the read boundary, which
+mandate #16a requires at every surface, and remove the `#[ignore]`. If the cause is the tenant
+addressing, fold the fix into TD-PGWIRE-VECTENANT-1's design.
