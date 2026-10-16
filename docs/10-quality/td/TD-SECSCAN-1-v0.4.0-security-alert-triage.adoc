@@ -247,14 +247,33 @@ the shared sinks (no third constant anywhere):
    a `Failure` audit outcome); the memory source's internal 5x recall
    oversample is clamped to the cap rather than rejected, so an at-cap
    `top_k` is still served. The MCP `memory` search tool rejects an over-cap
-   `k` as invalid params at its boundary. Writing the AQL e2e test exposed
-   that the AQL `vector` source never read a query vector: it sent an empty
-   vector into the distance kernel's `assert_eq!` dimension check, which
-   panicked the handler and dropped the connection. The source now reads the
-   vector from an `Equals { vector | embedding | query_vector }` predicate
-   (and `SemanticMatch.top_k` under `And`) and rejects a missing vector with a
-   400. The kernel's production `assert_eq!` itself is left open (see the
-   residual below). `GraphFusionService::graph_fusion_search_with_labels`
+   `k` as invalid params at its boundary. The AQL `vector` source now reads
+   its query vector from an `Equals { vector | embedding | query_vector }`
+   predicate (and `SemanticMatch.top_k` under `And`); the executor's WHERE
+   post-filter treats that vector-valued `Equals` as consumed by the source
+   (result rows carry no `vector` field, so re-applying it dropped every hit).
+3. **Query-vector validation + kernel backstop (release-gating, v0.4.1).** A
+   wrong-dimension or empty query vector reached `assert_eq!` in the distance
+   kernel (`compute_distance_simd`); under `release-server`
+   (`panic = "abort"`) one unauthenticated request killed the server
+   (REST v2 collection search — present in v0.4.0 —, gRPC v2 `Search` /
+   `SearchStream`, AQL `vector` / `memory`, MCP memory, the SQL executor,
+   the legacy entity store and the embedded `vector_search`). Fixed at two
+   layers: (a) `unified_search_v1_inner` — the authority all of these reach —
+   now rejects an empty vector and runs `validate_query_vector_for_search`
+   (finite + dimension) right after resolving the collection, and
+   `unified_search_native` runs the same check for non-empty vectors (empty
+   stays allowed there: analytics entanglement passes `vec![]` to load
+   records). The typed `InvalidQueryVector` error maps to HTTP 400 on REST v2
+   and AQL and `InvalidArgument` on gRPC via `is_client_argument_error`
+   (which also covers `TopKLimitExceeded`). (b) The kernel no longer panics:
+   a length mismatch scores the pair as worst-possible (`+inf` distance,
+   `-inf` dot product) and logs once. The check had to stay in release
+   builds — the SIMD kernels index both slices by `a.len()` inside `unsafe`,
+   so equal length is a memory-safety precondition — and it costs the same
+   single compare the `assert_eq!` did (mismatch path `#[cold]`), so there is
+   no hot-path regression. A `debug_assert` was rejected so debug and release
+   builds behave the same and tests exercise the production path. `GraphFusionService::graph_fusion_search_with_labels`
    clamps `limit` and `max_seeds` to the cap, and the external-collection hybrid
    pool saturates its `k * HYBRID_POOL_FACTOR` product. Both clamps use the
    *configured* cap (`max_top_k()`), not `DEFAULT_MAX_TOP_K` — before the
@@ -263,7 +282,7 @@ the shared sinks (no third constant anywhere):
    maps these to `Internal` (rather than `InvalidArgument`) is capped but
    reports a 500 — the list above names the routes that return 400 because
    the e2e test proves it; untested internal callers are capped, not proven.
-3. **Shared sinks.** `TopKHeap::with_capacity(k)` /
+4. **Shared sinks.** `TopKHeap::with_capacity(k)` /
    `BoundedPriorityQueue::new(k)` pre-allocate only
    `top_k_limit::bounded_prealloc(k)` (≤ 10,000) and grow on demand;
    `pax_rabitq_pool_for_top_k(k, n)` is clamped to the segment's row count
@@ -291,12 +310,12 @@ parse) and the cold-tier id-batch lookup are not `top_k`-capped boundaries, so
 there a value > 65,535 wraps silently — a result-correctness wart, not a
 memory one. Fix by routing through `optimizer_top_k_hint`-style saturating
 clamping when the `u16` field is next touched.
-Also residual: `compute_distance_simd`
-(`crates/foundation/proximadb-distance-kernel/src/engine.rs:756`) guards
-dimension equality with `assert_eq!` on a production path, so any caller that
-passes a mismatched query vector panics the request task rather than getting an
-error. The AQL source no longer does; other callers rely on upstream dimension
-validation.
+Also noted (not a defect today): `calculate_pq_distance` in the same kernel
+calls the SIMD kernels directly rather than through `compute_distance_simd`,
+so it does not get the mismatch backstop. Both slices it passes are
+`subvector_dim` long by construction (the centroid slice is bounds-checked),
+so the lengths cannot differ; it should still share the checked entry point
+when next touched.
 
 Evidence:
 

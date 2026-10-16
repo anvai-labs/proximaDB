@@ -1514,6 +1514,10 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
                     predicate_shortfall,
                 }))
             }
+            Err(e) if crate::services::operations::vectors::is_client_argument_error(&e) => {
+                // Invalid query vector or over-cap top_k (TD-SECSCAN-1).
+                Err(Status::invalid_argument(e.to_string()))
+            }
             Err(e) => {
                 error!("V2 gRPC: Search failed: {}", e);
                 if e.to_string().contains("not found") {
@@ -1565,7 +1569,13 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             .record_ops
             .handle_record_search_for_tenant(search_request, identity.as_borrowed())
             .await
-            .map_err(|e| Status::internal(format!("Search stream failed: {}", e)))?;
+            .map_err(|e| {
+                if crate::services::operations::vectors::is_client_argument_error(&e) {
+                    Status::invalid_argument(e.to_string())
+                } else {
+                    Status::internal(format!("Search stream failed: {}", e))
+                }
+            })?;
 
         // Create a channel for streaming results
         let (tx, rx) = tokio::sync::mpsc::channel(128);

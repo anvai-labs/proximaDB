@@ -220,7 +220,7 @@ impl ReferenceBackend for EngineBackend {
         // invalid params (client error) before embedding the query; the search
         // authority (`unified_search_v1`) enforces it again.
         proximadb_search_types::top_k_limit::check_top_k(k)
-            .map_err(|e| BackendError::not_found(e.to_string()))?;
+            .map_err(|e| BackendError::invalid_params(e.to_string()))?;
         let k = k as usize;
 
         let store = VectorMemoryStore::new(vector_ops.clone(), Arc::new(EmbeddingServiceEmbedder));

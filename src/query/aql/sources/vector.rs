@@ -11,8 +11,8 @@ use crate::query::aql::{
     AuditOp, DataModel, Result,
 };
 use crate::services::VectorOperationsService;
+use crate::services::operations::vectors::is_client_argument_error;
 use proximadb_kernel::error::{ProximaDBError, QueryError};
-use proximadb_search_types::top_k_limit::TopKLimitExceeded;
 
 pub struct VectorAqlSource {
     vector_ops: Arc<VectorOperationsService>,
@@ -51,9 +51,7 @@ impl VectorAqlSource {
             AqlPredicate::Equals {
                 field,
                 value: AqlValue::Vector(v),
-            } if matches!(field.as_str(), "embedding" | "vector" | "query_vector") => {
-                *query_vector = v.clone()
-            }
+            } if crate::query::aql::is_query_vector_field(field) => *query_vector = v.clone(),
             AqlPredicate::And { lhs, rhs } => {
                 Self::walk_predicate(lhs, query_vector, top_k);
                 Self::walk_predicate(rhs, query_vector, top_k);
@@ -62,17 +60,16 @@ impl VectorAqlSource {
         }
     }
 
-    /// Map a `unified_search_v1` failure to the AQL error space. A `top_k`
-    /// cap rejection (TD-SECSCAN-1 §5) is the client's argument, so it becomes
-    /// `InvalidInput` (HTTP 400 on `POST /api/v2/aql/execute`, message naming
-    /// `PROXIMADB_SEARCH_MAX_TOP_K`); anything else is a vector-search failure.
+    /// Map a `unified_search_v1` failure to the AQL error space. A client
+    /// argument error — `top_k` above the cap (message names
+    /// `PROXIMADB_SEARCH_MAX_TOP_K`) or an empty / wrong-dimension query
+    /// vector (TD-SECSCAN-1) — becomes `InvalidInput` (HTTP 400 on
+    /// `POST /api/v2/aql/execute`); anything else is a vector-search failure.
     pub(crate) fn vector_search_error(e: anyhow::Error) -> ProximaDBError {
-        match e
-            .chain()
-            .find_map(|c| c.downcast_ref::<TopKLimitExceeded>())
-        {
-            Some(limit) => ProximaDBError::InvalidInput(limit.to_string()),
-            None => ProximaDBError::Query(QueryError::VectorSearch(e.to_string())),
+        if is_client_argument_error(&e) {
+            ProximaDBError::InvalidInput(e.to_string())
+        } else {
+            ProximaDBError::Query(QueryError::VectorSearch(e.to_string()))
         }
     }
 

@@ -753,7 +753,17 @@ impl UnifiedDistanceCompute {
     /// Compute distance using the most optimal SIMD path available
     #[inline(always)]
     fn compute_distance_simd(&self, vec_a: &[f32], vec_b: &[f32], metric: &DistanceMetric) -> f32 {
-        assert_eq!(vec_a.len(), vec_b.len(), "Vectors must have same dimension");
+        // The SIMD kernels below index both slices by `a.len()` inside
+        // `unsafe`, so equal length is a memory-safety precondition and the
+        // check must stay in release builds. It used to be `assert_eq!`, which
+        // under `release-server` (`panic = "abort"`) let one wrong-dimension
+        // query kill the server (TD-SECSCAN-1). Callers validate the query
+        // dimension at the request boundary; this is the backstop. Same cost
+        // as the assert it replaces (one predictable compare; the mismatch
+        // path is out of line and cold).
+        if vec_a.len() != vec_b.len() {
+            return dimension_mismatch_score(vec_a.len(), vec_b.len(), metric);
+        }
 
         // Log search backend on first search only
         log_search_backend_first_time(self.platform_capability);
@@ -2051,9 +2061,63 @@ pub fn initialize_distance_compute_optimizations() {
     info!("   • Zero adapter overhead - direct inline calls");
 }
 
+/// Score for a vector pair whose dimensions differ: the worst possible value
+/// for `metric` (`-inf` for dot product, a similarity; `+inf` for every
+/// distance), so the pair ranks last and never displaces a valid candidate.
+/// Logged once per process — reaching it means a caller skipped the
+/// request-boundary dimension check.
+#[cold]
+#[inline(never)]
+fn dimension_mismatch_score(len_a: usize, len_b: usize, metric: &DistanceMetric) -> f32 {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, AtomicOrdering::Relaxed) {
+        tracing::error!(
+            len_a,
+            len_b,
+            "distance kernel called with mismatched vector dimensions; scoring the pair as \
+             worst-possible (a caller skipped query-vector dimension validation)"
+        );
+    }
+    match metric {
+        DistanceMetric::DotProduct => f32::NEG_INFINITY,
+        _ => f32::INFINITY,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-SECSCAN-1: a dimension mismatch must not panic. Under the
+    /// `release-server` profile (`panic = "abort"`) the former `assert_eq!`
+    /// killed the server process on one wrong-dimension query. A mismatched
+    /// pair now scores as the worst possible candidate for its metric, so it
+    /// ranks last and never wins a top-k slot.
+    #[test]
+    fn dimension_mismatch_scores_worst_instead_of_panicking() {
+        let a = [1.0f32, 0.0, 0.0, 0.0];
+        let b = [1.0f32, 0.0, 0.0];
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::Euclidean,
+            DistanceMetric::Manhattan,
+        ] {
+            let compute = UnifiedDistanceCompute::new(metric);
+            assert_eq!(compute.distance_with_metric(&a, &b, &metric), f32::INFINITY);
+            assert_eq!(
+                compute.distance_with_metric(&a, &[], &metric),
+                f32::INFINITY
+            );
+        }
+        let dot = DistanceMetric::DotProduct;
+        let compute = UnifiedDistanceCompute::new(dot);
+        assert_eq!(
+            compute.distance_with_metric(&a, &b, &dot),
+            f32::NEG_INFINITY
+        );
+        // Matching dimensions are unaffected.
+        assert_eq!(compute.distance_with_metric(&a, &a, &dot), 1.0);
+    }
 
     #[test]
     fn test_cosine_distance() {

@@ -3056,6 +3056,22 @@ impl VectorOperationsService {
         // boundary. Every cache, WAL, AXIS, and storage lookup below is keyed
         // by the immutable numeric L1 identity.
         let collection = self.get_or_load_collection(collection_id).await?;
+        // Validate the query vector before anything reaches the distance
+        // kernel (TD-SECSCAN-1): an empty or wrong-dimension vector is the
+        // client's error, typed so every boundary answers 400 /
+        // InvalidArgument. REST v2, gRPC v2, v1 progressive, AQL, MCP memory,
+        // the SQL executor and the legacy entity store all land here.
+        if query_vector.is_empty() {
+            return Err(super::input_validation::InvalidQueryVector(format!(
+                "Query vector for collection '{collection_id}' is empty"
+            ))
+            .into());
+        }
+        super::input_validation::validate_query_vector_for_search(
+            collection_id,
+            &collection,
+            &query_vector,
+        )?;
         let collection_object_id: crate::core::stable_id::CollectionObjectId =
             collection.id.parse().map_err(|error| {
                 anyhow::anyhow!(
@@ -3370,6 +3386,17 @@ impl VectorOperationsService {
         // ADR-0083 D5: internal search state is keyed by the catalog's native
         // L1 object id. Names and aliases terminate at this boundary.
         let collection = self.get_or_load_collection(collection_id).await?;
+        // Query-vector gate (TD-SECSCAN-1): hybrid / fusion-seed legs must not
+        // hand a wrong-dimension vector to the distance kernel. An EMPTY vector
+        // stays allowed here: analytics entanglement deliberately passes
+        // `vec![]` to load records without ranking.
+        if !query_vector.is_empty() {
+            super::input_validation::validate_query_vector_for_search(
+                collection_id,
+                &collection,
+                &query_vector,
+            )?;
+        }
         let collection_object_id: crate::core::stable_id::CollectionObjectId =
             collection.id.parse().map_err(|error| {
                 anyhow::anyhow!(

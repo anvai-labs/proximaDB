@@ -120,18 +120,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion")]
     fn test_dimension_mismatch_handling() {
-        // Test that dimension mismatch causes a panic (debug_assert_eq!)
-        // This is the expected behavior for safety - mismatched dimensions are programming errors
+        // A dimension mismatch scores as the worst possible distance instead
+        // of panicking: under `panic = "abort"` a panic here killed the server
+        // (TD-SECSCAN-1). Request boundaries reject mismatched query vectors.
         let _ = proximadb_hardware::hardware_capabilities(); // OnceLock auto-init
         let compute = UnifiedDistanceCompute::new(DistanceMetric::Euclidean);
 
         let vec1 = vec![1.0, 2.0];
         let vec2 = vec![1.0, 2.0, 3.0];
 
-        // This should panic due to dimension mismatch
-        let _distance = compute.calculate_distance(&vec1, &vec2, &DistanceMetric::Euclidean);
+        let distance = compute.distance_with_metric(&vec1, &vec2, &DistanceMetric::Euclidean);
+        assert_eq!(distance, f32::INFINITY);
     }
 
     #[test]
