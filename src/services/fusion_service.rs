@@ -513,12 +513,7 @@ impl FusionService {
         // vector ANN leg and `max_seeds` bounds graph expansion. Handlers reject
         // over-cap values with a client-facing error; this choke clamp keeps any
         // internal caller from deriving an unbounded workload from `params`.
-        let limit = params
-            .limit
-            .min(proximadb_search_types::top_k_limit::DEFAULT_MAX_TOP_K);
-        let max_seeds = params
-            .max_seeds
-            .min(proximadb_search_types::top_k_limit::DEFAULT_MAX_TOP_K);
+        let (limit, max_seeds) = clamp_fusion_bounds(params.limit, params.max_seeds);
 
         // Structural tenant scope, composed ONCE and shared by both legs (TD-ENTITY-TENANT-1):
         // - the graph leg keys reads + canonical oids by `scoped_gid` (`{tenant}/{graph_id}`, bare
@@ -816,9 +811,28 @@ fn truncate_source_to_budget(source: &mut SourceCandidates, budget: usize) {
     }
 }
 
+/// Clamp the fusion `limit` (vector seed width) and `max_seeds` (graph
+/// expansion bound) to the server `top_k` cap (TD-SECSCAN-1 §5).
+fn clamp_fusion_bounds(limit: usize, max_seeds: usize) -> (usize, usize) {
+    let cap = proximadb_search_types::top_k_limit::max_top_k();
+    (limit.min(cap), max_seeds.min(cap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-SECSCAN-1 §5 follow-up: the clamp honours the CONFIGURED cap. With
+    /// `PROXIMADB_SEARCH_MAX_TOP_K` raised above the 10,000 default, a request
+    /// at the override (which the handler accepted) must not be silently
+    /// truncated to the default.
+    #[test]
+    fn fusion_clamp_honours_configured_cap_override() {
+        crate::services::top_k_env_test_support::with_max_top_k_override("50000", || {
+            assert_eq!(clamp_fusion_bounds(50_000, 50_000), (50_000, 50_000));
+            assert_eq!(clamp_fusion_bounds(50_001, 7), (50_000, 7));
+        });
+    }
 
     /// TD-ENTITY-TENANT-1: both fusion legs derive their tenant scope from `params.tenant`.
     /// The graph leg keys reads + canonical oids by `scoped_graph_id` (named →

@@ -2993,6 +2993,11 @@ impl VectorOperationsService {
         tenant_stable_id: Option<u64>,
         auth_class: proximadb_tenant::AuthClass,
     ) -> Result<Vec<crate::proto::proximadb_v1::SearchResult>> {
+        // Shared server top_k cap (TD-SECSCAN-1 §5): the authority under AQL
+        // SEMANTIC_MATCH, MCP/agent memory, the legacy entity store and the SQL
+        // executor's vector step. Internal oversamples clamp to `max_top_k()`
+        // at their call site before reaching here.
+        proximadb_search_types::top_k_limit::check_top_k(k as u64)?;
         let (results, _explain) = self
             .unified_search_v1_inner(
                 collection_id,

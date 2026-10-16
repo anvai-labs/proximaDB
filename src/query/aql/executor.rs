@@ -60,18 +60,24 @@ impl AqlExecutor {
             .unwrap_or_default()
             .as_millis() as i64;
 
+        // A client-argument error (`InvalidInput`, e.g. an over-cap `top_k`)
+        // is audited like any failure but then surfaced to the caller, so the
+        // REST route can answer 400 instead of a 200 carrying a `Failure`.
+        let mut client_error = None;
         let (aql_result, outcome) = match result {
             Ok(r) => (r, AuditOutcome::Success),
             Err(e) => {
+                let reason = e.to_string();
+                if matches!(e, proximadb_kernel::error::ProximaDBError::InvalidInput(_)) {
+                    client_error = Some(e);
+                }
                 // Generate a dummy result for failure case
                 (
                     AqlResult {
                         rows: Vec::new(),
                         frame_id: 0,
                     },
-                    AuditOutcome::Failure {
-                        reason: e.to_string(),
-                    },
+                    AuditOutcome::Failure { reason },
                 )
             }
         };
@@ -92,6 +98,9 @@ impl AqlExecutor {
             tracing::warn!("Failed to persist audit trail: {}", e);
         }
 
+        if let Some(e) = client_error {
+            return Err(e);
+        }
         Ok((aql_result, trail))
     }
 

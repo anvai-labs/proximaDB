@@ -39,7 +39,8 @@ pass didn't enumerate.
   unbounded result-buffer allocation (`src/network/rest/v2/records.rs:1369`
   only validated `top_k > 0`).
 | Added a default cap of `10_000`, overridable via
-  `PROXIMADB_MAX_SEARCH_TOP_K`. Above-cap requests return HTTP 400.
+  `PROXIMADB_MAX_SEARCH_TOP_K` (renamed to `PROXIMADB_SEARCH_MAX_TOP_K` in
+  v0.3.0, #1207; the old name is no longer read). Above-cap requests return HTTP 400.
   Regression test:
   `tests/release_smoke_v2.rs::rest_v2_search_top_k_above_cap_returns_400`.
 

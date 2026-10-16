@@ -11,6 +11,8 @@ use crate::query::aql::{
     AuditOp, DataModel, Result,
 };
 use crate::services::VectorOperationsService;
+use proximadb_kernel::error::{ProximaDBError, QueryError};
+use proximadb_search_types::top_k_limit::TopKLimitExceeded;
 
 pub struct VectorAqlSource {
     vector_ops: Arc<VectorOperationsService>,
@@ -24,7 +26,7 @@ impl VectorAqlSource {
     fn extract_vector_search_params(&self, query: &AqlQuery) -> (String, Vec<f32>, u32) {
         // Default parameters
         let mut collection = "default".to_string();
-        let query_vector = Vec::new();
+        let mut query_vector = Vec::new();
         let mut top_k = 10;
 
         // Extract from FROM clause
@@ -32,20 +34,46 @@ impl VectorAqlSource {
             collection = name.clone();
         }
 
-        // Extract from WHERE clause
-        if let Some(AqlPredicate::SemanticMatch {
-            query: _q_text,
-            threshold: _,
-            top_k: k,
-            ..
-        }) = &query.where_clause.predicate
-        {
-            // In a real implementation, we'd call an embedding service for q_text.
-            // For now, we assume query_vector is provided in the request or handled by caller.
-            top_k = *k;
+        // Extract from WHERE clause: `SemanticMatch` carries `top_k` (its text
+        // is not embedded here — no embedding service on this source), and the
+        // query vector is an `Equals { embedding | vector | query_vector }`
+        // literal, both possibly nested under `And`.
+        if let Some(pred) = &query.where_clause.predicate {
+            Self::walk_predicate(pred, &mut query_vector, &mut top_k);
         }
 
         (collection, query_vector, top_k)
+    }
+
+    fn walk_predicate(pred: &AqlPredicate, query_vector: &mut Vec<f32>, top_k: &mut u32) {
+        match pred {
+            AqlPredicate::SemanticMatch { top_k: k, .. } => *top_k = *k,
+            AqlPredicate::Equals {
+                field,
+                value: AqlValue::Vector(v),
+            } if matches!(field.as_str(), "embedding" | "vector" | "query_vector") => {
+                *query_vector = v.clone()
+            }
+            AqlPredicate::And { lhs, rhs } => {
+                Self::walk_predicate(lhs, query_vector, top_k);
+                Self::walk_predicate(rhs, query_vector, top_k);
+            }
+            _ => {}
+        }
+    }
+
+    /// Map a `unified_search_v1` failure to the AQL error space. A `top_k`
+    /// cap rejection (TD-SECSCAN-1 §5) is the client's argument, so it becomes
+    /// `InvalidInput` (HTTP 400 on `POST /api/v2/aql/execute`, message naming
+    /// `PROXIMADB_SEARCH_MAX_TOP_K`); anything else is a vector-search failure.
+    pub(crate) fn vector_search_error(e: anyhow::Error) -> ProximaDBError {
+        match e
+            .chain()
+            .find_map(|c| c.downcast_ref::<TopKLimitExceeded>())
+        {
+            Some(limit) => ProximaDBError::InvalidInput(limit.to_string()),
+            None => ProximaDBError::Query(QueryError::VectorSearch(e.to_string())),
+        }
     }
 
     pub(crate) fn sql_data_to_aql(val: &SqlValueData) -> AqlValue {
@@ -124,6 +152,15 @@ impl AqlSource for VectorAqlSource {
 
     async fn execute(&self, query: &AqlQuery, ctx: &mut AuditContext) -> Result<AqlResult> {
         let (collection, vector, top_k) = self.extract_vector_search_params(query);
+        // Fail closed on a missing query vector: an empty vector would reach
+        // the distance kernel's dimension assertion and panic the handler.
+        if vector.is_empty() {
+            return Err(ProximaDBError::InvalidInput(
+                "AQL vector search requires a query vector: add \
+                 Equals { field: \"vector\", value: Vector([...]) } to the WHERE clause"
+                    .to_string(),
+            ));
+        }
         let start = Instant::now();
 
         // Perform vector search
@@ -141,13 +178,7 @@ impl AqlSource for VectorAqlSource {
                 proximadb_tenant::AuthClass::Anonymous,
             )
             .await
-            .map_err(|e| {
-                // Not an SST engine error — wraps a downstream vector
-                // service failure. Map to the query subsystem error.
-                proximadb_kernel::error::ProximaDBError::Query(
-                    proximadb_kernel::error::QueryError::VectorSearch(e.to_string()),
-                )
-            })?;
+            .map_err(Self::vector_search_error)?;
 
         let wall_time_us = start.elapsed().as_micros() as u64;
 

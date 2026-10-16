@@ -467,10 +467,7 @@ impl ExternalCollectionService {
         // Oversample each side so fusion has overlap to work with.
         // TD-SECSCAN-1 (sec review): saturate the oversample product and keep
         // the pool within cap * factor (k itself is capped at the boundary).
-        let pool = k.saturating_mul(HYBRID_POOL_FACTOR).max(k).min(
-            proximadb_search_types::top_k_limit::DEFAULT_MAX_TOP_K
-                .saturating_mul(HYBRID_POOL_FACTOR),
-        );
+        let pool = hybrid_pool_size(k);
         let vector_hits = self.vector_hits(&ec, query, pool).await?;
 
         // Lazily (re)build the BM25 index when a text query is supplied and the
@@ -676,6 +673,34 @@ impl ExternalCollectionService {
         catalog.drop_table(&identifier, false).await?;
         catalog.create_table(&identifier, schema).await?;
         Ok(())
+    }
+}
+
+/// Per-side oversample pool for hybrid fusion: `k * HYBRID_POOL_FACTOR`,
+/// saturating, bounded by `cap * HYBRID_POOL_FACTOR` (TD-SECSCAN-1 §5; `k`
+/// itself is capped at the request boundary).
+fn hybrid_pool_size(k: usize) -> usize {
+    let cap = proximadb_search_types::top_k_limit::max_top_k();
+    k.saturating_mul(HYBRID_POOL_FACTOR)
+        .max(k)
+        .min(cap.saturating_mul(HYBRID_POOL_FACTOR))
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    /// TD-SECSCAN-1 §5 follow-up: the pool bound follows the CONFIGURED cap.
+    /// With `PROXIMADB_SEARCH_MAX_TOP_K` raised above the 10,000 default, a
+    /// request at the override keeps its full oversample instead of being
+    /// clamped to the default-derived bound.
+    #[test]
+    fn hybrid_pool_honours_configured_cap_override() {
+        crate::services::top_k_env_test_support::with_max_top_k_override("50000", || {
+            assert_eq!(hybrid_pool_size(50_000), 50_000 * HYBRID_POOL_FACTOR);
+            assert_eq!(hybrid_pool_size(usize::MAX), 50_000 * HYBRID_POOL_FACTOR);
+            assert_eq!(hybrid_pool_size(3), 3 * HYBRID_POOL_FACTOR);
+        });
     }
 }
 

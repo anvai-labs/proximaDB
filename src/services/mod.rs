@@ -274,6 +274,48 @@ pub use search::{
     StreamingSearch as StreamingSearchService,
 };
 
+/// Test support for unit tests that override `PROXIMADB_SEARCH_MAX_TOP_K`.
+///
+/// `max_top_k()` reads the env var on every call (no `OnceLock`), so a test
+/// that sets it would race any concurrently running test that reads the cap
+/// under `cargo test`'s shared process. Every such test goes through
+/// [`top_k_env_test_support::with_max_top_k_override`], which serializes on
+/// one process-wide lock and restores the previous value on drop (even on
+/// panic). nextest (the project's runner) additionally isolates each test in
+/// its own process.
+#[cfg(test)]
+pub(crate) mod top_k_env_test_support {
+    use proximadb_search_types::top_k_limit::MAX_TOP_K_ENV;
+    use std::sync::Mutex;
+
+    static TOP_K_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct Restore(Option<String>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: env mutation is serialized by TOP_K_ENV_LOCK, held by the
+            // caller for the guard's whole lifetime.
+            match self.0.take() {
+                Some(prev) => unsafe { std::env::set_var(MAX_TOP_K_ENV, prev) },
+                None => unsafe { std::env::remove_var(MAX_TOP_K_ENV) },
+            }
+        }
+    }
+
+    /// Run `f` with `PROXIMADB_SEARCH_MAX_TOP_K=value`, restoring the prior
+    /// value afterwards.
+    pub(crate) fn with_max_top_k_override<R>(value: &str, f: impl FnOnce() -> R) -> R {
+        let _lock = TOP_K_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = Restore(std::env::var(MAX_TOP_K_ENV).ok());
+        // SAFETY: serialized by TOP_K_ENV_LOCK; restored by `_restore`.
+        unsafe { std::env::set_var(MAX_TOP_K_ENV, value) };
+        f()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
