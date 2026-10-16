@@ -667,6 +667,32 @@ class RetargetedPr(unittest.TestCase):
         )
         self.assertEqual(d.reused, {})
 
+    def test_unreadable_real_timeline_never_reuses(self):
+        """Drive the REAL Api.pr_timeline / Api._paged (only the low-level
+        _get is stubbed): an unreadable timeline must fail open, never read as
+        "no retarget". Kills a `try/except: return []` wrapped around either."""
+
+        def raise_403(path):
+            raise reuse.urllib.error.HTTPError(
+                path, 403, "API rate limit exceeded", {}, None
+            )
+
+        def non_list(path):
+            return {"message": "Not Found"}  # a dict where a list of events belongs
+
+        for label, get in (("http-403", raise_403), ("non-list-body", non_list)):
+            with self.subTest(case=label):
+
+                class RealTimeline(FakeApi):
+                    pr_timeline = reuse.Api.pr_timeline
+                    _paged = reuse.Api._paged
+
+                api = RealTimeline([run(100)], {100: jobs()})
+                api._get = get
+                d = decide(api, ctx(**PUSH_QA))
+                self.assertEqual(d.reused, {}, d.reason)
+                self.assertTrue(d.reason.startswith("fail-open"), d.reason)
+
     def test_routes_are_exactly_the_promotion_pairs(self):
         # A mutation adding a route (e.g. "feat/x": "qa") must fail here.
         self.assertEqual(reuse.PROMOTION_ROUTES, {"develop": "qa", "qa": "main"})
