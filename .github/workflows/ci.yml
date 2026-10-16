@@ -1,10 +1,13 @@
 name: CI
 
 on:
+  # `development` was listed here but never existed and is unprotected: a PR
+  # into it runs a ci.yml its author controls (the merge ref includes the
+  # base). Triggers are pinned by tests/scripts/test_ci_tree_reuse.py.
   push:
-    branches: [main, development, develop, qa]
+    branches: [main, develop, qa]
   pull_request:
-    branches: [main, development, develop, qa]
+    branches: [main, develop, qa]
   workflow_dispatch:
     inputs:
       skip_tests:
@@ -75,11 +78,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 2 min over 14 runs, 2026-10-09..11
     # TD-CITIER-2: `actions: read` lets the tree-reuse step list proof
-    # artifacts, runs and jobs. Job-level permissions REPLACE the workflow
-    # default, so `contents: read` is restated.
+    # artifacts, runs and jobs; `pull-requests: read` lets it resolve a PR
+    # proof run to its PR (base + head route check). Job-level permissions
+    # REPLACE the workflow default, so `contents: read` is restated.
     permissions:
       contents: read
       actions: read
+      pull-requests: read
     outputs:
       # Three-tier CI (feat -> develop -> qa -> main):
       #   * feat -> develop runs the LIGHT jobs (compile + fmt/clippy + layering
@@ -149,7 +154,7 @@ jobs:
       src_connectors: ${{ steps.filter.outputs.src_connectors }}
       spark_jni: ${{ steps.filter.outputs.spark_jni }}
       # TD-149: on a push to a protected branch (the only branches this workflow's
-      # `push:` trigger covers — main/development/develop/qa), run the drift-detecting
+      # `push:` trigger covers — main/develop/qa), run the drift-detecting
       # jobs unconditionally. PRs keep the path-filter so the feat→develop tier stays
       # LIGHT/fast; this catches drift/flakes the instant a merge lands them on the
       # branch, so they can't accumulate invisibly and block the next triggering PR.

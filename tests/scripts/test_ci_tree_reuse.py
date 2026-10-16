@@ -127,11 +127,29 @@ class FakeApi:
         jobs_by_run: dict[int, list[dict]],
         tree: str = TREE,
         fail: str = "",
+        pulls: list[dict] | None = None,
+        extra_pulls: list[dict] | None = None,
     ):
         self.runs = {r["id"]: r for r in runs}
         self.jobs_by_run = jobs_by_run
         self.tree = tree
         self.fail = fail
+        if pulls is None:
+            # By default each pull_request proof run is the route PR it claims
+            # to be (develop->qa / qa->main), as on the real promotion runs.
+            pulls = [
+                pr(r["head_branch"], ROUTES[r["head_branch"]], r["head_sha"])
+                for r in runs
+                if r.get("event") == "pull_request" and r.get("head_branch") in ROUTES
+            ]
+        self.pulls = pulls + (extra_pulls or [])
+        self.pull_queries: list[tuple[str, str]] = []
+
+    def pulls_from(self, owner: str, branch: str) -> list[dict]:
+        if self.fail == "pulls":
+            raise reuse.urllib.error.URLError("pulls down")
+        self.pull_queries.append((owner, branch))
+        return [p for p in self.pulls if p["head"]["ref"] == branch]
 
     def proof_artifacts(self, name: str) -> list[dict]:
         if self.fail == "artifacts":
@@ -181,6 +199,27 @@ PUSH_QA = {
 
 def decide(api, c=None, module: ModuleType = reuse, tree_of=lambda sha: TREE, **kw):
     return module.decide(c or ctx(module), api, tree_of=tree_of, now=NOW, **kw)
+
+
+ROUTES = {"develop": "qa", "qa": "main"}
+
+
+def pr(
+    head: str,
+    base: str,
+    sha: str,
+    number: int = 2038,
+    head_repo: str = REPO,
+    base_repo: str = REPO,
+) -> dict:
+    return {
+        "number": number,
+        "head": {"ref": head, "sha": sha, "repo": {"full_name": head_repo}},
+        "base": {"ref": base, "repo": {"full_name": base_repo}},
+    }
+
+
+DEV_SHA = "2166670a39eef8dbe9ccd67300750eaf2d3982e4"
 
 
 def green_api(**run_kw) -> FakeApi:
@@ -448,6 +487,210 @@ class RunsEverything(unittest.TestCase):
         self.assertNotIn("rust-build", decide(green_api()).reused)
 
 
+class PrProofTrust(unittest.TestCase):
+    """Review of #2051 (BLOCK): a PR proof was trusted by its HEAD branch
+    alone. A pull_request run executes the merge ref's ci.yml, which includes
+    the BASE branch, so a PR develop -> <unprotected base> could carry a forged
+    workflow that uploads `ci-tree-proof-<T>` and fakes green job names."""
+
+    def _exploit(self, base: str) -> FakeApi:
+        # The forged run looks exactly like a promotion run through the runs API
+        # (head_branch develop, same repo, ci.yml path, completed, green jobs),
+        # and `pull_requests` is empty, as on real promotion runs.
+        return FakeApi(
+            [run(100, pull_requests=[])],
+            {100: jobs()},
+            pulls=[pr("develop", base, DEV_SHA, number=6666)],
+        )
+
+    def test_exploit_pr_into_development_never_reuses(self):
+        for c in (ctx(), ctx(**PUSH_QA)):
+            with self.subTest(ctx=c.event):
+                d = decide(self._exploit("development"), c)
+                self.assertEqual(d.reused, {}, d.notes)
+                self.assertTrue(
+                    any("not a promotion route" in n for n in d.notes), d.notes
+                )
+
+    def test_exploit_pr_into_develop_never_reuses(self):
+        d = decide(self._exploit("develop"), ctx(**PUSH_QA))
+        self.assertEqual(d.reused, {})
+
+    def test_forged_pr_sharing_the_real_promotion_head_makes_it_ambiguous(self):
+        # The real develop->qa PR exists too; the forged develop->development PR
+        # has the same head SHA, so its run is indistinguishable => trust nobody.
+        api = FakeApi(
+            [run(100)],
+            {100: jobs()},
+            extra_pulls=[pr("develop", "development", DEV_SHA, number=6666)],
+        )
+        d = decide(api, ctx(**PUSH_QA))
+        self.assertEqual(d.reused, {})
+        self.assertTrue(any("need exactly one" in n for n in d.notes), d.notes)
+
+    def test_wrong_route_pair_never_reuses(self):
+        # qa head into qa's route base is main; a develop head into main is not a route.
+        api = FakeApi([run(100)], {100: jobs()}, pulls=[pr("develop", "main", DEV_SHA)])
+        self.assertEqual(decide(api, ctx(**PUSH_QA)).reused, {})
+
+    def test_unresolvable_pr_never_reuses(self):
+        api = FakeApi([run(100)], {100: jobs()}, pulls=[])
+        self.assertEqual(decide(api, ctx(**PUSH_QA)).reused, {})
+
+    def test_pr_with_a_different_head_sha_does_not_vouch(self):
+        api = FakeApi([run(100)], {100: jobs()}, pulls=[pr("develop", "qa", "f" * 40)])
+        self.assertEqual(decide(api, ctx(**PUSH_QA)).reused, {})
+
+    def test_fork_head_or_base_repo_never_reuses(self):
+        for kw in (
+            {"head_repo": "mallory/proximaDB"},
+            {"base_repo": "mallory/proximaDB"},
+        ):
+            with self.subTest(**kw):
+                api = FakeApi(
+                    [run(100)],
+                    {100: jobs()},
+                    pulls=[pr("develop", "qa", DEV_SHA, **kw)],
+                )
+                self.assertEqual(decide(api, ctx(**PUSH_QA)).reused, {})
+
+    def test_pr_head_ref_must_equal_run_head_branch(self):
+        bad = pr("develop", "qa", DEV_SHA)
+        bad["head"]["ref"] = "qa"  # listing returned it under develop, but it claims qa
+
+        class Lying(FakeApi):
+            def pulls_from(self, owner, branch):
+                return [bad]
+
+        api = Lying([run(100)], {100: jobs()})
+        self.assertEqual(decide(api, ctx(**PUSH_QA)).reused, {})
+
+    def test_route_pr_lookup_uses_this_repos_owner_and_run_head(self):
+        api = FakeApi([run(100)], {100: jobs()})
+        self.assertEqual(set(decide(api, ctx(**PUSH_QA)).reused), ALL_KEYS)
+        self.assertEqual(api.pull_queries, [("anvai-labs", "develop")])
+
+    def test_qa_to_main_route_is_trusted(self):
+        api = FakeApi([run(100, head_branch="qa", head_sha="5" * 40)], {100: jobs()})
+        self.assertEqual(set(decide(api, ctx(**PUSH_QA)).reused), ALL_KEYS)
+
+    def test_pulls_api_error_fails_open(self):
+        api = FakeApi([run(100)], {100: jobs()}, fail="pulls")
+        d = decide(api)
+        self.assertEqual(d.reused, {})
+        self.assertTrue(d.reason.startswith("fail-open"))
+
+
+class RedConclusions(unittest.TestCase):
+    """Each RED conclusion must veto even when another trusted run is green
+    (review of #2051: removing timed_out / startup_failure from _RED survived)."""
+
+    def test_each_red_conclusion_vetoes_alongside_a_green_run(self):
+        for conclusion in ("failure", "timed_out", "startup_failure"):
+            with self.subTest(conclusion=conclusion):
+                green = run(100)
+                red = run(200, event="push", head_branch="qa")
+                d = decide(
+                    FakeApi(
+                        [green, red],
+                        {
+                            100: jobs(),
+                            200: jobs({"Feature Matrix (cluster)": conclusion}),
+                        },
+                    )
+                )
+                self.assertEqual(d.reused, {})
+                self.assertIn("veto", d.reason)
+
+    def test_red_set_is_exactly_the_evidence_against_conclusions(self):
+        self.assertEqual(
+            reuse._RED, frozenset({"failure", "timed_out", "startup_failure"})
+        )
+
+
+class Pagination(unittest.TestCase):
+    """The real Api must read EVERY page (review of #2051: page-1-only survived)."""
+
+    def _api(self, pages: dict[str, list]) -> reuse.Api:
+        api = reuse.Api(REPO, "t")
+        calls = []
+
+        def fake_get(path):
+            calls.append(path)
+            for prefix, bodies in pages.items():
+                if path.startswith(prefix):
+                    page = int(re.search(r"[?&]page=(\d+)", path).group(1))
+                    return bodies[page - 1]
+            raise AssertionError(path)
+
+        api._get = fake_get
+        api.calls = calls
+        return api
+
+    def test_jobs_reads_page_two_and_a_red_job_there_vetoes(self):
+        names = [f"Feature Matrix (leg {i})" for i in range(100)]
+        page1 = {
+            "total_count": 102,
+            "jobs": [
+                {
+                    "name": "Detect Changes",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ]
+            + [
+                {"name": n, "status": "completed", "conclusion": "success"}
+                for n in names[:99]
+            ],
+        }
+        page2 = {
+            "total_count": 102,
+            "jobs": [
+                {
+                    "name": "Rust Tests (unit)",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+                {
+                    "name": "Rust Tests (doc)",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+            ],
+        }
+        api = self._api({"actions/runs/100/jobs": [page1, page2]})
+        got = api.jobs(100)
+        self.assertEqual(len(got), 102)
+        r = run(100)
+
+        class Wrapped(FakeApi):
+            def jobs(self, run_id):
+                return got
+
+        d = decide(Wrapped([r], {}))
+        self.assertEqual(d.reused, {})
+        self.assertIn("veto", d.reason)
+
+    def test_missing_total_count_does_not_stop_after_page_one(self):
+        full = [{"name": f"j{i}"} for i in range(100)]
+        api = self._api(
+            {"actions/runs/7/jobs": [{"jobs": full}, {"jobs": [{"name": "last"}]}]}
+        )
+        self.assertEqual(len(api.jobs(7)), 101)
+
+    def test_pulls_paginate_too(self):
+        page1 = [pr("develop", "qa", "a" * 40, number=i) for i in range(100)]
+        page2 = [pr("develop", "development", DEV_SHA, number=6666)]
+        api = self._api({"pulls?state=all&head=anvai-labs:develop": [page1, page2]})
+        self.assertEqual(len(api.pulls_from("anvai-labs", "develop")), 101)
+
+    def test_runaway_pagination_raises_and_so_fails_open(self):
+        full = {"jobs": [{"name": "x"}] * 100}
+        api = self._api({"actions/runs/9/jobs": [full] * (reuse.MAX_PAGES + 1)})
+        with self.assertRaises(RuntimeError):
+            api.jobs(9)
+
+
 # ---------------------------------------------------------------------------
 # Mutation tests: delete each guard; its scenario must flip to "reuse".
 # ---------------------------------------------------------------------------
@@ -540,10 +783,100 @@ MUTANTS = [
         ),
     ),
     (
-        "trust: PR head must be protected",
-        "        if branch not in TRUSTED_PR_HEADS:\n",
-        "        if False:\n",
-        lambda: (green_api(head_branch="feat/x"), {}, None),
+        "route: PR is looked up at all",
+        '        if run.get("event") == "pull_request":\n            route =',
+        '        if run.get("event") == "never":\n            route =',
+        lambda: (
+            FakeApi(
+                [run(100)], {100: jobs()}, pulls=[pr("develop", "development", DEV_SHA)]
+            ),
+            dict(PUSH_QA),
+            None,
+        ),
+    ),
+    (
+        "route: head branch must be a promotion source",
+        "    want_base = PROMOTION_ROUTES.get(head_branch)\n",
+        '    want_base = PROMOTION_ROUTES.get(head_branch, "qa")\n',
+        lambda: (
+            FakeApi(
+                [run(100, head_branch="feat/x")],
+                {100: jobs()},
+                pulls=[pr("feat/x", "qa", DEV_SHA)],
+            ),
+            dict(PUSH_QA),
+            None,
+        ),
+    ),
+    (
+        "route: PR head SHA must equal the run head SHA",
+        '        if (pr.get("head") or {}).get("sha") == head_sha\n',
+        "        if True\n",
+        lambda: (
+            FakeApi([run(100)], {100: jobs()}, pulls=[pr("develop", "qa", "f" * 40)]),
+            dict(PUSH_QA),
+            None,
+        ),
+    ),
+    (
+        "route: exactly one PR per head SHA",
+        "    if len(matches) != 1:\n",
+        "    if not matches:\n",
+        lambda: (
+            FakeApi(
+                [run(100)],
+                {100: jobs()},
+                extra_pulls=[pr("develop", "development", DEV_SHA, number=6666)],
+            ),
+            dict(PUSH_QA),
+            None,
+        ),
+    ),
+    (
+        "route: PR head repository",
+        '    if (head.get("repo") or {}).get("full_name") != ctx.repo:\n',
+        "    if False:\n",
+        lambda: (
+            FakeApi(
+                [run(100)],
+                {100: jobs()},
+                pulls=[pr("develop", "qa", DEV_SHA, head_repo="mallory/proximaDB")],
+            ),
+            dict(PUSH_QA),
+            None,
+        ),
+    ),
+    (
+        "route: PR base repository",
+        '    if (base.get("repo") or {}).get("full_name") != ctx.repo:\n',
+        "    if False:\n",
+        lambda: (
+            FakeApi(
+                [run(100)],
+                {100: jobs()},
+                pulls=[pr("develop", "qa", DEV_SHA, base_repo="mallory/proximaDB")],
+            ),
+            dict(PUSH_QA),
+            None,
+        ),
+    ),
+    (
+        "route: PR head ref equals run head branch",
+        '    if head.get("ref") != head_branch:\n',
+        "    if False:\n",
+        lambda: (_lying_head_ref_api(), dict(PUSH_QA), None),
+    ),
+    (
+        "route: PR base must be the route's base (the #2051 exploit)",
+        '    if base.get("ref") != want_base:\n',
+        "    if False:\n",
+        lambda: (
+            FakeApi(
+                [run(100)], {100: jobs()}, pulls=[pr("develop", "development", DEV_SHA)]
+            ),
+            dict(PUSH_QA),
+            None,
+        ),
     ),
     (
         "trust: push branch must be protected",
@@ -633,6 +966,17 @@ MUTANTS = [
 ]
 
 
+def _lying_head_ref_api() -> FakeApi:
+    bad = pr("develop", "qa", DEV_SHA)
+    bad["head"]["ref"] = "qa"
+
+    class Lying(FakeApi):
+        def pulls_from(self, owner, branch):
+            return [bad]
+
+    return Lying([run(100)], {100: jobs()})
+
+
 def _api_for_tree(tree: str) -> FakeApi:
     api = green_api()
     api.tree = tree
@@ -705,6 +1049,48 @@ def job_if(block: str) -> str:
     return first
 
 
+def _strip_outer_parens(expr: str) -> str:
+    expr = expr.strip()
+    while expr.startswith("(") and expr.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(expr):
+            depth += ch == "("
+            depth -= ch == ")"
+            if depth == 0 and i != len(expr) - 1:
+                return expr  # the leading "(" closes before the end
+        expr = expr[1:-1].strip()
+    return expr
+
+
+def top_level_conjuncts(cond: str) -> list[str]:
+    """The `&&` operands of an expression whose top level is an AND chain.
+    Returns [] when the top level contains `||` (then no operand is a
+    guaranteed conjunct). Quotes are respected; ${{ }} is unwrapped."""
+    cond = cond.strip()
+    if cond.startswith("${{") and cond.endswith("}}"):
+        cond = cond[3:-2]
+    cond = _strip_outer_parens(cond)
+    parts, depth, quote, start, i = [], 0, False, 0, 0
+    while i < len(cond):
+        ch = cond[i]
+        if ch == "'":
+            quote = not quote
+        elif not quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif depth == 0 and cond.startswith("||", i):
+                return []
+            elif depth == 0 and cond.startswith("&&", i):
+                parts.append(cond[start:i])
+                start = i + 2
+                i += 1
+        i += 1
+    parts.append(cond[start:])
+    return [_strip_outer_parens(p) for p in parts]
+
+
 def job_needs(block: str) -> list[str]:
     m = re.search(r"^    needs: *(.*)$", block, re.MULTILINE)
     if not m:
@@ -732,7 +1118,32 @@ class Wiring(unittest.TestCase):
                 cond = job_if(BLOCKS[g.key])
                 self.assertIn(guard, cond)
                 # The guard must be ANDed at top level, not inside an `||` arm.
-                self.assertTrue(cond.rstrip(" }").endswith(guard), cond)
+                self.assertIn(guard, top_level_conjuncts(cond), cond)
+
+    def test_top_level_conjunct_check_rejects_or_precedence_traps(self):
+        g = "!contains(needs.changes.outputs.reused, ',x,')"
+        self.assertIn(g, top_level_conjuncts(f"(A || B) && {g}"))
+        self.assertIn(g, top_level_conjuncts(f"${{{{ A && {g} }}}}"))
+        self.assertNotIn(g, top_level_conjuncts(f"A || B && {g}"))
+        self.assertNotIn(g, top_level_conjuncts(f"(A && {g}) || B"))
+        self.assertNotIn(g, top_level_conjuncts(f"A || ({g})"))
+        self.assertIn(g, top_level_conjuncts(f"(({g})) && A"))
+
+    def test_trigger_branches_are_exactly_the_protected_set(self):
+        # `development` (never existed, unprotected) let a PR into it run a
+        # ci.yml its author controls (review of #2051).
+        header = WF[: WF.index("\njobs:\n")]
+        for event in ("push", "pull_request"):
+            with self.subTest(event=event):
+                m = re.search(
+                    rf"^  {event}:\n    branches: \[([^\]]*)\]", header, re.MULTILINE
+                )
+                self.assertIsNotNone(m, f"{event}: branch list not found")
+                self.assertEqual(
+                    {b.strip() for b in m.group(1).split(",")},
+                    {"main", "develop", "qa"},
+                )
+        self.assertNotIn("development", header.replace("`development` was listed", ""))
 
     def test_group_patterns_match_the_job_name(self):
         for g in reuse.GROUPS:
@@ -818,7 +1229,8 @@ class Wiring(unittest.TestCase):
         changes = BLOCKS["changes"]
         self.assertIn("reused: ${{ steps.reuse.outputs.reused }}", changes)
         self.assertRegex(
-            changes, r"permissions:\n      contents: read\n      actions: read\n"
+            changes,
+            r"permissions:\n      contents: read\n      actions: read\n      pull-requests: read\n",
         )
         step = changes[changes.index("id: reuse") :]
         step = step[: step.index("\n      - name:")]

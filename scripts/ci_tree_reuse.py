@@ -32,9 +32,14 @@ Guarantees (every one is a guard clause below, and each has a mutation test)
 * Identity: only the exact tree hash is looked up; a push proof is
   re-verified by resolving the proving run's head commit to a tree locally.
 * Trust: the proving run must be this workflow file, in this repository (not
-  a fork), and either a push to qa/main or a PR whose head is develop or qa --
-  protected branches, so its workflow definition (which wrote the proof) is
-  reviewed code.
+  a fork), and either a push to qa/main (the pushed commit's ci.yml, on a
+  protected branch) or a PR on an exact promotion route, develop->qa or
+  qa->main. A pull_request run executes the MERGE ref's ci.yml, which
+  includes the BASE branch, so the head alone proves nothing: the PR is
+  resolved through the pulls API (head SHA match; `run.pull_requests` is empty
+  on real promotion runs), must be unique, same-repository, and have the
+  route's base. Both sides of a route are protected, so the definition that
+  wrote the proof is reviewed code.
 * Evidence: a group is proven only if at least one of its jobs ran and EVERY
   one of its jobs concluded `success` in that run. A run with any failed,
   cancelled or still-running reusable job is not a proof. A FAILED or
@@ -73,8 +78,14 @@ from dataclasses import dataclass, field
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 PROOF_PREFIX = "ci-tree-proof-"
 PROMOTION_BASES = ("qa", "main")
-# Heads of the only routes branch-route-guard.yml admits into qa / main.
-TRUSTED_PR_HEADS = ("develop", "qa")
+# The only routes branch-route-guard.yml admits into qa / main: head -> base.
+# A PR proof must be one of these EXACT pairs. The head alone is not enough:
+# a pull_request run executes the MERGE ref's ci.yml, which includes the BASE
+# branch's definition, so a PR from develop into an unprotected base could
+# carry a forged workflow (review of #2051).
+PROMOTION_ROUTES = {"develop": "qa", "qa": "main"}
+# Upper bound on paginated reads; exceeding it raises => fail open.
+MAX_PAGES = 20
 TRUSTED_PUSH_BRANCHES = ("qa", "main")
 CHANGES_JOB_NAME = "Detect Changes"
 DEFAULT_MAX_AGE_HOURS = 168.0
@@ -202,18 +213,33 @@ class Api:
     def run(self, run_id: int) -> dict:
         return self._get(f"actions/runs/{run_id}")
 
+    def _paged(self, path: str, key: str | None) -> list[dict]:
+        """Every page of a list endpoint. Stops on a short page; never trusts a
+        missing total_count to mean "done"; more than MAX_PAGES raises."""
+        items: list[dict] = []
+        sep = "&" if "?" in path else "?"
+        for page in range(1, MAX_PAGES + 1):
+            body = self._get(f"{path}{sep}per_page=100&page={page}")
+            batch = body if key is None else body.get(key, [])
+            if not isinstance(batch, list):
+                raise ValueError(f"{path}: expected a list")
+            items.extend(batch)
+            if len(batch) < 100:
+                return items
+            if (
+                key is not None
+                and "total_count" in body
+                and len(items) >= int(body["total_count"])
+            ):
+                return items
+        raise RuntimeError(f"{path}: more than {MAX_PAGES} pages")
+
     def jobs(self, run_id: int) -> list[dict]:
-        jobs: list[dict] = []
-        page = 1
-        while True:
-            body = self._get(
-                f"actions/runs/{run_id}/jobs?filter=latest&per_page=100&page={page}"
-            )
-            batch = body.get("jobs", [])
-            jobs.extend(batch)
-            if len(batch) < 100 or len(jobs) >= int(body.get("total_count", 0)):
-                return jobs
-            page += 1
+        return self._paged(f"actions/runs/{run_id}/jobs?filter=latest", "jobs")
+
+    def pulls_from(self, owner: str, branch: str) -> list[dict]:
+        """Every PR (any state, any base) whose head is owner:branch."""
+        return self._paged(f"pulls?state=all&head={owner}:{branch}", None)
 
 
 def git_tree_of(sha: str) -> str | None:
@@ -281,8 +307,7 @@ def trusted_run(
         if branch not in TRUSTED_PUSH_BRANCHES:
             return f"push to {branch!r} is not a promotion branch"
     elif event == "pull_request":
-        if branch not in TRUSTED_PR_HEADS:
-            return f"PR head {branch!r} is not a protected promotion source"
+        pass  # head AND base are checked against the PR itself: pr_route_reason
     else:
         return f"event {event!r} is not a proof source"
     if run.get("status") != "completed":
@@ -293,6 +318,45 @@ def trusted_run(
     age_h = (now - _parse_time(created)).total_seconds() / 3600.0
     if age_h > max_age_hours or age_h < -1.0:
         return f"age {age_h:.1f}h outside 0..{max_age_hours:.0f}h"
+    return None
+
+
+def pr_route_reason(run: dict, ctx: Context, api: Api) -> str | None:
+    """None if a pull_request proof run is a promotion PR on an allowed route.
+
+    `run.pull_requests` is EMPTY on real promotion runs, so the PR is resolved
+    by listing every PR whose head is this repo's `head_branch` and keeping
+    those whose head SHA is the run's head SHA. Exactly one may match, and it
+    must be a same-repository PR on an exact route pair (develop->qa or
+    qa->main). Any other PR from the same head commit -- e.g. develop into an
+    unprotected base -- makes the run ambiguous, because that PR's run has the
+    same head_branch and head_sha and is indistinguishable through the API.
+    """
+    head_branch = str(run.get("head_branch", ""))
+    head_sha = str(run.get("head_sha", ""))
+    want_base = PROMOTION_ROUTES.get(head_branch)
+    if want_base is None or not head_sha:
+        return f"PR head {head_branch!r} is not a promotion source"
+    owner = ctx.repo.split("/", 1)[0]
+    matches = [
+        pr
+        for pr in api.pulls_from(owner, head_branch)
+        if (pr.get("head") or {}).get("sha") == head_sha
+    ]
+    if len(matches) != 1:
+        bases = sorted(str((pr.get("base") or {}).get("ref")) for pr in matches)
+        return f"head {head_sha[:10]} maps to {len(matches)} PR(s) {bases}; need exactly one"
+    pr = matches[0]
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    if (head.get("repo") or {}).get("full_name") != ctx.repo:
+        return "PR head repository is not this repository"
+    if (base.get("repo") or {}).get("full_name") != ctx.repo:
+        return "PR base repository is not this repository"
+    if head.get("ref") != head_branch:
+        return f"PR head ref {head.get('ref')!r} != run head {head_branch!r}"
+    if base.get("ref") != want_base:
+        return f"PR #{pr.get('number')} {head_branch}->{base.get('ref')} is not a promotion route"
     return None
 
 
@@ -361,6 +425,11 @@ def _decide(
         if reason:
             decision.notes.append(f"run {run_id} ignored: {reason}")
             continue
+        if run.get("event") == "pull_request":
+            route = pr_route_reason(run, ctx, api)
+            if route:
+                decision.notes.append(f"run {run_id} ignored: {route}")
+                continue
         if run.get("event") == "push":
             head_tree = tree_of(str(run.get("head_sha", "")))
             if head_tree != ctx.tree:
