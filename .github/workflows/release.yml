@@ -147,7 +147,10 @@ jobs:
   # PREPARATION - Extract version, validate, and prepare release
   # ============================================================================
   prepare:
-    timeout-minutes: 30
+    # 120, not 30: "Await Pre-Release CI" below waits up to 110 min for
+    # prerelease-ci.yml (~55 min) to pass on the tagged commit, which is
+    # normally still running when the tag is pushed right after the qa->main merge.
+    timeout-minutes: 120
     name: Prepare Release
     runs-on: ubuntu-latest
     outputs:
@@ -193,22 +196,15 @@ jobs:
         run: |
           bash scripts/version-sync.sh check-tag "v${{ steps.version.outputs.version }}"
 
-      - name: Verify Pre-Release CI Passed
+      # Waits for the verdict rather than demanding it already exists. The v0.4.1
+      # tag was pushed one minute after the qa->main merge, while Pre-Release CI
+      # for that commit was still running, and the old single query failed the
+      # release with nothing built. A red Pre-Release CI still fails fast.
+      - name: Await Pre-Release CI
         if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          SHA="${{ github.sha }}"
-          echo "Verifying pre-release CI passed for commit: $SHA"
-          RESULT=$(gh api \
-            "repos/${{ github.repository }}/actions/workflows/prerelease-ci.yml/runs?head_sha=${SHA}&status=completed&conclusion=success" \
-            --jq '.total_count')
-          if [ "$RESULT" -lt 1 ]; then
-            echo "::error::Pre-release CI has not passed for commit ${SHA}."
-            echo "::error::Run pre-release-ci workflow first, or use workflow_dispatch with dry_run=true to bypass."
-            exit 1
-          fi
-          echo "Pre-release CI verified: $RESULT successful run(s) found"
+        run: bash scripts/await_prerelease_ci.sh "${{ github.repository }}" "${{ github.sha }}" 110 10
 
   # ============================================================================
   # BUILD RUST BINARIES - Cross-platform binary builds
