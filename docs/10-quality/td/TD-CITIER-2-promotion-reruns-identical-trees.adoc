@@ -1,0 +1,247 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CITIER-2: release promotion re-runs the same expensive CI on a byte-identical tree up to four times
+:toc: macro
+:icons: font
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial**. The PR that filed this TD ships the reuse gate for `ci.yml`. It must merge AFTER the v0.4.1 release, so no release runs on gating that has not been tested. Still open: the other workflows that repeat the same tree (QA Gate, TDD Test Suite, CodeQL, Windows Compile Ratchet; see "Open residuals"), and re-measuring the first promotion cycle that runs on the gate.
+| Severity | Medium. Results were correct, but each release burned roughly 700 redundant `ci.yml` runner-minutes. The qa→main gate held the release for about 2.5 h, and about 1.2 h of that was suites that had already passed on the same tree 2 h earlier.
+| Component | `.github/workflows/ci.yml`: the `changes` job (new `reuse` step, the proof-marker upload, the `reused` output, `actions: read`), the `if:` of 19 reusable jobs, `rust-coverage` and `integration-test` (explicit skip handling). New helper `scripts/ci_tree_reuse.py`, with tests in `tests/scripts/test_ci_tree_reuse.py`.
+| Relates to | Mandate #9 (CI tiering: the tiers are unchanged, and only duplicate runs of a tier on the same tree are removed). link:TD-CITIER-1-feat-develop-critical-path-long-poles.adoc[TD-CITIER-1] (feat→develop long poles, which made the specialised suites unconditional at promotion). PR #2043 (a failed `changes` job must fail `CI Success`; this gate preserves that).
+|===
+
+toc::[]
+
+== Measurement (2026-10-15 promotion cycle)
+
+The cycle measured is PR #2038 (develop→qa, merged 07:15Z) and PR #2039 (qa→main, merged
+10:26Z), plus the push runs that each merge triggered. Job data comes from
+`gh api repos/anvai-labs/proximaDB/actions/runs/<id>/jobs`. The commit each PR run tested
+comes from its `Detect Changes` checkout log (`HEAD is now at …`), because a PR run tests
+`refs/pull/N/merge`, not the PR head.
+
+[cols="2,1,2,2,1,1",options="header"]
+|===
+| `ci.yml` run | event | commit tested | git tree | jobs ran | runner-min
+| 38684845368 (#2038) | PR develop→qa | `578a9e75e` (pull/2038/merge) | `318f14450b69` | 63 | 657
+| 38697498068 | push qa | `597757c45` | `318f14450b69` | 22 | 96
+| 38697532716 (#2039) | PR qa→main | `8e8c0d749` (pull/2039/merge) | `318f14450b69` | 72 | 884
+| 38720270273 | push main | `328e8f917` | `318f14450b69` | 22 | 102
+|===
+
+**All four runs tested one tree.** The develop head `2166670a3` has the same tree as well:
+qa and main contained nothing that develop lacked, so every merge was content-identical.
+
+The expensive jobs, in runner-minutes (`—` means the job did not run):
+
+[cols="3,1,1,1,1",options="header"]
+|===
+| job | PR→qa | push qa | PR→main | push main
+| Rust Tests (unit / doc) | 63.3 / 24.4 | — | 44.7 / 20.4 | —
+| Feature Matrix (14 legs + enterprise-catalogs) | 146.5 + 36.5 | — | 149.3 + 46.6 | —
+| Rust Build (dev / release) | 8.0 / 34.6 | — | 27.3 / 27.2 | —
+| 7 Rust integration lanes | 176.3 | — | 139.9 | —
+| SIFT PAX recall ratchet | 28.1 | — | 32.7 | —
+| Object-store restart recovery (Azurite) | — ^1^ | — | 53.0 | —
+| MLflow conformance | 9.0 | — | 25.9 | —
+| OpenAPI Spec From Code | 7.1 | 25.9 | 26.2 | 24.6
+| Python SDK round-trip | 24.2 | 22.4 | 32.9 | 34.4
+| Python SDK Tests (3.11 + 3.12) | 20.8 | 19.5 | 18.6 | 19.0
+| Rust Compile (benches) | 19.4 | — | 25.3 | —
+| main-only extras: Code Coverage, Docker Build, Integration Tests | — | — | 74.8 + 41.1 + 7.2 | —
+|===
+
+^1^ The run predates #2043, which made restart recovery unconditional at promotion.
+
+**The push runs are cheap only by accident.** `dorny/paths-filter` compares a push to a
+non-default branch against the default branch (`develop`). In this cycle develop had not moved,
+so `rust` was `false` and the Rust suites skipped. When develop moves first, that accident does
+not happen. On 2026-10-14 the push-main run 38503666751 tested tree `708e8de123e5`, the same tree
+as the qa head `c86b79dab` that PR #2014 had just passed. It ran 75 jobs for **967 runner-min
+and 2 h 41 min**. 659 of those minutes were reusable suites.
+
+**Other workflows repeat the same tree too.** These are not in scope for this PR (see "Open residuals"):
+
+[cols="2,3,1",options="header"]
+|===
+| workflow | runs on tree `318f14450b69` | runner-min
+| QA Gate | PR→qa 281, push qa 255, PR→main 301 | 837
+| TDD Test Suite | PR→main 241, push main 258 | 499
+| CodeQL | PR→main 92, push main 98 | 190
+| Windows Compile Ratchet | PR→qa 26, PR→main 27 | 53
+|===
+
+== Design: reuse by exact tree, proven by the jobs API
+
+A promotion-tier run (`medium_tier`: a push to qa/main, or a PR into qa/main) uploads a tiny
+artifact named `ci-tree-proof-<tree>` from its `changes` job. A later run's `changes` job calls
+`scripts/ci_tree_reuse.py`. The script lists artifacts by that exact name (one API call), then
+checks each producing run through the runs and jobs APIs. A job group is **proven** when a
+trusted, completed run on the identical tree ran every job of the group to `success`. The script
+writes `reused=,key,key,`. Each reusable job ANDs
+`!contains(needs.changes.outputs.reused, ',<job-id>,')` into its `if:`, so a reused job shows as
+`skipped`, which `CI Success` already treats as a pass. The `changes` job summary records one line
+per group: "reused results from run <id> (tree <hash>)", with a link to the proving run.
+
+The artifact is only an index. The claim that the jobs passed always comes from the jobs API, and
+never from the artifact's content.
+
+The reusable set has 19 job groups: `rust-test`, `feature-matrix`, `feature-matrix-enterprise-catalogs`,
+`rust-compile-benches`, `rust-build`, the 7 `rust-integration-test-*` lanes, `object-store-emulator-tests`,
+`object-store-restart-recovery`, `mlflow-conformance`, `sift-recall-ratchet`, `python-test`,
+`python-sdk-round-trip` and `openapi-spec-drift`. These jobs do not reference the event, the base
+or `extensive` in their steps, so given the tree and the medium tier they do the same work.
+
+The following always run:
+
+* **Main-only extras:** Code Coverage, Docker Build, Integration Tests and Benchmarks, and CodeQL,
+  which is a separate workflow.
+* **The `rust-compile` hard gate and the cheap guards:** fmt, clippy, proto, panic-policy,
+  layering and docs. They are cheap, and they keep a fresh compile of the exact tree under
+  `CI Success`.
+
+=== Fail-open guarantees
+
+Every guard below has a unit test, and a mutation test that deletes the guard and shows the outcome
+flipping to "reuse".
+
+* **Context:** reuse applies only to a push to qa/main, or to a same-repo PR into qa/main, at
+  medium tier. feat→develop PRs, develop pushes, workflow_dispatch and forks never reuse.
+* **Identity:** the lookup is by exact tree. For a push proof, the proving run's head commit is
+  also resolved to its tree locally (with one fetch if needed), and must match.
+* **Trust:** the proving run must be `.github/workflows/ci.yml` in this repository, not a fork.
+  It must also be one of two kinds:
+** a push to qa/main, whose workflow comes from the pushed commit on a protected branch; or
+** a PR on an exact promotion route (develop→qa or qa→main). See "Trust model for PR proofs" below.
+* **Evidence:** a group needs at least one job, and every one of its jobs must be `success`.
+  Skipped, cancelled or incomplete jobs disqualify the run. A failed, timed-out or
+  startup-failed reusable job on the identical tree, in any trusted run, vetoes all reuse. Every
+  page of the jobs and pulls listings is read; a missing `total_count` never ends pagination
+  early, and more than 20 pages raises, which fails open.
+* **Freshness:** a proof must be no more than 168 h old. The proof artifact is kept for 14 days.
+* **Dependency safety:** `rust-build` is reused only when all five integration lanes that `needs:`
+  it are reused too. It is never reused at the FULL tier, because Integration Tests downloads its
+  release binary and Benchmarks needs it. `rust-coverage` (which needs `rust-test`) and
+  `integration-test` (which needs `python-test`) now treat a skip that the reuse step recorded as a
+  pass. Any other skip still skips them as before. A wiring test fails if any future job `needs:` a
+  reusable job without one of these protections.
+* **Fail open:** any exception yields an empty `reused`, so everything runs. That covers API or
+  network errors, a 403 from missing permission, malformed JSON, and git failures. The step is
+  `continue-on-error`, and the script's entry point never exits non-zero, so the step cannot fail
+  `changes`. A genuinely failed `changes` job still fails `CI Success`: that is #2043's invariant,
+  and a wiring test pins it.
+
+=== Trust model for PR proofs (review of #2051)
+
+The first version of this gate trusted a `pull_request` proof run by its HEAD branch alone
+(develop or qa). A review blocked it. A `pull_request` run executes the MERGE ref's `ci.yml`,
+and that ref includes the BASE branch. At the time, `ci.yml` listed `development` in its
+`pull_request:` and `push:` branches. That branch never existed and is unprotected.
+
+The exploit worked like this. A user with write access pushes a `development` branch whose
+`ci.yml` uploads `ci-tree-proof-<T>` and has trivially green jobs with the reusable names. T is
+the predictable next promotion tree, essentially develop's tree. The user then opens
+PR develop→development. Through the runs API, that run is indistinguishable from a real
+develop→qa run: same `head_branch`, same `head_sha`, same repo, same path, and an empty
+`pull_requests`. It passed every trust check. PR proofs got no tree re-verification, so the next
+real promotion reused all 19 groups. A regression test reproduces this with the forged PR's base
+set to `development` and to `develop`.
+
+The fix has two parts.
+
+* **The PR is resolved, not inferred.** `run.pull_requests` is empty on real promotion runs
+  (checked on 38684845368 and 38697532716). So `pr_route_reason` lists every PR, of any state,
+  whose head is `<owner>:<head_branch>`, through `pulls?state=all&head=…`, reading every page.
+  It keeps only the PRs whose `head.sha` equals the run's `head_sha`. The run is trusted only when:
+** exactly one PR matches;
+** the PR's head and base repositories are both this repository;
+** `head.ref` equals the run's head branch; and
+** `base.ref` is that head's route base: develop→qa or qa→main.
++
+If no PR matches, or more than one does (for example a forged develop→development PR sharing the
+real promotion's head SHA), the run is not trusted and everything runs. Both sides of an allowed
+route are protected branches, so the definition that wrote the proof is reviewed code. The
+`changes` job gains `pull-requests: read` for this lookup. A 403 or any other error fails open.
+Checked live: both real promotion runs resolve to #2038 and #2039 and are trusted. A forged
+head SHA resolves to 0 PRs and is rejected.
+* **The unprotected trigger is gone.** `development` is removed from `on.push.branches` and
+  `on.pull_request.branches`. A wiring test pins both lists to exactly `{main, develop, qa}`.
+
+**Re-review: retargeting.** The pulls API reports only a PR's *current* base, and that base can
+be edited after a run. A write-access user could carry out these steps:
+
+. push branch `evil` with a forged `ci.yml`;
+. open PR develop→evil at head S1, so the forged run executes `evil`'s `ci.yml` with
+  `head_branch` develop;
+. edit the base to qa;
+. close the PR.
+
+Nothing re-runs, because `edited` is not one of `ci.yml`'s `pull_request` types and `state=all`
+still lists the closed PR. The lookup would then find exactly one develop→qa PR for S1.
+
+The fix reads the PR's **complete timeline** (`issues/<n>/timeline`, every page). A PR whose
+timeline contains any `base_ref_changed` or `base_ref_force_pushed` event is rejected as a proof
+source, whatever the from/to; the REST event does not carry them anyway.
+
+* **Errors:** if any page cannot be read, the lookup fails open, so everything runs.
+* **Event name:** checked live against #1995, a real qa→develop retarget, which shows
+  `base_ref_changed`.
+* **Real proofs:** #2038 (16 events) and #2039 (39 events) have no base events, and their runs
+  38684845368 and 38697532716 remain trusted.
+* **No timestamp rule:** requiring the run to post-date the last base change would only matter if
+  a retargeted PR could ever be trusted. Since any base change rejects the PR, that rule is moot.
+* **Reopening** does not change the base, so it adds no path.
+
+**`edited` was considered and not added** to the `pull_request` types. It would trigger a full CI
+run (657+ runner-min at promotion) on every title or body edit, and would cancel and restart
+in-flight feature-PR runs. Re-running is not the fix in any case: the timeline check is.
+
+**Alternative rejected: push-only proofs.** With proofs from push runs only, PR qa→main would have
+nothing to reuse. The push-to-qa run skips the Rust suites, because paths-filter diffs against
+develop, so its proof covers about 3 groups (OpenAPI, the Python round-trip, Python tests;
+68 runner-min) instead of 17. The PR qa→main saving would drop from 566 to about 68 runner-min.
+
+What remains trusted is a run whose definition came from develop, qa or main. Writing to those
+branches requires a reviewed PR with `CI Success`, which is the same trust the promotion itself
+relies on.
+
+== Projection per release (replaying the 2026-10-15 jobs through the gate)
+
+The projection replays the measured jobs. Each run reuses what the earlier runs proved.
+`scripts/ci_tree_reuse.py` was run against the live API on runs 38684845368 and 38697498068, with
+the artifact index stubbed because those runs predate the marker. For PR qa→main it returned 17
+groups; `rust-build` was held back at the FULL tier. For push qa it returned 18 groups.
+
+[cols="2,1,1,2",options="header"]
+|===
+| run | runner-min before | after | critical path (job start → last job)
+| PR develop→qa | 657 | 657 | unchanged (first run on the tree)
+| push qa | 96 | 28 | 27 min → ~12 min
+| PR qa→main | 884 | 318 | **148 min → ~75 min** (long pole: Code Coverage, which no longer waits for `rust-test`)
+| push main | 102 | 24 | 35 min → ~8 min
+| **per release** | **1739** | **1027** | **−712 runner-min (−41 %)**
+|===
+
+When develop moves before the push to main, as on 2026-10-14, the push-main run also drops from
+about 967 to about 310 runner-min. That adds about 660 runner-min of saving that today depends on
+timing.
+
+== Open residuals
+
+* **QA Gate** repeats about 556 runner-min per release (the push qa and PR→main runs on a tree
+  that PR→qa already proved). It has no aggregator. Its header says its job names are required
+  checks on qa/main, but branch protection on both branches requires only `CI Success` (checked
+  2026-10-15). Serving it from the same script needs a
+  per-workflow group table and a `changes`-style job in `qa-gate.yml`. That is a follow-up slice.
+* **TDD Test Suite** (PR→main, then push main; about 250 runner-min) and **CodeQL** (about 95)
+  repeat the tree once each. A CodeQL result is per commit for code-scanning alerts, so its
+  repetition may be intended.
+* **Re-measure** the first promotion cycle on the gate. Correct the projection table if the
+  observed savings differ.
+* **Residual risk, not removable by a tree hash:** a reused job is not re-exposed to runner-image
+  drift, third-party downloads (the SIFT corpus, emulator images) or wall-clock-dependent tests
+  inside the 168 h window. The same exposure exists today whenever a green run is merged without a
+  re-run. The freshness window bounds it.

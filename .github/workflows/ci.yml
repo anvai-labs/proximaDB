@@ -1,10 +1,16 @@
 name: CI
 
 on:
+  # `development` was listed here but never existed and is unprotected: a PR
+  # into it runs a ci.yml its author controls (the merge ref includes the
+  # base). Triggers are pinned by tests/scripts/test_ci_tree_reuse.py.
+  # `pull_request` deliberately keeps the default types (no `edited`): adding
+  # it would re-run full CI on every title/body edit; a retargeted PR is
+  # instead rejected as a reuse proof by its timeline (TD-CITIER-2).
   push:
-    branches: [main, development, develop, qa]
+    branches: [main, develop, qa]
   pull_request:
-    branches: [main, development, develop, qa]
+    branches: [main, develop, qa]
   workflow_dispatch:
     inputs:
       skip_tests:
@@ -74,6 +80,15 @@ jobs:
     name: Detect Changes
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 2 min over 14 runs, 2026-10-09..11
+    # TD-CITIER-2: `actions: read` lets the tree-reuse step list proof
+    # artifacts, runs and jobs; `pull-requests: read` lets it resolve a PR
+    # proof run to its PR (route check) and read that PR's timeline (a
+    # `base_ref_changed` anywhere voids its runs). Job-level permissions
+    # REPLACE the workflow default, so `contents: read` is restated.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
       # Three-tier CI (feat -> develop -> qa -> main):
       #   * feat -> develop runs the LIGHT jobs (compile + fmt/clippy + layering
@@ -143,7 +158,7 @@ jobs:
       src_connectors: ${{ steps.filter.outputs.src_connectors }}
       spark_jni: ${{ steps.filter.outputs.spark_jni }}
       # TD-149: on a push to a protected branch (the only branches this workflow's
-      # `push:` trigger covers — main/development/develop/qa), run the drift-detecting
+      # `push:` trigger covers — main/develop/qa), run the drift-detecting
       # jobs unconditionally. PRs keep the path-filter so the feat→develop tier stays
       # LIGHT/fast; this catches drift/flakes the instant a merge lands them on the
       # branch, so they can't accumulate invisibly and block the next triggering PR.
@@ -151,6 +166,12 @@ jobs:
       # python-lint, the 4 sdk-codegen-drifts, go/nodejs/rust-sdk-lint) OR this `sweep`
       # into their `if:`.
       sweep: ${{ github.event_name == 'push' }}
+      # TD-CITIER-2: `,key,key,` of reusable job groups already proven GREEN on
+      # this exact git tree by a trusted promotion-tier run (empty = run all).
+      # Each reusable job ANDs `!contains(needs.changes.outputs.reused,
+      # ',<job-id>,')` into its `if:`. Only ever non-empty at promotion (push
+      # to qa/main, or a same-repo PR into qa/main); see scripts/ci_tree_reuse.py.
+      reused: ${{ steps.reuse.outputs.reused }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -615,6 +636,57 @@ jobs:
           fi
           echo "$verdicts" | tee -a "$GITHUB_OUTPUT"
 
+      # TD-CITIER-2: promotion runs re-tested byte-identical trees up to 4x per
+      # release (PR develop->qa, push qa, PR qa->main, push main all tested
+      # tree 318f14450b69 on 2026-10-15). Reuse the expensive suites a trusted
+      # promotion-tier run already passed on THIS tree. Fails OPEN: any error,
+      # missing permission, fork, tree mismatch or red/cancelled evidence =>
+      # empty `reused` => everything runs. `continue-on-error` (and a script
+      # that always exits 0) keep a crash here from failing `changes`, whose
+      # failure must still fail CI Success (#2043).
+      - name: Reuse results proven on an identical tree (promotion only)
+        id: reuse
+        if: >-
+          (github.event_name == 'push' && (github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/main')) ||
+          (github.event_name == 'pull_request' && (github.base_ref == 'qa' || github.base_ref == 'main') &&
+           github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          MEDIUM_TIER: ${{ github.base_ref == 'qa' || github.base_ref == 'main' || github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/main' }}
+          FULL_TIER: ${{ github.base_ref == 'main' || github.ref == 'refs/heads/main' }}
+        run: |
+          tree="$(git rev-parse HEAD^{tree})"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          python3 scripts/ci_tree_reuse.py --tree "$tree" || echo "reused=" >> "$GITHUB_OUTPUT"
+
+      # The proof INDEX for later runs on the same tree: a tiny artifact whose
+      # name carries the tree. It asserts nothing by itself -- the reuse step
+      # reads job conclusions from the API -- and it is only written by
+      # promotion-tier, same-repository runs.
+      - name: Record tree proof marker (promotion only)
+        if: steps.reuse.outputs.tree != ''
+        continue-on-error: true
+        env:
+          TREE: ${{ steps.reuse.outputs.tree }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BASE: ${{ github.base_ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-tree-proof"
+          python3 -c 'import json,os; print(json.dumps({k.lower(): os.environ[k] for k in ("TREE","EVENT","REF","BASE","SHA")}))' \
+            > "$RUNNER_TEMP/ci-tree-proof/proof.json"
+      - name: Upload tree proof marker
+        if: steps.reuse.outputs.tree != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-tree-proof-${{ steps.reuse.outputs.tree }}
+          path: ${{ runner.temp }}/ci-tree-proof/proof.json
+          retention-days: 14
+
   # NOTE (2026-07-13): the former `gpu-feature-check` (macOS) job was REMOVED.
   # It was pinned to `runs-on: macos-13` — the last free x86_64 macOS image,
   # which GitHub has retired — so the job could never be scheduled: it sat
@@ -668,6 +740,8 @@ jobs:
         run: python3 -m unittest discover -s tests/scripts -p 'test_cloud_emulator_harness.py'
       - name: Test trusted branch-route workflow contract
         run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
+      - name: Test promotion tree-reuse gate (TD-CITIER-2)
+        run: python3 -m unittest discover -s tests/scripts -p 'test_ci_tree_reuse.py'
       - name: Validate release build features (cloud-full + job timeouts)
         run: python3 scripts/check_release_build_features.py
       - name: Check for unreachable .rs files (TD-ORPHAN-1)
@@ -848,7 +922,7 @@ jobs:
     # the committed spec, or a dependency (TD-SPECORD-1) changes; `sweep`
     # (every push to a protected branch) and `medium_tier` (develop->qa,
     # qa->main) still run it unconditionally.
-    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.medium_tier == 'true' || needs.changes.outputs.openapi_code_changes == 'true' || needs.changes.outputs.openapi_spec == 'true'
+    if: (needs.changes.outputs.sweep == 'true' || needs.changes.outputs.medium_tier == 'true' || needs.changes.outputs.openapi_code_changes == 'true' || needs.changes.outputs.openapi_spec == 'true') && !contains(needs.changes.outputs.reused, ',openapi-spec-drift,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -1023,7 +1097,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 70  # max 36 min over 14 runs, 2026-10-09..11 (run 37880949062)
     needs: changes
-    if: needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true'
+    if: (needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true') && !contains(needs.changes.outputs.reused, ',python-sdk-round-trip,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -1223,7 +1297,7 @@ jobs:
     # reports a SKIPPED matrix job under its raw un-expanded name, which the
     # sample counted as a leg.
     needs: changes
-    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true'
+    if: (needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true') && !contains(needs.changes.outputs.reused, ',feature-matrix,')
     strategy:
       fail-fast: false
       matrix:
@@ -1334,7 +1408,8 @@ jobs:
     if: |
       needs.changes.outputs.test_tier == 'true' &&
       (needs.changes.outputs.medium_tier == 'true' ||
-       needs.changes.outputs.enterprise_catalogs_changes == 'true')
+       needs.changes.outputs.enterprise_catalogs_changes == 'true') &&
+      !contains(needs.changes.outputs.reused, ',feature-matrix-enterprise-catalogs,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -1910,7 +1985,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 50  # max 25 min over 14 runs, 2026-10-09..11
     needs: [changes]
-    if: needs.changes.outputs.compile == 'true' && needs.changes.outputs.medium_tier == 'true'
+    if: (needs.changes.outputs.compile == 'true' && needs.changes.outputs.medium_tier == 'true') && !contains(needs.changes.outputs.reused, ',rust-compile-benches,')
     env:
       CARGO_BUILD_JOBS: 1
       RUSTC_WRAPPER: sccache
@@ -1956,7 +2031,7 @@ jobs:
     timeout-minutes: 75
     # max 37 min over 14 runs, 2026-10-09..11, 2 legs (dev/release)
     needs: [changes]
-    if: needs.changes.outputs.rust == 'true' && !inputs.skip_tests
+    if: (needs.changes.outputs.rust == 'true' && !inputs.skip_tests) && !contains(needs.changes.outputs.reused, ',rust-build,')
     strategy:
       matrix:
         include:
@@ -2055,7 +2130,7 @@ jobs:
     # compile is ~42-45 min whichever job wrote the cache (16/16 runs), so the
     # edge only added its ~21 min wait to every feat->develop run's wall clock.
     needs: [changes]
-    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true' && !inputs.skip_tests
+    if: (needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true' && !inputs.skip_tests) && !contains(needs.changes.outputs.reused, ',rust-test,')
     # NO sccache here (reverted from #920): with RUSTC_WRAPPER=sccache this job's
     # root-crate test-binary compile OOM-killed the 16GB runner 3/3 times on
     # 2026-07-13 (exit 143 after ~10min of silence mid-compile — the documented
@@ -2271,7 +2346,8 @@ jobs:
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
-      needs.changes.outputs.object_store_cloud_changes == 'true'
+      needs.changes.outputs.object_store_cloud_changes == 'true' &&
+      !contains(needs.changes.outputs.reused, ',object-store-emulator-tests,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -2336,7 +2412,8 @@ jobs:
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
       (needs.changes.outputs.medium_tier == 'true' ||
-       needs.changes.outputs.object_store_restart_changes == 'true')
+       needs.changes.outputs.object_store_restart_changes == 'true') &&
+      !contains(needs.changes.outputs.reused, ',object-store-restart-recovery,')
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_DIR: /home/runner/.cache/sccache
@@ -2429,7 +2506,8 @@ jobs:
       needs.changes.outputs.test_tier == 'true' &&
       needs.changes.outputs.rust == 'true' &&
       (needs.changes.outputs.storage_changes == 'true' ||
-       needs.changes.outputs.core_changes == 'true')
+       needs.changes.outputs.core_changes == 'true') &&
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-storage,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -2470,7 +2548,8 @@ jobs:
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
       (needs.changes.outputs.medium_tier == 'true' ||
-       needs.changes.outputs.mlflow_changes == 'true')
+       needs.changes.outputs.mlflow_changes == 'true') &&
+      !contains(needs.changes.outputs.reused, ',mlflow-conformance,')
     env:
       PROXIMADB_MLFLOW_COMPAT_ENABLE: "1"
     steps:
@@ -2592,7 +2671,8 @@ jobs:
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
-      needs.changes.outputs.authz_changes == 'true'
+      needs.changes.outputs.authz_changes == 'true' &&
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-authz,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -2631,7 +2711,8 @@ jobs:
       needs.changes.outputs.test_tier == 'true' &&
       needs.changes.outputs.rust == 'true' &&
       (needs.changes.outputs.query_changes == 'true' ||
-       needs.changes.outputs.core_changes == 'true')
+       needs.changes.outputs.core_changes == 'true') &&
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-query,')
     env:
       # Match the QA recall lane and the hardened server runtime: the
       # delete/flush ANN recall path has a deep-but-finite async call chain
@@ -2667,7 +2748,8 @@ jobs:
     if: |
       !inputs.skip_tests &&
       needs.changes.outputs.test_tier == 'true' &&
-      needs.changes.outputs.pgwire_accuracy_changes == 'true'
+      needs.changes.outputs.pgwire_accuracy_changes == 'true' &&
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-pgwire-accuracy,')
     env:
       # 8MB worker stack: events_tsbs_pgwire_e2e (and correlated-subquery pgwire
       # paths) produce deep-but-finite async call chains that overflow the
@@ -2764,7 +2846,8 @@ jobs:
       needs.changes.outputs.test_tier == 'true' &&
       needs.changes.outputs.rust == 'true' &&
       (needs.changes.outputs.graph_changes == 'true' ||
-       needs.changes.outputs.core_changes == 'true')
+       needs.changes.outputs.core_changes == 'true') &&
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-graph,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -2797,7 +2880,8 @@ jobs:
       needs.changes.outputs.test_tier == 'true' &&
       needs.changes.outputs.rust == 'true' &&
       (needs.changes.outputs.network_changes == 'true' ||
-       needs.changes.outputs.core_changes == 'true')
+       needs.changes.outputs.core_changes == 'true') &&
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-cluster,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -2840,7 +2924,8 @@ jobs:
       needs.changes.outputs.test_tier == 'true' &&
       needs.changes.outputs.rust == 'true' &&
       (needs.changes.outputs.network_changes == 'true' ||
-       needs.changes.outputs.core_changes == 'true')
+       needs.changes.outputs.core_changes == 'true') &&
+      !contains(needs.changes.outputs.reused, ',rust-integration-test-api,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -2870,7 +2955,15 @@ jobs:
     # FULL tier only (qa -> main). rust-test runs at the MEDIUM tier (qa), but
     # coverage is expensive, so gate it to the main-promotion gate explicitly.
     needs: [changes, rust-test]
-    if: needs.changes.outputs.extensive == 'true'
+    # TD-CITIER-2: a `rust-test` SKIPPED because the reuse step proved it green
+    # on this exact tree must not silently skip coverage (a main-only extra)
+    # via the implicit success() of `needs`. Any other skip keeps the old
+    # behavior (skip with it).
+    if: >-
+      !cancelled() && needs.changes.result == 'success' &&
+      needs.changes.outputs.extensive == 'true' &&
+      (needs.rust-test.result == 'success' ||
+       (needs.rust-test.result == 'skipped' && contains(needs.changes.outputs.reused, ',rust-test,')))
     continue-on-error: true
     # 83 minutes then evicted mid-`Generate Coverage` with no logs uploaded on the
     # v0.4.0 qa->main promotion -- the runner-OOM signature, not a coverage result.
@@ -2997,7 +3090,7 @@ jobs:
     # on #1679, which rewrote large parts of the SDK, five Python gates ran and
     # this one was SKIPPED. Breakage therefore landed on develop and waited for
     # whoever promoted next to diagnose it.
-    if: ${{ !inputs.skip_tests && (needs.changes.outputs.medium_tier == 'true' || needs.changes.outputs.python == 'true') }}
+    if: ${{ (!inputs.skip_tests && (needs.changes.outputs.medium_tier == 'true' || needs.changes.outputs.python == 'true')) && !contains(needs.changes.outputs.reused, ',python-test,') }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -3179,7 +3272,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [changes, rust-build, python-test]
-    if: ${{ !inputs.skip_tests && needs.changes.outputs.extensive == 'true' }}
+    # TD-CITIER-2: `python-test` may be SKIPPED because it was proven green on
+    # this exact tree; that must not skip this main-only extra. `rust-build` is
+    # never reused at the FULL tier (this job downloads its release binary),
+    # so it must still have succeeded.
+    if: >-
+      ${{ !cancelled() && !inputs.skip_tests && needs.changes.result == 'success' &&
+      needs.changes.outputs.extensive == 'true' && needs.rust-build.result == 'success' &&
+      (needs.python-test.result == 'success' ||
+       (needs.python-test.result == 'skipped' && contains(needs.changes.outputs.reused, ',python-test,'))) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -3527,8 +3628,9 @@ jobs:
     # recur: every promotion is measured regardless of which paths moved. workflow_dispatch still runs it on
     # demand for a branch that wants the early signal.
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      needs.changes.outputs.medium_tier == 'true'
+      (github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.medium_tier == 'true') &&
+      !contains(needs.changes.outputs.reused, ',sift-recall-ratchet,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
