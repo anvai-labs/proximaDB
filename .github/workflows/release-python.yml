@@ -57,6 +57,13 @@ on:
         default: false
         type: boolean
 
+# Least privilege (CodeQL actions/missing-workflow-permissions #94, #176-#179):
+# build/test jobs only check out and pass artifacts. The three publish jobs
+# declare their own `id-token: write` for PyPI trusted publishing, which
+# replaces this default for those jobs.
+permissions:
+  contents: read
+
 env:
   PYTHON_VERSION: '3.12'
 
