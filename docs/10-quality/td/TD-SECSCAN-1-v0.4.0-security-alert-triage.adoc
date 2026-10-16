@@ -231,18 +231,58 @@ the shared sinks (no third constant anywhere):
    control frame, pgwire `vector_search(...)` UDTF and pgvector
    `ORDER BY … LIMIT n`. A malformed or zero override now falls back to the
    default instead of disabling (or zeroing) the cap.
-2. **Choke points (internal callers, error or clamp).** The two search
-   authorities every default-mounted route bottoms out in also enforce the
-   cap: `VectorOperationsService::search_v1` (progressive/hybrid v1 leg) and
-   `unified_search_native[_with_tenant_context]` (hybrid/fusion-seed/
-   entanglement leg), plus `handle_record_search_for_tenant` as defense in
-   depth. `GraphFusionService::graph_fusion_search_with_labels` clamps
-   `limit` and `max_seeds` to the cap, and the external-collection hybrid
-   pool saturates its `k * HYBRID_POOL_FACTOR` product. A route whose handler
+2. **Choke points (internal callers, error or clamp).** The shared search
+   authorities enforce the cap: `VectorOperationsService::search_v1`
+   (progressive/hybrid v1 leg), `unified_search_native[_with_tenant_context]`
+   (hybrid/fusion-seed/entanglement leg) and — added in the 2026-10-15
+   follow-up after the adversarial review of #2046 found the earlier claim
+   that every default-mounted route bottoms out in the first two was wrong —
+   `VectorOperationsService::unified_search_v1`, the authority under AQL
+   `SEMANTIC_MATCH` (`POST /api/v2/aql/execute`, `vector` and `memory`
+   sources), MCP agent-memory retrieval (`VectorMemoryStore::retrieve_similar`),
+   the legacy entity store and the SQL executor's vector-query step; plus
+   `handle_record_search_for_tenant` as defense in depth. The AQL route maps
+   the rejection to HTTP 400 naming `PROXIMADB_SEARCH_MAX_TOP_K` (the AQL
+   executor now surfaces `InvalidInput` instead of folding it into a 200 with
+   a `Failure` audit outcome); the memory source's internal 5x recall
+   oversample is clamped to the cap rather than rejected, so an at-cap
+   `top_k` is still served. The MCP `memory` search tool rejects an over-cap
+   `k` as invalid params at its boundary. The AQL `vector` source now reads
+   its query vector from an `Equals { vector | embedding | query_vector }`
+   predicate (and `SemanticMatch.top_k` under `And`); the executor's WHERE
+   post-filter treats that vector-valued `Equals` as consumed by the source
+   (result rows carry no `vector` field, so re-applying it dropped every hit).
+3. **Query-vector validation + kernel backstop (release-gating, v0.4.1).** A
+   wrong-dimension or empty query vector reached `assert_eq!` in the distance
+   kernel (`compute_distance_simd`); under `release-server`
+   (`panic = "abort"`) one unauthenticated request killed the server
+   (REST v2 collection search — present in v0.4.0 —, gRPC v2 `Search` /
+   `SearchStream`, AQL `vector` / `memory`, MCP memory, the SQL executor,
+   the legacy entity store and the embedded `vector_search`). Fixed at two
+   layers: (a) `unified_search_v1_inner` — the authority all of these reach —
+   now rejects an empty vector and runs `validate_query_vector_for_search`
+   (finite + dimension) right after resolving the collection, and
+   `unified_search_native` runs the same check for non-empty vectors (empty
+   stays allowed there: analytics entanglement passes `vec![]` to load
+   records). The typed `InvalidQueryVector` error maps to HTTP 400 on REST v2
+   and AQL and `InvalidArgument` on gRPC via `is_client_argument_error`
+   (which also covers `TopKLimitExceeded`). (b) The kernel no longer panics:
+   a length mismatch scores the pair as worst-possible (`+inf` distance,
+   `-inf` dot product) and logs once. The check had to stay in release
+   builds — the SIMD kernels index both slices by `a.len()` inside `unsafe`,
+   so equal length is a memory-safety precondition — and it costs the same
+   single compare the `assert_eq!` did (mismatch path `#[cold]`), so there is
+   no hot-path regression. A `debug_assert` was rejected so debug and release
+   builds behave the same and tests exercise the production path. `GraphFusionService::graph_fusion_search_with_labels`
+   clamps `limit` and `max_seeds` to the cap, and the external-collection hybrid
+   pool saturates its `k * HYBRID_POOL_FACTOR` product. Both clamps use the
+   *configured* cap (`max_top_k()`), not `DEFAULT_MAX_TOP_K` — before the
+   follow-up, an operator override above 10,000 was accepted at the boundary
+   and then silently truncated to 10,000 here. A route whose handler
    maps these to `Internal` (rather than `InvalidArgument`) is capped but
    reports a 500 — the list above names the routes that return 400 because
    the e2e test proves it; untested internal callers are capped, not proven.
-3. **Shared sinks.** `TopKHeap::with_capacity(k)` /
+4. **Shared sinks.** `TopKHeap::with_capacity(k)` /
    `BoundedPriorityQueue::new(k)` pre-allocate only
    `top_k_limit::bounded_prealloc(k)` (≤ 10,000) and grow on demand;
    `pax_rabitq_pool_for_top_k(k, n)` is clamped to the segment's row count
@@ -254,6 +294,46 @@ the shared sinks (no third constant anywhere):
    optimizer's `u16` `top_k` hint is clamped with a warning
    (`optimizer_top_k_hint`) instead of `k as u16` truncating. Results are
    never truncated by any of these layers.
+
+Residual (out of scope, filed here): bare `as u16` narrowing of a `top_k`
+into `SearchParams::top_k: Option<u16>` remains at
+`src/query/federated/execution/mod.rs:637`,
+`src/storage/engines/nova/engine.rs:1224`,
+`src/storage/engines/sst/readers/sst_query_engine.rs:2326/2462/2591/2754`,
+`src/storage/engines/viper/engine.rs:1535/2645` and
+`src/storage/document/storage/cold_tier.rs:287` (`ids.len() as u16`).
+Narrowing can only shrink the value (≤ 65,535), so none of these is an
+allocation risk. On the capped surfaces `top_k` is ≤ the cap, so the engine
+sites (NOVA/SST/VIPER) truncate only if an operator raises the override above
+65,535; the federated SQL vector-search node (`top_k` from the SQL extension
+parse) and the cold-tier id-batch lookup are not `top_k`-capped boundaries, so
+there a value > 65,535 wraps silently — a result-correctness wart, not a
+memory one. Fix by routing through `optimizer_top_k_hint`-style saturating
+clamping when the `u16` field is next touched.
+Residual (non-blocking review findings on the query-vector fix, 2026-10-16;
+none can abort the process — they are error-quality gaps):
+
+* An invalid query vector still returns HTTP 500, not 400, on v1 progressive
+  search, hybrid search (`unified_search_native`), v1/v2 entity search and
+  graph fusion-search: the typed `InvalidQueryVector` reaches those handlers,
+  but they do not map it through `is_client_argument_error`.
+* Client-facing dimension errors name the collection by its internal numeric
+  object id (e.g. `'16'`) rather than the user-facing name, because the
+  validator runs after catalog resolution in `unified_search_v1_inner` /
+  `unified_search_native`.
+* Graph fusion's error ("vector search failed for fusion") hides the
+  dimension cause.
+* AQL consumed-predicate edge case: the executor treats a vector-valued
+  `Equals` on `vector` / `embedding` / `query_vector` as satisfied, so
+  `Not { Equals vector }` drops every row and `Or { Equals vector, X }` is
+  always true. Unrealistic query shapes; noted only.
+
+Also noted (not a defect today): `calculate_pq_distance` in the same kernel
+calls the SIMD kernels directly rather than through `compute_distance_simd`,
+so it does not get the mismatch backstop. Both slices it passes are
+`subvector_dim` long by construction (the centroid slice is bounds-checked),
+so the lengths cannot differ; it should still share the checked entry point
+when next touched.
 
 Evidence:
 
@@ -269,6 +349,15 @@ Evidence:
   Flight `bulk_search`, progressive, hybrid and fusion-search. (The
   `bulk_search` and bypass-route cases were added with the fix or in the
   review pass; pre-fix they served the request like `DoGet`.)
+* Follow-up (2026-10-15): `aql_semantic_match_rejects_over_cap_top_k` in the
+  same e2e file. Before: FAILED — AQL `vector` / `memory` `SEMANTIC_MATCH` with
+  `top_k = 1_000_000` returned HTTP 200. After: HTTP 400 naming
+  `PROXIMADB_SEARCH_MAX_TOP_K`; `top_k = 10_000` is served (memory: `Success`
+  outcome, its 5x recall pool clamped). Unit tests
+  `fusion_clamp_honours_configured_cap_override`,
+  `hybrid_pool_honours_configured_cap_override` (before: a 50,000 override
+  truncated to 10,000 / 50,000) and `recall_pool_stays_within_the_top_k_cap`
+  (before: an at-cap `top_k` built a 50,000 pool that would trip the cap).
 * `bounded_queue` unit tests: before, `TopKHeap::with_capacity(1_000_000)` and
   `BoundedPriorityQueue::new(1_000_000)` reserved 1,000,000 slots; after ≤
   10,000 while `capacity()` stays 1,000,000 and 20,000 pushes are all kept.

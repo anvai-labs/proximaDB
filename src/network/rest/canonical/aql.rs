@@ -65,6 +65,12 @@ async fn execute_aql(
                 audit_trail: trail,
             }))
         }
+        // Client-argument errors (e.g. `top_k` above PROXIMADB_SEARCH_MAX_TOP_K)
+        // are the caller's to fix: 400, not 500.
+        Err(proximadb_kernel::error::ProximaDBError::InvalidInput(msg)) => {
+            info!("AQL query rejected: {}", msg);
+            Err(ApiError::InvalidArgument(msg))
+        }
         Err(e) => {
             error!("AQL execution failed: {}", e);
             Err(ApiError::Internal(e.to_string()))

@@ -9,7 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::query::aql::{
     AqlFrom, AqlPredicate, AqlQuery, AqlResult, AqlSource, AqlValue, AuditContext, AuditFrame,
-    AuditOp, AuditOutcome, AuditTrail, JoinType, Result,
+    AuditOp, AuditOutcome, AuditTrail, JoinType, Result, is_query_vector_field,
 };
 
 use crate::services::audit_sink::{AuditEventSink, AuditRecord, EventLogAuditSink};
@@ -60,18 +60,24 @@ impl AqlExecutor {
             .unwrap_or_default()
             .as_millis() as i64;
 
+        // A client-argument error (`InvalidInput`, e.g. an over-cap `top_k`)
+        // is audited like any failure but then surfaced to the caller, so the
+        // REST route can answer 400 instead of a 200 carrying a `Failure`.
+        let mut client_error = None;
         let (aql_result, outcome) = match result {
             Ok(r) => (r, AuditOutcome::Success),
             Err(e) => {
+                let reason = e.to_string();
+                if let proximadb_kernel::error::ProximaDBError::InvalidInput(msg) = e {
+                    client_error = Some(msg);
+                }
                 // Generate a dummy result for failure case
                 (
                     AqlResult {
                         rows: Vec::new(),
                         frame_id: 0,
                     },
-                    AuditOutcome::Failure {
-                        reason: e.to_string(),
-                    },
+                    AuditOutcome::Failure { reason },
                 )
             }
         };
@@ -92,6 +98,13 @@ impl AqlExecutor {
             tracing::warn!("Failed to persist audit trail: {}", e);
         }
 
+        if let Some(msg) = client_error {
+            // Carry the query id so the caller can fetch the audit trail
+            // (`GET /api/v2/aql/audit/{query_id}`) for the rejected query.
+            return Err(proximadb_kernel::error::ProximaDBError::InvalidInput(
+                format!("{msg} (query_id: {})", trail.query_id),
+            ));
+        }
         Ok((aql_result, trail))
     }
 
@@ -219,6 +232,13 @@ impl AqlExecutor {
 
     fn evaluate_predicate(&self, row: &HashMap<String, AqlValue>, pred: &AqlPredicate) -> bool {
         match pred {
+            // A vector-valued `Equals` on the query-vector fields is the search
+            // input, consumed by the vector / memory source — result rows carry
+            // no such field, so re-applying it as a filter would drop every hit.
+            AqlPredicate::Equals {
+                field,
+                value: AqlValue::Vector(_),
+            } if is_query_vector_field(field) => true,
             AqlPredicate::Equals { field, value } => row.get(field).is_some_and(|v| v == value),
             AqlPredicate::GreaterThan { field, value } => row.get(field).is_some_and(|v| v > value),
             AqlPredicate::LessThan { field, value } => row.get(field).is_some_and(|v| v < value),

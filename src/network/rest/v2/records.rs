@@ -1918,6 +1918,11 @@ pub async fn search_with_typed_filters(
 
             Ok(Json(response))
         }
+        Err(e) if crate::services::operations::vectors::is_client_argument_error(&e) => {
+            // Wrong-dimension / empty / non-finite query vector or over-cap
+            // top_k: the client's argument (TD-SECSCAN-1), not a server fault.
+            Err(ApiError::InvalidArgument(e.to_string()))
+        }
         Err(e) => {
             error!("V2 API: Search failed: {}", e);
             if e.to_string().contains("not found") {

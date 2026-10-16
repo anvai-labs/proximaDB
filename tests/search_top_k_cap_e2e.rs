@@ -513,3 +513,335 @@ async fn every_search_surface_rejects_over_cap_top_k() {
         fusion_at.text().await.unwrap_or_default()
     );
 }
+
+/// `POST /api/v2/aql/execute` body: `FROM <source> WHERE <predicate>`.
+fn aql_body(source: &str, predicate: serde_json::Value) -> serde_json::Value {
+    json!({
+        "query": {
+            "find": { "projections": [] },
+            "from": { "Source": { "name": source, "alias": null } },
+            "where_clause": { "predicate": predicate }
+        }
+    })
+}
+
+fn semantic_match(top_k: u32) -> serde_json::Value {
+    json!({ "SemanticMatch": {
+        "field": "embedding", "query": "", "threshold": 0.0, "top_k": top_k
+    }})
+}
+
+/// Vector source: query vector + `SemanticMatch(top_k)`.
+fn vector_predicate(top_k: u32) -> serde_json::Value {
+    json!({ "And": {
+        "lhs": { "Equals": { "field": "vector", "value": { "Vector": query_vector() } } },
+        "rhs": semantic_match(top_k)
+    }})
+}
+
+/// Agent-memory scope: tenant + query vector + `SemanticMatch(top_k)`.
+fn memory_predicate(top_k: u32) -> serde_json::Value {
+    json!({ "And": {
+        "lhs": { "Equals": { "field": "tenant_id", "value": { "String": "t-secscan1" } } },
+        "rhs": { "And": {
+            "lhs": { "Equals": { "field": "vector", "value": { "Vector": query_vector() } } },
+            "rhs": semantic_match(top_k)
+        }}
+    }})
+}
+
+/// TD-SECSCAN-1 §5 follow-up: AQL `SEMANTIC_MATCH` (the `vector` and `memory`
+/// sources) reaches `VectorOperationsService::unified_search_v1`, which had no
+/// cap. An over-cap `top_k` must be a 400 naming the env override; at-cap is
+/// still served (the memory source's 5x recall oversample is clamped to the
+/// cap rather than tripping it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aql_semantic_match_rejects_over_cap_top_k() {
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+
+    // The AQL `vector` / `memory` sources search the collection named after
+    // the source.
+    for name in ["vector", "memory"] {
+        let create = http
+            .post(format!("{base}/api/v2/collections"))
+            .json(&json!({
+                "name": name, "dimension": DIM, "engine": "sst",
+                "distance_metric": "cosine", "enable_proxima_record": false,
+            }))
+            .send()
+            .await
+            .expect("create");
+        assert!(
+            create.status().is_success(),
+            "create collection {name} failed: {}",
+            create.text().await.unwrap_or_default()
+        );
+        let records: Vec<serde_json::Value> = (0..3)
+            .map(|i| {
+                let mut v = vec![0.0f32; DIM];
+                v[i % DIM] = 1.0;
+                json!({
+                    "id": format!("{name}-{i}"), "vector": v,
+                    "props": { "tenant_id": "t-secscan1" }
+                })
+            })
+            .collect();
+        let insert = http
+            .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+            .json(&json!({ "records": records }))
+            .send()
+            .await
+            .expect("insert");
+        assert!(insert.status().is_success(), "insert into {name} failed");
+    }
+    sleep(Duration::from_millis(300)).await;
+
+    let aql = |body: serde_json::Value| {
+        let http = http.clone();
+        let url = format!("{base}/api/v2/aql/execute");
+        async move {
+            http.post(url)
+                .json(&body)
+                .send()
+                .await
+                .expect("aql execute")
+        }
+    };
+
+    for (source, over, at) in [
+        (
+            "vector",
+            vector_predicate(OVER_CAP_TOP_K),
+            vector_predicate(AT_CAP_TOP_K),
+        ),
+        (
+            "memory",
+            memory_predicate(OVER_CAP_TOP_K),
+            memory_predicate(AT_CAP_TOP_K),
+        ),
+    ] {
+        let resp = aql(aql_body(source, over)).await;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "AQL {source} SEMANTIC_MATCH must reject top_k above the cap: {body}"
+        );
+        assert!(
+            body.contains("PROXIMADB_SEARCH_MAX_TOP_K"),
+            "AQL {source} rejection must name the env override, got: {body}"
+        );
+        assert!(
+            body.contains("query_id"),
+            "AQL {source} rejection must carry the audit query_id, got: {body}"
+        );
+
+        let resp = aql(aql_body(source, at)).await;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "AQL {source} must serve top_k exactly at the cap, got {status}: {body}"
+        );
+        // At-cap runs to completion; for `memory` this also proves its 5x
+        // recall pool is clamped to the cap rather than rejected.
+        assert_eq!(
+            body["audit_trail"]["outcome"],
+            json!("Success"),
+            "AQL {source} at-cap search must succeed: {body}"
+        );
+        // The query-vector predicate is consumed by the source; the executor's
+        // WHERE post-filter must not drop every hit for lacking a `vector` field.
+        let rows = body["result"].as_array().map_or(0, Vec::len);
+        assert!(
+            rows > 0,
+            "AQL {source} correct-dimension search must return rows: {body}"
+        );
+    }
+
+    // A vector-source query without a query vector is a client error (400),
+    // not an empty vector reaching the distance kernel's dimension assert
+    // (which panicked the handler and dropped the connection before the fix).
+    let resp = aql(aql_body("vector", semantic_match(AT_CAP_TOP_K))).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "AQL vector search without a query vector must be a 400: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// AQL vector-source predicate with an explicit query vector.
+fn vector_predicate_with(vector: Vec<f32>, top_k: u32) -> serde_json::Value {
+    json!({ "And": {
+        "lhs": { "Equals": { "field": "vector", "value": { "Vector": vector } } },
+        "rhs": semantic_match(top_k)
+    }})
+}
+
+/// Agent-memory predicate with an explicit (possibly absent) query vector.
+fn memory_predicate_with(vector: Option<Vec<f32>>, top_k: u32) -> serde_json::Value {
+    let tenant = json!({ "Equals": { "field": "tenant_id", "value": { "String": "t-secscan1" } } });
+    match vector {
+        Some(v) => json!({ "And": {
+            "lhs": tenant,
+            "rhs": { "And": {
+                "lhs": { "Equals": { "field": "vector", "value": { "Vector": v } } },
+                "rhs": semantic_match(top_k)
+            }}
+        }}),
+        None => json!({ "And": { "lhs": tenant, "rhs": semantic_match(top_k) } }),
+    }
+}
+
+/// A query vector whose dimension does not match the collection (or is
+/// empty) used to reach `assert_eq!` in the distance kernel. Under the
+/// `release-server` profile (`panic = "abort"`) that killed the server
+/// process; under the test profile it panics the request task and drops the
+/// connection. Every surface must instead answer with a client error, and the
+/// server must keep serving afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_dimension_query_vectors_are_client_errors() {
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+
+    // `vector` / `memory` back the AQL sources; `secscan1_dim` the REST/gRPC cases.
+    for name in ["vector", "memory", "secscan1_dim"] {
+        let create = http
+            .post(format!("{base}/api/v2/collections"))
+            .json(&json!({
+                "name": name, "dimension": DIM, "engine": "sst",
+                "distance_metric": "cosine", "enable_proxima_record": false,
+            }))
+            .send()
+            .await
+            .expect("create");
+        assert!(create.status().is_success(), "create {name} failed");
+        let records: Vec<serde_json::Value> = (0..3)
+            .map(|i| {
+                let mut v = vec![0.0f32; DIM];
+                v[i % DIM] = 1.0;
+                json!({
+                    "id": format!("{name}-{i}"), "vector": v,
+                    "props": { "tenant_id": "t-secscan1" }
+                })
+            })
+            .collect();
+        let insert = http
+            .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+            .json(&json!({ "records": records }))
+            .send()
+            .await
+            .expect("insert");
+        assert!(insert.status().is_success(), "insert into {name} failed");
+    }
+    sleep(Duration::from_millis(300)).await;
+
+    let short = vec![1.0f32; DIM - 1];
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- REST v2 collection search: wrong dimension.
+    let outcome = http
+        .post(format!("{base}/api/v2/collections/secscan1_dim/search"))
+        .json(&json!({ "vector": short, "top_k": 5 }))
+        .send()
+        .await;
+    match outcome {
+        Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST => {}
+        Ok(r) => failures.push(format!("REST v2 wrong-dim: got {}", r.status())),
+        Err(e) => failures.push(format!("REST v2 wrong-dim: connection failed ({e})")),
+    }
+
+    // --- AQL: vector wrong-dim, memory wrong-dim, memory without a vector.
+    let aql_cases = [
+        (
+            "AQL vector wrong-dim",
+            "vector",
+            vector_predicate_with(short.clone(), 5),
+        ),
+        (
+            "AQL memory wrong-dim",
+            "memory",
+            memory_predicate_with(Some(short.clone()), 5),
+        ),
+        (
+            "AQL memory no vector",
+            "memory",
+            memory_predicate_with(None, 5),
+        ),
+    ];
+    for (label, source, predicate) in aql_cases {
+        let outcome = http
+            .post(format!("{base}/api/v2/aql/execute"))
+            .json(&aql_body(source, predicate))
+            .send()
+            .await;
+        match outcome {
+            Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST => {}
+            Ok(r) => {
+                let status = r.status();
+                failures.push(format!(
+                    "{label}: got {status}: {}",
+                    r.text().await.unwrap_or_default()
+                ))
+            }
+            Err(e) => failures.push(format!("{label}: connection failed ({e})")),
+        }
+    }
+
+    // --- gRPC v2 Search: wrong dimension and empty vector.
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    for (label, vector) in [
+        ("gRPC wrong-dim", short.clone()),
+        ("gRPC empty", Vec::new()),
+    ] {
+        let request = TypedSearchRequest {
+            collection_id: "secscan1_dim".to_string(),
+            query_vector: vector,
+            top_k: 5,
+            ..Default::default()
+        };
+        match grpc.search(request).await {
+            Err(status) if status.code() == tonic::Code::InvalidArgument => {}
+            Err(status) => failures.push(format!("{label}: got {status:?}")),
+            Ok(r) => failures.push(format!(
+                "{label}: accepted ({} results)",
+                r.into_inner().results.len()
+            )),
+        }
+    }
+
+    // The server is still alive and serving correct-dimension queries.
+    let alive = http
+        .post(format!("{base}/api/v2/collections/secscan1_dim/search"))
+        .json(&json!({ "vector": query_vector(), "top_k": 5 }))
+        .send()
+        .await;
+    match alive {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => failures.push(format!("follow-up REST search: got {}", r.status())),
+        Err(e) => failures.push(format!("follow-up REST search: server gone ({e})")),
+    }
+    let alive = grpc.search(grpc_search_request("secscan1_dim", 5)).await;
+    if let Err(status) = alive {
+        failures.push(format!("follow-up gRPC search: {status:?}"));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "wrong-dimension / empty query vectors must be client errors:\n  {}",
+        failures.join("\n  ")
+    );
+}

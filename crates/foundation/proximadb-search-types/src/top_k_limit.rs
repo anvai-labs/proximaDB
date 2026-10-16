@@ -59,6 +59,9 @@ impl std::error::Error for TopKLimitExceeded {}
 /// Reject a `top_k` above the server cap. Every search surface (REST, gRPC,
 /// Arrow Flight) calls this at its boundary so clients get an explicit
 /// invalid-argument error instead of a truncated result or an OOM.
+///
+/// `check_top_k` permits `0`: it bounds only the upper end, so each surface
+/// decides for itself whether `top_k == 0` is an error or an empty result.
 pub fn check_top_k(top_k: u64) -> Result<(), TopKLimitExceeded> {
     check_top_k_against(top_k, max_top_k())
 }

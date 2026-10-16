@@ -28,6 +28,13 @@ impl BackendError {
             message: message.into(),
         }
     }
+    /// The caller's arguments are invalid (JSON-RPC `INVALID_PARAMS`).
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: error_code::INVALID_PARAMS,
+            message: message.into(),
+        }
+    }
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             code: error_code::INTERNAL_ERROR,
