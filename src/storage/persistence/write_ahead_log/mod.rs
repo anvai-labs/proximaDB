@@ -142,13 +142,12 @@ pub(crate) fn local_wal_dir(config: &config::WALConfig) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// ADR-069 S1: the env-only local WAL root (`PROXIMADB_WAL_LOCAL_DIR`), for
-/// recovery/replay paths that are free functions without a `WALConfig` handle
-/// (the recovery manager is threaded with a `disk_manager`, not config). Env is
-/// the per-pod override and the highest-precedence source, so for full write
-/// and replay consistency an operator sets the env. Shares the same OnceLock as
-/// [`local_wal_dir`] so the two never disagree when the env is set.
-pub(crate) fn local_wal_dir_env() -> Option<String> {
+/// ADR-069 S1: the env half of [`local_wal_dir`] (`PROXIMADB_WAL_LOCAL_DIR`),
+/// read once per process. Private on purpose (TD-WAL-5): an env-only read on
+/// the replay side, while the write side also honoured the TOML field, lost
+/// acknowledged writes. Every reader — write path AND recovery — must go
+/// through [`local_wal_dir`] with the same `WALConfig`.
+fn local_wal_dir_env() -> Option<String> {
     static ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     ENV.get_or_init(|| {
         std::env::var("PROXIMADB_WAL_LOCAL_DIR")

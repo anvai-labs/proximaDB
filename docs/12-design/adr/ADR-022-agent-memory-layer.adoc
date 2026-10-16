@@ -7,7 +7,10 @@
 
 == Status
 
-Proposed
+Proposed — **partially implemented** (reconciled 2026-10-15): TD-101 (write surface) In Progress,
+TD-102 (mem0/agentmemory adapters) Partial; reference-MCP `event` tool wired to the
+EventLogEngine (#639); shared `AuditEventSink` activates memory audit (`5d6b253bd`). Open:
+TD-MCP-1 (only MCP-1c memory put remains), TD-EVENTLOG-1 (Partial).
 
 Paired HLD: link:../AGENT_MEMORY_LAYER_HLD_2026_05_30.adoc[AGENT_MEMORY_LAYER_HLD_2026_05_30].
 

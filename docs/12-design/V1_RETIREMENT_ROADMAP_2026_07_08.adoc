@@ -2,7 +2,16 @@
 :toc: left
 :toclevels: 2
 :icons: font
-:last-updated: 2026-07-08
+:last-updated: 2026-10-15
+
+[cols="1,1,3", options="header"]
+|===
+| Tier | State (reconciled 2026-10-15) | Evidence
+| Tier 0 — free deletes | **Done (rolling)** | #750 (`TypeSafeFilterEvaluator`); later dead `VectorRecord` carriers (#1508), dead `SstEntry` (#1452).
+| Tier 1 — gateable surfaces | **Done** | REST v1 flipped to 410-by-default (#814, 2026-07-09). Then **removed** entirely: the `v1_sunset` middleware is deleted and `/api/v1/*` answers 404 with the v2 replacement (TD-V1SUNSET-1 RESOLVED 2026-08-29, #1773). The gRPC v1 compat services are deleted (no `enable_grpc_v1_compat` remains). Below, the Tier 1 "remaining cutover" steps 2–3 are history.
+| Tier 2 — deprecated-engine v1 usage | **Partial** | link:../10-quality/td/TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-ENGINE-1]: CHRONO/TITAN removed (#702). SWIFT/RAPTOR/SEQUOIA/CEDAR relocation is open.
+| Tier 3 — internal domain model | **Open (long pole)** | v1-proto ratchet today: **2,681 refs** (src 1,889 · crates 367 · tests 376 · clients 49), down from 2,913. TD-104 root-handler retirement is done (#761), removing the ~141-ref `request_handlers.rs`. `VectorRecord` → `ProximaRecord` (TD-V1SUNSET-2) is scoped but not started. The `SqlValue` bridge and slice 1 are done; the residue is sequenced behind V1SUNSET-2 (TD-V1SUNSET-3).
+|===
 
 [.lead]
 Sequenced retirement of the v1 surface (REST `/api/v1`, gRPC v1, and the v1 proto types

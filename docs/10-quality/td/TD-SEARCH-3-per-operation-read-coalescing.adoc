@@ -1,7 +1,7 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-SEARCH-3: Per-operation PAX reads are fragmented and mis-metered
-:status: In Progress
+:status: Partial
 :dim: D1
 :pillar: PERF
 
@@ -10,7 +10,7 @@
 | Field | Value
 
 | Status
-| **In Progress.** The physical-operation counter and bounded prefix read are
+| **Partial: S1–S5 shipped (physical GET accounting #1649, factory coalescing #1681, prefix read, Region-A coalescer, SST1-probe removal, nprobe multiplier 2.0). Open: the default-OFF exact-plan estimator / Azure 16 MiB cap promotion, paired DRAM/persistent-disk cache validation, and the remaining inefficiencies below.** The physical-operation counter and bounded prefix read are
 implemented. A fixed-bed Azurite wire experiment proves that 24--32 MiB ranges
 reduce physical GETs by 64--65% and that the Azure SDK does not split them.
 The default-OFF exact-plan estimator now passes its exact-current BIGANN 1M
@@ -32,6 +32,9 @@ possible egress concern.
 `src/storage/engines/sst/search/mod.rs`;
 `crates/storage/proximadb-storage-filesystem-types/src/counting.rs`
 
+| Relates to
+| link:TD-IOBUDGET-1-toml-per-location-io-budget.adoc[TD-IOBUDGET-1] (per-location opt-in of the 16 MiB knee); link:TD-IOBUDGET-2-followup-verdicts-chooser-evidence-repair.adoc[TD-IOBUDGET-2] (Verdict 3 refused the Azure 4→16 MiB default raise pending evidence; chooser flip); link:TD-RDSTRAT-8-two-level-ivf-coarse-probe.adoc[TD-RDSTRAT-8]; link:TD-IVF-3-coarse-pca-projection-width-miscalibrated.adoc[TD-IVF-3]
+
 | Trigger
 | The SIFT1M investigation reported 205 GETs/query, but the benchmark and
 counter were not first-principles sound: `read_ranges()` counted one logical
@@ -40,155 +43,41 @@ per element. The original TD also assumed physical adjacencies that do not
 exist in the v3 layout.
 |===
 
-== Cost model: operations and bytes are different axes
+== History (shipped)
 
-For the Azure Blob **flat Blob endpoint** used by active PAX segments, every
-HTTP ranged GET is a read transaction. Hot-tier pricing has no separate
-per-GB *data retrieval* fee, so a 72-byte and a 24-MiB range each contribute
-one read operation. The exact transaction rate is region, redundancy, and
-account dependent; `$0.005/10K` must not be described as a universal Azure
-price.
+*Cost model (still applies).* On the flat Azure Blob endpoint every ranged GET is one read transaction regardless
+of size (Hot tier has no per-GB retrieval fee; the exact rate is region/redundancy dependent — never quote
+`$0.005/10K` as universal), but bytes are not free: NIC/memory bandwidth, tail latency, egress, ProximaDB's own
+scanned-byte KRU, and Cool/Cold retrieval charges. A merge is admissible only when the saved round trip is worth
+its bounded gap over-read. `az`/`azure`/`adls`/`abfs` all resolve to the same flat Blob backend, so path spelling
+cannot select a different range-cost policy.
 
-That does **not** make bytes free:
+*Layout facts (still apply).* The fixed header at byte zero mirrors every region offset including the footer, so
+the first ranged GET discovers the footer without a HEAD + tail seek; the variable footer stays at the tail
+(streaming assembly, mixed readability); both are retained in `SegmentInvariantsCache` and persistent L2, so their
+steady-state GET count is zero. The original TD's adjacency assumptions were wrong: A0 grows with dim and cell
+count and is not generally adjacent to the first probed cell, and a `B+footer` merge would read most of Region D
+(rejected). Selected cell extents may coalesce under `max_gap_bytes`/`max_range_bytes`; logical slices, and so
+recall, are invariant.
 
-* larger ranges consume network/NIC and memory bandwidth and can increase
-  tail latency;
-* cross-region/public transfer can incur bandwidth/egress charges;
-* ProximaDB's own scanned-byte KRU term still meters bytes;
-* Cool/Cold/Archive tiers add data-retrieval charges;
-* hierarchical-namespace/Data Lake endpoints can have different transaction
-  categorization, but ProximaDB does not route to them: `az://`, `azure://`,
-  `adls://`, and `abfs://` are aliases for the same flat Blob backend. Path
-  spelling therefore cannot select a different range-cost policy.
+* *S1 — physical GET accounting (#1649):* `read_ranges` has a plan/execute split; `CountingFileSystem` meters
+  `plan.physical.len()` and records over-read bytes separately (invariant: planned physical reads == counted range
+  operations == leaf `range_gets`, encryption wrapper excepted). *Lesson:* the original 205 GETs/query counted one
+  logical batch even when the default impl issued one physical read per element — a function named `read_ranges`
+  is not evidence of one cloud request. Coalescing moved to the factory where the backend is known (#1681).
+* *S2 — bounded prefix read:* 1 MiB default on a cold invariants miss (`PROXIMADB_PAX_PREFIX_PREFETCH_BYTES=0`
+  kill-switch, clamped to 8 MiB) supplies the header and, when covered, A0 and early cells; never reinterprets bytes.
+* *S3 — selected-range coalescer:* `plan_probe_cell_ranges()` merges only within `ObjectRangeCoalescePolicy`
+  bounds; Region A derives `max_gap = max(target/4, 64 KiB)`, `max_range = target` (Azure 1 MiB / 4 MiB). The
+  4 MiB Azure value is a conservative planner policy, not a billing quantum or a proven SDK split boundary.
+* *S4 — no PAX-as-SST1 magic probe:* two legacy helpers sniffed an 8-byte `SST1` magic per `.pax` file (2 GETs/query
+  on a warm two-segment bed); both now return `None` for `.pax` before any I/O, legacy paths still probe. The
+  expected local-warm 2→0 and object-cold ~42→40 effect was not promoted as evidence pending a release rerun.
+* *S5 — recall before minimizing nprobe:* `ceil(sqrt(30)·1.0) = 6` missed the recall@10 ratchet on the settled
+  SIFT1M segment; the default multiplier is now `2.0` (11 cells at `k_c=30`: recall 0.9822, 15.9 GETs/query on the
+  Azure planner; 0 GETs persistent-local warm).
 
-Therefore a merge is admissible only when the saved round trip is worth its
-bounded gap over-read. Optimizing GET count without a byte cap merely moves
-the cost.
-
-== Actual v3 layout and dependency chain
-
-The persisted order is:
-
-[source,text]
-----
-[fixed header, 72 B]
-[A0 coarse model + cell directory, variable]
-[Region A: RaBitQ header + presence bitmap + cell-major codes]
-[Region B: SQ8 params/codes]
-[optional OID-position resolver]
-[Region D blocks: OIDs, metadata, optional f32 stripes]
-[footer index, variable][footer_len][magic]
-----
-
-The fixed header is at byte zero and mirrors all region offsets, including
-`footer_off/footer_len`. This is deliberate: the reader can discover the
-footer with the first ranged GET and does **not** need an object-store `HEAD`
-plus tail seek.
-
-The footer is variable because it contains the block table, schema/encoding
-map, and optional resolver metadata that are known only after blocks are
-written. Keeping it at the tail preserves streaming assembly and mixed-version
-readability. Moving it beside the header would require a second-pass rewrite
-or a bounded reserved hole and would not eliminate the need for the fixed
-header. Duplicating the entire footer in a prefix would also make format
-evolution and integrity reconciliation harder.
-
-The efficient policy is:
-
-* keep the fixed routing header at byte zero;
-* keep the authoritative variable footer at the tail;
-* retain both in `SegmentInvariantsCache` and persistent L2;
-* populate them from writer-owned bytes only after atomic publication.
-
-Thus header/footer placement is not the steady-state GET problem. A working
-warm tier makes their steady-state object GET count zero.
-
-== Correct adjacency analysis
-
-The prior version made three incorrect assumptions.
-
-. **A0 is not always “a few KB.”** Its exact size is
-  `fixed + 4*dim + 4*ncomp*dim + 4*k*ncomp + 4*k + 72*k + checksum`.
-  It grows with dimension and cell count.
-. **A0 is not generally adjacent to the first selected cell.** Region A has
-  its own header and presence bitmap, and the nearest probed cell may occur
-  after codes for unselected cells. Joining them can require gap over-read.
-. **The footer is not adjacent to the last Region-B survivor range.** The
-  optional resolver and Region-D blocks lie between Region B and the footer.
-  A `B+footer` merge would read most of Region D and is rejected.
-
-Adjacent *selected cell extents* can still be coalesced, and non-adjacent
-extents can be joined when both `max_gap_bytes` and `max_range_bytes` admit the
-over-read. Logical selected slices remain unchanged, so recall is invariant.
-
-== Implemented remediation
-
-=== S1: physical GET accounting
-
-`FileSystem::read_ranges(path, ranges)` now has an explicit plan/execute split
-(#1649). `plan_read_ranges()` converts logical ranges into physical reads plus
-an input-order slice mapping under an optional `RangeCoalescePolicy`; execution
-issues exactly the physical plan and reconstructs the original logical result
-vector. With no policy the plan is the byte-identical identity path.
-
-`CountingFileSystem` delegates policy lookup through its decorator chain and
-meters `plan.physical.len()`, not `ranges.len()`. It separately records
-coalesced over-read bytes so logical bytes returned and physical bytes fetched
-cannot be conflated. The counter remains a prediction from the same plan;
-`io_trace.range_gets` and the Azurite request log are the independent leaf/wire
-measurements required for promotion. The encryption wrapper remains a
-documented exception because it can materialize one encrypted object and slice
-locally.
-
-The invariant is:
-
-[source,text]
-----
-unencrypted current backends with a stable policy:
-planned physical reads == counted range operations == leaf range_gets
-----
-
-A Rust function call named `read_ranges` is still not evidence of one cloud
-request; the physical plan and leaf/wire observations are.
-
-=== S2: bounded prefix read
-
-On a cold invariants miss, the reader now fetches a bounded prefix:
-
-* default: 1 MiB;
-* `PROXIMADB_PAX_PREFIX_PREFETCH_BYTES=0`: kill switch;
-* explicit values are clamped to 8 MiB.
-
-The same byte buffer supplies the fixed header and, when fully covered, A0,
-the RaBitQ control header, and early selected-cell ranges. No bytes are
-reinterpreted: every consumer takes its original exact logical slice.
-
-This speculative prefix is intentionally bounded. If A0 or a selected cell
-does not fit, the reader performs the normal exact ranged read. The expected
-cold saving is workload/layout dependent and must be measured; it is not
-asserted as “one GET per segment” for every segment.
-
-=== S3: existing selected-range coalescer
-
-`plan_probe_cell_ranges()` remains the correct cell-data seam. It sorts extents
-in file order and merges only under `ObjectRangeCoalescePolicy` gap/range
-bounds. It never changes `nprobe`, selected rows, or ranking inputs.
-
-Region A now derives its unset policy from the same backend IOP target as
-Regions B/D: `max_gap = max(target/4, 64 KiB)` and
-`max_range = target`. The Azure profile is therefore a 1 MiB maximum gap and
-4 MiB maximum range; local SSD remains 256 KiB/1 MiB. The two registered env
-mirrors can override either value, including `0` for exact-adjacency/unbounded
-diagnostics.
-
-The 4 MiB Azure value is a **conservative read-planner policy**, not a flat
-Blob billing quantum and not a proven SDK split boundary. The previous source
-comment that described a hard 4 MiB SDK boundary was unsupported and is
-removed. `AzureBlobFileSystem::read_range()` invokes
-`object_store.get_range()` once, but the application counter above that call
-cannot observe an HTTP-client retry or internal split. A wire-boundary
-measurement is therefore required before interpreting application GETs as
-Azure transactions for ranges larger than 4 MiB.
+== Open: range-cap and cell-count evidence for a default promotion
 
 === S3a: isolate range-cap effects before choosing cell count
 
@@ -579,78 +468,6 @@ fresh processes, consistent with the already isolated tie/nondeterminism
 diagnostic rather than range-policy data loss; no paired point lost more than
 the predeclared 0.0005 recall margin. These localhost results establish the
 relative concurrency knee and wire operation shape, not Azure service QPS.
-
-=== S4: remove the redundant PAX-as-SST1 magic probe
-
-The first passing release run after the persistent-tier implementation reported
-exactly 2 physical GETs/query and 16 bytes/query in the local-disk-warm phase
-with exactly 2 PAX segments. The source was not PAX header/footer loading.
-Two generic legacy-SST helpers could perform an 8-byte `SST1` magic probe for
-every discovered file before returning “not a legacy SST” for PAX:
-`load_sst_header_centroid()` during file pruning and
-`segment_vector_count()` during the adaptive exact-route decision. Removing
-the centroid probe reduced the object-cold total, but a release rerun retained
-exactly 2 GETs/query and 16 bytes/query; that isolated the adaptive count probe.
-
-Discovery already classifies current PAX segments by the durable `.pax` suffix,
-and PAX stores its partition model in A0 rather than a legacy SST header.
-Both helpers therefore return `None` for `.pax` before acquiring a filesystem
-or reading bytes. Unknown and legacy paths retain the magic sniff, so
-mixed-format reads are unchanged. Regression tests use a nonexistent `.pax`
-object to prove both PAX branches perform no I/O and a nonexistent `.sst`
-object to prove both fallbacks still probe.
-
-Expected effect for the measured two-segment geometry is local-disk-warm
-2→0 GETs/query and object-cold approximately 42→40. This expectation is not
-promoted as evidence until the release benchmark is rerun.
-
-=== S5: preserve recall before minimizing nprobe
-
-The settled one-segment SIFT1M file has 30 persisted A0 cells. A controlled
-release sweep found that the old geometric default
-`ceil(sqrt(30) * 1.0) = 6` missed the recall@10 ratchet on independent
-1,000-query slices. Raising nprobe while enabling the bounded Azure planner
-showed that recall and operations can both satisfy their gates:
-
-[cols="1,1,1,1,1,1"]
-|===
-| nprobe/profile | Query slice | recall@10 | GET/query | MB/query | p50
-
-| 6, local planner
-| 6000..6999
-| 0.9795
-| 26.69
-| 24.66
-| 23.91 ms
-
-| 7, Azure planner
-| 7000..7999
-| 0.9790
-| 11.00
-| 33.35
-| 26.79 ms
-
-| 11, Azure planner
-| 2000..2999
-| 0.9822
-| 15.90
-| 48.82
-| 36.90 ms
-
-| 11, persistent-local warm
-| 1000..1999
-| 0.9803
-| 0
-| 0
-| 47.72 ms
-|===
-
-These are diagnostic sweeps over the immutable acceptance segment, not the
-final post-change evidence run. They justify changing the default multiplier
-to `2.0` (11 cells at `k_c=30`) while preserving the canonical
-`recall@10 >= 0.98` ratchet. The byte increase is explicit: Azure Hot read-op
-COGS falls with fewer operations, but scanned bytes and latency remain
-separate constraints.
 
 == Cell-count / nprobe scale matrix
 

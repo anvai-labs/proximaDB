@@ -5,39 +5,22 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 1. First slice implemented: native table provider, default-OFF behind `PROXIMADB_NATIVE_TABLE_PROVIDER`.
+| Status | **Partial: first slice shipped (2026-09-21, #1917) — a native table provider registers non-Parquet relational tables with DataFusion, default-OFF behind `PROXIMADB_NATIVE_TABLE_PROVIDER`; TD-USUB-3 rides the same gate (#1919). Open: the default-ON flip (with the gate OFF — the default — a bare window function on a native table still returns a silently wrong answer, pinned KNOWN-BAD), an explicit typed decline for tables with no registered provider, and the evidence gate below.**
 | Priority | **HIGH — escalated during implementation.** Not only a usability cliff: on the native path a bare window function returns a **silently wrong answer**, not an error. See "Escalation".
 | Component | `src/query/execution/native_table_provider.rs` (new), `src/network/postgres/relational_pipeline.rs`, `src/query/execution/datafusion_engine.rs`, `src/query/compute_scheduler.rs`
-| Relates to | ADR-094 (Phase 1, defect **b**), **TD-187** (the same defect, fixed only for materialized tables), ADR-039 (leakage ratchet — lane discipline), TD-USUB-3 (the identity-derived sibling), TD-USUB-5, TD-USUB-9 (route-stamp integrity)
+| Relates to | ADR-094 (Phase 1, defect **b**), link:TD-USUB-3-abac-silently-removes-sql-capability.adoc[TD-USUB-3] (shares the gate), **TD-187** (the same defect, fixed only for materialized tables), ADR-039 (leakage ratchet — lane discipline), TD-USUB-3 (the identity-derived sibling), TD-USUB-5, TD-USUB-9 (route-stamp integrity)
 | Blocked by | Nothing. **This is not a storage-format problem** and does not wait on the format work.
 |===
 
-== The finding
+== History (shipped)
 
-`allow_engine_sql_fallback = true` appears at **exactly one call site**:
-`src/network/postgres/relational_pipeline.rs:1336`, the DataFusion floor. It is defined at
-`src/query/execution/engine.rs:196-199` as an escape hatch for SQL-dialect gaps and defaults
-to `false` everywhere else.
+* Finding: `allow_engine_sql_fallback = true` appeared at exactly one call site (the DataFusion floor in `relational_pipeline.rs`), so the whole `classify_unsupported` set (subquery, having, join, group_by, distinct, window) plus `DISTINCT ON`, `GROUP BY ALL`, `NATURAL JOIN`/`USING`, correlated scalar subqueries, `EXISTS`/`IN (SELECT)`, UDTFs and FROM-less `SELECT` — and a second tier `logical_lowering.rs` declines (semi/anti join without `ON`, null-aware anti join, `SUM`/`AVG(DISTINCT)`, `StringAgg`, `||`) — was reachable only on `parquet_backed` tables, i.e. after `ALTER TABLE … MATERIALIZE`. The CTE decline even named the workaround.
+* **Lesson — not a storage problem.** Parquet was incidental: it was merely the only format with a registered table provider. The cliff closes by registering a provider through the existing ADR-039-legal `ProximaTableProvider` seam, with zero format change, zero publication, zero write amplification.
+* Shipped: `src/query/execution/native_table_provider.rs`, gate `PROXIMADB_NATIVE_TABLE_PROVIDER` (registered in `ENV_GATE_REGISTRY`, OFF). With it ON, window functions on native tables return real values. E2E: `tests/native_table_capability_parity_e2e.rs`.
 
-Because `ctx.sql` (`src/query/execution/datafusion_engine.rs:249`) is the fallback for every
-shape the shared relational frontend declines, the entire `classify_unsupported` set —
-subquery, having, join, group_by, distinct, **window** — plus `DISTINCT ON`, `GROUP BY ALL`,
-`ORDER BY ALL`, `NATURAL JOIN`/`USING`, correlated scalar subqueries, `EXISTS`/`IN (SELECT)`,
-table-valued functions and `SELECT` without `FROM` is reachable **only on the DataFusion
-route**. That route requires `parquet_backed`, which per
-`catalog_table_is_parquet_backed` (`relational_pipeline.rs:2064-2085`) means the table was
-explicitly `ALTER TABLE … MATERIALIZE`'d.
+== Open
 
-A second tier behaves identically: shapes the frontend accepts but
-`src/datafusion/logical_lowering.rs` declines — semi/anti join without `ON` (`:261`),
-null-aware anti join (`:272`), `SUM`/`AVG(DISTINCT)` (`:379`/`:386`), `StringAgg` (`:392`),
-`||` concat (`:611`) — are served on Parquet-backed tables and hard-error otherwise.
-
-The user-visible artifact is the CTE decline, which names the workaround outright:
-*"WITH (CTE) queries require every referenced table to be materialized (ALTER TABLE …
-MATERIALIZE) so the DataFusion route can serve them."*
-
-== Escalation — it is a silent-wrong-answer bug, not just a capability gap
+=== Escalation — it is a silent-wrong-answer bug, not just a capability gap
 
 Measured during implementation (`tests/native_table_capability_parity_e2e.rs`), against a
 **native** table holding `val = 5, 20, 12, 40`:
@@ -65,21 +48,7 @@ The behaviour is pinned **KNOWN-BAD** in the e2e for the gate-OFF path (ADR-040 
 that when the legacy path is repaired or the gate flips default-ON, the assertion trips and
 the pin is removed deliberately rather than by accident.
 
-== Why this is not a storage problem
-
-Parquet is **incidental**. It is merely the only format with a **registered table provider**
-on the relational path. The seam already exists and is ADR-039-legal:
-
-* `impl TableProvider for SstTableProvider` — `src/datafusion/engine_adapters/sst_adapter.rs:280`
-* `impl ProximaTableProvider for SstTableProvider` — `:345`
-
-`PaxTableProvider` (`engine_adapters/pax_table_provider.rs:39`) and `register_pax_location`
-also exist but are referenced only from tests.
-
-So the cliff closes by **registering a provider for non-Parquet relational tables**, with
-**zero format change, zero publication and zero write amplification**.
-
-== How to apply
+=== How to apply
 
 . Register a table provider for relational tables regardless of physical format, reusing the
   existing `ProximaTableProvider` seam (do **not** add a new adapter — ADR-039 confines
@@ -93,7 +62,7 @@ So the cliff closes by **registering a provider for non-Parquet relational table
 
 Ship default-OFF behind an `ENV_GATE_REGISTRY`-registered gate.
 
-== Evidence gate (mandate #6)
+=== Evidence gate (mandate #6)
 
 * A conformance test asserting the **same SQL surface** on a non-materialized table and a
   materialized one — CTE, window function, join, correlated subquery, `EXISTS`, `DISTINCT ON`.

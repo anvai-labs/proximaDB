@@ -3,7 +3,7 @@
 :toclevels: 3
 :sectnums:
 
-Status: Proposed (design) +
+Status: **Partial (reconciled 2026-10-15)** — strategy steps 1–2 shipped. The spec is `utoipa`-emitted with a CI drift gate (`make verify-openapi-spec`). Spec-driven REST transports are generated for Python (`_generated/rest`, sync + async), Go (`clients/go/codegen`), TypeScript (`clients/nodejs-embedded/src/generated`) and Rust (`clients/rust/src/genrest.rs`), each with a `<lang>-sdk-codegen-drift` gate. **Open:** step 3 (Python package modularization — `chunking`/`embeddings`/`integrations` still ship inside `proximadb_sdk`) and step 5 (`buf`-ify gRPC codegen). Engineering mandate #15 now codifies step 2. +
 Date: 2026-06-21 +
 Owner: SDK / API surface +
 Tracking: TD-126
@@ -27,7 +27,7 @@ spec↔client boundary, not within one hand-rolled layer.
 == Current state (grounded, 2026-06-21)
 
 * *9 SDK variants*: `go`, `jvm`/`java`, `nodejs`, `python`, `rust`, plus four `*-embedded`.
-* *OpenAPI spec exists but is hand-maintained*: `docs/openapi/proximadb-openapi.yaml`, OpenAPI 3.1,
+* *(historical, superseded by step 1)* *OpenAPI spec exists but is hand-maintained*: `docs/openapi/proximadb-openapi.yaml`, OpenAPI 3.1,
   v2-first, 37 operations, ~1709 LOC. Used for *contract testing*, not *generation*. No
   `openapi-generator` config in the repo.
 * *gRPC stubs are generated* (protoc / `tonic-prost-build`); the SDK wraps them by hand.

@@ -26,8 +26,10 @@ the route-health diagnostic endpoint `GET /api/v2/_diagnostics/collections/:id/r
 
 Search-side limits in v0.2:
 
-* `top_k` is capped at **10000** by default (override via env var
-  `PROXIMADB_MAX_SEARCH_TOP_K`). Requests above the cap return HTTP 400.
+* `top_k` is capped at **10000** by default on EVERY search surface (REST,
+  gRPC, Arrow Flight, pgwire), not REST alone. Override via env var
+  `PROXIMADB_SEARCH_MAX_TOP_K`. Requests above the cap are rejected
+  (HTTP 400 / `INVALID_ARGUMENT`).
 
 See link:../SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`] "Not Supported
 in v0.2" for the full list and TD pointers.

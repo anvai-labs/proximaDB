@@ -5,30 +5,13 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export into existing crate (NO new crate)
+| Status | **Done (2026-08-07).** Moved the AES-256-GCM encryption key store (11 tests) into the existing `proximadb-security` crate (#1521).
 | Component | `crates/horizontal/proximadb-security`; root `src/security/encryption/mod.rs`
-| Relates to | [[TD-DECOMP-1]] (recipe)
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe)
 |===
 
-== Why
+== History
 
-`src/security/encryption/key_store.rs` (**11 tests**) is the encryption key store (ring AES-256-GCM
-key management: `KeyStore`, `KeyInfo`, `KeyStoreConfig`, `KeyStoreError`). Clean leaf: zero `crate::`
-climb-out, deps anyhow/chrono/ring/serde/thiserror. Moves into the **existing** `proximadb-security`
-crate (the natural home — already has anyhow/chrono/serde; ring + thiserror added). No new crate.
-
-== What moved (behavior-neutral)
-
-* `src/security/encryption/key_store.rs` → `crates/horizontal/proximadb-security/src/key_store.rs`.
-* Root `src/security/encryption/mod.rs`: `pub mod key_store;` → `pub use proximadb_security::key_store;`.
-* Security crate gains ring + thiserror deps. Root Cargo.toml **unchanged** (root already depends on
-  proximadb-security). **Zero root Cargo.tomlo changes** — simplest extraction yet.
-* No `CAPABILITY_MATRIX.toml` pointer.
-
-== Follow-ups
-
-* **Running total once merged: ~981 tests out of root** (970 + 11).
-* Standalone crate `--all-targets` compiled in ~11s with `RUSTC_WRAPPER=sccache`.
-* Pattern: extracting into an EXISTING crate (no new crate, no root Cargo.tomlo changes) is the lowest-
-  effort extraction when the module fits an existing crate's deps + semantics.
+* Pattern: extracting into an EXISTING crate (no new crate, no root `Cargo.toml` change) is the
+  lowest-effort move when the module fits that crate's deps and semantics; it also avoids stacked-PR
+  manifest conflicts. Later slices (48, 49, 51, 53, 55, 65, 69+) used it.

@@ -5,66 +5,49 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Resolved (this filing).** COPY and the three DML gates now resolve one tenant through `PostgresProtocol::write_tenant_for_session`.
+| Status | **Partial: COPY and the three DML primary-pod gates resolve one tenant through `PostgresProtocol::write_tenant_for_session`, COPY is tenant-scoped, insert-only and no longer reports false success (#2036, 2026-10-15); open: insert-only residuals, extended-protocol COPY, COPY into pgwire-created tables (relational bulk load), gate call-site and Arrow-forgery test coverage.**
 | Priority | **MEDIUM**. Both are parity defects, not cross-tenant breaches, under today's wiring (see *Severity, measured against the code*). The wider tenancy gap they sit inside is TD-PGWIRE-VECTENANT-1.
 | Component | `src/network/postgres/protocol.rs`: `execute_copy`, `receive_copy_data` and the four `process_*_copy_data` fns; the DML gate sites in `execute_insert`/`update`/`delete_via_dml_service`; `write_tenant_for_session`.
-| Relates to | TD-064 (pgwire tenant scoping, relational), TD-PGWIRE-AUTH-1, TD-PGWIRE-VECTENANT-1 (opened alongside), cluster Slice 6.3 (primary-pod write router).
+| Relates to | TD-064 (pgwire tenant scoping, relational), link:TD-PGWIRE-AUTH-1-scram-auth.adoc[TD-PGWIRE-AUTH-1], link:TD-PGWIRE-VECTENANT-1-pgwire-vector-collections-outside-tenant-boundary.adoc[TD-PGWIRE-VECTENANT-1] (opened alongside), cluster Slice 6.3 (primary-pod write router).
 | Found | 2026-10-15, evidence-bounded platform review (dimension H)
 |===
 
-== Defect 1: the DML primary-pod gate checked a different tenant from the one the write ran as
+== History (shipped, #2036)
 
-At all three DML sites the primary-pod gate resolved the tenant via `pgwire_resolve_tenant_id()`. That function read only the legacy `proximadb.write.tenant_id` session variable and otherwise fell back to `DEFAULT_TENANT`.
+*Defect 1 — the DML primary-pod gate checked a different tenant from the one the write ran as.* The gate used
+the legacy `proximadb.write.tenant_id` session variable (else `DEFAULT_TENANT`) while the write used the startup
+`database` first, so `database=acme` was routed as `default` and written as `acme`. Fix: each DML site resolves
+`write_tenant` once, before the gate, via the pure `write_tenant_for_session` (startup `database` → session
+variable → `DEFAULT_TENANT`); every pgwire read, write, gate and COPY now resolves through it. gRPC v2, REST v2
+and Arrow Flight were checked and already consistent.
 
-The write itself runs as `pgwire_resolve_write_tenant()`, which puts the startup `database` (the TD-064 catalog/tenant boundary) first. So a client connected with `database=acme` and no session variable was routed as `default` and written as `acme`. A primary-pod binding for `acme/<table>` could never misroute it, and a binding for `default/<table>` could misroute it wrongly.
+*Defect 2 — COPY used the unscoped insert and had no gate.* `COPY … FROM STDIN` (vector-collection bulk ingest,
+rows `id,<vector>`) called `insert_batch`: no tenant stamping (an Arrow payload could **forge** another tenant's
+`tenant_id`), no `validate_tenant_collection_access`, no gate. Fix: `execute_copy` gates on `write_tenant`
+**before** `CopyInResponse`, and all four format processors share `copy_insert` →
+`insert_records_only_with_tenant_context`; `ensure_tenant_on_records` rejects a forged tenant.
 
-gRPC v2, REST v2 and Arrow Flight already gate and write with one tenant value; they were checked and are consistent.
+Behaviour changes (stated): **insert-only is preserved** (the first revision upserted, so re-running `\copy`
+silently overwrote rows — caught in adversarial review); **no false success** (`success == false` now errors
+instead of `COPY n`); batches are validated (dimension, non-finite, duplicate ids); COPY rows are stamped with the
+write tenant, so tenant-filtered scans hide them from other tenants (psql always sends a `database`).
 
-*Fix:* each DML site resolves `write_tenant` **once**, before the gate, and uses that value for both the gate and the TD-064 `tenant_scope`. Precedence is now a pure function, `PostgresProtocol::write_tenant_for_session`: startup `database`, then the session variable, then `DEFAULT_TENANT`. Today every pgwire read, write, gate and COPY resolves through it via the call graph (`pgwire_resolve_write_tenant` → `pgwire_resolve_read_tenant` → `write_tenant_for_session`). No test pins the gate *call sites* themselves; see Verification.
+Lesson: the first-pass *Critical* (cross-tenant write) rating was refuted by tracing: production wires no
+`TenantManager`, and pgwire `CREATE TABLE … VECTOR(n)` creates collections with no tenant owner, so COPY could not
+reach another tenant's collection any more than INSERT could. The real exposure is TD-PGWIRE-VECTENANT-1.
 
-== Defect 2: COPY used the unscoped insert and had no gate
+Evidence: `protocol_tests.rs` resolver tests (`pgwire_gate_uses_startup_database_tenant`,
+`pgwire_gate_tenant_matches_write_scope_tenant`, `pgwire_gate_falls_back_to_session_var_without_database`);
+`tests/pgwire_td064_write_tenant_isolation_e2e.rs::pgwire_copy_from_stdin_ingests_vector_rows`, the first
+over-the-wire COPY test (re-COPY of an existing id and a duplicate-id payload are both rejected; both assertions
+fail against the upsert revision). Run with `RUST_MIN_STACK=8388608` (TD-STACK-1 class at the 2 MiB debug stack).
 
-`COPY … FROM STDIN` is pgwire's bulk ingest for **vector** collections; its rows are `id,<vector>`. All four format processors (arrow, csv, text, binary) called `VectorOperationsService::insert_batch`. Compared with the `insert_batch_with_tenant_context` that every other write surface uses, that path:
+== Open: verification gaps
 
-* did not stamp `tenant_id` onto the ingested records, and did not check a client-supplied one. An Arrow COPY payload can carry a `tenant_id` column (the arrow codec reads it into `record.tenant_id`), so a client could **forge another tenant's id** on its rows. `ensure_tenant_on_records` now rejects a mismatch;
-* skipped `validate_tenant_collection_access`;
-* never consulted the primary-pod gate.
-
-(Its precision-schema check is moot for COPY. All four decoders build `EmbeddingValues::Fp32` only, so that check can never fire on this path.)
-
-*Fix:* `execute_copy` resolves `write_tenant` and gates on it **before** sending `CopyInResponse`, so a misrouted client never streams its payload. It then threads one `TenantContext` through `receive_copy_data` into one shared helper, `copy_insert`, which all four processors call. That helper calls `insert_records_only_with_tenant_context`.
-
-=== Behaviour changes, stated
-
-* **Insert-only is preserved.** COPY's previous `insert_batch` used the WAL insert-only guard: duplicate ids within the payload, or ids that already exist, are rejected. The *first* revision of this fix switched to `insert_batch_with_tenant_context`, which upserts. Re-running a `\copy` would then silently overwrite rows, and adversarial review caught it. `insert_records_only_with_tenant_context` is the tenant-scoped insert-only equivalent: it checks duplicates within the payload and existing ids under a per-collection lock.
-* **COPY no longer reports false success.** All four processors used to match `Ok(_) => Ok(count)` and ignore `BatchOperationResult.success`. A rejected write, such as a WAL back-pressure or an insert conflict, came back as `COPY n` with nothing written. `copy_insert` now turns `success == false` into an error carrying the result's error code and messages.
-* **COPY now validates the batch.** The tenant-context insert runs `validate_records_for_insert`: dimension, non-finite values and duplicate ids. A COPY whose vectors don't match the collection's dimension is now **rejected**. By code reading, develop's `insert_batch` performed no dimension check on this path, so it would have accepted the batch; this was not reproduced by running develop.
-* **Visibility follows the tenant.** COPY rows are now stamped with the connection's write tenant, as INSERT rows are under TD-064. Tenant-filtered scans hide them from other non-empty tenant contexts, where unstamped rows used to be visible to all. Note that `psql` always sends a `database`, which defaults to the user name, so every psql COPY now stamps that name.
-
-== Severity, measured against the code
-
-The first-pass review rated defect 2 *Critical* (a cross-tenant write). Tracing the code refuted that:
-
-* Production never wires a `TenantManager` into the service context. Every `TenantManager::new()` is in tests or in an isolated crate. So the tenant branch of `validate_tenant_collection_access` does not run in production, and the scoped and unscoped inserts resolve a collection **by name** in the same way.
-* pgwire `CREATE TABLE … VECTOR(n)` creates the collection with **no tenant owner**: `collection_port.create_collection(config, None)`.
-
-So COPY could not reach another tenant's collection any more than an INSERT could. The real exposure is wider: the whole pgwire vector/document/graph surface sits outside the TD-064 boundary. That is filed as TD-PGWIRE-VECTENANT-1, because it is a catalog-design change, not a patch to COPY.
-
-== Verification
-
-* `protocol_tests.rs` covers the **resolver**:
-** `pgwire_gate_uses_startup_database_tenant`
-** `pgwire_gate_tenant_matches_write_scope_tenant`
-** `pgwire_gate_falls_back_to_session_var_without_database`
-** All 8 pgwire gate tests pass. These pin the precedence function only. Reverting a gate *call site* to the session-var tenant would not fail them, because no in-process harness wires a primary-pod gate. That remains a known coverage gap.
-* `tests/pgwire_td064_write_tenant_isolation_e2e.rs::pgwire_copy_from_stdin_ingests_vector_rows` is the **first end-to-end COPY test over the wire**. It uses a raw simple-protocol client, the path `psql \copy` uses, against a REST-created dim-3 collection:
-** `COPY 2` succeeds, the unparseable row is skipped, and both rows are readable;
-** **re-COPYing an existing id is rejected and leaves the stored vector unchanged;**
-** **a payload with a duplicate id is rejected and writes none of its rows.**
-** The two insert-only assertions were checked by running them against the first revision's upsert path, where they fail. So they pin the behaviour; they are not decoration.
-* Tenant stamping and Arrow forgery rejection are **not pinned end to end**. REST record reads do not expose `tenant_id`, and no Arrow-payload COPY test exists. They are covered by code path (`ensure_tenant_on_records`) only.
-* The existing `pgwire_relational_writes_and_reads_are_tenant_isolated` still passes.
-* Run with `RUST_MIN_STACK=8388608`, which is what CI's integration jobs use. At the default 2 MiB debug stack the in-process server overflows (TD-STACK-1 class).
+* The resolver tests pin the precedence function only. Reverting a gate *call site* to the session-var tenant
+  would not fail them, because no in-process harness wires a primary-pod gate.
+* Tenant stamping and Arrow forgery rejection are **not pinned end to end**. REST record reads do not expose
+  `tenant_id`, and no Arrow-payload COPY test exists. They are covered by code path (`ensure_tenant_on_records`) only.
 
 == Known residuals of the insert-only path (review round 2; shared with REST insert-only)
 

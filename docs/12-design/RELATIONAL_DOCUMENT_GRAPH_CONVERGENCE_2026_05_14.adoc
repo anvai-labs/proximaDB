@@ -3,7 +3,7 @@
 :toclevels: 3
 :sectnums:
 
-Status: Accepted architectural mandate +
+Status: Accepted architectural mandate — **implementation Partial (reconciled 2026-10-15)**: Phases 0–6 done; Phase 7 has three open items (see "Phase 7"). +
 Date: 2026-05-14 +
 Scope: vector, document, graph, relational, observability, SKS/entity, event log, multi-model query lowering, indexing, durability, and agent guidance
 
@@ -1024,273 +1024,45 @@ accepted ADR explicitly creates a new canonical store.
 
 == Migration Phases And Trackable Tasks
 
-=== Phase 0: Architectural Freeze And Inventory
+=== Phases 0–6 — History (shipped)
 
-Goal: prevent further divergence while the codebase is converging.
+All tasks in Phases 0–6 are checked. The full task-by-task record is in this file's git history
+(before 2026-10-15). What now exists:
 
-Tasks:
+* **Phase 0 (freeze + inventory):** this mandate is required agent reading. Every pre-convergence
+  durable path was inventoried and filed: TD-065 (DocumentService map), TD-066 (ORION WAL as parallel
+  truth), TD-067 (projection keys), TD-068 (QUASAR). TITAN adjacency was retired into
+  `src/graph/adjacency_projection.rs`.
+* **Phase 1 (contracts):** `RecordStore`, document/graph ↔ `ProximaRecord` mapping helpers, and
+  the `TopologyProjection` and `DocumentProjection` traits (epoch-based freshness).
+* **Phase 2 (document rebase):** CRUD and query route through canonical records behind
+  `canonical-document-store`, now a default feature. Document WAL entries are canonical record
+  operations replayed via `replay_record_recovery_operations`. JSON-path and full-text indexes are
+  rebuildable projections keyed by canonical `oid`. CEDAR reports `authority_role=rebuildable_projection`.
+* **Phase 3 (graph rebase):** canonical node/edge records, `edges_by_src`/`edges_by_dst`
+  adjacency projections, and transactional commits writing canonical records. ORION CSR is rebuilt
+  from adjacency and used only when its rebuild epoch is fresh; stale CSR falls back to adjacency, so
+  write-heavy paths never force a rebuild. The ORION WAL was demoted to a compatibility recovery
+  buffer; see link:TD_066_PART2_LSN_CORRELATION_DESIGN_2026_05_28.adoc[TD-066 Part 2].
+* **Phase 4 (planner unification):** `DocumentFilter` and Cypher/traversal lower to the shared
+  `FilterExpression`/`PatternMatch`/`HybridTraverse` algebra. Access-path cost rules exist for
+  adjacency vs CSR, JSON-path index vs scan, FTS vs scan, and columnar variation vs payload.
+  `push_rls_predicates` ANDs tenant/principal predicates into every `Scan`/`VectorTopK`. One
+  cross-protocol result envelope (`_id/_model/_score/<payload>`). Storage-authority metadata flows
+  through `PlanContext.resolved_objects` into EXPLAIN.
+* **Phase 5 (durability/CDC):** one `CanonicalWalEntry` shape (`RecordUpsert`, `RecordDelete`,
+  `Checkpoint`, `CdcBarrier`) carries `ProjectionDirective`s, so recovery rebuilds document indexes,
+  adjacency and CSR from the log. CDC events carry the canonical record plus derived document/graph
+  views.
+* **Phase 6 (validation + retirement):** WAL/recovery Criterion benches. CSR auto-materialize
+  thresholds: < 10k nodes adjacency only; ≥ 100k always CSR; in between, ≥ 5 reads/min and ≤ 10
+  writes/min; rebuild skipped under 300 s epoch age. PULSAR and QUASAR retired.
+  `SUPPORTED_SURFACES.adoc` separates API support from projection status. *Residual noted at the
+  time:* graph insert/k-hop/PageRank benches "in subsequent sprints". `benches/bench_graph_adjacency_vs_csr.rs`
+  now exists; confirm it covers k-hop/PageRank before closing.
 
-* [x] Mark this document as a required reference in `AGENTS.md`, `CLAUDE.md`, and `GEMINI.md`.
-** `CLAUDE.md` Relational/Document/Graph Convergence Mandate section already references this doc and requires it to be read into context before any change touching records, storage, document, graph, vector, observability, query lowering, indexing, catalog, WAL/recovery, or workspace boundaries.
-* [x] Add PR checklist language: document/graph durable changes must state whether they touch canonical records or only projections.
-** `CLAUDE.md` "Document / Graph Durability Checklist" section added with 5 checklist items enforced at PR review time.
-* [x] Inventory all direct writes to `DocumentService.documents`, `CedarEngine.collections`, ORION CSR, ORION snapshots, and TITAN adjacency maps.
-** `DocumentService.documents` (RwLock<HashMap>): ~20 direct write sites at `src/storage/document/service.rs:257–1971` — tracked as **TD-065**.
-** `DocumentService.collections`: ~8 write sites at `service.rs:333–1621` — same TD-065 scope.
-** ORION WAL/snapshot: `OrionPersistence::save_snapshot()` (`src/graph/engines/orion/persistence.rs:233`) + `GraphOperationsService::flush_wal()` dispatching to engine WALs — tracked as **TD-066**.
-** ORION CSR: rebuilt through `OrionGraphEngine::rebuild_csr_from_edges()` from adjacency projection — already canonical-projection-backed (Phase 3 complete). Not an independent durable authority.
-** TITAN adjacency maps: retired May 2026 — authority consolidated in `src/graph/adjacency_projection.rs`.
-** CEDAR: `CedarEngine` used as an optional canonical `RecordStore` adapter in tests — no independent WAL path.
-* [x] Inventory all tests that assume document or graph storage is independently durable.
-** Document service tests (inline `#[cfg(test)]` in `service.rs`) exercise the legacy in-memory path directly. These tests must be extended with canonical-store variants — tracked as part of **TD-065**.
-** Graph persistence tests in `src/graph/engines/orion/persistence.rs` serialize and reload `OrionSnapshot` — these assume ORION snapshot is the sole durable authority, tracked as part of **TD-066**.
-* [x] Create TD items in `docs/10-quality/TECHNICAL_DEBT.adoc` for any unavoidable temporary duplicate persistence.
-** TD-065: Document Service in-memory map as temporary durable source (P5, HIGH).
-** TD-066: ORION WAL as parallel durable graph truth (P5, HIGH).
-** TD-067: Projection keys use facade document ID instead of canonical OID (P6, MEDIUM).
-** TD-068: QUASAR cold-tier path has no canonical record binding (P6, MEDIUM).
-
-Acceptance:
-
-* New agent guidance points here.
-* A code owner can identify every current source-of-truth path for documents, nodes, and edges.
-
-=== Phase 1: Contract Convergence
-
-Goal: define interfaces that separate logical service semantics from durable storage.
-
-Tasks:
-
-* [x] Introduce or refine a canonical `RecordStore`/`RelationalRecordStore` contract around `ProximaRecord` operations.
-* [x] Define document mapping helpers: `DocumentRecord <-> ProximaRecord`.
-* [x] Define graph mapping helpers: `Node/Edge <-> ProximaRecord`.
-** [x] Canonical graph records carry graph id, labels, properties, RLS fields, version/time fields, and provenance through the shared `ProximaRecord` envelope.
-* [x] Define `TopologyProjection` trait for adjacency/CSR projections.
-** [x] Topology projection contracts expose canonical edge application, full rebuild, directional adjacency entries, and epoch-based freshness checks.
-* [x] Define `DocumentProjection` trait for JSON path, array, full-text, and columnar variation projections.
-* [x] Update `DocumentStorageOperations` docs to state it is facade-facing, not a separate persistence mandate.
-* [x] Update graph engine docs to state ORION CSR is a topology projection/cache when used with durable graph storage.
-
-Acceptance:
-
-* Facades can be tested against an in-memory canonical record store.
-* No new code requires CEDAR/ORION as the only durable store.
-
-=== Phase 2: Document Rebase Onto Canonical Records
-
-Goal: make document storage use canonical records for durable CRUD.
-
-Tasks:
-
-* [x] Route `DocumentService.insert_document` through the canonical record store behind a feature flag (`canonical-document-store`).
-* [x] Route `get_document`, `update_document`, `delete_document`, and `query_documents` through canonical records.
-** [x] Add canonical `get_document` read-through when a `RecordStore` is injected.
-** [x] Add canonical `delete_document` path when a `RecordStore` is injected.
-** [x] Add canonical `update_document` path when a `RecordStore` is injected.
-** [x] Add canonical `query_documents` path when a scan-capable `RecordStorage` is injected.
-* [x] Make document WAL entries encode canonical record operations when canonical document storage is active.
-** [x] Add canonical document upsert/delete WAL variants carrying `ProximaRecord` / canonical record id.
-** [x] Replay canonical document WAL entries into legacy hot projections during migration.
-** [x] Extract document WAL ownership fully into shared canonical record-store recovery.
-*** [x] `proximadb-records` exposes `RecordRecoveryOperation` plus `replay_record_recovery_operations`; canonical document WAL replay now routes recovered upserts/deletes through that shared record-store hook before document facade projections are used.
-*** [x] Feature-gated restart tests verify canonical document WAL upserts and deletes recover into a fresh canonical record store.
-* [x] Convert JSON path index maintenance into a rebuildable projection over canonical records.
-* [x] Convert full-text index maintenance into a rebuildable projection over canonical records.
-** [x] Add `IndexManager` canonical-record projection entry points for JSON path, array, and full-text indexes.
-** [x] Route canonical `DocumentService` insert/update/delete projection maintenance through those entry points.
-** [x] Switch projection keys from facade document id to canonical record oid after query executor supports record-id candidate sets.
-*** [x] Canonical `IndexManager` projection entry points now key JSON path, array, and full-text entries by `ProximaRecord::oid`.
-*** [x] Document query candidate filtering accepts both legacy facade ids and canonical record oid candidates during migration; feature-gated tests cover indexed query and delete projection cleanup.
-* [x] Decide CEDAR fate:
-** [x] access-method/projection over canonical records.
-** [x] implement canonical `RecordStore`/`RecordScan` adapter for CEDAR while keeping its document memtables as compatibility projection state.
-** [x] remove any future CEDAR plan that would add independent durable WAL/recovery semantics.
-*** [x] `CedarEngine` reports `authority_role=rebuildable_projection`, `durable_authority=canonical_record_store`, and `wal_role=none`; flush/compact are explicit no-op projection hooks and tests assert they do not claim durable writes.
-* [x] Add parity tests: old `DocumentService` behavior vs canonical record-backed behavior.
-** [x] Cover insert/get/update/query/delete parity for the feature-gated canonical CEDAR-backed path.
-
-Acceptance:
-
-* Document API behavior is unchanged.
-* Durable state is canonical records, not the `DocumentService` map.
-* Indexes can be dropped and rebuilt from canonical records.
-
-=== Phase 3: Graph Rebase Onto Edge Tables
-
-Goal: make graph nodes/edges durable as canonical records/tables while keeping traversal performance.
-
-Tasks:
-
-* [x] Define canonical node and edge schemas with graph id, labels, properties, RLS fields, version/time fields, and provenance.
-* [x] Implement adjacency table projections: `edges_by_src` and `edges_by_dst`.
-** [x] Define deterministic `edges_by_src` and `edges_by_dst` projection keys/entries over canonical edge records.
-** [x] Add root in-memory adjacency projection store over canonical edge records.
-** [x] Wire the root adjacency projection store into graph edge create/update/delete and batch-create service paths.
-** [x] Route graph edge reads through adjacency projection when the query is endpoint-bound.
-* [x] Route graph insert/update/delete through canonical node/edge records.
-** [x] Add optional canonical `RecordStore` injection for graph services.
-** [x] Upsert/delete canonical node and edge records from graph node/edge service paths when a record store is injected.
-** [x] Wire batch_create_nodes and batch_create_nodes_with_strategy to upsert canonical records.
-** [x] Wire transactional node/edge paths (commit_transaction) to write canonical records at commit time.
-*** [x] `GraphStore` implements the transactional graph write adapter and `TransactionalMultiModelFacade`/`TransactionalMultiModalFacade` auto-register graph participants from configured graph stores, so committed staged nodes/edges flow through `GraphService` and its canonical record-store hooks.
-** [x] Make canonical graph record storage the default durable path and demote ORION WAL to compatibility projection recovery.
-*** `GraphOperationsService::flush_wal()` now writes a `CanonicalOperation::Checkpoint(SnapshotManifest)` to the canonical WAL *before* flushing the engine-specific WAL (`src/graph/service.rs`).
-*** The checkpoint LSN is derived from the edge-mutation epoch counter, giving canonical recovery a stable replay boundary.
-*** The ORION projection WAL is retained as a compatibility projection recovery buffer only; it is not the durable authority.
-*** Full canonical WAL persistence to disk is tracked as **TD-066** (the in-process checkpoint log is wired; the disk-write path follows when the canonical WAL storage layer is fully integrated).
-* [x] Make ORION CSR load/build from edge records or adjacency projections.
-** `OrionGraphEngine::rebuild_csr_from_edges(&[Arc<Edge>])` clears and rebuilds all CSR state in one batch pass.
-** `GraphOperationsService::rebuild_orion_csr_from_adjacency_projection(graph_id)` snapshots `edges_by_src` from the in-memory adjacency projection, strips OID prefixes, and calls `rebuild_csr_from_edges`.
-** Test `orion_csr_rebuild_from_adjacency_projection` verifies end-to-end: insert edges → rebuild CSR → query via `get_outgoing_targets`.
-* [x] Add invalidation/epoch semantics for CSR when edge records change.
-** [x] Define `TopologyEpoch` and freshness state in the graph modality projection contract.
-** [x] Connect canonical edge mutations to ORION CSR epoch invalidation.
-*** CSR consumers call `service.edge_epoch(graph_id)` to snapshot freshness before building CSR.
-*** When epoch is stale, call `service.rebuild_orion_csr_from_adjacency_projection(graph_id)` to refresh.
-* [x] Add write-heavy path that uses adjacency indexes without forcing CSR rebuild.
-* [x] Add read-heavy path that uses CSR when projection freshness and workload justify it.
-** `GraphOperationsService` records the edge epoch applied to each ORION CSR rebuild.
-** Endpoint-bound `query_edges` uses CSR only when it was explicitly rebuilt and its rebuild epoch is fresh relative to the canonical edge epoch.
-** Edge mutations advance the canonical edge epoch; stale or missing CSR falls back to adjacency projection, preserving the write-heavy path without forcing CSR rebuild.
-** Test `endpoint_bound_query_uses_fresh_csr_and_falls_back_when_stale` verifies fresh CSR candidates and stale fallback through the public query path.
-* [x] Treat TITAN as either a projection/access method or retire it as duplicate adjacency ownership.
-** `TitanGraphEngine` retired (May 2026): its DashMap adjacency lists duplicated `InMemoryGraphAdjacencyProjection`.
-** `TitanEngine` kept as a factory-registration stub only; module comment prohibits independent durable graph authority.
-** Adjacency projection authority consolidated in `src/graph/adjacency_projection.rs`.
-
-Acceptance:
-
-* Graph nodes/edges survive without ORION snapshots as the only durable source.
-* CSR can be rebuilt from edge records.
-* Traversal tests pass through both adjacency-table and CSR-backed paths.
-
-=== Phase 4: Query Planner Unification
-
-Goal: ensure SQL, document query, Cypher, PGQ-style patterns, and UQL lower to the same algebra and storage contracts.
-
-Tasks:
-
-* [x] Lower `DocumentFilter` to shared filter algebra.
-** Implemented `document_filter_to_filter_expression()` in `crates/query/proximadb-query/src/document_adapter.rs`.
-** Bridges proto `DocumentFilter` (conditions/or_filters/and_filters) to `FilterExpression` (Comparison/And/Or) from `proximadb-filter-expression`.
-** `DocFilterOperator` → `ComparisonOperator` mapping: Eq→Equals, In→In, Contains/Fulltext→Contains, Regex→Like, Exists→IsNotNull.
-** 5 tests covering: single eq, multiple conditions→And, or_filters→Or, Exists→IsNotNull, empty→None.
-* [x] Lower graph pattern queries to `PatternMatch`/`HybridTraverse`.
-** `cypher_query_to_operators(query, graph_name)` in `graph_adapter.rs`: MATCH clauses → `Scan + PatternMatch`; inline WHERE → `Filter`; RETURN → `Project/Sort/Limit`.
-** `graph_traversal_expr_to_operators(expr)`: traversal expressions → `Scan + HybridTraverse` with `EdgePattern{edge_type, min_hops, max_hops, direction}`.
-** `where_clause_to_filter_expression(clause)`: Cypher WHERE (Property/And/Or/Not) → `FilterExpression`; property constraints mapped to `ComparisonOperator`.
-** 7 new tests in `graph_adapter::tests`; all 16 graph-adapter tests pass.
-* [x] Add cost rules:
-** [x] adjacency index vs CSR projection: `graph_traversal_access_path(epoch_age, write_rate, fan_out)` — CSR when fresh+read-heavy, AdjacencyTable otherwise.
-** [x] JSON path index vs row scan: `document_filter_access_path(has_index, selectivity, n)` — index when `index_cost < scan_cost`.
-** [x] full-text index vs row scan: `fulltext_access_path(has_index, term_selectivity, n)` — FTS only when selectivity < 50%; high-frequency terms fall back to CanonicalScan.
-** [x] columnar variation projection vs JSON payload scan: `variation_projection_access_path(has_columnar, projected, total, doc_size)` — columnar when projecting < 50% of fields.
-** `AccessPath` enum and `AccessPathCostEstimate` struct in `optimizer_support.rs`; `AccessPathCostEstimate::reason` surfaces choice rationale in EXPLAIN output.
-** 12 cost-rule tests added; all 18 optimizer_support tests pass.
-* [x] Ensure engine-level RLS predicates are pushed into every scan/projection.
-** `RlsContext { tenant_id, permitted_principals }` in `lowering.rs`.
-** `build_rls_filter(ctx)` builds `FilterExpression` for `tenant_id = v` AND/OR `permitted_principals IN [...]`.
-** `push_rls_predicates(plan, ctx)` ANDs the RLS filter into every `Scan.filter` and `VectorTopK.predicate` at planning time (no post-hoc application-layer filtering).
-** 7 tests: empty ctx is noop, non-Scan operators untouched, tenant+principals→And, existing filters preserved via And.
-** Per spec §8: tenant/principal context is pushed into scan iterators. `tenant_id` and
-   `permitted_principals` may be materialized as internal fields for mixed-tenant physical storage,
-   but dedicated-tenant tables/segments may enforce the same predicate from catalog/segment metadata.
-* [x] Align REST/gRPC/Arrow Flight/PostgreSQL wire behavior for document and graph result shapes.
-** `UnifiedRecord::to_canonical_envelope()` in `results.rs` produces a stable `{ _id, _model, _score, <payload_key> }` shape for all modalities.
-** `payload_key_for(model)` assigns `_data` for documents, `_node` for graph, `_vector` for vector, `_row` for relational — consumers can rely on these keys without branching on `_model`.
-** `normalize_document_result_shape()` hoists and strips inner `_id`/`id`/`_model`/`_score` fields from the `_data` payload so the envelope `_id` is the single authoritative identity.
-** `normalize_graph_result_shape()` normalises the `_node` sub-object: `labels` always an array, `properties` always an object (debug-string payloads become `{}`), `id` always present (falls back to envelope `_id`).
-** 14 tests covering: standard fields present, score null/present, metadata included, graph uses `_node` key, document strips duplicate ids, labels string→array, debug-string properties→empty object, structured properties preserved, missing node key, cross-model envelope key parity.
-** All 151 `proximadb-query` tests pass.
-* [x] Move storage authority metadata from endpoint-only EXPLAIN into planner-native context.
-** `PlanContext.resolved_objects` carries xCatalog-resolved authority, physical layout, projection freshness/lossiness, external policy boundary, and fallback behavior through lowering/optimization.
-** `UnifiedQueryRouter::context_for_statement()` resolves cataloged UQL `SELECT`, join, `EXPLAIN`, and multimodal sources through `CatalogManager` before lowering; missing metadata is non-fatal and leaves execution on the default context.
-** `StorageAuthorityExplanation::from_plan_context()` converts resolved planner context into EXPLAIN metadata so endpoint handlers can consume shared plan context instead of duplicating catalog lookups.
-** `UnifiedQueryPortImpl::explain_unified_query()` now enriches port-backed `/api/v1/sql/explain` and `/api/v1/unified/explain` JSON with `storage_authority` by resolving catalog targets into `PlanContext.resolved_objects`.
-** `query::authority_context` centralizes xCatalog-to-`ResolvedObjectContext` conversion so router and port-backed EXPLAIN paths share one interpretation of external authority, projection rebuildability, policy boundary, and fallback behavior.
-** Legacy root REST SQL/unified EXPLAIN helpers also use `query::authority_context` and `StorageAuthorityExplanation::from_plan_context()`, eliminating direct schema-to-EXPLAIN conversion from protocol handlers.
-** The planner contract remains anchored on canonical `ProximaRecord`/`ProximaType` authority. External tables and specialized formats are visible as cataloged authority/layout/projection metadata, not as hidden durable engines.
-
-Acceptance:
-
-* The planner can explain why a query used canonical scan, path index, adjacency table, or CSR.
-* Cross-model joins no longer depend on modality-specific persistence quirks.
-
-=== Phase 5: Durability, Recovery, And CDC Consolidation
-
-Goal: eliminate separate recovery semantics for document and graph.
-
-Tasks:
-
-* [x] Define canonical WAL entries for document/node/edge writes.
-** `CanonicalWalEntry` / `CanonicalOperation` in `crates/storage/proximadb-storage-common/src/wal_entry.rs`.
-** `RecordUpsert { collection_id, record: ProximaRecord, projections: Vec<ProjectionDirective> }` is the single WAL shape for document inserts, graph node writes, graph edge writes, vector writes, and observability writes.
-** `RecordDelete { collection_id, oid, projections }` covers all modality deletes.
-** `Checkpoint(SnapshotManifest)` and `CdcBarrier { barrier_sequence, events }` round out the four operation kinds.
-* [x] Make document WAL replay rebuild document projections, not document-only truth.
-** `ProjectionDirective::DocumentJsonPathIndex` and `ProjectionDirective::FullTextIndex` travel alongside every document `RecordUpsert`.
-** `recover_from_canonical_wal` fires `ProjectionRebuilder::apply_directive` for each directive, so recovery rebuilds JSON path and FTS indexes from the canonical log rather than depending on a separate `DocumentRecord` durable truth.
-** Test `recovery_replays_upserts_and_fires_directives` and `projection_corruption_repaired_by_full_replay_from_zero` verify this.
-* [x] Make graph WAL replay rebuild adjacency/CSR projections, not graph-only truth.
-** `ProjectionDirective::AdjacencyTableRow { graph_id, node_oid, edge_refs }` rebuilds per-node adjacency rows.
-** `ProjectionDirective::CsrRebuild { graph_id }` marks CSR stale for background re-materialisation; the constraint from `graph_adapter.rs` (CSR used only when `epoch_age_secs < MAX_STALE_SECS`) governs when it is consulted.
-** Tests `crash_recovery_graph_adjacency_directives_all_fired` and `recovery_replays_deletes_with_no_record` verify the adjacency rebuild path.
-* [x] Ensure snapshots/checkpoints capture canonical records plus projection metadata.
-** `SnapshotManifest { sequence_number, collection_ids, projection_freshness: Vec<ProjectionFreshness> }` is the checkpoint payload.
-** `ProjectionFreshness { projection_name, last_rebuilt_lsn, stale }` lets recovery skip projections already up-to-date.
-** `latest_checkpoint(entries)` finds the highest-LSN checkpoint; callers pass its `sequence_number` as `start_after_lsn` to replay only subsequent entries.
-** Tests `latest_checkpoint_finds_highest_lsn_checkpoint` and `crash_recovery_resumes_from_checkpoint_lsn` verify this.
-* [x] Ensure CDC streams publish canonical record changes with document/graph logical views as derived event forms.
-** `CdcRecordEvent { event_id, sequence_number, collection_id, operation: CdcOperation, record_after: Option<ProximaRecord>, logical_views: Vec<CdcLogicalView> }`.
-** `CdcLogicalView::DocumentChange`, `GraphNodeChange`, `GraphEdgeChange` carry pre-computed modality views so CDC subscribers receive the canonical record plus the logical shapes they care about.
-** Tests `cdc_event_carries_logical_views` and `cdc_delete_event_has_no_record_after` verify this.
-* [x] Add crash/recovery tests for document indexes, graph adjacency tables, and CSR rebuilds.
-** 17 tests in `wal_entry::tests` cover: upsert/delete replay, directive firing and error counting, LSN-scoped resume from checkpoint, graph adjacency + CSR directive replay, and full-log corruption repair from LSN 0.
-** All 55 `proximadb-storage-common` tests pass.
-
-Acceptance:
-
-* A recovery run reconstructs documents, nodes, edges, indexes, and CSR from canonical logs/records.
-* Projection corruption can be repaired by rebuild without losing data.
-
-=== Phase 6: Performance Validation And Retirement
-
-Goal: decide which specialized physical projections remain and remove redundant durable paths.
-
-Tasks:
-
-* [x] Benchmark document CRUD, JSON path filters, full-text, and aggregation before/after canonical rebase.
-** Criterion benchmark harness added: `crates/storage/proximadb-storage-common/benches/wal_throughput.rs`.
-** Four benchmark groups: `wal_entry_construction` (0/1/3/6 directives), `wal_entry_serde` (JSON serialize/deserialize), `recovery_throughput` (100/1 k/10 k entries, with and without checkpoint-scoped replay), `latest_checkpoint_scan` (1 k/10 k/100 k entries).
-** Baseline numbers captured by running `cargo bench -p proximadb-storage-common`; threshold criteria in `SUPPORTED_SURFACES.adoc`.
-* [x] Benchmark graph insert, neighbor lookup, path expansion, PageRank/centrality, and mixed read/write workloads for adjacency tables vs CSR.
-** Cost rules for adjacency vs CSR (`optimizer_support::graph_traversal_access_path`) codified with measured thresholds: MAX_STALE_SECS=300, MAX_WRITE_RATE=10/min.
-** CSR traversal speedup estimated at 1.5× (low degree <5), 3.5× (degree 5–20), 8.0× (degree ≥20) based on cache-line locality.
-** Graph benchmark workloads (insert, k-hop, PageRank) will be added to `benches/` in subsequent sprints once live engine integration is wired to the canonical WAL layer.
-* [x] Set thresholds for auto-materializing CSR by graph size, update rate, degree distribution, and query repetition.
-** `csr_auto_materialize_decision(input: &CsrMaterializationInput)` in `optimizer_support.rs`.
-** Thresholds (all evidence-informed, overridable via future statistics pipeline):
-*** Graphs < 10 k nodes → adjacency table sufficient, no CSR.
-*** Graphs ≥ 100 k nodes → always materialise CSR.
-*** 10 k–100 k nodes → materialise when query load ≥ 5 reads/min and write rate ≤ 10/min.
-*** Skip rebuild when epoch age < 300 s (CSR still fresh).
-** 8 new tests; all 159 `proximadb-query` tests pass.
-* [x] Remove or demote duplicate durable document/graph engines that fail to justify their maintenance cost.
-** `SUPPORTED_SURFACES.adoc` marks retirement outcomes:
-*** Legacy `DocumentRecord` durable path → compatibility-only; new writes must use `UpsertCanonicalDocumentRecord`.
-*** QUASAR tiered graph engine → retired; cold-tier value moves to xCatalog/storage projection policy.
-*** PULSAR distributed graph engine → retired; sharding/coordinator value moves to the relational distributed substrate.
-** Retirement checklist completed for PULSAR/QUASAR: surface doc update, feature removal, route removal, code removal, and test removal.
-* [x] Update `SUPPORTED_SURFACES.adoc` and docs to distinguish API support from physical projection status.
-** `docs/12-design/SUPPORTED_SURFACES.adoc` created.
-** Covers Document, Graph, Vector, Observability surfaces across REST/gRPC/Arrow Flight/pgwire.
-** Per-projection status table: Retained (durable authority), Retained (rebuildable), Compatibility-only, Experimental/demotion candidate, Retirement candidate.
-** Benchmark evidence table with threshold criteria (≥2× speedup, ≤1000-read amortization, ≤5% P99 write regression).
-
-Acceptance:
-
-* Retained projections have workload-specific benchmarks.
-* Deprecated durable paths have removal plans or compatibility wrappers.
+*Lesson that still applies:* a facade's in-memory map *looks* like a cache but was the durable
+truth. Inventory every write site before claiming a modality is projection-backed.
 
 === Phase 7: Protocol And Relational Surface Convergence
 
@@ -1303,63 +1075,25 @@ Operational HLD/LLD trackers for this phase:
 
 Tasks:
 
-* [x] Route SQL `INSERT` lowering through xCatalog row validation and canonical record construction.
-** `CatalogRow::validate` validates required columns, unknown columns, nullability, and type compatibility before storage.
-** `CatalogRow::to_proxima_record` projects validated rows to `ProximaRecord` with `ProximaValue` props and vector embeddings.
-** `CatalogRow::to_mutation_record` projects insert/upsert/update/delete intent into mutation-shaped canonical records.
-** SQL DML insert paths build canonical records from `CatalogTableSchema` instead of treating `SqlValue` as the internal durable representation.
-* [x] Introduce a SQL-facing canonical table-record write boundary.
-** `TableRecordStore` is the service-layer contract for cataloged `ProximaRecord` mutations from SQL/pgwire and other facades.
-** DML chooses the active writer from xCatalog workload/storage specialization metadata so old vector/LSM-specialized tables and new PAX/relational tables can coexist during migration.
-** `VectorOpsTableRecordStore` is a temporary compatibility adapter only; `VectorOps` must not be the semantic owner of relational row DML.
-** Prior-version closure for `UPDATE`/`UPSERT` belongs in the table-record writer/WAL mutation layer, not in vector-specific operation code.
-* [x] Add the first SQL table-to-table write planning boundary over the canonical table-record model.
-** `INSERT INTO ... SELECT` and `INSERT OVERWRITE ... SELECT` now lower into syntax-level `CopyIntoPlan` values and then pass through catalog-aware `DmlWritePlanner` validation plus `TableWriteRouter` route selection.
-** `TableWriteExecutor` is the routed execution boundary for native/DataFusion/open-table commits; the first implementation is planned-only so pgwire/DML can depend on the stable contract before concrete scan/write paths land.
-** `NativeTableWriteExecutor` commits canonical `ProximaRecord` batches from `TableRecordSourceReader` through `TableRecordStore`; source scan adapters remain the next implementation step.
-** `CREATE TABLE AS SELECT` and `MERGE INTO` must reuse the same plan/request/router contracts instead of adding protocol-specific shortcuts.
-** DataFusion is the default Rust SQL/Arrow execution substrate for scans, joins, aggregates, external reads, and distributed execution. ProximaDB owns catalog, policy, WAL, snapshots, record mutation, vector/graph/document operators, and write commits.
-** Polars is an optional local/pseudo-distributed dataframe backend for compatible batch transforms. DuckDB is an optional compatibility/interop engine. Neither owns ProximaDB internal semantics.
-** The initial rule router chooses native, DataFusion local/distributed, or external-engine delegation from xCatalog authority, workload, format, policy boundary, and write mode; statistics-backed CBO will add Polars/DuckDB and richer cost inputs.
-** The router follows a PostgreSQL-like path-then-plan split and a MariaDB-like engine/access-method cost hook model, extended with ProximaDB guards for open-table commits, distributed execution, RLS, MVCC, vector indexes, graph topology, projection freshness, and branch/snapshot retention.
-* [x] Add catalog-backed Arrow relational schemas.
-** `relational_schema_from_catalog(&CatalogTableSchema)` derives Arrow fields from xCatalog `CatalogDataType` and nullability.
-** The Arrow multimodal facade re-exports document, graph, observability, relational, and catalog-backed schema builders through one stable module path.
-* [x] Move catalog-aware Arrow bulk write preparation to canonical records.
-** `CatalogBulkWriteService::prepare_bulk_write` validates/infer-checks the Arrow schema through xCatalog and returns `Vec<ProximaRecord>`.
-** `BulkWriteRouter::should_use_direct_write_records` estimates rich canonical record batches without downcasting to legacy `VectorRecord`.
-* [x] Keep vector-only WAL/search compatibility paths from becoming new authority.
-** WAL/search migration work should use `ProximaRecord` as the canonical in-memory/storage envelope and leave `VectorRecord` only at v1 compatibility edges.
-* [x] Add Arrow Flight `GetSchema` catalog resolution for relational/table descriptors.
-** `ProximaFlightService::catalog_arrow_schema_for_descriptor` resolves relational/table descriptors through xCatalog and returns `relational_schema_from_catalog`.
-** Vector collection descriptors still fall back to `ArrowProtoCodec::create_vector_schema`.
-* [x] Wire server composition to inject the shared xCatalog manager into every `ProximaFlightService` instance.
-** `SharedServices` now owns the shared `CatalogManager`; REST app state, standalone Arrow Flight servers, and unified-mode internal Flight services receive that same manager.
-* [x] Wire live Arrow Flight DoPut/DoExchange relational/table ingestion through `CatalogBulkWriteService` so the catalog-validated `ProximaRecord` preparation path is exercised by the protocol handler.
-** DoPut and DoExchange now detect relational/table/sql descriptors, prepare Arrow batches through catalog-aware bulk validation, and preserve vector descriptors as compatibility fallback paths.
-** Preserve large-batch behavior by using canonical-record routing decisions, not vector-count-only heuristics.
+*Shipped (history):* SQL `INSERT` validates through `CatalogRow` and builds canonical records. A
+SQL-facing `TableRecordStore` boundary exists; `VectorOpsTableRecordStore` is a compatibility
+adapter only. `INSERT … SELECT` / `INSERT OVERWRITE … SELECT` lower to `CopyIntoPlan` →
+`DmlWritePlanner` → `TableWriteRouter` → `TableWriteExecutor`, with DataFusion as the default Rust
+SQL/Arrow substrate and Polars/DuckDB optional. Other shipped pieces:
+
+* catalog-backed Arrow schemas (`relational_schema_from_catalog`);
+* `CatalogBulkWriteService` producing `Vec<ProximaRecord>`;
+* Flight `GetSchema` catalog resolution;
+* a shared `CatalogManager` injected into every Flight service;
+* Flight DoPut/DoExchange relational ingestion through catalog validation.
+
+The detailed sub-bullets are in this file's git history and in
+link:RELATIONAL_PGWIRE_DML_COMPUTE_BLUEPRINT_2026_05_20.adoc[the pgwire/DML blueprint] (T0–T3).
+
 * [ ] Replace remaining REST/gRPC/embedded insert and streaming shims with v2 `ProximaRecord`/`ProximaValue` contracts below protocol compatibility adapters.
 ** Legacy v1 `VectorRecord`, metadata maps, `SqlValue`, and `SqlObject` may remain only as adapter inputs/outputs until the v1 compatibility surface is retired.
 ** Direction: do not maintain dual write APIs. Build the record-native v2 implementation as the only target, keep v1 names only as migration aliases, then remove old v1 vector-shaped routes/clients and promote/rename the record-native API as the stable v1 surface.
-** [x] Centralize v1 `VectorRecord` -> `ProximaRecord` defaulting/conversion in the proto compatibility adapter and route REST batch, service-level v1 batch, and gRPC streaming ingestion through that canonical adapter.
-** [x] Replace Python REST SDK insert payload construction with the record batch shape; `insert_records` posts to the v2 record endpoint and `insert_vector` / `insert_vectors` are temporary aliases over that path rather than `/api/v1/vectors/batch` writers.
-** [x] Replace Python REST SDK delete aliases with the v2 record delete endpoint; SDK writes no longer call `/api/v1/vectors/batch`.
-** [x] Keep SDK adapters as transport adapters only. Their canonical write contract is now `insert_records` / `upsert_records` typed around `ProximaRecord` or record-shaped dictionaries; `VectorRecord` appears only on vector-named compatibility aliases.
-** [x] Make the Python unified client expose native `insert_records` / `upsert_records` and route `insert_vectors` / `upsert_vectors` through those record methods instead of calling adapter vector writers directly.
-** [x] Generate Python v2 `ProximaRecordService` gRPC stubs and wire Python sync gRPC `insert_records` / `upsert_records` to `InsertRecords` / `UpsertRecords` instead of lowering through the v1 vector RPC.
-** [x] Replace the Python embedded HTTP wrapper's `_insert_vectors` v1 batch writer with `_insert_records` targeting `/api/v2/collections/{collection}/records/batch`; `_insert_vectors` is now only a compatibility alias.
-** [x] Add Python batching `batch_insert_records` as the native helper, export it through the SDK, and make `batch_insert_vectors` delegate to it as a compatibility alias.
-** [x] Convert the Python `InsertBuilder` to store and build record-shaped dictionaries natively; vector-named builder methods now populate records and `build_vectors` is a compatibility shim.
-** [x] Add Python chunking `create_records`, `prepare_records`, and `chunk_and_embed_records` helpers that return record-shaped dictionaries; vector-named chunking helpers now wrap those native functions for compatibility.
-** [x] Convert common Python optional integration write paths (LangChain, LlamaIndex, Haystack, CrewAI, AutoGen, Agentic IO) to build record-shaped payloads and call `insert_records` when available, with vector writes only as compatibility fallback.
-** [x] Convert remaining Python optional integration write paths for Victor, Victor multi-model indexing, dual-use embeddings, and agentic store vector memory to record-shaped payloads and `insert_records`.
-** [x] Convert Python embedded multi-model code indexing vector writes to record-shaped payloads and `insert_records`.
-** [x] Add record-native write methods to the legacy Python unified client facade and make its vector insert/upsert prefer `insert_records` / `upsert_records` before compatibility fallback.
-** [x] Convert Python CLI and code-knowledge indexing write helpers to build record-shaped payloads and call `insert_records` / `insert_records`-capable collections.
-** [x] Convert Python `client_v1` insert compatibility to use the record batch API; REST posts to `/api/v2/collections/{collection}/records/batch` and gRPC uses generated v2 record stubs when available.
-** [x] Convert Rust SDK insert builders to send `ProximaRecord` batches to `/api/v2/collections/{collection}/records/batch`; `VectorRecord` is now a deprecated compatibility alias.
-** [x] Convert Node embedded insert builders to send record batches to `/api/v2/collections/{collection}/records/batch`; `VectorRecord` is now a deprecated alias over `ProximaRecord`.
-** [x] Convert Go REST adapter inserts/upserts to send canonical record batches to `/api/v2/collections/{collection}/records/batch`; public `ProximaRecord` is available while `VectorRecord` remains compatibility input.
+** [x] *(shipped, summarized)* The v1 `VectorRecord` → `ProximaRecord` conversion is centralized in the proto compatibility adapter. REST batch, service-level v1 batch and gRPC streaming ingestion route through it. Every SDK writer posts `ProximaRecord` batches to `/api/v2/collections/{collection}/records/batch` or the v2 gRPC `InsertRecords`/`UpsertRecords`. That covers the Python REST/gRPC/unified/embedded/batching/builder/chunking/CLI/`client_v1` paths, all optional Python framework integrations, and the Rust, Node-embedded and Go adapters. `VectorRecord` remains only as deprecated compatibility aliases. /api/v1 itself was removed (TD-V1SUNSET-1, #1773); see link:V1_RETIREMENT_ROADMAP_2026_07_08.adoc[v1 retirement roadmap] Tier 3 for the remaining internal `VectorRecord` usage.
 * [ ] Add pandas/numpy/Arrow embedded normalization tests that prove dict/object, DataFrame, ndarray/vector, graph, document, and observability inputs normalize to xCatalog-validated canonical records.
 ** [x] Add embedded Python `ProximaRecord` normalization helpers and coverage for mapping/dict, NumPy matrix, pandas DataFrame, pyarrow Table, document, graph node, and observability event inputs.
 ** [x] Add embedded Python `insert_records` / `upsert_records` helpers that accept the modern record shape and route through the normalizer before reaching the current native batch boundary.
@@ -1449,4 +1183,3 @@ mandate as authority and adds layer-specific implementation detail.
 * SQL:2023 SQL/PGQ property graph queries
 * Jindal, Madden, Deshpande, Stonebraker: Vertexica
 * SQLgraph: relational-based property graph store
-nal-based property graph store

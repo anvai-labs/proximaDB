@@ -9,6 +9,13 @@
 
 Accepted
 
+Reconciliation (2026-10-15): implemented in a **diverged shape** in
+`src/core/search/filter_contract.rs` (`NormalizedFilter`, `FilterSelectivityPolicy`,
+`MemoryCandidateSet`, `CandidateMaskSet` — the packed bitmask added by ADR-021) and
+`src/core/search/hybrid/builder.rs`; recall-band bench `benches/filtered_ann_recall_bands.rs`.
+The `NormalizedFilterExpr` enum and File Plan paths below are historical; ANN filter-mode routing
+is governed by ADR-011.
+
 == Context
 
 Filters in ProximaDB are represented by at least 4 separate type systems:

@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | In Progress — slice 1 landed in #746 (2026-07-07): `PoolCapMode { Truncate, Error }` + `FusionStats.pool_cap_exceeded` on the canonical `Fuser`, and `PROXIMADB_FUSION_POOL_CAP` wired into the live `graph_fusion_search` path (default-off). Re-scoped from the original framing earlier the same day (see below).
+| Status | **Partial: slice 1 shipped (#746); open: fail-loud propagation in remaining callers, `pool_cap` wiring into `fuse_optimized` + `ResultFuser`, per-path tests; default-ON flip gated on a recall benchmark.** Slice 1 (2026-07-07): `PoolCapMode { Truncate, Error }` + `FusionStats.pool_cap_exceeded` on the canonical `Fuser`, and `PROXIMADB_FUSION_POOL_CAP` wired into the live `graph_fusion_search` path (default-off). Re-scoped from the original framing earlier the same day (see below).
 | Severity | Medium-High (robustness / reliability — wide fan-out buffers the full source union in RAM before the output trim)
 | Component | Cross-modal fusion. **Canonical (v2) core:** `src/core/search/cross_modal_fusion.rs` (`Fuser`, `FusionPolicy.pool_cap`) + `src/services/fusion_service.rs` (`fuse_optimized`, entity-orchestrator) + `crates/query/proximadb-query/src/fusion.rs` (`ResultFuser`). **Deprecated v1 (do NOT harden — retire):** `src/core/search/hybrid/fusion.rs` (`HybridFusionEngine`) reached via `execute_hybrid_search` on `proximadb_v1::HybridSearchRequest`. Resource-control contract mirrored from `src/query/execution/engine.rs` (`ExecutionControls`, `RowLimitMode`, `cap_plan`).
 | Governs | link:../../12-design/adr/ADR-053-cross-modal-query-fabric.adoc[ADR-053] (cross-modal query fabric); `docs/12-design/CROSS_MODAL_FUSION_SEAM_2026_06_22.adoc` (`Fuser` is its Phase-1 F-A core)

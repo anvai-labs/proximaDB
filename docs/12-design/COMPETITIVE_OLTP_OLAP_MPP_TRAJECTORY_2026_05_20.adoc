@@ -3,7 +3,7 @@
 :toclevels: 4
 :sectnums:
 
-Status: Active architecture trajectory +
+Status: Active architecture trajectory — **Partial (2026-10-15)**: Phase 1–2 deliverables largely shipped (canonical WAL write spine, PAX + DataFusion local OLAP, TPC-H 22/22 over pgwire); Phases 3–4 open. Direction since refined by link:DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc[the course correction], link:CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc[the co-design spine] and link:adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (DataFusion kernels are the OLAP executor — read Phase 3's "Rust-native distributed worker nodes" through ADR-052 and link:DATAFUSION_BALLISTA_DISTRIBUTED_EXECUTION_2026_06_05.adoc[the Ballista blueprint]). Per-deliverable status is not re-audited here. +
 Date: 2026-05-20 +
 Scope: competitive database architecture lessons, HLD/LLD design shape, route-selection knobs,
 implementation sequencing, and refactor boundaries for OLTP, OLAP, HTAP, MPP, and warehousing

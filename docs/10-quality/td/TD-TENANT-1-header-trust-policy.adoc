@@ -3,96 +3,43 @@
 = TD-TENANT-1: credential-bound tenant identity — X-Tenant-ID header-trust policy
 :icons: font
 
-**Status:** Phase 2 shipped; follow-up (a) is **partially closed 2026-08-30**:
-legacy config-backed API keys can now carry delegation-only gateway roles, while
-ADR-090 registry-backed API keys, SSO, and mTLS role stamping remain open.
-Follow-up (b) is re-scoped below as its own future TD (pgwire SCRAM bindings).
-**Origin:** anvaiops live-UAT debugging (issues #949/#950, PR #956) — the fix
-review raised the question: the engine honors a bare `X-Tenant-ID` header, so
-any client that can reach the port can masquerade as any tenant unless a
-well-behaved gateway fronts the engine. A tenant-isolation guarantee that
-depends on network topology is a topology assumption, not a guarantee.
-
-== Decision
-
-Open-core split follows the cache-tier precedent: **mechanism in OSS, policy in
-the control plane.** ProximaDB enforces *that* tenant identity is
-credential-bound; the commercial layer (AnvaiOps) owns *which* tenants exist,
-credential→tenant mapping UX, provisioning, and entitlements. No enforcement
-lives outside the engine.
-
-== Phase 1 (shipped with this TD)
-
-`HeaderTrustPolicy` on `TenantExtractorConfig`
-(`src/network/middleware/tenant.rs`), governing the **bare** header — a request
-asserting a tenant with no authenticated binding (no JWT claim / API-key
-mapping). When a binding exists, header≠binding is already rejected with 403
-in every mode (pre-existing behavior, now audit-logged).
-
+[cols="1,3"]
 |===
-| Mode | Bare header | Gateway delegation
-
-| `open` (default; `Default`/`single_tenant` presets)
-| accepted verbatim
-| n/a (header==identity)
-
-| `authenticated-only` (default for the `multi_tenant()` strict preset)
-| 403 + `proximadb::tenant_audit` warn
-| no — header must equal the credential's tenant
-
-| `gateway-only`
-| 403 + audit warn
-| yes — an authenticated principal whose bound tenant is in `system_tenants`
-  may set `X-Tenant-ID` to act on behalf of that tenant (delegation is
-  audit-logged)
+| Status | **Partial: Phase 1 `HeaderTrustPolicy` and Phase 2 (shared primitive on all four surfaces, config surface, stable-id resolution + mint, gateway principal marker) shipped (#965, #976, #1357, #1359, #1403); legacy config API-key gateway roles shipped (#1791); open: gateway-role stamping for ADR-090 registry `pxk_` keys and mTLS, and pgwire authenticated bindings (see Follow-ups).**
+| Component | `crates/foundation/proximadb-tenant` (`identity_trust.rs`); `src/network/middleware/tenant.rs`; `src/network/grpc/auth.rs`; `src/network/arrow_ipc/service.rs`; `src/network/postgres/`; `src/security/auth_service.rs`
+| Relates to | link:TD-SSO-1-oidc-provider-role-seam.adoc[TD-SSO-1] (OIDC half of SSO), link:TD-ABAC-6-unified-identity-seam.adoc[TD-ABAC-6], link:TD-ABAC-11-mint-and-fail-closed-composition.adoc[TD-ABAC-11] (the mint), link:TD-PGWIRE-AUTH-1-scram-auth.adoc[TD-PGWIRE-AUTH-1], link:TD-AUTH-FC-listener-admission.adoc[TD-AUTH-FC], link:TD-AUTHZ-1-adr090-program-tracker.adoc[TD-AUTHZ-1] (L0.2/L0.4)
 |===
 
-Env override at server construction (never in constructors — tests stay
-hermetic): `PROXIMADB_TENANT_HEADER_TRUST=open|authenticated-only|gateway-only`.
-An unparseable value tightens to `authenticated-only` (fail-closed) rather than
-silently running `open`. Unset ⇒ config value; default-safe, no flag-day.
+== History (shipped)
 
-== Phase 2 (shipped) — the follow-ups
+Origin: anvaiops live-UAT (#949/#950, #956) — the engine honored a bare `X-Tenant-ID`, so tenant
+isolation depended on a well-behaved gateway: a topology assumption, not a guarantee. **Decision
+(still binding): mechanism in OSS, policy in the control plane** — the engine enforces *that* tenant
+identity is credential-bound; AnvaiOps owns which tenants exist and the credential→tenant UX.
 
-1. **[DONE] One shared primitive, every surface.** The policy logic moved to
-   the foundation crate: `proximadb_tenant::identity_trust::resolve_tenant_assertion`
-   (pure; truth-table tested). All four surfaces call it:
-   * REST middleware (`src/network/middleware/tenant.rs`) — delegates and maps
-     onto `TenantIdSource` + 403.
-   * gRPC auth layer (`src/network/grpc/auth.rs`) — resolves once per request,
-     stores the verdict in `GrpcAuthContext::resolved_tenant`, rejects with
-     `PERMISSION_DENIED`. This CLOSED a pre-existing gap: a non-capability
-     credential's mismatched `x-tenant-id` used to be silently ignored.
-   * Arrow Flight (`src/network/arrow_ipc/service.rs`) — replaces the
-     hand-rolled mismatch match; also applies the policy when no
-     SecurityCoordinator is wired (bare-by-definition assertions).
-   * pgwire (`src/network/postgres/{mod,protocol}.rs`) — trust auth means
-     every assertion is bare; enforced at the TWO assertion entry points:
-     startup `database` (FATAL 28000 at handshake) and
-     `SET proximadb.write.tenant_id` (ERROR 28000). The ~15 downstream
-     resolve call sites are untouched — assertions are gated at entry.
-2. **[DONE] config.toml surface.** `[security.tenant] header_trust` on
-   `SecurityConfig` (serde kebab-case enum). Effective policy resolved ONCE in
-   `database.rs` via `HeaderTrustPolicy::effective` (env > config > mode
-   preset; unparseable env tightens to `authenticated-only`) and threaded
-   through `MultiServer::with_tenant_header_trust` into every surface.
-3. **[DONE] Stable-id resolution at the boundary (ADR-031/ADR-087).** The port
-   (`proximadb_tenant::TenantStableIdResolver`) + carry
-   (`MiddlewareTenantContext::tenant_stable_id`, stamped when a resolver is
-   wired via `TenantExtractor::with_stable_id_resolver`) shipped. REMAINING:
-   production resolver and both production mint authorities are wired. The
-   WAL-backed `SystemCatalog` persists the mapping as a canonical catalog delta
-   and snapshot state; `NativeCatalog` persists its account-registry sidecar.
-   Bootstrap mints `default`, and ABAC provisioning mints any new tenant before
-   its first policy write. The string `tenant_id` stays authoritative; the
-   stable id is a derived policy/path key, never a second source of truth.
-4. **[DONE] Gateway principal marker.** First-class
-   `UnifiedUserContext::is_gateway_principal()` (a `gateway`/`operator` role
-   or `gateway: "true"` metadata, stamped from credential data). The REST
-   middleware keeps `system_tenants` membership as a compat fallback; the
-   gRPC/Flight surfaces use the marker only (the desired end state).
+Phase 1: `HeaderTrustPolicy` governs the *bare* header (no authenticated binding) —
+`open` (default; accepted verbatim), `authenticated-only` (strict preset; 403 + `tenant_audit`),
+`gateway-only` (403, except an authenticated principal bound to a `system_tenants` tenant may delegate,
+audit-logged); header≠binding is rejected in every mode. Env `PROXIMADB_TENANT_HEADER_TRUST`; an
+unparseable value tightens to `authenticated-only` rather than running `open`.
+
+Phase 2: the pure `resolve_tenant_assertion` primitive is called by REST, gRPC (closing a gap where a
+mismatched `x-tenant-id` was silently ignored), Arrow Flight, and pgwire (gated at the two assertion
+entry points: startup `database`, FATAL 28000; `SET proximadb.write.tenant_id`, ERROR 28000);
+`[security.tenant] header_trust` resolved once (env > config > preset); `TenantStableIdResolver` port
+wired with both production mint authorities (`SystemCatalog` WAL delta + snapshot, `NativeCatalog`
+sidecar; bootstrap mints `default`) — the string `tenant_id` stays authoritative, the stable id is a
+derived key; `UnifiedUserContext::is_gateway_principal()` marker (gRPC/Flight use it only; REST keeps
+`system_tenants` as compat fallback).
 
 == Follow-ups (still open)
+
+NOTE (status re-verified 2026-10-15): `pxk_` registry keys still resolve with only `api_user`
+(`src/security/auth_service.rs`); the aws/azure enterprise SSO variants were since **deleted as dead
+code** (TD-SSO-3, b734d5dc4), so that half of the SSO residual is retired rather than implemented, and
+**mTLS role stamping remains open**; pgwire SCRAM authentication with tenant-bound verifiers shipped as
+TD-PGWIRE-AUTH-1 (2ef6cb577), but TD-AUTH-FC still requires authenticated deployments to disable
+pgwire pending full pgwire authn/authz conformance. The original text is kept verbatim below.
 
 * Credential-side stamping of the gateway role beyond JWTs — **legacy
   config-backed API keys: CLOSED 2026-08-30** (`ApiKeyInfo.roles`,

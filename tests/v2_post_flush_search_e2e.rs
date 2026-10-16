@@ -455,3 +455,130 @@ async fn v2_filtered_scan_survives_flush() {
          (the path hybrid filter enforcement reuses): {post_body}"
     );
 }
+
+/// TD-READFID-1: a point read on an `fp32` collection must return the written
+/// f32 vector BYTE-EXACTLY after the record is flushed to a PAX segment.
+///
+/// Before the fix the flush wrote only the lossy RaBitQ/SQ8 columns (the
+/// exact-f32 tier was opt-in via a `pax_f32_tier` tag nobody sets), so
+/// `GET /records/{id}` served an SQ8 reconstruction once the memtable drained.
+/// Values are deliberately irregular so no quantization grid can hit them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_fp32_point_read_is_byte_exact_after_flush() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = format!(
+        "v2_fp32_fid_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dim: usize = 8;
+    let n: usize = 6;
+
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({
+            "name": name,
+            "dimension": dim,
+            "engine": "sst",
+            "distance_metric": "euclidean",
+            "canonical_embedding_precision": "fp32",
+        }))
+        .send()
+        .await
+        .expect("create");
+    let create_status = create.status();
+    let create_body = create.text().await.expect("create response body");
+    assert!(
+        create_status.is_success(),
+        "create: {create_status} {create_body}"
+    );
+    let create_json: serde_json::Value =
+        serde_json::from_str(&create_body).expect("create response json");
+    let collection_id = create_json
+        .get("collection_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("create response collection_id")
+        .to_string();
+
+    let written: Vec<Vec<f32>> = (0..n)
+        .map(|i| {
+            (0..dim)
+                .map(|j| ((i * dim + j) as f32 * 0.013_717).sin() * 0.731 + j as f32 * 0.01)
+                .collect()
+        })
+        .collect();
+    let records: Vec<serde_json::Value> = written
+        .iter()
+        .enumerate()
+        .map(|(i, v)| json!({ "id": format!("rec-{i}"), "vector": v }))
+        .collect();
+    let insert = http
+        .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+        .json(&json!({ "records": records }))
+        .send()
+        .await
+        .expect("insert");
+    assert!(
+        insert.status().is_success(),
+        "insert: {} {}",
+        insert.status(),
+        insert.text().await.unwrap_or_default()
+    );
+
+    let read = |id: String| {
+        let http = http.clone();
+        let url = format!("{base}/api/v2/collections/{name}/records/{id}");
+        async move {
+            let resp = http.get(url).send().await.expect("get");
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.expect("get json");
+            assert!(status.is_success(), "get {id}: {status} {body}");
+            body.get("vector")
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("get {id}: no vector in {body}"))
+                .iter()
+                .map(|x| x.as_f64().expect("numeric component") as f32)
+                .collect::<Vec<f32>>()
+        }
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+
+    // Control: memtable-served reads are exact.
+    for (i, want) in written.iter().enumerate() {
+        let got = read(format!("rec-{i}")).await;
+        assert_eq!(
+            bits(&got),
+            bits(want),
+            "pre-flush rec-{i}: {got:?} vs {want:?}"
+        );
+    }
+
+    server.force_flush(&name).await.expect("force flush");
+    assert_eq!(
+        unflushed_batch_count(&collection_id).await,
+        0,
+        "force-flush must drain the WAL so reads come from the segment"
+    );
+    assert!(
+        !server.persisted_pax_files().is_empty(),
+        "flush must have produced a PAX segment: {:?}",
+        server.persisted_files()
+    );
+
+    for (i, want) in written.iter().enumerate() {
+        let got = read(format!("rec-{i}")).await;
+        assert_eq!(
+            bits(&got),
+            bits(want),
+            "POST-FLUSH rec-{i} is not the written f32 (TD-READFID-1): got {got:?} want {want:?}"
+        );
+    }
+}

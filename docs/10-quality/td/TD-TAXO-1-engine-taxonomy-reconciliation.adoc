@@ -5,58 +5,37 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Mostly done (2026-07-13) — canonical matrix landed in `SUPPORTED_SURFACE.adoc` §"Storage Engine Matrix" (all 12 `src/storage/engines/` dirs + ORION + the `Hybrid` reserved variant, each with a tier: Supported/Beta/Experimental/Internal/Removed/Planned); enum doc comments aligned to engine headers (SWIFT/RAPTOR gates, `Hybrid` fallback, CEDAR compat-projection, CHRONO removed); SYSTEM_MAP authority note points at the matrix instead of re-enumerating. **Remaining:** relocate the legacy `titan` dir next to ORION under `src/graph/engines/`; decide proto-value retirement for `Chrono`/`Titan` at a wire-compat window; publish per-engine conformance ratchets before any VIPER/HELIX/NOVA promotion above Beta.
-| Severity | Medium (architecture-communication + routing correctness risk — "one engine taxonomy across read and write" is a stated invariant of the `ComputeScheduler` module, but the taxonomy's surfaces disagree)
-| Component | `crates/storage/proximadb-storage-ports/src/capabilities.rs` (`StorageEngineStrategy`), `src/storage/engines/` (engine module tree), `docs/SUPPORTED_SURFACE.adoc` (support tiers), design-doc engine inventories (SYSTEM_MAP, ADRs)
-| Relates | TD-DOCS-2 (status-of-record drift — this is the engine-inventory instance of the same class), root-crate decomposition Slice D (#906 consolidated 4 duplicate `StorageEngineType` defs; #910 hoisted capability descriptors — the enum is now canonical, its *content* is not yet reconciled)
+| Status | **Partial: canonical Storage Engine Matrix in `SUPPORTED_SURFACE.adoc`, enum doc comments aligned to engine headers, and SYSTEM_MAP pointing at the matrix shipped (#915, #1107); open: proto-value retirement for `Chrono`/`Titan` at a wire-compat window; per-engine conformance ratchets before any VIPER/HELIX/NOVA promotion above Beta; reconcile the stale TITAN matrix row (see below).**
+| Severity | Medium (architecture-communication + routing correctness risk — "one engine taxonomy across read and write" is a stated invariant of the `ComputeScheduler` module)
+| Component | `crates/storage/proximadb-storage-ports/src/capabilities.rs` (`StorageEngineStrategy`), `src/storage/engines/`, `docs/SUPPORTED_SURFACE.adoc` §"Storage Engine Matrix"
+| Relates | TD-DOCS-2 (status-of-record drift — this is the engine-inventory instance of the same class), root-crate decomposition Slice D (#906, #910)
 | Suitable for | Autonomous agent execution (docs + doc-comment slices; no behavior change)
 |===
 
-== Finding (2026-07-12)
+== History (shipped)
 
-The engine taxonomy is told four different ways:
+* **Finding (2026-07-12).** The engine taxonomy was told four ways — the `StorageEngineStrategy` enum,
+  the `src/storage/engines/` tree (with dirs lacking variants), `SUPPORTED_SURFACE` tiers, and design-doc
+  inventories (an external analysis reproduced the partial SST/HELIX/NOVA/VIPER list). `Helix` was
+  doc-commented "time-series optimized" (a TST copy-paste) though it is a Hilbert-clustered spatial vector
+  engine. Lesson: when the enum, tree, support contract and docs disagree, every consumer resolves it by
+  guessing — the module header is the implementation truth.
+* **Fix (#915, #1107).** One matrix: every engine dir + ORION + reserved variants, each with purpose,
+  tier (Supported/Beta/Experimental/Internal/Removed/Planned), variant, path and gate; the missing-variant
+  question decided in the matrix (SEQUOIA internal, EVENTLOG infrastructure, UNIVERSAL not an engine).
+  CHRONO/TITAN stub engines had been removed by #702.
 
-1. **`StorageEngineStrategy` enum** (canonical type after #906/#910): `Sst`, `Viper`,
-   `Helix`, `Nova`, `Swift`, `Raptor`, `Hybrid`, `TimeSeries` (TST), `Cedar`, `Chrono`
-   — 10 variants. Until this filing's PR, `Helix` was doc-commented "time-series
-   optimized storage" (copy-paste of the TST line) while the engine's own header
-   (`src/storage/engines/helix/mod.rs`) describes a spatial-locality vector engine
-   (Hilbert-curve clustering, zone maps).
-2. **Engine module tree** (`src/storage/engines/`): `sst`, `viper`, `helix`, `nova`,
-   `swift`, `raptor`, `cedar`, `chrono`, `tst`, plus `sequoia`, `titan`, `universal` —
-   the last three have **no enum variant**; graph's ORION lives separately under
-   `crates/modalities/proximadb-orion-engine`.
-3. **`SUPPORTED_SURFACE.adoc`** support tiers: names a subset (GA/Beta/Experimental)
-   that predates several of the above.
-4. **Design docs / external analyses**: SYSTEM_MAP and ADRs enumerate
-   SST/HELIX/NOVA/VIPER (+ gated RAPTOR/SWIFT, ORION) — the external architecture
-   analysis reviewed on 2026-07-12 reproduced exactly this partial list, unaware of
-   cedar/chrono/sequoia/titan/tst/universal.
+== Remaining
 
-*Why it matters (first principles):* the `ComputeScheduler` module doc states "one
-engine taxonomy across read and write" as an invariant. When the enum, the module
-tree, the support contract, and the docs each tell a different story, every consumer —
-routing code, capability matrices, support commitments, agent sessions, external
-evaluators — resolves the disagreement by guessing. That is the same drift class as
-TD-DOCS-2, instantiated in the engine inventory.
-
-== Deliverable
-
-1. **One canonical engine matrix** (proposed home: `SUPPORTED_SURFACE.adoc`, which the
-   status-as-of guard already covers): engine → one-line purpose → support tier
-   (GA/Beta/Experimental/Internal-only) → enum variant → module path → feature gate.
-   Every engine in `src/storage/engines/` appears exactly once; `sequoia`, `titan`,
-   `universal` get an explicit tier (or an explicit retirement note), and ORION is
-   listed with its graph-modality home.
-2. **Enum doc comments align to the matrix** — each `StorageEngineStrategy` variant's
-   comment matches the engine's own module header (the implementation truth), as done
-   for `Helix` in this filing's PR.
-3. **Design-doc inventories point at the matrix** instead of re-enumerating (SYSTEM_MAP
-   engine sections link to it), so the list can no longer fork.
-4. **Decide the missing-variant question deliberately**: either `sequoia`/`titan`/
-   `universal` earn enum variants (they are routable strategies) or the matrix marks
-   them internal/experimental-only (they are implementation substrates, not
-   strategies). Record the decision in the matrix, not in tribal knowledge.
+* **Proto-value retirement.** Decide retirement for `Chrono`/`Titan` at a wire-compat window (the
+  `Chrono` enum variant and the v1 proto `TITAN = 11` value are retained for wire compatibility only).
+* **Conformance before promotion.** Publish per-engine conformance ratchets before any VIPER/HELIX/NOVA
+  promotion above Beta.
+* **Stale TITAN row.** The filed residual "relocate the legacy `titan` dir next to ORION under
+  `src/graph/engines/`" appears moot: as of 2026-10-15 no `titan` directory exists under `src/` or
+  `crates/`, but the matrix's TITAN row still says "the legacy dir under `src/storage/engines/` … candidate
+  for relocation; tracked in TD-TAXO-1". Re-verify and correct that row (status cell only — the matrix is
+  guarded).
 
 == Verify
 

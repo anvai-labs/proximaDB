@@ -331,7 +331,7 @@ ProximaDB includes a built‑in React dashboard for data exploration:
 
 [source,bash]
 ----
-cd ui && npm install && npm start
+cd ui && npm install && npm start   # Vite dev server on :3000, proxies /api to :5678
 ----
 
 Features:

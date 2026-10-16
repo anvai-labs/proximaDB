@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — **partially implemented** (reconciled 2026-10-15): the relational cold path shipped *WAL-first* (#405 read-merge + `DeletionVector` N0 primitive; #479 default-ON with kill-switch `PROXIMADB_OLAP_DELTA_MERGE=0`). Open: persistent on-disk DV N0–N4 (Puffin / inline PAX, ANN-segment DV) and the five Open Decisions below. See the NOTE in "Mixed-Read-Safe Migration".
 |Date|2026-06-25
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-007 (Iceberg REST), ADR-010 (PAX Block Format), ADR-020 (Canonical WAL Authority), `FORMAT_STRATEGY_ICEBERG_DELTA_LANCE_2026_06.adoc` (P4), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`

@@ -6,38 +6,32 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open — hard blocker FIXED (2026-07-13, #923 + review follow-up)**: the capability gate landed — `QueryShape::join_bearing` makes join-bearing plans ineligible FLIP TARGETS for Native across all three override paths (explore, RTT-budget hard gate, min-advantage soft gate), including ancestor-fallback consults whose coarse class carries no join signal; the ineligibility is disclosed in the decision reason (ADR-058 observability). Per the fresh-context review of #923, `query_join_bearing` now recurses through **derived tables, nested joins, CTEs, and WHERE/projection subqueries** (which lower to semi/anti/left joins) — not just the top-level FROM — and the eval asserts at the **decision level** as well as strict result parity. *Corrected premise (review finding):* Volcano DOES have hash/nested-loop join executors; the real capability gap is that the Native arm has **no multi-table external-parquet scan** (the vectorized native-over-parquet path is single-scan-only) — a gap-missed flip is served correctly by the #853 DataFusion floor but **stamps Native into the io_trace, poisoning the cost model's per-backend cells**, and diverges `EXPLAIN ANALYZE`. Note the original §Finding suggestion ("exclude by operation class") was insufficient — a `JOIN … GROUP BY` classes as `op=grp` because `query_operation_class` never inspects the FROM clause; hence the dedicated shape bit. **Remaining:** the enable decision itself — default-ON for `PROXIMADB_ROUTE_COST_OVERRIDE` only after the eval + TPC-H/TPC-DS ratchets run green under override-ON, plus plan-level `vectorized_supports`-style eligibility if further Native-arm capability gaps surface. Persistence landed (#721); eval landed (#766); eval stack pin = TD-ROUTE-2.
+| Status | **Partial: cell persistence (#721), the pgwire override eval (#766) and the join-bearing capability gate (#923, #940) shipped; open: the enable decision — default-ON for `PROXIMADB_ROUTE_COST_OVERRIDE` only after the eval + TPC-H/TPC-DS ratchets run green under override-ON (plan steps 2–3 below), plus plan-level `vectorized_supports`-style eligibility if further Native-arm capability gaps surface.**
 | Severity | Medium — the co-design routing lever is built but inert; enabling it blind risks the TPC-H/TPC-DS ratchets.
 | Component | `src/query/route_cost_model.rs`, `src/query/compute_scheduler.rs`, `tests/route_cost_offline_eval.rs`, `tests/tpch_pgwire_e2e.rs`
 | Pillar | PERF (co-design), REL (ratchets), EVAL (mandate #13)
+| Relates to | link:TD-ROUTE-2-override-eval-stack-overflow-dev-profile.adoc[TD-ROUTE-2] (eval stack pin), link:TD-ROUTE-3-decision-dispatch-separation.adoc[TD-ROUTE-3], link:TD-EXEC-2-plan-geometry-resource-model.adoc[TD-EXEC-2] (overlap: Slice 3 per-class `OverrideScope::Classes` staged enable), link:TD-USUB-9-route-stamp-integrity-and-dead-interop-code.adoc[TD-USUB-9] (route-stamp cell poisoning)
 |===
 
-toc::[]
+== History (shipped)
 
-== Finding (eval, 2026-07-08)
+The 2026-07-08 eval (`tests/route_cost_override_pgwire_eval.rs`) showed scan/aggregate queries flip
+DataFusion → Native with identical results, but a join flip **errored**: the freshness-safe candidate set for
+`olap/parquet` (`freshness_safe_backends_from_class` → `[Native, DataFusionLocal]`) was *capability-unaware*.
 
-The pgwire override eval (`tests/route_cost_override_pgwire_eval.rs`) materializes a
-small dataset, warms the model so Native is the cheaper `olap/parquet` arm, enables
-the override, and compares results to the override-OFF (DataFusion) baseline. Result:
+Fix (#923 + review follow-up #940): `QueryShape::join_bearing` makes join-bearing plans ineligible flip targets
+for Native across all three override paths (explore, RTT-budget hard gate, min-advantage soft gate), including
+ancestor-fallback consults; `query_join_bearing` recurses through derived tables, nested joins, CTEs and
+WHERE/projection subqueries; the ineligibility is disclosed in the decision reason; the eval asserts at the
+decision level and on strict result parity.
 
-* **Scan / aggregate queries flip safely.** `count(*)`, `GROUP BY … count(*)`, and
-  `sum(col)` flipped DataFusion → Native and returned **identical** results. The
-  override is correctness-safe for these shapes.
-* **A join flip is a hard blocker.** `… FROM orders o, lineitem l WHERE o.o_orderkey =
-  l.l_orderkey GROUP BY …` **errored** (`db error`) once flipped to Native — the
-  row-wise Volcano engine has no join executor, while DataFusion runs it. It fails
-  *loud* (errors, never a silently-wrong answer), but it means the *global* override
-  cannot be enabled as-is.
+Lessons that still apply:
 
-**Root cause:** `freshness_safe_backends_from_class` returns
-`[Native, DataFusionLocal]` for every `olap/parquet` class, but Native cannot execute
-the join-bearing subset. The freshness-safe candidate set is *capability-unaware*.
-
-**Concrete next action (the real gate now):** make the `olap/parquet` candidate set
-**capability-aware** — exclude Native/Volcano when the plan contains a join (or any
-operator Volcano lacks) so the override only ever flips to a backend that can execute
-the query. Then the eval's join case becomes a parity assert (it already tolerates
-both "errors" today and "matches" post-fix) and the override can be enabled behind it.
+* *Corrected premise:* Volcano DOES have hash/nested-loop join executors. The real gap is that the Native arm has
+  **no multi-table external-parquet scan**; a gap-missed flip is served correctly by the #853 DataFusion floor but
+  **stamps Native into the io_trace, poisoning per-backend cost cells**, and diverges `EXPLAIN ANALYZE`.
+* "Exclude by operation class" was insufficient: `JOIN … GROUP BY` classes as `op=grp` because
+  `query_operation_class` never inspects FROM — hence the dedicated shape bit.
 
 == Context
 
@@ -67,6 +61,8 @@ flipped route that fails or regresses would only surface at the ratchet, not at
 an eval.
 
 == Decision / plan (do NOT enable override until these land)
+
+Step 1 (the pgwire eval) is shipped (#766); steps 2–3 remain.
 
 1. **pgwire integration eval (mandate #13).** A test that: (a) sets
    `PROXIMADB_ROUTE_COST_OVERRIDE=1`, (b) warms the global model on a TPC-H

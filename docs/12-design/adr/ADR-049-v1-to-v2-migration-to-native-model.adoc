@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed
+|Status|Proposed — *M0 and M1 implemented* (reconciled 2026-10-15): M0-a v1-proto ratchet (#615), M0-b 17 v1 services proto-deprecated (#616), M0-c `PROXIMADB_REST_V1_COMPAT` gate (#719); M1 PAX default write format + format-preserving compaction + streaming-writer retirement (#621, #623, #627, #631, #642, #653). Open: M2 (= ADR-048 P2/P3), M3, M4 (delete `proto/proximadb/v1/`; TD-121, TD-123 Open). Relates: TD-V1SUNSET-1 (resolved 2026-08-29).
 |Date|2026-07-01
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-009 (schema modes), ADR-019 (relational completeness / v1 retirement), ADR-024 (single canonical `ProximaType`), ADR-048 (unified system catalog), "ADR-047" (collection-as-table — referenced in code, unfiled; see note)

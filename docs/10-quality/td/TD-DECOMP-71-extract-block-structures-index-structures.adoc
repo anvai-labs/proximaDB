@@ -5,42 +5,16 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | High-value — the crown-jewel extraction (7.2K LOC, 29 tests) from the compile-heaviest subsystem
+| Status | **Done (2026-08-15).** Moved `block_structures.rs` (`ProximaDataBlock` + 32 sibling types, 5.7K LOC, 29 tests) and `index_structures.rs` into `proximadb-engine-core::proximablocks` (#1629).
 | Component | `crates/storage/proximadb-engine-core/src/proximablocks`; root `src/storage/engines/core/formats/proximablocks/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-70-extract-fulltext-text-search-cluster.adoc[TD-DECOMP-70] (same PR); link:TD-DECOMP-75-extract-sst-swift-metadata-via-filesystem-port.adoc[TD-DECOMP-75]
 |===
 
-== What moved
-Phase 3 Step 3 — the largest single-file extraction of the engines program:
+== History
 
-* `block_structures.rs` (5,711 LOC, 29 tests via `#[path]`-included `block_structures_tests.rs`)
-  — `ProximaDataBlock` (used 358× codebase-wide) and 32 sibling pub types: the PAX block
-  container, encode/decode via ProximaCodec, adaptive bloom integration, JSON/metadata serde.
-* `block_structures_tests.rs` (830 LOC).
-* `index_structures.rs` (791 LOC) — block-level index types (BlockLocation etc.).
+The largest single-file extraction of the engines program (the PAX block container, used 358× codebase-wide).
 
-== Dependency analysis flipped the planned order
-The plan ordered by raw `crate::` ref count (block_reader 4 first). The real analysis showed
-*what the refs point at* matters more: every one of block_structures' 31 refs resolves to an
-already-extracted crate via root re-export shims — `crate::core::bloom` → `proximadb-bloom`,
-`crate::core::compression` → `proximab-compression`, `...ops::proximacodec` → `proximadb-codec`,
-`crate::core::search::json_value_serde` → `proximadb-search-types`, `crate::proto` →
-`proximadb-proto`, `super::engine_profile` → `proximadb-storage-common`. Meanwhile the
-"low-coupling" files (block_reader/sst_metadata/swift_metadata) are blocked by UNEXTRACTED root
-`FileSystem`/`FilesystemFactory` — they wait on the filesystem port.
-
-New engine-core deps: bloom, codec, search-types, proto, data-model, quantization-model (all
-`{workspace=true}` except bytemuck — root-package-only, inline spec), bincode, rayon, tokio,
-tracing; dev: rand.
-
-== Shims
-Root `proximablocks/mod.rs`: the two `pub mod` decls → `pub use
-proximadb_engine_core::proximablocks::{block_structures, index_structures};` — the parent's
-`pub use block_structures::{...}` / `pub use index_structures::{...}` re-export blocks are
-unchanged, so every consumer path in root/crates keeps resolving.
-
-== Verified
-engine-core standalone `--all-targets` ✓ + nextest **111/111** ✓ (was 100 pre-TD-69 on develop,
-+11 net index_structures/block_structures tests reachable in the new home); root `cargo check -p
-proximadb --lib` ✓; boundary `--strict` No findings; fmt ✓. SIFT RUNS (storage_changes) under
-the 45m cap.
+* Lesson: rank candidates by *what the refs point at*, not by raw `crate::` ref count. All 31 of
+  block_structures' refs resolved to already-extracted crates via root shims, while the "low-coupling"
+  files (block_reader, sst/swift metadata) were blocked by the unextracted root `FilesystemFactory` —
+  which led to the FilesystemPort inversion in link:TD-DECOMP-75-extract-sst-swift-metadata-via-filesystem-port.adoc[TD-DECOMP-75].

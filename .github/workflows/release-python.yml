@@ -1,6 +1,21 @@
-# Release workflow for the ProximaDB Python packages — independent of the binary/crates
-# `release.yml` (which owns `v*` tags). Follows the per-package tag convention used across
-# the workspace (`sdk-v*`, `victor-codegraph-v*`).
+# Release workflow for the ProximaDB Python packages.
+#
+# ONE TAG, ONE VERSION (TD-RELTAG-1). This workflow triggers on the SAME tag
+# patterns as `release.yml` -- `vX.Y.Z` (and `vX.Y.Z-<pre>`) -- so ONE pushed tag
+# releases every registry: GitHub Release binaries + crates.io + npm from
+# release.yml, PyPI from here. Every package carries the identical version X.Y.Z.
+# The `version-gate` job runs `scripts/version-sync.sh check-tag` before anything
+# builds: the tag's version must equal clients/python/pyproject.toml (proximadb),
+# the root pyproject.toml (proximadb_embedded) and every other manifest
+# `version-sync.sh check` covers, or the run fails with nothing built.
+#
+# History: until 0.4.x this workflow owned a separate per-package tag family
+# (python-v0.2.2, python-v0.3.0), which let PyPI drift from the other registries
+# (PyPI proximadb 0.3.0 and proximadb_embedded 0.2.2 while crates.io had 0.4.0).
+# Those old tags remain as history; they no longer trigger anything.
+# The FILE NAME is unchanged on purpose: PyPI trusted publishers are bound to
+# `release-python.yml`, so renaming or merging it into release.yml would break
+# publishing until the owner re-registered both projects on pypi.org.
 #
 # Publishes TWO separate PyPI projects from ONE release event (the right shape: the pure
 # SDK is a universal wheel, the embedded engine is native PyO3 wheels — they cannot be one
@@ -9,7 +24,8 @@
 #   - proximadb_embedded  native in-process engine (root maturin pkg)  platform wheels + sdist
 #
 # Triggers:
-#   - Push tag: python-v*  (e.g. python-v0.2.0)
+#   - Push tag: vX.Y.Z / vX.Y.Z-<pre> (identical to release.yml; pre-releases build
+#     and go to TestPyPI only, never PyPI -- same "hyphen = pre-release" rule)
 #   - Manual dispatch (dry_run to build without publishing; publish_testpypi for a TestPyPI run)
 #
 # Publishing uses PyPI Trusted Publishing (OIDC) — NO API token secret. Configure one
@@ -23,8 +39,11 @@ name: Release Python
 
 on:
   push:
+    # MUST stay identical to release.yml's list -- enforced by
+    # scripts/check_release_build_features.py (check_unified_release_tag).
     tags:
-      - 'python-v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'  # Pre-releases like v0.2.0-beta.1
   workflow_dispatch:
     inputs:
       dry_run:
@@ -42,9 +61,39 @@ env:
   PYTHON_VERSION: '3.12'
 
 jobs:
+  # ---- Version gate (TD-RELTAG-1): tag == every manifest, before any build -------------
+  # Every other job needs this one (directly or transitively), so a tag whose version
+  # disagrees with clients/python/pyproject.toml, the root pyproject.toml, or any
+  # other published manifest fails here with nothing built or published.
+  version-gate:
+    name: Version gate (tag == manifests)
+    runs-on: ubuntu-latest
+    # Reads a handful of manifests; no build. Floor applies.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag version must equal every published manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK=$(python3 -c 'import tomllib;print(tomllib.load(open("clients/python/pyproject.toml","rb"))["project"]["version"])')
+          EMB=$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          echo "proximadb (clients/python/pyproject.toml):  $SDK"
+          echo "proximadb_embedded (pyproject.toml):        $EMB"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Tag push: tag vX.Y.Z == Cargo.toml == both pyprojects == every manifest.
+            bash scripts/version-sync.sh check-tag "${GITHUB_REF_NAME}"
+          else
+            # Dispatch from a branch (dry_run / TestPyPI): no tag to compare, but the
+            # two packages still must agree with each other and with every manifest,
+            # so a dry run proves the tree is releasable as one version.
+            bash scripts/version-sync.sh check
+          fi
+
   # ---- Pure-Python SDK: proximadb (universal wheel + sdist) --------------------------
   build-sdk:
     name: Build SDK (proximadb)
+    needs: [version-gate]
     runs-on: ubuntu-latest
     # max 0.4 min green step span over 16 runs since 2026-07-06 (16 green);
     # pure-Python wheel. 1.5x is under the 15-min floor, so the floor applies.
@@ -68,6 +117,7 @@ jobs:
   # ---- Native engine: proximadb_embedded (platform wheels via maturin) ---------------
   build-embedded-wheels:
     name: Build embedded wheels (${{ matrix.os }} ${{ matrix.target }})
+    needs: [version-gate]
     runs-on: ${{ matrix.os }}
     # Slowest leg governs: max 59 min green step span (`windows-2022 x86_64`),
     # then `macos-14 aarch64` at 53 min, over 16 runs since 2026-07-06 (3-5
@@ -153,6 +203,7 @@ jobs:
 
   build-embedded-sdist:
     name: Build embedded sdist (proximadb_embedded)
+    needs: [version-gate]
     runs-on: ubuntu-latest
     # max 1.5 min green step span over 16 runs since 2026-07-06 (16 green);
     # `maturin sdist` does not compile. Floor applies.
@@ -258,8 +309,8 @@ jobs:
   # ---- TestPyPI (advisory/optional) --------------------------------------------------
   publish-testpypi:
     name: Publish to TestPyPI (advisory)
-    needs: [build-sdk, build-embedded-wheels, build-embedded-sdist, test-embedded-wheels]
-    if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.publish_testpypi == 'true' || startsWith(github.ref, 'refs/tags/python-v')) }}
+    needs: [version-gate, build-sdk, build-embedded-wheels, build-embedded-sdist, test-embedded-wheels]
+    if: ${{ github.event.inputs.dry_run != 'true' && (github.event.inputs.publish_testpypi == 'true' || startsWith(github.ref, 'refs/tags/v')) }}
     continue-on-error: true
     runs-on: ubuntu-latest
     # max 0.2 min green step span over 16 runs since 2026-07-06 (1 green);
@@ -290,8 +341,10 @@ jobs:
   # ---- PyPI (authoritative): proximadb SDK ------------------------------------------
   publish-sdk-pypi:
     name: Publish proximadb (SDK) to PyPI
-    needs: [build-sdk]
-    if: ${{ github.event.inputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/python-v') && !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc') }}
+    needs: [version-gate, build-sdk]
+    # Stable tags only: a hyphen marks a pre-release (v0.5.0-rc.1), the same rule
+    # release.yml's prepare job applies, so both workflows agree on what is stable.
+    if: ${{ github.event.inputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     # max 0.3 min green step span over 16 runs since 2026-07-06 (3 green);
     # upload only. Floor applies.
@@ -314,8 +367,10 @@ jobs:
   # ---- PyPI (authoritative): proximadb_embedded native package ----------------------
   publish-embedded-pypi:
     name: Publish proximadb_embedded to PyPI
-    needs: [build-embedded-wheels, build-embedded-sdist, test-embedded-wheels]
-    if: ${{ github.event.inputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/python-v') && !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc') }}
+    needs: [version-gate, build-embedded-wheels, build-embedded-sdist, test-embedded-wheels]
+    # Stable tags only: a hyphen marks a pre-release (v0.5.0-rc.1), the same rule
+    # release.yml's prepare job applies, so both workflows agree on what is stable.
+    if: ${{ github.event.inputs.dry_run != 'true' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     # max 0.4 min green step span over 16 runs since 2026-07-06 (1 green);
     # upload only. Floor applies.

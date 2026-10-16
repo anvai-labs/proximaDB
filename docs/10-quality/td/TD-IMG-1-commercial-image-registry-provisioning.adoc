@@ -35,18 +35,10 @@ and cloud credentials** in **AnvaiOps** before the commercial overlay build can 
 
 == Ownership boundary — the Azure provisioning is AnvaiOps', not ProximaDB's
 
-ProximaDB (this repo, OSS) publishes **only** the public image to **Docker Hub**
-(`docker.io/vjsingh1984/proximadb`) via `publish-image.yml`. It owns no cloud registry and no
-cloud credentials.
-
-The **commercial** side — Azure ACR provisioning, the pricing/entitlement overlay, and the
-push credentials — belongs to **AnvaiOps** and is tracked there. The concrete provisioning
+The concrete provisioning
 runbook (`az acr create`, federated-identity/OIDC role bindings, the overlay pipeline wiring)
 lives in the AnvaiOps repo, **not** here, so this TD does not reproduce it — that would drift
 against the real owner.
-
-This ProximaDB-side TD exists only to record the boundary so the red commercial build is not
-mistaken for a regression in this repo:
 
 * **ProximaDB obligation (this repo):** keep the OSS Docker Hub image green and stable — it is
   the base AnvaiOps overlays. Nothing here is blocked.

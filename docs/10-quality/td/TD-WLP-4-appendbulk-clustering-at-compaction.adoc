@@ -5,45 +5,15 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Resolved 2026-07-14; serving contract superseded/reconciled 2026-07-21.** The shared clustering kernel and compaction PCA+IVF/Hilbert plan shipped and remain reused. Coalesced L0 now uses SQ8-Morton, not the historical sign-Gray/Hilbert bootstrap. #1012 shipped execution wiring. VOE `pca_model_ref`/radius-prune payoff is retired; link:TD-RDSTRAT-8-two-level-ivf-coarse-probe.adoc[TD-RDSTRAT-8] owns persistence of the existing plan into in-segment Region A0 for selective A/B probing. Do not implement the original sidecar scope below.
-| Priority | P1b — the append-path recall payoff; double-gated (compaction armed + profile=AppendBulk).
-| Severity | High — the clustering geometry that read-side prune quality depends on.
-| Component | `src/storage/engines/sst/compaction.rs` (re-cluster call sites ~1221/1350); `src/storage/engines/sst/object_economy_directory.rs` (`pca_model_ref` + centroids ~46/135); `src/storage/engines/sst/block_cluster.rs` / `spatial_clustering.rs` (Hilbert bootstrap); `kmeans_clustering` hoist target (new foundation crate)
-| Governs | link:../../12-design/adr/ADR-061-per-collection-workload-profiles.adoc[ADR-061] (D3)
-| Relates to | TD-RDSTRAT-4/5 and TD-WLP-3 (historical negative block-prune evidence), link:TD-RDSTRAT-8-two-level-ivf-coarse-probe.adoc[TD-RDSTRAT-8] (current query-visible consumer), ADR-062/065 (current serving layout)
-| Pillar | PERF (recall + coalescing from compact clusters), COST (fewer block GETs)
+| Status | **Done (2026-07-14; reconciled 2026-07-21).** Compaction trains PCA + IVF on canonical f32 for `AppendBulk` collections and re-clusters in Hilbert cell order (#995), executed on the armed flush path (#1012). The VOE `pca_model_ref`/radius-prune payoff is retired; link:TD-RDSTRAT-8-two-level-ivf-coarse-probe.adoc[TD-RDSTRAT-8] persists the same plan as Region A0. Do not implement the original sidecar scope.
+| Priority | P1b — the append-path recall payoff.
+| Component | `src/storage/engines/sst/{compaction,block_cluster}.rs`; shared k-means kernel (foundation crate)
+| Relates to | link:../../12-design/adr/ADR-061-per-collection-workload-profiles.adoc[ADR-061] (D3); link:TD-WLP-2-per-collection-compaction-override.adoc[TD-WLP-2]; link:TD-WLP-7-pca-model-ref-and-compaction-execution-wiring.adoc[TD-WLP-7]; link:TD-RDSTRAT-8-two-level-ivf-coarse-probe.adoc[TD-RDSTRAT-8]; link:TD-IVF-3-coarse-pca-projection-width-miscalibrated.adoc[TD-IVF-3] (TD-WLP-4b env gates `PROXIMADB_IVF_NCOMP`/`_A`/`_B`)
+| Pillar | PERF, COST
 |===
 
-toc::[]
+== History
 
-== Why
-
-The original problem and measured negative result remain valid: sign-bit ordering did not make
-VOE block pruning selective enough. The surviving asset is the compaction-time canonical-f32
-PCA+IVF plan. Its current payoff is locality and TD-RDSTRAT-8 Region-A0 probing, not revival of
-VOE radius pruning. Short-lived coalesced L0 uses model-free SQ8-Morton.
-
-== Scope
-
-* At compaction for `AppendBulk` collections: train PCA + IVF (k-means) on PCA-projected fp32 and
-  re-cluster through the canonical compacted-segment writer.
-* L0 flush uses SQ8-Morton (no trained model). `Churn` pins compaction training OFF.
-* **Prerequisite: hoist `kmeans_clustering` from `crates/modalities/proximadb-quantization-kernel`
-  to a foundation crate** — storage/compaction must not depend on a modality kernel (layering
-  guard). Reuse it; do not reimplement Lloyd.
-* Order IVF cells by their centroid's Hilbert code so same-region blocks are physically contiguous
-  (coalescing-friendly).
-
-== TDD gate
-
-Integration test `tests/sst_compaction_reclustering_test.rs` (storage-integration CI job):
-
-* `test_append_compaction_trains_model_and_reclusters`: post-compaction locality improves versus
-  the model-free bootstrap; a `Churn` collection does not train. TD-RDSTRAT-8 separately gates
-  persisted Region-A0 coverage/read compatibility.
-* read-consistency across the atomic segment-swap during re-cluster (ADR-046 LSN-coherence).
-
-== Gating / descope
-
-Current gate: TD-WLP-2 armed AND profile=`AppendBulk`; an explicitly falsy global env remains the
-hard disable. The historical Hilbert-only descope is closed and must not be revived.
+Gate: TD-WLP-2 armed AND profile = `AppendBulk` (an explicitly falsy global env stays the hard disable); `Churn` pins compaction training OFF. Short-lived coalesced L0 uses model-free SQ8-Morton, not the historical sign-Gray/Hilbert bootstrap.
+*Decisions that still apply:* `kmeans_clustering` was hoisted out of the quantization modality kernel into a foundation crate, because storage/compaction must not depend on a modality kernel (layering guard) — reuse it, do not reimplement Lloyd. Sign-bit ordering did not make VOE block pruning selective enough (negative evidence kept in TD-RDSTRAT-4/5, TD-WLP-3); the surviving asset is the compaction-time f32 PCA+IVF plan, whose payoff is locality and A0 probing.
+*Evidence:* `tests/sst_compaction_reclustering_test.rs` (`test_append_compaction_trains_model_and_reclusters`; `Churn` does not train).

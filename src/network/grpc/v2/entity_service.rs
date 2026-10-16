@@ -460,6 +460,9 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
         let tenant = grpc_auth::resolved_tenant_id(&request)?;
         let principal = grpc_auth::user_id(&request);
         let req = request.into_inner();
+        // Shared server top_k cap (TD-SECSCAN-1 §5).
+        proximadb_search_types::top_k_limit::check_top_k(u64::from(req.top_k))
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         debug!(
             "v2 gRPC SearchEntities collection={collection} top_k={} has_vector={} has_filters={}",

@@ -45,7 +45,8 @@ use proximadb_catalog::fc_metamodel::{SubjectId, Target};
 use proximadb_catalog::{
     CatalogColumn, CatalogStorageLayout, CatalogTableSchema, CatalogTableStatistics,
     relational::{
-        CatalogRow, RelationalMutationKind, RelationalRecordOptions, RelationalWriteProfile,
+        CatalogRow, RelationalConstraintKind, RelationalConstraintViolation,
+        RelationalMutationKind, RelationalRecordOptions, RelationalWriteProfile,
         encode_primary_key_tuple, split_primary_key_tuple,
     },
 };
@@ -861,6 +862,17 @@ impl ParentTableResolver for CatalogManagerParentResolver {
             table_id_name: parent_table_id.name.clone(),
         }))
     }
+}
+
+/// Which row-producing statement `enforce_row_write_constraints` runs for
+/// (TD-DML-1): INSERT and UPSERT share one enforcement sequence and differ only
+/// in what a live PK holder means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowWriteConstraintMode {
+    /// A live PK holder is a duplicate (23505).
+    Insert,
+    /// A live PK holder is the row being replaced.
+    Upsert,
 }
 
 /// DML Service for executing DML statements
@@ -3643,121 +3655,18 @@ impl DmlService {
             records.push(record);
         }
 
-        // TD-110 Slice B: enforce PRIMARY KEY uniqueness on INSERT — reject a key that repeats
-        // within this statement OR already exists as a committed row. Uses the point `get_by_key`
-        // lookup (no full scan). Single-column PK; multi-column PK and non-PK UNIQUE constraints
-        // still fail-closed in `CatalogRow::validate` pending the index-backed slice.
-        if let Some(pk_column) = Self::primary_key_column(&table_schema) {
-            let mut batch_keys: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for record in &records {
-                let key = record.oid.clone();
-                if !batch_keys.insert(key.clone()) {
-                    return Err(anyhow!(
-                        "duplicate key value violates primary key '{}' on table '{}': '{}' appears more than once in this INSERT",
-                        pk_column,
-                        table_schema.name,
-                        key
-                    ));
-                }
-                // F2 (ADR-072 D3): when a fenced ConditionalKeyStore is wired, claim
-                // the PK atomically (oid == primary_key_string, so the row is keyed by
-                // its own PK) — a live holder is a duplicate. Otherwise fall back to the
-                // legacy check-then-act `get_by_key` probe. The op-lock is still held for
-                // cascade ordering (D3). NB: the claim and the later `write_mutations`
-                // row write are not yet a single atomic apply — that is the D11
-                // append-only-MVCC follow-up; recovery treats a claimed-but-rowless key
-                // as dead.
-                let is_duplicate = if let Some(cks) = &self.conditional_key_store {
-                    use proximadb_storage_ports::{Generation, Identity, Oid, PutOutcome};
-                    // Key on the F0 typed, order-preserving codec (length-delimited,
-                    // NULL-explicit, no separator collision) built from the row's typed
-                    // PK value and its tenant/keyspace scope — not the legacy oid string
-                    // (ADR-072 D9). Single-column PK matches this block's scope; the oid
-                    // it maps to stays the row's PK-string identity.
-                    let pk_value = match record.props.get(&pk_column) {
-                        Some(ProximaTreeNode::Value(v)) => v.clone(),
-                        _ => {
-                            return Err(anyhow!(
-                                "primary key column '{}' missing from record for '{}' on table '{}'",
-                                pk_column,
-                                key,
-                                table_schema.name
-                            ));
-                        }
-                    };
-                    let id =
-                        Identity::from_bytes(proximadb_data_model::key_codec::encode_identity(
-                            &record.tenant_id,
-                            &table_schema.name,
-                            std::slice::from_ref(&pk_value),
-                        )?);
-                    matches!(
-                        cks.put_if_absent(&id, &Oid(key.clone()), Generation(0))
-                            .await?,
-                        PutOutcome::Conflict { .. }
-                    )
-                } else {
-                    self.record_store
-                        .get_by_key(
-                            &table_schema,
-                            TableRecordGetRequest {
-                                table_id: table_id.name.clone(),
-                                key: key.clone(),
-                                include_vector: false,
-                                include_props: false,
-                            },
-                            None,
-                            #[cfg(feature = "abac-policy")]
-                            &ReadContext::system(
-                                SystemReadReason::ForeignKeyResolution,
-                                "dml::fk_check",
-                            ),
-                        )
-                        .await?
-                        .is_some()
-                };
-                if is_duplicate {
-                    return Err(anyhow!(
-                        "duplicate key value violates primary key '{}' on table '{}': '{}' already exists",
-                        pk_column,
-                        table_schema.name,
-                        key
-                    ));
-                }
-            }
-        }
-
-        // TD-110: enforce non-PK UNIQUE constraints/indexes on INSERT — within-batch
-        // dedup + cross-existing probe (O(1) on index-backed stores, Slice C). No
-        // rows are excluded: every candidate is a brand-new row.
-        let primary_key = Self::primary_key_column(&table_schema);
-        let candidate_sets =
-            Self::build_unique_candidate_sets(&table_schema, &records, primary_key.as_deref())?;
-        if !candidate_sets.is_empty()
-            && let Some(conflict) = self
-                .record_store
-                .check_unique_conflict(
-                    &table_schema,
-                    &table_id.name,
-                    primary_key.as_deref(),
-                    &candidate_sets,
-                    &std::collections::HashSet::new(),
-                    tenant_context,
-                )
-                .await?
-        {
-            return Err(anyhow!(
-                "duplicate key value violates unique constraint on ({}) for table '{}': ({}) already exists",
-                conflict.columns.join(", "),
-                table_schema.name,
-                conflict.tuple.join(", ")
-            ));
-        }
-
-        // TD-110: enforce FOREIGN KEY references (same-partition cross-table).
-        self.enforce_foreign_keys(&table_schema, &records, tenant_context)
-            .await?;
+        // TD-110 / TD-DML-1: PRIMARY KEY (fenced CKS claim or point probe),
+        // secondary UNIQUE and FOREIGN KEY — the ONE enforcement sequence every
+        // row-producing DML shares (UPSERT runs the same one). CHECK / NOT NULL /
+        // types were already enforced row-locally by `CatalogRow::validate`.
+        self.enforce_row_write_constraints(
+            &table_schema,
+            &table_id,
+            &records,
+            RowWriteConstraintMode::Insert,
+            tenant_context,
+        )
+        .await?;
 
         // Compute per-column min/max and NDV from the canonical record props before moving records
         // into mutations. Only orderable types (String, integers) tracked for min/max; floats and
@@ -3913,12 +3822,7 @@ impl DmlService {
                 )
                 .await?
             {
-                return Err(anyhow!(
-                    "duplicate key value violates unique constraint on ({}) for table '{}': ({}) already exists",
-                    conflict.columns.join(", "),
-                    table_schema.name,
-                    conflict.tuple.join(", ")
-                ));
+                return Err(Self::unique_violation(&table_schema, &conflict));
             }
         }
 
@@ -4060,30 +3964,25 @@ impl DmlService {
             .collect::<Result<Vec<_>>>()?;
         // F5: capture the fenced-store PK identities from these tombstone records
         // (same insert-path builder → matching tenant_id + typed PK), applied
-        // after the record store confirms the delete. Single-column PKs only.
+        // after the record store confirms the delete. Full PK tuple (TD-DML-2).
         let cks_tombstone_ids: Vec<proximadb_storage_ports::Identity> =
             if self.conditional_key_store.is_some() {
+                // TD-DML-2: composite PKs are fenced on their full tuple, so
+                // their deletes must release the full-tuple identity too.
                 let pk_cols = Self::primary_key_columns(&table_schema);
-                if pk_cols.len() == 1 {
-                    tombstones
-                        .iter()
-                        .filter_map(|rec| {
-                            let pk_value = match rec.props.get(&pk_cols[0]) {
-                                Some(ProximaTreeNode::Value(v)) => v.clone(),
-                                _ => return None,
-                            };
-                            proximadb_data_model::key_codec::encode_identity(
-                                &rec.tenant_id,
-                                &table_schema.name,
-                                std::slice::from_ref(&pk_value),
-                            )
-                            .ok()
-                            .map(proximadb_storage_ports::Identity::from_bytes)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
+                tombstones
+                    .iter()
+                    .filter_map(|rec| {
+                        let pk_values = Self::record_primary_key_values(rec, &pk_cols)?;
+                        proximadb_data_model::key_codec::encode_identity(
+                            &rec.tenant_id,
+                            &table_schema.name,
+                            &pk_values,
+                        )
+                        .ok()
+                        .map(proximadb_storage_ports::Identity::from_bytes)
+                    })
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -4114,8 +4013,8 @@ impl DmlService {
         // FK to it would wrongly succeed, and re-inserting the same PK would
         // wrongly conflict. The identities are derived from the SAME tombstone
         // records above (which go through the insert-path record builder), so the
-        // `tenant_id` + typed PK match the CKS registration exactly. Single-column
-        // PKs only (F2's fencing scope).
+        // `tenant_id` + typed PK tuple match the CKS registration exactly
+        // (single- and multi-column PKs alike — TD-DML-2).
         if let Some(cks) = &self.conditional_key_store {
             for id in &cks_tombstone_ids {
                 cks.tombstone(id, proximadb_storage_ports::Generation(0))
@@ -4167,6 +4066,10 @@ impl DmlService {
         let dml_lock_guard = self
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
+        // TD-DML-1: the same non-reentrant in-process op-lock INSERT holds (see
+        // execute_insert) — the constraint probes below and the write must not
+        // interleave with a concurrent writer or a cascading parent DELETE.
+        let _op_lock = self.catalog_manager.op_locks().acquire(&table_id).await?;
         let (write_intent, write_lane_decision) = Self::route_row_dml_write_intent(
             &table_schema,
             WriteOperationKind::Upsert,
@@ -4187,6 +4090,23 @@ impl DmlService {
             inserted_ids.push(record.oid.clone());
             records.push(record);
         }
+
+        // TD-DML-1: an UPSERT writes rows exactly like INSERT does, so it runs
+        // the SAME integrity sequence (PK claim, secondary UNIQUE, FOREIGN KEY);
+        // CHECK / NOT NULL ran row-locally in `build_mutation_record`. The
+        // Upsert mode differs only where the semantics do: a live PK holder is
+        // the row being replaced (not a duplicate), and replaced rows vacate
+        // their own UNIQUE values (no self-conflict).
+        let replaced = self
+            .enforce_row_write_constraints(
+                &table_schema,
+                &table_id,
+                &records,
+                RowWriteConstraintMode::Upsert,
+                tenant_context,
+            )
+            .await?;
+        let new_rows = replaced.iter().filter(|existed| !**existed).count();
 
         let num_records = records.len();
         let mutations = records
@@ -4214,8 +4134,8 @@ impl DmlService {
             "Upserted rows"
         );
 
-        self.bump_row_count_stats(table_name, num_records as i64)
-            .await;
+        // Only rows that did not exist grow the table; replaced rows do not.
+        self.bump_row_count_stats(table_name, new_rows as i64).await;
 
         let result =
             DmlResult::success(num_records as u64, format!("Upserted {} rows", num_records))
@@ -4975,6 +4895,246 @@ impl DmlService {
         crate::services::record_store::schema_unique_column_sets(table_schema)
     }
 
+    /// The record's typed PK tuple, one value per `pk_columns` entry in order —
+    /// the input `encode_identity` keys the fenced ConditionalKeyStore on.
+    /// `None` when any PK column is absent or non-scalar.
+    fn record_primary_key_values(
+        record: &ProximaRecord,
+        pk_columns: &[String],
+    ) -> Option<Vec<ProximaValue>> {
+        pk_columns
+            .iter()
+            .map(|column| match record.props.get(column) {
+                Some(ProximaTreeNode::Value(value)) => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The typed 23505 error for a secondary-UNIQUE conflict (shared by the
+    /// INSERT/UPSERT enforcement sequence and UPDATE).
+    fn unique_violation(
+        table_schema: &CatalogTableSchema,
+        conflict: &crate::services::record_store::UniqueConflict,
+    ) -> anyhow::Error {
+        RelationalConstraintViolation::new(
+            RelationalConstraintKind::Unique,
+            format!(
+                "duplicate key value violates unique constraint on ({}) for table '{}': ({}) already exists",
+                conflict.columns.join(", "),
+                table_schema.name,
+                conflict.tuple.join(", ")
+            ),
+        )
+        .into()
+    }
+
+    /// TD-DML-1: the ONE pre-write integrity sequence for row-producing DML
+    /// (INSERT and every UPSERT spelling). Runs, in order:
+    ///
+    /// 1. PRIMARY KEY — within-statement repeat, then per row the F2 fenced
+    ///    `ConditionalKeyStore::put_if_absent` claim when wired (ADR-072 D3),
+    ///    else the point `get_by_key` probe;
+    /// 2. secondary UNIQUE — `build_unique_candidate_sets` +
+    ///    `check_unique_conflict` (TD-110);
+    /// 3. FOREIGN KEY — `enforce_foreign_keys` (TD-110).
+    ///
+    /// CHECK / NOT NULL / type constraints are row-local and already ran in
+    /// `CatalogRow::validate` when the records were built.
+    ///
+    /// Returns, per record in order, whether its PK already had a live row. For
+    /// `Insert` a live holder is a 23505 error, so every entry is `false`; for
+    /// `Upsert` it marks the row being replaced. If a later step rejects the
+    /// statement, PK claims this call made in the fenced store are released so
+    /// a rejected statement leaves no claimed-but-rowless key behind.
+    async fn enforce_row_write_constraints(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &TableIdentifier,
+        records: &[ProximaRecord],
+        mode: RowWriteConstraintMode,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Vec<bool>> {
+        let mut fresh_claims: Vec<proximadb_storage_ports::Identity> = Vec::new();
+        let outcome = self
+            .enforce_row_write_constraints_inner(
+                table_schema,
+                table_id,
+                records,
+                mode,
+                tenant_context,
+                &mut fresh_claims,
+            )
+            .await;
+        if outcome.is_err()
+            && let Some(cks) = &self.conditional_key_store
+        {
+            for id in &fresh_claims {
+                if let Err(release_err) = cks
+                    .tombstone(id, proximadb_storage_ports::Generation(0))
+                    .await
+                {
+                    warn!(
+                        table = %table_schema.name,
+                        error = %release_err,
+                        "failed to release a fenced PK claim after a rejected write"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    async fn enforce_row_write_constraints_inner(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &TableIdentifier,
+        records: &[ProximaRecord],
+        mode: RowWriteConstraintMode,
+        tenant_context: Option<&TenantContext>,
+        fresh_claims: &mut Vec<proximadb_storage_ports::Identity>,
+    ) -> Result<Vec<bool>> {
+        let mut pk_live = vec![false; records.len()];
+
+        // TD-110 Slice B: PRIMARY KEY — reject a key that repeats within this
+        // statement OR (INSERT) already exists as a committed row. Composite-PK
+        // aware (TD-DML-2): the fenced identity is built from the FULL PK tuple.
+        let pk_columns = Self::primary_key_columns(table_schema);
+        if !pk_columns.is_empty() {
+            let pk_column = pk_columns.join(", ");
+            let mut batch_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (index, record) in records.iter().enumerate() {
+                let key = record.oid.as_str();
+                if !batch_keys.insert(key) {
+                    return Err(match mode {
+                        RowWriteConstraintMode::Insert => RelationalConstraintViolation::new(
+                            RelationalConstraintKind::Unique,
+                            format!(
+                                "duplicate key value violates primary key '{}' on table '{}': '{}' appears more than once in this INSERT",
+                                pk_column, table_schema.name, key
+                            ),
+                        ),
+                        RowWriteConstraintMode::Upsert => RelationalConstraintViolation::new(
+                            RelationalConstraintKind::UpsertAffectsRowTwice,
+                            format!(
+                                "ON CONFLICT DO UPDATE command cannot affect row a second time: primary key '{}' value '{}' appears more than once in this statement on table '{}'",
+                                pk_column, key, table_schema.name
+                            ),
+                        ),
+                    }
+                    .into());
+                }
+                // F2 (ADR-072 D3): when a fenced ConditionalKeyStore is wired,
+                // claim the PK atomically (oid == primary_key_string, so the row
+                // is keyed by its own PK) — a live holder means the key exists.
+                // Otherwise fall back to the legacy check-then-act `get_by_key`
+                // probe. The op-lock is held by the caller for cascade ordering
+                // (D3). NB: the claim and the later `write_mutations` row write
+                // are not yet a single atomic apply — that is the D11
+                // append-only-MVCC follow-up.
+                let is_live = if let Some(cks) = &self.conditional_key_store {
+                    use proximadb_storage_ports::{Generation, Identity, Oid, PutOutcome};
+                    // Key on the F0 typed, order-preserving codec built from the
+                    // row's typed PK tuple (every PK column, in catalog order —
+                    // TD-DML-2) and its tenant/keyspace scope — not the legacy
+                    // oid string (ADR-072 D9).
+                    let pk_values = Self::record_primary_key_values(record, &pk_columns)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "primary key ({}) missing from record for '{}' on table '{}'",
+                                pk_column,
+                                key,
+                                table_schema.name
+                            )
+                        })?;
+                    let id =
+                        Identity::from_bytes(proximadb_data_model::key_codec::encode_identity(
+                            &record.tenant_id,
+                            &table_schema.name,
+                            &pk_values,
+                        )?);
+                    match cks
+                        .put_if_absent(&id, &Oid(key.to_string()), Generation(0))
+                        .await?
+                    {
+                        PutOutcome::Conflict { .. } => true,
+                        PutOutcome::Committed { .. } => {
+                            fresh_claims.push(id);
+                            false
+                        }
+                    }
+                } else {
+                    self.record_store
+                        .get_by_key(
+                            table_schema,
+                            TableRecordGetRequest {
+                                table_id: table_id.name.clone(),
+                                key: key.to_string(),
+                                include_vector: false,
+                                include_props: false,
+                            },
+                            None,
+                            #[cfg(feature = "abac-policy")]
+                            &ReadContext::system(
+                                SystemReadReason::ForeignKeyResolution,
+                                "dml::fk_check",
+                            ),
+                        )
+                        .await?
+                        .is_some()
+                };
+                if is_live && mode == RowWriteConstraintMode::Insert {
+                    return Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::Unique,
+                        format!(
+                            "duplicate key value violates primary key '{}' on table '{}': '{}' already exists",
+                            pk_column, table_schema.name, key
+                        ),
+                    )
+                    .into());
+                }
+                pk_live[index] = is_live;
+            }
+        }
+
+        // TD-110: secondary UNIQUE constraints/indexes — within-statement dedup +
+        // cross-existing probe (O(1) on index-backed stores, Slice C). INSERT
+        // excludes nothing (every row is new). UPSERT excludes the statement's
+        // own oids: a replaced row vacates its old UNIQUE values (exactly as
+        // UPDATE excludes its target rows), and a new row's oid is not stored.
+        let primary_key = Self::primary_key_column(table_schema);
+        let candidate_sets =
+            Self::build_unique_candidate_sets(table_schema, records, primary_key.as_deref())?;
+        if !candidate_sets.is_empty() {
+            let exclude_oids: std::collections::HashSet<String> = match mode {
+                RowWriteConstraintMode::Insert => std::collections::HashSet::new(),
+                RowWriteConstraintMode::Upsert => {
+                    records.iter().map(|record| record.oid.clone()).collect()
+                }
+            };
+            if let Some(conflict) = self
+                .record_store
+                .check_unique_conflict(
+                    table_schema,
+                    &table_id.name,
+                    primary_key.as_deref(),
+                    &candidate_sets,
+                    &exclude_oids,
+                    tenant_context,
+                )
+                .await?
+            {
+                return Err(Self::unique_violation(table_schema, &conflict));
+            }
+        }
+
+        // TD-110: FOREIGN KEY references (same-partition cross-table).
+        self.enforce_foreign_keys(table_schema, records, tenant_context)
+            .await?;
+
+        Ok(pk_live)
+    }
+
     /// TD-110: build the per-set candidate tuples for `records`, rejecting a tuple
     /// that repeats within this statement (NULL tuples exempt). Shared by INSERT
     /// and UPDATE; the caller passes the result to `check_unique_conflict`.
@@ -5394,13 +5554,17 @@ impl DmlService {
                 None
                 | Some(proximadb_catalog::ReferentialAction::Restrict)
                 | Some(proximadb_catalog::ReferentialAction::NoAction) => {
-                    return Err(anyhow!(
-                        "DELETE on table '{}' violates FOREIGN KEY ({}) on table '{}': {} referencing row(s) remain (ON DELETE NO ACTION)",
-                        table_id.name,
-                        fk_columns.join(", "),
-                        child_id.name,
-                        referencing.len()
-                    ));
+                    return Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::ForeignKey,
+                        format!(
+                            "DELETE on table '{}' violates FOREIGN KEY ({}) on table '{}': {} referencing row(s) remain (ON DELETE NO ACTION)",
+                            table_id.name,
+                            fk_columns.join(", "),
+                            child_id.name,
+                            referencing.len()
+                        ),
+                    )
+                    .into());
                 }
                 Some(proximadb_catalog::ReferentialAction::Cascade) => {
                     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -5599,14 +5763,11 @@ impl DmlService {
                 // — "foreign-key existence checks (phase 2) ride this method"),
                 // instead of a check-then-act probe on the record store. This
                 // makes the child-insert see the authoritative uniqueness index
-                // and closes the TOCTOU with a concurrent parent delete. Only the
-                // single-column case is CKS-fenced today (F2 registers one PK
-                // value), so multi-column FKs keep the record-store probe.
-                let referenced_exists = if let Some(cks) = self
-                    .conditional_key_store
-                    .as_ref()
-                    .filter(|_| values.len() == 1)
-                {
+                // and closes the TOCTOU with a concurrent parent delete. The FK
+                // references the parent's FULL PK in order (checked above), and
+                // the parent claim is keyed on that full tuple (TD-DML-2), so
+                // single- and multi-column FKs both resolve through the CKS.
+                let referenced_exists = if let Some(cks) = self.conditional_key_store.as_ref() {
                     let id = proximadb_storage_ports::Identity::from_bytes(
                         proximadb_data_model::key_codec::encode_identity(
                             &record.tenant_id,
@@ -5636,14 +5797,18 @@ impl DmlService {
                         .is_some()
                 };
                 if !referenced_exists {
-                    return Err(anyhow!(
-                        "FOREIGN KEY ({}) on table '{}' violates reference: '{}' is not present in {}({})",
-                        fk_columns.join(", "),
-                        table_schema.name,
-                        key,
-                        references_table,
-                        references_columns.join(", ")
-                    ));
+                    return Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::ForeignKey,
+                        format!(
+                            "FOREIGN KEY ({}) on table '{}' violates reference: '{}' is not present in {}({})",
+                            fk_columns.join(", "),
+                            table_schema.name,
+                            key,
+                            references_table,
+                            references_columns.join(", ")
+                        ),
+                    )
+                    .into());
                 }
             }
         }

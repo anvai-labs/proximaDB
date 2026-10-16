@@ -2,6 +2,13 @@
 :toc: macro
 :icons: font
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (reconciled 2026-10-15).** Finding 1 is done: the code graph now indexes `src/storage`, per link:ROOT_CRATE_DECOMPOSITION_CI_BUILD_OPTIMIZATION_2026_07_11.adoc[CI-build-opt]. Finding 2 (test extraction) is partial (#874). Finding 4 (dead engines) is partial: CHRONO/TITAN removed (#702), `cedar`/`sequoia` reduced to `mod.rs`, SWIFT/RAPTOR gated `experimental-engines`, VIPER deprecated (ADR-093); see TD-ENGINE-1. `viper/pipeline.rs` was deleted. Findings 3 and 5 are open.
+| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:../10-quality/td/TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-ENGINE-1], link:../10-quality/td/TD-ENGDUP-1-per-engine-helpers-are-copied-across-the-storage-engines.adoc[TD-ENGDUP-1] (overlap: Finding 3 cross-engine duplication)
+|===
+
 [abstract]
 Structure + duplication review of `src/storage/` — the largest subsystem in the root crate
 (577 `.rs` files, ~52 MB of source; `engines/` alone is 333 files). Third in the per-subsystem

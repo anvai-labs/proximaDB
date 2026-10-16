@@ -3,6 +3,13 @@
 :filed: 2026-07-26
 :priority: P1 (corrects the flagship rate-card number)
 
+[cols="1,3"]
+|===
+| Status | **Open (measured 2026-07-26).** Corrected economics recorded (#1233; consistent 1M post-compaction measurement: survivor 38.2% hit, ledger `cache_hot_vs_cold_1m_post_compaction`, #1296). The whole-region SQ8 caching direction below is not recorded as shipped for the DRAM hot tier; the persistent-L2 parent-range entries of link:TD-CACHE-9-persistent-pax-warm-tier.adoc[TD-CACHE-9] are the related mechanism.
+| Component | `src/storage/engines/sst/survivor_range_cache.rs`; SQ8 survivor fetch keying
+| Relates to | link:TD-CACHE-6-survivor-cache-bypassed-on-probe-path.adoc[TD-CACHE-6], link:TD-CACHE-3-hot-tier-per-tenant-enforcement.adoc[TD-CACHE-3], link:TD-CACHE-9-persistent-pax-warm-tier.adoc[TD-CACHE-9] (overlap: parent-range reuse of SQ8 regions)
+|===
+
 == The finding (diverse-query hot-tier bed)
 
 The "hot ≈ 0 GETs, 2,602 QPS, ~$0.01/M" claim was measured with IDENTICAL

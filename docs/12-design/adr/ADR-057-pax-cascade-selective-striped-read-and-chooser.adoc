@@ -14,60 +14,15 @@
 | Research basis | In-code substrate verified against `origin/develop` 2026-07-09 (§3), via an `io_trace` backtrace probe on the live search read path — not doc-reading.
 |===
 
-== 1. Context + the question
+== 1. Context (compacted 2026-10-15 — superseded)
 
-TD-RDSTRAT-2 established, by measurement, that the read-strategy chooser and read-coalescing built in
-TD-151/TD-RDSTRAT-1 are **inert on real vector-search data**: they were wired into the reader for the
-**retired ProximaBlocks `.sst` format** (ADR-049 M1-3 folds every non-Arrow flush to `.pax`). The live
-path — the **PAX RaBitQ cascade** — reads **each segment WHOLE** in one `fs.read()`
-(`search/mod.rs:271`) and never consults a chooser.
-
-The question this ADR answers: *how do we give the live PAX vector-search path a real, cost-driven
-read-strategy choice — so a selective query on cold object storage stops paying to fetch the whole
-segment — without a from-scratch build and without touching recall?*
-
-The co-design framing (ADR-052/034): the dominant at-read cost term is **bytes moved + GET
-round-trips**, not CPU. A whole-segment read is one GET but over-fetches massively when the query
-touches few candidate rows; a **selective striped read** moves far fewer bytes at the cost of more
-(coalescable) GETs. The crossover is a function of selectivity + storage tier — exactly what a cost
-model decides.
-
-== 2. The key realisation — the selective read is already MODELLED, and the substrate already EXISTS
-
-The RaBitQ cascade is *already* a two-stage design, and `segment_format.rs:411` names the two stripes
-it *logically* reads per surviving block:
-
-* **Stage 1** — the **RaBitQ codes stripe** (`col_id::EMBED_BASE` codes, ~30× compressed): rank blocks
-  coarsely, produce a candidate pool.
-* **Stage 2** — the **SQ8 (or exact-f32 tier) bytes for ONLY the candidate rows**: rerank to final
-  order.
-
-Today both stages run over the **whole in-memory segment** (read at `search/mod.rs:271`), and
-`segment_format.rs:424` records `io_trace::record_range_gets(1)` + the projected byte cost as a
-**LOGICAL** trace ("Trace the cascade's logical reads for this kept block"). **This ADR makes that
-logical trace physical.**
-
-== 3. Substrate inventory (verified in-code — we are NOT building from scratch)
-
-* **Ranged stripe reads exist.** `crates/storage/proximadb-block-format/src/ranged.rs` reads an
-  individual column stripe by `ColumnMeta.stripe_offset` + `stripe_len` and decodes the returned
-  bytes (dependency-inverted: the caller supplies the reader). The per-column offsets/lengths are
-  persisted by the writer (`proximadb-block-format/src/writer.rs`).
-* **Batched, coalescing GET primitive exists.** `FileSystem::read_ranges` issues a **batched ranged
-  read — one call = one GET operation** that coalesces/parallelises on the wire
-  (`proximadb-storage-common/src/object_store_bridge.rs`, `…filesystem-types/src/counting.rs`). This
-  is the exact primitive a striped read needs, and it is already io_trace-instrumented.
-* **A selective PAX reader exists.** `PaxSplitReader` (`src/datafusion/engine_adapters/pax_adapter.rs`)
-  already does zone-map/bloom pruning + projection pushdown for the DataFusion table source (#736/#748;
-  ADR-055 reuses it for documents).
-* **The chooser core exists, pure + unit-tested.** `choose_read_strategy`
-  (`src/storage/engines/core/coalesce_strategy.rs`) prices per-block vs coalesced from
-  `per_get·n_gets + per_mib·n_bytes` and the `is_cloud` tier. Reusable verbatim as the decision core.
-* **The cost terms are measured.** `io_trace` (`range_gets`, `bytes_read`, `avg_get_bytes`) is
-  always-on and per-query; ADR-050's cost loop already prices `per_get`/`per_mib`.
-
-So the work is **routing + a chooser at one call site**, reusing four existing primitives — not a new
-reader.
+TD-RDSTRAT-2 measured that the read-strategy chooser and read-coalescing (TD-151/TD-RDSTRAT-1)
+were inert on real vector-search data: they were wired to the retired ProximaBlocks `.sst`
+reader, while the live PAX RaBitQ cascade read each segment whole in one `fs.read()`. The
+cascade already *modelled* a two-stage selective read (RaBitQ codes stripe → SQ8/f32 bytes for
+candidate rows only) as a *logical* io_trace; this ADR set out to make it physical by reusing
+existing primitives (`ranged` stripe reads, batched `FileSystem::read_ranges`, `PaxSplitReader`,
+the pure `choose_read_strategy` core) — routing plus one chooser call site, not a new reader.
 
 == 4. Decision
 
@@ -99,67 +54,18 @@ Binding directives:
 5. **Retire the dead wiring.** Remove or explicitly legacy-gate the `.sst`-path chooser sites
    (`batch_read_with_filtering`, `traditional_search`) so capability isn't misread as live (TD-RDSTRAT-2).
 
-== 5. The cost model (why not a selectivity threshold)
+== History (superseded)
 
-Per surviving-block set, with `S` = candidate rows, `dim`, tier `t`:
-
-----
-cost(whole)    = per_get(t)·1            + per_mib(t)·(segment_bytes / MiB)
-cost(striped)  = per_get(t)·n_get(ranges)+ per_mib(t)·((codes_stripe_bytes + S·rerank_row_bytes)/MiB)
-choose = argmin(cost(whole), cost(striped))
-----
-
-`n_get(ranges)` is the coalesced range count from the stripe offsets (via the existing coalescer);
-`per_get`/`per_mib` and the tier come from io_trace/ADR-050. The crossover — selective+cold ⇒ striped,
-dense+hot ⇒ whole — **falls out of the model**, not a hardcoded 30/50/70 % (the mistake ADR-052
-corrected).
-
-== 6. Trace-first plan (mirrors ADR-055's P-Trace discipline)
-
-* **P0 — Baseline trace (no code):** extend `tests/rdstrat_get_count_measurement_test.rs` (retired #1024 — striped-read dormant under the canonical coalesced path, ADR-062) to record the
-  cascade's whole-segment bytes vs the *logical* striped bytes it already projects, on a
-  cold-tier-simulated (`s3://`-schemed path) representative trace. This quantifies the headroom before
-  any build.
-* **P1 — Striped read (default-OFF):** route the cascade's two stages through `ranged`/`read_ranges`
-  behind a flag; parity test (byte-identical candidates + order) + recall ratchet green.
-* **P2 — Chooser at the cascade:** wire `choose_read_strategy` with the two-stage byte estimate; observe
-  mode (log chosen strategy + predicted/actual cost) under `PROXIMADB_READ_STRATEGY_CHOOSER`.
-* **P3 — Flip + cleanup:** flip default-on once the io_trace ratchet + recall gate pass on the cold-tier
-  trace; make the `segment_format.rs:424` accounting physical; retire the dead `.sst` sites.
-
-Slices, caps, and thresholds tracked under
-link:../../10-quality/td/TD-RDSTRAT-3-pax-cascade-striped-read-chooser-slices.adoc[TD-RDSTRAT-3]
-(blocked on this ADR's decider sign-off; S0 baseline trace may start beforehand).
-
-== 7. Alternatives considered
-
-* **Do nothing (whole-segment forever).** Rejected: on cold object storage a selective query pays to
-  move the whole segment — the exact bytes-scanned cost ADR-052 says is dominant. Fine only while every
-  segment is hot/cached or tiny.
-* **Always striped.** Rejected: on hot NVMe or dense queries the extra GETs + per-request overhead lose
-  to one whole-segment read. The point is the *choice*, tier-aware.
-* **Re-home onto the `.sst` ModularBlockReader path (fix TD-RDSTRAT-2's wiring in place).** Rejected: that
-  reader serves a retired format; no real data reaches it. Threading hints there is polishing dead code.
-* **Push vectors through the DataFusion `PaxSplitReader` pushdown path.** Deferred, not rejected: the
-  ANN cascade's stage-1 ranking is not a relational predicate, so it doesn't map onto projection/zone-map
-  pushdown cleanly today. Revisit if/when ANN becomes a table-source operator (ADR-053/054). For now the
-  `ranged` primitive is the right seam.
-
-== 8. Consequences
-
-* **Positive:** the read-strategy chooser finally acts on real data; selective cold-tier queries move
-  dramatically fewer bytes; io_trace stops double-counting logical reads; the dead `.sst` wiring is
-  cleaned up; TD-RDSTRAT-1's chooser investment is realised rather than stranded.
-* **Costs/risks:** two-stage striped reads add GET round-trips (mitigated by `read_ranges` coalescing
-  and the chooser declining on hot/dense cases); a new default-OFF read path to validate against the
-  recall ratchet; the stripe-offset metadata must be present + correct for every segment version
-  (mixed-read-safe: fall back to whole-segment when absent).
-* **Neutral:** no wire/format change — this is a *reader* strategy over the existing PAX layout; writers
-  are untouched.
-
-== 9. Non-goals
-
-* Changing the RaBitQ cascade's ranking/rerank math or recall (unchanged).
-* A PAX on-disk format/version bump (the stripe offsets already exist).
-* Building a new PAX reader or decoder (reuse `ranged` + `read_ranges` + `choose_read_strategy`).
-* Wiring ANN into DataFusion pushdown (separate, deferred — §7).
+* Accepted 2026-07-09 with TD-RDSTRAT-3: measured 72–73% byte headroom, S1a planner and S1b
+  ranged-rerank primitive, parity-verified (#816, #827).
+* **Superseded operationally by link:ADR-062-coalesced-rabitq-header-self-describing-footer-pax-layout.adoc[ADR-062]
+  (#1024, 2026-07-15):** one coalesced Region-A scan + survivor-range rerank beat the
+  tier-aware whole-vs-striped choice on the dominant GET-round-trip term; the chooser/striped
+  route is dormant and `tests/rdstrat_get_count_measurement_test.rs` was retired. The rerank
+  primitives are reused by ADR-062/ADR-065; TD-RDSTRAT-8 adds persisted coarse probing.
+* Lasting lessons: the crossover must fall out of a cost model (`per_get·n_gets +
+  per_mib·bytes`, tier-aware), never a hardcoded selectivity threshold; and verify a lever is on
+  the *live* read path (io_trace backtrace probe) before tuning it — the chooser polished dead
+  code for a retired format.
+* Do not revive the P0–P3 default-flip plan without new evidence that beats the ADR-062/065
+  stack.

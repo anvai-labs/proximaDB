@@ -1455,6 +1455,8 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             request.get_ref().top_k as usize,
             Some(prost::Message::encoded_len(request.get_ref()) as u64),
         )?;
+        // After auth: unauthenticated requests get the auth error, not the cap.
+        check_search_top_k(request.get_ref().top_k)?;
         let req = request.into_inner();
         debug!(
             "V2 gRPC: Search - collection='{}', top_k={}",
@@ -1512,6 +1514,10 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
                     predicate_shortfall,
                 }))
             }
+            Err(e) if crate::services::operations::vectors::is_client_argument_error(&e) => {
+                // Invalid query vector or over-cap top_k (TD-SECSCAN-1).
+                Err(Status::invalid_argument(e.to_string()))
+            }
             Err(e) => {
                 error!("V2 gRPC: Search failed: {}", e);
                 if e.to_string().contains("not found") {
@@ -1541,6 +1547,8 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             request.get_ref().top_k as usize,
             Some(prost::Message::encoded_len(request.get_ref()) as u64),
         )?;
+        // After auth: unauthenticated requests get the auth error, not the cap.
+        check_search_top_k(request.get_ref().top_k)?;
         let req = request.into_inner();
         debug!(
             "V2 gRPC: SearchStream - collection='{}', top_k={}",
@@ -1561,7 +1569,13 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             .record_ops
             .handle_record_search_for_tenant(search_request, identity.as_borrowed())
             .await
-            .map_err(|e| Status::internal(format!("Search stream failed: {}", e)))?;
+            .map_err(|e| {
+                if crate::services::operations::vectors::is_client_argument_error(&e) {
+                    Status::invalid_argument(e.to_string())
+                } else {
+                    Status::internal(format!("Search stream failed: {}", e))
+                }
+            })?;
 
         // Create a channel for streaming results
         let (tx, rx) = tokio::sync::mpsc::channel(128);
@@ -2569,6 +2583,13 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
         created_at: c.created_at,
         updated_at: c.updated_at,
     }
+}
+
+/// Reject a `top_k` above the shared server cap with `InvalidArgument`
+/// (TD-SECSCAN-1 §5) — the same limit REST and Arrow Flight enforce.
+fn check_search_top_k(top_k: u32) -> Result<(), Status> {
+    proximadb_search_types::top_k_limit::check_top_k(u64::from(top_k))
+        .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
 #[cfg(test)]

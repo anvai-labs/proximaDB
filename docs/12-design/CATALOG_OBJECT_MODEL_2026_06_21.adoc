@@ -20,7 +20,7 @@ is stacked.
 [IMPORTANT]
 ====
 Owner: Architecture. Scope: cross-cutting object/catalog model over all modalities and multitenancy.
-Status: *Vision accepted; phased implementation*. Subordinate to
+Status: *Vision accepted; phased implementation* — **Partial (verified 2026-10-15): §12 P2 shipped (single canonical DrPath layout, flag + legacy layout removed); P1, P3–P6 open** (`CatalogProjection` still has no `location`; `materialized_views` is still `Vec<String>`; `MetadataStoreInterface` still exists in `src/storage/metadata/mod.rs`). Collection identity is now owned by link:adr/ADR-0083-consolidated-catalog-identity-model.adoc[ADR-0083] (composite `CollectionIdentity`). Subordinate to
 link:DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc[the course correction] and
 link:CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc[the co-design spine]; consolidates the catalog
 authority that those docs assume.
@@ -245,20 +245,13 @@ Each slice is an independently shippable, gated increment (one meaty PR each):
   add the `indexes/<projection>` `DrResolvedPath` subprefix; ANN index persistence resolves its path
   from the projection (falls back to `index_persist_url` when unset). *Unblocks indexes-as-catalog-
   objects.* (Queued.)
-. *P2 — Resolver-persists-location + DrPath the SINGLE layout.* *Persist + prefer-stored was already
-  in place* for the warehouse path: `materialize_table_to_parquet` writes the computed `location` into
-  the catalog layout via `set_storage_layouts`, and the executor prefers the stored layout `location`
-  (`select_primary_layout`; computed prefix only when `location.is_none()`). On that basis the path
-  fork was *fully collapsed*, not just defaulted: `PROXIMADB_WAREHOUSE_DRPATH` (flag) **and** the
-  legacy `data/{tenant}/{ns.join}/{table}` layout **and** the now-redundant manual
-  `validate_object_path_segments` are all *removed*. `resolve_materialize_prefix` is the single
-  canonical DrPath `data/{tenant}/{namespace_id}/{table}` (`build_from_parts` validates every segment).
-  *Single-tenant is a degenerate multi-tenant*: the embedded / no-tenant path carries the well-known
-  `DEFAULT_NAMESPACE_ID` (`ns_default`) — matching the record-store write path — so there is no
-  special case. Safe with no read-both/backfill (reads use the *stored* location; no deployments).
-  Projection-`location` persist is unmotivated (the derived DrPath path is deterministic) and needs a
-  `set_projections` write that does not exist — deferred. *Principle:* addressing is structural, one
-  canonical representation, no per-mode fork (extends "isolation is structural").
+. *P2 — Resolver-persists-location + DrPath the SINGLE layout.* **Shipped.** The warehouse path
+  persists the computed `location` (`set_storage_layouts`) and the executor prefers it; the path fork was
+  *fully collapsed* — `PROXIMADB_WAREHOUSE_DRPATH`, the legacy `data/{tenant}/{ns.join}/{table}` layout and
+  `validate_object_path_segments` removed; `resolve_materialize_prefix` is the single canonical DrPath
+  `data/{tenant}/{namespace_id}/{table}`. *Single-tenant is a degenerate multi-tenant* (`ns_default`).
+  Projection-`location` persist is deferred (needs a `set_projections` write that does not exist).
+  *Principle:* addressing is structural, one canonical representation, no per-mode fork.
 . *P3 — MV as projection.* Replace name-only `materialized_views` with `CatalogProjection{
   MaterializedView}` + `location`; planners/EXPLAIN read projections.
 . *P4 — Collapse the parallel model.* `Collection`/`MetadataStoreInterface` → `CatalogObject`; proto

@@ -24,6 +24,16 @@ sequence inspired by PostgreSQL/Oracle, Exadata/Netezza, Teradata/Redshift, Vert
 Spark/Trino, Snowflake, and BigQuery, use
 link:COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20.adoc[COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20].
 
+NOTE: *Status (2026-10-15): vision anchor, Open/Partial; read through the later pivots.* This
+2026-05-12 anchor predates the
+link:DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc[2026-06-04 course correction],
+the link:CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc[co-design spine] and
+link:adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (DataFusion kernels are the
+OLAP executor). Where they disagree — e.g. "Rust-native distributed execution via DataFusion/Ballista"
+(still open: see link:DATAFUSION_BALLISTA_DISTRIBUTED_EXECUTION_2026_06_05.adoc[the Ballista blueprint])
+— the later docs win. Product shape, competitive lessons and the phasewise roadmap below are not
+re-audited here.
+
 == Executive Position
 
 ProximaDB should become the **context data and AI operating system**: one catalog, one policy

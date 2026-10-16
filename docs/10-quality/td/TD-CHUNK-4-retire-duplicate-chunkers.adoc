@@ -5,12 +5,22 @@
 [cols="1,3",options="header"]
 |===
 | Field | Value
-| Status | **Open — filed 2026-08-17 with ADR-091.** The dead-code half needs no port and no suite and can start immediately; the live-code half is gated on TD-CHUNK-2's migration.
+| Status | **Partial: the ProximaDB-side items shipped — zero-caller `proximadb-embedding/src/chunker.rs` deleted and the inert `Heading` chunk-strategy policy removed from the persisted config/proto (#1679, via TD-CHUNK-5); open: every Victor/victor-rag deletion below (other repositories) and the `victor_coding/codebase/` sweep gated on ADR-014 phase two.** The dead-code half needs no port and no suite; the live-code half is gated on TD-CHUNK-2's migration.
 | Dim | D4 (compute-per-modality)
 | Pillar | OE — secondary SUS
 | Blocks | Nothing
 | Depends on | Dead-code slices: nothing. Live-code slices: TD-CHUNK-2 (consumers must be on the port first).
+| Relates to | link:TD-CHUNK-5-reconcile-wire-and-rust-chunk-policy.adoc[TD-CHUNK-5] (overlap: the `chunker.rs` / catalog `Heading` items were executed there), link:TD-CHUNK-2-boundary-source-budget-segmenter-port.adoc[TD-CHUNK-2], link:TD-CG2-retire-in-sdk-code-chunker.adoc[TD-CG2]
 |===
+
+== History (shipped)
+
+* ProximaDB `crates/modalities/proximadb-embedding/src/chunker.rs` (127 lines, zero callers) and its
+  `ChunkConfig`/`ChunkStrategy` mirror were deleted, and the wire `ChunkConfig` was removed with proto
+  field 2 reserved by number and name (#1679, executed under TD-CHUNK-5). This also closes the
+  **catalog-truthfulness item**: a persisted `Heading` policy that silently fell back to paragraph no
+  longer exists. Lesson: the per-crate `cargo check` passed while the server binary was broken by the
+  deletion — verify the server binary.
 
 == The census, split by what it costs to remove
 
@@ -24,7 +34,7 @@ product chunking is only about **470 lines** in two paths; almost everything els
 | Victor `victor/framework/ingestion/` | 1,415 | **Zero importers package-wide.** A *verbatim fork* of victor-rag's chunker (differences are stripped comments and a `self.config → self._config` rename). Retire victor-rag's false docstring at the same time — it claims to wrap this module's `BaseChunker` and imports nothing from it; the refactor was announced in a docstring and never executed, in the opposite direction from reality.
 | Victor `victor/core/chunking/` | 1,559 | Reachable only through a `register_chunker()` shim that is explicitly deprecated, emits a warning, and has **no registered entry points** anywhere — so external discovery is a permanent no-op. Note it is a behavioural *divergence* from the other two copies, not a verbatim one, so diff it before deleting rather than assuming equivalence.
 | Victor `verticals/victor-coding/native/src/chunker.rs` | 530 | Duplicates the built Rust chunker and is **not even built** (`ModuleNotFoundError`), fronted by a backend registry with no reachable backend. Free.
-| ProximaDB `crates/modalities/proximadb-embedding/src/chunker.rs` | 127 | **Zero callers** in the workspace. Its `ChunkStrategy::Heading` silently falls back to paragraph while being *persisted per-collection in the catalog* and exposed on the embedding-config surface — so the catalog can hold a policy nothing implements. Either delete, or implement it via TD-CHUNK-3's heading source. **The policy surface it reads is TD-CHUNK-5's subject** — decide that before deleting, since the wire fields outlive the struct.
+| ProximaDB `crates/modalities/proximadb-embedding/src/chunker.rs` | 127 | **DONE (#1679)** — see History.
 | Victor `victor_coding/codebase/chunker.py` + `embeddings/chunker.py` | 1,962 | ~97% dead — only an 11-line `detect_language()` is live. **Gated:** the sweep also removes ~1,700 lines of tests, so it needs ADR-014 phase two verified first. Not a freebie; sequence last.
 | ProximaDB `chunking_strategies/code.py` | 4,427 | Owned by **TD-CG2**, not this TD. Listed for completeness.
 |===
@@ -33,22 +43,15 @@ Excluded deliberately: `build/lib/` copies (7 more chunking paths) and `.claude/
 files) are stale build/worktree artefacts, not source. And `victor/agent/services/chunk_runtime.py` is
 **not a text chunker** — it streams LLM response chunks. Pure name collision; leave it alone.
 
-== The catalog-truthfulness item
-
-Independent of deletion and worth doing regardless: stop persisting a `Heading` chunk-strategy policy that
-the server does not implement. A per-collection policy that silently degrades is worse than an absent one,
-because a caller reasonably assumes the catalog reflects behaviour. Either wire it (TD-CHUNK-3) or remove it
-from the enum and the persisted config.
-
 == Sequencing
 
 . **Free deletions, any order, no port required:** `processing/native/chunking.py`,
-  `framework/ingestion/`, the unbuilt `victor-coding` Rust chunker, ProximaDB's zero-caller
-  `proximadb-embedding/chunker.rs`. ~2,330 lines. Retire the false victor-rag docstring with the second
+  `framework/ingestion/`, the unbuilt `victor-coding` Rust chunker (ProximaDB's zero-caller
+  `proximadb-embedding/chunker.rs` is done). ~2,200 lines remaining. Retire the false victor-rag docstring with the second
   one.
 . **`core/chunking/`** — diff against the other two copies first (it diverged), then retire with its
   deprecated shim. ~1,559 lines.
-. **Catalog `Heading`** truthfulness fix.
+. ~~Catalog `Heading` truthfulness fix~~ — done (#1679).
 . **`victor_coding/codebase/` sweep** — after ADR-014 phase two, accepting the ~1,700 test lines that go
   with it.
 

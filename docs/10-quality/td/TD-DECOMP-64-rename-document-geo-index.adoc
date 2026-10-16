@@ -5,27 +5,20 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
+| Status | **Partial: crate rename `proximadb-geo-index` → `proximadb-document-geo-index` shipped (#1596); open: geohash algorithm dedup + `GeoPoint` field-name unification (verified 2026-10-15: the document crate still has its own inline encoder and depends only on `anyhow`).**
 | Severity | Low — behavior-neutral rename
 | Component | `crates/horizontal/proximadb-document-geo-index`; root `src/storage/document/indexes/mod.rs`
+| Relates to | link:TD-DECOMP-39-extract-geo-index.adoc[TD-DECOMP-39]; link:TD-DECOMP-60-extract-geohash.adoc[TD-DECOMP-60]; link:TD-DECOMP-62-extract-geo-index.adoc[TD-DECOMP-62]; link:TD-ORPHAN-1-fifty-eight-source-files-are-not-reachable.adoc[TD-ORPHAN-1] (overlap: byte-identical unreachable copy of the document `geo_index.rs` inside `proximadb-geo-spatial-index`; its option 1 overlaps the dedup below)
 |===
 
-== Problem
-TD-DECOMP-39 extracted the document-field geohash index as `proximadb-geo-index`. TD-DECOMP-62
-extracted the index/geo spatial search index as `proximadb-geo-spatial-index`. Both define a
-geohash-based `GeoIndex` struct — a competing-abstraction quality concern and naming confusion.
+== History (shipped)
 
-== Fix
-Renamed `proximadb-geo-index` → `proximadb-document-geo-index` (making its document-field role
-explicit). The crate serves the document-storage indexes subsystem (TD-39); `proximadb-geo-spatial-index`
-(TD-62) serves the index/geo spatial-search subsystem. The naming is now unambiguous.
+link:TD-DECOMP-39-extract-geo-index.adoc[TD-DECOMP-39] and link:TD-DECOMP-62-extract-geo-index.adoc[TD-DECOMP-62] both extracted a geohash-based `GeoIndex`; the document-field one was renamed to make
+its role explicit. `proximadb-geo-spatial-index` serves index/geo spatial search.
 
-== Future work (algorithm dedup)
+== Open: algorithm dedup
+
 TD-39's `geo_index.rs` has its OWN inline geohash encoder/decoder. It should depend on the shared
 `proximadb-geohash` crate (TD-60) instead of duplicating the algorithm. File as a follow-up TD.
 Also, TD-39's `GeoPoint { lat, lon }` vs geo-types' `GeoPoint { latitude, longitude }` — field-name
 unification when the inline geohash is replaced.
-
-== Verified
-Standalone check ✓. Root lib check pending. Behavior-neutral rename (crate name + lib name + shim
-path updated; no code logic changes).

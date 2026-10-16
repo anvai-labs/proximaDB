@@ -5,14 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export
+| Status | **Done (2026-08-07).** Moved `index/axis/filterable_metadata.rs` (14 tests, 21 consumers) into a new horizontal crate (#1543).
 | Component | `crates/horizontal/proximadb-filterable-metadata`; root `src/index/axis/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe)
 |===
 
-== What moved
+== History
 
-`src/index/axis/filterable_metadata.rs` (14 tests, 21 consumers) → new horizontal crate
-`proximadb-filterable-metadata`. Root `index/axis/mod.rs` re-exports it. Deps:
-dashmap/serde/thiserror/chrono + proximadb-data-model/proximadb-records.
-Verified: standalone + root lib both pass.
+Deps: dashmap/serde/thiserror/chrono + data-model/records; root re-export keeps all consumers unchanged.

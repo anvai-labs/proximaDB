@@ -5,33 +5,13 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export
-| Component | `crates/integrations/proximadb-cdc` (`connectors`); root `src/cdc/mod.rs`
-| Relates to | [[TD-DECOMP-1]] (recipe); [[TD-DECOMP-7..11]] (cdc crate prior slices)
+| Status | **Done (2026-08-03).** Moved `connectors/{mongodb,mysql,postgres}` (93 tests) into `proximadb-cdc` (#1399).
+| Component | `crates/integrations/proximadb-cdc` (`connectors`)
+| Relates to | link:TD-DECOMP-11-extract-cdc-config-offset-source.adoc[TD-DECOMP-11]; link:TD-DECOMP-13-extract-cdc-coordinator.adoc[TD-DECOMP-13]
 |===
 
-== Why
+== History
 
-The connectors subgraph (`{mongodb,mysql,postgres}/*`, **93 tests**) is the last big cdc
-subgraph. It references `crate::cdc::{config,error,event,offset,source}` (all now in the cdc
-crate via TD-DECOMP-7..11). DB-driver code (mongodb/bson/tokio_postgres/mysql_async) is behind
-`#[cfg(feature = "experimental-cdc-connectors")]` (never enabled in CI) so the default build
-compiles without those heavy deps.
-
-== What moved (behavior-neutral)
-
-* `src/cdc/connectors/` (whole subdir: mod + mongodb/{mod,change_event,config,connector} +
-  mysql/{mod,config,connector,decoder} + postgres/{mod,config,connector,decoder,replication,
-  snapshot}) → `crates/integrations/proximadb-cdc/src/connectors/`.
-* Rewrite: `crate::cdc::` → `crate::` (all refs — config/error/event/offset/source become
-  siblings; connectors self-refs stay valid).
-* cdc crate: + `experimental-cdc-connectors` feature (`["dep:tokio-postgres"]`), + deps
-  `anyhow` (workspace), `base64` (inline `"0.22"`), `tokio-postgres` (inline `{ version =
-  "0.7", optional = true }`).
-* cdc crate 199→292 tests.
-
-== Follow-ups
-
-* `coordinator` (~11 tests, the hub) — the LAST cdc module; completes the cdc extraction.
-* **Running total once merged: ~417 tests out of root lib binary** (324 + 93).
+The last big cdc subgraph. DB-driver code stays behind the `experimental-cdc-connectors` feature
+(never enabled in CI), so the default build compiles without the heavy driver deps. Part of the cdc
+vein completed in link:TD-DECOMP-13-extract-cdc-coordinator.adoc[TD-DECOMP-13].

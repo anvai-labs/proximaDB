@@ -91,6 +91,12 @@ impl StorageEngine {
 
         // Initialize WAL configuration from storage locations
         let mut wal_config = WALConfig::default();
+        // TD-WAL-5: this engine's WAL manager owns startup replay, so it must
+        // resolve the SAME local WAL root the write path uses. Built from
+        // `WALConfig::default()`, it dropped a config-file `wal_local_dir`, and
+        // replay never listed the segments written there: acknowledged writes
+        // were lost on a crash before a manifest entry recorded that base.
+        wal_config.wal_local_dir = config.wal_config.wal_local_dir.clone();
         wal_config.multi_disk.data_directories = config
             .storage_locations
             .iter()

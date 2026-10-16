@@ -9,6 +9,12 @@
 
 Accepted
 
+Reconciliation (2026-10-15): **partially implemented.** `$lookup` is in the proto
+(`LookupStage`, `proto/proximadb/v1/document.proto`); the Cypher parser/executor/functions live
+in `src/graph/query/` and `crates/modalities/proximadb-graph` (UNWIND parsing present there).
+Not verified here: `REDUCE`, extended accumulators, `ComputedField`. File Plan paths below are
+historical.
+
 == Context
 
 Gap implementation sprint added several extension modules that are not yet wired into production paths:

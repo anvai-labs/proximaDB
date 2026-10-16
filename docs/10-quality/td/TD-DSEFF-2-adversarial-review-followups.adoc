@@ -6,97 +6,33 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Items 1-3 FIXED (2026-08-29/30); items 4-6 open, deliberately not scheduled (see per-item rationale)
+| Status | **Partial: items 1–3 shipped (2026-08-29/30; #1772, #1788); open: items 4–6, deliberately not scheduled (see per-item rationale), plus the VIPER byproduct findings (subsumed by TD-VIPER-1 retirement).**
 | Severity | Mixed — see per-item severity
-| Component | `crates/control/proximadb-catalog/src/cache.rs`, `src/storage/engines/nova/engine.rs`, `crates/binding/proximadb-embedded/src/lib.rs`, `src/storage/memtable/implementations/skiplist.rs`, `src/network/grpc/v2/record_service.rs`, `src/storage/engines/raptor/`, `src/index/axis/management/manager.rs`, `src/storage/flush_materializer.rs`
+| Component | `proximadb-catalog` cache, `src/storage/engines/{nova,raptor}/`, `proximadb-embedded`, skiplist memtable, `src/network/grpc/v2/record_service.rs`, `src/index/axis/management/`, `src/storage/flush_materializer.rs`
+| Relates to | link:TD-DSEFF-1-data-structure-efficiency-audit.adoc[TD-DSEFF-1] (the program re-reviewed); link:TD-CAT-5-catalog-cache-eviction-scan.adoc[TD-CAT-5]; link:TD-VIPER-1-staged-retirement.adoc[TD-VIPER-1]
 | Pillar | CORRECTNESS / SIMPLIFY
 |===
 
-toc::[]
+== History (shipped)
 
-== Context
+An adversarial re-review of the merged DS-efficiency program (#1735/#1737/#1738/#1743) found six issues; three were fixed:
 
-After the data-structure-efficiency program (TD-DSEFF-1, #1735/#1737/#1738)
-and the embedded engine-routing fix (#1743) landed, an adversarial re-review
-of all four PRs' already-merged code was run at the user's request (in
-conjunction with the ADR-093 VIPER-retirement re-check). Three independently
-dispatched review passes (one per PR group) surfaced six findings. This TD
-tracks the ones not folded into ADR-093 or fixed inline.
+. *CatalogCache shared eviction ring* (#1772) — one ring across map families defeated the cache's own capacity bound under multi-family traffic; split per family (see TD-CAT-5).
+. *NOVA `vector_by_id`* (#1788) — #1743's real point-read resolved by first-match-in-listing-order and never filtered tombstones/TTL. Now resolves the MVCC winner across *all* rows in *all* files before any liveness check, then gates with `ProximaRecord::is_dead`. *Lesson:* resolve MVCC first, liveness second — a tombstone is a newer version that must shadow an older live one (invariant 16d). Tests: `test_nova_vector_by_id_{returns_latest_version_across_flushes,hides_tombstoned_record,filters_ttl_expired_and_returns_live}`.
+. *Embedded migration risk from #1743* (#1788) — a one-shot, log-only startup scan warns when a non-SST-declared collection holds only legacy `.sst` files (pure helper `engine_data_mismatch`, never fails startup), closing a mixed-read-safety gap (directive 8).
 
-== 1. CatalogCache shared eviction ring — FIXED
-
-See link:TD-CAT-5-catalog-cache-eviction-scan.adoc[TD-CAT-5]'s follow-up
-section. High confidence, high severity (defeated the cache's own capacity
-bound under realistic multi-family traffic). Fixed same day by splitting the
-ring per map family; regression test added.
-
-== 2. NOVA `vector_by_id` lacks MVCC version resolution and tombstone filtering — FIXED
-
-`src/storage/engines/nova/engine.rs` (`vector_by_id`): #1743 replaced a
-hardcoded `Ok(None)` stub (which silently made every upsert re-insert as a
-duplicate) with a real point-read that resolved by
-first-match-in-file-listing-order and did not filter tombstoned/expired
-records at all.
-
-Fixed by rewriting `vector_by_id` to scan the raw Arrow columns per file/row
-(mirroring the `(version, timestamp)` best-match comparator VIPER's own
-point-read and the shared compaction dedup
-(`columnar_compaction.rs::deduplicate_arrow_batches`) already use), resolving
-the MVCC winner across *all* candidate rows in *all* files before any
-liveness check — a tombstone is itself a newer version and must be able to
-shadow an older live one (CLAUDE.md invariant 16d). The winning row converts
-to `ProximaRecord` via the existing `From<VectorRecord> for ProximaRecord`
-(`conversions.rs`), which already correctly derives `valid_to_ns` (ns) from
-the on-disk millisecond `expires_at` column, preserving the `Some(0)`
-tombstone sentinel; the canonical `ProximaRecord::is_dead(now_ns)` then gates
-the return.
-
-Two byproduct findings surfaced while implementing this, both about
-already-merged VIPER code (not fixed — VIPER isn't in this TD's scope):
+== VIPER byproduct findings (not fixed; VIPER is retiring per TD-VIPER-1 / ADR-093)
 
 * VIPER's point-read compares the millisecond `expires_at` column against
   `chrono::Utc::now().timestamp_micros()` — a 1000x unit mismatch that makes
   any record with a real future expiry read as already-expired.
 * VIPER's point-read also skips liveness mid-scan (`continue` on an
   expired/tombstoned row) *before* MVCC resolution, so a stale live version
-  can win over a newer tombstone instead of being shadowed by it — the fix
-  here deliberately resolves MVCC first, then checks liveness once on the
-  winner, to avoid reproducing this.
+  can win over a newer tombstone instead of being shadowed by it.
 * NOVA's `FIELD_VERSION` Parquet column is `UInt32` (`schema_builder.rs`),
   while VIPER's own factory schema (`viper/factory.rs`) declares the same
   logical column `Int8` — a third VIPER-side type/unit inconsistency in this
   code family, also not fixed here.
-
-Tests: `tests/integration/nova_engine_test.rs` —
-`test_nova_vector_by_id_returns_latest_version_across_flushes`,
-`test_nova_vector_by_id_hides_tombstoned_record`,
-`test_nova_vector_by_id_filters_ttl_expired_and_returns_live`.
-
-== 3. Embedded migration risk from the #1743 routing fix is undocumented — FIXED
-
-`crates/binding/proximadb-embedded/src/lib.rs` (`EmbeddedProximaDB::new`)
-previously had no detection for the case where a pre-existing embedded
-deployment's non-SST-declared collection has old SST-formatted data
-(residue of the bug #1743 fixed) that its declared engine's
-extension-filtered reader can never see — a mixed-read-safety gap against
-CLAUDE.md directive 8 (format transitions must be detectable, never
-flag-day).
-
-Fixed with a one-shot, best-effort, log-only scan at the end of
-`EmbeddedProximaDB::new`: for every collection whose declared engine isn't
-SST, list its data directory and — if non-empty and every file carries the
-legacy `.sst` extension — emit a `tracing::warn!` naming the collection, its
-declared engine, and re-ingest as the remediation. The decision logic is
-factored into a pure `engine_data_mismatch(&[String]) -> bool` helper for
-direct unit testing; never blocks or fails startup (all internal errors are
-swallowed, matching the no-`.unwrap()`/`.expect()`/`panic!()` mandate).
-
-Tests: `crates/binding/proximadb-embedded/src/tests.rs` —
-`engine_data_mismatch_detects_sst_only_directory`,
-`engine_data_mismatch_ignores_empty_directory`,
-`engine_data_mismatch_ignores_directory_with_declared_engine_files`,
-`reopen_does_not_fail_on_mismatched_pre_fix_collection_data` (end-to-end:
-plants real pre-fix-shaped residue via the filesystem, reopens against it).
 
 == 4. raptor `select_nth_unstable_by` — nondeterministic tie-break vs. old stable sort
 

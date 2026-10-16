@@ -9,7 +9,7 @@
 [cols="1,3"]
 |===
 | Field | Value
-| Status | Accepted (stage 1 lands with this ADR)
+| Status | Accepted (stage 1 lands with this ADR). *Progress (2026-10-15):* TD-VIPER-1 Partial — S1 soft-deprecation (#1770) and S2 rejection of new VIPER selections (`e55df2325`) shipped; S3 deletion open.
 | Date | 2026-08-29
 | Supersedes | — (executes the retirement stage ADR-026 explicitly deferred: "engines stay until a migration")
 | Amends | ADR-026 (non-goal clause scoped to VIPER now resolved)

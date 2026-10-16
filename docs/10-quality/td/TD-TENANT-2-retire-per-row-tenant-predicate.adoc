@@ -3,6 +3,13 @@
 :dim: D5
 :pillar: SEC
 
+[cols="1,3"]
+|===
+| Status | **Open.** Verified 2026-10-15: the per-row predicate (`record.tenant_id.is_empty() \|\| record.tenant_id == tenant_context.tenant_id`) is still live at three sites in `src/services/operations/vectors/legacy.rs`; the grant-aware catalog seam (step 1 of the 2026-08-08 order) has not landed. Related shipped work: the result-metadata validator was demoted to corroboration (#1597) — a different check from this predicate.
+| Component | `src/services/operations/vectors/legacy.rs`; `src/storage/persistence/write_ahead_log/mod.rs` (`get_collection_vectors_raw`)
+| Relates to | link:TD-AUTHZ-1-adr090-program-tracker.adoc[TD-AUTHZ-1] (overlap: cross-tenant sequencing and the item-3 seam spec — canonical there), ADR-0083 D2, ADR-090
+|===
+
 == Problem
 
 Tenant isolation is currently enforced in the read path by a **per-row predicate**:

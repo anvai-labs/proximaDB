@@ -3,6 +3,12 @@
 :icons: font
 2026-06-19
 
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial (verified 2026-10-15).** P1 Iceberg manifests shipped; P2 core + REST change feed shipped; P3 RaBitQ cascade shipped. Open: P2 pgwire `table_changes` TVF + `pgoutput`; P4 (see the clustering/freshness plan); the Phase-2 spec-only items (Delta read/UniForm, remaining Lance parity incl. R1/R3, BM25 inverted index, router signal enrichment) — deletion vectors have since shipped under TD-DELVEC-1.
+|===
+
 toc::[]
 
 == Why this document
@@ -97,7 +103,7 @@ the manifest, so TPC-H 22/22 stays green.
 REMAINING: serve the current `TableMetadata` via the native Iceberg REST catalog
 (`load_table` discovery); partitioned layout; column statistics in manifests.
 
-=== P2 — CDC change-feed (`since_lsn` + surfaces)  [CORE SHIPPED; surfaces pending]
+=== P2 — CDC change-feed (`since_lsn` + surfaces)  [CORE + REST SHIPPED; pgwire TVF + pgoutput pending]
 
 *Core (shipped):* the change-feed read primitive over the canonical WAL —
 `TableWalAppender::read_all_entries` (framed appender), `TableRecordStore::read_changes_since`
@@ -116,7 +122,8 @@ pgwire path (reuse short-circuit). Proven by `tests/cross_surface_unification_e2
 (pgwire INSERT visible on the shared store) with full modality regression green. This
 unblocks the surfaces below — they now read the same state any protocol wrote.
 
-*Surface wiring (remaining):* with the store unified, the surfaces are thin adapters:
+*Surface wiring (remaining):* with the store unified, the surfaces are thin adapters.
+_Status 2026-10-15: the REST surface shipped as `GET /api/v2/collections/{collection_id}/changes?since_lsn=N` (`src/network/rest/v2/records.rs`); the pgwire `table_changes` TVF and outbound `pgoutput` remain open (the `proximadb-cdc` Postgres connector is an inbound source, not this)._
 
 * *REST* `GET /collections/:id/changes?since_lsn=N` — add a change-feed reader to `AppState`
   wired from the same WAL-backed store; handler calls `changes_since`.
@@ -129,14 +136,16 @@ v3 alignment: model the feed on *row lineage* and later emit the Iceberg
 `_row_id`/`_last_updated_sequence_number` columns so external engines do the same
 incremental read.
 
-=== P3 — Wire RaBitQ into ANN search + f32 rerank  [PLANNED]
+=== P3 — Wire RaBitQ into ANN search + f32 rerank  [SHIPPED — status 2026-10-15]
+
+_Shipped as the PAX RaBitQ→SQ8 cascade with rerank on the SST search path (`src/storage/engines/sst/search/mod.rs`; ADR-062 / TD-RDSTRAT-6; filter-aware variant #1520). Canonical plans: link:RABITQ_ANN_INTEGRATION_SCOPING_2026_06.adoc[RABITQ_ANN_INTEGRATION_SCOPING], link:RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc[RABITQ_PAX_SEGMENT_MIGRATION_PLAN]. Original plan:_
 
 RaBitQ (~30×) kernel + length-renorm are built/tested but UNWIRED (reserved
 `quant_kind=2`). Populate codes on write; decode + length-renorm in the ANN scan; add a
 f32 cold-rerank tier for top-k; per-collection opt-in. Gate: the `vector_ann_recall_e2e`
 recall ratchet must hold with ~30× smaller payload.
 
-=== P4 — Adaptive clustering + relational streaming freshness  [PLANNED]
+=== P4 — Adaptive clustering + relational streaming freshness  [PLANNED — detailed in link:CLUSTERING_AND_STREAMING_FRESHNESS_PLAN_2026_06.adoc[CLUSTERING_AND_STREAMING_FRESHNESS_PLAN] (canonical); deletion vectors shipped separately under TD-DELVEC-1]
 
 `cluster_by` / `allow_zorder_pruning` are catalog-only stubs. Thread `cluster_by` into
 the flush sort + optional Z-order in the PAX writer (tighter zone-map skip). Union the

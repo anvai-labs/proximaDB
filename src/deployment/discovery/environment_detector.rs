@@ -532,28 +532,7 @@ impl EnvironmentDetector {
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
 
-        match client
-            .get("http://169.254.169.254/latest/meta-data/instance-id")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let is_aws = response.status().is_success();
-                debug!(
-                    "☁️ AWS metadata service: {}",
-                    if is_aws {
-                        "✅ Available"
-                    } else {
-                        "❌ Not available"
-                    }
-                );
-                Ok(is_aws)
-            }
-            Err(_) => {
-                debug!("❌ AWS metadata service not accessible");
-                Ok(false)
-            }
-        }
+        Ok(aws_imds_reachable(&client, AWS_IMDS_BASE).await)
     }
 
     /// Check if running in Azure environment
@@ -1162,6 +1141,41 @@ async fn run_command_with_timeout(
     })??;
 
     Ok(output)
+}
+
+pub use crate::core::utils::aws_imds::AWS_IMDS_BASE;
+
+/// Whether the AWS instance-metadata service at `base` answers an
+/// `instance-id` read (environment detection). Always IMDSv2 via the shared
+/// [`crate::core::utils::aws_imds::aws_imdsv2_get`] — never a token-less
+/// IMDSv1 GET, which is SSRF-reachable and refused (401) on instances with
+/// `HttpTokens=required` (TD-SECSCAN-1 §4). `base` is a parameter so the
+/// probe is testable against a local IMDS stand-in.
+pub async fn aws_imds_reachable(client: &reqwest::Client, base: &str) -> bool {
+    match crate::core::utils::aws_imds::aws_imdsv2_get(
+        client,
+        base,
+        "/latest/meta-data/instance-id",
+    )
+    .await
+    {
+        Ok(response) => {
+            let is_aws = response.status().is_success();
+            debug!(
+                "☁️ AWS metadata service: {}",
+                if is_aws {
+                    "✅ Available"
+                } else {
+                    "❌ Not available"
+                }
+            );
+            is_aws
+        }
+        Err(e) => {
+            debug!("❌ AWS metadata service not accessible: {e}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

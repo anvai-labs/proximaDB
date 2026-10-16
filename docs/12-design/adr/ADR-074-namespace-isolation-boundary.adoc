@@ -7,7 +7,7 @@
 
 [cols="1,3"]
 |===
-| Status | Proposed
+| Status | Proposed — *partially implemented (reconciled 2026-10-15):* most of S1 shipped (#1221 identity-boundary seam; #1218 `DrCollectionPath`/`DrTenantSystemPath` split); TD-NS-1 Partial. **Confirmed and elevated by link:ADR-0083-consolidated-catalog-identity-model.adoc[ADR-0083]** (its composite + two-layer naming *is* the identity). The Relates-to labels below are stale: ADR-031 is superseded (u64-as-identity) by ADR-0083, and ADR-027 is Accepted (as narrowed by ADR-094).
 | Date | 2026-07-26
 | Deciders | Vijaykumar Singh
 | Relates to | ADR-027 (DrPath / storage layout — **the path-contract authority this amends**, itself Proposed), ADR-031 (stable object_id + typed base62 paths, Proposed), ADR-036 (flat keys + per-object access tier), ADR-060 (OSS↔commercial boundary; metering), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (structural isolation)

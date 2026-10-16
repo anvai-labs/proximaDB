@@ -4,9 +4,24 @@
 #
 # OVERVIEW:
 #   This workflow creates and publishes ProximaDB releases across multiple
-#   platforms and package registries. It builds native binaries, Python wheels,
-#   and publishes to GitHub Releases and crates.io. Python packages are NOT
-#   published here — release-python.yml owns PyPI/TestPyPI on python-v* tags.
+#   platforms and package registries. It builds native binaries and publishes
+#   to GitHub Releases, crates.io (proximadb-sdk) and npm
+#   (@anvailabs/proximadb-client).
+#
+# ONE TAG, ONE VERSION (TD-RELTAG-1):
+#   ONE tag `vX.Y.Z` releases EVERY registry, and every package carries the
+#   IDENTICAL version X.Y.Z:
+#     release.yml         (this file)  GitHub Release binaries, crates.io, npm
+#     release-python.yml  (same tags)  PyPI: proximadb + proximadb_embedded
+#   Both workflows trigger on the identical tag list and both run
+#   `scripts/version-sync.sh check-tag` before building, so a tag that
+#   disagrees with any published manifest fails before anything is built.
+#   The two files stay SEPARATE on purpose: npm's trusted publisher is bound to
+#   `release.yml` and PyPI's to `release-python.yml`; renaming or merging them
+#   breaks OIDC publishing until the owner re-registers on npmjs.com/pypi.org.
+#   There is no per-registry tag (the old per-package Python tag family is
+#   retired) and no per-package version hold. Guarded by
+#   scripts/check_release_build_features.py (check_unified_release_tag).
 #
 # TRIGGER MODES:
 #   1. Tag Push: Automatically triggered by pushing a version tag (v0.2.0, v0.2.0-beta.1)
@@ -27,9 +42,10 @@
 #   ├─────────────────────────────────────────────────────────────────────────┤
 #   │  4. PUBLISH (sequential, gated)                                        │
 #   │     ├── create-release    GitHub Release with all artifacts            │
-#   │     (Python → PyPI/TestPyPI is owned by release-python.yml on            │
-#   │     python-v* tags — its trusted-publisher registration is the live one.)│
+#   │     (Python → PyPI/TestPyPI: release-python.yml on the SAME vX.Y.Z     │
+#   │     tag; its trusted publisher is bound to that file name.)            │
 #   │     ├── publish-crates    crates.io (stable only)                      │
+#   │     ├── publish-npm       npm via OIDC (stable only)                   │
 #   │     └── update-homebrew   Homebrew formula artifact                    │
 #   ├─────────────────────────────────────────────────────────────────────────┤
 #   │  5. VERIFY             Post-release installation verification          │
@@ -44,9 +60,9 @@
 #
 #   Python Wheels are NOT built here. The pure-Python SDK (`proximadb`) and the
 #   native embedded engine (`proximadb_embedded`, one abi3 wheel per platform,
-#   CPython 3.11+) are built and published by `release-python.yml` on `python-v*`
-#   tags — decoupled from this binary/OS-package release. This workflow (`v*`)
-#   only builds the server binaries, the sdist, and the OS packages below.
+#   CPython 3.11+) are built and published by `release-python.yml`, triggered by
+#   the SAME `vX.Y.Z` tag. This workflow only builds the server binaries, the
+#   sdist, and the OS packages below.
 #
 # SAFEGUARDS:
 #   - dry_run: Builds all artifacts but skips publishing (test the pipeline)
@@ -61,7 +77,8 @@
 #   - Python packages are pure Python (no Rust wheels)
 #
 # MANUAL RELEASE PROCESS:
-#   1. Ensure Cargo.toml version matches intended release version
+#   1. Ensure every manifest is at the intended version
+#      (`bash scripts/version-sync.sh set X.Y.Z` in a PR; the gate rejects drift)
 #   2. Run workflow manually with:
 #      - version: "0.2.0" (without 'v' prefix)
 #      - prerelease: true/false
@@ -69,11 +86,12 @@
 #   3. Review dry_run output, verify all artifacts built successfully
 #   4. Re-run with dry_run: false to publish
 #
-# TAG-BASED RELEASE PROCESS:
-#   1. Ensure Cargo.toml version matches tag version
-#   2. Create and push tag: git tag v0.2.0 && git push origin v0.2.0
-#   3. Workflow triggers automatically
-#   4. Stable releases go to crates.io (Python: release-python.yml on python-v*)
+# TAG-BASED RELEASE PROCESS (runbook: docs/04-operations/release/release-procedure.md):
+#   1. `bash scripts/version-sync.sh set X.Y.Z` merged; `check-tag vX.Y.Z` passes
+#   2. Create and push ONE tag: git tag vX.Y.Z && git push origin vX.Y.Z
+#   3. release.yml AND release-python.yml both trigger on it
+#   4. Stable releases go to crates.io + npm (here) and PyPI (release-python.yml),
+#      all at the identical version X.Y.Z
 #
 # TROUBLESHOOTING:
 #   - Build failures: Check platform-specific build logs
@@ -91,6 +109,8 @@ name: Release
 
 on:
   push:
+    # MUST stay identical to release-python.yml's list -- enforced by
+    # scripts/check_release_build_features.py (check_unified_release_tag).
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'  # Pre-releases like v0.2.0-beta.1
@@ -161,22 +181,17 @@ jobs:
           echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
           echo "Release version: $VERSION (prerelease: $PRERELEASE, dry_run: $DRY_RUN)"
 
-      - name: Validate Cargo.toml Version
+      # TD-RELTAG-1 version gate. This was a ::warning:: that compared only
+      # Cargo.toml and stripped any pre-release suffix, so a tag could publish
+      # packages carrying a different version. Now a HARD failure: the release
+      # version (tag, or the dispatch input) must equal EVERY manifest that
+      # `version-sync.sh check` covers -- Cargo workspace, clients/rust
+      # (crates.io), clients/nodejs-embedded (npm), both pyprojects (PyPI, via
+      # release-python.yml's identical gate). Every other job needs `prepare`,
+      # so nothing builds or publishes on a mismatch.
+      - name: Version gate (release version == every manifest)
         run: |
-          # Structural, not `grep '^version = ' | head -1`: that slides down to
-          # [workspace.package] when [package] has no version line, so it
-          # compared the wrong field. Same fix as scripts/version-sync.sh.
-          CARGO_VERSION=$(bash scripts/version-sync.sh get)
-          EXPECTED="${{ steps.version.outputs.version }}"
-          # Remove pre-release suffix for comparison
-          EXPECTED_BASE="${EXPECTED%%-*}"
-          if [ "$CARGO_VERSION" != "$EXPECTED_BASE" ]; then
-            echo "::warning::Cargo.toml version ($CARGO_VERSION) differs from release version ($EXPECTED_BASE)"
-          fi
-
-      - name: Run Version Consistency Check
-        run: |
-          bash scripts/version-sync.sh check
+          bash scripts/version-sync.sh check-tag "v${{ steps.version.outputs.version }}"
 
       - name: Verify Pre-Release CI Passed
         if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
@@ -652,13 +667,13 @@ jobs:
           # Python Wheels — validated & published by release-python.yml, not here
           # ----------------------------------------
           # This `v*` workflow builds no Python wheels (SDK + embedded abi3 wheels
-          # ship from release-python.yml on `python-v*` tags), so there is nothing
+          # ship from release-python.yml on the same `vX.Y.Z` tag), so there is nothing
           # to validate here. The prior per-Python-version count checks (expecting
           # 5 wheels for 3.8-3.12) were orphaned when the wheel-build jobs moved
           # out — they force-failed VALIDATION_PASSED against wheels this run never
           # produces, blocking the publish gate. Removed.
           echo "## Python Wheel Artifacts"
-          echo "  (built & published by release-python.yml on python-v* tags — not validated here)"
+          echo "  (built & published by release-python.yml on the same vX.Y.Z tag — not validated here)"
           echo ""
 
           # ----------------------------------------
@@ -841,14 +856,21 @@ jobs:
           Linux musl, Linux aarch64, and macOS archives are not built by this
           workflow and are therefore not advertised in this release.
 
-          #### Python Installation
+          #### Packages (every registry at the identical version ${{ needs.prepare.outputs.version }})
+
+          This one tag publishes every registry: PyPI from `release-python.yml`,
+          crates.io and npm from `release.yml`.
 
           ```bash
-          # Install from PyPI (main package - full features)
-          pip install proximadb
+          # Python client SDK and the in-process embedded engine (PyPI)
+          pip install proximadb==${{ needs.prepare.outputs.version }}
+          pip install proximadb-embedded==${{ needs.prepare.outputs.version }}
 
-          # Install embedded package (lightweight)
-          pip install proximadb-embedded
+          # Rust client SDK (crates.io)
+          cargo add proximadb-sdk@${{ needs.prepare.outputs.version }}
+
+          # Node/TypeScript client SDK (npm)
+          npm install @anvailabs/proximadb-client@${{ needs.prepare.outputs.version }}
           ```
 
           #### Build From Source
@@ -927,7 +949,7 @@ jobs:
   publish-crates:
     timeout-minutes: 30
     name: Publish to crates.io
-    needs: [prepare, build-binaries, create-release]
+    needs: [prepare, build-binaries, validate-artifacts, create-release]
     runs-on: ubuntu-latest
     if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true' && needs.validate-artifacts.outputs.validation_passed == 'true'
     environment:
@@ -962,6 +984,17 @@ jobs:
       # carry path dependencies with no registry version. The SDK keeps its
       # embedded-engine deps in [dev-dependencies] so `cargo publish`
       # packages it clean; `embedded`/`full` are workspace-local features.
+      # Belt-and-braces over `prepare`'s gate: the version `cargo publish`
+      # uploads is the manifest's, so assert it IS the release version.
+      - name: Assert crate version == release version
+        working-directory: clients/rust
+        run: |
+          CRATE_VERSION=$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          if [ "$CRATE_VERSION" != "${{ needs.prepare.outputs.version }}" ]; then
+            echo "::error::clients/rust/Cargo.toml is $CRATE_VERSION, release is ${{ needs.prepare.outputs.version }} (TD-RELTAG-1)"
+            exit 1
+          fi
+
       - name: Verify Package
         working-directory: clients/rust
         run: cargo package --list
@@ -975,7 +1008,7 @@ jobs:
   publish-npm:
     timeout-minutes: 30
     name: Publish Node SDK to npm
-    needs: [prepare, build-binaries, create-release]
+    needs: [prepare, build-binaries, validate-artifacts, create-release]
     runs-on: ubuntu-latest
     # Same gating as publish-crates: no dry-runs, no pre-releases, artifacts validated.
     if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true' && needs.validate-artifacts.outputs.validation_passed == 'true'
@@ -1027,9 +1060,11 @@ jobs:
             exit 1
           fi
 
-      # The SDK is a standalone package (single public dep: openapi-fetch);
-      # its own version field is the source of truth — the release version
-      # and the package version are bumped together in the release commit.
+      # The SDK is a standalone package (single public dep: openapi-fetch).
+      # Its version field is NOT an independent source of truth: it must equal
+      # the release version (TD-RELTAG-1). `prepare` gates that for the whole
+      # tree and the publish step below re-asserts it, so npm can no longer
+      # lag (0.4.0 skipped npm; from 0.4.1 every registry ships the same X.Y.Z).
       #
       # `npm ci`, NOT `npm install`: this is the one job whose tree becomes a
       # published artifact, and `npm install` RE-RESOLVES rather than installing
@@ -1061,6 +1096,10 @@ jobs:
           NPM_CONFIG_USERCONFIG: /dev/null
         run: |
           VERSION="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" != "${{ needs.prepare.outputs.version }}" ]; then
+            echo "::error::clients/nodejs-embedded/package.json is $VERSION, release is ${{ needs.prepare.outputs.version }} (TD-RELTAG-1)"
+            exit 1
+          fi
           if curl -sf -A "proximadb-release" \
             "https://registry.npmjs.org/@anvailabs%2fproximadb-client" \
             | grep -q "\"${VERSION}\""; then
@@ -1228,16 +1267,16 @@ jobs:
             if [ "$PRERELEASE" = "true" ]; then
               echo "  WOULD PUBLISH TO:"
               echo "    - GitHub Releases (pre-release: true)"
-              echo "    - TestPyPI (https://test.pypi.org/project/proximadb/)"
+              echo "    - TestPyPI (release-python.yml, same tag)"
               echo ""
               echo "  WOULD NOT PUBLISH TO:"
-              echo "    - PyPI (stable releases only)"
-              echo "    - crates.io (stable releases only)"
+              echo "    - PyPI, crates.io, npm (stable releases only)"
             else
-              echo "  WOULD PUBLISH TO:"
+              echo "  WOULD PUBLISH TO (all at version $VERSION, ONE tag v$VERSION):"
               echo "    - GitHub Releases (pre-release: false)"
-              echo "    - PyPI (https://pypi.org/project/proximadb/)"
               echo "    - crates.io (https://crates.io/crates/proximadb-sdk)"
+              echo "    - npm (https://www.npmjs.com/package/@anvailabs/proximadb-client)"
+              echo "    - PyPI proximadb + proximadb_embedded (release-python.yml, same tag)"
               echo ""
               echo "  WOULD ALSO:"
               echo "    - Generate Homebrew formula"
@@ -1357,7 +1396,7 @@ jobs:
   cleanup:
     timeout-minutes: 30
     name: Cleanup Old Artifacts
-    needs: [prepare, create-release, publish-crates, dry-run-summary]
+    needs: [prepare, validate-artifacts, create-release, publish-crates, dry-run-summary]
     runs-on: ubuntu-latest
     if: always()
     steps:

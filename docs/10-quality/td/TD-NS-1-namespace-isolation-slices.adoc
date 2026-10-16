@@ -1,14 +1,14 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-NS-1: Namespace isolation boundary — implementation slices for ADR-074
-:status: Open
+:status: Partial
 :dim: D5
 :pillar: SEC
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Design decided in ADR-074 (Proposed); no slice started.
+| Status | **Partial: most of S1 shipped — `DrResolvedPath` split into `DrCollectionPath` / `DrTenantSystemPath` (#1218, TD-CACHE-5) and `namespace_id` threaded through `MiddlewareTenantContext` → `StorageTenantContext` (#1221, zero behavior change). Open: S1 residual (the `mock_namespace` literal + `.expect` still in `src/services/record_store.rs` ~L331, falling back to `DrPathBuilder::DEFAULT_NAMESPACE_ID = "ns_default"`; verified 2026-10-15), S2–S4.** Design decided in ADR-074 (Proposed).
 | Priority | **P1** — every tenant in a deployment currently shares one hardcoded `namespace_id`, so the namespace tier of the isolation tree is inert.
 | Component | `src/network/middleware/tenant.rs` (ingress context), `src/storage/trait_components/path_resolver.rs` (path types), `src/services/dml/mod.rs:94` + `src/services/record_store.rs:305` (the constants to delete), `crates/foundation/proximadb-tenant/src/rbac_context.rs` (authz dimension), `crates/control/proximadb-catalog/src/native.rs` (registry).
 | Evidence | `DEFAULT_NAMESPACE_ID = "ns_default"` and a literal `mock_namespace` under `#[allow(clippy::expect_used)]` supply the path segment that `DrPathBuilder` requires; nothing in the identity flow resolves it. `MiddlewareTenantContext` carries `account_id` and `tenant_stable_id` but no namespace.

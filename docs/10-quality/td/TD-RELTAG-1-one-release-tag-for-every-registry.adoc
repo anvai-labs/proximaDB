@@ -1,0 +1,102 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RELTAG-1: one release tag `vX.Y.Z` for every registry, at one identical version
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved in-PR (2026-10-15).** Filed and closed in the change that unified the tags; kept as the record of why the gate exists.
+| Severity | **MEDIUM**: user-visible version skew across registries for the same release, with no failing check.
+| Component | `.github/workflows/release.yml`, `.github/workflows/release-python.yml`, `scripts/version-sync.sh`, `scripts/check_release_build_features.py`
+| Runbook | `docs/04-operations/release/release-procedure.md` (docs site: "Release procedure (one tag, every registry)")
+| Related | link:TD-HELMDUP-1-second-helm-chart-is-unrenderable-and-unwatched.adoc[TD-HELMDUP-1] (same "a version nothing watches" class)
+|===
+
+== What was wrong
+
+Two tag families released the product:
+
+* `vX.Y.Z` -> `release.yml`: GitHub Release binaries, crates.io (`proximadb-sdk`), npm (`@anvailabs/proximadb-client`).
+* `python-vX.Y.Z` -> `release-python.yml`: PyPI (`proximadb`, `proximadb_embedded`).
+
+Nothing tied the two together, and nothing tied a tag to the manifests it
+published. `release.yml` compared the tag against `Cargo.toml` only, emitted a
+`::warning::` (not a failure) on a mismatch, and stripped any pre-release suffix
+before comparing. The npm job published whatever `package.json` said.
+
+Measured registry state on 2026-10-15, after the v0.4.0 release:
+
+[cols="2,1,1", options="header"]
+|===
+| Package | Registry max | Tag that should have released it
+| crates.io `proximadb-sdk` | 0.4.0 | `v0.4.0`
+| npm `@anvailabs/proximadb-client` | 0.3.0 | `v0.4.0` (publish failed on a dead token; held deliberately)
+| PyPI `proximadb` | 0.3.0 | none: no `python-v0.4.0` was ever pushed
+| PyPI `proximadb_embedded` | 0.2.2 | none: `python-v0.3.0` never reached PyPI for it
+|===
+
+Four packages, three different versions, for one product release.
+
+== The fix
+
+. **One trigger.** `release-python.yml` triggers on exactly the tag list in
+  `release.yml` (`v[0-9]+.[0-9]+.[0-9]+` and `v[0-9]+.[0-9]+.[0-9]+-*`); the
+  `python-v*` trigger is removed. Old `python-v0.2.2` / `python-v0.3.0` tags stay
+  as history and trigger nothing. Pre-releases (a hyphen in the tag) reach
+  TestPyPI only, the same "hyphen = pre-release" rule `release.yml` applies.
+. **One gate.** `scripts/version-sync.sh check-tag <tag>` fails unless the tag
+  is `v<semver>`, its version equals `Cargo.toml` `[package].version` exactly
+  (no suffix stripping), and `check` passes, i.e. every published manifest
+  equals it. `release.yml` runs it in `prepare` (every job needs `prepare`);
+  `release-python.yml` runs it in a new `version-gate` job every build job
+  needs. A dispatch from a branch (dry run / TestPyPI) runs `check`.
+  `publish-crates` and `publish-npm` additionally assert their own manifest
+  equals the release version right before uploading.
+. **No hold.** The npm 0.3.0 hold was a one-release decision, not a mechanism in
+  any file (`package.json` was already 0.4.0). It ends: from 0.4.1 every
+  registry ships the same version, and the publish step now refuses a
+  `package.json` that disagrees.
+. **Files NOT renamed or merged.** npm's trusted publisher is registered against
+  `release.yml` (environment `npm`) and PyPI's against `release-python.yml`
+  (environments `pypi`, `testpypi`). Renaming either breaks OIDC publishing until
+  the owner re-registers on npmjs.com / pypi.org, so the unification is in the
+  triggers and the gate, not the file layout.
+. **Version bumped to 0.4.1** everywhere with `version-sync.sh set 0.4.1`
+  (0.4.0 is consumed by the binary release; 0.4.1 was unused on every registry).
+
+== `version-sync.sh check` coverage
+
+Audited against every manifest a registry publishes; nothing was missing, so the
+list is unchanged. What changed is that the list is now *pinned*: the guard
+fails if any published manifest drops out of it.
+
+[cols="2,2", options="header"]
+|===
+| Manifest | Published as
+| `Cargo.toml` `[package]` + `[workspace.package]` + path-dep pins + `Cargo.lock` | GitHub Release binaries; every workspace crate
+| `clients/rust/Cargo.toml` | crates.io `proximadb-sdk`
+| `clients/nodejs-embedded/package.json` + `package-lock.json` (both own-version fields) | npm `@anvailabs/proximadb-client`
+| `clients/python/pyproject.toml` (+ `embedded` extra lower bound) + `proximadb_sdk/__init__.py` | PyPI `proximadb`
+| `pyproject.toml` (root, maturin) + `proximadb_embedded/__init__.py` | PyPI `proximadb_embedded`
+| `deploy/helm/proximadb/Chart.yaml` (`version`, `appVersion`) | Helm chart / image tag default
+| `ui/package.json` + lock, `clients/python-queue-embedded/pyproject.toml`, `clients/java-embedded/pom.xml` | not published to a registry; kept in lockstep
+|===
+
+Go modules (`clients/go*`) carry no version string; Go versions by VCS tag and is
+out of scope here.
+
+== Guard
+
+`scripts/check_release_build_features.py` (`check_unified_release_tag`, run by
+the merge-blocking `Deterministic Commit Contract` job) fails when:
+
+* the two workflows' `on.push.tags` lists differ, or either contains a
+  non-`v<semver>` pattern;
+* either workflow has a live reference to the `python-v` tag family;
+* either workflow has no job running `version-sync.sh check-tag`, or any job does
+  not depend (directly or transitively) on that gate job;
+* `version-sync.sh` loses its `check-tag` command or drops a published manifest
+  from `check`.
+
+Negative controls: `UnifiedReleaseTagGuard` and `VersionSyncCheckTag` in
+`tests/scripts/test_release_build_features.py`.

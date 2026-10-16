@@ -5,38 +5,16 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Medium — first extraction through BOTH the FilesystemPort and QuantizationEnginePort seams
-| Component | `crates/storage/proximadb-engine-core/src/parquet_write_engine/`; root columnar mod.rs + hybrid_writer.rs
+| Status | **Done (2026-08-16).** Moved `parquet_write_engine/` (7 files, 2.2K LOC, 11 tests) into engine-core through both `FilesystemPort` and `QuantizationEnginePort` (#1648).
+| Component | `crates/storage/proximadb-engine-core/src/parquet_write_engine/`; root columnar `mod.rs` + `hybrid_writer.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-75-extract-sst-swift-metadata-via-filesystem-port.adoc[TD-DECOMP-75]; link:TD-DECOMP-80-extract-columnar-serialization-common.adoc[TD-DECOMP-80] (shipped the deferred common + serialization pair)
 |===
 
-== What moved (Phase 5 PR B, 2,228 LOC, 11 tests)
-`columnar/parquet_write_engine/` (7 files: streaming_writer, batch_writer, schema_builder,
-bloom_filter_builder, writer_config, writer_statistics, mod) → engine-core as a top-level
-module. Deps resolved to extracted crates except two root seams, both dissolved via EXISTING
-ports:
+== History
 
-* **FilesystemPort** (storage-ports:198): `filesystem_factory` fields → `Arc<dyn
-  FilesystemPort>`; the factory-CONSTRUCTING convenience `new` moved root-side (mod.rs helper
-  + hybrid_writer's `root_quantization_engine` companion) — construction belongs to the
-  composition root.
-* **QuantizationEnginePort** (storage-ports:104): streaming_writer's inline
-  `UnifiedQuantizationEngine::new(...)` construction (modality tier — storage→modality is a
-  hard ERROR layering rule) became an injected `Option<Arc<dyn QuantizationEnginePort>>`.
-  The port already exposed exactly the two level-specific encoders the writer calls
-  (`quantize_to_binary`, `quantize_to_u8`); the kernel impls it downward (allowed direction).
-  The `None` case errors only when quantization arrays are actually enabled.
-
-== Scope corrections during execution (recorded for the next wave)
-* `columnar/common.rs` was moved then REVERTED — it imports `super::serialization::*`
-  (ColumnarSerializer etc.), and serialization.rs holds `Arc<StorageQuantizationEngine>`
-  (modality). common+serialization are ONE unit; extracting them needs the wider
-  `StorageQuantizationEnginePort` (batch/level surface) threaded through the serializer
-  constructors — queued as its own step, not bundled here.
-* streaming_writer's builder `build()` now REQUIRES the factory (the None-arm convenience
-  was the root-locked default construction). All builders are root-driven.
-
-== Verified
-engine-core standalone `--all-targets` ✓; clippy `--lib --bins -D warnings` ✓ (root +
-engine-core); root lib ✓; workspace `--tests` shape ✓; boundary `--strict` No findings
-(the modality edge stayed dissolved); fmt ✓. SIFT RUNS (45m cap).
+* Decision: construction belongs to the composition root — factory-constructing conveniences moved
+  root-side; streaming_writer's inline `UnifiedQuantizationEngine::new` (a storage → modality hard error)
+  became an injected `Option<Arc<dyn QuantizationEnginePort>>`; `None` errors only when quantization arrays
+  are enabled. The builder's `build()` now requires the factory.
+* `columnar/common.rs` was moved then reverted — it and `serialization.rs` are one unit needing the wider
+  `StorageQuantizationEnginePort`; that shipped in link:TD-DECOMP-80-extract-columnar-serialization-common.adoc[TD-DECOMP-80].

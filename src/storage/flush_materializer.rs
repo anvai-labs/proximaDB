@@ -79,6 +79,11 @@ pub struct CollectionFlushPlan {
     /// TD-FPRUNE-1 M1: whether this is a ProximaRecord (document) collection —
     /// the gate for shredding (mirrors `collection_mapping`'s precondition).
     pub enable_proxima_record: Option<bool>,
+    /// TD-READFID-1: the collection's declared canonical embedding precision
+    /// (proto `EmbeddingPrecision` discriminant). The flush resolves the exact-f32
+    /// tier from it; without it the transitional DTO below dropped the declaration
+    /// and an `fp32` collection flushed only lossy RaBitQ/SQ8 columns.
+    pub canonical_embedding_precision: Option<i32>,
 }
 
 /// Build a [`CollectionFlushPlan`] from a collection's catalog metadata. The single
@@ -143,6 +148,7 @@ pub fn flush_plan_from_collection_meta(
             .map(|c| c.filterable_columns.clone())
             .unwrap_or_default(),
         enable_proxima_record: config.and_then(|c| c.enable_proxima_record),
+        canonical_embedding_precision: config.and_then(|c| c.canonical_embedding_precision),
     })
 }
 
@@ -595,6 +601,7 @@ async fn materialize_collection_with_coordinator_mode(
             // this transitional DTO, keeping footer-pruning dark end-to-end.
             filterable_columns: plan.filterable_columns.clone(),
             enable_proxima_record: plan.enable_proxima_record,
+            canonical_embedding_precision: plan.canonical_embedding_precision,
             ..Default::default()
         }),
         ..Default::default()
@@ -792,6 +799,7 @@ mod tests {
         entered_flush: Notify,
         release_flush: Notify,
         last_storage_assignment: Mutex<Option<StorageAssignment>>,
+        last_precision: Mutex<Option<i32>>,
     }
 
     impl RecordingEngine {
@@ -809,6 +817,7 @@ mod tests {
                 entered_flush: Notify::new(),
                 release_flush: Notify::new(),
                 last_storage_assignment: Mutex::new(None),
+                last_precision: Mutex::new(None),
             }
         }
 
@@ -859,6 +868,11 @@ mod tests {
                 .collection_config
                 .as_ref()
                 .and_then(|collection| collection.storage_assignment.clone());
+            *self.last_precision.lock().expect("test precision lock") = params
+                .collection_config
+                .as_ref()
+                .and_then(|collection| collection.config.as_ref())
+                .and_then(|config| config.canonical_embedding_precision);
             let active = self.active_flushes.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active_flushes.fetch_max(active, Ordering::SeqCst);
             let _active_guard = ActiveFlush(&self.active_flushes);
@@ -923,6 +937,7 @@ mod tests {
             tenant_id: Some("test-tenant".to_string()),
             filterable_columns: Vec::new(),
             enable_proxima_record: None,
+            canonical_embedding_precision: None,
         }
     }
 
@@ -1207,6 +1222,58 @@ mod tests {
         assert_eq!(assignment.typed_account_id, Some(7));
         assert_eq!(assignment.typed_namespace_id, Some(11));
         assert_eq!(assignment.typed_collection_id, Some(13));
+    }
+
+    /// TD-READFID-1: the declared canonical precision must survive the catalog
+    /// meta -> plan -> transitional engine DTO hop; the SST flush resolves the
+    /// exact-f32 tier from it. It used to be dropped here, so an `fp32`
+    /// collection flushed lossy-only no matter what the resolver did.
+    #[tokio::test]
+    async fn canonical_precision_reaches_the_engine_flush_boundary() {
+        use crate::proto::proximadb_v1::EmbeddingPrecision;
+        let meta = Collection {
+            id: "115".to_string(),
+            config: Some(CollectionConfig {
+                name: "fp32-collection".to_string(),
+                dimension: 2,
+                storage_engine: Some(ProtoStorageEngine::Sst as i32),
+                canonical_embedding_precision: Some(EmbeddingPrecision::Fp32 as i32),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut fp32_plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        assert_eq!(
+            fp32_plan.canonical_embedding_precision,
+            Some(EmbeddingPrecision::Fp32 as i32)
+        );
+        fp32_plan.base_location = "file:///tmp/readfid1-tests".to_string();
+
+        let coordinator = FlushExecutionCoordinator::new(1);
+        let write_buffer = Arc::new(WALBehaviorWrapper::new(MemtableConfig::default()));
+        add_batch(&write_buffer, 115, "v0").await;
+        let engine = Arc::new(RecordingEngine::new());
+        coordinator
+            .register_engine(ProtoStorageEngine::Sst, engine.clone())
+            .await;
+        materialize_collection_with_coordinator(
+            &coordinator,
+            &write_buffer,
+            &fp32_plan,
+            None,
+            None,
+            true,
+            None,
+        )
+        .await
+        .expect("flush must succeed")
+        .expect("flush must publish its batch");
+
+        assert_eq!(
+            *engine.last_precision.lock().expect("test precision lock"),
+            Some(EmbeddingPrecision::Fp32 as i32),
+            "the engine flush DTO must carry the declared canonical precision"
+        );
     }
 
     #[test]

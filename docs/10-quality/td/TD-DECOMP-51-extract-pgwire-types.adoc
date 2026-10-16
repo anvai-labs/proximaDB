@@ -5,16 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Landing
-| Severity | Low — behavior-neutral re-export (+2 crate-local deps)
+| Status | **Done (2026-08-11).** Moved `network/postgres/types.rs` (pgwire type conversions; 6 tests) into the existing `proximadb-pgwire-translator` crate (#1572).
 | Component | `crates/horizontal/proximadb-pgwire-translator`; root `src/network/postgres/mod.rs`
+| Relates to | link:../../../roadmap/techdebt/P2_GOD_CRATE_TEST_DECOMPOSITION.md[P2 god-crate decomposition roadmap] (program rationale + recipe); link:TD-DECOMP-38-extract-pgwire-translator.adoc[TD-DECOMP-38]; link:TD-DECOMP-44-extract-type-validators.adoc[TD-DECOMP-44]
 |===
 
-== What moved
-`src/network/postgres/types.rs` (6 tests: pgwire type conversions) → the EXISTING horizontal crate
-`proximadb-pgwire-translator` (TD-DECOMP-38), joining `translator`. Root `network/postgres/mod.rs`
-re-exports it (`pub use proximadb_pgwire_translator::types;`), so `crate::network::postgres::types::*`
-consumers resolve unchanged. Self-contained (0 `crate::`, 0 translator cross-refs). Deps: uuid + hex,
-both added crate-locally (neither is in `[workspace.dependencies]` — same gotcha as TD-44/47).
-NO new crate, NO root `Cargo.toml` wiring → no stacked-PR conflict. Verified: standalone + clippy
--D warnings + root lib all pass. SIFT recall ratchet SKIPS (network/** is not storage_changes).
+== History
+
+Self-contained; `uuid` + `hex` added crate-locally (see link:TD-DECOMP-44-extract-type-validators.adoc[TD-DECOMP-44]). No root manifest change.

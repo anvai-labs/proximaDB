@@ -19,9 +19,12 @@
   canonical `ResourceKey` encoding, full-key renewal, real `TenantContext`
   lock keys, enforced hierarchy, guard-owned renewal/release, and
   storage-visible fencing first.
-* Still open for MVP wiring: bootstrap a `PartitionLeaseManager` from the
-  operator control-plane prefix, run its renewal task, and call `acquire`
-  before accepting writes for a `(tenant_id, collection_id)`.
+* *Reconciled 2026-10-15:* the MVP wiring has landed. `SharedServices` bootstraps a
+  `PartitionLeaseManager` over `_operator/leases`, installs it globally, reconciles it into the
+  **same** `PrimaryPodRegistry` and self pod id that the write gates consult (fixing a split-brain
+  where a displaced pod kept writing), and spawns the renew loop (`src/network/shared_services.rs`;
+  DDL leases #922/#938). Still open: xCatalog `primary_pod`, gateway routing, the bounded-staleness
+  disclosure, and the failover detector (see "Open questions").
 
 == Why this matters
 

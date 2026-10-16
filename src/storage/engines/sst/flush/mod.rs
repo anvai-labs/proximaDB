@@ -565,10 +565,12 @@ impl SstEngine {
                 let target_block = std::env::var("PROXIMADB_PAX_BLOCK_SIZE")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok());
-                // P3 Phase D f32 tier (opt-in): per-collection `pax_f32_tier` tag >
-                // env `PROXIMADB_PAX_F32_TIER` > default off. Emits an exact-f32
-                // stripe (read lazily) for an exact final rerank + include_vectors.
-                let f32_tier = resolve_pax_f32_tier(params.collection_config.as_ref());
+                // P3 Phase D f32 tier: per-collection `pax_f32_tier` tag > a declared
+                // `fp32` canonical precision (TD-READFID-1: the written f32 IS the
+                // record, so a lossy base column must carry the exact tier) > env
+                // `PROXIMADB_PAX_F32_TIER` > default off. Emits an exact-f32 stripe
+                // (read lazily) that point reads / exact scans materialize.
+                let f32_tier = resolve_pax_f32_tier(params.collection_config.as_ref(), quant);
                 // Extract the tag list here (flush config is the legacy v1 proto
                 // type, already referenced by the calls above) so resolve_pax_rerank_quant
                 // stays v1-free — TD-123: don't add new v1-proto references.
@@ -1407,10 +1409,6 @@ fn pax_f32_tier_tag(config: &crate::proto::proximadb_v1::CollectionConfig) -> Op
     latest
 }
 
-/// Resolve whether a flush should ALSO emit the exact-f32 tier (P3 Phase D).
-/// Precedence: per-collection `pax_f32_tier` tag > env `PROXIMADB_PAX_F32_TIER` >
-/// default OFF. The tier is read lazily (exact final rerank / `include_vectors`),
-/// so the only always-paid cost is the storage bytes — not scan/egress.
 /// Tag prefix encoding the per-collection row-group Region D layout switch
 /// (TD-PAXRG-1). Values: `on`, `off`.
 const PAX_RG_LAYOUT_TAG_PREFIX: &str = "pax_rg_layout:";
@@ -1437,14 +1435,47 @@ pub(crate) fn resolve_pax_rg_layout(tags: &[String]) -> bool {
     per_collection.unwrap_or_else(crate::storage::engines::sst::segment_format::rg_layout_enabled)
 }
 
+/// Resolve whether a flush emits the exact-f32 tier (P3 Phase D).
+///
+/// Precedence: per-collection `pax_f32_tier` tag (explicit opt-in/out) > the
+/// collection's declared canonical precision > env `PROXIMADB_PAX_F32_TIER` >
+/// default OFF.
+///
+/// TD-READFID-1: a collection declared `canonical_embedding_precision = fp32`
+/// promises that the stored value IS the written f32. When the base embedding
+/// column is lossy (RaBitQ/SQ8/FP16/env-`Auto`), the exact tier is the ONLY
+/// place that value survives a flush — without it every post-flush point read
+/// serves a reconstruction. `RawF32` base columns are already exact, so the
+/// tier would only duplicate bytes there. The tier is an existing, footer-
+/// declared, mixed-read-safe section: readers that predate it ignore it, and
+/// segments without it still read (lossy) exactly as before.
 fn resolve_pax_f32_tier(
     collection_config: Option<&crate::proto::proximadb_v1::Collection>,
+    quant: proximadb_block_format::VectorQuant,
 ) -> bool {
-    let per_collection = collection_config
-        .as_ref()
-        .and_then(|c| c.config.as_ref())
-        .and_then(pax_f32_tier_tag);
-    per_collection.unwrap_or_else(|| env_truthy("PROXIMADB_PAX_F32_TIER"))
+    let config = collection_config.as_ref().and_then(|c| c.config.as_ref());
+    if let Some(explicit) = config.and_then(pax_f32_tier_tag) {
+        return explicit;
+    }
+    if config.is_some_and(declares_fp32_canonical_precision)
+        && quant != proximadb_block_format::VectorQuant::RawF32
+    {
+        return true;
+    }
+    env_truthy("PROXIMADB_PAX_F32_TIER")
+}
+
+/// True when the collection explicitly declares `fp32` as its canonical
+/// embedding precision. `Unspecified` is NOT treated as a declaration: the
+/// storage cost of retaining f32 for every undeclared collection is a separate,
+/// evidence-gated default decision (see TD-READFID-1).
+fn declares_fp32_canonical_precision(
+    config: &crate::proto::proximadb_v1::CollectionConfig,
+) -> bool {
+    use crate::proto::proximadb_v1::EmbeddingPrecision;
+    config
+        .canonical_embedding_precision
+        .is_some_and(|p| EmbeddingPrecision::try_from(p) == Ok(EmbeddingPrecision::Fp32))
 }
 
 /// TD-FPRUNE-1 (M1): build the P-Shred spec for the SST flush from the in-scope
@@ -1674,6 +1705,55 @@ mod tests {
     use crate::storage::persistence::filesystem::FilesystemFactory;
     use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
     use std::sync::Arc;
+
+    // TD-READFID-1: a declared `fp32` collection retains the exact tier unless
+    // its base column is already exact or it explicitly opts out by tag.
+    #[test]
+    fn fp32_declaration_resolves_the_exact_tier() {
+        use crate::proto::proximadb_v1::{Collection, CollectionConfig, EmbeddingPrecision};
+        use proximadb_block_format::VectorQuant;
+        let mk = |precision: Option<EmbeddingPrecision>, tags: &[&str]| Collection {
+            config: Some(CollectionConfig {
+                canonical_embedding_precision: precision.map(|p| p as i32),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fp32 = mk(Some(EmbeddingPrecision::Fp32), &[]);
+        for lossy in [
+            VectorQuant::RaBitQ,
+            VectorQuant::Sq8,
+            VectorQuant::Fp16,
+            VectorQuant::Auto,
+        ] {
+            assert!(
+                resolve_pax_f32_tier(Some(&fp32), lossy),
+                "fp32 + lossy {lossy:?} base must keep the exact tier"
+            );
+        }
+        // RawF32 base is already the exact authority: no duplicate tier.
+        assert!(!resolve_pax_f32_tier(Some(&fp32), VectorQuant::RawF32));
+        // An explicit per-collection tag wins over the declaration.
+        let opted_out = mk(Some(EmbeddingPrecision::Fp32), &["pax_f32_tier:off"]);
+        assert!(!resolve_pax_f32_tier(Some(&opted_out), VectorQuant::RaBitQ));
+        // Undeclared / non-fp32 precisions are unchanged by this fix (env-gated,
+        // default off). Only asserted when the env override is absent.
+        if std::env::var("PROXIMADB_PAX_F32_TIER").is_err() {
+            for precision in [
+                None,
+                Some(EmbeddingPrecision::Unspecified),
+                Some(EmbeddingPrecision::Fp16),
+                Some(EmbeddingPrecision::Int8),
+            ] {
+                assert!(
+                    !resolve_pax_f32_tier(Some(&mk(precision, &[])), VectorQuant::RaBitQ),
+                    "{precision:?} must not silently gain the tier"
+                );
+            }
+            assert!(!resolve_pax_f32_tier(None, VectorQuant::RaBitQ));
+        }
+    }
 
     // TD-FPRUNE-1 M1: the flush-side shred spec reconstructs the SAME
     // `(name, 100+idx)` pairs the catalog schema assigns, gated on

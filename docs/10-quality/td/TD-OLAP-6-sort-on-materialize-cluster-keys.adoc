@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | Slice 1 **landed 2026-07-05**: heuristic cluster key (first DATE/TIMESTAMP column) + explicit `cluster_key` table property; sort at MATERIALIZE; regression test pins monotone row-group windows. Measured effect: TPC-H static split skip 0% -> **19.2%** (`TPC_PERF_GATE_EVIDENCE_V3_2026_07_05.adoc`). Remaining: DDL surface (`CLUSTER BY`), Iceberg sort_orders interop, default-heuristic opt-out
+| Status | **Partial: slice 1 (cluster key + sort at MATERIALIZE) shipped; open: `CLUSTER BY` DDL surface, Iceberg `sort_orders` interop, default-heuristic opt-out (none present, 2026-10-15).** Slice 1 **landed 2026-07-05**: heuristic cluster key (first DATE/TIMESTAMP column) + explicit `cluster_key` table property; sort at MATERIALIZE; regression test pins monotone row-group windows. Measured effect: TPC-H static split skip 0% -> **19.2%** (`TPC_PERF_GATE_EVIDENCE_V3_2026_07_05.adoc`). Remaining: DDL surface (`CLUSTER BY`), Iceberg sort_orders interop, default-heuristic opt-out
 | Priority | P2a follow-on (ADR-052) — gates TD-OLAP-3 promotion; the other three links are fixed
 | Severity | High — without it, row-group min/max on MATERIALIZE'd tables always spans the whole domain and zone-map + runtime-filter pruning skip 0 bytes regardless of data shape
 | Component | `src/services/dml/mod.rs` (materialize snapshot write), snapshot scan ordering, catalog (cluster-key metadata), `proximadb-iceberg-engine` writer

@@ -1,5 +1,5 @@
 = TD-SDK-2: TypeScript 7 for the Node SDK is blocked on openapi-typescript
-:status: Open
+:status: Open (re-checked 2026-10-15: `openapi-typescript` latest 7.13.0 still peers `typescript ^5.x`)
 :dim: D5
 :pillar: OE
 
@@ -88,5 +88,5 @@ tests pass, `gen-sdk` succeeds with no `src/generated` drift.
 
 * Blocks: TypeScript 7 adoption in `clients/nodejs-embedded`.
 * Blocked by: upstream `openapi-typescript` TS 7 support.
-* Related: TD-126 (spec-driven SDK transports), dependabot #1460 (closed with
+* Related: link:TD-SDK-1-sdk-codegen-doctrine-migration.adoc[TD-SDK-1] (ADR-068 doctrine: drift gates may become advisory), TD-126 (spec-driven SDK transports), dependabot #1460 (closed with
   this finding recorded).

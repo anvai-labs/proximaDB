@@ -93,7 +93,9 @@ SDKs only insofar as the field name passes deserialization; the server does not 
   silent-failure shape that hid the round-1 INSERT→SEARCH gap). Now maps `NOT_FOUND` →
   `ApiError::NotFound` → real HTTP 404 (commit a446b3964).
 * **`top_k` cap** — v2 search now defaults to a 10 000-row cap; above-cap requests return HTTP
-  400. Override via the `PROXIMADB_MAX_SEARCH_TOP_K` env var (commit a446b3964).
+  400. Override via the `PROXIMADB_MAX_SEARCH_TOP_K` env var (commit a446b3964). +
+  *Renamed in v0.3.0* (#1207): the override is now `PROXIMADB_SEARCH_MAX_TOP_K`, and the old
+  name is no longer read — it applies to every search surface since TD-SECSCAN-1.
 * **Arrow Flight precision-coercion parity** — `handle_record_insert_batch_for_tenant` (used by
   Arrow Flight DoPut) now applies the same fp16/bf16/int8 precision coercion as the REST/gRPC
   upsert handler. Previously Arrow Flight INSERT into an fp16 collection landed fp32 records

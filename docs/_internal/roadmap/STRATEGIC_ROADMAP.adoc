@@ -2,12 +2,21 @@
 :toc: left
 :toclevels: 3
 :icons: font
-:last-updated: 2026-06-24
+:last-updated: 2026-10-15
 
 [.lead]
 **Strategic roadmap aligned with the Vision document phases. This file is authoritative for sequencing and prioritization, not for support tier by itself.**
 
 Execution tracking across sessions: link:./BEST_IN_CLASS_EXECUTION_TRACKER.adoc[Best-in-Class Foundation Execution Tracker]
+
+[NOTE]
+====
+*2026-10-15 reconciliation (design-corpus consolidation).* Status cells were re-checked against
+`origin/develop` where evidence was cheap and unambiguous: engine tiers (from `SUPPORTED_SURFACE.adoc`),
+ports, Phase 2.5 history, the Phase 5/7/8 rows, SDKs, SSO and DuckDB. Each changed cell cites its
+evidence. Contradictions *inside* this roadmap are flagged in "MVP Definition". Cells not mentioned
+were not re-verified.
+====
 
 [NOTE]
 ====
@@ -32,7 +41,7 @@ matrix also marks that capability as supported.
 
 == Vision Alignment
 
-This roadmap implements the phased approach from link:../../05-concepts/vision.adoc[Vision Document],
+This roadmap implements the phased approach from link:../../05-concepts/vision.adoc[Vision Document] (historical; canonical: link:../../00-product/VISION.adoc[VISION]),
 co-optimized under the 2026-06-04 data-warehouse course correction and the 2026-06-19 co-design
 dimensional architecture (see `docs/12-design/`):
 
@@ -44,7 +53,7 @@ dimensional architecture (see `docs/12-design/`):
 * **Phase 5**: Agentic Intelligence & Research Frontier (2026 Strategy) — ✅ research landed; agent-memory layer In Progress
 * **Phase 6**: Active Memory & Collective Reasoning — 🔄 In Progress
 * **Phase 7**: Competitive Platform Architecture & Storage Authority (lakehouse-native pgwire) — 🔄 In Progress
-* **Phase 8**: Continuous Data Loop & Elastic Compute (CS/CD, scale-to-zero, External Collection) — 📅 Planned
+* **Phase 8**: Continuous Data Loop & Elastic Compute (CS/CD, scale-to-zero, External Collection) — 🔄 In Progress _(F1/F2/F5 largely shipped; F4b/F6 open — reconciled 2026-10-15)_
 
 
 == Status Legend
@@ -73,12 +82,12 @@ _Foundation: Storage formats and metadata define the contract, not the compute e
 |===
 | Feature | Status | Notes
 
-| SST Engine | ✅ Complete | LSM-tree, write-optimized
-| HELIX Engine | ✅ Complete | Hilbert curves, spatial locality
-| VIPER Engine | ✅ Complete | Parquet columnar, analytics
-| SWIFT Engine | ✅ Complete | Ultra-low latency, small datasets
-| NOVA Engine | ✅ Complete | Progressive columnar, mixed workloads
-| RAPTOR Engine | ✅ Complete | Adaptive row-groups, dynamic
+| SST Engine | ✅ Supported (default) | LSM over PAX blocks; serves the supported vector surface
+| HELIX Engine | ⚠️ Beta | Hilbert curves, spatial locality (tier per `SUPPORTED_SURFACE.adoc`)
+| VIPER Engine | ❌ Deprecated | ADR-093 staged retirement (TD-VIPER-1); do not create new VIPER collections
+| SWIFT Engine | 🧪 Experimental | `experimental-engines`-gated; slated for removal unless completed
+| NOVA Engine | ⚠️ Beta | Progressive columnar, mixed workloads
+| RAPTOR Engine | 🧪 Experimental | `experimental-engines`-gated; leaves extracted to `proximadb-raptor-*` crates
 |===
 
 === Core Infrastructure [✅ Complete]
@@ -87,13 +96,13 @@ _Foundation: Storage formats and metadata define the contract, not the compute e
 | Feature | Status | Notes
 
 | UnifiedStorageEngine Architecture | ✅ Complete | Trait-based engine abstraction
-| Proto-first Pipeline | ✅ Complete | VectorRecord throughout
+| Proto-first Pipeline | 🔄 Superseded | Canonical type is `ProximaRecord` (ADR-024); `VectorRecord` is v1 internal-model residue being retired (`12-design/V1_RETIREMENT_ROADMAP_2026_07_08.adoc` Tier 3)
 | UnifiedCachingFilesystem | ✅ Complete | S3/Azure/GCS + local
 | WAL & Recovery System | ✅ Complete | ACID compliance, crash recovery
 | REST API | ✅ Complete | Port 5678
-| gRPC API | ✅ Complete | Port 5679
+| gRPC API | ✅ Complete | Multiplexed with REST + Arrow Flight on port 5678 (v1 gRPC services removed, TD-V1SUNSET-1)
 | Arrow Flight | ✅ Complete | High-throughput data transfer
-| PostgreSQL Wire Protocol | ✅ Complete | Port 5433, pgvector compatible
+| PostgreSQL Wire Protocol | ✅ Complete | Port 5433, pgvector `<->` compatible; TPC-H 22/22 + TPC-DS ratchets
 |===
 
 === Catalog System [✅ Complete]
@@ -262,7 +271,7 @@ _Added June 04, 2026 to support the commercial revenue wedge._
 | Spark Connector | ⚠️ Partial | P3 | JNI embedded impls + Rust-side filter pushdown + lifecycle (TD-097); JVM DataSource V2 + Gradle harness residual
 | Hadoop Connector | ⚠️ Partial | P3 | records-scan endpoint + cursor + WAL scan push-down (TD-099)
 | DataFusion Native | ✅ Complete | P2 | Already integrated
-| DuckDB Integration | 📅 Phase 3 | P3 | Embedded analytics (planned)
+| DuckDB Integration | ✅ Beta | P3 | DuckDB OLAP routing for join/grouped shapes in `ComputeScheduler` (`duckdb_route`; shipped in v0.3.0, #1451)
 |===
 
 === Streaming & CDC [✅ Complete]
@@ -286,13 +295,13 @@ _Added June 04, 2026 to support the commercial revenue wedge._
 | JWT Authentication | ✅ Complete | P1 | Token-based auth
 | API Key Authentication | ✅ Complete | P1 | Key-based auth
 | RBAC | ✅ Complete | P1 | Role-based access control
-| Rate Limiting | ✅ Complete | P1 | Request throttling
+| Rate Limiting | ✅ Complete | P1 | Request throttling — limiter was inert until mounted 2026-08-25 (TD-RATE-1, #1739; default-off)
 | CORS Middleware | ✅ Complete | P1 | Cross-origin support
 | mTLS | ✅ Complete | P2 | Mutual TLS (TD-006 resolved Mar 2026)
 | Row-Level Security | ✅ Complete | P2 | Policy-based RLS implemented
 | Encryption at Rest | ✅ Complete | P3 | AES-256-GCM (TD-016 resolved Mar 2026)
 | Field-Level Encryption | 📅 Phase 3 | P3 | Column encryption
-| Enterprise SSO | 📅 Phase 3 | P3 | SAML/OIDC
+| Enterprise SSO | ⚠️ Partial | P3 | OIDC provider/role seam shipped (TD-SSO-1); dead legacy SSO stack removed (TD-SSO-3); multi-provider OIDC open (TD-SSO-2)
 | Audit Logging | 🔄 In Progress | P2 | Compliance logging
 |===
 
@@ -303,9 +312,9 @@ _Added June 04, 2026 to support the commercial revenue wedge._
 
 | Python SDK | ✅ Complete | P1 | Full featured; REST spec-generated (TD-126)
 | Rust SDK | ✅ Complete | P1 | Native Rust; `clients/rust/`
-| Go SDK | ⚠️ Partial | P2 | `clients/go` (+embedded); spec-driven codegen Phase 2 open (TD-126)
+| Go SDK | ✅ Complete | P2 | `clients/go` (+embedded); spec-driven REST codegen landed (`clients/go/codegen`, `make gen-go-sdk`, drift gate)
 | Java SDK | ⚠️ Embedded | P3 | `clients/java-embedded`, `clients/jvm`; standalone SDK planned
-| Node.js SDK | ⚠️ Embedded | P3 | `clients/nodejs-embedded`; standalone SDK planned
+| Node.js SDK | ⚠️ Embedded | P3 | `clients/nodejs-embedded` with generated TS wire types (`make gen-ts-sdk`; TD-SDK-2); standalone SDK planned
 | C++ SDK | 💡 Nice to Have | - | C++ ecosystem (planned, TD-005)
 | .NET SDK | 💡 Nice to Have | - | .NET ecosystem (planned, TD-005)
 | Ruby SDK | 💡 Nice to Have | - | Ruby ecosystem (planned, TD-005)
@@ -335,164 +344,23 @@ The storage layer (ProximaCodec, Parquet integration, WAL) is production-grade.
 The gap is in the *query execution layer above storage* -- the layer that turns columnar storage into fast analytical queries and eliminates format conversion at model boundaries.
 ====
 
-=== Vectorized Execution Engine [📅 Phase 2.5 -- CRITICAL]
+=== Phase 2.5 planned workstreams — History
 
-|===
-| Feature | Status | Priority | Notes
+The March 2026 plan's per-workstream tables are in this file's git history (before 2026-10-15).
+They covered: DataChunk vectorized operators, selection vectors and pipelines; Parquet typed
+row-group, page and bloom pruning; Arrow `RecordBatch` as the cross-model lingua franca; graph
+executor completion; L2 NVMe spill, external sort and hash-join spill; morsel-driven parallelism;
+wiring the vectorized executor into `UnifiedParquetReader`; and durable cross-modal 2PC.
+The outcomes are in the table below. The single highest-ROI item, wiring the existing vectorized
+executor into the primary path (TD-041), turned out to be plumbing, not new engine work. Later,
+ADR-052 moved OLAP execution to DataFusion's kernels, so native HashAgg/HashJoin/Sort are no longer
+a build target. Two rows remain open:
 
-| DataChunk-based physical operators
-| 📅 Phase 2.5
-| P0
-| 2048-value chunks fitting L2 cache. Pull-based pipeline with `next_chunk()`. Selection vector (bitmap) pattern instead of row copying. (TD-031)
-
-| Selection vector filtering
-| 📅 Phase 2.5
-| P0
-| Evaluate predicates on entire arrays (SIMD auto-vectorizable). Maintain bitmap through pipeline. Late materialization -- read column values only after filtering.
-
-| Pipeline-based execution
-| 📅 Phase 2.5
-| P0
-| Decompose query plan into pipelines separated by breakers (sort, aggregate, hash-build). Each pipeline processes morsels through full operator chain.
-
-| Re-enable adaptive filter executor
-| 📅 Phase 2.5
-| P1
-| `adaptive_filter_executor.rs` disabled due to API changes. Re-implement against current Arrow/Parquet API.
-|===
-
-=== Row Group Statistics Pruning [📅 Phase 2.5 -- HIGH]
-
-|===
-| Feature | Status | Priority | Notes
-
-| Numeric statistics pruning
-| 📅 Phase 2.5
-| P0
-| Use Parquet typed statistics API (`Statistics::Int64`, `Statistics::Float`, etc.) for proper comparison. Currently returns `true` for all row groups on numeric filters. (TD-033)
-
-| Page-level statistics
-| 📅 Phase 2.5
-| P1
-| Within pruned row groups, skip individual data pages using page-level statistics (Parquet v2).
-
-| Bloom filter predicate resolution
-| 📅 Phase 2.5
-| P2
-| For dictionary-encoded columns, resolve predicates against dictionary before decoding data.
-|===
-
-=== Arrow Native Cross-Model Format [📅 Phase 2.5 -- HIGH]
-
-|===
-| Feature | Status | Priority | Notes
-
-| Arrow RecordBatch as cross-model lingua franca
-| 📅 Phase 2.5
-| P1
-| All model-specific engines return Arrow RecordBatch. Eliminates serialization tax at model boundaries. (TD-032)
-
-| Document embeddings in Arrow columns
-| 📅 Phase 2.5
-| P1
-| Store embeddings as `FixedSizeList<Float32>`, not inside JSON metadata. Eliminates per-row `serde_json::from_str()` in LATERAL joins.
-
-| Graph results as Arrow RecordBatch
-| 📅 Phase 2.5
-| P2
-| Graph traversal results returned as Arrow columns. Enables vectorized processing in federated queries.
-|===
-
-=== Graph Query Executor Completion [📅 Phase 2.5]
-
-|===
-| Feature | Status | Priority | Notes
-
-| Traverse, Filter, Project operators
-| 📅 Phase 2.5
-| P1
-| Complete stubbed `executor.rs`. Execute plans from query planner instead of bypassing to direct engine calls. (TD-035)
-
-| Arrow-native graph results
-| 📅 Phase 2.5
-| P2
-| Return `RecordBatch` from graph queries for integration with federated execution.
-|===
-
-=== Spill-to-Disk [📅 Phase 2.5]
-
-|===
-| Feature | Status | Priority | Notes
-
-| L2 NVMe cache backend
-| 📅 Phase 2.5
-| P1
-| Implement the TODO stub in `backend/mod.rs`. Automatic spillover from L1 memory when budget exceeded. (TD-034)
-
-| External merge sort
-| 📅 Phase 2.5
-| P2
-| Spill ORDER BY intermediate results to temp files for larger-than-memory sorts.
-
-| Hash join spill
-| 📅 Phase 2.5
-| P2
-| Partition hash join build tables and spill partitions when memory exceeded.
-|===
-
-=== Morsel-Driven Query Parallelism [📅 Phase 2.5 -- HIGH]
-
-_Added March 26, 2026 from comprehensive architectural review._
-
-|===
-| Feature | Status | Priority | Notes
-
-| Morsel-based row group distribution
-| 📅 Phase 2.5
-| P1
-| Divide row groups into 4096-element morsels distributed to thread pool with work-stealing. Currently row groups processed sequentially. (TD-039)
-
-| Intra-operator parallelism
-| 📅 Phase 2.5
-| P2
-| Parallel sort, parallel aggregation within query operators. Currently only `tokio::spawn` for I/O.
-|===
-
-=== Wire Vectorized Executor into Query Path [📅 Phase 2.5 -- CRITICAL]
-
-_Added March 26, 2026. Single highest-ROI item._
-
-|===
-| Feature | Status | Priority | Notes
-
-| Plumb `vectorized_executor.rs` into `UnifiedParquetReader`
-| 📅 Phase 2.5
-| P0
-| `DataChunk`, `evaluate_predicate_vectorized()`, and `materialize()` already exist. Primary query path in `unified_reader.rs` uses scalar loops instead. Primarily a plumbing task. (TD-041)
-
-| Batch SIMD distance through vectorized path
-| 📅 Phase 2.5
-| P0
-| Replace per-record `compute_cosine_similarity()` in `unified_reader.rs` with batch call to the SIMD distance engine.
-|===
-
-=== Cross-Modal Transaction Isolation [📅 Phase 2.5]
-
-_Added March 26, 2026._
-
-|===
-| Feature | Status | Priority | Notes
-
-| 2PC participant implementations per store
-| 📅 Phase 2.5
-| P2
-| 2PC protocol defined in `src/storage/multimodel/transaction/` but no participants wired. Each modality handles transactions independently. (TD-038)
-
-| Federated executor transaction context
-| 📅 Phase 2.5
-| P2
-| Pass transaction context through federated query execution so cross-modal queries have consistency guarantees.
-|===
+* *Graph Query Executor Completion (TD-035)* — Traverse, Filter, Project operators: complete stubbed
+  `executor.rs`; execute plans from query planner instead of bypassing to direct engine calls; return
+  `RecordBatch` from graph queries for integration with federated execution.
+* *Read-side quantization-aware row-group pruning (TD-040)* — write-side stats landed; read-side
+  pruning open.
 
 === Reconciled Status (2026-06-24)
 
@@ -528,7 +396,7 @@ _Category Leadership: Time-series, event sourcing, hybrid search, and framework 
 | tantivy BM25 Integration | ✅ Complete | P4 | Full-text indexing via tantivy crate (TD-008 resolved Feb 2025)
 | Reciprocal Rank Fusion (RRF) | ✅ Complete | P4 | Default fusion strategy, 14 tests passing
 | Weighted Linear Fusion | ✅ Complete | P4 | User-specified BM25/vector weights
-| Hybrid Search API | ✅ Complete | P4 | `/api/v1/hybrid/search` with `text_query` + `vector` + `hybrid_mode`
+| Hybrid Search API | ✅ Complete | P4 | `/api/v2/hybrid/search` with `text_query` + `vector` + `hybrid_mode` (v1 path removed)
 |===
 
 === Time-Series Engine (TST) [✅ Complete]
@@ -650,7 +518,7 @@ _Reconciled 2026-06-24. The agent-memory layer (ADR-022) and the fuse-by-`oid` s
 | mem0 / agentmemory framework adapters | ⚠️ Partial | TD-102 | pgwire Slice A landed; Python provider Slice B open.
 | Agent branching (BranchRef, COW, writer fence) | ⚠️ Partial | TD-117 | Foundation landed; ancestor fall-through, live CAS fencing, branch GC open. Depends on TD-116/119.
 | Neutral `Fuser` core + GraphExpander + REST v2 fusion-search | 🔄 In Progress | TD-136, TD-137 | Calibrated fuse-by-`oid` seam; document/relational/edge expanders + cost-routed fusion (TD-138–143) open.
-| EntityService.SearchEntities → seam typed facade | 📅 Open | TD-146 | No standalone retrieval engine; delegates to the seam.
+| EntityService.SearchEntities → seam typed facade | ✅ Complete | TD-146 | Resolved: delegates to the seam (REST `/api/v2/collections/{id}/entities/search`, gRPC v2 `ProximaEntityService`). gRPC v2 `ProximaFusionService.FusionSearch` also exists.
 | Cross-modal atomic multi-modal write | ✅ Complete | TD-133 | `CrossModelTransactionCoordinator` (resolved 2026-06-24).
 |===
 
@@ -714,7 +582,7 @@ _Governing doc: `docs/12-design/PROXIMADB_AS_LAKEHOUSE_NATIVE_PG_ENGINE_2026_06_
 
 | OLTP/OLAP HTAP storage + PG constraints | ⚠️ Partial | TD-110 | ON DELETE FK actions (RESTRICT/CASCADE/SET NULL) on single-col FK landed; ON UPDATE / composite-FK / MVCC residual.
 | Background L0→base compactor + deletion vectors | ⚠️ Partial | TD-114 | Tested PAX merge-on-read core + flag-gated trigger (default OFF); live auto-invoke from flush residual.
-| Cost-based multi-engine dispatch | 📅 Open | TD-115 | `ComputeScheduler::route_select` hardcodes Native today; cost model + `QueryShape` stats not wired.
+| Cost-based multi-engine dispatch | ⚠️ Partial | TD-115 | _Reconciled 2026-10-15:_ `route_select` no longer hardcodes Native. It routes parquet-backed shapes to DataFusion and eligible join/grouped shapes to DuckDB, and a measured `route_cost_model` exists with route-stamp integrity fixed (TD-USUB-9 #1924). Cost-*only* routing over enumerated layouts is open (ADR-094 §5).
 | WAL tiering + read-as-of-LSN time travel | 📅 Open | TD-116 | WAL local-only; `SELECT … AS OF` read path missing. Unblocks TD-117.
 | Unify paging/cache policy with tier policy | 📅 Open | TD-118 | One hierarchy policy for eviction + demotion; scan-ring so cold scans don't evict the OLTP working set.
 | Real Iceberg snapshots (metadata.json + manifest log) | ⚠️ Partial | TD-119 | Phase 1 landed; Avro manifest-list/DataFile stats for Spark/Trino scans residual.
@@ -730,7 +598,7 @@ _Governing doc: `docs/12-design/PROXIMADB_AS_LAKEHOUSE_NATIVE_PG_ENGINE_2026_06_
 | gRPC v2 parity services (graph/document/entity) | ⚠️ Partial | TD-122 | `ProximaGraphService` delivered 2026-06-21; Document/Entity v2 services residual.
 | v1→v2 message-type migration (transport-agnostic domain) | 🔄 In Progress | TD-123 | Graph keystone done (neutral `graph::model`); record/vector/collection services + typed `GraphRef` tenancy residual.
 | Deferred v2 graph RPCs (analytic/batch/stream) | 📅 Open | TD-124 | `GetConnectedComponents`, `HasCycle`, `BatchCreate*`, `StreamTraverse`, declarative `ExecuteQuery`.
-| Hard-delete gRPC v1 proto + compat adapters | 📅 Open | TD-121 | Post-Sunset 2026-06-30 (do NOT merge before 2026-07-01); unblocked by TD-122 + TD-123.
+| Hard-delete gRPC v1 proto + compat adapters | ⚠️ Partial | TD-121 | gRPC v1 compat services and REST /api/v1 are deleted (TD-V1SUNSET-1, #1773). The v1 *proto* remains as the internal domain model (2,681 refs) and retires via ADR-024 / TD-V1SUNSET-2.
 |===
 
 === Competitive Query And Observability Surface
@@ -774,8 +642,8 @@ the full trend analysis and the alignment scorecard. These workstreams realize t
 |===
 | Feature | Status | TD ID | Notes
 
-| Continuous Discovery surface + atomic republish | 📅 Phase 8 | TD-086 | `DiscoveryJob` catalog asset (dedup, recluster, re-embed, drift/quality scan, agent-trajectory analysis) reads a pinned snapshot; completion republishes new data + rebuilt indexes as a new snapshot with an atomic serving switch. Mostly composition over manifest/branch versioning + projection freshness state machine + `compute_route`; converts `src/automl/` into the offline arm of the flywheel.
-| External Collection (index-in-place over lake data) | 📅 Phase 8 | TD-090 | ProximaDB-owned vector/inverted/JSON indexes over external-resident Iceberg/Lance/Parquet data, un-copied and externally governed. Extends `FederatedRead`/`ExternalAuthoritative` from read/federate to index-in-place. Lets the discovery loop cover lake data, not just imported data.
+| Continuous Discovery surface + atomic republish | 🔄 Largely shipped | TD-086 | _Reconciled 2026-10-15:_ registry, passes (recluster/dedup/quality/trajectory), trigger arm and atomic republish shipped; `ReEmbed` pass open — see `12-design/PHASE8_CONTINUOUS_LOOP_HLD_LLD_2026_05_28.adoc`. `DiscoveryJob` catalog asset (dedup, recluster, re-embed, drift/quality scan, agent-trajectory analysis) reads a pinned snapshot; completion republishes new data + rebuilt indexes as a new snapshot with an atomic serving switch. Mostly composition over manifest/branch versioning + projection freshness state machine + `compute_route`; converts `src/automl/` into the offline arm of the flywheel.
+| External Collection (index-in-place over lake data) | 🔄 Largely shipped | TD-090 | _Reconciled 2026-10-15:_ F5 slices 1–3 (federated fetch, BM25 over external text, hybrid, lazy rebuild). ProximaDB-owned vector/inverted/JSON indexes over external-resident Iceberg/Lance/Parquet data, un-copied and externally governed. Extends `FederatedRead`/`ExternalAuthoritative` from read/federate to index-in-place. Lets the discovery loop cover lake data, not just imported data.
 | Lance format interoperability | 📅 Phase 8 | TD-091 | Lance as read/import/external-index substrate alongside Iceberg/Delta/Hudi/Parquet. Gates External Collection for Lance-resident corpora.
 |===
 
@@ -784,9 +652,9 @@ the full trend analysis and the alignment scorecard. These workstreams realize t
 |===
 | Feature | Status | TD ID | Notes
 
-| Scale-to-zero cold path (binary-first two-stage + IVF pruning) | 📅 Phase 8 | TD-087 | Cold-path index profile loads a compact binary/RaBitQ-style representation first; two-stage rerank with disclosed recall envelope (`RecallProbeGate` TD-075 + predicate-aware disclosure TD-064); IVF pruning bounds bytes-touched-per-query. Makes scale-to-zero usable for large vector workloads.
-| Point-read I/O amplification (point-read-optimized lake layout) | 📅 Phase 8 | TD-088 | PAX row-aligned column-group mode + evaluate open Vortex format for point-read-heavy collections; serving (point read) and discovery (scan) over one logical copy.
-| Elastic compute modes + resources-follow-data scheduler | 📅 Phase 8 | TD-089 | `Long-running` / `OnDemand` (minute-billed) / `OfflineBatch` modes over one logical store; warm-pool scheduler attaches a pinned snapshot on request, releases on idle, metadata stays queryable with zero resident compute. Depends on TD-077 (distributed transport); gated by TD-087/TD-088 making scale-to-zero economical first.
+| Scale-to-zero cold path (binary-first two-stage + IVF pruning) | 🔄 Largely shipped | TD-087 | _Reconciled 2026-10-15:_ slices A/B + binary route activation + ADR-023 WARM byte-directory; TD-075 gate live. Cold-path index profile loads a compact binary/RaBitQ-style representation first; two-stage rerank with disclosed recall envelope (`RecallProbeGate` TD-075 + predicate-aware disclosure TD-064); IVF pruning bounds bytes-touched-per-query. Makes scale-to-zero usable for large vector workloads.
+| Point-read I/O amplification (point-read-optimized lake layout) | ⚠️ Partial | TD-088 | _Reconciled 2026-10-15:_ pgwire PK point-lookup path landed; PAX column-group mode not verified. PAX row-aligned column-group mode + evaluate open Vortex format for point-read-heavy collections; serving (point read) and discovery (scan) over one logical copy.
+| Elastic compute modes + resources-follow-data scheduler | 📅 Open (blocked on TD-077) | TD-089 | _Single-node suspend/resume (TD-094) shipped as the F4a first slice._ `Long-running` / `OnDemand` (minute-billed) / `OfflineBatch` modes over one logical store; warm-pool scheduler attaches a pinned snapshot on request, releases on idle, metadata stays queryable with zero resident compute. Depends on TD-077 (distributed transport); gated by TD-087/TD-088 making scale-to-zero economical first.
 |===
 
 == Documentation Status
@@ -862,6 +730,15 @@ For v1.0 release, the following must be complete:
 
 === Deferred Post-MVP
 
+[WARNING]
+====
+*Internal contradiction (flagged 2026-10-15):* this list marks external catalogs, Streaming/CDC and
+Enterprise SSO as not done. The Phase 1 "Catalog System" and Phase 3 "Streaming & CDC" tables mark
+them ✅ Complete, and SSO is Partial. "All 6 storage engines" above is also no longer true as a
+support claim (see the engine tiers). The tables are the more recent source. This MVP checklist is
+the original v1.0 definition.
+====
+
 * [ ] External catalog integration
 * [ ] Distributed operations (Raft, multi-region)
 * [ ] Streaming/CDC
@@ -908,7 +785,7 @@ For v1.0 release, the following must be complete:
 * mTLS infrastructure is complete (TD-006 resolved); remaining security work is admin/status and stronger online revocation policy.
 * Pre-release foundations focus: dashboard/support-surface honesty, multi-tenant safety hardening, canonical WAL authority, ADR-012 minimum branch merge, and hybrid gRPC parity.
 
-=== Q3 2026 [Planned]
+=== Q3 2026 [Planned — reconciled 2026-10-15: TD-030 dogfood still Open; TD-064 residual (a) shipped, (b)/(c) open; benchmark baselines partially recorded in BENCHMARK_EVIDENCE.toml]
 
 * v0.2 GA validation: run the ibkrtrading dogfood window and publish documented results (TD-030).
 * Complete ADR-012 minimum branch merge write-back and close the remaining pgwire/SQL Phase 2 parity gaps from ADR-018.
@@ -945,7 +822,7 @@ For v1.0 release, the following must be complete:
 
 ---
 
-_Last Updated_: 2026-06-24 (full reconciliation vs the Technical Debt Register + the 2026-06-04 / 2026-06-19 pivots)
+_Last Updated_: 2026-10-15 (targeted status-cell reconciliation; previous full reconciliation 2026-06-24 vs the Technical Debt Register + the 2026-06-04 / 2026-06-19 pivots)
 _Version_: 0.2.0
 _Authoritative live status_: link:../../10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register] (implementation) + link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] (support contract)
 _Next Review_: End of Phase 6 Design Review

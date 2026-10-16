@@ -129,6 +129,30 @@ pub(crate) fn validate_records_for_insert(
     Ok(())
 }
 
+/// A query vector the client must fix: empty, non-finite, or of the wrong
+/// dimension for the collection. Typed so request boundaries can map it to
+/// a client error (HTTP 400 / gRPC `InvalidArgument`) instead of a 500.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidQueryVector(pub String);
+
+impl std::fmt::Display for InvalidQueryVector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidQueryVector {}
+
+/// True when a search failure is the client's argument: an invalid query
+/// vector or a `top_k` above the server cap (TD-SECSCAN-1 §5). Walks the
+/// whole `anyhow` chain so `.context(..)` wrappers don't hide it.
+pub fn is_client_argument_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.is::<InvalidQueryVector>()
+            || cause.is::<proximadb_search_types::top_k_limit::TopKLimitExceeded>()
+    })
+}
+
 /// Validate a query vector against the collection: finite values and a
 /// dimension that matches the collection config (when configured).
 pub(crate) fn validate_query_vector_for_search(
@@ -141,12 +165,11 @@ pub(crate) fn validate_query_vector_for_search(
         .enumerate()
         .find(|(_, value)| !value.is_finite())
     {
-        return Err(anyhow::anyhow!(
+        return Err(InvalidQueryVector(format!(
             "Query vector for collection '{}' contains non-finite value at dimension {}: {}",
-            collection_id,
-            i,
-            value
-        ));
+            collection_id, i, value
+        ))
+        .into());
     }
 
     let expected_dimension = collection
@@ -155,12 +178,13 @@ pub(crate) fn validate_query_vector_for_search(
         .map(|config| config.dimension)
         .unwrap_or_default();
     if expected_dimension > 0 && query_vector.len() != expected_dimension as usize {
-        return Err(anyhow::anyhow!(
+        return Err(InvalidQueryVector(format!(
             "Query vector has dimension {} but collection '{}' expects dimension {}",
             query_vector.len(),
             collection_id,
             expected_dimension
-        ));
+        ))
+        .into());
     }
 
     Ok(())

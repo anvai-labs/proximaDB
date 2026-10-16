@@ -5,10 +5,10 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Discovered/verified 2026-09-15 while scoping the gap-closure program's PR-G (moat convergence) slice 1 ("RERANK() SQL contract: document + pgwire e2e for the federated-path SRF").
+| Status | **Open** (the false comment correction and the decline-pinning e2e test shipped with the filing, #1903; the RERANK pgwire SQL surface itself is unbuilt). Discovered/verified 2026-09-15 while scoping the gap-closure program's PR-G (moat convergence) slice 1 ("RERANK() SQL contract: document + pgwire e2e for the federated-path SRF").
 | Priority | Medium — a stale comment claimed working pgwire support that does not exist; a client attempting `SELECT * FROM RERANK(...)` over pgwire gets a confusing, unrelated error rather than an honest "not supported here" decline.
 | Component | `src/query/facade/adapter.rs` (`should_use_federated_request` — the only place `RERANK(` is recognized anywhere in the codebase).
-| Relates to | TD-XMODAL-4 (unified vector-SQL routing / pgwire UDTF reachability gap — the SAME class of gap, already tracked, evidenced further by this session against `graph_traverse`; see the note added there); `docs/12-design/adr/ADR-053-cross-modal-query-fabric.adoc` (cross-modal query fabric: "no new DSL; reuse SQL + table functions" — RERANK is the one modality this principle was never extended to over pgwire).
+| Relates to | link:TD-XMODAL-4-unified-vector-sql-routing-pgwire-udtf-and-operator.adoc[TD-XMODAL-4] (unified vector-SQL routing / pgwire UDTF reachability gap — the SAME class of gap) and link:TD-XMODAL-10-graph-traverse-udtf-pgwire-reachability-unverified.adoc[TD-XMODAL-10] (the `graph_traverse` evidence; overlap: the `legacy_unsupported_from_shape` paren-blind comma check + stale TD-REL-LOWER-1 citation cleanup is listed in both — canonical in TD-XMODAL-10); `docs/12-design/adr/ADR-053-cross-modal-query-fabric.adoc` (cross-modal query fabric: "no new DSL; reuse SQL + table functions" — RERANK is the one modality this principle was never extended to over pgwire).
 |===
 
 == The finding

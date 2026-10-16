@@ -7,27 +7,17 @@
 
 == Status
 
-Accepted — Wired
-
-== Wiring (2026-05-26 audit Tier 3.3)
-
-* Route mounted: `src/network/rest/v1/handlers.rs:1032` → `create_iceberg_rest_router().with_state(iceberg_state)` at `/iceberg/v1`.
-* Router definition: `src/network/rest/v1/iceberg_rest_catalog.rs:107`.
-* Service backend: `src/catalog/iceberg_rest_service.rs`.
-* All standard Iceberg REST endpoints implemented: GET `/config`, GET+POST `/namespaces`, namespace CRUD, table CRUD, `/register`, `/views`.
-* One intentional 501: POST `/oauth/tokens` (line 207) returns NOT_IMPLEMENTED. OAuth2 token exchange is an opt-in feature — header-based auth and no-auth alternatives are documented in the response body. Not a coverage gap.
-* `panic!` at `iceberg_rest_service.rs:1114` is an internal type-coercion assertion (`_ => panic!("expected list type for Vector")`), not a route handler. Defense-in-depth improvement candidate but not customer-facing.
+Accepted — Wired (verified 2026-05-26; source locations re-verified 2026-10-15). See
+<<_implementation_history>>.
 
 == Context
 
-ProximaDB has Iceberg/Delta/Unity catalog *client* implementations (connecting to external systems) but no way for external compute engines (Spark, Trino, DuckDB, Flink, PyIceberg, Polaris) to treat ProximaDB as a catalog authority without writing a custom connector.
-
-The Apache Iceberg REST Catalog specification v1 is a lightweight HTTP contract that every major compute engine supports out of the box.  Implementing the server side inside xCatalog removes the integration barrier entirely.
-
-Relevant research:
-
-* XTable in Action (2401.09621): format-agnostic catalog metadata translation; confirms Iceberg REST is the convergence point for open-format federation.
-* Hadoop InputFormat mental model: `getSplits()` (coordinator, metadata-only) → `createRecordReader()` (worker, data I/O).  Iceberg REST + Arrow Flight maps to this exactly.
+ProximaDB had Iceberg/Delta/Unity catalog *client* implementations but no way for external
+compute engines (Spark, Trino, DuckDB, Flink, PyIceberg, Polaris) to treat ProximaDB as a catalog
+authority without a custom connector. The Iceberg REST Catalog spec v1 is the lightweight HTTP
+contract every major engine supports out of the box (XTable, 2401.09621, confirms it as the
+open-format federation convergence point); Iceberg REST + Arrow Flight maps onto the Hadoop
+`getSplits()` (metadata) / `createRecordReader()` (data I/O) split.
 
 == Decision
 
@@ -124,44 +114,25 @@ For external Hadoop-style key/value or semi-structured files, xCatalog registrat
 `Struct`, `Binary`, or declared typed columns. Readers project data into `ProximaRecord` before
 query planning.
 
-=== Key Source Files
-
-* `src/catalog/iceberg_rest_service.rs` — service layer; `CatalogTableSchema ↔ IcebergTableMetadata` translation; synthetic snapshot generation
-* `src/network/rest/v1/iceberg_rest_catalog.rs` — Axum route handlers; `IcebergRestState`; `create_iceberg_rest_router()`
-* `src/network/rest/v1/handlers.rs` — `create_router()` nests `/iceberg/v1` unconditionally
-
-=== Client Verification
-
-[source,python]
-----
-from pyiceberg.catalog.rest import RestCatalog
-cat = RestCatalog("proximadb", **{"uri": "http://localhost:5678/iceberg/v1"})
-print(cat.list_namespaces())
-print(cat.list_tables(("default",)))
-----
-
-[source,bash]
-----
-curl http://localhost:5678/iceberg/v1/config
-curl http://localhost:5678/iceberg/v1/namespaces
-----
-
 == Consequences
 
-=== Positive
+* External engines connect with no custom connector code; ProximaDB is a catalog authority and
+  engines plan splits against its shards; index metadata in table properties advertises
+  embedding dims/index types.
+* Synthetic Iceberg manifests must stay consistent with engine shard topology across compaction.
+* Endpoints are unconditional (no feature flag); the `/iceberg/v1` prefix avoids `/api/v1/*`.
+* OAuth2 token exchange stays an intentional 501 (opt-in; header-auth/no-auth documented in the
+  response body).
+* Stale since filing: Arrow Flight is no longer a 501 stub and is multiplexed on port 5678
+  (`multi_server.rs`); the `5680` endpoint/port in the table-property and split-mapping examples
+  above is historical.
 
-* Spark, Trino, DuckDB, Flink, and PyIceberg connect to ProximaDB without any custom connector code.
-* ProximaDB becomes a catalog authority; external engines can plan splits against ProximaDB shards.
-* HNSW index metadata in table properties lets engines discover embedding dimensions and index types.
-* Arrow Flight (port 5680) is the natural data-plane complement; Iceberg REST handles catalog only.
+== Implementation history
 
-=== Negative / Risks
-
-* Arrow Flight server is currently a stub (501).  Full external data access requires completing the Flight implementation (Phase D/E).
-* Synthetic Iceberg manifests must be kept consistent with storage engine shard topology on compaction.
-* OAuth2/token auth is currently a 501 stub — production deployments behind a proxy need this wired.
-
-=== Neutral
-
-* Iceberg REST endpoints are added unconditionally (no feature flag).  This is intentional — the catalog is always accessible, keeping external engine configuration simple.
-* The `/iceberg/v1` prefix avoids conflict with `/api/v1/*` internal routes.
+* Router: `src/network/rest/canonical/iceberg_rest_catalog.rs` (`create_iceberg_rest_router`),
+  nested at `/iceberg/v1` by `src/network/rest/canonical/handlers.rs`.
+* Service: `crates/control/proximadb-catalog/src/iceberg_rest_service.rs`
+  (`CatalogTableSchema ↔ IcebergTableMetadata`, synthetic snapshot); bridge test
+  `crates/control/proximadb-catalog/tests/iceberg_rest_service_bridge.rs`.
+* Client check: `RestCatalog("proximadb", uri="http://localhost:5678/iceberg/v1").list_namespaces()`
+  or `curl http://localhost:5678/iceberg/v1/config`.

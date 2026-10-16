@@ -296,12 +296,25 @@ pub async fn search_entities(
         ));
     }
 
-    if top_k == 0 || top_k > 10000 {
+    // top_k=0 stays rejected here (this surface's existing contract, same as
+    // REST v2 record search); the UPPER bound is the shared server cap so
+    // PROXIMADB_SEARCH_MAX_TOP_K governs it like every other search surface
+    // (TD-SECSCAN-1 §5).
+    if top_k == 0 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "Invalid top_k".to_string(),
-                details: Some("top_k must be between 1 and 10000".to_string()),
+                details: Some("top_k must be greater than 0".to_string()),
+            }),
+        ));
+    }
+    if let Err(e) = proximadb_search_types::top_k_limit::check_top_k(top_k as u64) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid top_k".to_string(),
+                details: Some(e.to_string()),
             }),
         ));
     }

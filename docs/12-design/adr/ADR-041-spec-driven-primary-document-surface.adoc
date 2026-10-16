@@ -67,3 +67,13 @@ spec); hand-written surfaces are deprecated, then removed.
 * Phased execution (P0–P5) so consumers migrate before the hand-rolled surface is removed. AnvaiOps's
   connector SDK (Phase 4) switches its `_rest_ingest` to the generated `ingest_documents`, retiring
   its hand-rolled REST + the documented blocker.
+
+== Implementation history
+
+Reconciled 2026-10-15. P0 canonical `ingest_documents` documented from Rust + `insertDocument`
+deprecated (#462); P2 SDK `ingest_documents` delegates to the generated client (#532); P3
+`insert_document` deprecated (#535); P5 public `insert_document` removed (#546) and doc-writers
+migrated (#548). P1 (regenerate all language clients) is now enforced repo-wide by the
+`<lang>-sdk-codegen-drift` gates (mandate 15; doctrine generalized in
+link:ADR-068-sdk-codegen-doctrine-hand-facade-generated-oracle.adoc[ADR-068]). P4 (AnvaiOps
+connector SDK) lives in the AnvaiOps repo and is not verifiable here.

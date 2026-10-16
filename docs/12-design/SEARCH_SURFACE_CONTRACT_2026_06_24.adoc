@@ -3,7 +3,7 @@
 :sectnums:
 :icons: font
 
-Status: Draft (decision record) +
+Status: Decision record — **adopted; convergence Partial (reconciled 2026-10-15)**. TD-146 is Resolved (`SearchEntities` delegates to the seam). A v2 gRPC `ProximaFusionService.FusionSearch` exists (`proto/proximadb/v2/fusion.proto`). Open: TD-138 (`DocumentExpander`; `/api/v2/hybrid/search` is still its own fusion), TD-139 (`RelationalExpander` semimask), and TD-143 (the legacy `execute_hybrid_query`, still reachable through `src/network/grpc/graph_service.rs`). The register lists TD-136/137 "In Progress". +
 Date: 2026-06-24 +
 Owner: Query / Search +
 Related: `CROSS_MODAL_FUSION_SEAM_2026_06_22.adoc` (authority for the retrieval engine), `SUPPORTED_SURFACES.adoc` (apex surface authority), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`, `TD_064_PREDICATE_AWARE_VECTOR_SEARCH_DESIGN_2026_05_27.adoc`, PR #278 (ProximaEntityService v2)

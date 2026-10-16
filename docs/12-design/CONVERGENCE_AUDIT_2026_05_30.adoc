@@ -6,7 +6,7 @@
 :sectnums:
 :last-updated: 2026-05-30
 
-Status: Active audit (no code changes in this pass — reconcile work is queued as TD items) +
+Status: Active audit (no code changes in this pass — reconcile work is queued as TD items) — **Partial (verified 2026-10-15)**: S2 (TD-105), S4 (TD-107), S6 (TD-108) resolved; S8 mostly done (TD-111). Open: S1 (TD-104 In Progress), S3 (TD-106 Partial; its regression guard is link:../10-quality/td/TD-PROTO-2-v1-mirror-drift-unguarded.adoc[TD-PROTO-2], ledger burned 41→0), S7 (F-series opportunistic converter convergence). +
 Date: 2026-05-30 +
 Apex map: link:SYSTEM_MAP_2026_05_30.adoc[SYSTEM_MAP_2026_05_30] +
 Prior audits: `project_proliferation_audit_2026_05_20`, `project_proliferation_audit_2026_05_25` (memory)
