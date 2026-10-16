@@ -95,3 +95,5 @@ reqwest = { version = "0.11", features = ["json"] }
 serde_json.workspace = true
 tempfile.workspace = true
 uuid = { version = "1.0", features = ["v4"] }
+# ADR-095 OLTP crash/fencing e2e: drive the server over pgwire like a real client.
+tokio-postgres = "0.7"

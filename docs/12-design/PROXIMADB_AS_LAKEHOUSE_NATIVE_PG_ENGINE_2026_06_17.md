@@ -1,6 +1,13 @@
 # ProximaDB as a Lakehouse-Native, Multi-Engine Postgres-Wire Server
 
 **Status:** Design proposal / architecture review
+
+> **Superseded in part (2026-10-16).** §2's "ProximaDB today" table is a 2026-06 snapshot. The
+> router no longer always picks Native: Parquet-backed tables route to DataFusion (ADR-052/064),
+> and ADR-094 has since unified the storage substrate. The OLTP and transaction half of this study
+> continues in [ADR-095](adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc), which
+> refreshes §3's market survey (Aurora, DSQL, HorizonDB, AlloyDB, PlanetScale, Supabase 2026,
+> Snowflake Postgres, SlateDB). §3–§10 remain the reference for branching and HTAP dispatch.
 **Date:** 2026-06-17
 **Author:** Architecture review (Claude)
 **Scope:** Refine ProximaDB's architecture toward a single server that (a) speaks the Postgres wire protocol, (b) dispatches each query shape to a purpose-built engine, (c) uses decoupled lakehouse object storage (Iceberg/Delta/Parquet) as the analytical base, (d) keeps a hot LSM/WAL tier for fast OLTP read-after-write, and (e) gives agents cheap, instant, object-store-metadata-driven branches.

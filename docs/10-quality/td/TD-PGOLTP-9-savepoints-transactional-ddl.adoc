@@ -1,0 +1,31 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-9: Savepoints and transactional DDL
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open (filed 2026-10-16). Priority 9 of ADR-095.
+| Severity | Medium (compatibility). ORM migration runners wrap DDL in transactions, and some drivers issue savepoints implicitly.
+| Component | `src/network/postgres/protocol.rs` (transaction control), `src/services/ddl/mod.rs`, catalog WAL
+| Realizes | ADR-095 D7
+| Relates to | ADR-018 P2.D amendment (savepoints and DDL-in-transaction currently fail closed with `0A000`), TD-PGOLTP-1, TD-PGOLTP-4
+|===
+
+== Design
+
+* **Savepoints:** `SAVEPOINT`, `ROLLBACK TO`, and `RELEASE` are marks in the transaction write set.
+  `ROLLBACK TO` truncates the write set and releases key locks taken after the mark. Nothing is
+  durable before COMMIT, so no storage change is needed. A statement error inside a savepoint
+  scope is recoverable by `ROLLBACK TO`, as in PG; this changes the current 25P02 behaviour for
+  that case only.
+* **Transactional DDL:** catalog mutations become entries of the `TxnCommit` record and are applied
+  to the catalog after the fsync. The transaction's own reads see its uncommitted catalog changes
+  through the write-set overlay. DDL takes the table-level lock.
+
+== Acceptance
+
+* `BEGIN; CREATE TABLE t…; INSERT INTO t…; ROLLBACK;`: `t` does not exist, including after a
+  crash.
+* Alembic and Prisma migrate run inside a transaction.
+* psql's `ON_ERROR_ROLLBACK` (which uses implicit savepoints) works.

@@ -1,0 +1,169 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-1: A transaction is one WAL commit record, acknowledged after a group-commit fsync
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **In progress.** S1–S2 are implemented **default-OFF** behind `[oltp] atomic_commit` / `PROXIMADB_OLTP_ATOMIC_COMMIT`. S4a (autocommit through the atomic path) is implemented. S3 (cross-session group commit) and S4b (default flip) are open. **Priority 1** of ADR-095.
+| Severity | **High (correctness).** On the legacy path, a failure partway through COMMIT leaves a partially applied transaction durable.
+| Component | `src/services/canonical_wal.rs` (group frame), `src/services/txn_staging.rs` (staging decorator), `src/services/record_store.rs` (`commit_atomic`), `src/services/dml/mod.rs` (`fork_for_transaction`), `src/network/postgres/protocol.rs` (`commit_buffer_atomically`)
+| Realizes | link:../../12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095] D3
+| Relates to | ADR-018 P2.D amendment (the documented divergence this closes), TD-PGOLTP-3 (integrity folds into this record), TD-PGOLTP-4 (commit LSN = snapshot)
+|===
+
+== Premise correction (2026-10-16, filing rule 7)
+
+**What this TD originally claimed.** The atomic unit was `disk_manager.rs::write_batch`; pgwire
+OLTP fsync semantics were governed by `sync_mode = PerBatch`; and group commit should generalise
+`batch_sync_coordinator`.
+
+**What is true.** Verified by tracing `DmlService` →
+`CatalogRoutingTableRecordStore` → `DirectWalTableRecordStore::write_mutations` →
+`FramedTableWalAppender::append_operations`:
+
+* Relational pgwire writes never touch the collection WAL (`disk_manager`, `sync_mode`,
+  `batch_sync_coordinator`). `BatchSyncCoordinator` has **no production caller**.
+* They go to **one shared framed log**, `<data_dir>/pgwire/canonical-records.wal`, for every table
+  and tenant. A multi-table transaction therefore needs no cross-file coordination.
+* `append_operations` wrote **one frame per operation**, then a single `sync_data`. A torn write
+  could therefore leave a durable **prefix of one multi-row INSERT**, a second defect beyond the
+  COMMIT one.
+* A full-length tail of zero bytes, as left by a crash that extended the file before its data
+  blocks landed, made boot **fail** rather than being treated as a torn tail.
+
+**What it changes.** The group frame lives in `canonical_wal.rs`, not in `disk_manager`.
+Cross-session group commit (S3) must be built in `FramedTableWalAppender`.
+
+== Design as built (S1–S2)
+
+1. **Group frame** (`FRAME_VERSION_GROUP = 2`). The header is unchanged. The payload is a msgpack
+   `Vec<CanonicalWalEntry>` with one CRC, and each entry carries its own tenant. Readers expand it
+   into ordinary entries, so replay, CDC and every `CanonicalOperation` consumer are unchanged.
+   Group sequences must be contiguous from the header, or decoding fails. The format is
+   mixed-read-safe: version 1 and version 2 coexist. Binaries that predate it reject version 2
+   rather than apply part of a transaction. **A single version-2 frame blocks downgrading the
+   binary** (the pgwire WAL is not compacted).
+2. **Torn tail.** An incomplete trailing frame (existing behaviour) and an **all-zero**
+   remainder are truncated. The dropped bytes are first copied, best effort and fsynced, to
+   `canonical-records.wal.torn-<offset>-<nanos>`, and
+   `proximadb_canonical_wal_torn_tail_truncations_total` is incremented.
+   * These two rules apply to **every** framed WAL, including the system catalog's. Truncating an
+     all-zero tail, where boot used to fail, is a deliberate change to the default path.
+   * A complete frame with bad magic, a bad CRC, a bad payload or a bad sequence stays a hard error.
+     A frame that is still incomplete when the file ends (including a corrupt `payload_len` in a
+     frame that is not the last) takes the incomplete-frame path. That is pre-existing, and it is
+     the reason point 2a matters.
+2a. **Failed appends never leave junk** (review finding 1).
+   * The appender records the file length before writing.
+   * If the write fails part-way (for example ENOSPC), the file is truncated back to that length
+     and fsynced, still under the append lock, and the error is a plain "nothing was written".
+   * If the rollback fails, or `sync_data` itself failed (fsyncgate), the appender is **poisoned**:
+     every later append is refused until a restart. The error is typed
+     `WalAppendIndeterminate` and reported as 08007, never as "nothing committed".
+   * Debug-only fault seams `fail_mid_write` and `fail_sync` test both paths.
+3. **Staging decorator.** At COMMIT the buffered statements re-execute through the unchanged
+   `DmlService` against `StagingTableRecordStore`. Writes are captured. Reads, unique checks and
+   scans see base ∪ staged, so INSERT-then-UPDATE of one row works. Nothing is written until
+   commit.
+4. **`commit_atomic`.**
+   * It re-validates INSERT-absent / UPDATE-exists against current partitions in staged order,
+     because writers that do not take op-locks exist. A mismatch fails with `40001` and nothing
+     becomes durable.
+   * It then makes **one** `append_operations_atomic` call and applies the batches with positional
+     LSNs.
+   * **If the apply fails after the durable append** (review finding 2), the store is **poisoned**:
+     every read and write is refused until a restart replays the WAL, so a half-applied commit is
+     never served. pgwire sends **FATAL 08007** and closes the connection, so no ROLLBACK tag can
+     follow a transaction that committed, and caches are invalidated whenever the commit may be
+     durable.
+   * The routing store refuses a commit that spans two stores (`0A000`).
+   * All of these are typed errors (`TxnSerializationConflict`, `CommitOutcomeUnknown`,
+     `AtomicCommitUnsupported`); no error text is string-matched.
+4a. **PostgreSQL error semantics** (review finding 9).
+   * A statement that fails at COMMIT keeps its own SQLSTATE (23505, 23503, …); 25P02 is only the
+     fallback.
+   * A statement timeout is 57014.
+   * After any non-FATAL COMMIT failure, the transaction is over and the session returns to idle
+     (`I`), as in PostgreSQL.
+5. **Locks.** COMMIT holds the sorted op-locks of every buffered table and its cascade closure for
+   the whole commit. The forked service asserts membership instead of re-acquiring, and fails
+   closed if a table is not held.
+6. **Cancellation.** The durable step runs in its own task, outside the statement timeout, so a
+   disconnect cannot split the append from the apply.
+6a. **Overlay keying and filtered scans** (review findings 6 and 7). Staged rows are keyed by the
+    durable store's partition id (the stable object id under ADR-031 keying), not by bare name.
+    Filtered scans push the predicate down to the base and overlay matching staged rows, rather
+    than materialising whole tables while the commit holds their locks.
+7. **Refusals with the gate on.** `INSERT … SELECT` / `INSERT OVERWRITE` inside a transaction are
+   refused with `0A000`, because the table-write executor would bypass staging. The
+   `oltp-integrity` key store is also refused with `0A000` (TD-PGOLTP-3).
+8. **Fail closed.** With the gate on, failing to open or replay the shared canonical WAL is fatal at
+   boot (it previously only `warn!`ed).
+
+**Guarantee.** Crash atomicity and all-or-nothing, **not isolation**. Concurrent readers can
+observe a commit mid-apply until TD-PGOLTP-4.
+
+**Statistics are transactional (review finding 8, fixed).** The transaction fork queues row-count,
+null-count, min/max and NDV bumps (`DeferredStatBump`) instead of applying them. The COMMIT routine
+applies the queue only after `commit_atomic` succeeds and drops it on failure, so a failed
+transaction never moves planner statistics. Covered by
+`transaction_fork_defers_statistics_until_commit`.
+
+**Test seams.** `PROXIMADB_TEST_TXN_COMMIT_FAULT` is compiled out of release builds
+(`cfg!(debug_assertions)`), so a production server cannot be aborted through it (review
+finding 10).
+
+**S4a: autocommit is atomic too.** With the gate on, every pgwire autocommit INSERT / UPDATE /
+DELETE runs as a one-statement atomic unit through the same core as COMMIT
+(`services::atomic_txn::execute_atomically`, shared by both paths). A cascading DELETE's child and
+parent rows therefore land in one group frame. Ordinary statement errors keep each call site's
+existing mapping (55P03 lock conflicts, constraint SQLSTATEs). An outcome-unknown failure is
+FATAL 08007, as for COMMIT. Evidence:
+* `autocommit_cascade_delete_is_one_atomic_unit` (red before the change)
+* `autocommit_statements_keep_their_tags_and_sqlstates`
+* the existing `pgwire_fk_referential_actions_e2e` and `pgwire_transaction_e2e` suites pass with
+  the gate on (7/7)
+
+The REST `/api/v2/sql` and gRPC `ExecuteQuery` DML paths still call `DmlService` directly and are
+not yet atomic.
+
+**Known gaps.**
+* UNIQUE races with writers that take no op-locks (INSERT…SELECT, DDL, graph merge-back)
+  pre-date this work and remain.
+
+== Acceptance (evidence)
+
+* Unit tests (`canonical_wal.rs`, `txn_staging.rs`):
+  ** group round trip
+  ** mixed v1/v2 replay order
+  ** a torn group drops the whole group
+  ** zero tail quarantined and truncated
+  ** mid-file corruption still an error
+  ** non-contiguous group rejected
+  ** fenced appender refuses
+  ** per-appender flag
+  ** staged visibility, INSERT→UPDATE, delete hiding, merged limit, unique conflicts
+  ** one append per commit, applied in order
+  ** concurrent-insert abort with nothing durable
+  ** router refusing a split commit
+* pgwire e2e (`tests/pgwire_atomic_commit_e2e.rs`):
+  ** a mid-COMMIT failure leaves **nothing** durable (red on the legacy path with
+     `PROXIMADB_OLTP_ATOMIC_COMMIT=0`)
+  ** multi-table all-or-nothing
+  ** INSERT then UPDATE in one transaction
+  ** `fail_before_append`
+  ** INSERT…SELECT refusal
+* Server-binary crash matrix (`apps/proximadb-server/tests/oltp_reattach_e2e.rs`):
+  ** `abort_after_append` → the whole transaction recovered
+  ** `torn_append` → boots, none of it, earlier commits intact, tail quarantined
+* MinIO smoke (`scripts/smoke_oltp_reattach_minio.sh`): a bank-transfer workload preserves the
+  total-balance invariant across forced failures, reattach and crash.
+
+== Remaining slices
+
+. S3: cross-session group commit in `FramedTableWalAppender` (one fsync per batch of concurrent
+  commits), with metrics (`proximadb_wal_group_commit_size`, fsync latency).
+. S4a ✅: autocommit pgwire DML through the same routine (one write path, ADR-095 D3).
+. S4b: route the REST/gRPC DML paths through it too, then flip the default once the TD-PGOLTP-6
+  ratchet is green.

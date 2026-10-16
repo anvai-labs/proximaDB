@@ -122,6 +122,12 @@ impl ProximaDB {
         tracing::info!("🚀 ProximaDB::new - STARTING database initialization");
         tracing::debug!("🔍 ProximaDB::new - Config: {:?}", config);
 
+        // ADR-095: publish `[oltp] atomic_commit` before SharedServices opens the
+        // canonical WAL (which arms group frames from it). Env still overrides.
+        crate::services::oltp_gate::install_atomic_commit(
+            config.oltp.as_ref().is_some_and(|oltp| oltp.atomic_commit),
+        );
+
         // Fail closed before any storage init: memory-mapped I/O is invalid
         // against a cloud object store (S3/GCS/Azure) — the operator must set
         // `[storage.optimization] enable_mmap = false` for cloud deployments.

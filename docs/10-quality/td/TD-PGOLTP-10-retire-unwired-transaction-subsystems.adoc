@@ -1,0 +1,34 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-10: Retire the three unwired transaction subsystems
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open (filed 2026-10-16). Do after TD-PGOLTP-1 lands, so the replacement is live first.
+| Severity | Low (code health), with a real risk: three dormant "transaction managers" invite a fourth, and a reader can mistake them for the live path.
+| Component | `crates/storage/proximadb-storage-transaction` (2,719 lines), `src/transaction/` + `src/storage/multimodel/transaction/` (5,871 lines), `src/services/transaction/` (667 lines)
+| Realizes | ADR-095 D9
+| Relates to | TD-133 (cross-model coordinator), ADR-071 (ledger: "distributed multi-key / cross-modal ledger transactions deferred to wiring `MultiModelTransactionManager`")
+|===
+
+== Premise (verified 2026-10-16)
+
+* No file under `src/network`, `src/services`, `src/query`, `apps` or `crates/platform` uses
+  `crate::transaction::`, `storage::transaction::`, `multimodel::transaction` or
+  `MultiModelTransactionManager`.
+* Two **different** structs are named `CrossModelTransactionCoordinator`
+  (`src/transaction/coordinator.rs:111` and `src/services/transaction/`). The second is referenced
+  from `services/dml/mod.rs` only in a doc comment.
+* Only their own unit tests and `tests/transaction_integration_test.rs` /
+  `tests/cross_model_transaction_e2e.rs` construct them.
+
+== Plan
+
+. Re-verify the premise at start (filing rule 7). Check `tests/cross_model_transaction_e2e.rs`
+  for a live caller that grep missed.
+. Move anything ADR-095 reuses (for example the isolation-level enum) into `proximadb-txn-core`.
+. ADR-071 cites `MultiModelTransactionManager` as the future cross-modal path. Amend ADR-071 to
+  point at ADR-095's `TxnCommit` record instead: cross-modal atomicity on one node is one commit
+  record spanning modalities, not 2PC.
+. Delete the three subsystems and their tests in one PR, recording the line count removed.

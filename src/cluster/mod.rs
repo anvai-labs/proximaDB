@@ -69,6 +69,8 @@ pub mod partition_lease;
 pub mod primary_pod_registry;
 pub mod replication;
 pub mod routing;
+/// ADR-095 D2: object-store writer-epoch log fencing a reattachable WAL volume.
+pub mod writer_epoch;
 
 // RPC abstraction layer for inter-node communication
 // Provides SOLID-compliant traits for consensus, replication, search fanout, and health

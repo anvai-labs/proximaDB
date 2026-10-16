@@ -1,0 +1,659 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= ADR-095: Postgres-compatible OLTP on object storage — a reattachable WAL volume, epoch fencing, and LSN-snapshot transactions
+:toc: left
+:toclevels: 3
+:icons: font
+:last-updated: 2026-10-16
+
+[cols="1,3"]
+|===
+| Status | **Proposed (2026-10-16).** Each decision is tracked by a `TD-PGOLTP-*` entry and ships default-OFF until its gate passes. **Implemented (opt-in):** D3 atomic COMMIT, as a group frame plus a staging decorator (TD-PGOLTP-1 S1–S2), and D1/D2 volume check, epoch log, fence and watchdog (TD-PGOLTP-2 S1–S2). Group commit, epoch stamping (S3) and D4–D8 are open.
+| Date | 2026-10-16
+| Deciders | Vijaykumar Singh
+| Relates to | ADR-018 (pgwire SQL parity: this ADR is the storage design ADR-018 P3.B said MVCC "likely" needs), ADR-020 (canonical WAL authority), ADR-045 / ADR-046 (PAX durable core, LSN-coherent merge read), ADR-063 (object-store WAL recovery tokens), ADR-069 (local-disk WAL, tiered flush), ADR-072 (foundational contracts: F2 PK, F5 FK), ADR-084 D2 (multi-node coordination is commercial), ADR-094 (unified storage substrate)
+| Revisits | link:../../10-quality/td/TD-LTAP-3-quorum-wal-latency-only-wontdo.adoc[TD-LTAP-3]. It closed the quorum-WAL question with "revisit only if the workload shifts to high-frequency per-tx OLTP". This ADR is that shift. It answers with a durable block volume instead of a quorum, and TD-LTAP-3 stays Won't Do.
+| Tracked under | TD-PGOLTP-1 … TD-PGOLTP-10
+| Non-goals | Multi-writer or sharded OLTP; distributed transactions; building an Aurora/Neon-style storage fleet (page servers, quorum log); PL/pgSQL, triggers, extensions, LISTEN/NOTIFY; full `pg_catalog` parity (tracked separately under ADR-018 P2.B/P3.A)
+|===
+
+toc::[]
+
+== 1. The ask
+
+Serve **PostgreSQL-compatible OLTP**, at least the SQL and transaction semantics an application
+or ORM depends on, with data on **object storage**. The write-ahead log may live on a
+**network-attached durable volume** (AWS EBS / EFS, Azure Premium SSD / Azure Files, GCP
+Persistent Disk / Hyperdisk / Filestore). That volume outlives the compute instance and can be
+**reattached to a replacement machine**, which recovers and resumes serving.
+
+== 2. What exists today (verified 2026-10-16 against `origin/develop` @ `36638a8ee`)
+
+Each row was checked in source, not taken from an older doc. The rows marked ❌ are the plan.
+
+[cols="2,1,4", options="header"]
+|===
+| Primitive | State | Evidence
+
+| pgwire front: simple + extended query, portals, SCRAM auth
+| ✅
+| `src/network/postgres/{protocol,session}.rs`; TD-PGWIRE-AUTH-1
+
+| `BEGIN` / `COMMIT` / `ROLLBACK`, `READ ONLY`, `statement_timeout`
+| ⚠️ partial
+| ADR-018 amendment 2026-09-10 (P2.D). DML is buffered per connection (`TransactionBuffer`, `protocol.rs:349`) and **replayed one statement at a time at COMMIT** (`replay_transaction_buffer`, `protocol.rs:2251`).
+
+| **Atomic COMMIT**
+| ❌
+| A mid-COMMIT replay failure leaves earlier statements **durable** (documented P2.D divergence). The WAL has **no transaction or commit record**: the unit of atomicity is one framed batch append (`disk_manager.rs::write_batch`).
+
+| Read-your-own-writes inside a transaction
+| ❌
+| Reads are store-only until COMMIT (documented divergence).
+
+| Isolation beyond READ COMMITTED; snapshots
+| ❌
+| `REPEATABLE READ` / `SERIALIZABLE` fail closed. No per-transaction snapshot exists.
+
+| Write concurrency
+| ⚠️ coarse
+| UPDATE/DELETE take a **table-level** DML lock plus a per-table op lock (`services/dml/mod.rs:3744-3747`). Writers to one table serialize. There are no row locks and no `SELECT … FOR UPDATE`.
+
+| PK point read
+| ✅ single-column
+| `point_lookup_relational` (`dml/mod.rs:2275`). UPDATE resolves matching ids, then calls `get_by_key` once per row.
+
+| PK / UNIQUE / FK enforcement
+| ⚠️ opt-in
+| The `ConditionalKeyStore` is wired at the composition root (TD-OLTP-WIRING-1) but only behind the **`oltp-integrity` feature, default OFF**, and it persists to a **separate** `oltp-cks.wal`, which is not atomic with the record WAL. The UNIQUE index lives in `record_store.rs`.
+
+| Sequences / `SERIAL` / `IDENTITY`, DML `RETURNING`
+| ❌
+| `grep` finds no `CREATE SEQUENCE` / `nextval` handling and no DML `RETURNING` in the SQL frontend.
+
+| Savepoints, DDL inside a transaction
+| ❌
+| Both fail closed with `0A000` (ADR-018 P2.D amendment).
+
+| WAL durability modes
+| ✅
+| `SyncMode::{Never,Always,Periodic,PerBatch,MemoryOnly}`; the default is **`PerBatch`** (`write_ahead_log/config.rs:157`).
+
+| WAL on a dedicated local root, separate from object-store data
+| ✅
+| ADR-069 S1 (`wal_local_dir`). TD-WAL-5 (crash recovery with a config-file WAL dir) was fixed 2026-10-15.
+
+| Single-owner guard on local roots
+| ⚠️ same-host only
+| `StorageOwnershipLease` takes an advisory `flock` on every local writable root (`apps/proximadb-server/src/storage_ownership.rs`). That excludes a second process on **one host**. It is **not** a cross-host fence: `flock` over NFS/EFS is lease-based, and on a multi-attach block device it does not exist at all.
+
+| Writer incarnation for object-store WAL objects
+| ✅ (object-store WAL only)
+| `RecoveryToken { tenant_id, epoch, sequence }` (`write_ahead_log/recovery_token.rs`, ADR-063).
+
+| Flush to object store; WAL truncation behind manifest durability
+| ✅
+| ADR-094 / TD-USUB-1 (spill store, LSN plumbing, unflushed-minimum truncation point that fails closed).
+
+| PITR manager, branching foundation
+| ⚠️ partial
+| `write_ahead_log/pitr.rs`; TD-LTAP-4 / TD-116 / TD-117 open.
+|===
+
+**Correction (2026-10-16, found while implementing TD-PGOLTP-1).** Two rows above describe the
+*collection* WAL (`disk_manager`, `SyncMode`, `batch_sync_coordinator`). Relational pgwire writes
+never touch it. They go to **one shared framed log**, `<data_dir>/pgwire/canonical-records.wal`
+(`FramedTableWalAppender`), which wrote one frame per operation, so a torn write could persist a
+prefix of a single multi-row INSERT. D3 is therefore implemented as a **group frame in that log**
+(TD-PGOLTP-1 premise correction). `BatchSyncCoordinator` has no production caller.
+
+**Reading:** the storage spine (WAL → memtable → PAX/Parquet on object store, LSN-tracked
+truncation) is in place. What is missing is the **transaction layer on top of it**: atomic commit,
+snapshots, row-level concurrency, integrity enforced in the same atomic unit, and a WAL that can
+**move between machines without split-brain**.
+
+== 3. How the market solves this (refreshed 2026-10)
+
+Builds on the June 2026 study in
+link:../PROXIMADB_AS_LAKEHOUSE_NATIVE_PG_ENGINE_2026_06_17.md[PROXIMADB_AS_LAKEHOUSE_NATIVE_PG_ENGINE]
+§3, which covers Neon, Lakebase, Supabase, OrioleDB, pg_lake and the HTAP engines.
+
+[cols="2,3,3,3", options="header"]
+|===
+| System | Where the commit becomes durable | Where the data lives / how compute is replaced | Lesson for ProximaDB
+
+| **Amazon Aurora PostgreSQL** (provisioned and Serverless v2)
+| Log records shipped to a purpose-built storage fleet, **4-of-6 quorum across 3 AZs**
+| Storage fleet materialises pages. Compute is stateless, and Serverless v2 scales compute (ACUs) only.
+| "The log is the database." Requires a storage *service*, which is out of scope for us (non-goal).
+
+| **Aurora DSQL**
+| Journal-based commit; **optimistic concurrency**, conflicts surface at COMMIT as serialization errors
+| Disaggregated, multi-region active-active
+| Deliberately ships a **subset** of PG (no PL/pgSQL, async DDL, limited FKs) and still markets "PostgreSQL-compatible". Scoping compatibility by declared level is accepted practice.
+
+| **Neon / Databricks Lakebase**
+| **Safekeepers**: Paxos WAL quorum on local disk
+| Pageservers rebuild pages at an LSN from image + delta layers offloaded to S3. Compute is stateless Postgres; branching = parent LSN.
+| WAL-as-interface and **LSN as snapshot and branch point**. We take the LSN model and not the safekeeper fleet.
+
+| **Azure HorizonDB** (public preview 2026)
+| A dedicated WAL service (database-as-a-log)
+| A separate page service; replicas share one storage copy
+| The same family as Aurora and Neon, which confirms that splitting WAL storage from page storage is the industry's chosen seam.
+
+| **Google AlloyDB**
+| Log-processing storage layer, regional
+| Disaggregated storage; columnar engine for analytics
+| The same family again. Its in-memory columnar cache is the HTAP analogue of our DataFusion route.
+
+| **Amazon RDS / Azure Flexible Server / Cloud SQL** (classic)
+| fsync to an **attached network block volume** (EBS / Managed Disk / PD)
+| Data files on the same volume. Single-AZ recovery = **reattach the volume to a new VM and replay**. HA = a synchronous standby or a zone-redundant disk.
+| **This is the model the ask describes.** It is simple and well proven: RPO 0 within the volume's replication domain, RTO in minutes. Its weakness is that the volume holds *all* data, so it is large, expensive and slow to move. We keep only the **WAL tail** on the volume.
+
+| **PlanetScale Postgres / Metal**
+| Local NVMe plus replicas across 3 AZs
+| Replicated nodes; failover promotes a replica
+| Latency comes from local NVMe, and durability from replication rather than from the disk. This is the opposite trade to ours, and a useful latency bound.
+
+| **Supabase** (+ OrioleDB, Multigres alpha)
+| Stock Postgres WAL on an attached volume
+| Instances; Multigres (Vitess-style) is alpha. OrioleDB (undo log, no VACUUM) targets production in 2026.
+| Compatibility is "stock Postgres", so it inherits everything. OrioleDB's undo-log design is a reference for avoiding VACUUM-style bloat in our MVCC.
+
+| **Snowflake Postgres / pg_lake** (ex-Crunchy)
+| Stock Postgres WAL
+| Iceberg tables via an extension plus an out-of-process DuckDB; the heap↔Iceberg boundary is **not fully ACID**
+| Two engines joined at query time. Our single-engine design avoids that ACID seam, which is the reason not to bolt OLTP onto the lake.
+
+| **SlateDB** (embedded LSM on object storage)
+| Batched WAL objects on S3; **writer epoch in the manifest fences zombie writers** (CAS / put-if-absent)
+| Single writer, many readers
+| **The fencing pattern for us:** an object-store CAS epoch stops a zombie writer from corrupting shared state after a takeover.
+|===
+
+*Sources:* Neon architecture overview (neon.com/docs/introduction/architecture-overview);
+Databricks Lakebase architecture (docs.databricks.com/aws/en/oltp/projects/architecture);
+How Aurora Serverless v2 works (AWS Aurora user guide); Aurora DSQL PostgreSQL-compatibility
+migration guide (AWS) and DEVCLASS 2024-12-09; Azure HorizonDB overview (learn.microsoft.com/azure/horizondb/overview);
+Supabase Series F / Select 2026 posts; PlanetScale Metal (InfoQ 2025-10); Snowflake pg_lake
+engineering blog (2025-11); thebuild.com "pg_lake vs Lakebase" and "picking the lock-in you want";
+SlateDB docs and Jack Vanlightly's notes on SlateDB fencing; AWS EBS NVMe reservations
+(docs.aws.amazon.com/ebs/latest/userguide/nvme-reservations.html). Vendor numbers are vendor claims.
+
+=== 3.1 The design space, reduced
+
+There are three ways to make a commit durable while compute stays replaceable:
+
+. **Quorum log service** (Aurora, Neon, HorizonDB, AlloyDB): lowest RPO across AZs, but it is a
+  distributed storage system to build and operate. TD-LTAP-3 already rejected it, and ADR-084 D2
+  puts multi-node coordination in the commercial layer.
+. **Commit = object-store PUT** (today's object-store WAL, SlateDB, WarpStream): durable across AZs
+  with nothing to operate, but each commit costs one PUT round trip (tens of ms on S3 Standard).
+  Batch ingest can amortise that. Per-transaction OLTP cannot.
+. **Commit = fsync on a durable network volume** (classic RDS; this ask): sub-ms to low-ms
+  commits, durable within the volume's replication domain, and recovery by reattach. The cloud
+  runs the replication; we only have to guarantee **one writer at a time**.
+
+**ProximaDB takes (3) for the WAL tail and (2) for everything else.** The volume holds only the
+uncheckpointed WAL. The object store holds the base data, checkpoints, the catalog, and archived
+WAL segments. That keeps the volume small, which makes it cheap and fast to move and bounds
+replay time. It is still the same engine and the same WAL code. The volume is a *placement* of the
+existing ADR-069 local WAL root, not a new subsystem.
+
+== 4. Decision
+
+[source,mermaid]
+----
+%%{init: {"theme": "neutral"}}%%
+flowchart LR
+  subgraph Clients
+    APP["Apps / ORMs / psql / pgbench"]
+  end
+  subgraph Compute["Compute (replaceable)"]
+    PG["pgwire session<br/>txn write-set + snapshot LSN"]
+    TXN["Txn manager<br/>row key-locks · first-committer-wins"]
+    MEM["MVCC memtable<br/>version chains by commit LSN"]
+    CACHE["Local NVMe cache<br/>(rebuildable)"]
+  end
+  subgraph Volume["Durable WAL volume"]
+    WAL["WAL tail (EBS · Azure Disk · PD · EFS)<br/>commit records: rows + catalog + keys"]
+    EP["epoch fence file"]
+  end
+  subgraph ObjectStore["Object storage"]
+    CTRL["_control/…/writer/v{n}<br/>(create-only epoch slots)"]
+    BASE["PAX / Parquet segments<br/>+ manifests (epoch-checked CAS)"]
+    ARCH["Archived WAL segments<br/>(PITR · cross-AZ restore)"]
+  end
+  APP --> PG --> TXN --> MEM
+  TXN -- "group commit: one fsync" --> WAL
+  MEM -- "checkpoint / flush" --> BASE
+  WAL -- "seal + ship" --> ARCH
+  MEM -. "read miss" .-> CACHE -. "ranged GET" .-> BASE
+  Compute -- "boot: win epoch" --> CTRL
+----
+
+=== D1 — One durable volume root holds every piece of state not yet in object storage
+
+A new `[oltp.durable_volume] root` (env override `PROXIMADB_OLTP_DURABLE_VOLUME`) is the single
+local path that must survive compute loss. It contains the record WAL, the system-catalog WAL, the
+key-constraint log (folded in by D3), the checkpoint LSN and the epoch fence file. **Everything else
+on local disk is cache** and must rebuild from object storage. The invariant is: _durable = on the
+volume or in object storage; anything else is a cache._ The boot path enforces it by refusing to
+start (fail closed) when a durable role (`RootRole::{WalLocalDir, WalWriteBuffer, Metadata}`)
+resolves outside the volume root while the volume is configured. The existing `root_plan` /
+`durable_locations` machinery already enumerates these roles, so this is a new check over an
+existing list, not new plumbing.
+
+Supported volume classes, and what each gives:
+
+[cols="2,2,2,3", options="header"]
+|===
+| Volume | Replication domain (RPO 0 within) | Hardware fence | Notes
+
+| AWS EBS gp3 / io2 (single-attach)
+| One AZ
+| Single attach is exclusive (the cloud refuses a second attach)
+| Default recommendation. io2 Block Express gives sub-ms fsync.
+
+| AWS EBS io2 Multi-Attach
+| One AZ
+| **NVMe reservations** (register / acquire / preempt)
+| For hot-standby takeover without a detach. The new owner *preempts* the old reservation.
+
+| Azure Premium SSD v2 / Ultra
+| One zone (LRS)
+| Single attach; shared disks use SCSI persistent reservations
+| Lowest latency on Azure.
+
+| Azure Premium SSD **ZRS**
+| **Three zones, synchronous**
+| As above
+| Cross-zone RPO 0 with no extra machinery. Check per-region availability.
+
+| GCP regional PD / Hyperdisk Balanced HA
+| **Two zones, synchronous**
+| Single writer attach; force-attach for failover
+| Cross-zone RPO 0.
+
+| AWS EFS / Azure Files / Filestore (NFS)
+| Region (EFS)
+| **None.** NFS locks are leases
+| Allowed, but fsync costs several ms and the **object-store epoch (D2) is the only fence**. Suits a low commit rate.
+|===
+
+Volume sizing is set by the ADR-069 D6 WAL budget (the uncheckpointed tail), not by data size.
+
+=== D2 — Exactly one writer, enforced by an epoch at two layers
+
+1. **Object-store epoch (authoritative; works for every volume class).** At boot the server
+   appends a **create-only successor slot** `_control/{deployment_id}/writer/v{n}.manifest`
+   (epoch = n + 1) via `ManifestCommitter::commit_fenced`. Create-only (`If-None-Match: *` on S3,
+   the equivalents on Azure/GCS, `O_EXCL` on `file://`) is the one conditional write that is
+   atomic on every backend. An If-Match update of a single `writer.json` (this ADR's first draft)
+   cannot be done on `file://`. Losing the race is fatal: the process exits and never serves.
+   *(Implemented, TD-PGOLTP-2 S2.)* The epoch is then stamped into *(S3, open)*:
+   * every WAL segment header and commit record on the volume. This is a **new** `writer_epoch`
+     field. The existing `precision_epoch` in `proximadb-wal-segment-header` is the
+     quantization-policy epoch and is unrelated: do not reuse it;
+   * every manifest/head commit, which **rejects a lower epoch** as part of its existing CAS
+     (`ManifestCommitter`);
+   * every object-store data key or metadata, via the existing `RecoveryToken.epoch` (ADR-063).
+2. **Volume fence (defence in depth).** The new writer writes `epoch.fence` on the volume and
+   fsyncs it before replay. A writer that later reads a higher epoch in that file stops acking.
+   Where the platform offers a hardware fence (single-attach, NVMe reservations, SCSI PR), the
+   orchestrator uses it, so a zombie's I/O fails with `EIO` before it can acknowledge anything.
+
+The zombie case drives this design. The old process may survive a network partition, lose its
+volume, and keep running. As built (TD-PGOLTP-2 S2), the pgwire WAL refuses appends once the
+process's **ownership lease** lapses. The lease is renewed only by a successful epoch check and is
+timed on the monotonic clock, so a partitioned, stalled or paused owner stops acknowledging within
+one lease. A new owner waits out that lease before opening the WAL. On single-attach volumes the
+cloud additionally fails the old owner's I/O. **Not yet fenced (S3):** flush, compaction, spill,
+the collection WAL and catalog writes, and manifest publication. Stamping the epoch into manifest
+commits so that a lower epoch is rejected is the open S3 slice. The same-host `flock` lease stays
+in place unchanged.
+
+*Who moves the volume:* the orchestrator. In Kubernetes that is a StatefulSet pod with a
+ReadWriteOnce PVC, which the CSI driver reattaches on reschedule. Otherwise it is the commercial
+operator (ADR-084 D2). The engine's contract is narrow: **win the epoch, replay, serve; never serve
+without the epoch.** No consensus code is added to the OSS engine.
+
+=== D3 — A transaction is one WAL commit record; acknowledge after a group-commit fsync
+
+* At COMMIT, the transaction's write set (record puts, tombstones, unique/PK/FK key claims,
+  sequence advances, and catalog mutations once D7 lands) is encoded as **one framed, CRC-checked
+  WAL batch** carrying `{txn_id, commit_lsn, epoch}`. This replaces the per-statement replay. A
+  torn tail fails its CRC and is discarded on recovery, so **a transaction is either entirely
+  present or entirely absent**.
+* **Group commit:** concurrent COMMITs coalesce into one `write + fsync`. This uses the
+  `batch_sync_coordinator` pattern with a small `commit_delay` (Postgres semantics, default 0).
+  A COMMIT is acknowledged only after the fsync covering its record returns.
+* **Durability ladder:** `synchronous_commit = on` (default for pgwire OLTP tables) maps to
+  `SyncMode::Always` with group commit. `off` maps to `PerBatch` / `Periodic`: an explicit, opt-in
+  risk of losing the last few ms, never a silent default. Bulk-ingest paths keep `PerBatch`.
+* **Key-constraint log folded in:** PK/UNIQUE/FK claims stop going to the separate
+  `oltp-cks.wal` and become entries in the same commit record. Two logs cannot be atomic with each
+  other. This is what lets `oltp-integrity` become **default ON** for relational tables.
+* **Autocommit statements** take the same path as a one-statement transaction. There is only one
+  write path.
+
+=== D4 — Snapshot = commit LSN; MVCC in the memtable; row-level locks
+
+* **Versioning:** the memtable keeps a short **version chain per primary key**, tagged with
+  `commit_lsn` (and a tombstone flag), instead of overwriting in place. Flushed PAX/Parquet
+  segments are immutable and carry their max LSN. ADR-046's LSN-coherent merge read is the read
+  rule: `visible(v, snap) = v.commit_lsn ≤ snap` and the newest such version wins. That is the
+  mandate #16 merge read with a snapshot bound added.
+* **READ COMMITTED** (the default, as in Postgres): each statement reads at the latest committed
+  LSN.
+* **REPEATABLE READ** (snapshot isolation): the snapshot is taken at the transaction's first
+  statement. On commit, **first-committer-wins**: if any key in the write set has a version newer
+  than the snapshot, fail with `40001` (`could not serialize access`), as Postgres RR does.
+* **SERIALIZABLE:** stays fail-closed until an SSI design is filed. We do not silently downgrade.
+  CockroachDB-style "serializable only, retry everything" is an explicit anti-goal.
+* **Read-your-own-writes:** the session's uncommitted write set is overlaid on reads. This closes
+  the P2.D "store-only reads" divergence.
+* **Row locks:** UPDATE/DELETE/`SELECT … FOR UPDATE|SHARE [NOWAIT|SKIP LOCKED]` take
+  `(table, pk)` key locks in an in-memory lock table held to end of transaction, with deadlock
+  detection by wait-for-graph timeout (`40P01`). The table-level DML lock is kept **only** for DDL
+  and bulk writes. This is the change that takes write concurrency from "one writer per table" to
+  "one writer per row".
+* **Version GC:** a version older than the oldest active snapshot is pruned at flush, so no
+  VACUUM is exposed to users. Long-running snapshots are bounded by a configured
+  `max_snapshot_age` (the OrioleDB / undo-log lesson: bloat must have a hard bound).
+
+=== D5 — Point and range access without scans
+
+* **PK index:** the memtable `BTreeMap` (already the scan index) is the in-memory index.
+  Flushed segments get a per-segment PK range in the catalog-resident serving metadata
+  (ADR-094 Layer B) plus a bloom filter, so a cold point read is one ranged GET. Composite PKs
+  are included (closes TD-DML-2).
+* **Secondary indexes:** `CREATE INDEX` on relational tables becomes an LSM **index table**
+  (`index_key → pk`), maintained inside the same commit record (D3), so the index is never stale
+  against its base. The planner uses it for equality and range predicates under a selectivity
+  threshold. Otherwise the scan stays on the existing route.
+
+=== D6 — Checkpoints bound recovery; the archive gives PITR and cross-AZ restore
+
+* **Checkpoint** = flush memtable versions to object-store segments, commit the manifest (with
+  epoch), then record `checkpoint_lsn` on the volume. WAL before `checkpoint_lsn` may be truncated
+  only after the manifest commit is durable. That is the existing TD-USUB-1 truncation obligation,
+  unchanged.
+* **Recovery time objective:** `RTO ≈ reattach (cloud, ~30–60 s) + epoch CAS (one round trip) +
+  replay(WAL tail)`. The tail is capped by the WAL budget, so replay time is bounded by
+  configuration rather than by data size. The gate (TD-PGOLTP-2) **measures** RTO; this ADR does
+  not assert a number (mandate #6).
+* **Archive:** sealed WAL segments are shipped asynchronously to
+  `data/{tenant}/{ns}/_wal_archive/{epoch}/{lsn_range}` under `DrPathBuilder`, metered as KSU.
+  This enables:
+  ** **PITR / branching** (TD-LTAP-4, TD-116), restoring at an LSN;
+  ** **loss of the volume's AZ:** restore from base + archive on a fresh volume. RPO equals the
+     archive lag (configurable; target ≤ 1 s for OLTP tables). On Azure ZRS or GCP regional
+     disks, the RPO is 0 without the archive;
+  ** **read replicas** that tail the archive. These are later work, and ADR-084 places them in
+     the commercial layer.
+
+=== D7 — Transactional DDL and savepoints (after D3/D4)
+
+* Catalog mutations are written as entries in the same commit record, so `BEGIN; CREATE TABLE …;
+  INSERT …; ROLLBACK;` leaves nothing behind. This is the PG behaviour ORMs' migration runners
+  rely on.
+* **Savepoints** are write-set marks: `ROLLBACK TO` truncates the write set and releases key locks
+  taken after the mark. No storage change is needed, because the write set is not durable before
+  COMMIT.
+
+=== D8 — PG compatibility is declared in levels and gated by ratchets
+
+ProximaDB declares compatibility by level, as DSQL does, rather than claiming "Postgres-compatible"
+without qualification:
+
+[cols="1,3,3", options="header"]
+|===
+| Level | Contract | Gate (ratchet: only goes up)
+
+| **PG-OLTP-1** (this ADR)
+| Atomic multi-statement transactions; READ COMMITTED + REPEATABLE READ; read-your-writes; row locks + `FOR UPDATE`; PK/UNIQUE/FK on by default; `SERIAL`/`IDENTITY`/sequences; `RETURNING`; `ON CONFLICT DO NOTHING/UPDATE`; savepoints; transactional DDL; crash- and reattach-safe
+| `pgbench` TPC-B built-in script under concurrency, with the **balance invariant** checked after a crash; isolation anomaly suite (Elle/Hermitage-style: G0, G1a/b/c, lost update, write skew documented under RR); ORM migration + CRUD matrix (SQLAlchemy, Prisma, sqlx, JDBC/Hibernate); reattach crash matrix
+
+| PG-OLTP-2 (later)
+| SERIALIZABLE (SSI), advisory locks, `LISTEN/NOTIFY`, wider `pg_catalog`
+| Filed when PG-OLTP-1 is green
+|===
+
+=== D9 — Build strategy: isolate the logic, never the integration
+
+**Question considered:** build the OLTP layer as a standalone system first and wire it in later,
+or extend ProximaDB's existing seams?
+
+**Answer: extend the existing seams, and put the new pure logic in one small crate that is
+wired into the pgwire/DML path in the same PR as each slice, behind a default-OFF flag.**
+
+The repository has already run the "build in isolation, wire later" experiment three times, and it
+failed each time in the same way:
+
+[cols="2,1,3", options="header"]
+|===
+| Isolated build | Size | Outcome (verified 2026-10-16)
+
+| `crates/storage/proximadb-storage-transaction` (`MultiModelTransactionManager`, 2PC, isolation levels)
+| 2,719 lines
+| **0 production callers.** It is re-exported from `src/storage/mod.rs:250` and nothing on the network/services path uses it.
+
+| `src/transaction/` (`CrossModelTransactionCoordinator`, `WALCoordinator`, `WALTransactionState`, participants, `engine_wiring`) + `src/storage/multimodel/transaction/` ("MVCC + 2PC")
+| 5,871 lines
+| **0 production callers.** Constructed only in its own unit tests and `tests/transaction_integration_test.rs`.
+
+| `src/services/transaction/` (a **second, different** `CrossModelTransactionCoordinator`, TD-133)
+| 667 lines
+| Referenced from `services/dml/mod.rs` only in a doc comment.
+
+| `ConditionalKeyStore` (ADR-072 F2/F5)
+| —
+| Test-only until TD-OLTP-WIRING-1 wired it, and it is still default-OFF.
+
+| TD-USUB-1 spill store
+| —
+| Dead code until #1945. Wiring it surfaced a vacuously-true safety comment.
+|===
+
+About 9,200 lines of transaction code exist, and the pgwire `COMMIT` path uses none of them. It
+replays statements one at a time. Code that is not on the request path is not tested by the
+request path, so its assumptions (here, a multi-participant 2PC model) drift from what the
+product needs: a single-writer, single-log atomic commit. Building a fourth system in isolation
+would repeat this.
+
+**Rules:**
+
+. **One new crate, pure logic only:** `crates/storage/proximadb-txn-core`. It holds the
+  `TxnCommit` record codec, the snapshot/visibility rule, the key-lock table, the group-commit
+  queue and the epoch-fence state machine. Its I/O goes through **ports** (`WalAppender`,
+  `DurableSync`, `EpochStore`), so it can be property-tested and deterministically simulated
+  (crash at every await point) **without** the server. That is where isolation helps: the logic
+  gets tested hard in isolation.
+. **Wiring lands in the same PR as the logic, every slice.** Each slice is reachable from pgwire
+  behind `[oltp]` flags, and each slice adds a TD-PGOLTP-6 ratchet row exercised through pgwire on
+  the server binary. No slice merges without a production caller.
+. **Do not revive the three existing transaction subsystems.** They solve a different problem
+  (cross-engine 2PC). They may be mined for parts, for example the isolation-level enum
+  (`proximadb-storage-common/src/transaction_isolation.rs`), with a premise check before any
+  reuse. Their retirement is tracked (TD-PGOLTP-10) so a fifth system does not appear.
+
+**Reuse map: the existing investment this plan rides on.**
+
+[cols="2,3,2", options="header"]
+|===
+| Existing component | Role in ADR-095 | Change
+
+| pgwire front (`network/postgres/protocol.rs`, `session.rs`), SCRAM, extended query, portals
+| Unchanged front door
+| None
+
+| `TransactionBuffer` (`protocol.rs:349`)
+| Becomes the transaction **write set** (read-your-writes overlay, savepoint marks)
+| Extend
+
+| `DmlService` (`resolve_matching_ids`, `build_updated_proxima_record`, `execute_upsert`, validation)
+| COMMIT **planning**: produces record images instead of writing
+| Split plan/apply
+
+| `TableRecordStore` trait (`services/record_store.rs:551`), `get_by_key`, `point_lookup_relational`
+| Read seam; gains a `snapshot_lsn` parameter
+| Extend
+
+| WAL framing + CRC (`disk_manager.rs::write_batch[_with_sync]`), `SyncMode::Always`
+| Carries the `TxnCommit` record kind
+| New record kind (mixed-read-safe)
+
+| `batch_sync_coordinator.rs`
+| Group-commit queue
+| Generalise
+
+| ADR-069 `wal_local_dir`, `root_plan`, `durable_locations`, `StorageOwnershipLease`
+| The durable-volume root and the boot check
+| Extend
+
+| `RecoveryToken.epoch` (ADR-063), `ManifestCommitter` CAS, `write_if_absent`
+| Writer-epoch fencing
+| Extend (epoch on local WAL + manifest)
+
+| TD-USUB-1 LSN plumbing + unflushed-minimum truncation, `flush_materializer`, spill store
+| Checkpoint and WAL truncation
+| Reuse as-is
+
+| `ConditionalKeyStore` port (`proximadb-storage-ports`), `proximadb-cks-local`
+| Constraint **logic** reused; backing log folds into `TxnCommit`
+| Re-back
+
+| `DmlLockService` / `DmlLockScope::{Schema,Table,Partition}` (`cluster/partition_lease.rs:1322`)
+| Gains a `Row { table, pk }` scope; the table scope remains for DDL and bulk writes
+| Extend
+
+| ADR-046 LSN-coherent merge read, `ProximaRecord::is_dead`, `CacheInvalidationCoordinator`
+| Snapshot visibility, dead-record filtering, post-commit invalidation
+| Reuse
+
+| `write_ahead_log/pitr.rs`, cold backup/restore, TD-117 `BranchRef`
+| Archive, PITR, branches
+| Extend
+|===
+
+== 5. Prioritised plan — the most impactful OLTP items
+
+Ranked by **impact ÷ cost, respecting dependencies**. Items 1–3 are the minimum for the claim
+"a crash or a machine loss never loses or half-applies a committed transaction".
+
+[cols="1,3,4,2", options="header"]
+|===
+| # | TD | Why it matters | Depends on
+
+| 1
+| link:../../10-quality/td/TD-PGOLTP-1-atomic-commit-record-group-commit.adoc[TD-PGOLTP-1] — atomic commit record + group commit
+| Today a failure partway through COMMIT leaves a **partial transaction durable**. That is a correctness defect, not a missing feature, and every other item builds on the commit record.
+| —
+
+| 2
+| link:../../10-quality/td/TD-PGOLTP-2-durable-volume-epoch-fencing-reattach.adoc[TD-PGOLTP-2] — durable volume root + epoch fencing + reattach recovery
+| The core of the ask: the WAL survives compute loss and a replacement machine resumes **without split-brain**.
+| 1 (epoch in the commit record)
+
+| 3
+| link:../../10-quality/td/TD-PGOLTP-3-integrity-default-on-in-commit-record.adoc[TD-PGOLTP-3] — PK/UNIQUE/FK default-on, inside the commit record
+| A Postgres-compatible database that accepts duplicate primary keys by default is not compatible. Two logs cannot be atomic.
+| 1
+
+| 4
+| link:../../10-quality/td/TD-PGOLTP-4-mvcc-lsn-visibility-row-locks.adoc[TD-PGOLTP-4] — LSN snapshots, MVCC memtable, read-your-writes, row locks
+| Unlocks concurrent OLTP (writers per row, not per table) and REPEATABLE READ.
+| 1
+
+| 5
+| link:../../10-quality/td/TD-PGOLTP-5-sequences-returning-upsert.adoc[TD-PGOLTP-5] — sequences / SERIAL / IDENTITY, RETURNING, ON CONFLICT parity
+| Without these, pgbench, ORM migrations and `INSERT … RETURNING id` fail on day one.
+| 1
+
+| 6
+| link:../../10-quality/td/TD-PGOLTP-6-oltp-conformance-ratchet.adoc[TD-PGOLTP-6] — pgbench + isolation + ORM + reattach conformance ratchet
+| Measurement before claims (mandates #6 and #10). It can start **now** and records the baseline, red rows included.
+| — (grows with 1–5)
+
+| 7
+| link:../../10-quality/td/TD-PGOLTP-7-relational-secondary-indexes.adoc[TD-PGOLTP-7] — relational secondary indexes + composite PK
+| Removes scans from non-PK OLTP predicates.
+| 1, 4
+
+| 8
+| link:../../10-quality/td/TD-PGOLTP-8-wal-archive-pitr-cross-az.adoc[TD-PGOLTP-8] — WAL archive to object storage: PITR + cross-AZ restore
+| Covers losing the volume's AZ (EBS is single-AZ) and feeds TD-LTAP-4 branching.
+| 2
+
+| 9
+| link:../../10-quality/td/TD-PGOLTP-9-savepoints-transactional-ddl.adoc[TD-PGOLTP-9] — savepoints + transactional DDL
+| What ORM migration runners need.
+| 1, 4
+|===
+
+=== 5.1 Failover sequence (what TD-PGOLTP-2 must prove)
+
+[source,mermaid]
+----
+%%{init: {"theme": "neutral"}}%%
+sequenceDiagram
+  participant Old as Compute A (epoch 7)
+  participant Vol as WAL volume
+  participant Orc as Orchestrator (CSI / operator)
+  participant OS as Object store
+  participant New as Compute B
+  Old->>Vol: commit record (epoch 7) + fsync → ack
+  Note over Old: host dies or is partitioned
+  Orc->>Vol: detach from A (or NVMe/SCSI preempt)
+  Orc->>New: attach volume, start server
+  New->>OS: create-only slot v7 → epoch 8 (If-None-Match)
+  OS-->>New: ok (epoch 8)
+  New->>Vol: write + fsync epoch.fence = 8
+  New->>Vol: replay WAL tail after checkpoint_lsn (CRC-checked)
+  New->>OS: manifest commits carry epoch 8
+  Old--xOS: zombie manifest commit (epoch 7) → rejected
+  Old--xVol: zombie fsync → EIO / fenced, so never acks
+  New-->>New: serve pgwire
+----
+
+== 6. Consequences
+
+* **Positive:** a defensible "Postgres-compatible OLTP" claim at a declared level. One WAL and one
+  write path. A small, cheap, fast-to-move volume. Object storage stays the source of truth, so
+  OLAP (DataFusion) and vector routes read the same data with no CDC copy, which avoids Lakebase's
+  two-copy bridge and pg_lake's non-ACID seam.
+* **Negative / cost:** single-writer throughput is capped by one node. Memtable version chains
+  raise memory per hot key, bounded by `max_snapshot_age`. Group commit adds a small latency floor
+  under low concurrency. On AWS, cross-AZ RPO is the archive lag, not 0, unless a quorum
+  (TD-LTAP-3, commercial) is added later.
+* **Format:** the commit record is a WAL **format change**. Per mandate #8 it is mixed-read-safe:
+  a new record kind behind a version byte, legacy batches still replay, and it ships behind
+  `[oltp] atomic_commit = false` until the TD-PGOLTP-6 ratchet is green, then flips under the
+  pre-GA directive.
+* **Docs:** `SUPPORTED_SURFACE.adoc` keeps "PostgreSQL-style OLTP parity" under Experimental until
+  PG-OLTP-1 is green. ADR-018 P3.B points here.
+
+== 7. Alternatives considered
+
+* **Become a Postgres extension / fork (OrioleDB, pg_lake).** Rejected again, for the reasons in the
+  lakehouse-PG study §8: the Table-AM TID constraint blocks the vector and columnar arms, and it
+  would introduce a second engine.
+* **Commit = object-store PUT for OLTP.** Rejected for per-transaction latency. Still the right
+  answer for batch ingest, which keeps it.
+* **Quorum WAL (Safekeeper-style).** Deferred (TD-LTAP-3, ADR-084 D2). Cloud-replicated volumes
+  give the same within-domain durability with zero code.
+* **Keep the whole database on the volume (classic RDS).** Rejected: it loses object-storage
+  economics and separation from the OLAP/vector readers, and makes the volume large and slow to
+  move.
+* **Optimistic-only concurrency (DSQL).** Rejected as the default: Postgres applications expect
+  blocking row locks and `FOR UPDATE`. OCC appears only as RR's first-committer-wins check.
+
+== 8. References
+
+ADR-018, ADR-020, ADR-045, ADR-046, ADR-063, ADR-069, ADR-072, ADR-084, ADR-094; TD-LTAP-3,
+TD-LTAP-4, TD-OLTP-WIRING-1, TD-DML-2, TD-WAL-5, TD-USUB-1;
+link:../PROXIMADB_AS_LAKEHOUSE_NATIVE_PG_ENGINE_2026_06_17.md[Lakehouse-native PG engine study];
+external sources listed under §3.
