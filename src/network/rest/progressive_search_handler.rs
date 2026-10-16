@@ -49,6 +49,12 @@ pub async fn progressive_search_handler(
         .handle_vector_search_v1_for_tenant(request, proximadb_runtime::PortIdentity::from(&tenant))
         .await
         .map_err(|e| {
+            // Wrong-dimension / empty / non-finite query vector or over-cap
+            // top_k: the client's argument (TD-SECSCAN-1 §5), not a server fault.
+            if let Some(message) = crate::services::operations::vectors::client_argument_message(&e)
+            {
+                return ApiError::InvalidArgument(message);
+            }
             error!(
                 "Progressive search failed for collection {}: {}",
                 collection_id, e

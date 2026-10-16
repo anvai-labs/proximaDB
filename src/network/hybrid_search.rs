@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tracing::debug;
 
 use crate::core::search::hybrid::{
@@ -131,7 +131,11 @@ impl HybridPort for RestHybridPortImpl {
                 .vector_ops
                 .search(search_request, proximadb_runtime::PortIdentity::anonymous())
                 .await
-                .map_err(|e| anyhow!("Vector search failed: {}", e))?;
+                // `context`, not `anyhow!("..: {}", e)`: re-formatting flattened
+                // the typed client-argument cause (wrong-dimension vector,
+                // over-cap top_k) into a string the REST boundary could only
+                // report as a 500 (TD-SECSCAN-1 §5).
+                .context("Vector search failed")?;
             resp.results
                 .map(|r| r.results)
                 .unwrap_or_default()
@@ -523,6 +527,8 @@ mod tests {
     #[derive(Default)]
     struct CapturingVectorOpsPort {
         last_request: Mutex<Option<proximadb_v1::VectorSearchRequest>>,
+        /// Fail every search with a typed wrong-dimension client error.
+        reject_dimension: bool,
     }
 
     #[async_trait]
@@ -533,6 +539,13 @@ mod tests {
             _identity: proximadb_runtime::PortIdentity<'_>,
         ) -> Result<proximadb_v1::VectorOperationResponse> {
             *self.last_request.lock().unwrap() = Some(request);
+            if self.reject_dimension {
+                return Err(crate::services::operations::vectors::InvalidQueryVector(
+                    "Query vector has dimension 2 but collection 'test' expects dimension 4"
+                        .to_string(),
+                )
+                .into());
+            }
             Ok(proximadb_v1::VectorOperationResponse {
                 success: true,
                 results: Some(proximadb_v1::SearchResult {
@@ -621,5 +634,39 @@ mod tests {
                 .and_then(|value| value.value.as_ref()),
             Some(SqlValueKind::StringValue(value)) if value == "acme"
         ));
+    }
+
+    /// TD-SECSCAN-1 §5 residual: the vector leg's typed client error must
+    /// survive the hybrid port so the REST boundary answers 400 with the
+    /// dimension cause (it was re-wrapped by `anyhow!("...: {}", e)`, which
+    /// flattened the type and turned it into a 500).
+    #[tokio::test]
+    #[allow(deprecated)] // exercises the deprecated v1 HybridPort::hybrid_search (TD-138 phase 1)
+    async fn rest_hybrid_port_keeps_the_vector_legs_client_error_typed() {
+        let vector_ops = Arc::new(CapturingVectorOpsPort {
+            reject_dimension: true,
+            ..Default::default()
+        });
+        let port = RestHybridPortImpl::new(vector_ops, Arc::new(RwLock::new(HashMap::new())));
+        let err = port
+            .hybrid_search(
+                HybridFusionSearchRequest {
+                    collection: "test".to_string(),
+                    query_vector: vec![0.1, 0.2],
+                    top_k: 3,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .err();
+        let Some(err) = err else {
+            panic!("a wrong-dimension vector must fail the hybrid search");
+        };
+        assert!(
+            crate::services::operations::vectors::is_client_argument_error(&err),
+            "typed cause lost: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("dimension 2"), "{err:#}");
     }
 }

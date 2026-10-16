@@ -164,11 +164,13 @@ impl ProximaFusionService for ProximaFusionServiceImpl {
                 }),
         };
 
-        let (items, stats) = self
-            .fusion
-            .graph_fusion_search(params)
-            .await
-            .map_err(|e| Status::internal(format!("fusion search failed: {e}")))?;
+        let (items, stats) = self.fusion.graph_fusion_search(params).await.map_err(|e| {
+            // Same mapping as the REST fusion-search handler (TD-SECSCAN-1 §5).
+            match crate::services::operations::vectors::client_argument_message(&e) {
+                Some(message) => Status::invalid_argument(format!("fusion search: {message}")),
+                None => Status::internal(format!("fusion search failed: {e:#}")),
+            }
+        })?;
 
         let results = items
             .into_iter()

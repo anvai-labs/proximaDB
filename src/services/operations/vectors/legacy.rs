@@ -1532,17 +1532,14 @@ impl VectorOperationsService {
     /// boundary is clamped here with a warning instead of silently wrapping
     /// (the old `k as u16` truncated e.g. 65_536 → 0).
     fn optimizer_top_k_hint(k: usize) -> u16 {
-        const U16_MAX: usize = u16::MAX as usize;
-        if k > U16_MAX {
+        if k > usize::from(u16::MAX) {
             tracing::warn!(
                 k,
                 "top_k exceeds the optimizer's u16 hint range; clamping to {}",
                 u16::MAX
             );
-            u16::MAX
-        } else {
-            k as u16
         }
+        proximadb_search_types::top_k_limit::u16_top_k_hint(k)
     }
 
     /// Public v1 boundary: execute vector search and return v1 response
@@ -3063,7 +3060,8 @@ impl VectorOperationsService {
         // the SQL executor and the legacy entity store all land here.
         if query_vector.is_empty() {
             return Err(super::input_validation::InvalidQueryVector(format!(
-                "Query vector for collection '{collection_id}' is empty"
+                "Query vector for {} is empty",
+                super::input_validation::client_collection_label(collection_id, &collection)
             ))
             .into());
         }

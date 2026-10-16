@@ -181,10 +181,17 @@ impl AqlExecutor {
                         name
                     ))
                 })?;
+                // Resolve the WHERE post-filter BEFORE running the source, so a
+                // query vector in an unconsumable position is rejected without
+                // running a search.
+                let post_filter = match &full_query.where_clause.predicate {
+                    Some(predicate) => post_filter_predicate(predicate)?,
+                    None => None,
+                };
                 let mut res = source.execute(full_query, ctx).await?;
 
                 // Apply post-retrieval filtering if WHERE clause is present
-                if let Some(predicate) = &full_query.where_clause.predicate {
+                if let Some(predicate) = &post_filter {
                     let start = Instant::now();
                     let initial_count = res.rows.len();
                     res.rows
@@ -232,13 +239,6 @@ impl AqlExecutor {
 
     fn evaluate_predicate(&self, row: &HashMap<String, AqlValue>, pred: &AqlPredicate) -> bool {
         match pred {
-            // A vector-valued `Equals` on the query-vector fields is the search
-            // input, consumed by the vector / memory source — result rows carry
-            // no such field, so re-applying it as a filter would drop every hit.
-            AqlPredicate::Equals {
-                field,
-                value: AqlValue::Vector(_),
-            } if is_query_vector_field(field) => true,
             AqlPredicate::Equals { field, value } => row.get(field).is_some_and(|v| v == value),
             AqlPredicate::GreaterThan { field, value } => row.get(field).is_some_and(|v| v > value),
             AqlPredicate::LessThan { field, value } => row.get(field).is_some_and(|v| v < value),
@@ -377,6 +377,67 @@ impl AqlExecutor {
             }
         }
         Ok(result)
+    }
+}
+
+/// The WHERE predicate to re-apply to a source's result rows.
+///
+/// A vector-valued `Equals` on a query-vector field (`vector` / `embedding` /
+/// `query_vector`) is the SEARCH INPUT: the vector and memory sources read it
+/// from the top level or an AND conjunct (`VectorAqlSource::walk_predicate`).
+/// Result rows carry no such field, so it is stripped from the post-filter
+/// there — re-applying it would drop every hit. Anywhere else (under `Not` or
+/// `Or`) it cannot be a query vector the source consumed: `Not { Equals vector }`
+/// would drop every row and `Or { Equals vector, X }` would always be true, so
+/// it is rejected as `InvalidInput` (HTTP 400) rather than silently
+/// mis-evaluated (TD-SECSCAN-1 §5). A scalar-valued `Equals` on the same field
+/// names is an ordinary filter and is kept everywhere.
+pub(crate) fn post_filter_predicate(predicate: &AqlPredicate) -> Result<Option<AqlPredicate>> {
+    match predicate {
+        AqlPredicate::Equals {
+            field,
+            value: AqlValue::Vector(_),
+        } if is_query_vector_field(field) => Ok(None),
+        AqlPredicate::And { lhs, rhs } => {
+            let lhs = post_filter_predicate(lhs)?;
+            let rhs = post_filter_predicate(rhs)?;
+            Ok(match (lhs, rhs) {
+                (None, None) => None,
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (Some(lhs), Some(rhs)) => Some(AqlPredicate::And {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                }),
+            })
+        }
+        AqlPredicate::Or { .. } | AqlPredicate::Not { .. } => {
+            if let Some(field) = nested_query_vector_field(predicate) {
+                return Err(proximadb_kernel::error::ProximaDBError::InvalidInput(
+                    format!(
+                        "a query vector (vector-valued Equals on '{field}') is only allowed at the \
+                     top level of WHERE or as an AND conjunct; it cannot appear under NOT or OR"
+                    ),
+                ));
+            }
+            Ok(Some(predicate.clone()))
+        }
+        other => Ok(Some(other.clone())),
+    }
+}
+
+/// The field of the first vector-valued `Equals` on a query-vector field
+/// anywhere in `predicate`.
+fn nested_query_vector_field(predicate: &AqlPredicate) -> Option<&str> {
+    match predicate {
+        AqlPredicate::Equals {
+            field,
+            value: AqlValue::Vector(_),
+        } if is_query_vector_field(field) => Some(field),
+        AqlPredicate::And { lhs, rhs } | AqlPredicate::Or { lhs, rhs } => {
+            nested_query_vector_field(lhs).or_else(|| nested_query_vector_field(rhs))
+        }
+        AqlPredicate::Not { inner } => nested_query_vector_field(inner),
+        _ => None,
     }
 }
 

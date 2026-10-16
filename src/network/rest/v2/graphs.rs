@@ -231,7 +231,16 @@ pub async fn fusion_search_v2(
     let (items, stats, node_labels) = service
         .graph_fusion_search_with_labels(params)
         .await
-        .map_err(|error| ApiError::Internal(format!("fusion search failed: {error}")))?;
+        .map_err(|error| {
+            // The vector seed leg's wrong-dimension / empty / non-finite query
+            // vector or over-cap top_k is the client's argument, reported with
+            // its cause (TD-SECSCAN-1 §5); anything else is a server fault,
+            // reported with its whole cause chain rather than the outer context.
+            match crate::services::operations::vectors::client_argument_message(&error) {
+                Some(message) => ApiError::InvalidArgument(format!("fusion search: {message}")),
+                None => ApiError::Internal(format!("fusion search failed: {error:#}")),
+            }
+        })?;
 
     Ok(Json(FusionSearchResponse {
         results: items

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use proximadb_graph::record::{GraphEdgeKey, GraphNodeKey};
 use proximadb_records::{ProximaRecord, RecordKey};
 
@@ -43,8 +43,8 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<OptimizedSearchRecord>, anyhow::Error>>,
 {
-    let mut last_error_msg = String::new();
-    for attempt in 0..=max_retries {
+    let mut attempt = 0;
+    loop {
         match attempt_fn().await {
             Ok(result) => {
                 if attempt > 0 {
@@ -56,28 +56,35 @@ where
                 }
                 return Ok(result);
             }
+            // A client-argument error (wrong-dimension / empty / non-finite query
+            // vector, over-cap top_k) is not transient: retrying only delays the
+            // same answer. Return it as-is so the typed cause reaches the request
+            // boundary, which maps it to 400 / `InvalidArgument` (TD-SECSCAN-1 §5).
+            Err(e) if crate::services::operations::vectors::is_client_argument_error(&e) => {
+                return Err(e);
+            }
+            Err(e) if attempt < max_retries => {
+                let delay = Duration::from_millis(100 * (2_u64.pow(attempt)));
+                tracing::warn!(
+                    collection,
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    error = %e,
+                    "Vector search failed, retrying with exponential backoff"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            // Keep the last error's chain (`context`, not a re-formatted string).
             Err(e) => {
-                last_error_msg = e.to_string();
-                if attempt < max_retries {
-                    let delay = Duration::from_millis(100 * (2_u64.pow(attempt)));
-                    tracing::warn!(
-                        collection,
-                        attempt,
-                        delay_ms = delay.as_millis(),
-                        error = %last_error_msg,
-                        "Vector search failed, retrying with exponential backoff"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
+                return Err(e.context(format!(
+                    "Vector search failed after {} attempts for collection '{}'",
+                    attempt + 1,
+                    collection
+                )));
             }
         }
     }
-    bail!(
-        "Vector search failed after {} attempts for collection '{}': {}",
-        max_retries + 1,
-        collection,
-        last_error_msg
-    )
 }
 use crate::storage::engines::core::formats::columnar::fulltext_index::FulltextSearchResult;
 
@@ -1263,5 +1270,69 @@ mod tests {
             source.scores, original,
             "no change when budget exceeds size"
         );
+    }
+
+    /// TD-SECSCAN-1 §5 residual: a client-argument failure (wrong-dimension
+    /// query vector, over-cap top_k) on the fusion seed leg is not transient —
+    /// it is not retried, and its typed cause survives the retry wrapper so
+    /// the boundary can answer 400 / `InvalidArgument` with the real cause
+    /// instead of "vector search failed for fusion".
+    #[tokio::test]
+    async fn retry_keeps_client_argument_errors_typed_and_does_not_retry_them() {
+        use crate::services::operations::vectors::{InvalidQueryVector, is_client_argument_error};
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let err = retry_vector_search(
+            "orders",
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err(InvalidQueryVector(
+                        "Query vector has dimension 3 but collection 'orders' expects dimension 4"
+                            .to_string(),
+                    )
+                    .into())
+                }
+            },
+            2,
+        )
+        .await
+        .err()
+        .map(|e| e.context("vector search failed for fusion"));
+        let Some(err) = err else {
+            panic!("a client-argument error must fail the search");
+        };
+        assert!(is_client_argument_error(&err), "typed cause lost: {err:#}");
+        assert!(format!("{err:#}").contains("dimension 3"), "{err:#}");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a client-argument error must not be retried"
+        );
+    }
+
+    /// A genuine (non-client) failure is still retried and still surfaces.
+    #[tokio::test]
+    async fn retry_still_retries_server_errors() {
+        use crate::services::operations::vectors::is_client_argument_error;
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let err = retry_vector_search(
+            "orders",
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err(anyhow::anyhow!("storage unavailable")) }
+            },
+            1,
+        )
+        .await
+        .err();
+        let Some(err) = err else {
+            panic!("a server error must fail the search");
+        };
+        assert!(!is_client_argument_error(&err));
+        assert!(
+            format!("{err:#}").contains("storage unavailable"),
+            "{err:#}"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

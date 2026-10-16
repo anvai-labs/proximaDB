@@ -198,8 +198,15 @@ pub async fn hybrid_search(
             })))
         }
         Err(e) => {
-            error!("hybrid_search error: {}", e);
-            Err(RestError::Internal(e.to_string()))
+            // The vector leg's wrong-dimension / empty / non-finite query
+            // vector or over-cap top_k is the client's argument (TD-SECSCAN-1 §5).
+            if let Some(message) =
+                proximadb_search_types::client_argument::client_argument_message(&e)
+            {
+                return Err(RestError::InvalidArgument(message));
+            }
+            error!("hybrid_search error: {:#}", e);
+            Err(RestError::Internal(format!("{e:#}")))
         }
     }
 }

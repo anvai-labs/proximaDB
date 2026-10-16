@@ -129,28 +129,31 @@ pub(crate) fn validate_records_for_insert(
     Ok(())
 }
 
-/// A query vector the client must fix: empty, non-finite, or of the wrong
-/// dimension for the collection. Typed so request boundaries can map it to
-/// a client error (HTTP 400 / gRPC `InvalidArgument`) instead of a 500.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidQueryVector(pub String);
+// The typed client-argument errors live in the foundation search-types crate
+// so the API crate's handlers (which cannot see this crate) classify them the
+// same way (TD-SECSCAN-1 §5).
+pub use proximadb_search_types::client_argument::{
+    InvalidQueryVector, client_argument_message, is_client_argument_error,
+};
 
-impl std::fmt::Display for InvalidQueryVector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+/// How a client-facing message names a catalog-resolved collection. The
+/// search authorities validate AFTER resolving the client's name to the
+/// internal numeric object id, so `requested` is usually that id — the
+/// catalog name is used instead. A nameless collection falls back to
+/// `requested` only when it is not the object id (TD-SECSCAN-1 §5).
+pub(crate) fn client_collection_label(requested: &str, collection: &Collection) -> String {
+    let name = collection
+        .config
+        .as_ref()
+        .map(|config| config.name.as_str())
+        .filter(|name| !name.is_empty());
+    match name {
+        Some(name) => format!("collection '{name}'"),
+        None if !requested.is_empty() && requested != collection.id => {
+            format!("collection '{requested}'")
+        }
+        None => "the collection".to_string(),
     }
-}
-
-impl std::error::Error for InvalidQueryVector {}
-
-/// True when a search failure is the client's argument: an invalid query
-/// vector or a `top_k` above the server cap (TD-SECSCAN-1 §5). Walks the
-/// whole `anyhow` chain so `.context(..)` wrappers don't hide it.
-pub fn is_client_argument_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause.is::<InvalidQueryVector>()
-            || cause.is::<proximadb_search_types::top_k_limit::TopKLimitExceeded>()
-    })
 }
 
 /// Validate a query vector against the collection: finite values and a
@@ -166,8 +169,10 @@ pub(crate) fn validate_query_vector_for_search(
         .find(|(_, value)| !value.is_finite())
     {
         return Err(InvalidQueryVector(format!(
-            "Query vector for collection '{}' contains non-finite value at dimension {}: {}",
-            collection_id, i, value
+            "Query vector for {} contains non-finite value at dimension {}: {}",
+            client_collection_label(collection_id, collection),
+            i,
+            value
         ))
         .into());
     }
@@ -179,9 +184,9 @@ pub(crate) fn validate_query_vector_for_search(
         .unwrap_or_default();
     if expected_dimension > 0 && query_vector.len() != expected_dimension as usize {
         return Err(InvalidQueryVector(format!(
-            "Query vector has dimension {} but collection '{}' expects dimension {}",
+            "Query vector has dimension {} but {} expects dimension {}",
             query_vector.len(),
-            collection_id,
+            client_collection_label(collection_id, collection),
             expected_dimension
         ))
         .into());
@@ -243,6 +248,57 @@ mod tests {
         assert!(
             out.is_err(),
             "a dim-2 record in a dim-8 collection must be rejected"
+        );
+    }
+
+    /// A catalog-resolved collection: the search authorities validate AFTER
+    /// resolving the client's name to the internal numeric object id.
+    fn resolved_collection(object_id: &str, name: &str) -> Collection {
+        Collection {
+            id: object_id.to_string(),
+            config: Some(CollectionConfig {
+                name: name.to_string(),
+                dimension: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// TD-SECSCAN-1 §5 residual: the validator runs after catalog resolution,
+    /// so the id it is handed is the internal object id (`'16'`). The client
+    /// message must name the collection the client used, not that id.
+    #[test]
+    fn dimension_error_names_the_collection_not_its_internal_id() {
+        let collection = resolved_collection("16", "orders");
+        for vector in [vec![1.0f32; 3], vec![f32::NAN; 4]] {
+            let err = validate_query_vector_for_search("16", &collection, &vector)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains("'orders'"), "must name 'orders': {err}");
+            assert!(!err.contains("'16'"), "must not leak the object id: {err}");
+        }
+    }
+
+    /// A nameless collection falls back to the requested identifier only when
+    /// it is not the internal object id.
+    #[test]
+    fn nameless_collection_never_echoes_its_object_id() {
+        let nameless = resolved_collection("16", "");
+        let err = validate_query_vector_for_search("16", &nameless, &[1.0; 3])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(!err.contains("'16'"), "must not leak the object id: {err}");
+        assert!(err.contains("dimension 3"), "keeps the cause: {err}");
+        let err = validate_query_vector_for_search("by_alias", &nameless, &[1.0; 3])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("'by_alias'"),
+            "falls back to the request name: {err}"
         );
     }
 }

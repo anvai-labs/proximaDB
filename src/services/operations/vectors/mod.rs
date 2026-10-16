@@ -70,7 +70,7 @@ mod legacy;
 pub use config::{SearchPlanHints, UnifiedSearchConfig};
 #[cfg(feature = "axis")]
 pub use hybrid::build_axis_hybrid_query;
-pub use input_validation::{InvalidQueryVector, is_client_argument_error};
+pub use input_validation::{InvalidQueryVector, client_argument_message, is_client_argument_error};
 pub(crate) use legacy::rich_filters_to_filter_expression;
 pub use legacy::{
     RichFilterCondition, RichFilterOperator, RichRecordBatchRequest, RichRecordDeleteBatchRequest,
