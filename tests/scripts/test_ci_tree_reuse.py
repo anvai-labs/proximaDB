@@ -144,6 +144,16 @@ class FakeApi:
             ]
         self.pulls = pulls + (extra_pulls or [])
         self.pull_queries: list[tuple[str, str]] = []
+        self.timelines: dict[int, list[dict]] = {}
+        self.timeline_queries: list[int] = []
+
+    def pr_timeline(self, number: int) -> list[dict]:
+        if self.fail == "timeline":
+            raise reuse.urllib.error.HTTPError(
+                "u", 404, "timeline unavailable", {}, None
+            )
+        self.timeline_queries.append(number)
+        return self.timelines.get(number, [{"event": "committed"}, {"event": "merged"}])
 
     def pulls_from(self, owner: str, branch: str) -> list[dict]:
         if self.fail == "pulls":
@@ -581,6 +591,92 @@ class PrProofTrust(unittest.TestCase):
         self.assertTrue(d.reason.startswith("fail-open"))
 
 
+class RetargetedPr(unittest.TestCase):
+    """Re-review of #2051 (BLOCK): the pulls API shows only the CURRENT base.
+    Open develop->evil (the forged run executes evil's ci.yml with
+    head_branch develop), then edit the base to qa -- `edited` is not a
+    trigger, so nothing re-runs -- and close it. Lookup then finds exactly one
+    develop->qa PR for that head SHA."""
+
+    def _retargeted(self, events: list[dict]) -> FakeApi:
+        api = FakeApi(
+            [run(100)], {100: jobs()}, pulls=[pr("develop", "qa", DEV_SHA, number=6666)]
+        )
+        api.timelines[6666] = events
+        return api
+
+    def test_retargeted_pr_never_reuses(self):
+        api = self._retargeted(
+            [
+                {"event": "committed"},
+                {"event": "base_ref_changed", "created_at": "2026-10-15T05:10:00Z"},
+                {"event": "closed"},
+            ]
+        )
+        for c in (ctx(), ctx(**PUSH_QA)):
+            with self.subTest(ctx=c.event):
+                d = decide(api, c)
+                self.assertEqual(d.reused, {}, d.notes)
+                self.assertTrue(any("base was changed" in n for n in d.notes), d.notes)
+
+    def test_force_pushed_base_never_reuses(self):
+        api = self._retargeted([{"event": "base_ref_force_pushed", "created_at": "x"}])
+        self.assertEqual(decide(api, ctx(**PUSH_QA)).reused, {})
+
+    def test_timeline_error_never_reuses(self):
+        api = FakeApi([run(100)], {100: jobs()}, fail="timeline")
+        d = decide(api, ctx(**PUSH_QA))
+        self.assertEqual(d.reused, {})
+        self.assertTrue(d.reason.startswith("fail-open"), d.reason)
+
+    def test_unretargeted_promotion_pr_is_still_trusted(self):
+        api = FakeApi([run(100)], {100: jobs()})
+        self.assertEqual(set(decide(api, ctx(**PUSH_QA)).reused), ALL_KEYS)
+        self.assertEqual(api.timeline_queries, [2038])
+
+    def test_timeline_event_on_page_two_never_reuses(self):
+        # Real Api pagination: 100 ordinary events, then the retarget on page 2.
+        api = reuse.Api(REPO, "t")
+        pages = [
+            [{"event": "committed"}] * 100,
+            [{"event": "base_ref_changed", "created_at": "2026-10-15T05:10:00Z"}],
+        ]
+        seen = []
+
+        def fake_get(path):
+            seen.append(path)
+            assert path.startswith("issues/6666/timeline"), path
+            page = int(re.search(r"[?&]page=(\d+)", path).group(1))
+            return pages[page - 1]
+
+        api._get = fake_get
+        events = api.pr_timeline(6666)
+        self.assertEqual(len(events), 101)
+
+        class RealTimeline(FakeApi):
+            def pr_timeline(self, number):
+                return events
+
+        d = decide(
+            RealTimeline(
+                [run(100)],
+                {100: jobs()},
+                pulls=[pr("develop", "qa", DEV_SHA, number=6666)],
+            ),
+            ctx(**PUSH_QA),
+        )
+        self.assertEqual(d.reused, {})
+
+    def test_routes_are_exactly_the_promotion_pairs(self):
+        # A mutation adding a route (e.g. "feat/x": "qa") must fail here.
+        self.assertEqual(reuse.PROMOTION_ROUTES, {"develop": "qa", "qa": "main"})
+
+    def test_base_events_cover_retarget_and_base_rewrite(self):
+        self.assertEqual(
+            reuse.BASE_EVENTS, frozenset({"base_ref_changed", "base_ref_force_pushed"})
+        )
+
+
 class RedConclusions(unittest.TestCase):
     """Each RED conclusion must veto even when another trusted run is green
     (review of #2051: removing timed_out / startup_failure from _RED survived)."""
@@ -867,6 +963,12 @@ MUTANTS = [
         lambda: (_lying_head_ref_api(), dict(PUSH_QA), None),
     ),
     (
+        "route: a retargeted PR's runs are unattributable (re-review of #2051)",
+        "    if retargets:\n",
+        "    if False:\n",
+        lambda: (_retargeted_api(), dict(PUSH_QA), None),
+    ),
+    (
         "route: PR base must be the route's base (the #2051 exploit)",
         '    if base.get("ref") != want_base:\n',
         "    if False:\n",
@@ -964,6 +1066,16 @@ MUTANTS = [
         ),
     ),
 ]
+
+
+def _retargeted_api() -> FakeApi:
+    api = FakeApi(
+        [run(100)], {100: jobs()}, pulls=[pr("develop", "qa", DEV_SHA, number=6666)]
+    )
+    api.timelines[6666] = [
+        {"event": "base_ref_changed", "created_at": "2026-10-15T05:10:00Z"}
+    ]
+    return api
 
 
 def _lying_head_ref_api() -> FakeApi:

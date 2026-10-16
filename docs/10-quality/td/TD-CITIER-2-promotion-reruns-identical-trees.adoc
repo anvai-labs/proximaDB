@@ -170,6 +170,40 @@ head SHA resolves to 0 PRs and is rejected.
 * **The unprotected trigger is gone.** `development` is removed from `on.push.branches` and
   `on.pull_request.branches`. A wiring test pins both lists to exactly `{main, develop, qa}`.
 
+**Re-review: retargeting.** The pulls API reports only a PR's *current* base, and that base can
+be edited after a run. A write-access user could carry out these steps:
+
+. push branch `evil` with a forged `ci.yml`;
+. open PR develop→evil at head S1, so the forged run executes `evil`'s `ci.yml` with
+  `head_branch` develop;
+. edit the base to qa;
+. close the PR.
+
+Nothing re-runs, because `edited` is not one of `ci.yml`'s `pull_request` types and `state=all`
+still lists the closed PR. The lookup would then find exactly one develop→qa PR for S1.
+
+The fix reads the PR's **complete timeline** (`issues/<n>/timeline`, every page). A PR whose
+timeline contains any `base_ref_changed` or `base_ref_force_pushed` event is rejected as a proof
+source, whatever the from/to; the REST event does not carry them anyway.
+
+* **Errors:** if any page cannot be read, the lookup fails open, so everything runs.
+* **Event name:** checked live against #1995, a real qa→develop retarget, which shows
+  `base_ref_changed`.
+* **Real proofs:** #2038 (16 events) and #2039 (39 events) have no base events, and their runs
+  38684845368 and 38697532716 remain trusted.
+* **No timestamp rule:** requiring the run to post-date the last base change would only matter if
+  a retargeted PR could ever be trusted. Since any base change rejects the PR, that rule is moot.
+* **Reopening** does not change the base, so it adds no path.
+
+**`edited` was considered and not added** to the `pull_request` types. It would trigger a full CI
+run (657+ runner-min at promotion) on every title or body edit, and would cancel and restart
+in-flight feature-PR runs. Re-running is not the fix in any case: the timeline check is.
+
+**Alternative rejected: push-only proofs.** With proofs from push runs only, PR qa→main would have
+nothing to reuse. The push-to-qa run skips the Rust suites, because paths-filter diffs against
+develop, so its proof covers about 3 groups (OpenAPI, the Python round-trip, Python tests;
+68 runner-min) instead of 17. The PR qa→main saving would drop from 566 to about 68 runner-min.
+
 What remains trusted is a run whose definition came from develop, qa or main. Writing to those
 branches requires a reviewed PR with `CI Success`, which is the same trust the promotion itself
 relies on.

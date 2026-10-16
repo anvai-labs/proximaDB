@@ -38,8 +38,11 @@ Guarantees (every one is a guard clause below, and each has a mutation test)
   includes the BASE branch, so the head alone proves nothing: the PR is
   resolved through the pulls API (head SHA match; `run.pull_requests` is empty
   on real promotion runs), must be unique, same-repository, and have the
-  route's base. Both sides of a route are protected, so the definition that
-  wrote the proof is reviewed code.
+  route's base, and its full timeline must show no base change
+  (`base_ref_changed` / `base_ref_force_pushed`): the pulls API reports only
+  the CURRENT base, which can be edited after a run without re-running CI.
+  Both sides of a route are protected, so the definition that wrote the proof
+  is reviewed code.
 * Evidence: a group is proven only if at least one of its jobs ran and EVERY
   one of its jobs concluded `success` in that run. A run with any failed,
   cancelled or still-running reusable job is not a proof. A FAILED or
@@ -84,6 +87,10 @@ PROMOTION_BASES = ("qa", "main")
 # branch's definition, so a PR from develop into an unprotected base could
 # carry a forged workflow (review of #2051).
 PROMOTION_ROUTES = {"develop": "qa", "qa": "main"}
+# PR timeline events that mean "the base this run merged with may not be the
+# base the PR shows now". `base_ref_changed` is the retarget (verified live on
+# #1995, qa -> develop); a force-pushed base rewrites what was merged.
+BASE_EVENTS = frozenset({"base_ref_changed", "base_ref_force_pushed"})
 # Upper bound on paginated reads; exceeding it raises => fail open.
 MAX_PAGES = 20
 TRUSTED_PUSH_BRANCHES = ("qa", "main")
@@ -241,6 +248,10 @@ class Api:
         """Every PR (any state, any base) whose head is owner:branch."""
         return self._paged(f"pulls?state=all&head={owner}:{branch}", None)
 
+    def pr_timeline(self, number: int) -> list[dict]:
+        """Every timeline event of a PR (all pages)."""
+        return self._paged(f"issues/{int(number)}/timeline", None)
+
 
 def git_tree_of(sha: str) -> str | None:
     """Resolve a commit to its tree, fetching it once if absent. None on failure."""
@@ -357,6 +368,20 @@ def pr_route_reason(run: dict, ctx: Context, api: Api) -> str | None:
         return f"PR head ref {head.get('ref')!r} != run head {head_branch!r}"
     if base.get("ref") != want_base:
         return f"PR #{pr.get('number')} {head_branch}->{base.get('ref')} is not a promotion route"
+    # The pulls API reports only the CURRENT base, and the base can be edited
+    # after a run (`edited` is not a ci.yml pull_request trigger, so nothing
+    # re-runs). A run made while the base was another branch executed THAT
+    # branch's ci.yml. Any recorded base change -- whatever its from/to, which
+    # the REST event does not carry -- makes the PR's runs unattributable.
+    # The full timeline must be read; any error propagates and fails open.
+    retargets = [
+        e
+        for e in api.pr_timeline(int(pr.get("number", 0)))
+        if e.get("event") in BASE_EVENTS
+    ]
+    if retargets:
+        when = ", ".join(sorted(str(e.get("created_at")) for e in retargets))
+        return f"PR #{pr.get('number')} base was changed/rewritten ({when}); runs unattributable"
     return None
 
 

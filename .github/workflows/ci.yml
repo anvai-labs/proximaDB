@@ -4,6 +4,9 @@ on:
   # `development` was listed here but never existed and is unprotected: a PR
   # into it runs a ci.yml its author controls (the merge ref includes the
   # base). Triggers are pinned by tests/scripts/test_ci_tree_reuse.py.
+  # `pull_request` deliberately keeps the default types (no `edited`): adding
+  # it would re-run full CI on every title/body edit; a retargeted PR is
+  # instead rejected as a reuse proof by its timeline (TD-CITIER-2).
   push:
     branches: [main, develop, qa]
   pull_request:
@@ -79,7 +82,8 @@ jobs:
     timeout-minutes: 15  # max 2 min over 14 runs, 2026-10-09..11
     # TD-CITIER-2: `actions: read` lets the tree-reuse step list proof
     # artifacts, runs and jobs; `pull-requests: read` lets it resolve a PR
-    # proof run to its PR (base + head route check). Job-level permissions
+    # proof run to its PR (route check) and read that PR's timeline (a
+    # `base_ref_changed` anywhere voids its runs). Job-level permissions
     # REPLACE the workflow default, so `contents: read` is restated.
     permissions:
       contents: read
