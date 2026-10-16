@@ -104,10 +104,11 @@ Cross-session group commit (S3) must be built in `FramedTableWalAppender`.
 **Guarantee.** Crash atomicity and all-or-nothing, **not isolation**. Concurrent readers can
 observe a commit mid-apply until TD-PGOLTP-4.
 
-**Stats regression (review finding 8, open).** Row-count, min/max, NDV and corpus-version bumps
-run at staging time. A transaction that then fails still bumps them, which the legacy path never
-did. They are planner-only (no data impact). Fix: collect them on the fork and apply them after
-`commit_atomic` succeeds.
+**Statistics are transactional (review finding 8, fixed).** The transaction fork queues row-count,
+null-count, min/max and NDV bumps (`DeferredStatBump`) instead of applying them. The COMMIT routine
+applies the queue only after `commit_atomic` succeeds and drops it on failure, so a failed
+transaction never moves planner statistics. Covered by
+`transaction_fork_defers_statistics_until_commit`.
 
 **Test seams.** `PROXIMADB_TEST_TXN_COMMIT_FAULT` is compiled out of release builds
 (`cfg!(debug_assertions)`), so a production server cannot be aborted through it (review

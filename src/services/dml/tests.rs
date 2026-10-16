@@ -6735,3 +6735,105 @@ async fn composite_pk_is_fenced_on_full_tuple() {
         .await
         .expect_err("the UPSERTed composite key is claimed");
 }
+
+/// ADR-095 review F8: statistics bumped while a transaction is STAGED must not
+/// land in the catalog unless the transaction commits. The fork queues them;
+/// the COMMIT routine applies them after `commit_atomic` succeeds and drops
+/// them on failure.
+#[tokio::test]
+async fn transaction_fork_defers_statistics_until_commit() {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::txn_staging::StagingTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    let ddl_stmt = parser
+        .parse_ddl("CREATE TABLE txn_stats (id TEXT NOT NULL, val TEXT, PRIMARY KEY (id));")
+        .expect("parse ddl")
+        .expect("ddl stmt");
+    ddl.execute(ddl_stmt).await.expect("create table");
+
+    let wal = Arc::new(
+        FramedTableWalAppender::open(temp_dir.path().join("txn-stats.wal"))
+            .await
+            .expect("open WAL"),
+    );
+    let base: Arc<dyn TableRecordStore> = Arc::new(DirectWalTableRecordStore::new(
+        Arc::new(MemtableRecordStorage::new()),
+        wal,
+    ));
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager.clone(),
+        base.clone(),
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    );
+    let row_count = || async {
+        let (catalog, table_id) = manager.resolve_table("txn_stats").await.expect("resolve");
+        catalog
+            .get_statistics(&table_id)
+            .await
+            .unwrap_or_default()
+            .row_count
+    };
+    let insert = |id: &str| {
+        parser
+            .parse_dml(&format!(
+                "INSERT INTO txn_stats (id, val) VALUES ('{id}', 'v');"
+            ))
+            .expect("parse insert")
+            .expect("dml stmt")
+    };
+
+    // A transaction that never commits: its staged inserts move no stats.
+    {
+        let locks = dml
+            .transaction_op_lock_set(&[("txn_stats".to_string(), None)])
+            .await
+            .expect("lock set");
+        let fork =
+            dml.fork_for_transaction(Arc::new(StagingTableRecordStore::new(base.clone())), locks);
+        fork.execute(insert("a")).await.expect("staged insert a");
+        fork.execute(insert("b")).await.expect("staged insert b");
+        assert_eq!(row_count().await, 0, "staged writes must not bump stats");
+        drop(fork); // failed / rolled back: the queue is discarded
+    }
+    assert_eq!(
+        row_count().await,
+        0,
+        "an uncommitted transaction leaves stats untouched"
+    );
+
+    // A transaction that commits: the queued bumps land exactly once.
+    let locks = dml
+        .transaction_op_lock_set(&[("txn_stats".to_string(), None)])
+        .await
+        .expect("lock set");
+    let staging = Arc::new(StagingTableRecordStore::new(base.clone()));
+    let fork = dml.fork_for_transaction(staging.clone(), locks);
+    fork.execute(insert("c")).await.expect("staged insert c");
+    fork.execute(insert("d")).await.expect("staged insert d");
+    let deferred = fork.take_deferred_stats();
+    drop(fork);
+    assert_eq!(row_count().await, 0);
+    let batches = Arc::try_unwrap(staging)
+        .map_err(|_| ())
+        .expect("staging unshared")
+        .into_batches();
+    base.commit_atomic(batches).await.expect("commit");
+    dml.apply_deferred_stats(deferred).await;
+    assert_eq!(row_count().await, 2, "committed rows are counted once");
+}

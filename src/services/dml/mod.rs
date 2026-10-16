@@ -902,6 +902,33 @@ pub struct DmlService {
     /// registry is non-reentrant) and any table outside the set fails closed —
     /// never written without its lock. `None` ⇒ acquire per statement (legacy).
     held_op_locks: Option<Arc<std::collections::HashSet<TableIdentifier>>>,
+    /// ADR-095 review F8: in a transaction fork, catalog-statistics bumps are
+    /// queued here instead of applied, so a transaction that fails at COMMIT
+    /// never moves row counts / min-max / NDV. `None` ⇒ apply immediately.
+    deferred_stats: Option<Arc<parking_lot::Mutex<Vec<DeferredStatBump>>>>,
+}
+
+/// A catalog-statistics update captured during a staged transaction, applied
+/// by [`DmlService::apply_deferred_stats`] only once the commit is durable.
+#[derive(Debug, Clone)]
+pub enum DeferredStatBump {
+    RowCount {
+        table: String,
+        delta: i64,
+    },
+    NullCounts {
+        table: String,
+        columns: Vec<String>,
+        null_counts: Vec<u64>,
+    },
+    MinMax {
+        table: String,
+        column_minmax: HashMap<String, (String, String)>,
+    },
+    Ndv {
+        table: String,
+        ndv_per_column: HashMap<String, u64>,
+    },
 }
 
 /// ADR-025: `DmlService` is the authoritative post-snapshot delta source for the
@@ -1129,6 +1156,7 @@ impl DmlService {
             #[cfg(feature = "abac-policy")]
             abac_enforcer: None,
             held_op_locks: None,
+            deferred_stats: None,
         }
     }
 
@@ -1151,6 +1179,56 @@ impl DmlService {
             #[cfg(feature = "abac-policy")]
             abac_enforcer: self.abac_enforcer.clone(),
             held_op_locks: Some(Arc::new(held_op_locks)),
+            deferred_stats: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+        }
+    }
+
+    /// Drain the statistics bumps this transaction fork queued (empty when not
+    /// a fork). Hand them to [`Self::apply_deferred_stats`] after the commit is
+    /// durable; drop them if it fails.
+    pub fn take_deferred_stats(&self) -> Vec<DeferredStatBump> {
+        self.deferred_stats
+            .as_ref()
+            .map(|queue| std::mem::take(&mut *queue.lock()))
+            .unwrap_or_default()
+    }
+
+    /// Apply statistics bumps queued by a committed transaction, in order.
+    /// Best-effort, like every statistics update (planner-only, never data).
+    pub async fn apply_deferred_stats(&self, bumps: Vec<DeferredStatBump>) {
+        for bump in bumps {
+            match bump {
+                DeferredStatBump::RowCount { table, delta } => {
+                    self.bump_row_count_stats(&table, delta).await
+                }
+                DeferredStatBump::NullCounts {
+                    table,
+                    columns,
+                    null_counts,
+                } => {
+                    self.bump_column_null_counts(&table, &columns, &null_counts)
+                        .await
+                }
+                DeferredStatBump::MinMax {
+                    table,
+                    column_minmax,
+                } => self.bump_column_minmax(&table, column_minmax).await,
+                DeferredStatBump::Ndv {
+                    table,
+                    ndv_per_column,
+                } => self.bump_column_ndv(&table, ndv_per_column).await,
+            }
+        }
+    }
+
+    /// Queue `bump` when this is a transaction fork; `false` ⇒ apply it now.
+    fn defer_stat(&self, bump: impl FnOnce() -> DeferredStatBump) -> bool {
+        match &self.deferred_stats {
+            Some(queue) => {
+                queue.lock().push(bump());
+                true
+            }
+            None => false,
         }
     }
 
@@ -4287,6 +4365,12 @@ impl DmlService {
     /// Called by DML paths and by fast-lane (gRPC/REST/Arrow Flight) write paths for
     /// collections that are registered as relational tables in xCatalog.
     pub(crate) async fn bump_row_count_stats(&self, table_name: &str, delta: i64) {
+        if self.defer_stat(|| DeferredStatBump::RowCount {
+            table: table_name.to_string(),
+            delta,
+        }) {
+            return;
+        }
         let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
             return;
         };
@@ -4334,6 +4418,13 @@ impl DmlService {
         null_counts: &[u64],
     ) {
         if columns.is_empty() || null_counts.iter().all(|&c| c == 0) {
+            return;
+        }
+        if self.defer_stat(|| DeferredStatBump::NullCounts {
+            table: table_name.to_string(),
+            columns: columns.to_vec(),
+            null_counts: null_counts.to_vec(),
+        }) {
             return;
         }
         let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
@@ -4415,6 +4506,16 @@ impl DmlService {
         if column_minmax.is_empty() {
             return;
         }
+        let column_minmax = match &self.deferred_stats {
+            Some(queue) => {
+                queue.lock().push(DeferredStatBump::MinMax {
+                    table: table_name.to_string(),
+                    column_minmax,
+                });
+                return;
+            }
+            None => column_minmax,
+        };
         let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
             return;
         };
@@ -4495,6 +4596,16 @@ impl DmlService {
         if ndv_per_column.is_empty() {
             return;
         }
+        let ndv_per_column = match &self.deferred_stats {
+            Some(queue) => {
+                queue.lock().push(DeferredStatBump::Ndv {
+                    table: table_name.to_string(),
+                    ndv_per_column,
+                });
+                return;
+            }
+            None => ndv_per_column,
+        };
         let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
             return;
         };

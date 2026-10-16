@@ -2357,7 +2357,10 @@ impl PostgresProtocol {
         let entries = std::mem::take(&mut self.transaction_buffer.entries);
         self.transaction_buffer.total_bytes = 0;
 
-        let outcome: std::result::Result<(), (&'static str, String)> = async {
+        let outcome: std::result::Result<
+            Vec<crate::services::dml::DeferredStatBump>,
+            (&'static str, String),
+        > = async {
             if dml_service.has_conditional_key_store() {
                 return Err((
                     "0A000",
@@ -2430,6 +2433,8 @@ impl PostgresProtocol {
                     ));
                 }
             }
+            // Statistics bumps queued while staging land only if the commit does.
+            let deferred_stats = fork.take_deferred_stats();
             drop(fork);
             let staging = Arc::try_unwrap(staging).map_err(|_| {
                 (
@@ -2440,7 +2445,7 @@ impl PostgresProtocol {
             })?;
             let batches = staging.into_batches();
             if batches.is_empty() {
-                return Ok(());
+                return Ok(deferred_stats);
             }
 
             // Durable step: own task, so the caller's cancellation cannot split
@@ -2452,7 +2457,7 @@ impl PostgresProtocol {
             })
             .await
             .map_err(|join| ("08007", format!("commit task did not complete: {join}")))?;
-            committed.map(|_| ()).map_err(|e| {
+            committed.map(|_| deferred_stats).map_err(|e| {
                 if caused_by::<CommitOutcomeUnknown>(&e) {
                     ("08007", format!("{e:#}"))
                 } else if caused_by::<TxnSerializationConflict>(&e) {
@@ -2471,7 +2476,7 @@ impl PostgresProtocol {
 
         // Mandate #16b: invalidate whenever the commit may have reached the WAL
         // — after success, and after an outcome-unknown failure too.
-        let maybe_durable = matches!(outcome, Ok(()) | Err(("08007", _)));
+        let maybe_durable = matches!(outcome, Ok(_) | Err(("08007", _)));
         if maybe_durable {
             let mut seen = std::collections::HashSet::new();
             for entry in &entries {
@@ -2485,7 +2490,10 @@ impl PostgresProtocol {
             }
         }
         match outcome {
-            Ok(()) => Ok(()),
+            Ok(deferred_stats) => {
+                dml_service.apply_deferred_stats(deferred_stats).await;
+                Ok(())
+            }
             Err(("08007", message)) => {
                 // The commit may be durable. Like PostgreSQL, never let the
                 // client believe either outcome: FATAL and drop the connection,
