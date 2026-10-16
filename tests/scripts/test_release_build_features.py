@@ -1009,6 +1009,12 @@ class PrereleaseGateGuard(unittest.TestCase):
         result = _run(self.tree)
         self.assertNotIn("publish-testpypi", result.stdout)
 
+    def test_a_stray_testpypi_mention_does_not_exempt_a_real_publish(self) -> None:
+        """Only the action's repository-url input exempts a job, not the substring."""
+        needs = "    needs: [version-gate, prerelease-gate, build-sdk]\n"
+        self._edit(self.PY, needs, "    needs: [version-gate, build-sdk]\n    env:\n      MIRROR: https://test.pypi.org/simple/\n")
+        self._fails_with("job `publish-sdk-pypi` publishes but does not wait")
+
     def test_catches_a_missing_gate_script(self) -> None:
         (self.tree / "scripts/await_prerelease_ci.sh").unlink()
         self._fails_with("scripts/await_prerelease_ci.sh: missing")

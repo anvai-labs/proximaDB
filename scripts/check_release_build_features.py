@@ -700,8 +700,11 @@ PUBLISH_MARKERS = (
     "npm publish",
     "softprops/action-gh-release",
 )
-# TestPyPI is advisory (continue-on-error) and deliberately not gated.
-ADVISORY_PUBLISH = "test.pypi.org"
+# TestPyPI is advisory (continue-on-error) and deliberately not gated. The
+# exemption keys on the publish action's own `repository-url:` input, not on the
+# string appearing anywhere in the job: a stray mention (an env var, a URL in a
+# step) must not exempt a real PyPI publish.
+ADVISORY_REPOSITORY_URL = "repository-url: https://test.pypi.org/legacy/"
 
 
 def check_prerelease_gate(msgs: list[str]) -> None:
@@ -738,7 +741,7 @@ def check_prerelease_gate(msgs: list[str]) -> None:
         for job, body in jobs.items():
             live = [b for b in body if _live(b)]
             publishes = any(m in b for b in live for m in PUBLISH_MARKERS)
-            advisory = any(ADVISORY_PUBLISH in b for b in live)
+            advisory = any(b.strip() == ADVISORY_REPOSITORY_URL for b in live)
             if publishes and not advisory and not reaches(job):
                 _fail(
                     msgs,
