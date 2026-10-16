@@ -278,10 +278,9 @@ fn commit_crash_matrix_is_all_or_nothing_e2e() -> anyhow::Result<()> {
             wal_buffer_override: None,
         };
 
-        // Crash point 1: killed right AFTER the group frame is durable, BEFORE
-        // it is applied in memory. DDL and autocommit writes are single-op
-        // appends and do not hit the fault; the 2-row COMMIT does.
-        let host = Host::start(&opts(vec![(FAULT, "abort_after_append".into())])).await?;
+        // Setup on a clean boot: with atomic commit on, autocommit statements
+        // also take the atomic append, so they must not run under a fault.
+        let host = Host::start(&opts(vec![])).await?;
         let client = host.client().await?;
         client
             .simple_query("CREATE TABLE acct (id BIGINT PRIMARY KEY, label VARCHAR)")
@@ -289,6 +288,12 @@ fn commit_crash_matrix_is_all_or_nothing_e2e() -> anyhow::Result<()> {
         client
             .simple_query("INSERT INTO acct (id, label) VALUES (1, 'autocommit')")
             .await?;
+        host.crash();
+
+        // Crash point 1: killed right AFTER the group frame is durable, BEFORE
+        // it is applied in memory.
+        let host = Host::start(&opts(vec![(FAULT, "abort_after_append".into())])).await?;
+        let client = host.client().await?;
         let commit = client
             .simple_query(
                 "BEGIN; INSERT INTO acct (id, label) VALUES (2, 'b'); \

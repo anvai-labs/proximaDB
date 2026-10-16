@@ -171,6 +171,7 @@
 pub mod advisor_observations;
 pub mod agent_checkpoint;
 pub mod agent_memory;
+pub mod atomic_txn;
 pub mod audit_sink;
 pub mod bulk_load;
 pub mod canonical_wal;

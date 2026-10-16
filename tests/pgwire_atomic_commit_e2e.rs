@@ -342,3 +342,119 @@ fn atomic_commit_fault_before_append_and_insert_select_refusal() {
         );
     });
 }
+
+/// TD-PGOLTP-1 S4: with the gate on, an AUTOCOMMIT statement is a one-statement
+/// atomic transaction — a cascading DELETE writes child and parent rows as ONE
+/// WAL group frame. An append failure must therefore leave parent AND children
+/// intact (the legacy path wrote children, then the parent, as separate appends,
+/// and bypassed the atomic append entirely).
+#[test]
+fn autocommit_cascade_delete_is_one_atomic_unit() {
+    run(async {
+        let server = Server::start().await.expect("server");
+        let client = server.connect().await;
+        let parent = unique("par");
+        let child = unique("chi");
+        exec(
+            &client,
+            &format!("CREATE TABLE {parent} (id VARCHAR PRIMARY KEY, label VARCHAR)"),
+        )
+        .await;
+        exec(
+            &client,
+            &format!(
+                "CREATE TABLE {child} (id VARCHAR PRIMARY KEY, pid VARCHAR, \
+                 FOREIGN KEY (pid) REFERENCES {parent}(id) ON DELETE CASCADE)"
+            ),
+        )
+        .await;
+        exec(
+            &client,
+            &format!("INSERT INTO {parent} (id, label) VALUES ('p1', 'x')"),
+        )
+        .await;
+        exec(
+            &client,
+            &format!("INSERT INTO {child} (id, pid) VALUES ('c1', 'p1')"),
+        )
+        .await;
+        exec(
+            &client,
+            &format!("INSERT INTO {child} (id, pid) VALUES ('c2', 'p1')"),
+        )
+        .await;
+
+        // SAFETY: one test per process under nextest; cleared right after.
+        unsafe { std::env::set_var(FAULT, "fail_before_append") };
+        let state = batch_sqlstate(&client, &format!("DELETE FROM {parent} WHERE id = 'p1'")).await;
+        unsafe { std::env::remove_var(FAULT) };
+        assert!(
+            state.is_some(),
+            "an autocommit DELETE must go through the atomic append (and fail with it)"
+        );
+        assert_eq!(
+            column(&client, &format!("SELECT id FROM {parent}")).await,
+            vec!["p1"]
+        );
+        assert_eq!(
+            column(&client, &format!("SELECT id FROM {child}")).await,
+            vec!["c1", "c2"],
+            "a failed cascading DELETE must not have removed any child"
+        );
+
+        // Without a fault the cascade commits whole.
+        exec(&client, &format!("DELETE FROM {parent} WHERE id = 'p1'")).await;
+        assert!(
+            column(&client, &format!("SELECT id FROM {parent}"))
+                .await
+                .is_empty()
+        );
+        assert!(
+            column(&client, &format!("SELECT id FROM {child}"))
+                .await
+                .is_empty()
+        );
+    });
+}
+
+/// Autocommit through the atomic path keeps the wire contract: command tags
+/// report the rows each statement affected, and constraint errors keep their
+/// SQLSTATE.
+#[test]
+fn autocommit_statements_keep_their_tags_and_sqlstates() {
+    run(async {
+        let server = Server::start().await.expect("server");
+        let client = server.connect().await;
+        let t = unique("acct");
+        exec(
+            &client,
+            &format!("CREATE TABLE {t} (id BIGINT PRIMARY KEY, label VARCHAR)"),
+        )
+        .await;
+        let inserted = client
+            .execute(&format!("INSERT INTO {t} (id, label) VALUES (1, 'a')"), &[])
+            .await
+            .expect("insert");
+        assert_eq!(inserted, 1);
+        let updated = client
+            .execute(&format!("UPDATE {t} SET label = 'b' WHERE id = 1"), &[])
+            .await
+            .expect("update");
+        assert_eq!(updated, 1);
+        let dup = batch_sqlstate(
+            &client,
+            &format!("INSERT INTO {t} (id, label) VALUES (1, 'dup')"),
+        )
+        .await;
+        assert!(dup.is_some(), "a duplicate primary key must fail");
+        assert_eq!(
+            column(&client, &format!("SELECT label FROM {t}")).await,
+            vec!["b"]
+        );
+        let deleted = client
+            .execute(&format!("DELETE FROM {t} WHERE id = 1"), &[])
+            .await
+            .expect("delete");
+        assert_eq!(deleted, 1);
+    });
+}

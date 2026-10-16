@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** S1–S2 are implemented **default-OFF** behind `[oltp] atomic_commit` / `PROXIMADB_OLTP_ATOMIC_COMMIT`. S3 (cross-session group commit) and S4 (autocommit unification, default flip) are open. **Priority 1** of ADR-095.
+| Status | **In progress.** S1–S2 are implemented **default-OFF** behind `[oltp] atomic_commit` / `PROXIMADB_OLTP_ATOMIC_COMMIT`. S4a (autocommit through the atomic path) is implemented. S3 (cross-session group commit) and S4b (default flip) are open. **Priority 1** of ADR-095.
 | Severity | **High (correctness).** On the legacy path, a failure partway through COMMIT leaves a partially applied transaction durable.
 | Component | `src/services/canonical_wal.rs` (group frame), `src/services/txn_staging.rs` (staging decorator), `src/services/record_store.rs` (`commit_atomic`), `src/services/dml/mod.rs` (`fork_for_transaction`), `src/network/postgres/protocol.rs` (`commit_buffer_atomically`)
 | Realizes | link:../../12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095] D3
@@ -114,11 +114,23 @@ transaction never moves planner statistics. Covered by
 (`cfg!(debug_assertions)`), so a production server cannot be aborted through it (review
 finding 10).
 
+**S4a: autocommit is atomic too.** With the gate on, every pgwire autocommit INSERT / UPDATE /
+DELETE runs as a one-statement atomic unit through the same core as COMMIT
+(`services::atomic_txn::execute_atomically`, shared by both paths). A cascading DELETE's child and
+parent rows therefore land in one group frame. Ordinary statement errors keep each call site's
+existing mapping (55P03 lock conflicts, constraint SQLSTATEs). An outcome-unknown failure is
+FATAL 08007, as for COMMIT. Evidence:
+* `autocommit_cascade_delete_is_one_atomic_unit` (red before the change)
+* `autocommit_statements_keep_their_tags_and_sqlstates`
+* the existing `pgwire_fk_referential_actions_e2e` and `pgwire_transaction_e2e` suites pass with
+  the gate on (7/7)
+
+The REST `/api/v2/sql` and gRPC `ExecuteQuery` DML paths still call `DmlService` directly and are
+not yet atomic.
+
 **Known gaps.**
 * UNIQUE races with writers that take no op-locks (INSERT…SELECT, DDL, graph merge-back)
   pre-date this work and remain.
-* Autocommit statements still use the per-statement path. An autocommit cascading DELETE is
-  therefore not atomic across child and parent until S4.
 
 == Acceptance (evidence)
 
@@ -152,5 +164,6 @@ finding 10).
 
 . S3: cross-session group commit in `FramedTableWalAppender` (one fsync per batch of concurrent
   commits), with metrics (`proximadb_wal_group_commit_size`, fsync latency).
-. S4: route autocommit pgwire DML through the same routine (one write path, ADR-095 D3), then flip
-  the default once the TD-PGOLTP-6 ratchet is green.
+. S4a ✅: autocommit pgwire DML through the same routine (one write path, ADR-095 D3).
+. S4b: route the REST/gRPC DML paths through it too, then flip the default once the TD-PGOLTP-6
+  ratchet is green.
