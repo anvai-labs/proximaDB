@@ -25,9 +25,13 @@ on:
         default: false
 
 concurrency:
-  # Dedup push+PR of the same branch into one group; cancel superseded runs
-  # on feature/PR branches, but let protected-branch validation finish.
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  # One group per (event, branch): superseded runs of the SAME event cancel on
+  # feature/PR branches, while protected-branch validation finishes.
+  # `github.event_name` is in the key (CI redesign PR1) because without it a
+  # push and a PR whose head is that branch shared one group: the qa->main PR
+  # (head_ref `qa`) queued ~70 min behind the push-to-qa run of the same SHA
+  # (v0.4.1, 2026-10-16), and a develop->qa PR queued behind every develop push.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
   # Exempt promotion surfaces (push to qa; PRs targeting qa or main) in addition
   # to main/develop pushes. A develop->qa promotion PR with head=develop lands in
   # the SAME group as develop pushes, so with cancel-in-progress:true every
@@ -35,6 +39,9 @@ concurrency:
   # checks could finish — the promotion never completed during develop churn.
   # qa-gate.yml already sets cancel-in-progress:false for this reason; mirror it
   # here. Feature PRs (base=develop) still cancel superseded runs as before.
+  # Since `event_name` joined the group key that push/PR collision is gone; the
+  # exemption stays so a promotion PR or protected-branch push is never
+  # cancelled by its own successor (a new push to the PR's head re-runs it).
   cancel-in-progress: ${{ !(github.event_name == 'pull_request' && contains(fromJson('["qa", "main"]'), github.base_ref)) && !contains(fromJson('["main", "develop", "qa"]'), github.ref_name) }}
 
 env:
@@ -48,6 +55,35 @@ env:
   # already disables incr-comp, so only debug needs cutting here.
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
+
+# ============================================================================
+# rust-cache policy (CI redesign PR1; pinned by check_rust_cache_keys in
+# scripts/check_deterministic_commit_contract.py):
+# * one `shared-key` per BUILD SHAPE, prefix `v2-rust`, `add-job-id-key: false`:
+#     check       cargo check/clippy (rust-compile, clippy, every feature-matrix
+#                 leg, proto-compat, benches)  -- writer: rust-compile (test)
+#     dev-test    dev-profile test builds (rust-test, integration lanes,
+#                 openapi, mlflow, rust-build dev, ...) -- writer: rust-test (unit)
+#     release     release builds (python-sdk-round-trip, rust-build release,
+#                 sift, benchmarks)                 -- writer: python-sdk-round-trip
+#     coverage / objstore-fast / sdk-codegen / sdk-contract: single-job shapes
+# * `save-if` is develop-push only. develop is the default branch, whose caches
+#   every PR and promotion run can read; a cache saved on a PR ref is readable
+#   only by that PR, so per-PR saves just filled the 10 GB quota with keys
+#   nothing else could use. Readers set `save-if: false`; exactly ONE writer
+#   per key, so jobs racing to "reserve" the same key cannot leave a
+#   nondeterministic (or partial) cache behind.
+# * A reader whose build differs from its shape only in ROOT-crate features
+#   (authz: abac-policy, sift: io-trace, the feature-matrix legs) still
+#   restores the shape: the dependencies are shared, and it never writes.
+# * Job-level CARGO_*/RUST* env is hashed into the key, so such env lives on
+#   build steps, never on a job that reads a shared shape.
+# * `cache-workspace-crates` is deliberately NOT set: cargo decides freshness of
+#   workspace (path) crates by source mtime, and a fresh checkout makes every
+#   source newer than any restored artifact, so cached workspace-crate
+#   artifacts are always rebuilt -- they would only crowd the quota (rust-cache
+#   README: "generally not effective", Swatinem/rust-cache#37).
+# ============================================================================
 
 # ============================================================================
 # This consolidated CI workflow combines:
@@ -166,6 +202,18 @@ jobs:
       # python-lint, the 4 sdk-codegen-drifts, go/nodejs/rust-sdk-lint) OR this `sweep`
       # into their `if:`.
       sweep: ${{ github.event_name == 'push' }}
+      # CI redesign PR1: the develop-push CACHE WRITER. rust-cache saves ONLY on
+      # a push to develop (every rust-cache step's `save-if`), because develop is
+      # the default branch -- the one cache scope every PR and promotion run can
+      # read. Before this, develop pushes skipped `test_tier`, so the dev-test
+      # shape (rust-test / integration lanes) was never built there and never
+      # saved, and every PR started from a cold dependency compile. `warm` lets
+      # the rust-test unit leg -- the dev-test shape's single designated
+      # writer -- run on develop push. The check shape is written by
+      # rust-compile (test) and the release shape by python-sdk-round-trip,
+      # both of which already run on develop push. PR2 replaces this with
+      # archive builders.
+      warm: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
       # TD-CITIER-2: `,key,key,` of reusable job groups already proven GREEN on
       # this exact git tree by a trusted promotion-tier run (empty = run all).
       # Each reusable job ANDs `!contains(needs.changes.outputs.reused,
@@ -742,6 +790,10 @@ jobs:
         run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
       - name: Test promotion tree-reuse gate (TD-CITIER-2)
         run: python3 -m unittest discover -s tests/scripts -p 'test_ci_tree_reuse.py'
+      - name: Test Flake Rerun infra-kill matcher (fixture job logs)
+        run: python3 -m unittest discover -s tests/scripts -p 'test_flake_rerun.py'
+      - name: Test Pre-Release CI await gate (run_id hand-off to release.yml)
+        run: python3 -m unittest discover -s tests/scripts -p 'test_await_prerelease_ci.py'
       - name: Validate release build features (cloud-full + job timeouts)
         run: python3 scripts/check_release_build_features.py
       - name: Check for unreachable .rs files (TD-ORPHAN-1)
@@ -893,7 +945,10 @@ jobs:
           python -m pip install -e ".[test]"
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-proto-compat"
+          prefix-key: "v2-rust"
+          shared-key: "check"
+          add-job-id-key: false
+          save-if: false
       - name: Run proto compatibility gate
         env:
           PYTHON: python
@@ -932,7 +987,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-openapi-spec-drift"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Regenerate OpenAPI spec from handlers (drift gate)
         run: cargo test -p proximadb --test openapi_spec_gen -- --nocapture
       - name: Fail on uncommitted drift in generated OpenAPI spec
@@ -1030,7 +1088,10 @@ jobs:
         run: python -m pip install --upgrade pip pyyaml
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-sdk-codegen-drift"
+          prefix-key: "v2-rust"
+          shared-key: "sdk-codegen"
+          add-job-id-key: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
           workspaces: clients/rust/codegen
       - name: Regenerate the Rust REST transport from the OpenAPI spec
         # ADR-068 D6: regeneration is ADVISORY here. progenitor 0.14 panics on
@@ -1107,7 +1168,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config curl
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-python-sdk-round-trip"
+          prefix-key: "v2-rust"
+          shared-key: "release"
+          add-job-id-key: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
       - name: Build server binary
         run: cargo build --release --package proximadb-server --bin proximadb-server
       - uses: actions/setup-python@v7
@@ -1253,7 +1317,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-clippy-nightly"
+          prefix-key: "v2-rust"
+          shared-key: "check"
+          add-job-id-key: false
+          save-if: false
       # Clippy is authoritative. TD-079 retired the accumulated root-crate
       # lint debt (2026-05-28); any new warning fails CI. If a new lint
       # surfaces from a dependency or toolchain update, prefer fixing it
@@ -1361,8 +1428,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler g++
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-feature-matrix"
-          shared-key: ${{ matrix.label }}
+          prefix-key: "v2-rust"
+          shared-key: "check"
+          add-job-id-key: false
+          save-if: false
       - name: cargo check -p ${{ matrix.pkg }} --tests ${{ matrix.args }}
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
@@ -1393,8 +1462,8 @@ jobs:
   # second on the run's critical path. A matrix leg cannot carry its own job-level
   # `if:`, hence a separate job. Its `name:` is IDENTICAL to the old leg's check
   # name, so dashboards/history keep continuity (branch protection requires only
-  # `CI Success`). Same cache key (prefix `v1-feature-matrix`, shared-key
-  # `enterprise-catalogs`) so existing caches stay warm.
+  # `CI Success`). Restores the shared `check` cache read-only, like every
+  # feature-matrix leg (CI redesign PR1).
   # Tiering: feat->develop runs it only when `enterprise_catalogs_changes`
   # matches (the cfg-gated code + what it imports + manifests + this file);
   # develop->qa and qa->main (`medium_tier`) run it unconditionally.
@@ -1419,8 +1488,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler g++
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-feature-matrix"
-          shared-key: "enterprise-catalogs"
+          prefix-key: "v2-rust"
+          shared-key: "check"
+          add-job-id-key: false
+          save-if: false
       # OOM insurance, same as the unit matrix row's "Add swap headroom", and
       # for the same peak. The "serve enterprise-catalog tests" step builds the
       # root crate's lib-test binary (`--lib`), whose single-rustc codegen+link
@@ -1655,8 +1726,10 @@ jobs:
       - if: matrix.setup == 'rust'
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-sdk-contract-rust"
-          workspaces: "clients/rust -> target"
+          prefix-key: "v2-rust"
+          shared-key: "sdk-contract"
+          add-job-id-key: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
 
       - if: matrix.setup == 'go'
         uses: actions/setup-go@v7
@@ -1727,7 +1800,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-connectors-contract"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
 
       - name: REST contract gate
         if: matrix.kind == 'rest'
@@ -1781,8 +1857,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-spark-jni-smoke"
-          workspaces: ". -> target"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Run JNI smoke harness
         run: |
           chmod +x clients/jvm/spark-connector/run-smoke.sh
@@ -1951,10 +2029,9 @@ jobs:
     # `test` shape compiles every crate's test targets at once and OOM-killed the
     # runner (exit 143) under default parallelism; serial is the repo's standard
     # fix for the root-crate test compile (mirrors the rust-test job).
-    env:
-      CARGO_BUILD_JOBS: 1
-      RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: /home/runner/.cache/sccache
+    # Job-level CARGO_*/RUST* env is folded into the rust-cache key, so it lives
+    # on the build steps instead: a job-level value would give this job a
+    # different key from the shape's writer and it would never restore.
     strategy:
       fail-fast: false
       matrix:
@@ -1970,8 +2047,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-compile-${{ matrix.shape }}"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "check"
+          add-job-id-key: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' && matrix.shape == 'test' }}
 
       # sccache complements rust-cache: caches individual rustc invocations
       # (content-addressed), so it hits even when the target/ artifact cache misses.
@@ -1988,9 +2067,15 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
 
       - name: cargo check ${{ matrix.args }}
+        env:
+          CARGO_BUILD_JOBS: 1
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: /home/runner/.cache/sccache
         run: cargo check ${{ matrix.args }}
 
       - name: sccache stats
+        env:
+          SCCACHE_DIR: /home/runner/.cache/sccache
         run: sccache --show-stats || true
 
   # Benches compile — split from the rust-compile matrix to gate on medium_tier
@@ -2003,18 +2088,19 @@ jobs:
     timeout-minutes: 50  # max 25 min over 14 runs, 2026-10-09..11
     needs: [changes]
     if: (needs.changes.outputs.compile == 'true' && needs.changes.outputs.medium_tier == 'true') && !contains(needs.changes.outputs.reused, ',rust-compile-benches,')
-    env:
-      CARGO_BUILD_JOBS: 1
-      RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: /home/runner/.cache/sccache
+    # Job-level CARGO_*/RUST* env is folded into the rust-cache key, so it lives
+    # on the build steps instead: a job-level value would give this job a
+    # different key from the shape's writer and it would never restore.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-compile-benches"
-          shared-key: "benches"
-      # sccache MUST be installed: this job sets RUSTC_WRAPPER=sccache, so without
+          prefix-key: "v2-rust"
+          shared-key: "check"
+          add-job-id-key: false
+          save-if: false
+      # sccache MUST be installed: the check step sets RUSTC_WRAPPER=sccache, so without
       # the action cargo dies instantly ("could not execute process `sccache`").
       # The step was missing while the env + stats step were present — the job is
       # gated on medium_tier, so it only runs on develop→qa promotions and the gap
@@ -2034,9 +2120,15 @@ jobs:
       # `--examples` into this job restores the coverage without a new runner
       # or a longer feat→develop path.
       - name: cargo check --workspace --benches --examples
+        env:
+          CARGO_BUILD_JOBS: 1
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: /home/runner/.cache/sccache
         run: cargo check --workspace --benches --examples
       - name: Show sccache stats
         if: always()
+        env:
+          SCCACHE_DIR: /home/runner/.cache/sccache
         run: sccache --show-stats || true
 
   # ============================================================================
@@ -2054,8 +2146,10 @@ jobs:
         include:
           - profile: dev
             args: ""
+            cache: dev-test
           - profile: release
             args: "--release"
+            cache: release
     steps:
       - name: Reclaim disk space
         # ubuntu-latest ships ~25 GB of preinstalled toolchains this build never
@@ -2079,8 +2173,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-${{ matrix.profile }}"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: ${{ matrix.cache }}
+          add-job-id-key: false
+          save-if: false
 
       - name: Install Dependencies
         run: |
@@ -2147,7 +2243,9 @@ jobs:
     # compile is ~42-45 min whichever job wrote the cache (16/16 runs), so the
     # edge only added its ~21 min wait to every feat->develop run's wall clock.
     needs: [changes]
-    if: (needs.changes.outputs.rust == 'true' && needs.changes.outputs.test_tier == 'true' && !inputs.skip_tests) && !contains(needs.changes.outputs.reused, ',rust-test,')
+    # `warm` (develop push) runs it as the dev-test cache writer -- see the
+    # `warm` output in `changes`.
+    if: (needs.changes.outputs.rust == 'true' && (needs.changes.outputs.test_tier == 'true' || needs.changes.outputs.warm == 'true') && !inputs.skip_tests) && !contains(needs.changes.outputs.reused, ',rust-test,')
     # NO sccache here (reverted from #920): with RUSTC_WRAPPER=sccache this job's
     # root-crate test-binary compile OOM-killed the 16GB runner 3/3 times on
     # 2026-07-13 (exit 143 after ~10min of silence mid-compile — the documented
@@ -2193,8 +2291,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' && matrix.test-type == 'unit' }}
 
       - name: Install Dependencies
         run: |
@@ -2227,6 +2327,9 @@ jobs:
           free -h
 
       - name: Run Tests
+        # On a develop push (`warm`, not `test_tier`) only the unit leg -- the
+        # dev-test cache writer -- does work; the doc leg is a no-op there.
+        if: matrix.test-type == 'unit' || needs.changes.outputs.test_tier == 'true'
         run: |
           if [ "${{ matrix.test-type }}" = "unit" ]; then
             # CARGO_BUILD_JOBS=1: the root `proximadb` crate's test binary
@@ -2300,12 +2403,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-affected-fast"
-          shared-key: "build"
-          # A genuine test/compile FAILURE here is the signal this lane exists to
-          # give; saving its (small, leaf-only) target/ means the fix push on the
-          # same PR rebuilds warm instead of repeating the cold compile.
-          cache-on-failure: true
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
 
       - name: Install Dependencies
         run: |
@@ -2374,7 +2475,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-cloud-emulator-fast"
+          prefix-key: "v2-rust"
+          shared-key: "objstore-fast"
+          add-job-id-key: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
       # Authenticated pulls. The emulator images (Azurite, LocalStack, fake-gcs)
       # come from Docker Hub, and an ANONYMOUS pull is rate-limited per IP across
       # every job on the runner fleet -- so these jobs fail with
@@ -2431,9 +2535,9 @@ jobs:
       (needs.changes.outputs.medium_tier == 'true' ||
        needs.changes.outputs.object_store_restart_changes == 'true') &&
       !contains(needs.changes.outputs.reused, ',object-store-restart-recovery,')
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_DIR: /home/runner/.cache/sccache
+    # Job-level CARGO_*/RUST* env is folded into the rust-cache key, so it lives
+    # on the build steps instead: a job-level value would give this job a
+    # different key from the shape's writer and it would never restore.
     steps:
       - name: Reclaim disk space
         run: |
@@ -2471,18 +2575,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-objstore-restart"
-          # This job is compile-bound and sits at the edge of its 90-minute
-          # budget: a WARM run finishes in ~75 min, a COLD one does not finish at
-          # all (observed: 72 min in, still emitting compile warnings, then
-          # killed). rust-cache saves `target/` only on success by default, so a
-          # single failure starts a loop it cannot leave — the run fails, saves
-          # nothing, and the next run is cold again and fails for the same
-          # reason. Caching on failure persists the partial `target/` so the next
-          # attempt starts warm and completes. (`CARGO_BUILD_JOBS=1` is already
-          # set inside run_cloud_emulator_tests.sh for the memory cliff; this is
-          # the other half.)
-          cache-on-failure: true
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: actions/cache@v6
         with:
@@ -2510,6 +2606,9 @@ jobs:
       - name: Prove full-server restart recovery over Azurite (adls://)
         # docker + aws/az CLIs preinstalled on ubuntu-latest; the script starts
         # Azurite and runs catalog_wal_and_sst_survive_fresh_local_disks.
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_DIR: /home/runner/.cache/sccache
         run: bash scripts/run_cloud_emulator_tests.sh --restart
 
   # Targeted integration tests based on changed components
@@ -2530,8 +2629,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -2574,8 +2675,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - name: Build server binary (with MLflow UI feature)
@@ -2665,8 +2768,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     # was 45; green spans reach 30-34 min across the integration legs
-    env:
-      RUST_MIN_STACK: "8388608"
+    # RUST_MIN_STACK lives on the run step: job-level RUST* env would change
+    # this job's rust-cache key (see the rust-compile job).
     # `needs: [changes]` ONLY — deliberately not `rust-build`. `rust-build` is
     # itself gated on the `rust` filter (src/**, crates/**, apps/**, Cargo*),
     # so depending on it makes this lane inherit that gate transitively and skip
@@ -2695,13 +2798,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - name: Run Authorization E2E (live transports)
+        env:
+          RUST_MIN_STACK: "8388608"
         run: |
           set -uo pipefail
           # NOTE: deliberately NOT `set -e` around the capture. With `-e`, a
@@ -2730,23 +2837,26 @@ jobs:
       (needs.changes.outputs.query_changes == 'true' ||
        needs.changes.outputs.core_changes == 'true') &&
       !contains(needs.changes.outputs.reused, ',rust-integration-test-query,')
-    env:
-      # Match the QA recall lane and the hardened server runtime: the
-      # delete/flush ANN recall path has a deep-but-finite async call chain
-      # that overflows tokio's default ~2 MiB worker stack on Linux.
-      RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - name: Run Query Integration Tests
+        env:
+          # Match the QA recall lane and the hardened server runtime: the
+          # delete/flush ANN recall path has a deep-but-finite async call chain
+          # that overflows tokio's default ~2 MiB worker stack on Linux. On the
+          # step, not the job: job-level RUST* env changes the rust-cache key.
+          RUST_MIN_STACK: "8388608"
         run: |
           for test_file in tests/*query*.rs tests/*federated*.rs tests/*cache*.rs tests/filtered_ann_recall_bands.rs tests/query_cache_test.rs tests/vector_ann_recall_e2e.rs tests/retrieval_quality_gates.rs tests/nl_translate_eval.rs; do
             if [ -f "$test_file" ]; then
@@ -2767,19 +2877,18 @@ jobs:
       needs.changes.outputs.test_tier == 'true' &&
       needs.changes.outputs.pgwire_accuracy_changes == 'true' &&
       !contains(needs.changes.outputs.reused, ',rust-integration-test-pgwire-accuracy,')
-    env:
-      # 8MB worker stack: events_tsbs_pgwire_e2e (and correlated-subquery pgwire
-      # paths) produce deep-but-finite async call chains that overflow the
-      # default ~2MB tokio worker stack. Mirrors qa-gate (b87d05a31); ci.yml's
-      # integration-test jobs previously lacked this.
-      RUST_MIN_STACK: "8388608"
+    # The job-level RUST_MIN_STACK=8 MiB that used to sit here was always
+    # overridden by the run step's 16 MiB below; it is gone because job-level
+    # RUST* env changes the rust-cache key (see the rust-compile job).
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -2870,8 +2979,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -2904,8 +3015,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -2924,9 +3037,9 @@ jobs:
   # spec (time-series TD-TS-1, external collections Phase 8 F5). These exercise
   # the REAL store (full round-trips) — the router-level drift gate only checks
   # route existence, and `build_test_app_state`'s embedded profile cannot do
-  # write→read round-trips. tdd.yml runs the broader REST suite only at qa→main
-  # (its trigger is `feature/**` + PRs to main), so without this job these
-  # surfaces had NO functional coverage at feat→develop. Runs on network/core
+  # write→read round-trips. The former tdd.yml ran the broader REST suite only
+  # at qa→main, and only advisorily (continue-on-error; deleted in CI redesign
+  # PR1), so without this job these surfaces had NO functional coverage. Runs on network/core
   # changes; skipped⇒pass in ci-success, so it gates only when it runs.
   # (CDC REST `/changes` is route-covered by the drift gate; its functional
   # round-trip needs the full server + is exercised by the cdc-kafka-gated
@@ -2948,8 +3061,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-dev"
-          shared-key: "build"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -3019,7 +3134,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-coverage"
+          prefix-key: "v2-rust"
+          shared-key: "coverage"
+          add-job-id-key: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
       # sccache complements rust-cache: caches individual rustc invocations
       # (content-addressed), so it hits even when the target/ artifact cache misses.
       - uses: mozilla-actions/sccache-action@v0.0.11
@@ -3507,7 +3625,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-nightly-bench"
+          prefix-key: "v2-rust"
+          shared-key: "release"
+          add-job-id-key: false
+          save-if: false
 
       - name: Install Dependencies
         run: |
@@ -3548,7 +3669,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-tpc-perf"
+          prefix-key: "v2-rust"
+          shared-key: "dev-test"
+          add-job-id-key: false
+          save-if: false
 
       - name: Install Dependencies
         run: |
@@ -3657,7 +3781,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-sift-ratchet"
+          prefix-key: "v2-rust"
+          shared-key: "release"
+          add-job-id-key: false
+          save-if: false
       - name: Cache SIFT corpus
         uses: actions/cache@v6
         with:
@@ -3705,9 +3832,16 @@ jobs:
     # `mlflow-conformance` was never in needs, so it gated nothing; path-scoped
     # it must block when it runs. Last 60 CI runs: 28 attempts, 23 success,
     # 0 failure, 5 cancelled (superseded-run concurrency cancels) — not flaky.
+    # `hygiene-check`, `repository-identity` and `oss-docs-decontamination` ran
+    # on every PR but were never in needs, so a red one gated nothing (CI
+    # redesign PR1). Their last 20 develop-push runs: every run that started
+    # jobs was green (hygiene path-skipped in 3); 2 runs were cancelled whole.
     needs:
       - changes
       - deterministic-commit-contract
+      - hygiene-check
+      - repository-identity
+      - oss-docs-decontamination
       - rust-format
       - capability-matrix
       - proto-compat

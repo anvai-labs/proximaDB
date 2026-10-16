@@ -50,10 +50,7 @@ COPY = (
     # scope asserts nothing and the suite stays green. Kept in lockstep by
     # `test_the_copy_list_covers_every_timed_workflow` below, which reads the
     # tuple out of the guard rather than restating it.
-    ".github/workflows/_platform-packages.yml",
-    ".github/workflows/_shared-build.yml",
     ".github/workflows/branch-route-guard.yml",
-    ".github/workflows/capability-contract-tests.yml",
     ".github/workflows/codeql.yml",
     ".github/workflows/docs-site.yml",
     ".github/workflows/flake-rerun.yml",
@@ -64,7 +61,6 @@ COPY = (
     ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
     ".github/workflows/public-overflow-runner-smoke.yml",
     ".github/workflows/release-python.yml",
-    ".github/workflows/tdd.yml",
     ".github/workflows/tier-config-fingerprint.yml",
     ".github/workflows/windows-compile-ratchet.yml",
     # TD-RELTAG-1: the unified-tag check reads the gate's implementation and
@@ -171,10 +167,7 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         and requires the guard to exit 1 AND to name that file.
         """
         newly_scoped = [
-            ".github/workflows/_platform-packages.yml",
-            ".github/workflows/_shared-build.yml",
             ".github/workflows/branch-route-guard.yml",
-            ".github/workflows/capability-contract-tests.yml",
             ".github/workflows/codeql.yml",
             ".github/workflows/docs-site.yml",
             ".github/workflows/flake-rerun.yml",
@@ -185,7 +178,6 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
             ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
             ".github/workflows/public-overflow-runner-smoke.yml",
             ".github/workflows/release-python.yml",
-            ".github/workflows/tdd.yml",
             ".github/workflows/tier-config-fingerprint.yml",
             ".github/workflows/windows-compile-ratchet.yml",
         ]
@@ -1027,6 +1019,150 @@ class PrereleaseGateGuard(unittest.TestCase):
             "select(true)",
         )
         self._fails_with("no longer restricts to building runs")
+
+
+class ReleaseBinaryReuseGuard(unittest.TestCase):
+    """CI redesign PR1: release.yml downloads Pre-Release CI's binaries.
+
+    Each mutation is one way the reuse could ship the wrong bytes, or quietly
+    stop falling back to a build. The guard's pre-reuse form (always build) is
+    still accepted.
+    """
+
+    REL = ".github/workflows/release.yml"
+    PRE = ".github/workflows/prerelease-ci.yml"
+
+    def setUp(self) -> None:
+        self.tree = _tree()
+        self.addCleanup(shutil.rmtree, self.tree, ignore_errors=True)
+
+    def _edit(self, rel: str, old: str, new: str, count: int = 1) -> None:
+        p = self.tree / rel
+        text = p.read_text(encoding="utf-8")
+        self.assertIn(old, text, f"fixture drift in {rel}: {old!r}")
+        p.write_text(text.replace(old, new, count), encoding="utf-8")
+
+    def _fails_with(self, needle: str) -> None:
+        result = _run(self.tree)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(needle, result.stdout)
+
+    def test_real_tree_reuses_with_fallback(self) -> None:
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SHA-256", result.stdout)
+
+    def test_the_always_build_form_is_still_accepted(self) -> None:
+        self._edit(self.REL, "          run-id: ${{ needs.prepare.outputs.prerelease_run_id }}\n", "")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_catches_a_download_that_fails_the_release_instead_of_falling_back(self) -> None:
+        self._edit(
+            self.REL,
+            "        id: fetch\n        if: needs.prepare.outputs.prerelease_run_id != '' && needs.prepare.outputs.dry_run != 'true'\n        continue-on-error: true\n",
+            "        id: fetch\n        if: needs.prepare.outputs.prerelease_run_id != '' && needs.prepare.outputs.dry_run != 'true'\n",
+        )
+        self._fails_with("must be `continue-on-error: true`")
+
+    def test_catches_a_download_on_a_dry_run(self) -> None:
+        self._edit(self.REL, " && needs.prepare.outputs.dry_run != 'true'\n        continue-on-error: true", "\n        continue-on-error: true")
+        self._fails_with("must be skipped on a dry run")
+
+    def test_catches_a_missing_checksum_verification(self) -> None:
+        """The step still mentions `.sha256` files, but hashes nothing."""
+        self._edit(self.REL, "have=\"$(sha256sum \"$expected\" | awk '{print $1}')\"", "have=\"$want\"")
+        self._fails_with("must verify downloaded archives' SHA-256")
+
+    def test_catches_a_checksum_step_that_cannot_fail(self) -> None:
+        self._edit(
+            self.REL,
+            "      - name: Verify fetched binaries (name + SHA-256)\n        if: steps.fetch.outcome == 'success'\n",
+            "      - name: Verify fetched binaries (name + SHA-256)\n        if: steps.fetch.outcome == 'success'\n        continue-on-error: true\n",
+        )
+        self._fails_with("must verify downloaded archives' SHA-256")
+
+    def test_catches_a_fallback_build_that_always_runs(self) -> None:
+        self._edit(
+            self.REL,
+            "      - name: Build Binaries\n        if: steps.fetch.outcome != 'success'\n",
+            "      - name: Build Binaries\n",
+        )
+        self._fails_with("fallback build must be gated")
+
+    def test_catches_a_removed_fallback_build(self) -> None:
+        self._edit(self.REL, "cargo build --release --target", "cargo build --target", count=-1)
+        self._fails_with("lost its fallback `cargo build --release`")
+
+    def test_catches_an_archive_step_that_runs_after_a_fetch(self) -> None:
+        self._edit(
+            self.REL,
+            "        if: steps.fetch.outcome != 'success' && runner.os != 'Windows'\n",
+            "        if: runner.os != 'Windows'\n",
+        )
+        self._fails_with("`Create Archive (Unix)` must be gated")
+
+    def test_catches_an_artifact_name_prerelease_never_uploads(self) -> None:
+        self._edit(self.PRE, "          name: binaries-${{ matrix.target }}\n", "          name: bins-${{ matrix.target }}\n")
+        self._fails_with("never uploads")
+
+    def test_catches_prerelease_retention_shorter_than_the_reuse_window(self) -> None:
+        self._edit(self.PRE, "retention-days: 14", "retention-days: 7")
+        self._fails_with("must be kept >= 14 days (got 7)")
+
+    def test_catches_prepare_not_exposing_the_run_id(self) -> None:
+        self._edit(self.REL, "      prerelease_run_id: ${{ steps.prerelease.outputs.run_id }}\n", "")
+        self._fails_with("must output `prerelease_run_id`")
+
+    def test_catches_missing_actions_read(self) -> None:
+        self._edit(self.REL, "      contents: read\n      actions: read\n", "      contents: read\n")
+        self._fails_with("needs `permissions: actions: read`")
+
+
+class NpmOidcPublishGuard(unittest.TestCase):
+    """v0.4.1's npm publish failed twice with a bare ENEEDAUTH: npm logs an
+    OIDC exchange refusal only at verbose. These pin the OIDC-only shape."""
+
+    REL = ".github/workflows/release.yml"
+
+    def setUp(self) -> None:
+        self.tree = _tree()
+        self.addCleanup(shutil.rmtree, self.tree, ignore_errors=True)
+
+    def _edit(self, old: str, new: str) -> None:
+        p = self.tree / self.REL
+        text = p.read_text(encoding="utf-8")
+        self.assertIn(old, text, f"fixture drift: {old!r}")
+        p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def _fails_with(self, needle: str) -> None:
+        result = _run(self.tree)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(needle, result.stdout)
+
+    def test_real_tree_passes(self) -> None:
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_catches_the_registry_url_npmrc(self) -> None:
+        self._edit("          node-version: '24'\n\n      - name: Require an npm new enough",
+                   "          node-version: '24'\n          registry-url: 'https://registry.npmjs.org'\n\n      - name: Require an npm new enough")
+        self._fails_with("sets setup-node `registry-url:`")
+
+    def test_catches_a_token_secret(self) -> None:
+        self._edit("          npm_config_registry: https://registry.npmjs.org/\n",
+                   "          npm_config_registry: https://registry.npmjs.org/\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n")
+        self._fails_with("feeds npm a token secret")
+
+    def test_catches_a_missing_id_token_permission(self) -> None:
+        self._edit("    permissions:\n      id-token: write\n      contents: read\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v7\n\n      # Node 24",
+                   "    permissions:\n      contents: read\n    steps:\n      - name: Checkout\n        uses: actions/checkout@v7\n\n      # Node 24")
+        self._fails_with("without `permissions: id-token: write`")
+
+    def test_catches_a_missing_exchange_preflight(self) -> None:
+        self._edit('url="https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/@anvailabs%2fproximadb-client"',
+                   'url="https://registry.npmjs.org/-/whoami"')
+        self._fails_with("must preflight the npm OIDC exchange")
 
 
 class VersionSyncCheckTag(unittest.TestCase):

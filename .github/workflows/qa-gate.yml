@@ -158,8 +158,12 @@ jobs:
           cargo test --test embedded_flush_recovery --no-run
           # TD-182 P0b: previously-orphaned vector recall ratchets (gate them here).
           cargo test --test vector_ann_recall_e2e --test nova_cold_search_recall_test \
-            --test td112_postflush_recall_e2e --test raptor_recall_test \
+            --test td112_postflush_recall_e2e \
             --test helix_cold_search_recall_test --no-run
+          # RAPTOR is `#![cfg(feature = "experimental-engines")]`: built without
+          # the feature it compiled to ZERO tests and the ratchet step below
+          # passed while running nothing (CI redesign PR1). Built here with it.
+          cargo test --features experimental-engines --test raptor_recall_test --no-run
       - name: Run TPC-H over pgwire
         env:
           # 8MB worker stack: correlated subqueries (Q2/Q20-Q22) produce
@@ -198,7 +202,19 @@ jobs:
       - name: Run HELIX cold-search recall ratchet (TD-182 P0b)
         run: cargo test --test helix_cold_search_recall_test -- --nocapture
       - name: Run RAPTOR recall-after-reopen ratchet (TD-182 P0b)
-        run: cargo test --test raptor_recall_test -- --nocapture
+        # `--features experimental-engines` is load-bearing: the file is
+        # `#![cfg(feature = "experimental-engines")]`, so without it this step
+        # ran zero tests and passed. Fail if that ever happens again.
+        run: |
+          set -uo pipefail
+          status=0
+          output=$(cargo test --features experimental-engines --test raptor_recall_test -- --nocapture 2>&1) || status=$?
+          echo "$output"
+          if echo "$output" | grep -qE "running 0 tests"; then
+            echo "::error::raptor_recall_test compiled to ZERO tests -- the experimental-engines feature is not enabled, so this ratchet verified nothing."
+            exit 1
+          fi
+          exit "$status"
       - name: Run TD-112 post-flush recall ratchet (TD-182 P0b)
         run: cargo test --test td112_postflush_recall_e2e recall -- --nocapture
 

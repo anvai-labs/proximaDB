@@ -6,7 +6,9 @@
 # not a code failure. Historically a human had to notice and run
 # `gh run rerun <id> --failed`. This workflow does that once, automatically, and
 # ONLY when every failed job carries the infra-kill signature — a genuine test
-# failure is never retried. (This is a SAFETY NET for non-deterministic infra
+# failure is never retried. The signature lives in the job LOG ("##[error]The
+# runner has received a shutdown signal"); the annotation only says "exit code
+# 143", which is why the annotation-only matcher this replaced never fired. (This is a SAFETY NET for non-deterministic infra
 # kills; the deterministic cold-compile OOM is fixed at the source — e.g. the
 # cloud-emulator job runs CARGO_BUILD_JOBS=1, see run_cloud_emulator_tests.sh.)
 #
@@ -20,8 +22,9 @@ on:
     types: [completed]
 
 permissions:
-  actions: write
-  contents: read
+  actions: write   # rerun-failed-jobs; also covers reading job logs
+  checks: read     # check-run annotations (the exit-143 fallback)
+  contents: read   # checkout of the default branch's scripts/
 
 jobs:
   rerun-infra-flakes:
@@ -35,48 +38,15 @@ jobs:
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.run_attempt == 1
     steps:
+      # workflow_run executes the DEFAULT branch's copy of this file, and this
+      # checkout is that same trusted ref -- never the failed run's head.
+      - uses: actions/checkout@v7
       - name: Rerun failed jobs if all failures are runner shutdowns
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const run_id = context.payload.workflow_run.id;
-            const { owner, repo } = context.repo;
-
-            const jobs = await github.paginate(
-              github.rest.actions.listJobsForWorkflowRun,
-              { owner, repo, run_id, filter: 'latest', per_page: 100 }
-            );
-            // The aggregator job fails whenever any dependency fails; ignore it
-            // when deciding whether the failure set is pure infrastructure.
-            const failed = jobs.filter(
-              (j) => j.conclusion === 'failure' && j.name !== 'CI Success'
-            );
-            if (failed.length === 0) {
-              core.info('No non-aggregator failed jobs; nothing to do.');
-              return;
-            }
-
-            const SIGNATURE = 'The runner has received a shutdown signal';
-            let allInfra = true;
-            for (const job of failed) {
-              const annotations = await github.paginate(
-                github.rest.checks.listAnnotations,
-                { owner, repo, check_run_id: job.id, per_page: 100 }
-              );
-              const infra = annotations.some((a) =>
-                (a.message || '').includes(SIGNATURE)
-              );
-              core.info(`${job.name}: infra-kill=${infra}`);
-              if (!infra) allInfra = false;
-            }
-
-            if (!allInfra) {
-              core.info('At least one failure is not an infra kill; not rerunning.');
-              return;
-            }
-
-            core.notice(
-              `All ${failed.length} failed job(s) show the runner-shutdown ` +
-              'signature; rerunning failed jobs once.'
-            );
-            await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id });
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        # The matcher reads each failed job's LOG (the shutdown text is never
+        # in an annotation), falls back to the exit-143 annotation only when
+        # the log is unreadable, and reruns only when EVERY failure matches.
+        # Tested against real log excerpts in tests/scripts/test_flake_rerun.py.
+        run: python3 scripts/flake_rerun.py --repo "${{ github.repository }}" --run-id "$RUN_ID"

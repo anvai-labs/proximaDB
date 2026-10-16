@@ -13,6 +13,7 @@ point at deterministic policies:
 * Arrow Flight exports bind client paths to the selected collection
 * query ratchets count only executed queries and cloud proofs cover every backend
 * rust-cache inputs resolve to keys accepted by GitHub's cache service
+* every ci.yml rust-cache step shares a shape key, and only a develop push saves it
 * every Dockerfile a workflow `file:`-builds is visible to the `docker` path filter
 * `serde_json` is declared with `preserve_order` where the OpenAPI doc is serialised
 * conflict markers are not staged into source/docs
@@ -59,9 +60,6 @@ CACHE_INPUT_RE = re.compile(
     r"^\s+(?P<name>prefix-key|shared-key):\s*(?P<value>.*?)\s*$"
 )
 MATRIX_REF_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*}}")
-RUST_TOOLCHAIN_RE = re.compile(
-    r"^(?P<indent>\s*)uses:\s*actions-rust-lang/setup-rust-toolchain@v2\s*$"
-)
 
 
 @dataclass(frozen=True)
@@ -501,40 +499,192 @@ def check_rust_cache_keys(findings: list[Finding]) -> None:
                             )
 
 
-def check_tdd_rust_warning_contract(findings: list[Finding]) -> None:
-    """Keep the TDD workflow's intentional warning policy across action upgrades."""
+# CI redesign PR1: the cache policy every rust-cache step in ci.yml follows.
+# Only a push to develop may save -- develop is the default branch, the one
+# cache scope every PR and promotion run can read. A cache a PR saves is
+# readable only by that PR, so per-PR saves filled the 10 GB quota with keys no
+# other run could use (0 of 15 heavy jobs hit cache on the v0.4.1 release).
+RUST_CACHE_POLICY_WORKFLOW = ".github/workflows/ci.yml"
+DEVELOP_PUSH_SAVE = "github.event_name == 'push' && github.ref == 'refs/heads/develop'"
+CACHE_POLICY_INPUT_RE = re.compile(
+    r"^\s+(?P<name>[A-Za-z0-9_-]+):\s*(?P<value>.*?)\s*(?:#.*)?$"
+)
 
-    path = ROOT / ".github/workflows/tdd.yml"
-    lines = path.read_text(encoding="utf-8").splitlines()
+
+def _rust_cache_steps(lines: list[str]):
+    """Yield (line_no, job_lines, inputs) for every rust-cache step."""
     for index, line in enumerate(lines):
-        action = RUST_TOOLCHAIN_RE.match(line)
+        action = RUST_CACHE_RE.match(line)
         if action is None:
-            continue
-
-        action_indent = len(action.group("indent"))
+            # `- if: ...` then `uses:` on the next line is the same step.
+            bare = re.match(r"^(?P<indent>\s*)uses:\s*Swatinem/rust-cache@", line)
+            if bare is None or line.lstrip().startswith("#"):
+                continue
+            step_indent = len(bare.group("indent")) - 2
+        else:
+            step_indent = len(action.group("indent"))
+        job_start = index
+        while job_start >= 0 and not re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[job_start]):
+            job_start -= 1
+        job_end = index + 1
+        while job_end < len(lines) and not re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines[job_end]):
+            job_end += 1
+        inputs: dict[str, str] = {}
         cursor = index + 1
-        step: list[str] = []
         while cursor < len(lines):
-            stripped = lines[cursor].lstrip()
-            indent = len(lines[cursor]) - len(stripped)
-            if indent < action_indent or (
-                indent == action_indent - 2 and stripped.startswith("- ")
-            ):
+            text = lines[cursor]
+            stripped = text.lstrip()
+            indent = len(text) - len(stripped)
+            if stripped and indent <= step_indent:
                 break
-            step.append(lines[cursor])
+            if stripped and not stripped.startswith("#") and stripped != "with:":
+                found = CACHE_POLICY_INPUT_RE.match(text)
+                if found:
+                    inputs[found.group("name")] = found.group("value").strip("\"'")
             cursor += 1
+        yield index + 1, lines[max(job_start, 0) : job_end], inputs
 
-        if not any(
-            re.match(r'^\s+build-warnings:\s*["\']{2}\s*(?:#.*)?$', item)
-            for item in step
-        ):
+
+RUST_CACHE_ENV_PREFIXES = ("CARGO", "CC", "CFLAGS", "CXX", "CMAKE", "RUST")
+
+
+def _job_env_names(job: list[str]) -> list[str]:
+    """Variable names of a job's own `env:` block (4-space key, 6-space items)."""
+    names: list[str] = []
+    inside = False
+    for line in job:
+        if re.match(r"^    env:\s*(?:#.*)?$", line):
+            inside = True
+            continue
+        if inside:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            item = re.match(r"^      (?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:", line)
+            if item:
+                names.append(item.group("name"))
+                continue
+            inside = False
+    return names
+
+
+def _save_if_is_develop_only(value: str | None) -> bool:
+    if value is None:
+        return False
+    if value.strip().lower() == "false":
+        return True
+    expr = re.fullmatch(r"\$\{\{\s*(?P<body>.*?)\s*}}", value.strip())
+    if expr is None:
+        return False
+    body = re.sub(r"\s+", " ", expr.group("body"))
+    # The develop-push conjunction must lead, and nothing may widen it: an
+    # `||` (or a `!` that could negate it) would let another ref save.
+    if not body.startswith(DEVELOP_PUSH_SAVE):
+        return False
+    rest = body[len(DEVELOP_PUSH_SAVE) :]
+    return "||" not in rest and "!" not in rest and (rest == "" or rest.startswith(" && "))
+
+
+def check_rust_cache_policy(findings: list[Finding]) -> None:
+    """Every rust-cache step in ci.yml restores a shared shape key and only a
+    develop push ever writes it -- and each key has exactly one writer."""
+
+    path = ROOT / RUST_CACHE_POLICY_WORKFLOW
+    if not path.exists():
+        findings.append(Finding("rust-cache-policy", f"{RUST_CACHE_POLICY_WORKFLOW} is missing"))
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    writers: dict[str, list[int]] = {}
+    users: dict[str, list[tuple[int, list[str]]]] = {}
+    seen = 0
+    for line_no, job, inputs in _rust_cache_steps(lines):
+        seen += 1
+        if inputs.get("shared-key"):
+            users.setdefault(inputs["shared-key"], []).append((line_no, job))
+        where = f"{RUST_CACHE_POLICY_WORKFLOW}:{line_no}"
+        if inputs.get("add-job-id-key", "").lower() != "false":
             findings.append(
                 Finding(
-                    "tdd-rust-warning-policy",
-                    f"{rel(path)}:{index + 1} setup-rust-toolchain@v2 must set "
-                    'build-warnings: "" to preserve the workflow warning policy',
+                    "rust-cache-policy",
+                    f"{where} must set `add-job-id-key: false` -- a job-id key "
+                    f"makes one cache per job instead of one per build shape",
                 )
             )
+        shared = inputs.get("shared-key")
+        if not shared:
+            findings.append(
+                Finding(
+                    "rust-cache-policy",
+                    f"{where} must set a `shared-key` naming its build shape -- "
+                    f"without one rust-cache keys the cache on the job id",
+                )
+            )
+        save_if = inputs.get("save-if")
+        if not _save_if_is_develop_only(save_if):
+            findings.append(
+                Finding(
+                    "rust-cache-policy",
+                    f"{where} `save-if` must be `false` or "
+                    f"`${{{{ {DEVELOP_PUSH_SAVE} [&& <narrowing>] }}}}` (got "
+                    f"{save_if!r}) -- only a develop push writes caches every "
+                    f"run can read",
+                )
+            )
+            continue
+        if save_if is None or save_if.strip().lower() == "false" or not shared:
+            continue
+        # Resolve a matrix-valued key so two legs writing different shapes
+        # are not mistaken for one key with two writers.
+        keys = [shared]
+        for field in MATRIX_REF_RE.findall(shared):
+            values = [
+                m.group(1).strip("\"'")
+                for job_line in job
+                for m in re.finditer(
+                    rf"(?:^|[{{,\s-])\s*{re.escape(field)}\s*:\s*([^,}}\s#]+)",
+                    job_line.strip(),
+                )
+            ]
+            keys = [MATRIX_REF_RE.sub(v, shared) for v in values] or keys
+        for key in keys:
+            writers.setdefault(key, []).append(line_no)
+    # rust-cache hashes every CARGO*/CC*/CFLAGS*/CXX*/CMAKE*/RUST* variable in
+    # the step's environment into the key. A job-level one (e.g. RUST_MIN_STACK)
+    # silently gives that job a different key from the shape's writer, so it
+    # never restores. Step-level env on the build step is invisible to the key.
+    for key, uses in sorted(users.items()):
+        if len(uses) < 2:
+            continue
+        for line_no, job in uses:
+            for name in _job_env_names(job):
+                if name.startswith(RUST_CACHE_ENV_PREFIXES):
+                    findings.append(
+                        Finding(
+                            "rust-cache-policy",
+                            f"{RUST_CACHE_POLICY_WORKFLOW}:{line_no} job-level env "
+                            f"`{name}` is hashed into the rust-cache key, so this "
+                            f"job can never restore shared-key {key!r}; move it "
+                            f"to the step that runs cargo",
+                        )
+                    )
+    for key, at in sorted(writers.items()):
+        if len(at) > 1:
+            findings.append(
+                Finding(
+                    "rust-cache-policy",
+                    f"{RUST_CACHE_POLICY_WORKFLOW}: shared-key {key!r} has "
+                    f"{len(at)} writers (lines {', '.join(map(str, at))}) -- "
+                    f"racing writers leave whichever cache reserved the key "
+                    f"first; give every other step `save-if: false`",
+                )
+            )
+    if seen == 0:
+        findings.append(
+            Finding(
+                "rust-cache-policy",
+                f"{RUST_CACHE_POLICY_WORKFLOW}: no rust-cache step found -- this "
+                f"check would pass vacuously",
+            )
+        )
 
 
 def tracked_files() -> list[Path]:
@@ -868,6 +1018,31 @@ def check_promotion_concurrency(findings: list[Finding]) -> None:
             )
 
 
+def check_ci_concurrency_per_event(findings: list[Finding]) -> None:
+    """ci.yml's concurrency group must separate events (CI redesign PR1).
+
+    Keyed on `head_ref || ref_name` alone, a PR and a push of its head branch
+    share one group, so the qa->main PR (head_ref `qa`) queued ~70 min behind
+    the push-to-qa run of the very same SHA on the v0.4.1 release.
+    """
+    path = ROOT / CI_WORKFLOW
+    if not path.exists():
+        return
+    block = _top_level_block(path.read_text(encoding="utf-8"), "concurrency")
+    group = _scalar_after(block, "group", indent=2) if block else None
+    if group is None:
+        findings.append(Finding("ci-concurrency", f"{CI_WORKFLOW}: no top-level concurrency group"))
+    elif "github.event_name" not in group:
+        findings.append(
+            Finding(
+                "ci-concurrency",
+                f"{CI_WORKFLOW}: concurrency group {group!r} must include "
+                f"`github.event_name` -- otherwise a PR queues behind the push "
+                f"of its own head branch",
+            )
+        )
+
+
 # A `#` starts a YAML comment only after whitespace (or at line start); a
 # mid-scalar `#` (`file: deploy/Dockerfile#x`) is literal and must stay in the
 # value, so the comment tail requires at least one space. Trailing whitespace
@@ -1105,9 +1280,10 @@ def main() -> int:
     check_query_conformance_authority(findings)
     check_object_store_proof_authority(findings)
     check_rust_cache_keys(findings)
-    check_tdd_rust_warning_contract(findings)
+    check_rust_cache_policy(findings)
     check_conflict_markers(findings)
     check_promotion_concurrency(findings)
+    check_ci_concurrency_per_event(findings)
     check_node_version_pins(findings)
     check_docker_filter_covers_build_targets(findings)
     check_serde_json_preserve_order(findings)
@@ -1116,7 +1292,7 @@ def main() -> int:
     if not findings:
         print(
             "OK: nextest, CI runner/Makefile wiring, architecture guards, Flight/query/object-store "
-            "authorities, rust-cache keys, TDD Rust warning policy, promotion concurrency, "
+            "authorities, rust-cache keys and develop-only cache policy, promotion and per-event concurrency, "
             "Node version pins, docker-filter build targets, serde_json preserve_order, and "
             "conflict-marker checks pass."
         )

@@ -157,6 +157,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
       dry_run: ${{ steps.version.outputs.dry_run }}
+      # The Pre-Release CI run that passed on this commit; build-binaries
+      # downloads its binaries instead of rebuilding them. Empty on a dry run.
+      prerelease_run_id: ${{ steps.prerelease.outputs.run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -201,6 +204,7 @@ jobs:
       # for that commit was still running, and the old single query failed the
       # release with nothing built. A red Pre-Release CI still fails fast.
       - name: Await Pre-Release CI
+        id: prerelease
         if: github.event_name != 'workflow_dispatch' || inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -209,11 +213,24 @@ jobs:
   # ============================================================================
   # BUILD RUST BINARIES - Cross-platform binary builds
   # ============================================================================
+  # CI redesign PR1: Pre-Release CI (prerelease-ci.yml) already built these
+  # exact archives -- same commit (await_prerelease_ci.sh matches head_sha),
+  # same matrix, same `cloud-full` features -- so this job first DOWNLOADS them
+  # from the run `prepare` waited on and checks their SHA-256. It rebuilds only
+  # when there is nothing to download: a dry run (no Pre-Release wait), or the
+  # artifact expired (prerelease-ci.yml keeps it 14 days) or is missing. A
+  # checksum or name MISMATCH fails the job rather than rebuilding: that is a
+  # corrupt or unexpected artifact, not an absent one.
   build-binaries:
     timeout-minutes: 150
-    name: Build ${{ matrix.target }}
+    name: Fetch or build ${{ matrix.target }}
     needs: prepare
     runs-on: ${{ matrix.os }}
+    # Job-level permissions replace the workflow default: `actions: read` lets
+    # download-artifact read another run's artifacts.
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -258,14 +275,54 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Fetch Pre-Release CI binaries
+        id: fetch
+        if: needs.prepare.outputs.prerelease_run_id != '' && needs.prepare.outputs.dry_run != 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-${{ matrix.target }}
+          run-id: ${{ needs.prepare.outputs.prerelease_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: prerelease-binaries
+
+      - name: Verify fetched binaries (name + SHA-256)
+        if: steps.fetch.outcome == 'success'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          cd prerelease-binaries
+          expected="proximadb-${VERSION}-${TARGET}.${ARCHIVE}"
+          ls -la
+          if [ ! -f "$expected" ] || [ ! -f "$expected.sha256" ]; then
+            echo "::error::Pre-Release run ${{ needs.prepare.outputs.prerelease_run_id }} has no ${expected} (+ .sha256) -- its version differs from this release's."
+            exit 1
+          fi
+          # Compare hashes directly: the Windows .sha256 is written by
+          # PowerShell (CRLF), which `sha256sum -c` does not parse portably.
+          want="$(tr -d '\r' < "$expected.sha256" | awk '{print tolower($1)}')"
+          have="$(sha256sum "$expected" | awk '{print $1}')"
+          if [ -z "$want" ] || [ "$want" != "$have" ]; then
+            echo "::error::SHA-256 mismatch for ${expected}: recorded '${want}', downloaded '${have}'."
+            exit 1
+          fi
+          echo "sha256 OK: ${expected} ${have}"
+          mv "$expected" "$expected.sha256" ..
+          echo "ARCHIVE_NAME=${expected}" >> "$GITHUB_ENV"
+
       - name: Install Rust Toolchain
+        if: steps.fetch.outcome != 'success'
         uses: dtolnay/rust-toolchain@1.99.0
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install Cross (for cross-compilation)
-        if: matrix.cross
+        if: steps.fetch.outcome != 'success' && matrix.cross
         run: |
           # Install cross from a temp directory to avoid rust-version downgrade
           # The project's Cargo.toml specifies rust-version = "1.88" which causes
@@ -274,7 +331,7 @@ jobs:
           cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Install Linux Dependencies
-        if: runner.os == 'Linux'
+        if: steps.fetch.outcome != 'success' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
@@ -283,12 +340,14 @@ jobs:
           fi
 
       - name: Setup Rust Cache
+        if: steps.fetch.outcome != 'success'
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-${{ matrix.target }}"
           shared-key: "release"
 
       - name: Build Binaries
+        if: steps.fetch.outcome != 'success'
         run: |
           FEATURES="${{ matrix.features }}"
           if [ -n "$FEATURES" ]; then
@@ -311,7 +370,7 @@ jobs:
         shell: bash
 
       - name: Create Archive (Unix)
-        if: runner.os != 'Windows'
+        if: steps.fetch.outcome != 'success' && runner.os != 'Windows'
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
           TARGET="${{ matrix.target }}"
@@ -332,7 +391,7 @@ jobs:
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
 
       - name: Create Archive (Windows)
-        if: runner.os == 'Windows'
+        if: steps.fetch.outcome != 'success' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $VERSION = "${{ needs.prepare.outputs.version }}"
@@ -1040,11 +1099,17 @@ jobs:
       # Node 24, not 22: OIDC trusted publishing needs npm >= 11.5.1 and node 22
       # ships npm 10.x. The guard below fails loudly rather than letting npm
       # fall back to a credential it does not have.
+      #
+      # NO `registry-url:` (v0.4.1 follow-up). With it, setup-node writes an
+      # .npmrc holding `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` and
+      # points NPM_CONFIG_USERCONFIG at it -- the stale-token line #1990 had to
+      # neutralise. Without it there is no token line anywhere for npm to
+      # prefer over the OIDC exchange; the registry is the npm default, and the
+      # publish step pins it explicitly.
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Require an npm new enough for OIDC trusted publishing
         run: |
@@ -1080,16 +1145,9 @@ jobs:
 
       # Idempotent: the tag's version may already be on npm (manual bootstrap
       # publish, or a re-run after a partial failure) — skip, don't fail.
-      - name: Publish to npm via OIDC (skip if already published)
+      - name: Check version and whether it is already on npm
+        id: npmver
         working-directory: clients/nodejs-embedded
-        env:
-          # Deliberately EMPTY, and the user config is sent to /dev/null:
-          # actions/setup-node writes an .npmrc wired to NODE_AUTH_TOKEN, and a
-          # present-but-invalid token makes npm authenticate with it instead of
-          # exchanging the OIDC token -- which is how this job 404'd. Both lines
-          # are load-bearing; neither is tidiness.
-          NODE_AUTH_TOKEN: ''
-          NPM_CONFIG_USERCONFIG: /dev/null
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           if [ "$VERSION" != "${{ needs.prepare.outputs.version }}" ]; then
@@ -1100,9 +1158,94 @@ jobs:
             "https://registry.npmjs.org/@anvailabs%2fproximadb-client" \
             | grep -q "\"${VERSION}\""; then
             echo "::notice::${VERSION} already on npm — skipping"
+            echo "published=true" >> "$GITHUB_OUTPUT"
           else
-            npm publish --access public --provenance
+            echo "published=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # v0.4.1 failed twice here with ENEEDAUTH and nothing else: npm runs the
+      # OIDC exchange itself (npm/cli v11 lib/utils/oidc.js) but swallows every
+      # failure at `verbose` log level and falls through to "not logged in".
+      # This step performs the SAME two requests npm does, so a refusal fails
+      # HERE with its HTTP status and the registry's message:
+      #   1. GET $ACTIONS_ID_TOKEN_REQUEST_URL&audience=npm:registry.npmjs.org
+      #      (Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN)
+      #   2. POST https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/<escaped name>
+      #      (Authorization: Bearer <GitHub id token>, no body)
+      # It prints the id token's identity claims (repository, workflow ref,
+      # environment) -- the fields npm's trusted-publisher match compares --
+      # but never either token: both are masked the moment they exist, and a
+      # success body (which carries the npm token) is never echoed.
+      - name: Preflight the npm OIDC token exchange
+        if: steps.npmver.outputs.published != 'true'
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::No GitHub OIDC request variables -- the job lacks 'permissions: id-token: write'."
+            exit 1
+          fi
+          resp="$(curl -sS -w '\n%{http_code}' \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            -H "Accept: application/json" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org")"
+          code="${resp##*$'\n'}"
+          body="${resp%$'\n'*}"
+          if [ "$code" != "200" ]; then
+            echo "::error::GitHub OIDC id-token request failed: HTTP ${code}"
+            jq -c 'del(.value)' <<<"$body" 2>/dev/null || echo "(non-JSON body withheld)"
+            exit 1
+          fi
+          id_token="$(jq -r '.value // empty' <<<"$body")"
+          if [ -z "$id_token" ]; then
+            echo "::error::GitHub OIDC response had no id token"
+            exit 1
+          fi
+          echo "::add-mask::${id_token}"
+          claims="$(cut -d. -f2 <<<"$id_token" | tr '_-' '/+')"
+          while [ $(( ${#claims} % 4 )) -ne 0 ]; do claims="${claims}="; done
+          echo "id-token claims npm matches against the trusted publisher:"
+          base64 -d <<<"$claims" 2>/dev/null \
+            | jq '{aud, repository, repository_owner, workflow_ref, job_workflow_ref, environment, ref, event_name, repository_visibility}' \
+            || echo "(claims not decodable)"
+
+          url="https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/@anvailabs%2fproximadb-client"
+          resp="$(curl -sS -w '\n%{http_code}' -X POST \
+            -H "Authorization: Bearer ${id_token}" \
+            -H "Accept: application/json" \
+            "$url")"
+          code="${resp##*$'\n'}"
+          body="${resp%$'\n'*}"
+          npm_token="$(jq -r '.token // empty' <<<"$body" 2>/dev/null || true)"
+          if [ -n "$npm_token" ]; then
+            echo "::add-mask::${npm_token}"
+          fi
+          if [ "${code:0:1}" != "2" ] || [ -z "$npm_token" ]; then
+            echo "::error::npm OIDC token exchange refused: HTTP ${code} from POST ${url}"
+            jq -c 'del(.token)' <<<"$body" 2>/dev/null || head -c 2000 <<<"$body"
+            echo "::error::Compare the claims above with 'npm trust list @anvailabs/proximadb-client' (repository, workflow file release.yml, environment npm)."
+            exit 1
+          fi
+          echo "npm OIDC exchange OK (HTTP ${code}); npm will repeat it inside 'npm publish'."
+
+      - name: Publish to npm via OIDC
+        if: steps.npmver.outputs.published != 'true'
+        working-directory: clients/nodejs-embedded
+        env:
+          # A fresh, EMPTY user config (created below) instead of /dev/null.
+          # npm keeps the exchanged token in memory -- oidc.js sets
+          # `opts["//registry.npmjs.org/:_authToken"]` and
+          # `config.set(..., 'user')`, and config.set() only mutates the
+          # in-memory layer -- so neither choice blocks it; but a real empty
+          # file guarantees no `_authToken` line from anywhere (setup-node no
+          # longer writes one: see "Setup Node") and stays writable if npm
+          # ever persists to the user layer.
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npmrc-oidc
+          npm_config_registry: https://registry.npmjs.org/
+        run: |
+          : > "$NPM_CONFIG_USERCONFIG"
+          # --loglevel verbose prints oidc.js's own messages (the exchange's
+          # failure reason is logged ONLY at verbose).
+          npm publish --access public --provenance --loglevel verbose
 
       - name: Verify the registry actually has this version
         run: |
