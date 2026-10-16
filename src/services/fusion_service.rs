@@ -1286,7 +1286,7 @@ mod tests {
             || {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async {
-                    Err(InvalidQueryVector(
+                    Err(InvalidQueryVector::other(
                         "Query vector has dimension 3 but collection 'orders' expects dimension 4"
                             .to_string(),
                     )

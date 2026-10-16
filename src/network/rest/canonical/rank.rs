@@ -824,15 +824,26 @@ impl CandidateProvider for HybridCoordinatorAdapter {
                     backend_vec
                         .vector_search(&collection_for_vec, &v)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        // Keep the typed `RankError` in the chain so a
+                        // client-argument error survives the coordinator.
+                        .map_err(anyhow::Error::new)
                 },
                 &query_text,
                 &request.query_vector,
             )
             .await
-            .map_err(|e| RankError::ModelInference {
-                model_id: "hybrid_coordinator".into(),
-                reason: format!("hybrid search failed: {e}"),
+            .map_err(|e| {
+                let client_argument = e.chain().find_map(|cause| match cause.downcast_ref() {
+                    Some(RankError::InvalidArgument(message)) => Some(message.clone()),
+                    _ => None,
+                });
+                match client_argument {
+                    Some(message) => RankError::InvalidArgument(message),
+                    None => RankError::ModelInference {
+                        model_id: "hybrid_coordinator".into(),
+                        reason: format!("hybrid search failed: {e}"),
+                    },
+                }
             })?;
 
         // R-7c.3.2: build CandidateBatch with sequential synthetic
@@ -895,6 +906,8 @@ pub async fn rank_search_dispatch(
             ApiError::NotFound(format!("rank profile not found: {name}"))
         }
         RankError::InvalidProfile(msg) => ApiError::InvalidArgument(msg),
+        // TD-SECSCAN-1 §5: e.g. a wrong-dimension query vector.
+        RankError::InvalidArgument(msg) => ApiError::InvalidArgument(msg),
         other => ApiError::Internal(format!("rank pipeline failed: {other}")),
     })
 }

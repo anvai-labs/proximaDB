@@ -540,11 +540,13 @@ mod tests {
         ) -> Result<proximadb_v1::VectorOperationResponse> {
             *self.last_request.lock().unwrap() = Some(request);
             if self.reject_dimension {
-                return Err(crate::services::operations::vectors::InvalidQueryVector(
-                    "Query vector has dimension 2 but collection 'test' expects dimension 4"
-                        .to_string(),
-                )
-                .into());
+                return Err(
+                    crate::services::operations::vectors::InvalidQueryVector::other(
+                        "Query vector has dimension 2 but collection 'test' expects dimension 4"
+                            .to_string(),
+                    )
+                    .into(),
+                );
             }
             Ok(proximadb_v1::VectorOperationResponse {
                 success: true,

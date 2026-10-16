@@ -18,18 +18,93 @@
 use crate::top_k_limit::TopKLimitExceeded;
 
 /// A query vector the client must fix: empty, non-finite, or of the wrong
-/// dimension for the collection. The message names the collection the way the
-/// client knows it, never by its internal object id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidQueryVector(pub String);
+/// dimension for the collection.
+///
+/// The message names the collection ONLY by an identifier the caller supplied
+/// ([`Self::collection`]); when none is known it says "the collection". It is
+/// never filled from the catalog: an error message echoes only what the
+/// request contained. Authorities that rewrite the caller's identifier to the
+/// internal object id attach the caller's identifier on the way out with
+/// [`label_client_collection`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvalidQueryVector {
+    /// The collection as the caller named it, if known.
+    pub collection: Option<String>,
+    /// What is wrong with the vector.
+    pub problem: QueryVectorProblem,
+}
+
+/// What is wrong with a query vector.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryVectorProblem {
+    /// No values.
+    Empty,
+    /// A NaN or infinite value.
+    NonFinite { index: usize, value: f32 },
+    /// The vector's dimension differs from the collection's.
+    Dimension { actual: usize, expected: usize },
+    /// Any other client-side defect, described verbatim.
+    Other(String),
+}
+
+impl InvalidQueryVector {
+    /// An invalid query vector for `collection` (as the caller named it).
+    pub fn new(collection: Option<String>, problem: QueryVectorProblem) -> Self {
+        Self {
+            collection,
+            problem,
+        }
+    }
+
+    /// An opaque client-argument message (no collection label).
+    pub fn other(message: impl Into<String>) -> Self {
+        Self::new(None, QueryVectorProblem::Other(message.into()))
+    }
+
+    fn label(&self) -> String {
+        match &self.collection {
+            Some(name) => format!("collection '{name}'"),
+            None => "the collection".to_string(),
+        }
+    }
+}
 
 impl std::fmt::Display for InvalidQueryVector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match &self.problem {
+            QueryVectorProblem::Empty => write!(f, "Query vector for {} is empty", self.label()),
+            QueryVectorProblem::NonFinite { index, value } => write!(
+                f,
+                "Query vector for {} contains non-finite value at dimension {index}: {value}",
+                self.label()
+            ),
+            QueryVectorProblem::Dimension { actual, expected } => write!(
+                f,
+                "Query vector has dimension {actual} but {} expects dimension {expected}",
+                self.label()
+            ),
+            QueryVectorProblem::Other(message) => f.write_str(message),
+        }
     }
 }
 
 impl std::error::Error for InvalidQueryVector {}
+
+/// Attach the identifier the CALLER supplied to an unlabelled
+/// [`InvalidQueryVector`] anywhere in `err`'s chain. Used by search
+/// authorities that rewrite the caller's collection name to the internal
+/// object id before validating: the validator then (correctly) declines to
+/// echo the id, and this restores the caller's own name. A label that is
+/// already present is never overwritten, and nothing is read from the catalog.
+pub fn label_client_collection(mut err: anyhow::Error, requested: &str) -> anyhow::Error {
+    if !requested.is_empty()
+        && let Some(invalid) = err.downcast_mut::<InvalidQueryVector>()
+        && invalid.collection.is_none()
+    {
+        invalid.collection = Some(requested.to_string());
+    }
+    err
+}
 
 /// True when a search failure is the client's argument: an invalid query
 /// vector or a `top_k` above the server cap. Walks the whole `anyhow` chain so
@@ -60,8 +135,12 @@ mod tests {
 
     #[test]
     fn typed_cause_survives_context_wrappers() {
-        let err = Err::<(), _>(InvalidQueryVector(
-            "Query vector has dimension 3 but collection 'orders' expects dimension 4".into(),
+        let err = Err::<(), _>(InvalidQueryVector::new(
+            Some("orders".into()),
+            QueryVectorProblem::Dimension {
+                actual: 3,
+                expected: 4,
+            },
         ))
         .context("vector search failed for fusion")
         .context("entity fusion search")
@@ -97,5 +176,34 @@ mod tests {
             .context("vector search failed");
         assert!(!is_client_argument_error(&err));
         assert_eq!(client_argument_message(&err), None);
+    }
+
+    /// The caller's identifier is attached through context wrappers, only to
+    /// an UNLABELLED error, and never replaces an existing label.
+    #[test]
+    fn label_client_collection_fills_only_a_missing_label() {
+        let dimension = QueryVectorProblem::Dimension {
+            actual: 3,
+            expected: 4,
+        };
+        let unlabelled = anyhow::Error::new(InvalidQueryVector::new(None, dimension.clone()))
+            .context("search failed");
+        assert_eq!(
+            client_argument_message(&unlabelled).as_deref(),
+            Some("Query vector has dimension 3 but the collection expects dimension 4")
+        );
+        let labelled = label_client_collection(unlabelled, "orders");
+        assert_eq!(
+            client_argument_message(&labelled).as_deref(),
+            Some("Query vector has dimension 3 but collection 'orders' expects dimension 4")
+        );
+        let relabelled = label_client_collection(labelled, "someone_else");
+        assert!(
+            client_argument_message(&relabelled).is_some_and(|m| m.contains("'orders'")),
+            "an existing label must not be overwritten"
+        );
+        // Non-client errors pass through untouched.
+        let server = label_client_collection(anyhow::anyhow!("disk full"), "orders");
+        assert_eq!(server.to_string(), "disk full");
     }
 }

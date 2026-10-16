@@ -133,27 +133,39 @@ pub(crate) fn validate_records_for_insert(
 // so the API crate's handlers (which cannot see this crate) classify them the
 // same way (TD-SECSCAN-1 §5).
 pub use proximadb_search_types::client_argument::{
-    InvalidQueryVector, client_argument_message, is_client_argument_error,
+    InvalidQueryVector, QueryVectorProblem, client_argument_message, is_client_argument_error,
+    label_client_collection,
 };
 
-/// How a client-facing message names a catalog-resolved collection. The
-/// search authorities validate AFTER resolving the client's name to the
-/// internal numeric object id, so `requested` is usually that id — the
-/// catalog name is used instead. A nameless collection falls back to
-/// `requested` only when it is not the object id (TD-SECSCAN-1 §5).
-pub(crate) fn client_collection_label(requested: &str, collection: &Collection) -> String {
-    let name = collection
-        .config
-        .as_ref()
-        .map(|config| config.name.as_str())
-        .filter(|name| !name.is_empty());
-    match name {
-        Some(name) => format!("collection '{name}'"),
-        None if !requested.is_empty() && requested != collection.id => {
-            format!("collection '{requested}'")
-        }
-        None => "the collection".to_string(),
+/// The collection label a client-facing message may carry: ONLY the
+/// identifier the caller supplied (`requested`), never anything resolved from
+/// the catalog (TD-SECSCAN-1 §5).
+///
+/// The search authorities validate after the caller's identifier may have
+/// been rewritten to the internal numeric object id; when `requested` is that
+/// id the label is `None` ("the collection"), and the rewriting call site
+/// attaches the caller's own identifier with [`label_client_collection`].
+/// The catalog name is deliberately not used: an error message echoes only
+/// what the request contained.
+pub(crate) fn client_collection_label(requested: &str, collection: &Collection) -> Option<String> {
+    (!requested.is_empty() && requested != collection.id).then(|| requested.to_string())
+}
+
+/// [`validate_query_vector_for_search`] plus the non-empty requirement of the
+/// v1 search authority (`unified_search_v1_inner`).
+pub(crate) fn validate_query_vector_presence_and_shape(
+    collection_id: &str,
+    collection: &Collection,
+    query_vector: &[f32],
+) -> Result<()> {
+    if query_vector.is_empty() {
+        return Err(InvalidQueryVector::new(
+            client_collection_label(collection_id, collection),
+            QueryVectorProblem::Empty,
+        )
+        .into());
     }
+    validate_query_vector_for_search(collection_id, collection, query_vector)
 }
 
 /// Validate a query vector against the collection: finite values and a
@@ -163,17 +175,16 @@ pub(crate) fn validate_query_vector_for_search(
     collection: &Collection,
     query_vector: &[f32],
 ) -> Result<()> {
-    if let Some((i, value)) = query_vector
+    if let Some((index, value)) = query_vector
         .iter()
+        .copied()
         .enumerate()
         .find(|(_, value)| !value.is_finite())
     {
-        return Err(InvalidQueryVector(format!(
-            "Query vector for {} contains non-finite value at dimension {}: {}",
+        return Err(InvalidQueryVector::new(
             client_collection_label(collection_id, collection),
-            i,
-            value
-        ))
+            QueryVectorProblem::NonFinite { index, value },
+        )
         .into());
     }
 
@@ -183,12 +194,13 @@ pub(crate) fn validate_query_vector_for_search(
         .map(|config| config.dimension)
         .unwrap_or_default();
     if expected_dimension > 0 && query_vector.len() != expected_dimension as usize {
-        return Err(InvalidQueryVector(format!(
-            "Query vector has dimension {} but {} expects dimension {}",
-            query_vector.len(),
+        return Err(InvalidQueryVector::new(
             client_collection_label(collection_id, collection),
-            expected_dimension
-        ))
+            QueryVectorProblem::Dimension {
+                actual: query_vector.len(),
+                expected: expected_dimension as usize,
+            },
+        )
         .into());
     }
 
@@ -265,40 +277,50 @@ mod tests {
         }
     }
 
-    /// TD-SECSCAN-1 §5 residual: the validator runs after catalog resolution,
-    /// so the id it is handed is the internal object id (`'16'`). The client
-    /// message must name the collection the client used, not that id.
+    /// TD-SECSCAN-1 §5 residual: a client-facing message echoes the
+    /// identifier the caller supplied — here its own collection name, which an
+    /// authority validating BEFORE the name→id rewrite still holds.
     #[test]
-    fn dimension_error_names_the_collection_not_its_internal_id() {
+    fn dimension_error_echoes_the_callers_own_identifier() {
         let collection = resolved_collection("16", "orders");
         for vector in [vec![1.0f32; 3], vec![f32::NAN; 4]] {
-            let err = validate_query_vector_for_search("16", &collection, &vector)
+            let err = validate_query_vector_for_search("orders", &collection, &vector)
                 .err()
                 .map(|e| e.to_string())
                 .unwrap_or_default();
             assert!(err.contains("'orders'"), "must name 'orders': {err}");
-            assert!(!err.contains("'16'"), "must not leak the object id: {err}");
+            assert!(!err.contains("'16'"), "must not echo the object id: {err}");
         }
     }
 
-    /// A nameless collection falls back to the requested identifier only when
-    /// it is not the internal object id.
+    /// A request that addressed the collection by object id gets a message
+    /// built only from what it sent: never the catalog name (which the request
+    /// did not contain), and not the object id either.
     #[test]
-    fn nameless_collection_never_echoes_its_object_id() {
-        let nameless = resolved_collection("16", "");
-        let err = validate_query_vector_for_search("16", &nameless, &[1.0; 3])
+    fn object_id_reference_never_echoes_the_catalog_name() {
+        let collection = resolved_collection("17", "catalog_only_name");
+        for vector in [vec![1.0f32; 3], vec![f32::INFINITY; 4], Vec::new()] {
+            let err = validate_query_vector_presence_and_shape("17", &collection, &vector)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(!err.is_empty(), "{vector:?} must be rejected");
+            assert!(
+                !err.contains("catalog_only_name"),
+                "echoed a name the request did not contain: {err}"
+            );
+            assert!(!err.contains("'17'"), "must not echo the object id: {err}");
+            assert!(err.contains("the collection"), "{err}");
+        }
+    }
+
+    #[test]
+    fn empty_vector_is_rejected_by_the_presence_check_only() {
+        let collection = resolved_collection("16", "orders");
+        let err = validate_query_vector_presence_and_shape("orders", &collection, &[])
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        assert!(!err.contains("'16'"), "must not leak the object id: {err}");
-        assert!(err.contains("dimension 3"), "keeps the cause: {err}");
-        let err = validate_query_vector_for_search("by_alias", &nameless, &[1.0; 3])
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            err.contains("'by_alias'"),
-            "falls back to the request name: {err}"
-        );
+        assert_eq!(err, "Query vector for collection 'orders' is empty");
     }
 }

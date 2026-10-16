@@ -303,7 +303,7 @@ The other was the non-blocking review findings on the query-vector fix.
 Neither could abort the process: one was a result-correctness wart, the other
 error quality. All are now closed.
 
-1. **Invalid query vector → 400, not 500, on every route.** The typed errors
+1. **Invalid query vector → 400, not 500.** The typed errors
    (`InvalidQueryVector`, `TopKLimitExceeded`) and the classifier moved down
    to `proximadb_search_types::client_argument`. The root crate re-exports
    them, so the API crate's handlers (which cannot see the root crate) apply
@@ -317,15 +317,58 @@ error quality. All are now closed.
    * the legacy v1 entity search (`canonical/entities.rs`) and v2 entity
      search (`rest/v2/entities.rs`);
    * REST graph fusion-search (`rest/v2/graphs.rs`);
-   * gRPC `FusionSearch` and gRPC `SearchEntities`.
+   * gRPC `FusionSearch` and gRPC `SearchEntities`;
+   * Arrow Flight `DoGet` `vector_search` tickets (`arrow_ipc/service.rs`);
+   * REST rank search (`POST /api/v2/rank/search`). `ProductionHybridBackend`
+     maps the vector leg's typed error to a new `RankError::InvalidArgument`,
+     the rank route answers it as 400, and the coordinator closure keeps the
+     typed `RankError` in the chain (`anyhow::Error::new`, not
+     `anyhow!("{e}")`). This is unit-tested at the backend; the e2e skips it
+     because `RankServices` is not injected in the test server (501).
 
-   Every other failure stays 500 / `Internal`.
-2. **User-facing collection name.** `validate_query_vector_for_search` and the
-   empty-vector check run after catalog resolution, so the id they receive is
-   the internal object id. They now name the collection through
-   `client_collection_label`: the catalog name, then the requested identifier
-   only if it is not the object id, and otherwise "the collection". The
-   internal id never reaches a client message.
+   Every other failure stays 500 / `Internal`. Already 400 before this work:
+   REST v2 collection search, gRPC v2 `Search` / `SearchStream`, AQL
+   `vector` / `memory` and MCP memory.
+
+   Still not a client error (documented, not fixed here):
+   * **pgwire `<->` / `vector_search(...)` UDTF.** `relational_pipeline.rs`
+     stringifies the error as `native collection vector search failed: <cause>`.
+     The SQL client gets the dimension cause in the message, but under the
+     generic server SQLSTATE rather than a 22xxx/42xxx class. A client
+     SQLSTATE needs a typed error path through `protocol.rs`, which several
+     open PRs are touching.
+   * **Arrow Flight `bulk_search` DoExchange** reports per-query failures as
+     in-band error frames rather than a call status. This is unchanged and
+     not a 500.
+
+   Analytics entanglement
+   (`GET /api/v2/analytics/collections/{id}/entanglement`) deliberately calls
+   `unified_search_native` with an EMPTY vector to load records. That path is
+   exempt from the gate and still works: the e2e test records `200 OK` with
+   an Entanglement Index on current code. Static reading agrees, since only
+   `unified_search_v1_inner` rejects an empty vector and the native path
+   never calls it.
+2. **User-facing collection name, and only one the caller supplied.**
+   `InvalidQueryVector` is now structured: an optional `collection` label plus
+   a `QueryVectorProblem` (`Empty` / `NonFinite` / `Dimension` / `Other`).
+   * **The validator labels conservatively.** `client_collection_label` uses
+     the identifier the validator received only when it is not the internal
+     object id. Otherwise the message says "the collection".
+   * **Rewrite sites restore the caller's name.** Authorities that rewrite the
+     caller's name to the object id before validating add the caller's own
+     identifier on the way out with `label_client_collection`. They are
+     `handle_record_search_for_tenant` (REST v2 / gRPC v2 / Flight),
+     `VectorOpsPort::search` (progressive and other v1 port callers) and
+     `unified_search_native_with_tenant_context` (fusion seed, v2 entities).
+     `unified_search_with_tenant_context` keeps the requested identifier in
+     scope. `label_client_collection` fills only a missing label.
+   * **The catalog name is never used.** An error message echoes only what
+     the request contained. A first draft of this fix used the catalog name;
+     review finding F1 replaced it, because a request that addressed a
+     collection by object id would get back a name it never sent.
+   * Pinned by `object_id_reference_never_echoes_the_catalog_name` (unit) and
+     an e2e check that requests addressing collections by object id never get
+     the collection's name back.
 3. **Graph fusion keeps the cause.** `retry_vector_search` used to re-format
    the last error into a string (losing the type) and retried client errors
    twice (≈300 ms of backoff for a guaranteed failure). It now returns a
@@ -361,6 +404,15 @@ error quality. All are now closed.
    already bounds-checked. The two slices are equal-length by construction,
    so the check is a backstop that keeps this invariant checked rather than
    assumed. No input reaches it today.
+   * **Mismatch score: `+inf` for every metric.** PQ accumulates a DISTANCE
+     for every metric, including dot product (as `-dot`), so `+inf` is the
+     worst value under its own convention.
+     `dimension_mismatch_score`'s dot-product value (`-inf`, the kernel's
+     similarity convention) would have been the best.
+   * **Pre-existing sign inconsistency, not changed here.** PQ hands its
+     accumulated `-dot` to `SimilarityResult::new(.., DotProduct)`, which
+     treats the raw value as a similarity. INT8 passes a raw dot product, so
+     PQ and INT8 disagree on the sign of the dot-product raw value.
 
 Evidence (each new test FAILED on the unfixed tree, PASSES after):
 
@@ -382,6 +434,16 @@ Evidence (each new test FAILED on the unfixed tree, PASSES after):
     (before: 65,536 ids → `[Some(0)]`);
   * `federated::execution` `engine_result_limit_rejects_values_the_u16_cannot_carry`;
   * `top_k_limit::tests::u16_top_k_hint_saturates_at_the_boundary`.
+
+  Added in the review round (2026-10-16):
+  * the e2e test above extended with Flight `DoGet`, rank search, the
+    by-object-id message check and the analytics-entanglement check (Flight returned
+    `Internal` before its mapping);
+  * `input_validation::tests::object_id_reference_never_echoes_the_catalog_name`;
+  * `client_argument::tests::label_client_collection_fills_only_a_missing_label`;
+  * `rank_backend::tests::vector_search_keeps_client_argument_errors_distinct`;
+  * `aql::executor_test` `query_vector_under_not_of_and_is_rejected_as_invalid_input`
+    and `rejected_query_vector_never_runs_the_source`.
 
   Kept green, as regression guards: `retry_still_retries_server_errors`, the
   AQL top-level / AND-conjunct / scalar-`Equals` cases,

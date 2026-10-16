@@ -1932,9 +1932,24 @@ impl UnifiedDistanceCompute {
                 // results. Cost: one predictable `usize` compare per
                 // subvector, next to the bounds-checked slicing above; the
                 // mismatch path is out of line and `#[cold]`.
+                //
+                // Worst-score convention: PQ accumulates a DISTANCE for every
+                // metric (dot product as `-dot`), so the worst value is
+                // `+inf` regardless of `metric`. `dimension_mismatch_score`
+                // returns `-inf` for dot product (the kernel's similarity
+                // convention), which here would be the BEST distance, so it is
+                // asked for the distance-convention value (Euclidean) and
+                // used for its one-time log. (The PQ result is then fed to
+                // `SimilarityResult::new` with the caller's metric, which for
+                // dot product reinterprets the accumulated `-dot` — a
+                // pre-existing PQ/INT8 sign inconsistency, TD-SECSCAN-1 §5.)
                 if query_subvector.len() != centroid.len() {
                     return SimilarityResult::new(
-                        dimension_mismatch_score(query_subvector.len(), centroid.len(), metric),
+                        dimension_mismatch_score(
+                            query_subvector.len(),
+                            centroid.len(),
+                            &DistanceMetric::Euclidean,
+                        ),
                         *metric,
                     );
                 }
@@ -3314,12 +3329,11 @@ mod tests {
     #[test]
     fn test_nan_and_infinity_handling() {
         let _ = proximadb_hardware::hardware_capabilities(); // OnceLock auto-init
-        use std::f32::{INFINITY, NAN, NEG_INFINITY};
 
         let normal = vec![1.0, 2.0, 3.0];
-        let with_nan = vec![1.0, NAN, 3.0];
-        let with_inf = vec![1.0, INFINITY, 3.0];
-        let with_neg_inf = vec![1.0, NEG_INFINITY, 3.0];
+        let with_nan = vec![1.0, f32::NAN, 3.0];
+        let with_inf = vec![1.0, f32::INFINITY, 3.0];
+        let with_neg_inf = vec![1.0, f32::NEG_INFINITY, 3.0];
 
         let euclidean_calc = UnifiedDistanceCompute::new(DistanceMetric::Euclidean);
 

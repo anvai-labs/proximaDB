@@ -175,8 +175,15 @@ mod tests {
     async fn run_where(
         predicate: AqlPredicate,
     ) -> crate::query::aql::Result<Vec<HashMap<String, AqlValue>>> {
+        run_where_on(Arc::new(TwoRowSource), predicate).await
+    }
+
+    async fn run_where_on(
+        source: Arc<dyn crate::query::aql::AqlSource>,
+        predicate: AqlPredicate,
+    ) -> crate::query::aql::Result<Vec<HashMap<String, AqlValue>>> {
         let mut executor = AqlExecutor::new();
-        executor.register_source("vec".to_string(), Arc::new(TwoRowSource));
+        executor.register_source("vec".to_string(), source);
         let query = AqlQuery {
             find: AqlFind {
                 projections: vec![AqlProjection {
@@ -297,5 +304,72 @@ mod tests {
         .await
         .expect("scalar equals under Not");
         assert_eq!(kinds(&rows), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn query_vector_under_not_of_and_is_rejected_as_invalid_input() {
+        let err = run_where(AqlPredicate::Not {
+            inner: Box::new(AqlPredicate::And {
+                lhs: Box::new(vector_eq()),
+                rhs: Box::new(kind_eq("a")),
+            }),
+        })
+        .await
+        .err();
+        assert!(
+            matches!(
+                err,
+                Some(proximadb_kernel::error::ProximaDBError::InvalidInput(_))
+            ),
+            "Not{{And{{Equals vector, X}}}} must be a client error, got {err:?}"
+        );
+    }
+
+    /// Counts `execute` calls, so a test can prove a rejected predicate never
+    /// runs the (possibly expensive) source search.
+    #[derive(Default)]
+    struct CountingSource {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::query::aql::AqlSource for CountingSource {
+        fn model(&self) -> DataModel {
+            DataModel::Vector
+        }
+        async fn execute(
+            &self,
+            _q: &AqlQuery,
+            _ctx: &mut crate::query::aql::AuditContext,
+        ) -> crate::query::aql::Result<crate::query::aql::AqlResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::query::aql::AqlResult {
+                rows: Vec::new(),
+                frame_id: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_query_vector_never_runs_the_source() {
+        let source = Arc::new(CountingSource::default());
+        let rejected = run_where_on(
+            source.clone(),
+            AqlPredicate::Not {
+                inner: Box::new(vector_eq()),
+            },
+        )
+        .await;
+        assert!(rejected.is_err());
+        assert_eq!(
+            source.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the source must not run for a rejected predicate"
+        );
+        // Control: an accepted predicate does run it.
+        run_where_on(source.clone(), vector_eq())
+            .await
+            .expect("accepted predicate");
+        assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -890,7 +890,8 @@ async fn wrong_dimension_is_a_client_error_on_every_search_route() {
         .map(|i| {
             let mut v = vec![0.0f32; DIM];
             v[i % DIM] = 1.0;
-            json!({ "id": format!("{name}-{i}"), "vector": v })
+            let topic = if i % 2 == 0 { "alpha" } else { "beta" };
+            json!({ "id": format!("{name}-{i}"), "vector": v, "props": { "topic": topic } })
         })
         .collect();
     let insert = http
@@ -936,12 +937,22 @@ async fn wrong_dimension_is_a_client_error_on_every_search_route() {
             format!("{base}/api/v2/graphs/{name}/fusion-search"),
             json!({ "vector_collection": name, "query_vector": short, "limit": 5 }),
         ),
+        (
+            "REST rank search",
+            format!("{base}/api/v2/rank/search"),
+            json!({ "collection": name, "query_vector": short, "k": 5 }),
+        ),
     ];
     for (label, url, body) in rest_cases {
         match http.post(url).json(&body).send().await {
             Ok(r) => {
                 let status = r.status();
                 let text = r.text().await.unwrap_or_default();
+                if label == "REST rank search" && status == reqwest::StatusCode::NOT_IMPLEMENTED {
+                    // RankServices not injected in this server mode.
+                    eprintln!("REST rank search: not wired here (501), skipped");
+                    continue;
+                }
                 if status != reqwest::StatusCode::BAD_REQUEST {
                     failures.push(format!("{label}: got {status}: {text}"));
                     continue;
@@ -962,6 +973,83 @@ async fn wrong_dimension_is_a_client_error_on_every_search_route() {
             }
             Err(e) => failures.push(format!("{label}: connection failed ({e})")),
         }
+    }
+
+    // A request that addresses a collection by object id gets an error built
+    // only from what it sent: the collection's name, which the request did
+    // not contain, must not appear in the response.
+    for object_id in 1..=4 {
+        let by_id = [
+            (
+                "REST v1 progressive search by object id",
+                format!("{base}/api/v2/progressive/search/{object_id}"),
+                json!({ "collection_id": object_id.to_string(), "queries": [{ "vector": short }], "top_k": 5 }),
+            ),
+            (
+                "REST v2 collection search by object id",
+                format!("{base}/api/v2/collections/{object_id}/search"),
+                json!({ "vector": short, "top_k": 5 }),
+            ),
+        ];
+        for (label, url, body) in by_id {
+            if let Ok(r) = http.post(url).json(&body).send().await {
+                let text = r.text().await.unwrap_or_default();
+                if text.contains(name) {
+                    failures.push(format!(
+                        "{label} ({object_id}): echoed a name the request did not contain: {text}"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Arrow Flight DoGet `vector_search` ticket.
+    let channel =
+        tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", server.flight_port))
+            .expect("flight endpoint")
+            .connect()
+            .await
+            .expect("flight channel");
+    let mut flight = FlightServiceClient::new(channel);
+    let ticket = Ticket {
+        ticket: serde_json::to_vec(&json!({
+            "type": "vector_search",
+            "collection_id": name,
+            "query_vector": short,
+            "top_k": 5,
+            "include_vector": false,
+        }))
+        .expect("ticket json")
+        .into(),
+    };
+    match flight.do_get(ticket).await {
+        Err(status)
+            if status.code() == tonic::Code::InvalidArgument
+                && status.message().contains("dimension")
+                && status.message().contains(name) => {}
+        Err(status) => failures.push(format!("Flight DoGet: got {status:?}")),
+        Ok(_) => failures.push("Flight DoGet: accepted a wrong-dim vector".to_string()),
+    }
+
+    // Analytics entanglement loads records through `unified_search_native`
+    // with an EMPTY query vector by design; the query-vector gate must not
+    // break it (it may still 400 for data reasons, never 500 / "is empty").
+    match http
+        .get(format!(
+            "{base}/api/v2/analytics/collections/{name}/entanglement?topic_field=topic&limit=10"
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            eprintln!("analytics entanglement: {status}: {text}");
+            if status.is_server_error() || text.contains("is empty") {
+                failures.push(format!("analytics entanglement: got {status}: {text}"));
+            }
+        }
+        Err(e) => failures.push(format!("analytics entanglement: connection failed ({e})")),
     }
 
     let grpc_endpoint = format!("http://127.0.0.1:{}", server.grpc_port);
@@ -1043,6 +1131,9 @@ async fn wrong_dimension_is_a_client_error_on_every_search_route() {
 fn internal_id_detector() {
     assert!(names_collection_by_internal_id(
         "Query vector has dimension 3 but collection '16' expects dimension 4"
+    ));
+    assert!(!names_collection_by_internal_id(
+        "Query vector has dimension 3 but the collection expects dimension 4"
     ));
     assert!(!names_collection_by_internal_id(
         "Query vector has dimension 3 but collection 'secscan1_route' expects dimension 4"
