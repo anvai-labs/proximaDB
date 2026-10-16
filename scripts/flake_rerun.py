@@ -31,11 +31,19 @@ import re
 import subprocess
 import sys
 
-# The runner writes these as `##[error]` lines in the job log. Anchoring on the
-# error marker keeps a test that merely PRINTS the phrase from matching.
+# The runner writes these as `##[error]` lines in the job log. The marker alone
+# does NOT tell the runner apart from a test: a step that prints
+# `::error::<text>` is rendered as the same `##[error]<text>` line. What does
+# tell them apart is position -- a reclaimed runner prints the shutdown line as
+# one of the LAST lines of the log (then only the exit code and "Cleaning up
+# orphan processes"), while a test's line is followed by the rest of the run.
 INFRA_LOG_RE = re.compile(
     r"##\[error\].*(?:The runner has received a shutdown signal|lost communication with the server)"
 )
+# How many trailing non-empty log lines may hold the signature. Job 117020211299
+# ends: shutdown line, "Process completed with exit code 143.", "Cleaning up
+# orphan processes" -- the signature is third from last.
+INFRA_TAIL_LINES = 5
 # Annotations can carry the lost-communication text directly.
 INFRA_ANNOTATION_RE = re.compile(
     r"The runner has received a shutdown signal|lost communication with the server"
@@ -51,8 +59,10 @@ AGGREGATOR_JOBS = frozenset({"CI Success"})
 
 def job_is_infra_kill(log_text: str | None, annotations: list[str]) -> bool:
     """True when this failed job was killed by runner infrastructure."""
-    if log_text is not None and INFRA_LOG_RE.search(log_text):
-        return True
+    if log_text is not None:
+        tail = [line for line in log_text.splitlines() if line.strip()][-INFRA_TAIL_LINES:]
+        if any(INFRA_LOG_RE.search(line) for line in tail):
+            return True
     if any(INFRA_ANNOTATION_RE.search(a or "") for a in annotations):
         return True
     if log_text is None:

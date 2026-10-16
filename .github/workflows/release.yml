@@ -1174,8 +1174,9 @@ jobs:
       #      (Authorization: Bearer <GitHub id token>, no body)
       # It prints the id token's identity claims (repository, workflow ref,
       # environment) -- the fields npm's trusted-publisher match compares --
-      # but never either token: both are masked the moment they exist, and a
-      # success body (which carries the npm token) is never echoed.
+      # but never either token: both are masked the moment they exist, a
+      # success body (which carries the npm token) is never echoed, and an
+      # error body is reduced to a fixed field allowlist.
       - name: Preflight the npm OIDC token exchange
         if: steps.npmver.outputs.published != 'true'
         run: |
@@ -1192,7 +1193,7 @@ jobs:
           body="${resp%$'\n'*}"
           if [ "$code" != "200" ]; then
             echo "::error::GitHub OIDC id-token request failed: HTTP ${code}"
-            jq -c 'del(.value)' <<<"$body" 2>/dev/null || echo "(non-JSON body withheld)"
+            jq -c '{error, message, code}' <<<"$body" 2>/dev/null || echo "(non-JSON body withheld)"
             exit 1
           fi
           id_token="$(jq -r '.value // empty' <<<"$body")"
@@ -1221,7 +1222,10 @@ jobs:
           fi
           if [ "${code:0:1}" != "2" ] || [ -z "$npm_token" ]; then
             echo "::error::npm OIDC token exchange refused: HTTP ${code} from POST ${url}"
-            jq -c 'del(.token)' <<<"$body" 2>/dev/null || head -c 2000 <<<"$body"
+            # A fixed allowlist, never "the body minus .token": a renamed token
+            # field would otherwise be printed. A non-JSON body is withheld.
+            jq -c '{error, message, code, reason}' <<<"$body" 2>/dev/null \
+              || echo "(non-JSON response body withheld)"
             echo "::error::Compare the claims above with 'npm trust list @anvailabs/proximadb-client' (repository, workflow file release.yml, environment npm)."
             exit 1
           fi

@@ -545,6 +545,31 @@ def _rust_cache_steps(lines: list[str]):
         yield index + 1, lines[max(job_start, 0) : job_end], inputs
 
 
+WRITER_BLOCKING_GATES = (
+    "outputs.test_tier",
+    "outputs.medium_tier",
+    "outputs.extensive",
+)
+DEVELOP_PUSH_ROLES = ("outputs.warm", "outputs.sweep")
+
+
+def _job_if(job: list[str]) -> str:
+    """The job-level `if:` (single line or block scalar), flattened."""
+    out: list[str] = []
+    inside = False
+    for line in job:
+        if not inside:
+            found = re.match(r"^    if:\s*(?P<rest>.*)$", line)
+            if found:
+                inside = True
+                out.append(found.group("rest"))
+            continue
+        if line.strip() and len(line) - len(line.lstrip()) <= 4:
+            break
+        out.append(line.strip())
+    return " ".join(out)
+
+
 RUST_CACHE_ENV_PREFIXES = ("CARGO", "CC", "CFLAGS", "CXX", "CMAKE", "RUST")
 
 
@@ -632,6 +657,24 @@ def check_rust_cache_policy(findings: list[Finding]) -> None:
             continue
         if save_if is None or save_if.strip().lower() == "false" or not shared:
             continue
+        # A writer only writes on a develop push, so its JOB must be able to
+        # run there. A job gated on a promotion tier (test_tier, medium_tier,
+        # extensive) is false on every develop push -- such a "writer" never
+        # writes and its key stays cold forever -- unless the gate also admits
+        # the develop-push roles (`warm`, or `sweep` = every protected push).
+        job_if = _job_if(job)
+        tiers = [t for t in WRITER_BLOCKING_GATES if t in job_if]
+        if tiers and not any(role in job_if for role in DEVELOP_PUSH_ROLES):
+            findings.append(
+                Finding(
+                    "rust-cache-policy",
+                    f"{where} writes shared-key {shared!r}, but its job `if:` is "
+                    f"gated on {', '.join(tiers)} (false on a develop push) and "
+                    f"admits neither `warm` nor `sweep` -- the key is never "
+                    f"written; restore an existing shape with `save-if: false`, "
+                    f"or let the job run on a develop push",
+                )
+            )
         # Resolve a matrix-valued key so two legs writing different shapes
         # are not mistaken for one key with two writers.
         keys = [shared]

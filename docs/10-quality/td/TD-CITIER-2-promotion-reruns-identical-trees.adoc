@@ -257,22 +257,26 @@ runner-min per release; 0 of 15 heavy jobs restored a cache). Workflows and scri
 | Concurrency per event | `ci.yml`'s group is now `workflow-event-branch`. Keyed on the branch
 alone, a PR shared a group with the push of its own head: the qa→main PR queued about 70 min
 behind the push-to-qa run of the same SHA. Pinned by `check_ci_concurrency_per_event`.
-| Cache policy | One `shared-key` per build shape (`check`, `dev-test`, `release`, plus four
+| Cache policy | One `shared-key` per build shape (`check`, `dev-test`, `release`, plus two
 single-job shapes), `add-job-id-key: false`, and `save-if` true only on a push to develop: the
 default branch is the one cache scope every PR and promotion can read. Each key has exactly one
 writer (rust-compile `test` → `check`; rust-test `unit` → `dev-test`, enabled on develop push by
 the new `warm` output; python-sdk-round-trip → `release`); every other step restores
-read-only. Job-level `CARGO*`/`RUST*` env moved onto build steps, because rust-cache hashes it
+read-only, and a writer's job must be able to run on a develop push (coverage and the
+object-store emulator job, which never do, restore `dev-test` instead of owning a key that
+would never be written). Job-level `CARGO*`/`RUST*` env moved onto build steps, because rust-cache hashes it
 into the key. Pinned by `check_rust_cache_policy`.
 | Guards that gated nothing | `hygiene-check`, `repository-identity` and
 `oss-docs-decontamination` joined `ci-success.needs`. Their last 20 develop-push runs: every run
 that started jobs was green (hygiene path-skipped in 3); 2 runs were cancelled whole.
 | RAPTOR ratchet | qa-gate's `raptor_recall_test` step now builds and runs with
 `--features experimental-engines`; the file is `#![cfg(feature = "experimental-engines")]`, so
-it had compiled to zero tests and passed. The step now fails on `running 0 tests`.
+it had compiled to zero tests and passed. The step now fails unless a
+`raptor_recall_tests::` test ran.
 | Flake Rerun | The matcher read check-run annotations, which only ever say "Process completed
 with exit code 143"; the shutdown text is in the job log. `scripts/flake_rerun.py` reads each
-failed job's log, falls back to the exit-143 annotation only when the log is unreadable, and
+failed job's log and accepts the shutdown line only among its last 5 non-empty lines (a step
+printing `::error::` renders the same `##[error]` line, so position is the evidence), falls back to the exit-143 annotation only when the log is unreadable, and
 still reruns once and only when every failure matches. Tested on real log excerpts
 (`tests/scripts/test_flake_rerun.py`).
 | Dead workflows deleted | `tdd.yml` (a duplicate of `ci.yml` on an unpinned toolchain; its
@@ -289,8 +293,8 @@ rebuilding, and builds as before otherwise.
 | npm OIDC publish | v0.4.1 failed twice with a bare `ENEEDAUTH`, because npm logs an OIDC
 exchange refusal only at `verbose`. The job now preflights the same two requests npm makes
 (GitHub id token, then `POST /-/npm/v1/oidc/token/exchange/package/<name>`, per npm/cli v11.19.0
-`lib/utils/oidc.js`) and fails with the HTTP status, the registry's message and the id-token
-claims. setup-node no longer gets `registry-url` (no `_authToken` line is written anywhere), and
+`lib/utils/oidc.js`) and fails with the HTTP status, a fixed allowlist of the registry's error fields and the
+id-token claims. setup-node no longer gets `registry-url` (no `_authToken` line is written anywhere), and
 the publish uses an empty temp user config and `--loglevel verbose`. Pinned by
 `check_npm_oidc_publish`.
 |===

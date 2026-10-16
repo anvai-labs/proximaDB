@@ -13,7 +13,7 @@
 # cloud-emulator job runs CARGO_BUILD_JOBS=1, see run_cloud_emulator_tests.sh.)
 #
 # NOTE: workflow_run triggers execute from the DEFAULT branch's copy of this
-# file, so this becomes active once promoted to main.
+# file -- develop -- so a change here takes effect once it merges to develop.
 name: Flake Rerun
 
 on:

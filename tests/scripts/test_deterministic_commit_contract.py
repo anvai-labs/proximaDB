@@ -986,6 +986,62 @@ class RustCachePolicyContractTest(unittest.TestCase):
         for needle in ("add-job-id-key", "shared-key", "save-if"):
             self.assertIn(needle, messages)
 
+    @staticmethod
+    def _gated(name: str, job_if: str, cache: str) -> str:
+        return (
+            f"  {name}:\n"
+            "    runs-on: ubuntu-24.04\n"
+            f"    if: {job_if}\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@v2\n"
+            "        with:\n"
+            f"{cache}"
+            "      - run: cargo check\n"
+        )
+
+    def test_writer_that_never_runs_on_a_develop_push_is_rejected(self) -> None:
+        """Review M1: rust-coverage (`extensive`) and the emulator job
+        (`test_tier`) each 'wrote' their own key, and neither runs on a
+        develop push, so the keys were never written."""
+        for gate in (
+            "needs.changes.outputs.extensive == 'true'",
+            "needs.changes.outputs.test_tier == 'true' && needs.changes.outputs.rust == 'true'",
+            "needs.changes.outputs.medium_tier == 'true'",
+        ):
+            with self.subTest(gate=gate):
+                findings = self.findings_for(
+                    self.wf(self._gated("cov", gate, self._cache(key='"coverage"', save=self.DEVELOP)))
+                )
+                self.assertTrue(any("never written" in f.message for f in findings), findings)
+
+    def test_block_scalar_if_is_read(self) -> None:
+        cache = self._cache(key='"objstore-fast"', save=self.DEVELOP)
+        job = (
+            "  cov:\n"
+            "    runs-on: ubuntu-24.04\n"
+            "    if: |\n"
+            "      !inputs.skip_tests &&\n"
+            "      needs.changes.outputs.test_tier == 'true'\n"
+            "    steps:\n"
+            "      - uses: Swatinem/rust-cache@v2\n"
+            "        with:\n"
+            f"{cache}"
+        )
+        findings = self.findings_for(self.wf(job))
+        self.assertTrue(any("never written" in f.message for f in findings), findings)
+
+    def test_tier_gated_writer_admitting_warm_or_sweep_is_accepted(self) -> None:
+        for gate in (
+            "(needs.changes.outputs.test_tier == 'true' || needs.changes.outputs.warm == 'true')",
+            "needs.changes.outputs.sweep == 'true' || needs.changes.outputs.medium_tier == 'true'",
+            "needs.changes.outputs.compile == 'true'",
+        ):
+            with self.subTest(gate=gate):
+                findings = self.findings_for(
+                    self.wf(self._gated("w", gate, self._cache(save=self.DEVELOP)))
+                )
+                self.assertEqual(findings, [], [f.message for f in findings])
+
     def test_the_real_tree_passes(self) -> None:
         findings: list[contract.Finding] = []
         contract.check_rust_cache_policy(findings)

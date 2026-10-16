@@ -204,14 +204,17 @@ jobs:
       - name: Run RAPTOR recall-after-reopen ratchet (TD-182 P0b)
         # `--features experimental-engines` is load-bearing: the file is
         # `#![cfg(feature = "experimental-engines")]`, so without it this step
-        # ran zero tests and passed. Fail if that ever happens again.
+        # ran no RAPTOR test and passed. Fail if that ever happens again.
         run: |
           set -uo pipefail
           status=0
           output=$(cargo test --features experimental-engines --test raptor_recall_test -- --nocapture 2>&1) || status=$?
           echo "$output"
-          if echo "$output" | grep -qE "running 0 tests"; then
-            echo "::error::raptor_recall_test compiled to ZERO tests -- the experimental-engines feature is not enabled, so this ratchet verified nothing."
+          # Assert the RAPTOR test itself ran, not merely "not 0 tests": the
+          # binary also carries helper-module tests (vector_generator,
+          # collection_builder), so a count alone could pass without it.
+          if ! echo "$output" | grep -qE "^test raptor_recall_tests::"; then
+            echo "::error::raptor_recall_test ran no raptor_recall_tests:: test (feature off, or the test renamed or filtered), so this ratchet verified nothing."
             exit 1
           fi
           exit "$status"

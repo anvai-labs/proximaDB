@@ -93,6 +93,28 @@ class InfraKillMatcherTest(unittest.TestCase):
         self.assertFalse(flake_rerun.job_is_infra_kill(log, []))
 
 
+    def test_an_error_annotation_printed_mid_log_does_not_match(self) -> None:
+        """Review L1: `echo "::error::The runner has received a shutdown
+        signal"` from a step renders as the SAME `##[error]` line; only its
+        position (not at the end of the log) gives it away."""
+        log = (
+            "2026-10-16T15:00:00.0000000Z ##[error]The runner has received a shutdown signal. (printed by a test)\n"
+            "2026-10-16T15:00:01.0000000Z running 3 tests\n"
+            "2026-10-16T15:00:02.0000000Z test a ... ok\n"
+            "2026-10-16T15:00:03.0000000Z test b ... FAILED\n"
+            "2026-10-16T15:00:04.0000000Z test c ... ok\n"
+            "2026-10-16T15:00:05.0000000Z test result: FAILED. 2 passed; 1 failed\n"
+            "2026-10-16T15:00:05.1000000Z ##[error]Process completed with exit code 101.\n"
+            "2026-10-16T15:00:05.2000000Z Post job cleanup.\n"
+        )
+        self.assertFalse(flake_rerun.job_is_infra_kill(log, ["Process completed with exit code 101."]))
+
+    def test_the_real_shutdown_log_still_matches_with_trailing_blank_lines(self) -> None:
+        self.assertTrue(
+            flake_rerun.job_is_infra_kill(RUNNER_SHUTDOWN_LOG + "\n\n   \n", RUNNER_SHUTDOWN_ANNOTATIONS)
+        )
+
+
 class RerunDecisionTest(unittest.TestCase):
     def test_all_infra_reruns(self) -> None:
         self.assertTrue(flake_rerun.should_rerun([True, True]))
