@@ -72,6 +72,8 @@ COPY = (
     # control would catch an omission -- but copy it so the mutations below
     # exercise the real list.
     "scripts/version-sync.sh",
+    # The Pre-Release CI gate both release workflows call before publishing.
+    "scripts/await_prerelease_ci.sh",
 )
 
 
@@ -947,6 +949,78 @@ class UnifiedReleaseTagGuard(unittest.TestCase):
     def test_catches_a_removed_check_tag_command(self) -> None:
         self._edit("scripts/version-sync.sh", "  check-tag)\n", "  check-tagx)\n")
         self._fails_with("no `check-tag` command")
+
+
+class PrereleaseGateGuard(unittest.TestCase):
+    """Every registry publish waits for Pre-Release CI (v0.4.1, 2026-10-16).
+
+    release-python.yml published PyPI with no Pre-Release CI gate at all, and
+    nothing noticed. These pin that every publishing job reaches a job that runs
+    scripts/await_prerelease_ci.sh, so the hole cannot reopen silently.
+    """
+
+    PY = ".github/workflows/release-python.yml"
+    REL = ".github/workflows/release.yml"
+
+    def setUp(self) -> None:
+        self.tree = _tree()
+        self.addCleanup(shutil.rmtree, self.tree, ignore_errors=True)
+
+    def _edit(self, rel: str, old: str, new: str) -> None:
+        p = self.tree / rel
+        text = p.read_text(encoding="utf-8")
+        self.assertIn(old, text, f"fixture drift in {rel}: {old!r}")
+        p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def _fails_with(self, needle: str) -> None:
+        result = _run(self.tree)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(needle, result.stdout)
+
+    def test_real_tree_gates_every_publish(self) -> None:
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_catches_a_pypi_publish_that_skips_the_gate(self) -> None:
+        """The exact v0.4.1 hole: a PyPI job that does not need the gate."""
+        for job, needs in (
+            ("publish-sdk-pypi", "    needs: [version-gate, prerelease-gate, build-sdk]\n"),
+            (
+                "publish-embedded-pypi",
+                "    needs: [version-gate, prerelease-gate, build-embedded-wheels, build-embedded-sdist, test-embedded-wheels]\n",
+            ),
+        ):
+            with self.subTest(job=job):
+                self.setUp()
+                self._edit(self.PY, needs, needs.replace("prerelease-gate, ", ""))
+                self._fails_with(f"job `{job}` publishes but does not wait")
+
+    def test_catches_release_yml_without_the_gate(self) -> None:
+        """Dropping the await step from prepare ungates crates, npm and the GH release."""
+        self._edit(self.REL, "run: bash scripts/await_prerelease_ci.sh", "run: echo skipped")
+        self._fails_with(f"{self.REL}: no job runs `scripts/await_prerelease_ci.sh`")
+
+    def test_a_commented_out_gate_does_not_count(self) -> None:
+        self._edit(self.PY, "        run: bash scripts/await_prerelease_ci.sh", "        # run: bash scripts/await_prerelease_ci.sh")
+        self._fails_with(f"{self.PY}: no job runs `scripts/await_prerelease_ci.sh`")
+
+    def test_testpypi_is_advisory_and_exempt(self) -> None:
+        """publish-testpypi does not need the gate, and must not be flagged."""
+        result = _run(self.tree)
+        self.assertNotIn("publish-testpypi", result.stdout)
+
+    def test_catches_a_missing_gate_script(self) -> None:
+        (self.tree / "scripts/await_prerelease_ci.sh").unlink()
+        self._fails_with("scripts/await_prerelease_ci.sh: missing")
+
+    def test_catches_a_gate_that_accepts_any_run(self) -> None:
+        """A qa push skips every build yet concludes success; it must not count."""
+        self._edit(
+            "scripts/await_prerelease_ci.sh",
+            'select((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")',
+            "select(true)",
+        )
+        self._fails_with("no longer restricts to building runs")
 
 
 class VersionSyncCheckTag(unittest.TestCase):

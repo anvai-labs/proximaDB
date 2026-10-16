@@ -687,6 +687,66 @@ def check_dockerfiles(msgs: list[str]) -> None:
         )
 
 
+PRERELEASE_GATE = "scripts/await_prerelease_ci.sh"
+# Only a building Pre-Release CI run may satisfy the gate: a push to qa also
+# triggers prerelease-ci.yml but skips every build, concluding `success` in ~15 s.
+PRERELEASE_RUN_FILTER = (
+    'select((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")'
+)
+# A live line with one of these makes a job a registry publish.
+PUBLISH_MARKERS = (
+    "pypa/gh-action-pypi-publish",
+    "cargo publish",
+    "npm publish",
+    "softprops/action-gh-release",
+)
+# TestPyPI is advisory (continue-on-error) and deliberately not gated.
+ADVISORY_PUBLISH = "test.pypi.org"
+
+
+def check_prerelease_gate(msgs: list[str]) -> None:
+    """Every registry publish waits for Pre-Release CI on the tagged commit.
+
+    v0.4.1 (2026-10-16): release-python.yml published PyPI with no Pre-Release
+    CI gate at all, and release.yml's gate failed instead of waiting.
+    """
+    gate = ROOT / PRERELEASE_GATE
+    if not gate.exists():
+        _fail(msgs, f"{PRERELEASE_GATE}: missing -- both release workflows wait on it before publishing")
+    elif PRERELEASE_RUN_FILTER not in gate.read_text(encoding="utf-8"):
+        _fail(
+            msgs,
+            f"{PRERELEASE_GATE}: no longer restricts to building runs (push to main or dispatch) -- "
+            f"a qa-push run skips every build yet concludes success",
+        )
+    for rel in PUBLISH_WORKFLOWS:
+        path = ROOT / rel
+        if not path.exists():
+            continue  # check_unified_release_tag already reports it
+        jobs = _jobs(path.read_text(encoding="utf-8").splitlines())
+        gates = {j for j, body in jobs.items() if any(_live(b) and PRERELEASE_GATE in b for b in body)}
+        if not gates:
+            _fail(msgs, f"{rel}: no job runs `{PRERELEASE_GATE}` -- it can publish a commit whose Pre-Release CI failed")
+            continue
+        needs = {j: _needs(body) for j, body in jobs.items()}
+
+        def reaches(job: str, seen: frozenset = frozenset()) -> bool:
+            if job in gates:
+                return True
+            return any(reaches(d, seen | {job}) for d in needs.get(job, ()) if d not in seen)
+
+        for job, body in jobs.items():
+            live = [b for b in body if _live(b)]
+            publishes = any(m in b for b in live for m in PUBLISH_MARKERS)
+            advisory = any(ADVISORY_PUBLISH in b for b in live)
+            if publishes and not advisory and not reaches(job):
+                _fail(
+                    msgs,
+                    f"{rel}: job `{job}` publishes but does not wait (directly or transitively) "
+                    f"for Pre-Release CI (`{PRERELEASE_GATE}`)",
+                )
+
+
 def main() -> int:
     msgs: list[str] = []
     check_workflow_features(msgs)
@@ -695,6 +755,7 @@ def main() -> int:
     check_dockerfiles(msgs)
     check_runtime_config_ownership(msgs)
     check_unified_release_tag(msgs)
+    check_prerelease_gate(msgs)
     if msgs:
         print("release-build-features: FAILED")
         for m in msgs:
@@ -705,7 +766,7 @@ def main() -> int:
         f"(both release workflows and {PUBLISHED_DOCKERFILE} build with "
         f"`{REQUIRED_FEATURE}`, every job in {len(TIMED_WORKFLOWS)} workflows "
         "bounded, runtime config copied --chown, one release tag gated "
-        "against every published manifest)"
+        "against every published manifest, every publish behind Pre-Release CI)"
     )
     return 0
 

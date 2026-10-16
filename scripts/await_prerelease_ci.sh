@@ -11,6 +11,12 @@
 #   newest run for SHA concluded red  -> exit 1 (fail fast, do not wait)
 #   a run for SHA is queued/running   -> keep polling
 #   no run for SHA at all             -> poll for a short grace window, then exit 1
+#   gh api error (e.g. a transient 502) -> warn and retry until the deadline
+#
+# Only a run that really builds counts: a push to main, or a dispatch. A push to
+# qa also triggers prerelease-ci.yml, but every build job is skipped there
+# (`if: !(push && ref_name == 'qa')`), so that run concludes `success` in ~15 s
+# having verified nothing, and it must not satisfy this gate.
 #
 # Usage: await_prerelease_ci.sh <repo> <sha> [deadline_minutes] [grace_minutes]
 # Needs GH_TOKEN with actions:read. Poll interval: PRERELEASE_POLL_SECONDS (60).
@@ -29,10 +35,24 @@ grace=$((start + GRACE_MIN * 60))
 
 echo "Waiting for ${WORKFLOW} to pass on ${SHA} (deadline ${DEADLINE_MIN} min)"
 while :; do
+  now=$(date +%s)
+  if [ "$now" -ge "$deadline" ]; then
+    echo "::error::Pre-Release CI did not pass on ${SHA} within ${DEADLINE_MIN} min."
+    exit 1
+  fi
+
   # Newest run first. One query gives both the success check and the newest
   # run's state, so a red run is seen without waiting out the deadline.
-  runs=$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?head_sha=${SHA}&per_page=20" \
-    --jq '[.workflow_runs[] | {id, status, conclusion}]')
+  if ! runs=$(gh api "repos/${REPO}/actions/workflows/${WORKFLOW}/runs?head_sha=${SHA}&per_page=20" \
+    --jq '[.workflow_runs[]
+           | select((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")
+           | {id, status, conclusion}]'); then
+    # A transient API error must not throw away a long wait; the deadline
+    # still bounds the retries.
+    echo "::warning::Could not query ${WORKFLOW} runs; retrying."
+    sleep "$POLL"
+    continue
+  fi
   succeeded=$(jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' <<<"$runs")
   total=$(jq 'length' <<<"$runs")
 
@@ -41,11 +61,11 @@ while :; do
     exit 0
   fi
 
-  now=$(date +%s)
   if [ "$total" -eq 0 ]; then
     if [ "$now" -ge "$grace" ]; then
       echo "::error::No ${WORKFLOW} run exists for ${SHA} after ${GRACE_MIN} min."
-      echo "::error::Pre-Release CI runs on push to main: tag a commit that is on main, or dispatch ${WORKFLOW} for it."
+      echo "::error::A building Pre-Release CI run starts on push to main (a qa push skips every build)."
+      echo "::error::Tag the qa->main merge commit on main, or dispatch ${WORKFLOW} on a ref whose head is ${SHA}."
       exit 1
     fi
     echo "No ${WORKFLOW} run for ${SHA} yet; waiting."
@@ -59,11 +79,6 @@ while :; do
       exit 1
     fi
     echo "Pre-Release CI run ${newest_id} is ${newest_status}; waiting."
-  fi
-
-  if [ "$now" -ge "$deadline" ]; then
-    echo "::error::Pre-Release CI did not pass on ${SHA} within ${DEADLINE_MIN} min."
-    exit 1
   fi
   sleep "$POLL"
 done
