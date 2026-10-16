@@ -1421,6 +1421,23 @@ jobs:
         with:
           prefix-key: "v1-feature-matrix"
           shared-key: "enterprise-catalogs"
+      # OOM insurance, same as the unit matrix row's "Add swap headroom", and
+      # for the same peak. The "serve enterprise-catalog tests" step builds the
+      # root crate's lib-test binary (`--lib`), whose single-rustc codegen+link
+      # sits near the 16GB hosted-runner ceiling. The runner was OOM-killed
+      # there ("shutdown signal", exit 143) on all three v0.4.1 promotion
+      # attempts (#2052 x2, #2053); `cargo check` had already passed in ~15 min.
+      # The kill is marginal, not deterministic: the same tree passed this job
+      # on #2050, and a cold-cache run has passed without swap. Swap turns
+      # the peak into a slowdown instead of a dead runner. It must stay ahead
+      # of the serve step.
+      - name: Add swap headroom
+        run: |
+          sudo fallocate -l 12G /mnt/swapfile-ci
+          sudo chmod 600 /mnt/swapfile-ci
+          sudo mkswap /mnt/swapfile-ci
+          sudo swapon /mnt/swapfile-ci
+          free -h
       - name: cargo check -p proximadb --tests --features enterprise-catalogs
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
