@@ -2016,6 +2016,79 @@ mod tests {
         assert_eq!(flushed.pax_files().len(), 2, "inputs must be untouched");
     }
 
+    /// Review of 11a9ab725: arming (`compaction:off`, `workload_profile:churn`)
+    /// and `l0_threshold:` gate BACKGROUND producers only. An explicit operator
+    /// request (Flight compact action / flush-and-compact, which reach
+    /// `do_compact` with `force: false` and no background hint) must still
+    /// compact a `compaction:off` collection; the background trigger on the
+    /// same collection still declines.
+    #[tokio::test]
+    async fn explicit_compaction_bypasses_arming_but_background_does_not() {
+        use crate::storage::persistence::write_ahead_log::background_manager::BackgroundMaintenanceManager;
+        let config = CollectionConfig {
+            tags: vec!["compaction:off".into()],
+            ..Default::default()
+        };
+        // Five L0 segments: the configured threshold, never auto-compacted.
+        let flushed = flush_via_materializer(281, config.clone(), 5).await;
+        assert_eq!(flushed.pax_files().len(), 5);
+        let meta = knob_meta(281, &flushed.root, config);
+        let compaction = flushed
+            .engine
+            .compaction_manager()
+            .expect("sst compaction manager")
+            .clone();
+
+        let context =
+            crate::storage::background_flush_context::BackgroundFlushContext::from_collection_service(
+                &OneCollection(meta.clone()),
+                "281",
+            )
+            .await
+            .expect("context from catalog meta");
+        BackgroundMaintenanceManager::execute_compaction_with_context(
+            &sst_engine_map(&flushed.engine),
+            &context,
+            None,
+        )
+        .await
+        .expect("background request is accepted");
+        assert!(
+            compaction
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await
+        );
+        assert_eq!(
+            flushed.pax_files().len(),
+            5,
+            "the background trigger must honour compaction:off"
+        );
+
+        // Exactly what `StorageCompactor::compact_collection` sends.
+        let explicit = crate::storage::traits::CompactionParameters {
+            collection_id: Some("281".to_string()),
+            collection_config: Some(meta),
+            force: false,
+            synchronous: true,
+            ..Default::default()
+        };
+        flushed
+            .engine
+            .do_compact(&explicit)
+            .await
+            .expect("explicit compaction");
+        assert!(
+            compaction
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await
+        );
+        assert_eq!(
+            flushed.pax_files().len(),
+            1,
+            "an explicit operator compaction must not be disarmed by compaction:off"
+        );
+    }
+
     #[test]
     fn flush_plan_preserves_catalog_storage_identity() {
         let mut collection = Collection {

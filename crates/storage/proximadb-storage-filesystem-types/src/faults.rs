@@ -59,7 +59,8 @@ fn read_fault_armed() -> bool {
 /// True when the read-fault env gate is set, so the factory installs this
 /// wrapper.
 pub fn read_fault_requested() -> bool {
-    std::env::var_os("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST").is_some()
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    *REQUESTED.get_or_init(|| std::env::var_os("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST").is_some())
 }
 
 fn already_read() -> &'static Mutex<HashSet<String>> {

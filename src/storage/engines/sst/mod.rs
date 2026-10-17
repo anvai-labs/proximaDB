@@ -302,6 +302,14 @@ pub mod segment_format; // P3 Phase A: mixed-format (ProximaBlocks/PAX) read pri
 /// / `pax_vector_quant`). SST `do_compact` declines such a request instead of
 /// resolving the output encoding from a guess (TD-READFID-2 review).
 pub const COLLECTION_META_COMPLETE_HINT: &str = "collection_meta_complete";
+
+/// `CompactionParameters.hints` key a BACKGROUND compaction producer sets to
+/// `true`. Only background requests are gated by the collection's
+/// `compaction:` / `workload_profile:` arming and `l0_threshold:` tags (the
+/// same cascade the flush trigger applies); an explicit operator request
+/// (Flight compact action, flush-and-compact) without it is never silently
+/// disarmed by those tags.
+pub const BACKGROUND_COMPACTION_HINT: &str = "background_compaction";
 pub mod survivor_range_cache;
 pub mod text_column_support; // TEXT column storage integration
 pub mod tiering_integration;

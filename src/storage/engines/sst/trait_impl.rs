@@ -25,8 +25,8 @@ use std::collections::HashMap;
 use tracing::{debug, info};
 
 use crate::core::search::results::OptimizedSearchRecord;
-use crate::storage::engines::sst::COLLECTION_META_COMPLETE_HINT;
 use crate::storage::engines::sst::core::SstEngine;
+use crate::storage::engines::sst::{BACKGROUND_COMPACTION_HINT, COLLECTION_META_COMPLETE_HINT};
 use crate::storage::traits::{
     CompactionParameters, CompactionResult, FlushParameters, FlushResult, StorageFormatStrategy,
     StorageQueryContext, UnifiedStorageFormat,
@@ -224,9 +224,17 @@ impl UnifiedStorageFormat for SstEngine {
             .as_ref()
             .map(|config| config.l0_file_threshold)
             .unwrap_or(self.config().compaction_threshold as usize);
-        // A non-forced (background) compaction honours the same per-collection
-        // arming + threshold cascade the flush trigger uses.
-        if !params.force && !proximadb_storage_common::resolve_compaction_armed(collection_tags) {
+        // Only a BACKGROUND producer honours the per-collection arming +
+        // threshold cascade the flush trigger uses. An explicit operator
+        // request keeps its pre-existing semantics: never disarmed by
+        // `compaction:off` / `workload_profile:churn`, configured threshold.
+        let background = !params.force
+            && params
+                .hints
+                .get(BACKGROUND_COMPACTION_HINT)
+                .and_then(|value| value.as_bool())
+                == Some(true);
+        if background && !proximadb_storage_common::resolve_compaction_armed(collection_tags) {
             return Ok(CompactionResult {
                 success: true,
                 collections_affected: vec![collection_id],
@@ -240,8 +248,10 @@ impl UnifiedStorageFormat for SstEngine {
         }
         let l0_threshold = if params.force {
             1
-        } else {
+        } else if background {
             proximadb_storage_common::resolve_l0_threshold(collection_tags, configured_l0_threshold)
+        } else {
+            configured_l0_threshold
         };
         let precision_hint = params
             .collection_config

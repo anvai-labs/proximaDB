@@ -335,7 +335,9 @@ fn record_compaction_declined(task: &SstCompactionTask, reason: CompactionDeclin
             level = task.level,
             input_files = task.input_files.len(),
             reason = reason.label(),
-            "compaction declined; inputs left authoritative (rate-limited: 1/min)"
+            "compaction declined for collection {}; inputs left authoritative \
+             (rate-limited: 1/min process-wide, see compaction_declined_total)",
+            task.collection_object_id
         );
     }
 }
