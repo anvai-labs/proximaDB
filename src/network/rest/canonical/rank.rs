@@ -68,6 +68,11 @@ pub struct RankSearchRequest {
     /// Per-phase overrides applied on top of the profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank_overrides: Option<RankOverrides>,
+    /// The tenant the request acts as (set by the route from the request
+    /// context, never from the wire). Candidate providers resolve the
+    /// collection within it; `None` = internal, unscoped.
+    #[serde(skip)]
+    pub request_tenant: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -738,6 +743,17 @@ pub trait HybridSearchBackend: Send + Sync {
         collection: &str,
         vector: &[f32],
     ) -> RankResult<Vec<crate::core::search::hybrid::VectorResult>>;
+
+    /// Resolve `collection` within `request_tenant` before either leg runs:
+    /// `Err(RankError::CollectionNotFound)` when the tenant may not resolve it
+    /// (answered exactly like a missing collection). Default: no scoping.
+    async fn scope_collection(
+        &self,
+        _collection: &str,
+        _request_tenant: Option<&str>,
+    ) -> RankResult<()> {
+        Ok(())
+    }
 }
 
 /// `CandidateProvider` that delegates to a real
@@ -810,6 +826,11 @@ impl CandidateProvider for HybridCoordinatorAdapter {
         // can short-circuit on empty input or apply their own
         // fallback (e.g. broad recall).
         let query_text = request.query_text.clone().unwrap_or_default();
+
+        // Resolve the collection within the request tenant before either leg.
+        self.backend
+            .scope_collection(&request.collection, request.request_tenant.as_deref())
+            .await?;
 
         let results = self
             .coordinator
@@ -914,6 +935,7 @@ fn rank_error_to_api(error: RankError) -> ApiError {
         }
         RankError::InvalidProfile(msg) => ApiError::InvalidArgument(msg),
         RankError::InvalidArgument(msg) => ApiError::InvalidArgument(msg),
+        RankError::CollectionNotFound(collection) => ApiError::CollectionNotFound(collection),
         other => ApiError::Internal(format!("rank pipeline failed: {other}")),
     }
 }
@@ -968,6 +990,7 @@ mod tests {
     #[test]
     fn request_round_trips_through_json() {
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![0.1, 0.2, 0.3],
             query_text: None,
@@ -1001,6 +1024,7 @@ mod tests {
     #[test]
     fn request_omits_optionals_from_json_when_unset() {
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1185,6 +1209,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(5), DocHandle(2)]);
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1332,6 +1357,7 @@ mod tests {
         );
         let candidates = FixedCandidates(vec![DocHandle(7), DocHandle(4)]);
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1383,6 +1409,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1), DocHandle(2), DocHandle(3)]);
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1473,6 +1500,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1), DocHandle(2)]);
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1541,6 +1569,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(11)]);
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1569,6 +1598,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1)]);
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1592,6 +1622,7 @@ mod tests {
         let candidates = FixedCandidates(vec![DocHandle(1), DocHandle(2), DocHandle(3)]);
         let factory = factory_with_docid();
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1615,6 +1646,7 @@ mod tests {
         let candidates = FixedCandidates(vec![DocHandle(1)]);
         let factory = factory_with_docid();
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1637,6 +1669,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1), DocHandle(2), DocHandle(3)]);
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1667,6 +1700,7 @@ mod tests {
 
         let candidates = FixedCandidates((1..=20).map(DocHandle).collect());
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1692,6 +1726,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1)]);
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![0.5; 384],
             query_text: None,
@@ -1726,6 +1761,7 @@ mod tests {
     async fn mock_range_candidate_provider_returns_configured_count() {
         let p = MockRangeCandidateProvider { count: 7 };
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "x".into(),
             query_vector: vec![],
             query_text: None,
@@ -1767,6 +1803,7 @@ mod tests {
 
         let candidates = FixedCandidates((1..=20).map(DocHandle).collect());
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1826,6 +1863,7 @@ mod tests {
 
         let candidates = FixedCandidates((1..=5).map(DocHandle).collect());
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1882,6 +1920,7 @@ mod tests {
 
         let candidates = FixedCandidates((1..=5).map(DocHandle).collect());
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1938,6 +1977,7 @@ mod tests {
             Arc::new(ConstantMultiplierSecondPhaseScorer { factor: 0.1 });
         let candidates = FixedCandidates((1..=5).map(DocHandle).collect());
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -2066,6 +2106,7 @@ mod tests {
 
     fn rank_req(collection: &str, query_vector: Vec<f32>, k: usize) -> RankSearchRequest {
         RankSearchRequest {
+            request_tenant: None,
             collection: collection.into(),
             query_vector,
             query_text: None,
@@ -2313,6 +2354,7 @@ mod tests {
     #[test]
     fn request_query_text_round_trips_through_json() {
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![0.1],
             query_text: Some("hello world".into()),
@@ -2329,6 +2371,7 @@ mod tests {
     #[test]
     fn request_query_text_omitted_from_json_when_none() {
         let req = RankSearchRequest {
+            request_tenant: None,
             collection: "docs".into(),
             query_vector: vec![0.1],
             query_text: None,

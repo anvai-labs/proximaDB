@@ -237,6 +237,9 @@ pub struct AuditContext {
     pub query_id: Uuid,
     pub frames: Vec<AuditFrame>,
     pub next_frame_id: u64,
+    /// The tenant the request acts as; sources resolve collections within it.
+    /// `None` = internal (unscoped) execution.
+    pub request_tenant: Option<String>,
 }
 
 impl Default for AuditContext {
@@ -251,6 +254,7 @@ impl AuditContext {
             query_id: Uuid::new_v4(),
             frames: Vec::new(),
             next_frame_id: 1,
+            request_tenant: None,
         }
     }
 

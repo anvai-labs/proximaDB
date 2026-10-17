@@ -432,18 +432,11 @@ impl CollectionService {
             return Ok(None);
         };
 
-        let Some(collection_tenant) = Self::collection_tenant_id(&collection) else {
-            warn!(
-                "🚨 Collection '{}' is missing tenant metadata; denying tenant-scoped access",
-                collection_identifier
-            );
-            return Ok(None);
-        };
-
-        if collection_tenant != tenant_ctx.tenant_id {
-            warn!(
-                "🚨 Cross-tenant access attempt blocked: user tenant {} tried to access collection owned by tenant {}",
-                tenant_ctx.tenant_id, collection_tenant
+        if !proximadb_tenant::collection_visible_to(&collection, Some(&tenant_ctx.tenant_id)) {
+            debug!(
+                tenant = %tenant_ctx.tenant_id,
+                collection = %collection_identifier,
+                "collection is not resolvable for this tenant"
             );
             return Ok(None);
         }
@@ -467,6 +460,69 @@ impl CollectionService {
     ) -> Result<CollectionServiceResponse> {
         self.create_collection_with_tenant_context(config, None)
             .await
+    }
+
+    /// Resolve a collection for a request acting as `request_tenant`.
+    ///
+    /// `Some(tenant)` (a request; blank = the default tenant) returns the
+    /// collection only when that tenant may resolve it under the one ownership
+    /// rule (`proximadb_tenant::collection_visible_to`); otherwise `None`,
+    /// exactly as for a collection that does not exist. `None` is an internal /
+    /// system lookup and is not scoped.
+    pub async fn collection_for_tenant(
+        &self,
+        identifier: &str,
+        request_tenant: Option<&str>,
+    ) -> Result<Option<Collection>> {
+        let ctx = self.load_tenant_context(request_tenant)?;
+        let found = self
+            .get_collection_with_tenant_context(identifier, ctx.as_ref())
+            .await?;
+        Ok(match request_tenant {
+            Some(tenant) => found.filter(|collection| {
+                proximadb_tenant::collection_visible_to(collection, Some(tenant))
+            }),
+            None => found,
+        })
+    }
+
+    /// Record `tenant` as the owner of a collection that has no recorded owner,
+    /// through the same catalog write as `update_collection`. Never re-assigns
+    /// a collection that already records an owner (or conflicting owners).
+    /// Returns whether an owner was written.
+    pub async fn assign_owner_if_unattributed(
+        &self,
+        identifier: &str,
+        tenant: &str,
+    ) -> Result<bool> {
+        // Under tenant-prefixed catalog namespaces (TD-CAT-2b gate) an owner
+        // change would move the catalog asset to another namespace; leave such
+        // collections to the default tenant (fail closed) rather than rewrite
+        // the asset key here.
+        if self.tenant_namespaces_on() {
+            return Ok(false);
+        }
+        let Some(mut record) = self.collection(identifier).await? else {
+            return Ok(false);
+        };
+        if proximadb_tenant::collection_owner(&record)
+            != proximadb_tenant::CollectionOwner::Unattributed
+        {
+            return Ok(false);
+        }
+        let Some(config) = record.config.as_mut() else {
+            return Ok(false);
+        };
+        proximadb_tenant::stamp_collection_owner(config, tenant);
+        let name = config.name.clone();
+        record.updated_at = chrono::Utc::now().timestamp_millis();
+        self.upsert_collection_catalog_asset(&record, None)
+            .await
+            .context("Failed to record collection owner")?;
+        let _ = crate::catalog::CorpusVersionRegistry::global()
+            .bump(Self::DEFAULT_VERSION_TENANT, &name)
+            .await;
+        Ok(true)
     }
 
     /// Get collection with tenant validation
@@ -515,7 +571,7 @@ impl CollectionService {
             let filtered = collections
                 .into_iter()
                 .filter(|collection| {
-                    Self::collection_tenant_id(collection).as_deref() == Some(&tenant_ctx.tenant_id)
+                    proximadb_tenant::collection_visible_to(collection, Some(&tenant_ctx.tenant_id))
                 })
                 .collect();
             return Ok(filtered);
@@ -585,6 +641,7 @@ impl CollectionService {
         name: &str,
         dimension: u32,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&str>,
         promote_keys: &[String],
     ) -> Result<()> {
         // P-Shred follow-up (ADR-055): declared hot keys become filterable columns (typed, id >= 100
@@ -601,7 +658,7 @@ impl CollectionService {
                 ..Default::default()
             })
             .collect();
-        let config = CollectionConfig {
+        let mut config = CollectionConfig {
             name: name.to_string(),
             dimension,
             storage_engine: Some(StorageEngine::Sst as i32),
@@ -609,6 +666,10 @@ impl CollectionService {
             filterable_columns,
             ..Default::default()
         };
+        // Record the requesting tenant as owner.
+        if let Some(tenant) = request_tenant {
+            proximadb_tenant::stamp_collection_owner(&mut config, tenant);
+        }
         let resp = self
             .create_collection_with_tenant_context(&config, tenant_context)
             .await?;
@@ -786,26 +847,15 @@ impl CollectionService {
 
         // Resolve compression and storage configuration
 
-        // NEW: Add tenant metadata to collection if tenant context is provided
+        // Record the owning tenant on the collection (the one ownership rule,
+        // `proximadb_tenant::ownership`). The port-level create stamps the
+        // request tenant even without a tenant context; this covers callers
+        // that pass a context.
         if let Some(tenant_ctx) = tenant_context {
-            enriched_config
-                .tags
-                .retain(|tag| !tag.starts_with("tenant:") && tag != "tenant_isolated:true");
-
-            // Add tenant ID to collection tags for tenant isolation (metadata field doesn't exist)
-            enriched_config
-                .tags
-                .push(format!("tenant:{}", tenant_ctx.tenant_id));
-            enriched_config
-                .tags
-                .push("tenant_isolated:true".to_string());
+            proximadb_tenant::stamp_collection_owner(&mut enriched_config, &tenant_ctx.tenant_id);
             enriched_config
                 .tags
                 .push(format!("created_at:{}", chrono::Utc::now().to_rfc3339()));
-
-            // Set owner field if available
-            enriched_config.owner = Some(tenant_ctx.tenant_id.clone());
-
             debug!(
                 "✅ Added tenant metadata to collection: tenant_id={}",
                 tenant_ctx.tenant_id
@@ -1830,6 +1880,11 @@ impl CollectionService {
                 if new_config.owner.is_some() {
                     existing_config.owner = new_config.owner;
                 }
+                // Ownership is not client-updatable: keep the recorded owner
+                // signals exactly as they were.
+                if let Some(previous) = previous_record.config.as_ref() {
+                    proximadb_tenant::ownership::carry_over_owner(previous, existing_config);
+                }
                 if !new_config.filterable_columns.is_empty() {
                     existing_config.filterable_columns = new_config.filterable_columns;
                 }
@@ -2336,11 +2391,19 @@ impl CollectionService {
             // (`PROXIMADB_INDEX_CATALOG_PATHS`), and catalog asset paths are still
             // flat/name-keyed — so this records identity now for the
             // tenant-prefixed-paths slice (TD-CAT-2b) without shifting any path.
+            // Without tenant-prefixed namespaces (TD-CAT-2b gate off) a
+            // namespace is shared by every tenant's collections, so it records
+            // no single owner even though the collection itself does.
+            let namespace_tenant = if self.tenant_namespaces_on() {
+                Self::collection_tenant_id(collection)
+            } else {
+                None
+            };
             catalog
                 .create_namespace_for_tenant(
                     &identifier.namespace,
                     std::collections::HashMap::new(),
-                    Self::collection_tenant_id(collection).as_deref(),
+                    namespace_tenant.as_deref(),
                 )
                 .await?;
         }
@@ -3329,8 +3392,9 @@ mod tests {
         Ok(())
     }
 
-    /// TD-CAT-2a (audit gap G6): creating a `tenant:`-tagged collection records
-    /// the owning tenant on the freshly-created namespace. The upsert routes
+    /// TD-CAT-2a (audit gap G6): with tenant-prefixed namespaces (TD-CAT-2b
+    /// gate on), creating a `tenant:`-tagged collection records the owning
+    /// tenant on the freshly-created namespace. The upsert routes
     /// through `create_namespace_for_tenant`, so the persisted
     /// `CatalogNamespace.tenant_id` carries the tenant derived by
     /// `collection_tenant_id` (the `tenant:` tag) — instead of the `None` the
@@ -3350,6 +3414,9 @@ mod tests {
             .await
             .context("service")?
             .with_catalog_manager(catalog_manager.clone());
+        // Owner recording applies to tenant-prefixed namespaces (TD-CAT-2b);
+        // a namespace shared by every tenant records no single owner.
+        service.set_tenant_namespaces_for_test(true);
 
         // A namespaced name → the upsert creates a brand-new namespace
         // `tdc2a_ns` (the tenant is recorded only on namespace creation, so the
@@ -3375,7 +3442,7 @@ mod tests {
             .await
             .context("default catalog")?;
         let ns = catalog
-            .get_namespace(&["tdc2a_ns".to_string()])
+            .get_namespace(&["acme".to_string(), "tdc2a_ns".to_string()])
             .await
             .context("get_namespace")?;
         assert_eq!(
@@ -3384,6 +3451,178 @@ mod tests {
             "the freshly-created namespace must record the owning tenant (TD-CAT-2a)"
         );
 
+        Ok(())
+    }
+
+    async fn service_with_catalog() -> Result<(CollectionService, tempfile::TempDir)> {
+        let temp_dir = tempfile::TempDir::new().context("temp dir")?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let catalog_manager = Arc::new(CatalogManager::new());
+        catalog_manager
+            .create_native_catalog("default", &temp_path)
+            .await
+            .context("xcatalog")?;
+        let service = CollectionService::new(StorageConfig::default())
+            .await
+            .context("service")?
+            .with_catalog_manager(catalog_manager);
+        Ok((service, temp_dir))
+    }
+
+    fn scope_config(name: &str) -> CollectionConfig {
+        CollectionConfig {
+            name: name.to_string(),
+            dimension: 4,
+            primary_index: Some("default".to_string()),
+            auto_index_selection: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// Collection resolution is scoped to the request tenant: a collection
+    /// created through the port records its creator as owner, resolves for that
+    /// tenant (by name and object id), and is absent for every other tenant —
+    /// in get, list, update and delete alike.
+    #[tokio::test]
+    async fn port_resolution_is_scoped_to_the_request_tenant() -> Result<()> {
+        use proximadb_runtime::CollectionPort;
+        let (service, _dir) = service_with_catalog().await?;
+        let created =
+            CollectionPort::create_collection(&service, scope_config("scope_acme"), Some("acme"))
+                .await
+                .context("create as acme")?;
+        assert_eq!(
+            proximadb_tenant::collection_owner(&created),
+            proximadb_tenant::CollectionOwner::Tenant("acme".into()),
+            "create records its owner"
+        );
+        for reference in ["scope_acme", created.id.as_str()] {
+            assert!(
+                CollectionPort::get_collection(&service, reference, Some("acme"))
+                    .await?
+                    .is_some()
+            );
+            assert!(
+                CollectionPort::get_collection(&service, reference, Some("globex"))
+                    .await?
+                    .is_none()
+            );
+            assert!(
+                CollectionPort::get_collection(&service, reference, None)
+                    .await?
+                    .is_some(),
+                "internal"
+            );
+            assert!(
+                CollectionPort::get_collection(&service, reference, Some(""))
+                    .await?
+                    .is_none()
+            );
+        }
+        let names = |list: Vec<Collection>| {
+            list.into_iter()
+                .filter_map(|c| c.config.map(|cfg| cfg.name))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            names(CollectionPort::list_collections(&service, Some("acme")).await?)
+                .contains(&"scope_acme".to_string())
+        );
+        assert!(
+            !names(CollectionPort::list_collections(&service, Some("globex")).await?)
+                .contains(&"scope_acme".to_string())
+        );
+
+        // Update by another tenant behaves like a missing collection; an update
+        // by the owner cannot change the recorded owner.
+        let foreign_update = CollectionPort::update_collection(
+            &service,
+            "scope_acme",
+            CollectionConfig {
+                description: Some("x".into()),
+                ..Default::default()
+            },
+            Some("globex"),
+        )
+        .await;
+        assert!(foreign_update.is_err());
+        let updated = CollectionPort::update_collection(
+            &service,
+            "scope_acme",
+            CollectionConfig {
+                tags: vec!["tenant:globex".into()],
+                owner: Some("globex".into()),
+                ..Default::default()
+            },
+            Some("acme"),
+        )
+        .await?;
+        assert_eq!(
+            proximadb_tenant::collection_owner(&updated),
+            proximadb_tenant::CollectionOwner::Tenant("acme".into())
+        );
+        assert!(!CollectionPort::delete_collection(&service, "scope_acme", Some("globex")).await?);
+        assert!(
+            CollectionPort::get_collection(&service, "scope_acme", Some("acme"))
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// A collection created before ownership was recorded belongs to the
+    /// default tenant only, until the owner backfill records its owner — and
+    /// the backfill never re-assigns an owned collection.
+    #[tokio::test]
+    async fn unattributed_collection_is_default_only_until_assigned() -> Result<()> {
+        use proximadb_runtime::CollectionPort;
+        let (service, _dir) = service_with_catalog().await?;
+        let legacy = service
+            .create_collection_with_tenant_context(&scope_config("scope_legacy"), None)
+            .await?
+            .collection
+            .context("created")?;
+        assert_eq!(
+            proximadb_tenant::collection_owner(&legacy),
+            proximadb_tenant::CollectionOwner::Unattributed
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("default"))
+                .await?
+                .is_some()
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("acme"))
+                .await?
+                .is_none()
+        );
+
+        assert!(
+            service
+                .assign_owner_if_unattributed("scope_legacy", "acme")
+                .await?
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("acme"))
+                .await?
+                .is_some()
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("default"))
+                .await?
+                .is_none()
+        );
+        assert!(
+            !service
+                .assign_owner_if_unattributed("scope_legacy", "globex")
+                .await?,
+            "never re-assigns"
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("acme"))
+                .await?
+                .is_some()
+        );
         Ok(())
     }
 
@@ -4416,17 +4655,20 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         identifier: &str,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<Option<crate::proto::proximadb_v1::Collection>> {
-        let ctx = self.load_tenant_context(tenant_id)?;
-        self.get_collection_with_tenant_context(identifier, ctx.as_ref())
-            .await
+        self.collection_for_tenant(identifier, tenant_id).await
     }
 
     async fn create_collection(
         &self,
-        config: crate::proto::proximadb_v1::CollectionConfig,
+        mut config: crate::proto::proximadb_v1::CollectionConfig,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::Collection> {
         let ctx = self.load_tenant_context(tenant_id)?;
+        // Stamp the creating tenant as owner (the tenant-context path below
+        // does the same when a context exists).
+        if let Some(tenant) = tenant_id {
+            proximadb_tenant::stamp_collection_owner(&mut config, tenant);
+        }
         let resp = self
             .create_collection_with_tenant_context(&config, ctx.as_ref())
             .await?;
@@ -4442,8 +4684,13 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         &self,
         id: &str,
         config: crate::proto::proximadb_v1::CollectionConfig,
-        _tenant_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::Collection> {
+        if tenant_id.is_some() && self.collection_for_tenant(id, tenant_id).await?.is_none() {
+            return Err(
+                proximadb_search_types::client_argument::CollectionNotFound::new(id).into(),
+            );
+        }
         let resp = CollectionService::update_collection(self, id, Some(config)).await?;
         resp.collection.ok_or_else(|| {
             anyhow::anyhow!(
@@ -4454,6 +4701,9 @@ impl proximadb_runtime::CollectionPort for CollectionService {
     }
 
     async fn delete_collection(&self, id: &str, tenant_id: Option<&str>) -> anyhow::Result<bool> {
+        if tenant_id.is_some() && self.collection_for_tenant(id, tenant_id).await?.is_none() {
+            return Ok(false);
+        }
         let ctx = self.load_tenant_context(tenant_id)?;
         let resp = self
             .delete_collection_with_tenant_context(id, ctx.as_ref())
@@ -4466,8 +4716,18 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         tenant_id: Option<&str>,
     ) -> anyhow::Result<Vec<crate::proto::proximadb_v1::Collection>> {
         let ctx = self.load_tenant_context(tenant_id)?;
-        self.list_collections_with_tenant_context(ctx.as_ref())
-            .await
+        let collections = self
+            .list_collections_with_tenant_context(ctx.as_ref())
+            .await?;
+        Ok(match tenant_id {
+            Some(tenant) => collections
+                .into_iter()
+                .filter(|collection| {
+                    proximadb_tenant::collection_visible_to(collection, Some(tenant))
+                })
+                .collect(),
+            None => collections,
+        })
     }
 
     async fn resolve_collection_id(&self, identifier: &str) -> anyhow::Result<Option<String>> {

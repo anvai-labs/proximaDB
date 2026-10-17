@@ -634,6 +634,73 @@ impl EntityStore for ProximaEntityStore {
         // temporal_filter: Option<TemporalFilter>, // Deferred: Add when proto is available
         top_k: usize,
     ) -> Result<Vec<(Entity, f32)>> {
+        self.search_entities_for_tenant(collection_id, None, query_vector, metadata_filter, top_k)
+            .await
+    }
+
+    async fn list_entities(
+        &self,
+        collection_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Entity>> {
+        // Simple implementation: collect all entities with pagination
+        // In a production system, this would use more efficient indexing
+        let mut entities = Vec::new();
+        let mut count = 0;
+        let mut skipped = 0;
+
+        // Collect entity IDs first to avoid holding lock across await
+        let entity_ids = {
+            let headers = self.headers.read().map_err(|e| {
+                proximadb_kernel::error::VectorDBError::Internal(format!(
+                    "RwLock for headers is poisoned: {}",
+                    e
+                ))
+            })?;
+            let mut ids = Vec::new();
+            for key in headers.keys() {
+                if key.starts_with(&format!("{}:", collection_id))
+                    && let Some(entity_id) = key.split(':').nth(1)
+                {
+                    ids.push(entity_id.to_string());
+                }
+            }
+            ids
+        };
+
+        // Now process the entities
+        for entity_id in entity_ids {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if count >= limit {
+                break;
+            }
+
+            if let Ok(Some(entity)) = self.get_entity(collection_id, &entity_id, true, true).await {
+                entities.push(entity);
+                count += 1;
+            }
+        }
+
+        Ok(entities)
+    }
+}
+
+impl ProximaEntityStore {
+    /// Entity search for a request acting as `request_tenant`: the backing
+    /// collection is resolved within that tenant (a collection the tenant may
+    /// not resolve is answered exactly like a missing one). `None` = internal.
+    pub async fn search_entities_for_tenant(
+        &self,
+        collection_id: &str,
+        request_tenant: Option<&str>,
+        query_vector: Option<Vec<f32>>,
+        metadata_filter: Option<MetadataFilter>,
+        top_k: usize,
+    ) -> Result<Vec<(Entity, f32)>> {
         let mut results: Vec<(Entity, f32)> = Vec::new();
 
         // Convert proto MetadataFilter to internal FilterExpression (best-effort)
@@ -653,8 +720,9 @@ impl EntityStore for ProximaEntityStore {
                     freshness_mode: None,
                 };
                 let vos_results = vs
-                    .unified_search_v1(
+                    .unified_search_v1_for_tenant(
                         collection_id,
+                        request_tenant,
                         vector,
                         top_k,
                         core_filter.clone(),
@@ -718,56 +786,6 @@ impl EntityStore for ProximaEntityStore {
 
         results.truncate(top_k);
         Ok(results)
-    }
-
-    async fn list_entities(
-        &self,
-        collection_id: &str,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<Entity>> {
-        // Simple implementation: collect all entities with pagination
-        // In a production system, this would use more efficient indexing
-        let mut entities = Vec::new();
-        let mut count = 0;
-        let mut skipped = 0;
-
-        // Collect entity IDs first to avoid holding lock across await
-        let entity_ids = {
-            let headers = self.headers.read().map_err(|e| {
-                proximadb_kernel::error::VectorDBError::Internal(format!(
-                    "RwLock for headers is poisoned: {}",
-                    e
-                ))
-            })?;
-            let mut ids = Vec::new();
-            for key in headers.keys() {
-                if key.starts_with(&format!("{}:", collection_id))
-                    && let Some(entity_id) = key.split(':').nth(1)
-                {
-                    ids.push(entity_id.to_string());
-                }
-            }
-            ids
-        };
-
-        // Now process the entities
-        for entity_id in entity_ids {
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            if count >= limit {
-                break;
-            }
-
-            if let Ok(Some(entity)) = self.get_entity(collection_id, &entity_id, true, true).await {
-                entities.push(entity);
-                count += 1;
-            }
-        }
-
-        Ok(entities)
     }
 }
 

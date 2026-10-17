@@ -5478,7 +5478,13 @@ impl PostgresProtocol {
             ..Default::default()
         };
 
-        match self.collection_port.create_collection(config, None).await {
+        // The connection's tenant (startup `database`) owns the collection.
+        let tenant = self.pgwire_resolve_write_tenant().await;
+        match self
+            .collection_port
+            .create_collection(config, Some(&tenant))
+            .await
+        {
             Ok(_) => {
                 info!("Created vector collection '{}' via PostgreSQL", table_name);
                 self.send_command_complete("CREATE TABLE").await
@@ -5549,9 +5555,10 @@ impl PostgresProtocol {
             ..Default::default()
         };
 
+        let tenant = self.pgwire_resolve_write_tenant().await;
         match self
             .collection_port
-            .create_collection(vector_config, None)
+            .create_collection(vector_config, Some(&tenant))
             .await
         {
             Ok(_) => {

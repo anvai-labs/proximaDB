@@ -83,6 +83,9 @@ use proximadb_runtime::HybridPort;
 pub struct RestHybridPortImpl {
     vector_ops: Arc<dyn proximadb_runtime::VectorOpsPort>,
     indexes: HybridFullTextIndexMap,
+    /// Resolves the target collection within the request tenant before either
+    /// leg runs. `None` (tests) skips the check.
+    collection_port: Option<Arc<dyn proximadb_runtime::CollectionPort>>,
 }
 
 impl RestHybridPortImpl {
@@ -93,7 +96,18 @@ impl RestHybridPortImpl {
         Self {
             vector_ops,
             indexes,
+            collection_port: None,
         }
+    }
+
+    /// Resolve the target collection within the request tenant before either
+    /// leg (BM25 or vector) runs.
+    pub fn with_collection_port(
+        mut self,
+        collection_port: Arc<dyn proximadb_runtime::CollectionPort>,
+    ) -> Self {
+        self.collection_port = Some(collection_port);
+        self
     }
 }
 
@@ -106,6 +120,28 @@ impl HybridPort for RestHybridPortImpl {
     ) -> Result<HybridFusionSearchResponse> {
         let start = std::time::Instant::now();
         let top_k = normalize_top_k(request.top_k as usize);
+
+        // Both legs read the collection named in the request: resolve it
+        // within the request tenant first (absent ⇒ the default tenant). A
+        // collection the tenant may not resolve is answered exactly like a
+        // missing one, before any BM25 or vector work.
+        if let Some(collection_port) = &self.collection_port {
+            let request_tenant = tenant_id
+                .as_deref()
+                .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+            if collection_port
+                .get_collection(&request.collection, Some(request_tenant))
+                .await?
+                .is_none()
+            {
+                return Err(
+                    crate::services::operations::vectors::CollectionNotFound::new(
+                        request.collection.as_str(),
+                    )
+                    .into(),
+                );
+            }
+        }
 
         // ── Vector search ──────────────────────────────────────────────────
         let vector_start = std::time::Instant::now();
@@ -127,9 +163,17 @@ impl HybridPort for RestHybridPortImpl {
                 distance_metric_override: None,
                 search_optimization: None,
             };
+            // The vector leg resolves the collection within the request tenant
+            // (absent ⇒ the default tenant), like every request surface.
+            let request_tenant = tenant_id
+                .as_deref()
+                .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
             let resp = self
                 .vector_ops
-                .search(search_request, proximadb_runtime::PortIdentity::anonymous())
+                .search(
+                    search_request,
+                    proximadb_runtime::PortIdentity::for_tenant(request_tenant),
+                )
                 .await
                 // `context`, not `anyhow!("..: {}", e)`: re-formatting flattened
                 // the typed client-argument cause (wrong-dimension vector,

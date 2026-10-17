@@ -423,6 +423,22 @@ pub fn create_router() -> Router<UnifiedQueryApiState> {
             delete(delete_prepared_statement),
         )
         .route("/prepared/stats", post(get_prepared_stats))
+        .layer(axum::middleware::from_fn(scope_request_tenant))
+}
+
+/// Run each unified-query request with its tenant as the request tenant, so
+/// the facade and federated executor resolve collections within it (absent ⇒
+/// the default tenant, as for every request surface).
+async fn scope_request_tenant(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let tenant = request
+        .extensions()
+        .get::<crate::network::middleware::tenant::TenantContext>()
+        .map(|tenant| tenant.tenant_id.clone())
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    crate::query::request_scope::with_request_tenant(Some(tenant), next.run(request)).await
 }
 
 /// Execute a unified SQL-like query

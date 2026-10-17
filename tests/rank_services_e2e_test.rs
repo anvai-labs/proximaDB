@@ -119,6 +119,7 @@ async fn rest_install_then_search_emits_spec_metrics() -> Result<(), Box<dyn std
     // ── 3. Issue a rank search through the same code path REST + gRPC + Arrow
     //    Flight share at the production seam. ─────────────────────────────────
     let request = RankSearchRequest {
+        request_tenant: None,
         collection: "docs".to_string(),
         query_vector: vec![0.1, 0.2],
         query_text: Some("body content".to_string()),

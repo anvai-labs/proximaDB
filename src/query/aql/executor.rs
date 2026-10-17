@@ -46,8 +46,21 @@ impl AqlExecutor {
     }
 
     /// Execute an AQL query and return results along with an audit trail.
+    /// Internal (unscoped) execution; request handlers use
+    /// [`Self::execute_for_tenant`].
     pub async fn execute(&self, query: AqlQuery) -> Result<(AqlResult, AuditTrail)> {
+        self.execute_for_tenant(query, None).await
+    }
+
+    /// Execute an AQL query for a request acting as `request_tenant`: sources
+    /// resolve collections within that tenant.
+    pub async fn execute_for_tenant(
+        &self,
+        query: AqlQuery,
+        request_tenant: Option<String>,
+    ) -> Result<(AqlResult, AuditTrail)> {
         let mut ctx = AuditContext::new();
+        ctx.request_tenant = request_tenant;
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

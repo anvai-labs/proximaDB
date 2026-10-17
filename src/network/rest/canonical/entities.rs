@@ -276,8 +276,14 @@ pub struct DeleteEntityQuery {
 pub async fn search_entities(
     Path(collection_id): Path<String>,
     State(state): State<EntityApiState>,
+    tenant: Option<axum::Extension<crate::network::middleware::tenant::TenantContext>>,
     Json(request): Json<SearchEntitiesRequest>,
 ) -> impl IntoResponse {
+    // The backing collection is resolved within the request tenant (absent ⇒
+    // the default tenant).
+    let request_tenant = tenant
+        .map(|axum::Extension(t)| t.tenant_id)
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
     let top_k = request.top_k.unwrap_or(10);
 
     info!(
@@ -361,7 +367,13 @@ pub async fn search_entities(
     // It did not; the field was never accepted on the REST surface.)
     match state
         .store
-        .search_entities(&collection_id, query_vector, metadata_filter, top_k)
+        .search_entities_for_tenant(
+            &collection_id,
+            Some(&request_tenant),
+            query_vector,
+            metadata_filter,
+            top_k,
+        )
         .await
     {
         Ok(results) => {
@@ -384,6 +396,15 @@ pub async fn search_entities(
             }))
         }
         Err(e) => {
+            if let Some(missing) = crate::services::operations::vectors::collection_not_found(&e) {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: "Collection not found".to_string(),
+                        details: Some(missing.to_string()),
+                    }),
+                ));
+            }
             // Wrong-dimension / empty / non-finite query vector or over-cap
             // top_k: the client's argument (TD-SECSCAN-1 §5), not a server fault.
             if let Some(message) = crate::services::operations::vectors::client_argument_message(&e)

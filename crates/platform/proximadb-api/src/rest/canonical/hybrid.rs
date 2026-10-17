@@ -205,6 +205,10 @@ pub async fn hybrid_search(
             {
                 return Err(RestError::InvalidArgument(message));
             }
+            if let Some(missing) = proximadb_search_types::client_argument::collection_not_found(&e)
+            {
+                return Err(RestError::CollectionNotFound(missing.identifier.clone()));
+            }
             // Server fault: log the cause chain, return a stable message (the
             // response envelope carries the request id for correlation).
             error!("hybrid_search error: {:#}", e);

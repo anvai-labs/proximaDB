@@ -279,7 +279,10 @@ impl FederatedQueryContext {
 
         // Check cache first if enabled
         if let Some(ref cache) = self.cache {
-            let key = QueryKey::from_sql(sql);
+            let key = match crate::query::request_scope::current_request_tenant() {
+                Some(tenant) => QueryKey::from_sql_with_params(sql, &[tenant.as_str()]),
+                None => QueryKey::from_sql(sql),
+            };
             if let Some(cached) = cache.get(&key) {
                 debug!(
                     query_fingerprint = key.fingerprint,
@@ -322,7 +325,10 @@ impl FederatedQueryContext {
 
             // Cache the result if caching is enabled
             if let Some(ref cache) = self.cache {
-                let key = QueryKey::from_sql(sql);
+                let key = match crate::query::request_scope::current_request_tenant() {
+                Some(tenant) => QueryKey::from_sql_with_params(sql, &[tenant.as_str()]),
+                None => QueryKey::from_sql(sql),
+            };
                 // Clone the result for caching
                 let cached_result = ExecutionResult {
                     batches: result.batches.clone(),

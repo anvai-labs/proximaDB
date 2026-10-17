@@ -920,9 +920,58 @@ fn default_graph_branch_merge_dry_run() -> bool {
 /// ORDER BY score ASC
 /// LIMIT 10
 /// ```
+/// Ensure every request carries a tenant: the one the tenant middleware
+/// resolved, or the default tenant when none was. Never overwrites a resolved
+/// tenant. Mirrors it into the API crate's tenant extension.
+async fn default_tenant_if_unresolved(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let tenant = match request.extensions().get::<TenantContext>() {
+        Some(tenant) => tenant.clone(),
+        None => {
+            let tenant = TenantContext::new(
+                proximadb_tenant::DEFAULT_TENANT,
+                crate::network::middleware::tenant::TenantIdSource::Default,
+            );
+            request.extensions_mut().insert(tenant.clone());
+            tenant
+        }
+    };
+    if request
+        .extensions()
+        .get::<proximadb_api::rest::TenantContext>()
+        .is_none()
+    {
+        request
+            .extensions_mut()
+            .insert(proximadb_api::rest::TenantContext {
+                tenant_id: tenant.tenant_id.clone(),
+            });
+    }
+    next.run(request).await
+}
+
 pub async fn execute_sql(
     State(state): State<AppState>,
+    tenant: Option<Extension<crate::network::middleware::tenant::TenantContext>>,
     Json(request): Json<SqlQueryRequest>,
+) -> ApiResult<JsonResponse<serde_json::Value>> {
+    // Collections are resolved within the request tenant (absent ⇒ the
+    // default tenant) for the whole statement, through every query layer.
+    let request_tenant = tenant
+        .map(|Extension(t)| t.tenant_id)
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    crate::query::request_scope::with_request_tenant(
+        Some(request_tenant),
+        execute_sql_in_scope(state, request),
+    )
+    .await
+}
+
+async fn execute_sql_in_scope(
+    state: AppState,
+    request: SqlQueryRequest,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
     let start_time = std::time::Instant::now();
     let request_id = Uuid::new_v4().to_string();
@@ -1026,6 +1075,8 @@ pub async fn execute_sql(
     // Optional: read seeding strategy from HTTP header (X-Seeding-Strategy) or from request.parameters via a special key
     let _seeding_strategy = crate::query::execution::SeedingStrategy::Average; // default
 
+    let scoped_tenant = crate::query::request_scope::current_request_tenant()
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
     let query_with_hint = if let Some(seeding) = &request.seeding {
         let seed_upper = seeding.to_ascii_uppercase();
         format!("-- SEEDING: {}\n{}", seed_upper, request.query)
@@ -1045,7 +1096,7 @@ pub async fn execute_sql(
             query_with_hint,
             sql_params_to_proxima_values(request.parameters.clone()),
             request.collection,
-            proximadb_runtime::PortIdentity::anonymous(),
+            proximadb_runtime::PortIdentity::for_tenant(&scoped_tenant),
         )
         .await
     {
@@ -1545,12 +1596,21 @@ fn operator_and_control_v2_routes() -> axum::Router<AppState> {
             "/api/v2/rank/search",
             post(
                 |State(state): State<AppState>,
+                 tenant: Option<
+                    axum::Extension<crate::network::middleware::tenant::TenantContext>,
+                >,
                  payload: Result<
                     Json<crate::network::rest::canonical::rank::RankSearchRequest>,
                     axum::extract::rejection::JsonRejection,
                 >| async move {
                     match payload {
-                        Ok(Json(req)) => {
+                        Ok(Json(mut req)) => {
+                            // Candidates resolve the collection within the
+                            // request tenant (absent ⇒ the default tenant).
+                            req.request_tenant =
+                                Some(tenant.map(|axum::Extension(t)| t.tenant_id).unwrap_or_else(
+                                    || proximadb_tenant::DEFAULT_TENANT.to_string(),
+                                ));
                             match crate::network::rest::canonical::rank::rank_search_dispatch(
                                 state, req,
                             )
@@ -1792,8 +1852,11 @@ pub fn create_router(state: AppState) -> axum::Router {
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())));
         let vector_ops: Arc<dyn proximadb_runtime::VectorOpsPort> =
             state.vector_operations_service.clone();
-        let hybrid_port: Arc<dyn proximadb_runtime::HybridPort> =
-            Arc::new(RestHybridPortImpl::new(vector_ops, indexes.clone()));
+        let hybrid_port: Arc<dyn proximadb_runtime::HybridPort> = Arc::new(
+            RestHybridPortImpl::new(vector_ops, indexes.clone()).with_collection_port(
+                state.collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>,
+            ),
+        );
         let bm25_port: Arc<dyn proximadb_runtime::BM25IndexPort> =
             Arc::new(Bm25IndexPortImpl::new(indexes));
         let hybrid_state = HybridRestState {
@@ -1995,18 +2058,13 @@ pub fn create_router(state: AppState) -> axum::Router {
         warn!("⚠️ LLM engine not available; Natural Language (AV-SQL) endpoints disabled");
     }
 
-    // Convert to Router<()> by providing state, with default tenant context for all routes
-    let default_tenant = TenantContext::new(
-        "default",
-        crate::network::middleware::tenant::TenantIdSource::Default,
-    );
-    let default_api_tenant = proximadb_api::rest::TenantContext {
-        tenant_id: "default".to_string(),
-    };
+    // Convert to Router<()> by providing state. Routes get the per-request
+    // tenant resolved by the tenant middleware; the default tenant only when
+    // none was resolved (an unconditional Extension layer here would
+    // overwrite the request's tenant on every route below).
     let router = router
         .with_state(state)
-        .layer(Extension(default_tenant))
-        .layer(axum::Extension(default_api_tenant))
+        .layer(axum::middleware::from_fn(default_tenant_if_unresolved))
         .layer(axum::middleware::from_fn(add_rest_v1_deprecation_headers))
         // Merged AFTER the layers above so the per-request tenant from the
         // tenant middleware is not clobbered by the default-tenant Extension

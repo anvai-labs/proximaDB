@@ -893,31 +893,23 @@ impl VectorOperationsService {
         collection_id: &str,
         tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
     ) -> Result<crate::core::stable_id::CollectionObjectId> {
-        let collection = if self.tenant_manager.is_some() {
-            let tenant_ctx = tenant_context.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Tenant context is required for collection '{}' in multi-tenant mode",
-                    collection_id
-                )
-            })?;
-            let collection = self
+        if self.tenant_manager.is_some() && tenant_context.is_none() {
+            return Err(anyhow::anyhow!(
+                "Tenant context is required for collection '{}' in multi-tenant mode",
+                collection_id
+            ));
+        }
+        // A request (tenant context present) resolves the collection within its
+        // tenant: the collection port applies the one ownership rule and
+        // answers a collection this tenant may not resolve exactly like a
+        // missing one. No tenant context ⇒ internal/system lookup.
+        let collection = match tenant_context {
+            Some(tenant_ctx) => self
                 .collection_port
                 .get_collection(collection_id, Some(&tenant_ctx.tenant_id))
-                .await?;
-            let Some(collection) = collection else {
-                warn!(
-                    "🚨 Tenant '{}' attempted to access collection '{}' without authorization",
-                    tenant_ctx.tenant_id, collection_id
-                );
-                return Err(anyhow::anyhow!(
-                    "Collection '{}' is not accessible for tenant '{}'",
-                    collection_id,
-                    tenant_ctx.tenant_id
-                ));
-            };
-            collection
-        } else {
-            (*self.get_or_load_collection(collection_id).await?).clone()
+                .await?
+                .ok_or_else(|| super::input_validation::CollectionNotFound::new(collection_id))?,
+            None => (*self.get_or_load_collection(collection_id).await?).clone(),
         };
 
         if self.rbac_enforcer.is_some()
@@ -3013,6 +3005,46 @@ impl VectorOperationsService {
         Ok(results)
     }
 
+    /// [`Self::unified_search_v1`] for a request acting as `request_tenant`:
+    /// the collection is resolved within that tenant first (a collection the
+    /// tenant may not resolve is answered exactly like a missing one), then
+    /// searched by its canonical id. `None` = internal, unscoped.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn unified_search_v1_for_tenant(
+        &self,
+        collection_id: &str,
+        request_tenant: Option<&str>,
+        query_vector: Vec<f32>,
+        k: usize,
+        filter: Option<FilterExpression>,
+        config: Option<UnifiedSearchConfig>,
+        subject: Option<&str>,
+        tenant_stable_id: Option<u64>,
+        auth_class: proximadb_tenant::AuthClass,
+    ) -> Result<Vec<crate::proto::proximadb_v1::SearchResult>> {
+        let resolved = match request_tenant {
+            Some(tenant) => self
+                .collection_port
+                .get_collection(collection_id, Some(tenant))
+                .await?
+                .map(|collection| collection.id)
+                .ok_or_else(|| super::input_validation::CollectionNotFound::new(collection_id))?,
+            None => collection_id.to_string(),
+        };
+        self.unified_search_v1(
+            &resolved,
+            query_vector,
+            k,
+            filter,
+            config,
+            subject,
+            tenant_stable_id,
+            auth_class,
+        )
+        .await
+        .map_err(|e| super::input_validation::label_client_collection(e, collection_id))
+    }
+
     /// Shared implementation for the v1 path and its hints-aware
     /// sibling. Returns the v1 result envelope plus the Phase 5
     /// VectorObjectEconomyExplain populated by the shared delta-merge
@@ -3299,11 +3331,7 @@ impl VectorOperationsService {
                     .await?
                     .map(|collection| collection.id)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Collection '{}' is not accessible for tenant '{}'",
-                            collection_id,
-                            context.tenant_id
-                        )
+                        super::input_validation::CollectionNotFound::new(collection_id)
                     })?
             }
             _ => collection_id.to_string(),
@@ -6744,12 +6772,17 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
         // The identifier as the caller supplied it: the only collection
         // reference a client-facing error may echo (TD-SECSCAN-1 §5).
         let requested_collection = request.collection_id.clone();
-        if let Some(tid) = tenant_id.filter(|t| !t.is_empty())
-            && let Ok(Some(collection)) = self
+        // A request resolves the collection within its tenant; a collection
+        // this tenant may not resolve is answered exactly like a missing one
+        // (no fallback to an unscoped lookup).
+        if let Some(tid) = tenant_id.filter(|t| !t.is_empty()) {
+            let collection = self
                 .collection_port
                 .get_collection(&request.collection_id, Some(tid))
-                .await
-        {
+                .await?
+                .ok_or_else(|| {
+                    super::input_validation::CollectionNotFound::new(requested_collection.as_str())
+                })?;
             request.collection_id = collection.id;
         }
         self.search_v1(request, identity)

@@ -2527,6 +2527,7 @@ impl SharedServices {
         // singleton `RankServices` that REST / gRPC / Arrow Flight share.
         let (rank_services, rank_profile_store) = build_rank_services(
             vector_operations_service.clone() as Arc<dyn proximadb_runtime::VectorOpsPort>,
+            Some(collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>),
             fulltext_indexes.clone(),
             canonical_wal_appender.clone(),
             opt_config,
@@ -2544,6 +2545,25 @@ impl SharedServices {
         // restart on both engines. Threaded into every per-connection
         // `DdlService` (pgwire) so new `CREATE FUNCTION` statements persist here.
         let function_store = build_function_store(canonical_wal_appender.clone()).await;
+
+        // Backfill collection owner (non-fatal, background): record an owner on
+        // collections created before ownership was recorded, so each resolves
+        // within its tenant. Until it runs (or if it fails) such a collection
+        // belongs to the default tenant.
+        {
+            let store = collection_service.clone();
+            let sampler = vector_operations_service.clone();
+            tokio::spawn(async move {
+                let report =
+                    crate::services::collection::owner_backfill::backfill_collection_owners(
+                        store.as_ref(),
+                        sampler.as_ref(),
+                        crate::services::collection::owner_backfill::DEFAULT_SAMPLE_CAP,
+                    )
+                    .await;
+                info!(?report, "collection owner backfill finished");
+            });
+        }
 
         // Create FederatedQueryContext for SQL with multi-model extensions
         debug!("🔧 SharedServices::new - Creating FederatedQueryContext...");
@@ -3384,6 +3404,7 @@ impl SharedServices {
 /// the server down.
 async fn build_rank_services(
     vector_ops: Arc<dyn proximadb_runtime::VectorOpsPort>,
+    collection_port: Option<Arc<dyn proximadb_runtime::CollectionPort>>,
     fulltext_indexes: crate::network::hybrid_search::HybridFullTextIndexMap,
     canonical_wal_appender: Option<Arc<crate::services::FramedTableWalAppender>>,
     opt_config: Option<&crate::core::config::Config>,
@@ -3423,6 +3444,7 @@ async fn build_rank_services(
 
     build_rank_services_with_appender(
         vector_ops,
+        collection_port,
         fulltext_indexes,
         store_appender,
         &recovered_entries,
@@ -3517,6 +3539,7 @@ async fn build_function_store(
 /// round-trip.
 async fn build_rank_services_with_appender(
     vector_ops: Arc<dyn proximadb_runtime::VectorOpsPort>,
+    collection_port: Option<Arc<dyn proximadb_runtime::CollectionPort>>,
     fulltext_indexes: crate::network::hybrid_search::HybridFullTextIndexMap,
     store_appender: Arc<dyn crate::services::record_store::TableWalAppender>,
     recovered_entries: &[proximadb_storage_common::CanonicalWalEntry],
@@ -3538,7 +3561,11 @@ async fn build_rank_services_with_appender(
     // Build the production hybrid backend over the shared vector port + the
     // shared per-collection BM25 index map. Both surfaces are already
     // SharedServices fields.
-    let backend = Arc::new(ProductionHybridBackend::new(vector_ops, fulltext_indexes));
+    let mut backend = ProductionHybridBackend::new(vector_ops, fulltext_indexes);
+    if let Some(collection_port) = collection_port {
+        backend = backend.with_collection_port(collection_port);
+    }
+    let backend = Arc::new(backend);
     let adapter = Arc::new(HybridCoordinatorAdapter::new(
         FusionStrategy::ReciprocalRank { k: 60 },
         backend,
@@ -3703,6 +3730,7 @@ heap_size = 50
         let appender: Arc<dyn TableWalAppender> = Arc::new(MemoryTableWalAppender::new());
         let (services, store) = build_rank_services_with_appender(
             Arc::new(NoopVectorPort),
+            None,
             empty_indexes(),
             appender,
             &[],
@@ -3738,6 +3766,7 @@ heap_size = 50
         let builder_appender: Arc<dyn TableWalAppender> = memory_appender.clone();
         let (services, store) = build_rank_services_with_appender(
             Arc::new(NoopVectorPort),
+            None,
             empty_indexes(),
             builder_appender,
             &entries,
@@ -3772,6 +3801,7 @@ heap_size = 50
         let builder_appender: Arc<dyn TableWalAppender> = memory_appender.clone();
         let (services, store) = build_rank_services_with_appender(
             Arc::new(NoopVectorPort),
+            None,
             empty_indexes(),
             builder_appender,
             &entries,

@@ -413,15 +413,26 @@ impl RecordOpsService {
         debug!("Collection ID cache cleared");
     }
 
+    /// Resolve a client identifier to the canonical collection id for a request
+    /// acting as `request_tenant`: a collection that tenant may not resolve is
+    /// `None`, exactly like a missing one (the one ownership rule). `None`
+    /// tenant (and no tenant context) is an internal lookup.
     pub(crate) async fn resolve_collection_id_internal(
         &self,
         collection_identifier: &str,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&str>,
     ) -> Result<Option<String>> {
         if let Some(tenant_ctx) = tenant_context {
             Ok(self
                 .collection_service
-                .get_collection_with_tenant_context(collection_identifier, Some(tenant_ctx))
+                .collection_for_tenant(collection_identifier, Some(&tenant_ctx.tenant_id))
+                .await?
+                .map(|collection| collection.id))
+        } else if request_tenant.is_some() {
+            Ok(self
+                .collection_service
+                .collection_for_tenant(collection_identifier, request_tenant)
                 .await?
                 .map(|collection| collection.id))
         } else {
@@ -442,11 +453,15 @@ impl RecordOpsService {
         &self,
         collection_identifier: &str,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&str>,
     ) -> Result<Option<(String, String)>> {
-        if let Some(tenant_ctx) = tenant_context {
+        let scope = tenant_context
+            .map(|ctx| ctx.tenant_id.as_str())
+            .or(request_tenant);
+        if scope.is_some() {
             Ok(self
                 .collection_service
-                .get_collection_with_tenant_context(collection_identifier, Some(tenant_ctx))
+                .collection_for_tenant(collection_identifier, scope)
                 .await?
                 .map(|collection| {
                     let name = collection
@@ -472,8 +487,12 @@ impl RecordOpsService {
         tenant_id: Option<&str>,
     ) -> Result<Option<(String, String)>> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
-        self.resolve_collection_id_and_name(collection_identifier, tenant_context.as_ref())
-            .await
+        self.resolve_collection_id_and_name(
+            collection_identifier,
+            tenant_context.as_ref(),
+            tenant_id,
+        )
+        .await
     }
 
     // ---- precision coercion (TD-080/TD-082) ----
@@ -555,7 +574,11 @@ impl RecordOpsService {
     ) -> Result<BatchOperationResult> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+            .resolve_collection_id_and_name(
+                &request.collection_id,
+                tenant_context.as_ref(),
+                tenant_id,
+            )
             .await?
         {
             Some((id, name)) => (id, name),
@@ -610,7 +633,11 @@ impl RecordOpsService {
     ) -> Result<BatchOperationResult> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+            .resolve_collection_id_and_name(
+                &request.collection_id,
+                tenant_context.as_ref(),
+                tenant_id,
+            )
             .await?
         {
             Some((id, name)) => (id, name),
@@ -693,7 +720,11 @@ impl RecordOpsService {
     ) -> Result<BatchOperationResult> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+            .resolve_collection_id_and_name(
+                &request.collection_id,
+                tenant_context.as_ref(),
+                tenant_id,
+            )
             .await?
         {
             Some((id, name)) => (id, name),
@@ -803,7 +834,11 @@ impl RecordOpsService {
         let requested_collection = request.collection_id.clone();
         let request = RichSearchRequest {
             collection_id: match self
-                .resolve_collection_id_internal(&request.collection_id, tenant_context.as_ref())
+                .resolve_collection_id_internal(
+                    &request.collection_id,
+                    tenant_context.as_ref(),
+                    identity.tenant_id,
+                )
                 .await?
             {
                 Some(id) => id,
@@ -842,7 +877,11 @@ impl RecordOpsService {
             .load_tenant_context(identity.tenant_id)?;
         let request = RichRecordGetRequest {
             collection_id: match self
-                .resolve_collection_id_internal(&request.collection_id, tenant_context.as_ref())
+                .resolve_collection_id_internal(
+                    &request.collection_id,
+                    tenant_context.as_ref(),
+                    identity.tenant_id,
+                )
                 .await?
             {
                 Some(id) => id,
@@ -870,7 +909,7 @@ impl RecordOpsService {
     ) -> Result<Option<proximadb_records::ProximaRecord>> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let resolved = match self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant_id)
             .await?
         {
             Some(id) => id,
@@ -898,7 +937,7 @@ impl RecordOpsService {
     ) -> Result<(Vec<ProximaRecord>, Option<ScanCursor>)> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let resolved_id = match self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant_id)
             .await?
         {
             Some(id) => id,
@@ -1084,7 +1123,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
             Err(_) => return false,
         };
         matches!(
-            self.resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            self.resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant)
                 .await,
             Ok(Some(_))
         )
@@ -1108,6 +1147,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
                 collection_id,
                 dimension,
                 tenant_context.as_ref(),
+                tenant,
                 promote_keys,
             )
             .await
@@ -1163,7 +1203,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
         let tenant_context = self.collection_service.load_tenant_context(tenant)?;
         // Unknown collection ⇒ empty (mixed-safe: the caller falls back / merges nothing).
         let Some(resolved_id) = self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant)
             .await?
         else {
             return Ok(Vec::new());

@@ -280,8 +280,9 @@ impl AqlSource for MemoryAqlSource {
         let start = Instant::now();
         let search_results = self
             .vector_ops
-            .unified_search_v1(
+            .unified_search_v1_for_tenant(
                 &scope.collection,
+                ctx.request_tenant.as_deref(),
                 scope.query_vector.clone(),
                 recall_k,
                 scope_filter,

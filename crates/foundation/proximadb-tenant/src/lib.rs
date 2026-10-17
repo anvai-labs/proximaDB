@@ -447,3 +447,13 @@ pub use claim_vocabulary::{
     TIER_CLAIM_PG_PARAM, legacy_alias_present, tenant_claim, tenant_claim_with_legacy_aliases,
     tier_claim, tier_claim_pg,
 };
+
+// ============================================================================
+// Collection ownership: the one rule for which request tenant may resolve a
+// stored collection (search, get/scan, collection GET/list).
+// ============================================================================
+pub mod ownership;
+pub use ownership::{
+    CollectionOwner, collection_owner, collection_visible_to, effective_owner,
+    stamp_collection_owner,
+};

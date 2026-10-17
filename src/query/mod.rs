@@ -142,6 +142,7 @@ pub mod prepared; // Prepared statements for parse-once-execute-many pattern
 pub mod query_optimizer;
 pub mod query_router; // Query routing (Issue #46, SB-16)
 pub mod read_route; // Read-side route/explain contract for DataFusion/Ballista execution
+pub mod request_scope; // The request tenant carried through the facade + federated executor
 pub mod route_cost_model; // Co-design C4: trace-driven route cost model (feeds the scheduler)
 pub mod unified_query_port_impl; // Root-crate implementation of UnifiedQueryPort
 pub use unified_query_port_impl::UnifiedQueryPortImpl;

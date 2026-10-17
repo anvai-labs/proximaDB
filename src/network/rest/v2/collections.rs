@@ -1024,8 +1024,11 @@ pub async fn get_collection_v2(
         .await
     {
         Ok(resp) => {
-            // Extract collection info from response
-            let collection = resp.collection.unwrap_or_default();
+            // A collection that does not resolve for this request (missing, or
+            // not resolvable by its tenant) is 404, never a defaulted body.
+            let Some(collection) = resp.collection else {
+                return Err(ApiError::CollectionNotFound(collection_id));
+            };
             let config = collection.config.unwrap_or_default();
             // Read the count off the Option *before* unwrapping: an absent stats
             // block means "unknown", and `unwrap_or_default()` below would turn

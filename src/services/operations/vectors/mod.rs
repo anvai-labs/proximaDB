@@ -71,8 +71,8 @@ pub use config::{SearchPlanHints, UnifiedSearchConfig};
 #[cfg(feature = "axis")]
 pub use hybrid::build_axis_hybrid_query;
 pub use input_validation::{
-    InvalidQueryVector, QueryVectorProblem, client_argument_message, is_client_argument_error,
-    label_client_collection,
+    CollectionNotFound, InvalidQueryVector, QueryVectorProblem, client_argument_message,
+    collection_not_found, is_client_argument_error, label_client_collection,
 };
 pub(crate) use legacy::rich_filters_to_filter_expression;
 pub use legacy::{

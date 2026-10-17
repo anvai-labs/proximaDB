@@ -1679,6 +1679,14 @@ impl FlightService for ProximaFlightService {
                 .map_err(|e| {
                     // Wrong-dimension / empty / non-finite query vector or
                     // over-cap top_k: the client's argument (TD-SECSCAN-1 §5).
+                    if let Some(missing) =
+                        crate::services::operations::vectors::collection_not_found(&e)
+                    {
+                        return TonicStatus::not_found(format!(
+                            "Collection not found: {}",
+                            missing.identifier
+                        ));
+                    }
                     match crate::services::operations::vectors::client_argument_message(&e) {
                         Some(message) => TonicStatus::invalid_argument(message),
                         None => TonicStatus::internal(format!("Search failed: {}", e)),

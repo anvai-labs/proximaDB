@@ -237,6 +237,11 @@ pub async fn fusion_search_v2(
             // its cause (TD-SECSCAN-1 §5). Anything else is a server fault: the
             // full cause chain is logged server-side and the client gets a
             // stable generic message (internal detail stays out of the body).
+            if let Some(missing) =
+                crate::services::operations::vectors::collection_not_found(&error)
+            {
+                return ApiError::CollectionNotFound(missing.identifier.clone());
+            }
             match crate::services::operations::vectors::client_argument_message(&error) {
                 Some(message) => ApiError::InvalidArgument(format!("fusion search: {message}")),
                 None => {

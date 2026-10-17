@@ -3,6 +3,7 @@
 //! This crate owns host/runtime policy that composes lower contract crates without
 //! pushing system inspection, tracing, or bootstrap behavior into foundation crates.
 
+mod anonymous_identity_guard;
 pub mod batch_result;
 pub mod bm25_port;
 pub mod bootstrap_config;

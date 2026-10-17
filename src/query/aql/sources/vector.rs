@@ -164,8 +164,9 @@ impl AqlSource for VectorAqlSource {
         // For AQL, we use the vector_ops directly.
         let search_results = self
             .vector_ops
-            .unified_search_v1(
+            .unified_search_v1_for_tenant(
                 &collection,
+                ctx.request_tenant.as_deref(),
                 vector,
                 top_k as usize,
                 None, // No filter pushdown implemented in this skeleton
