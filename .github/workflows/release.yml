@@ -1145,6 +1145,10 @@ jobs:
         run: |
           npm ci
           npm run build
+          # Every path package.json routes a consumer to must be in the tarball,
+          # require() and import() must both load, VERSION == package.json
+          # (v0.4.1 shipped an `import` target that did not exist).
+          npx vitest run tests/package_entry.test.ts
 
       # Idempotent: the tag's version may already be on npm (manual bootstrap
       # publish, or a re-run after a partial failure) — skip, don't fail.

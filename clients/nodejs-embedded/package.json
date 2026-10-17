@@ -17,7 +17,7 @@
     "src"
   ],
   "scripts": {
-    "build": "tsc && tsc -p tsconfig.esm.json",
+    "build": "tsc && node scripts/write-esm-entry.mjs",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build",
     "lint": "tsc --noEmit",

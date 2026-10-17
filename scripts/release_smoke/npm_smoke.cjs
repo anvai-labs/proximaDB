@@ -41,7 +41,9 @@ async function retry(fn, ms = 10000) {
   const resolved = require.resolve(PKG);
   if (!resolved.includes(path.join("node_modules", PKG))) fail(`${PKG} resolved to ${resolved}, not the registry install`);
 
-  const { connectRest } = require(PKG);
+  const { connectRest, VERSION } = require(PKG);
+  // v0.4.1 exported VERSION = "1.0.0" while publishing as 0.4.1.
+  if (VERSION !== want) fail(`exported VERSION ${VERSION} != ${want}`);
   const client = connectRest(baseUrl);
   const steps = [];
 

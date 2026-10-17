@@ -1762,6 +1762,9 @@ jobs:
           go test -v -count=1 -run '^TestOpenAPIContract|MatchesSpec|AllV2OperationsCovered' \
             ./proximadb/internal/rest/...
 
+      # `npm test` includes tests/package_entry.test.ts: every exports/main/
+      # module/types path must be in `npm pack --dry-run --json`, and both the
+      # require() and import() entries must load.
       - name: TypeScript contract gate
         if: matrix.sdk == 'typescript'
         working-directory: clients/nodejs-embedded
