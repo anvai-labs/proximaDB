@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -491,6 +492,117 @@ class HomebrewVerdicts(unittest.TestCase):
         text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
         self.assertNotIn("sha256 will be updated after release", text)
         self.assertIn("scripts/release_homebrew_formula.py", text)
+
+
+GH_STUB = r"""#!/usr/bin/env python3
+import base64, json, os, sys
+state_path = os.environ["GH_STUB_STATE"]
+st = json.load(open(state_path))
+args = sys.argv[1:]
+open(os.environ["GH_STUB_LOG"], "a").write(" ".join(args) + "\n")
+def save(): json.dump(st, open(state_path, "w"))
+def fail(code): sys.stderr.write(f"gh: error (HTTP {code})\n"); sys.exit(1)
+if args[0] == "api":
+    path = next(a for a in args[1:] if a.startswith("repos/"))
+    method = args[args.index("-X") + 1] if "-X" in args else "GET"
+    if method != "GET":
+        if "contents/" in path: st["branch_file"] = True
+        save(); print("{}"); sys.exit(0)
+    if path.endswith("/git/ref/heads/main"):
+        shas = st["main_shas"]; sha = shas.pop(0) if len(shas) > 1 else shas[0]; save(); print(sha); sys.exit(0)
+    if "/git/ref/heads/" in path:
+        if st.get("branch_exists"): print("{}"); sys.exit(0)
+        fail(404)
+    if "/contents/" in path:
+        ref = path.split("ref=", 1)[1]
+        if ref.startswith("automation/"):
+            if st.get("branch_file"): print("blobsha"); sys.exit(0)
+            fail(404)
+        main = st["main_formula"]
+        if main in ("404", "500"): fail(int(main))
+        print(base64.b64encode(main.encode()).decode()); sys.exit(0)
+if args[:2] == ["pr", "list"]:
+    print(st.get("pr", "")); sys.exit(0)
+if args[:2] == ["pr", "create"]:
+    st["pr"] = "17"; save(); sys.exit(0)
+if args[:2] == ["pr", "view"]:
+    print(st["ci"]); sys.exit(0)
+if args[:2] == ["pr", "merge"]:
+    r = st["merges"].pop(0); save(); sys.exit(0 if r else 1)
+sys.exit(3)
+"""
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("base64"), "needs bash + base64")
+class HomebrewPublish(unittest.TestCase):
+    """scripts/release_homebrew_publish.sh against a stub `gh` (no network)."""
+
+    def _run(self, state: dict, token: str = "t"):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "bin").mkdir()
+        gh = tmp / "bin" / "gh"
+        gh.write_text(GH_STUB)
+        gh.chmod(0o755)
+        (tmp / "state.json").write_text(json.dumps(state))
+        (tmp / "new.rb").write_text("NEW FORMULA\n")
+        env = dict(os.environ, PATH=f"{tmp / 'bin'}:{os.environ['PATH']}", GH_TOKEN=token,
+                   GH_STUB_STATE=str(tmp / "state.json"), GH_STUB_LOG=str(tmp / "log"),
+                   HOMEBREW_POLL_SECONDS="0", HOMEBREW_CI_WAIT_MINUTES="1", GITHUB_STEP_SUMMARY=str(tmp / "sum"))
+        proc = subprocess.run(["bash", str(ROOT / "scripts/release_homebrew_publish.sh"), "o/tap",
+                               "Formula/proximadb.rb", "0.4.2", str(tmp / "new.rb"), "https://run"],
+                              capture_output=True, text=True, env=env, cwd=tmp, timeout=60)
+        log = (tmp / "log").read_text() if (tmp / "log").exists() else ""
+        return proc, log
+
+    def _state(self, **over):
+        st = {"main_shas": ["m1"], "main_formula": "OLD FORMULA\n", "ci": "SUCCESS", "merges": [True]}
+        st.update(over)
+        return st
+
+    def test_no_token_is_reported_not_published(self) -> None:
+        proc, log = self._run(self._state(), token="")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("NOT updated", proc.stdout)
+        self.assertEqual(log, "")
+
+    def test_happy_path_opens_pr_waits_and_merges(self) -> None:
+        proc, log = self._run(self._state())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("pr create", log)
+        self.assertIn("pr merge", log)
+
+    def test_main_already_serving_it_is_done(self) -> None:
+        proc, log = self._run(self._state(main_formula="NEW FORMULA\n"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("pr create", log)
+
+    def test_main_moved_during_ci_is_retried_from_new_main(self) -> None:
+        proc, log = self._run(self._state(main_shas=["m1", "m2", "m2", "m2"], merges=[False, True]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("main moved", proc.stdout)
+        self.assertEqual(log.count("pr merge"), 2)
+
+    def test_unmergeable_without_race_fails(self) -> None:
+        proc, _ = self._run(self._state(merges=[False]))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("main did not move", proc.stdout)
+
+    def test_red_tap_ci_fails(self) -> None:
+        proc, log = self._run(self._state(ci="FAILURE"))
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("pr merge", log)
+
+    def test_non_404_read_error_is_fatal_not_absent(self) -> None:
+        proc, log = self._run(self._state(main_formula="500"))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertNotIn("contents/Formula/proximadb.rb -f", log.replace("-X PUT ", ""))
+        self.assertNotIn("PUT", log)
+
+    def test_absent_formula_404_is_created(self) -> None:
+        proc, log = self._run(self._state(main_formula="404"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("-X PUT", log)
 
 
 class SummaryVerdicts(unittest.TestCase):

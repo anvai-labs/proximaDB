@@ -169,11 +169,20 @@ jobs:
 
       - name: Extract Version
         id: version
+        # Inputs reach the shell through env, never `${{ }}` interpolation: a
+        # dispatch input is attacker-shaped text, and interpolated into the
+        # script it is code. The version is then validated as semver.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_PRERELEASE: ${{ inputs.prerelease }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-            PRERELEASE="${{ inputs.prerelease }}"
-            DRY_RUN="${{ inputs.dry_run }}"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$IN_VERSION"
+            PRERELEASE="$IN_PRERELEASE"
+            DRY_RUN="$IN_DRY_RUN"
           else
             # Extract version from tag (remove 'v' prefix)
             VERSION="${GITHUB_REF#refs/tags/v}"
@@ -185,6 +194,12 @@ jobs:
             fi
             DRY_RUN="false"
           fi
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release version '${VERSION}' is not semver X.Y.Z[-pre]"
+            exit 1
+          fi
+          case "$PRERELEASE" in true|false) ;; *) echo "::error::prerelease must be true/false"; exit 1 ;; esac
+          case "$DRY_RUN" in true|false) ;; *) echo "::error::dry_run must be true/false"; exit 1 ;; esac
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
           echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
@@ -1313,12 +1328,17 @@ jobs:
         run: |
           set -euo pipefail
           # The tap is public: read its current formula without the tap token.
-          if gh api "repos/${TAP}/contents/${FORMULA}" --jq .content > tap.b64 2>/dev/null; then
+          # ONLY a 404 means "no formula yet"; any other error (rate limit,
+          # 5xx) fails here rather than resetting the tap to the template.
+          if gh api "repos/${TAP}/contents/${FORMULA}" --jq .content > tap.b64 2> tap.err; then
             base64 -d tap.b64 > tap-current.rb
             BASE=(--base tap-current.rb)
-          else
+          elif grep -q 'HTTP 404' tap.err; then
             echo "::warning::${TAP} has no ${FORMULA}; rendering a fresh formula"
             BASE=()
+          else
+            echo "::error::cannot read ${TAP}/${FORMULA}: $(cat tap.err)"
+            exit 1
           fi
           python3 scripts/release_homebrew_formula.py --repo "${{ github.repository }}" \
             --version "$VERSION" "${BASE[@]}" --out proximadb.rb
@@ -1334,55 +1354,8 @@ jobs:
       - name: Publish to the tap (PR, tap CI, merge)
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN is not set: ${TAP} was NOT updated to ${VERSION}."
-            {
-              echo "### Homebrew tap NOT updated"
-              echo "Secret \`HOMEBREW_TAP_TOKEN\` is missing (fine-grained PAT on ${TAP}: Contents + Pull requests read/write)."
-              echo "The rendered formula is the \`homebrew-formula\` artifact; the tap's update-data-tools workflow opens the same PR within 6h."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if [ -f tap-current.rb ] && cmp -s tap-current.rb proximadb.rb; then
-            echo "${TAP} already serves ${VERSION}"; exit 0
-          fi
-          BRANCH="automation/proximadb-v${VERSION}"
-          MAIN_SHA="$(gh api "repos/${TAP}/git/ref/heads/main" --jq .object.sha)"
-          if gh api "repos/${TAP}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/${TAP}/git/refs/heads/${BRANCH}" -f sha="$MAIN_SHA" -F force=true >/dev/null
-          else
-            gh api -X POST "repos/${TAP}/git/refs" -f ref="refs/heads/${BRANCH}" -f sha="$MAIN_SHA" >/dev/null
-          fi
-          ARGS=(-f message="proximadb v${VERSION}" -f branch="$BRANCH" -f content="$(base64 -w0 proximadb.rb)")
-          if BLOB="$(gh api "repos/${TAP}/contents/${FORMULA}?ref=${BRANCH}" --jq .sha 2>/dev/null)"; then
-            ARGS+=(-f sha="$BLOB")
-          fi
-          gh api -X PUT "repos/${TAP}/contents/${FORMULA}" "${ARGS[@]}" >/dev/null
-          PR="$(gh pr list -R "$TAP" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
-          if [ -z "$PR" ]; then
-            gh pr create -R "$TAP" --base main --head "$BRANCH" --title "proximadb v${VERSION}" \
-              --body "Automated from ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}: url + sha256 for the v${VERSION} linux x86_64 archive, verified against SHA256SUMS.txt and the downloaded bytes."
-            PR="$(gh pr list -R "$TAP" --head "$BRANCH" --state open --json number --jq '.[0].number')"
-          fi
-          echo "tap PR #${PR}; waiting for its CI Success (bounded)"
-          deadline=$(( $(date +%s) + 75 * 60 ))
-          while :; do
-            STATE="$(gh pr view -R "$TAP" "$PR" --json statusCheckRollup \
-              --jq '[.statusCheckRollup[] | select(.name == "CI Success")][0] | (.conclusion // .status // "")')"
-            case "$STATE" in
-              SUCCESS) break ;;
-              FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED|STARTUP_FAILURE)
-                echo "::error::${TAP} PR #${PR} CI Success concluded ${STATE}; the formula did not land"; exit 1 ;;
-            esac
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::${TAP} PR #${PR} CI Success not green within 75 min"; exit 1
-            fi
-            sleep 60
-          done
-          gh pr merge -R "$TAP" "$PR" --squash --delete-branch
-          echo "${TAP}: ${FORMULA} now serves ${VERSION} (PR #${PR})"
+        run: bash scripts/release_homebrew_publish.sh "$TAP" "$FORMULA" "$VERSION" proximadb.rb \
+          "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   # ============================================================================
   # DRY RUN SUMMARY - Report when running in dry-run mode
@@ -1587,8 +1560,12 @@ jobs:
   # long (150 min) and bounded.
   release-smoke:
     name: Release Smoke (evidence)
+    # `needs` orders the smoke after every publish; `always()` makes it run even
+    # when one of them failed (a Homebrew tap merge, an npm publish), so the
+    # evidence for every OTHER channel is still produced and the failed
+    # channel's own smoke job reports it. Pinned by scripts/check_release_smoke.py.
     needs: [prepare, create-release, verify-release, update-homebrew]
-    if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true'
+    if: always() && needs.create-release.result == 'success' && needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true'
     permissions:
       contents: read
       actions: read
