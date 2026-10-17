@@ -40,6 +40,7 @@ import datetime as _dt
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -88,31 +89,70 @@ def _newest(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(runs, key=lambda r: (r.get("created_at") or "", r.get("id") or 0))
 
 
-def _ci_runs(repo: str, head_sha: str) -> dict[str, Any]:
-    """Newest CI run for the qa push and for the qa -> main PR, with CI Success."""
+def pick_push_run(runs: list[dict[str, Any]], repo: str, head_sha: str) -> dict[str, Any] | None:
+    """Pure: the newest CI run for the push to THIS repo's `qa` at head_sha."""
+    return _newest([
+        r for r in runs
+        if r.get("event") == "push"
+        and r.get("head_branch") == "qa"
+        and r.get("head_sha") == head_sha
+        and ((r.get("head_repository") or {}).get("full_name") == repo)
+    ])
+
+
+def pick_pr_run(runs: list[dict[str, Any]], repo: str, pr: dict[str, Any]) -> dict[str, Any] | None:
+    """Pure: the newest CI run of the qa -> main PR ITSELF.
+
+    Not "any pull_request run whose head branch is called qa at this sha": a
+    fork's branch named `qa`, or another PR from the same head, could carry a
+    green run. A run counts only when its head is THIS repository's `qa` at the
+    PR's head sha, it was created while the PR was open (opened <= created <=
+    merged), and -- when GitHub lists the run's PRs -- that list names this PR.
+    """
+    opened, merged = pr.get("created_at") or "", pr.get("merged_at") or ""
+
+    def belongs(r: dict[str, Any]) -> bool:
+        if r.get("event") != "pull_request" or r.get("head_branch") != "qa":
+            return False
+        if r.get("head_sha") != pr.get("head_sha"):
+            return False
+        if (r.get("head_repository") or {}).get("full_name") != repo:
+            return False
+        created = r.get("created_at") or ""
+        if not (opened and merged and opened <= created <= merged):
+            return False
+        listed = [x.get("number") for x in (r.get("pull_requests") or [])]
+        return not listed or pr.get("number") in listed
+
+    return _newest([r for r in runs if belongs(r)])
+
+
+def _run_record(repo: str, run: dict[str, Any] | None) -> dict[str, Any] | None:
+    if run is None:
+        return None
+    return {
+        "run_id": run.get("id"),
+        "url": run.get("html_url"),
+        "status": run.get("status"),
+        "conclusion": run.get("conclusion"),
+        "run_attempt": run.get("run_attempt"),
+        "created_at": run.get("created_at"),
+        "updated_at": run.get("updated_at"),
+        "head_repository": (run.get("head_repository") or {}).get("full_name"),
+        "ci_success": _ci_success_job(repo, int(run["id"])),
+    }
+
+
+def _ci_runs(repo: str, pr: dict[str, Any]) -> dict[str, Any]:
+    """CI Success of the qa push run and of the qa -> main PR's own run."""
+    head_sha = pr["head_sha"]
     runs = gh_json(
-        f"repos/{repo}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={head_sha}&per_page=50"
+        f"repos/{repo}/actions/workflows/{CI_WORKFLOW}/runs?head_sha={head_sha}&per_page=100"
     ).get("workflow_runs", [])
-    out: dict[str, Any] = {}
-    for key, pick in (
-        ("push", lambda r: r.get("event") == "push" and r.get("head_branch") == "qa"),
-        ("pull_request", lambda r: r.get("event") == "pull_request" and r.get("head_branch") == "qa"),
-    ):
-        run = _newest([r for r in runs if pick(r)])
-        if run is None:
-            out[key] = None
-            continue
-        out[key] = {
-            "run_id": run.get("id"),
-            "url": run.get("html_url"),
-            "status": run.get("status"),
-            "conclusion": run.get("conclusion"),
-            "run_attempt": run.get("run_attempt"),
-            "created_at": run.get("created_at"),
-            "updated_at": run.get("updated_at"),
-            "ci_success": _ci_success_job(repo, int(run["id"])),
-        }
-    return out
+    return {
+        "push": _run_record(repo, pick_push_run(runs, repo, head_sha)),
+        "pull_request": _run_record(repo, pick_pr_run(runs, repo, pr)),
+    }
 
 
 def _prerelease(repo: str, sha: str) -> dict[str, Any]:
@@ -166,6 +206,7 @@ def _qa_pr(repo: str, sha: str) -> dict[str, Any] | None:
             pr.get("merged_at") is not None
             and (pr.get("base") or {}).get("ref") == "main"
             and (pr.get("head") or {}).get("ref") == "qa"
+            and ((pr.get("head") or {}).get("repo") or {}).get("full_name") == repo
             and pr.get("merge_commit_sha") == sha
         )
 
@@ -185,6 +226,7 @@ def _qa_pr(repo: str, sha: str) -> dict[str, Any] | None:
         "url": pr.get("html_url"),
         "head_sha": (pr.get("head") or {}).get("sha"),
         "base_sha": (pr.get("base") or {}).get("sha"),
+        "created_at": pr.get("created_at"),
         "merged_at": pr.get("merged_at"),
         "merged_by": (pr.get("merged_by") or {}).get("login"),
     }
@@ -214,7 +256,7 @@ def gather(repo: str, version: str) -> dict[str, Any]:
     head = (facts["qa_pr"] or {}).get("head_sha")
     if head:
         facts["qa_head_tree"] = gh_json(f"repos/{repo}/commits/{head}")["commit"]["tree"]["sha"]
-        facts["qa_ci"] = _ci_runs(repo, head)
+        facts["qa_ci"] = _ci_runs(repo, facts["qa_pr"])
     else:
         facts["qa_head_tree"] = None
         facts["qa_ci"] = {"push": None, "pull_request": None}
@@ -317,16 +359,24 @@ def load_overrides(path: pathlib.Path = OVERRIDES_FILE) -> list[dict[str, str]]:
     entries = doc.get("override", [])
     if not isinstance(entries, list):
         raise OverrideError(f"{path.name}: `override` must be an array of tables")
+    approvers = doc.get("approvers")
+    if entries and (not isinstance(approvers, list) or not approvers
+                    or not all(isinstance(a, str) and a.strip() for a in approvers)):
+        raise OverrideError(f"{path.name}: a non-empty top-level `approvers` list (GitHub logins) is required")
     seen: set[tuple[str, str]] = set()
     for i, e in enumerate(entries):
         where = f"{path.name} override #{i + 1}"
         for field in OVERRIDE_FIELDS:
             if not isinstance(e.get(field), str) or not e[field].strip():
                 raise OverrideError(f"{where}: `{field}` is required and must be a non-empty string")
+        if e["approver"] not in approvers:
+            raise OverrideError(f"{where}: approver `{e['approver']}` is not in `approvers` {approvers}")
         if e["check"] not in OVERRIDABLE:
             raise OverrideError(f"{where}: check `{e['check']}` is not overridable (only {sorted(OVERRIDABLE)})")
-        if not e["evidence"].startswith("https://"):
-            raise OverrideError(f"{where}: evidence must be an https URL of the failed run")
+        if evidence_run_id(e["evidence"]) is None:
+            raise OverrideError(
+                f"{where}: evidence must be a run URL https://github.com/<owner>/<repo>/actions/runs/<id>[/job/<id>]"
+            )
         if not _dt.date.fromisoformat(e["recorded"]):
             raise OverrideError(f"{where}: recorded must be YYYY-MM-DD")
         key = (e["version"], e["check"])
@@ -336,12 +386,30 @@ def load_overrides(path: pathlib.Path = OVERRIDES_FILE) -> list[dict[str, str]]:
     return entries
 
 
-def apply_overrides(checks: list[dict[str, Any]], version: str, entries: list[dict[str, str]]) -> list[str]:
+EVIDENCE_RE = re.compile(
+    r"^https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/actions/runs/(?P<run>[0-9]+)"
+    r"(?:/attempts/[0-9]+)?(?:/job/[0-9]+)?/?$"
+)
+
+
+def evidence_run_id(url: str, repo: str | None = None) -> int | None:
+    """The run id an evidence URL names, parsed (not substring-matched); None
+    when it is not a run URL, or not one of `repo` when given."""
+    m = EVIDENCE_RE.match(url.strip())
+    if m is None or (repo is not None and m.group("repo") != repo):
+        return None
+    return int(m.group("run"))
+
+
+def apply_overrides(checks: list[dict[str, Any]], version: str, entries: list[dict[str, str]],
+                    repo: str | None = None, merged_by: str | None = None) -> list[str]:
     """Pure: mark failed checks that a valid entry covers as overridden.
 
-    An override applies only to a check that FAILED, and only when its evidence
-    URL names the run id that failed. Returns problems (stale or mismatched
-    entries for this version), which the caller reports as failures.
+    An override applies only to a check that FAILED, only when its evidence URL
+    names exactly the run id that failed (in `repo`), and -- for `qa_pr_ci` --
+    only when the approver is the person who merged the qa -> main PR over the
+    red run. Returns problems (stale or mismatched entries for this version),
+    which the caller reports as failures.
     """
     problems: list[str] = []
     by_name = {c["name"]: c for c in checks}
@@ -353,9 +421,14 @@ def apply_overrides(checks: list[dict[str, Any]], version: str, entries: list[di
             problems.append(f"override for `{e['check']}`: no such check ran")
         elif c["ok"]:
             problems.append(f"override for `{e['check']}` is stale: the check passes -- delete the entry")
-        elif not c.get("run_id") or str(c["run_id"]) not in e["evidence"]:
+        elif not c.get("run_id") or evidence_run_id(e["evidence"], repo) != int(c["run_id"]):
             problems.append(
                 f"override for `{e['check']}`: evidence {e['evidence']} does not name the failed run {c.get('run_id')}"
+                + (f" of {repo}" if repo else "")
+            )
+        elif e["check"] == "qa_pr_ci" and merged_by is not None and e["approver"] != merged_by:
+            problems.append(
+                f"override for `qa_pr_ci`: approver `{e['approver']}` is not who merged the qa -> main PR (`{merged_by}`)"
             )
         else:
             c["overridden"] = {k: e[k] for k in ("reason", "approver", "evidence", "followup", "recorded")}
@@ -409,7 +482,8 @@ def main() -> int:
         facts = {"repo": args.repo, "version": args.version, "tag": f"v{args.version}"}
         checks = [{"name": "gather", "ok": False, "detail": f"could not collect facts: {exc}"}]
     try:
-        problems = apply_overrides(checks, args.version, load_overrides())
+        problems = apply_overrides(checks, args.version, load_overrides(), repo=args.repo,
+                                   merged_by=(facts.get("qa_pr") or {}).get("merged_by"))
     except (OverrideError, ValueError) as exc:  # tomllib.TOMLDecodeError is a ValueError
         problems = [f"ci/release-overrides.toml is invalid: {exc}"]
     for msg in problems:

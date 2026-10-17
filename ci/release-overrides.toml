@@ -17,7 +17,14 @@
 #   followup  what fixed the underlying cause (PR URL), or why none is needed
 #   recorded  date the override was written down (YYYY-MM-DD)
 #
-# Adding an entry is a reviewed change to this file like any other.
+#   approver  must be listed in `approvers` below, and for qa_pr_ci must be the
+#             login that merged the qa -> main PR over the red run
+#
+# Adding an entry -- or a login to `approvers` -- is a reviewed change to this
+# file like any other.
+
+# Logins allowed to authorize an override: the repository's admins.
+approvers = ["vjsingh1984"]
 
 [[override]]
 version = "0.4.1"

@@ -248,6 +248,50 @@ class ProvenanceVerdicts(unittest.TestCase):
         self.assertEqual(self._failed(facts), ["qa_push_ci"])
 
 
+class CiRunSelection(unittest.TestCase):
+    """The qa_pr_ci / qa_push_ci verdicts come from THIS repo's runs of THIS PR."""
+
+    REPO = "anvai-labs/proximaDB"
+    PR = {"number": 2053, "head_sha": "9fc3ec20", "created_at": "2026-10-16T13:09:00Z",
+          "merged_at": "2026-10-16T16:49:34Z"}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = _load("scripts/release_smoke/provenance.py")
+
+    def _run(self, rid, event="pull_request", repo=REPO, created="2026-10-16T13:09:52Z",
+             sha="9fc3ec20", prs=None, branch="qa"):
+        return {"id": rid, "event": event, "head_branch": branch, "head_sha": sha,
+                "head_repository": {"full_name": repo}, "created_at": created,
+                "pull_requests": prs or []}
+
+    def test_the_prs_own_red_run_wins_over_decoys(self) -> None:
+        own_red = self._run(1, created="2026-10-16T13:09:52Z")
+        decoys = [
+            self._run(2, repo="mallory/proximaDB", created="2026-10-16T15:00:00Z"),   # fork named qa
+            self._run(3, created="2026-10-16T17:30:00Z"),                            # after the merge
+            self._run(4, created="2026-10-16T12:00:00Z"),                            # before the PR opened
+            self._run(5, created="2026-10-16T15:00:00Z", prs=[{"number": 9999}]),   # another PR
+            self._run(6, created="2026-10-16T15:00:00Z", sha="deadbeef"),            # other head
+        ]
+        picked = self.mod.pick_pr_run([own_red, *decoys], self.REPO, self.PR)
+        self.assertEqual(picked["id"], 1)
+
+    def test_no_own_run_means_no_verdict(self) -> None:
+        decoy = self._run(2, repo="mallory/proximaDB", created="2026-10-16T15:00:00Z")
+        self.assertIsNone(self.mod.pick_pr_run([decoy], self.REPO, self.PR))
+
+    def test_rerun_within_the_pr_window_is_used(self) -> None:
+        runs = [self._run(1), self._run(7, created="2026-10-16T16:00:00Z", prs=[{"number": 2053}])]
+        self.assertEqual(self.mod.pick_pr_run(runs, self.REPO, self.PR)["id"], 7)
+
+    def test_push_run_must_be_this_repo_and_sha(self) -> None:
+        runs = [self._run(1, event="push"), self._run(2, event="push", repo="mallory/proximaDB",
+                                                       created="2026-10-17T00:00:00Z")]
+        self.assertEqual(self.mod.pick_push_run(runs, self.REPO, "9fc3ec20")["id"], 1)
+        self.assertIsNone(self.mod.pick_push_run(runs, self.REPO, "other"))
+
+
 class ProvenanceOverrides(unittest.TestCase):
     """ci/release-overrides.toml: strict by default, a documented exception only
     for a CI verdict, tied to the exact failed run, and never shown as a pass."""
@@ -283,7 +327,8 @@ class ProvenanceOverrides(unittest.TestCase):
         self.assertEqual([e["check"] for e in v041], ["qa_pr_ci"])
         self.assertIn("38905751066", v041[0]["evidence"])
         checks = self._checks()
-        self.assertEqual(self.mod.apply_overrides(checks, "0.4.1", entries), [])
+        self.assertEqual(self.mod.apply_overrides(checks, "0.4.1", entries, repo="anvai-labs/proximaDB",
+                                                  merged_by="vjsingh1984"), [])
         self.assertEqual(self.mod.status(checks[2]), "overridden")
         self.assertFalse(checks[2]["ok"], "an override must not rewrite the failure into a pass")
 
@@ -308,16 +353,56 @@ class ProvenanceOverrides(unittest.TestCase):
         self.assertTrue(any("stale" in p for p in problems), problems)
 
     def test_structural_checks_are_not_overridable(self) -> None:
-        p = self._write('[[override]]\nversion="0.4.1"\ncheck="qa_tree_equal"\nreason="r"\napprover="a"\n'
-                        'evidence="https://x/1"\nfollowup="f"\nrecorded="2026-10-17"\n')
-        with self.assertRaises(self.mod.OverrideError):
+        p = self._write('approvers=["a"]\n[[override]]\nversion="0.4.1"\ncheck="qa_tree_equal"\nreason="r"\napprover="a"\n'
+                        'evidence="https://github.com/o/r/actions/runs/1"\nfollowup="f"\nrecorded="2026-10-17"\n')
+        with self.assertRaisesRegex(self.mod.OverrideError, "not overridable"):
             self.mod.load_overrides(p)
 
     def test_missing_field_is_an_error_not_a_silent_skip(self) -> None:
-        p = self._write('[[override]]\nversion="0.4.1"\ncheck="qa_pr_ci"\nreason="r"\n'
-                        'evidence="https://x/1"\nfollowup="f"\nrecorded="2026-10-17"\n')
-        with self.assertRaisesRegex(self.mod.OverrideError, "approver"):
+        p = self._write('approvers=["a"]\n[[override]]\nversion="0.4.1"\ncheck="qa_pr_ci"\nreason="r"\n'
+                        'evidence="https://github.com/o/r/actions/runs/1"\nfollowup="f"\nrecorded="2026-10-17"\n')
+        with self.assertRaisesRegex(self.mod.OverrideError, "`approver` is required"):
             self.mod.load_overrides(p)
+
+    def _valid_toml(self, approver: str = "a", approvers: str = '["a"]', evidence: str =
+                    "https://github.com/o/r/actions/runs/1") -> str:
+        return (f'approvers={approvers}\n[[override]]\nversion="0.4.1"\ncheck="qa_pr_ci"\nreason="r"\n'
+                f'approver="{approver}"\nevidence="{evidence}"\nfollowup="f"\nrecorded="2026-10-17"\n')
+
+    def test_approver_must_be_allowlisted(self) -> None:
+        self.assertEqual(len(self.mod.load_overrides(self._write(self._valid_toml()))), 1)
+        with self.assertRaisesRegex(self.mod.OverrideError, "not in `approvers`"):
+            self.mod.load_overrides(self._write(self._valid_toml(approver="mallory")))
+        with self.assertRaisesRegex(self.mod.OverrideError, "approvers"):
+            self.mod.load_overrides(self._write(self._valid_toml(approvers="[]")))
+
+    def test_evidence_must_be_a_run_url(self) -> None:
+        with self.assertRaisesRegex(self.mod.OverrideError, "run URL"):
+            self.mod.load_overrides(self._write(self._valid_toml(evidence="https://example.com/38905751066")))
+
+    def test_run_id_is_matched_exactly_not_by_substring(self) -> None:
+        # 3890575106 is a prefix of the failed run 38905751066.
+        for ev in ("https://github.com/o/r/actions/runs/3890575106",
+                   "https://github.com/o/r/actions/runs/389057510661",
+                   "https://github.com/o/r/actions/runs/1/job/38905751066"):
+            checks = self._checks()
+            problems = self.mod.apply_overrides(checks, "0.4.1", [self._entry(evidence=ev)])
+            self.assertEqual(self.mod.status(checks[2]), "fail", ev)
+            self.assertTrue(problems, ev)
+
+    def test_evidence_must_be_this_repos_run(self) -> None:
+        checks = self._checks()
+        self.mod.apply_overrides(checks, "0.4.1", [self._entry()], repo="anvai-labs/proximaDB")
+        self.assertEqual(self.mod.status(checks[2]), "fail")
+
+    def test_qa_pr_ci_approver_must_be_who_merged(self) -> None:
+        checks = self._checks()
+        problems = self.mod.apply_overrides(checks, "0.4.1", [self._entry()], merged_by="someone-else")
+        self.assertEqual(self.mod.status(checks[2]), "fail")
+        self.assertTrue(any("not who merged" in p for p in problems), problems)
+        checks = self._checks()
+        self.assertEqual(self.mod.apply_overrides(checks, "0.4.1", [self._entry()], merged_by="owner"), [])
+        self.assertEqual(self.mod.status(checks[2]), "overridden")
 
     def test_summary_reports_overridden_not_passed(self) -> None:
         summ = _load("scripts/release_smoke/summarize.py")
