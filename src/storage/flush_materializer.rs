@@ -1498,6 +1498,16 @@ mod tests {
             .await
             .expect("production flush must succeed")
             .expect("production flush must publish its batch");
+            // Quiesce any compaction this flush enqueued so the next round sees
+            // a settled level geometry (deterministic multi-level chains).
+            if let Some(compaction) = engine.compaction_manager() {
+                assert!(
+                    compaction
+                        .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                        .await,
+                    "compaction must quiesce between flushes"
+                );
+            }
         }
         KnobFlush {
             _dir: dir,
@@ -1795,6 +1805,215 @@ mod tests {
             proximadb_storage_common::segment_layout::is_coalesced_segment(&merged),
             "the default compaction output is the coalesced RaBitQ layout"
         );
+    }
+
+    /// Four flushes with `l0_threshold:2` (quiesced after each): two L0->L1
+    /// compactions, then the worker's L1->L2 follow-up. Returns the single
+    /// surviving segment's file name and bytes.
+    async fn two_level_compacted_segment(
+        collection_object_id: u64,
+        config: CollectionConfig,
+    ) -> (String, Vec<u8>) {
+        let flushed = flush_via_materializer(collection_object_id, config, 4).await;
+        let files = flushed.pax_files();
+        assert_eq!(
+            files.len(),
+            1,
+            "expected one fully compacted segment: {files:?}"
+        );
+        let name = files[0]
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (name, flushed.only_segment())
+    }
+
+    /// TD-READFID-2 review (blocker): the worker's L1->L2 follow-up task is
+    /// built by the config-free `check_compaction_needed` and used to carry
+    /// `vector_quant: None`, so an sq8 collection was re-encoded as RaBitQ at L2.
+    #[tokio::test]
+    async fn two_level_compaction_keeps_the_sq8_base_quant() {
+        use proximadb_block_format::vparam::QUANT_SQ8;
+        let (name, merged) = two_level_compacted_segment(
+            261,
+            CollectionConfig {
+                tags: vec!["l0_threshold:2".into()],
+                pax_vector_quant: Some("sq8".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            name.starts_with("L2_"),
+            "expected an L2 segment, got {name}"
+        );
+        assert_eq!(
+            block0_vector_quants(&merged).0,
+            Some(QUANT_SQ8),
+            "an sq8 collection must stay SQ8 through L1->L2"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_level_compaction_keeps_the_raw_f32_base() {
+        use crate::storage::engines::sst::segment_format::pax_segment_has_exact_vector_authority;
+        use proximadb_block_format::vparam::QUANT_RAW_F32;
+        let (name, merged) = two_level_compacted_segment(
+            262,
+            CollectionConfig {
+                tags: vec!["l0_threshold:2".into(), "pax_vector_format:off".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            name.starts_with("L2_"),
+            "expected an L2 segment, got {name}"
+        );
+        assert!(
+            !proximadb_storage_common::segment_layout::is_coalesced_segment(&merged),
+            "a RawF32 collection must not flip to coalesced RaBitQ at L2"
+        );
+        assert_eq!(block0_vector_quants(&merged).0, Some(QUANT_RAW_F32));
+        assert!(pax_segment_has_exact_vector_authority(&merged));
+    }
+
+    /// Catalog stub serving one collection — the background manager's real
+    /// context source is `CollectionMetadataPort`.
+    struct OneCollection(Collection);
+
+    #[async_trait::async_trait]
+    impl proximadb_storage_ports::CollectionMetadataPort for OneCollection {
+        async fn collection(&self, _identifier: &str) -> anyhow::Result<Option<Collection>> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    fn sst_engine_map(
+        engine: &Arc<crate::storage::engines::sst::SstEngine>,
+    ) -> Arc<tokio::sync::RwLock<HashMap<String, Arc<dyn UnifiedStorageFormat>>>> {
+        Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+            "sst".to_string(),
+            engine.clone() as Arc<dyn UnifiedStorageFormat>,
+        )])))
+    }
+
+    fn knob_meta(
+        collection_object_id: u64,
+        root: &std::path::Path,
+        config: CollectionConfig,
+    ) -> Collection {
+        Collection {
+            id: collection_object_id.to_string(),
+            config: Some(CollectionConfig {
+                name: format!("knob-{collection_object_id}"),
+                dimension: 4,
+                storage_engine: Some(ProtoStorageEngine::Sst as i32),
+                ..config
+            }),
+            storage_assignment: Some(StorageAssignment {
+                base_location: format!("file://{}", root.display()),
+                engine: ProtoStorageEngine::Sst as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// TD-READFID-2 review: the background-maintenance producer must resolve the
+    /// compaction from the REAL collection meta, the same way the flush trigger
+    /// does. Its context DTO used to drop `tags` and `pax_vector_quant`, so it
+    /// compacted at the default threshold with the default (RaBitQ) quant.
+    #[tokio::test]
+    async fn background_producer_resolves_the_same_quant_as_flush() {
+        use crate::storage::persistence::write_ahead_log::background_manager::BackgroundMaintenanceManager;
+        use proximadb_block_format::vparam::QUANT_SQ8;
+        // Two L0 segments, below the flush trigger's threshold of 3.
+        let flushed = flush_via_materializer(
+            271,
+            CollectionConfig {
+                tags: vec!["l0_threshold:3".into()],
+                pax_vector_quant: Some("sq8".into()),
+                ..Default::default()
+            },
+            2,
+        )
+        .await;
+        assert_eq!(flushed.pax_files().len(), 2);
+        // The operator lowers the threshold; the background producer must see
+        // it AND keep the sq8 base quant the flush used.
+        let meta = knob_meta(
+            271,
+            &flushed.root,
+            CollectionConfig {
+                tags: vec!["l0_threshold:2".into()],
+                pax_vector_quant: Some("sq8".into()),
+                ..Default::default()
+            },
+        );
+        let context =
+            crate::storage::background_flush_context::BackgroundFlushContext::from_collection_service(
+                &OneCollection(meta),
+                "271",
+            )
+            .await
+            .expect("context from catalog meta");
+        BackgroundMaintenanceManager::execute_compaction_with_context(
+            &sst_engine_map(&flushed.engine),
+            &context,
+            None,
+        )
+        .await
+        .expect("background compaction");
+        let compaction = flushed
+            .engine
+            .compaction_manager()
+            .expect("sst compaction manager")
+            .clone();
+        assert!(
+            compaction
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await
+        );
+        assert_eq!(
+            block0_vector_quants(&flushed.only_segment()).0,
+            Some(QUANT_SQ8),
+            "the background producer must compact an sq8 collection to SQ8, like flush"
+        );
+    }
+
+    /// A producer without the catalog meta must not enqueue a quant-deciding
+    /// task on a guess; it defers (the SST engine declines the request).
+    #[tokio::test]
+    async fn meta_less_compaction_producer_defers_instead_of_guessing() {
+        use crate::storage::persistence::write_ahead_log::background_manager::BackgroundMaintenanceManager;
+        let flushed = flush_via_materializer(
+            272,
+            CollectionConfig {
+                tags: vec!["compaction:off".into()],
+                pax_vector_quant: Some("sq8".into()),
+                ..Default::default()
+            },
+            2,
+        )
+        .await;
+        let mut context =
+            crate::storage::background_flush_context::BackgroundFlushContext::for_testing(
+                "272",
+                crate::storage::background_flush_context::StorageEngineType::Sst,
+            );
+        context.base_location = format!("file://{}", flushed.root.display());
+        let result = BackgroundMaintenanceManager::execute_compaction_with_context(
+            &sst_engine_map(&flushed.engine),
+            &context,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a meta-less producer must be declined, not compacted on a guess: {result:?}"
+        );
+        assert_eq!(flushed.pax_files().len(), 2, "inputs must be untouched");
     }
 
     #[test]

@@ -3490,6 +3490,7 @@ mod simple_context_tests {
             extra_metadata: HashMap::new(),
 
             tenant_id: None,
+            collection_meta: None,
         };
 
         // Validate context fields
@@ -3515,6 +3516,7 @@ mod simple_context_tests {
             extra_metadata: HashMap::new(),
 
             tenant_id: None,
+            collection_meta: None,
         };
         assert_eq!(sst_context.engine_name(), "sst");
 
@@ -3542,6 +3544,7 @@ mod simple_context_tests {
             extra_metadata: HashMap::new(),
 
             tenant_id: None,
+            collection_meta: None,
         };
 
         // Test dimension-based optimizations
@@ -3875,6 +3878,7 @@ mod optimization_validation_tests {
             extra_metadata: HashMap::new(),
 
             tenant_id: None,
+            collection_meta: None,
         };
 
         debug!("   BackgroundManager → Uses pre-computed context (NO service call)");
@@ -3944,6 +3948,7 @@ mod optimization_validation_tests {
             },
 
             tenant_id: None,
+            collection_meta: None,
         };
 
         assert_eq!(context.collection_id, "completeness_test");

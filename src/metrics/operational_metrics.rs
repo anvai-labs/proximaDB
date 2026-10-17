@@ -210,6 +210,11 @@ lazy_static! {
         "proximadb_compaction_scratch_reserved_bytes",
         "Projected local scratch bytes reserved by all in-flight compactions",
     );
+    pub static ref COMPACTION_DECLINED_TOTAL: Option<IntCounterVec> = counter_vec(
+        "proximadb_compaction_declined_total",
+        "Compactions deliberately declined with every input left authoritative, by reason",
+        &["reason"],
+    );
     pub static ref COMPACTION_SPILL_TOTAL: IntCounter = counter(
         "proximadb_compaction_spill_total",
         "Compactions admitted with the deterministic local-spill execution plan",
@@ -284,6 +289,12 @@ pub fn touch() {
     COMPACTION_MEMORY_RESERVED_BYTES.get();
     COMPACTION_SCRATCH_RESERVED_BYTES.get();
     COMPACTION_SPILL_TOTAL.get();
+    if let Some(family) = COMPACTION_DECLINED_TOTAL.as_ref() {
+        family
+            .with_label_values(&["spill_base_quant_unsupported"])
+            .get();
+        family.with_label_values(&["spill_inputs_not_exact"]).get();
+    }
     COMPACTION_MEMORY_ADMISSION_WAITS_TOTAL.get();
     COMPACTION_QUEUE_DEPTH.get();
     COMPACTION_RUNNING.get();

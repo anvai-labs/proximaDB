@@ -482,6 +482,7 @@ pub fn write_pax_segment_compacted_shredded(
     target_block: Option<usize>,
     shred_spec: &[(String, i32)],
     destination_url: Option<&str>,
+    rg_layout: Option<bool>,
 ) -> Result<SegmentMeta> {
     Ok(write_pax_segment_compacted_internal(
         path,
@@ -492,7 +493,9 @@ pub fn write_pax_segment_compacted_shredded(
         rerank_quant,
         f32_tier,
         target_block,
-        rg_layout_enabled(),
+        // TD-PAXRG-1: the producer-resolved `pax_rg_layout` (tag > env >
+        // default); `None` follows the env gate.
+        rg_layout.unwrap_or_else(rg_layout_enabled),
         None,
         shred_spec,
         destination_url,
@@ -520,6 +523,7 @@ pub fn write_pax_segment_compacted_with_cache_seed_shredded(
     include_sq8: bool,
     shred_spec: &[(String, i32)],
     destination_url: Option<&str>,
+    rg_layout: Option<bool>,
 ) -> Result<proximadb_storage_common::pax_block::PaxSegmentWrite> {
     write_pax_segment_compacted_internal(
         path,
@@ -530,7 +534,7 @@ pub fn write_pax_segment_compacted_with_cache_seed_shredded(
         rerank_quant,
         f32_tier,
         target_block,
-        rg_layout_enabled(),
+        rg_layout.unwrap_or_else(rg_layout_enabled),
         Some(include_sq8),
         shred_spec,
         destination_url,
@@ -850,6 +854,10 @@ pub struct PaxCompactionInputTiers {
     /// SQ8. Defaults to [`VectorQuant::Sq8`] when no input carries a block-level
     /// rerank column (coalesced segments hoist it to Region B, which is SQ8).
     pub rerank_quant: VectorQuant,
+    /// False only when the probe was skipped because the merged records carry
+    /// no embeddings (relational / document): then neither answer applies and
+    /// callers must not reason about exactness (no "inputs not exact" warning).
+    pub carries_vectors: bool,
 }
 
 /// What one `.pax` compaction input declares about its vector tiers.
@@ -873,12 +881,16 @@ struct PaxInputTierProbe {
 /// back to ONE whole read through the port that answers both questions. (Under
 /// local encryption the port's `EncryptedFilesystem::read_range` decrypts the
 /// whole object and slices it, so the probe sees plaintext but each ranged read
-/// costs a whole read + decrypt; TD-COMPACT-IO-1.) Unreadable inputs
-/// fail closed (no exact tier) and are logged.
+/// costs a whole read + decrypt; TD-COMPACT-IO-1.)
+///
+/// An input that cannot be READ is an `Err`, never "not exact": classifying a
+/// transient I/O failure as lossy would let compaction write a tierless output
+/// and then delete the inputs — the only copies of the exact f32 values. The
+/// caller aborts the compaction and keeps its inputs so it retries later.
 pub async fn pax_compaction_input_tiers(
     port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
     input_files: &[std::path::PathBuf],
-) -> PaxCompactionInputTiers {
+) -> anyhow::Result<PaxCompactionInputTiers> {
     let mut saw_pax = false;
     let mut all_exact = true;
     let mut rerank_quant: Option<VectorQuant> = None;
@@ -898,16 +910,17 @@ pub async fn pax_compaction_input_tiers(
             continue;
         }
         let url = f.to_string_lossy();
-        let probe = probe_pax_input_tiers(port, &url).await;
+        let probe = probe_pax_input_tiers(port, &url).await?;
         all_exact &= probe.exact;
         if rerank_quant.is_none() {
             rerank_quant = probe.rerank_quant;
         }
     }
-    PaxCompactionInputTiers {
+    Ok(PaxCompactionInputTiers {
         f32_tier: saw_pax && all_exact,
         rerank_quant: rerank_quant.unwrap_or(VectorQuant::Sq8),
-    }
+        carries_vectors: true,
+    })
 }
 
 /// [`pax_compaction_input_tiers`] for a canonical compaction that already holds
@@ -919,12 +932,13 @@ pub async fn pax_compaction_input_tiers_for_records(
     port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
     input_files: &[std::path::PathBuf],
     records: &[ProximaRecord],
-) -> PaxCompactionInputTiers {
+) -> anyhow::Result<PaxCompactionInputTiers> {
     if !records.iter().any(|record| !record.embeddings.is_empty()) {
-        return PaxCompactionInputTiers {
+        return Ok(PaxCompactionInputTiers {
             f32_tier: false,
             rerank_quant: VectorQuant::Sq8,
-        };
+            carries_vectors: false,
+        });
     }
     pax_compaction_input_tiers(port, input_files).await
 }
@@ -932,17 +946,17 @@ pub async fn pax_compaction_input_tiers_for_records(
 async fn probe_pax_input_tiers(
     port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
     url: &str,
-) -> PaxInputTierProbe {
+) -> anyhow::Result<PaxInputTierProbe> {
     match read_coalesced_segment_footer(port, url).await {
         // Coalesced: the footer is the authoritative tier declaration and the
         // rerank column is hoisted out of blocks (Region B, SQ8) — identical to
         // what `pax_segment_has_exact_vector_authority` and a block-0 probe of
         // the whole object would conclude.
         Ok(Some(footer)) => {
-            return PaxInputTierProbe {
+            return Ok(PaxInputTierProbe {
                 exact: footer.has_f32_tier,
                 rerank_quant: None,
-            };
+            });
         }
         Ok(None) => {}
         Err(error) => {
@@ -953,24 +967,21 @@ async fn probe_pax_input_tiers(
             );
         }
     }
-    match crate::storage::engines::sst::staged_write::read_object_bytes(port, url).await {
-        Ok(bytes) => PaxInputTierProbe {
-            exact: pax_segment_has_exact_vector_authority(&bytes),
-            rerank_quant: pax_segment_rerank_quant(bytes),
-        },
-        Err(error) => {
+    let bytes = crate::storage::engines::sst::staged_write::read_object_bytes(port, url)
+        .await
+        .map_err(|error| {
             tracing::warn!(
                 url,
                 %error,
-                "compaction tier probe: input segment unreadable; treating it as lossy \
-                 (the merged segment will not carry the exact-f32 tier)"
+                "compaction tier probe: input segment unreadable; aborting this compaction \
+                 and keeping its inputs (retried on the next trigger)"
             );
-            PaxInputTierProbe {
-                exact: false,
-                rerank_quant: None,
-            }
-        }
-    }
+            anyhow::anyhow!("compaction tier probe could not read input {url}: {error}")
+        })?;
+    Ok(PaxInputTierProbe {
+        exact: pax_segment_has_exact_vector_authority(&bytes),
+        rerank_quant: pax_segment_rerank_quant(bytes),
+    })
 }
 
 /// Read a coalesced segment's footer index through the filesystem port with
@@ -6816,7 +6827,9 @@ mod tests {
             .expect("filesystem factory");
         let port: std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort> =
             std::sync::Arc::new(factory);
-        pax_compaction_input_tiers(&port, inputs).await
+        pax_compaction_input_tiers(&port, inputs)
+            .await
+            .expect("every input is readable")
     }
 
     fn file_url(path: &std::path::Path) -> std::path::PathBuf {
@@ -6917,10 +6930,11 @@ mod tests {
         );
     }
 
-    /// An input the port cannot read fails CLOSED (no exact tier, logged),
-    /// never open: a vanished input must not let a merged segment claim exactness.
+    /// TD-READFID-2 review: an input the port cannot read is an ERROR, never
+    /// "not exact". Classifying it as lossy let compaction write a tierless
+    /// output and delete the inputs — the only copies of the exact values.
     #[tokio::test]
-    async fn unreadable_compaction_input_fails_closed() {
+    async fn unreadable_compaction_input_is_an_error_not_lossy() {
         enable_coalesced_rabitq();
         let dir = tempfile::tempdir().unwrap();
         let exact = dir.path().join("exact.pax");
@@ -6938,10 +6952,20 @@ mod tests {
             None,
         )
         .unwrap();
-        let tiers =
-            input_tiers(&[file_url(&exact), file_url(&dir.path().join("missing.pax"))]).await;
-        assert!(!tiers.f32_tier, "an unreadable input must fail closed");
-        assert_eq!(tiers.rerank_quant, VectorQuant::Sq8);
+        let factory = crate::storage::persistence::filesystem::FilesystemFactory::create_default()
+            .await
+            .expect("filesystem factory");
+        let port: std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort> =
+            std::sync::Arc::new(factory);
+        let result = pax_compaction_input_tiers(
+            &port,
+            &[file_url(&exact), file_url(&dir.path().join("missing.pax"))],
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unreadable input must abort the probe, not demote the output: {result:?}"
+        );
     }
 
     /// In-memory object store keyed by full URL, counting whole vs ranged
@@ -7169,8 +7193,9 @@ mod tests {
         let port: std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort> =
             std::sync::Arc::new(CountingPort(store.clone()));
 
-        let tiers =
-            pax_compaction_input_tiers(&port, &[std::path::PathBuf::from(&coalesced_url)]).await;
+        let tiers = pax_compaction_input_tiers(&port, &[std::path::PathBuf::from(&coalesced_url)])
+            .await
+            .expect("coalesced object-store input is readable");
         assert!(
             tiers.f32_tier,
             "object-store coalesced input keeps the tier"
@@ -7193,7 +7218,8 @@ mod tests {
                 std::path::PathBuf::from(&legacy_url),
             ],
         )
-        .await;
+        .await
+        .expect("both object-store inputs are readable");
         assert!(tiers.f32_tier, "both object-store inputs carry the tier");
         assert_eq!(
             tiers.rerank_quant,
@@ -7226,8 +7252,10 @@ mod tests {
             )],
             std::slice::from_ref(&row),
         )
-        .await;
+        .await
+        .expect("non-vector compactions never read");
         assert!(!tiers.f32_tier);
+        assert!(!tiers.carries_vectors);
         assert_eq!(tiers.rerank_quant, VectorQuant::Sq8);
         assert_eq!(store.whole_reads.load(Ordering::SeqCst), 0);
         assert_eq!(store.ranged_reads.load(Ordering::SeqCst), 0);
@@ -9446,6 +9474,7 @@ mod tests {
             Some(16 * 1024),
             &[("partition".to_string(), 100)],
             None,
+            None,
         )
         .unwrap();
         unsafe {
@@ -9688,6 +9717,7 @@ mod tests {
                 Some(16 * 1024),
                 &[("partition".to_string(), 100)],
                 None,
+                None,
             )
             .unwrap();
             unsafe {
@@ -9882,6 +9912,7 @@ mod tests {
                 false,
                 Some(8 * 1024),
                 &[("partition".to_string(), 100)],
+                None,
                 None,
             )
             .unwrap();
@@ -10129,6 +10160,7 @@ mod tests {
                 false,
                 Some(16 * 1024),
                 &[("partition".to_string(), 100)],
+                None,
                 None,
             )
             .unwrap();

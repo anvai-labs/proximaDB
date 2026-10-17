@@ -296,6 +296,12 @@ pub mod pca_manager; // PCA caching for Z-Order spatial encoding
 pub mod progressive_stages; // ISP-compliant progressive search stages
 pub mod search;
 pub mod segment_format; // P3 Phase A: mixed-format (ProximaBlocks/PAX) read primitives
+
+/// `CompactionParameters.hints` key a compaction producer sets to `false` when
+/// its `collection_config` is synthesized rather than the catalog meta (no tags
+/// / `pax_vector_quant`). SST `do_compact` declines such a request instead of
+/// resolving the output encoding from a guess (TD-READFID-2 review).
+pub const COLLECTION_META_COMPLETE_HINT: &str = "collection_meta_complete";
 pub mod survivor_range_cache;
 pub mod text_column_support; // TEXT column storage integration
 pub mod tiering_integration;

@@ -889,7 +889,11 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
     );
     assert_no_task_scratch(&scratch)?;
 
-    let stats = compaction.perform_compaction_with_plan(&task, plan).await?;
+    let stats = compaction
+        .perform_compaction_with_plan(&task, plan)
+        .await?
+        .completed()
+        .ok_or_else(|| anyhow::anyhow!("an untagged (RaBitQ) spill must not be declined"))?;
 
     assert_eq!(stats.files_merged, 2);
     assert!(stats.bytes_written > 0);
@@ -1145,4 +1149,315 @@ async fn fp16_records_survive_compaction_round_trip_bit_exact() {
         );
         assert_eq!(got.embeddings[0].precision, EmbeddingScalarType::Fp16);
     }
+}
+
+// ---- TD-READFID-2 review: spill admission by base quant + probe-error abort ----
+//
+// These assert through the API that exists before and after the fix
+// (`perform_compaction_with_plan` / `perform_compaction_enhanced` + filesystem
+// effects + the Prometheus registry), so each can be shown failing on the
+// pre-fix commit.
+
+struct SpillQuantFixture {
+    _root: tempfile::TempDir,
+    compaction: Compaction,
+    task: CompactionTask,
+    plan: crate::storage::common::compaction_memory::CompactionResourcePlan,
+    inputs: [PathBuf; 2],
+    output: PathBuf,
+}
+
+fn spill_quant_records(seed: usize) -> Vec<proximadb_records::ProximaRecord> {
+    (0..64usize)
+        .map(|row| proximadb_records::ProximaRecord {
+            oid: format!("oid-{seed}-{row:04}"),
+            record_version: 1,
+            tenant_id: "tenant-42".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "sift",
+                "dense_vector",
+                8,
+                (0..8)
+                    .map(|d| ((seed * 64 + row) as f32 * 0.013_7 + d as f32 * 0.101).sin())
+                    .collect(),
+            )],
+            ..proximadb_records::ProximaRecord::default()
+        })
+        .collect()
+}
+
+/// Two PAX inputs written with `input_quant` (+ optional exact tier) and a task
+/// for a collection whose resolved base quant is `collection_quant`, admitted
+/// on the forced local-spill plan.
+async fn spill_quant_fixture(
+    input_quant: proximadb_block_format::VectorQuant,
+    input_f32_tier: bool,
+    collection_quant: proximadb_block_format::VectorQuant,
+) -> anyhow::Result<SpillQuantFixture> {
+    use crate::storage::common::compaction_memory::{
+        CompactionExecutionMode, CompactionResourceUsage, plan_compaction_resources,
+    };
+    use crate::storage::engines::sst::segment_format::write_pax_segment_compacted;
+    use proximadb_hardware::MemorySnapshot;
+    const MIB: u64 = 1024 * 1024;
+    // SAFETY: nextest runs each test in its own process; only this test
+    // touches the gate (the spill MVCC needs version stripes on its inputs).
+    unsafe { std::env::set_var("PROXIMADB_PAX_RECORD_VERSION", "1") };
+    let root = tempfile::tempdir()?;
+    let scratch = root.path().join("spill");
+    let inputs = [
+        root.path().join("segment_L0_a.pax"),
+        root.path().join("segment_L0_b.pax"),
+    ];
+    let output = root.path().join("segment_L1_compacted.pax");
+    for (seed, input) in inputs.iter().enumerate() {
+        write_pax_segment_compacted(
+            input,
+            &spill_quant_records(seed),
+            "7",
+            1,
+            input_quant,
+            proximadb_block_format::VectorQuant::Sq8,
+            input_f32_tier,
+            Some(1_024),
+            None,
+        )?;
+    }
+    let input_bytes = std::fs::metadata(&inputs[0])?.len() + std::fs::metadata(&inputs[1])?.len();
+    let mut config = SstConfig::default();
+    let policy = config
+        .compaction_config
+        .get_or_insert_with(crate::core::config::CompactionConfig::default);
+    policy.memory_amplification_factor = 12.0;
+    policy.memory_budget_fraction = 1.0;
+    policy.available_memory_fraction = 1.0;
+    policy.max_memory_mb = 64;
+    policy.spill_enabled = true;
+    policy.spill_directory = Some(scratch.to_string_lossy().into_owned());
+    policy.spill_working_memory_mb = 32;
+    policy.spill_scratch_amplification_factor = 4.0;
+    policy.spill_available_disk_fraction = 1.0;
+    let plan = plan_compaction_resources(
+        input_bytes.max(10 * MIB),
+        policy,
+        MemorySnapshot {
+            total_bytes: 64 * MIB,
+            available_bytes: 64 * MIB,
+        },
+        1_024 * MIB,
+        CompactionResourceUsage::default(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("forced spill plan was not admitted"))?;
+    anyhow::ensure!(plan.mode == CompactionExecutionMode::LocalSpill);
+    let compaction = Compaction::new(config).await?;
+    let task = CompactionTask {
+        collection_object_id: 7,
+        collection_identity: crate::core::stable_id::CollectionIdentity {
+            account_id: 1,
+            namespace_id: 2,
+            collection_id: 7,
+        },
+        level: 0,
+        input_files: inputs.to_vec(),
+        input_bytes,
+        output_file: output.clone(),
+        priority: CompactionPriority::High,
+        block_size_kb: Some(1),
+        compression_config: None,
+        precision_hint: None,
+        rg_layout: None,
+        vector_quant: Some(collection_quant),
+    };
+    Ok(SpillQuantFixture {
+        _root: root,
+        compaction,
+        task,
+        plan,
+        inputs,
+        output,
+    })
+}
+
+/// `proximadb_compaction_declined_total{reason}` read from the global registry
+/// (0 when the family does not exist yet).
+fn declined_total(reason: &str) -> f64 {
+    prometheus::gather()
+        .iter()
+        .filter(|family| family.name() == "proximadb_compaction_declined_total")
+        .flat_map(|family| family.metric.iter())
+        .filter(|metric| {
+            metric
+                .label
+                .iter()
+                .any(|label| label.name() == "reason" && label.value() == reason)
+        })
+        .map(|metric| metric.counter.value())
+        .sum()
+}
+
+/// An SQ8 collection whose compaction lands on the spill executor (coalesced
+/// RaBitQ only) is DECLINED: not an error, inputs untouched, no output, and
+/// the decline is counted. Before the review fix it was an `Err` with no
+/// counter, and a collection over the memory budget stalled silently.
+#[tokio::test]
+async fn spill_declines_an_sq8_collection_without_an_error() -> anyhow::Result<()> {
+    use proximadb_block_format::VectorQuant;
+    let fixture = spill_quant_fixture(VectorQuant::Sq8, false, VectorQuant::Sq8).await?;
+    let before = declined_total("spill_base_quant_unsupported");
+    let result = fixture
+        .compaction
+        .perform_compaction_with_plan(&fixture.task, fixture.plan)
+        .await;
+    let rendered = format!("{result:?}");
+    assert!(result.is_ok(), "a decline is not an error: {rendered}");
+    assert!(
+        rendered.contains("Declined"),
+        "expected a typed decline: {rendered}"
+    );
+    assert!(fixture.inputs.iter().all(|input| input.exists()));
+    assert!(!fixture.output.exists());
+    assert_eq!(declined_total("spill_base_quant_unsupported"), before + 1.0);
+    Ok(())
+}
+
+/// A RawF32 collection's spill compaction keeps exactness: RaBitQ + the exact
+/// tier when every input is exact (only the encoding cost changes).
+#[tokio::test]
+async fn spill_keeps_the_exact_tier_for_a_raw_f32_collection() -> anyhow::Result<()> {
+    use crate::storage::engines::sst::segment_format::{
+        pax_segment_has_exact_vector_authority, read_segment_records,
+    };
+    use proximadb_block_format::VectorQuant;
+    let fixture = spill_quant_fixture(VectorQuant::RawF32, false, VectorQuant::RawF32).await?;
+    let result = fixture
+        .compaction
+        .perform_compaction_with_plan(&fixture.task, fixture.plan)
+        .await;
+    let rendered = format!("{result:?}");
+    assert!(
+        result.is_ok() && !rendered.contains("Declined"),
+        "an all-exact RawF32 spill must compact: {rendered}"
+    );
+    let bytes = std::fs::read(&fixture.output)?;
+    assert!(
+        pax_segment_has_exact_vector_authority(&bytes),
+        "the spill output must carry the exact tier"
+    );
+    let want: std::collections::HashMap<String, Vec<u32>> = (0..2)
+        .flat_map(spill_quant_records)
+        .map(|record| {
+            let bits = record.embeddings[0]
+                .as_fp32_cow()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect();
+            (record.oid, bits)
+        })
+        .collect();
+    let got = read_segment_records(&bytes, &[], &[], None)?;
+    assert_eq!(got.len(), want.len());
+    for record in got {
+        let bits: Vec<u32> = record.embeddings[0]
+            .as_fp32_cow()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(
+            Some(&bits),
+            want.get(&record.oid),
+            "{} not exact",
+            record.oid
+        );
+    }
+    Ok(())
+}
+
+/// A RawF32 collection with a LOSSY input cannot be spilled exactly, so it is
+/// declined (typed, counted) rather than relabelled.
+#[tokio::test]
+async fn spill_declines_a_raw_f32_collection_with_lossy_inputs() -> anyhow::Result<()> {
+    use proximadb_block_format::VectorQuant;
+    let fixture = spill_quant_fixture(VectorQuant::RaBitQ, false, VectorQuant::RawF32).await?;
+    let before = declined_total("spill_inputs_not_exact");
+    let result = fixture
+        .compaction
+        .perform_compaction_with_plan(&fixture.task, fixture.plan)
+        .await;
+    let rendered = format!("{result:?}");
+    assert!(result.is_ok(), "a decline is not an error: {rendered}");
+    assert!(
+        rendered.contains("Declined"),
+        "expected a typed decline: {rendered}"
+    );
+    assert!(fixture.inputs.iter().all(|input| input.exists()));
+    assert_eq!(declined_total("spill_inputs_not_exact"), before + 1.0);
+    Ok(())
+}
+
+/// TD-READFID-2 review (data loss): a transient read error in the tier probe
+/// used to be classified as "not exact" — compaction then wrote a TIERLESS
+/// output and deleted the inputs, the only copies of the exact f32 values.
+/// The probe error must abort the compaction and keep the inputs.
+#[tokio::test]
+async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result<()> {
+    use crate::storage::engines::sst::segment_format::write_pax_segment_full_with_layout;
+    use proximadb_block_format::VectorQuant;
+    // SAFETY: isolated nextest process; armed before the factory is built.
+    unsafe { std::env::set_var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST", "1") };
+    let dir = tempfile::tempdir()?;
+    let inputs = [
+        dir.path().join("segment_L0_a.pax"),
+        dir.path().join("segment_L0_b.pax"),
+    ];
+    for (seed, input) in inputs.iter().enumerate() {
+        write_pax_segment_full_with_layout(
+            input,
+            &spill_quant_records(seed),
+            "7",
+            1,
+            VectorQuant::RaBitQ,
+            VectorQuant::Sq8,
+            true,
+            None,
+            true,
+            &[],
+            None,
+        )?;
+    }
+    let output = dir.path().join("segment_L1_compacted.pax");
+    let config = SstConfig::default();
+    let compaction = Compaction::new(config.clone()).await?;
+    let task = CompactionTask {
+        collection_object_id: 7,
+        collection_identity: crate::core::stable_id::CollectionIdentity::default(),
+        level: 0,
+        input_files: inputs
+            .iter()
+            .map(|input| PathBuf::from(format!("file://{}", input.display())))
+            .collect(),
+        input_bytes: 0,
+        output_file: output.clone(),
+        priority: CompactionPriority::High,
+        block_size_kb: None,
+        compression_config: None,
+        precision_hint: None,
+        rg_layout: None,
+        vector_quant: None,
+    };
+    let result = compaction
+        .perform_compaction_enhanced(&task, &config, None, None)
+        .await;
+    assert!(
+        inputs.iter().all(|input| input.exists()),
+        "a probe I/O error must never retire the exact inputs (result: {:?})",
+        result.as_ref().map(|_| ())
+    );
+    assert!(
+        !output.exists(),
+        "no lossy output may be published after a probe I/O error"
+    );
+    assert!(result.is_err(), "the compaction must abort");
+    Ok(())
 }

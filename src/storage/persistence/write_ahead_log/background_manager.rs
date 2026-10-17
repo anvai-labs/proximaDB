@@ -157,7 +157,13 @@ impl BackgroundMaintenanceManager {
             collection_id: Some(context.collection_id.clone()),
             force: false,      // Background compaction is not forced
             synchronous: true, // Wait for completion
-            hints: std::collections::HashMap::new(),
+            // TD-READFID-2 review: tell the engine whether `collection_config` is
+            // the real catalog meta (tags + `pax_vector_quant`) or a synthesized
+            // stand-in, so it never resolves an output encoding from a guess.
+            hints: std::collections::HashMap::from([(
+                crate::storage::engines::sst::COLLECTION_META_COMPLETE_HINT.to_string(),
+                serde_json::Value::Bool(context.collection_meta.is_some()),
+            )]),
             timeout_ms: context.timeout_ms.or(Some(300_000)), // Use context timeout or 5 minute default
             estimated_input_size: 0,                          // Will be calculated by compaction
             priority: match context.priority {

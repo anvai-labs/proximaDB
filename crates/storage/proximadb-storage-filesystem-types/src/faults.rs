@@ -41,6 +41,32 @@ fn fault_mode() -> Option<FaultMode> {
     )
 }
 
+/// `PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST=1`: the first read (`read` or
+/// `read_range`) of each unique `.pax` path passes, every later read of that
+/// path fails with a transient `FilesystemError::Network`. Reproduces "the
+/// compaction read its records, then a later probe read of the same input hit
+/// a transient I/O error" (TD-READFID-2 review). Keyed with `file://`
+/// stripped so URL and resolved-path forms of one file share a count.
+fn read_fault_armed() -> bool {
+    static ARMED: OnceLock<bool> = OnceLock::new();
+    *ARMED.get_or_init(|| {
+        std::env::var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// True when the read-fault env gate is set, so the factory installs this
+/// wrapper.
+pub fn read_fault_requested() -> bool {
+    std::env::var_os("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST").is_some()
+}
+
+fn already_read() -> &'static Mutex<HashSet<String>> {
+    static READ: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    READ.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 fn already_failed() -> &'static Mutex<HashSet<String>> {
     static FAILED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     FAILED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -53,6 +79,9 @@ pub fn reset_for_tests() {
     if let Ok(mut failed) = already_failed().lock() {
         failed.clear();
     }
+    if let Ok(mut read) = already_read().lock() {
+        read.clear();
+    }
 }
 
 #[derive(Debug)]
@@ -63,6 +92,25 @@ pub struct FaultInjectingFileSystem {
 impl FaultInjectingFileSystem {
     pub fn new(inner: std::sync::Arc<dyn FileSystem>) -> Self {
         Self { inner }
+    }
+
+    fn read_fault(&self, path: &str) -> Option<FilesystemError> {
+        if !read_fault_armed()
+            || !path.ends_with(".pax")
+            || path.contains("__flush")
+            || path.contains("__compact")
+        {
+            return None;
+        }
+        let key = path.strip_prefix("file://").unwrap_or(path).to_string();
+        let mut seen = already_read().lock().ok()?;
+        if seen.insert(key) {
+            None
+        } else {
+            Some(FilesystemError::Network(format!(
+                "fault-injected transient read failure: {path}"
+            )))
+        }
     }
 
     fn delete_fault(&self, path: &str) -> Option<FilesystemError> {
@@ -108,9 +156,15 @@ impl FileSystem for FaultInjectingFileSystem {
     }
 
     async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+        if let Some(error) = self.read_fault(path) {
+            return Err(error);
+        }
         self.inner.read(path).await
     }
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+        if let Some(error) = self.read_fault(path) {
+            return Err(error);
+        }
         self.inner.read_range(path, offset, length).await
     }
     async fn read_ranges(

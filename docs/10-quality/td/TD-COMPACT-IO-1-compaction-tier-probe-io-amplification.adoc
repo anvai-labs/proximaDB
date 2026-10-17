@@ -19,7 +19,7 @@ TD-READFID-2 made compaction read each input's vector-tier declarations (exact-f
 . **A second read of each block-layout input.** The canonical arms read every `.pax` input whole (`read_all_records_from_file_unified` -> `read_object_bytes`) to merge it, then drop the bytes. The tier probe then reads a legacy block-layout input whole a second time, because its exactness is declared per block. Coalesced inputs cost 2 small ranged reads instead (header prefix, then footer).
 . **About 2x transient memory on the whole-read path.** `pax_segment_has_exact_vector_authority(&bytes)` hands `bytes.to_vec()` to `PaxSegmentScanner::from_bytes`, so the probe briefly holds two copies of the segment.
 . **Encrypted local storage turns ranged reads into whole reads.** `EncryptedFilesystem::read_range` decrypts the whole object and slices it (`filesystem.rs`, `read_range`). The probe therefore sees plaintext and stays correct, but each coalesced input costs **2 whole read+decrypt passes** instead of 2 small ranged reads.
-. **The spill executor also probes separately.** It streams inputs through its own external-MVCC reader, so its probe is extra I/O too.
+. **The spill executor also probes separately.** It streams inputs through its own external-MVCC reader, so its probe is extra I/O too. Since the second review round, the spill executor runs the probe up front: the base-quant admission decision (RawF32 needs every input exact) depends on it. A probe read error now aborts the compaction instead of demoting it, so this fixed per-input cost buys correctness.
 
 [[shipped]]
 == Mitigations shipped with TD-READFID-2's review fixes
