@@ -2237,9 +2237,9 @@ pub async fn delete_record_v2(
 // the similarity bias of `searchRecords`.
 //
 // Storage-engine delegation (TD-099 acceptance 2) shipped in
-// `c8050ab1a`: the handler drives `UnifiedHandlers::handle_record_scan_for_tenant`
-// → `VectorOperationsService::scan_records_with_tenant_context` (the
-// same WAL/memtable scan used by the rest of the v2 surface).
+// `c8050ab1a`; the handler now drives
+// `RecordOpsService::handle_record_scan_paginated_for_tenant` (the
+// storage-inclusive, cursor-paginated scan used by the rest of the v2 surface).
 //
 // Cursor pagination (TD-099 acceptance 3, sub-slice a): the handler
 // now stable-sorts records by `(updated_at_ns, oid)` then filters

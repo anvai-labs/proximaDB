@@ -129,8 +129,8 @@ pub fn create_v2_router() -> Router<AppState> {
             post(records::insert_records),
         )
         // TD-099: paginated scan — SHIPPED (storage-engine delegation landed in
-        // c8050ab1a: handler drives `handle_record_scan_for_tenant` → the shared
-        // WAL/memtable scan, cursor-paginated; see records.rs + services/scan_cursor.rs).
+        // c8050ab1a; the handler now drives `handle_record_scan_paginated_for_tenant`, the
+        // storage-inclusive cursor-paginated scan; see records.rs).
         .route(
             "/collections/{collection_id}/records/scan",
             post(records::scan_records),

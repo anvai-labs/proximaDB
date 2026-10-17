@@ -80,6 +80,18 @@ impl Server {
         config.api.grpc_port = free_port();
         config.api.unified_mode = false;
         config.api.pg_port = Some(pg_port);
+        // Anchor every storage root in this server's tempdir (TD-CONV-1
+        // pattern). The defaults are CWD-relative (`file://./data`), so
+        // vector-profile tables from concurrently running test servers shared
+        // one directory and boot-time WAL recovery hit another server's
+        // segments ("recovery segment collision").
+        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
+            url: format!("file://{}", tmp.path().display()),
+            ..Default::default()
+        }];
+        config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
+        config.storage.wal_config.write_buffer_directory =
+            format!("file://{}/wal", tmp.path().display());
 
         let mut db = ProximaDB::new(config).await?;
         db.start().await?;
@@ -103,6 +115,16 @@ impl Server {
             db: Some(db),
             _tmp: tmp,
         })
+    }
+
+    /// Force the WAL → storage flush for one table's collection.
+    async fn flush(&self, table: &str) {
+        self.db
+            .as_ref()
+            .expect("server running")
+            .force_flush_collection(table)
+            .await
+            .expect("force flush");
     }
 
     async fn connect(&self) -> tokio_postgres::Client {
@@ -560,8 +582,12 @@ fn vector_tables_keep_working_with_the_gate_on() {
             deleted, 1,
             "the DELETE must find the row it is asked to delete"
         );
-        // Visibility of the delete to SELECT is TD-PGWIRE-VECDEL-1 — see
-        // `vector_table_delete_is_invisible_to_select` (ignored until fixed).
+        assert!(
+            column(&client, &format!("SELECT id FROM {t}"))
+                .await
+                .is_empty(),
+            "the deleted row must not be returned (TD-PGWIRE-VECDEL-1)"
+        );
 
         if std::env::var(GATE).as_deref() == Ok("1") {
             let state = batch_sqlstate(
@@ -573,47 +599,166 @@ fn vector_tables_keep_working_with_the_gate_on() {
             .await;
             assert_eq!(state.as_deref(), Some("0A000"));
             exec(&client, "ROLLBACK").await;
-            // Fail closed: the refused transaction wrote nothing. (Check `v2`
-            // specifically — `v1`'s delete visibility is TD-PGWIRE-VECDEL-1.)
+            // Fail closed: the refused transaction wrote nothing.
             assert!(
-                !column(&client, &format!("SELECT id FROM {t}"))
+                column(&client, &format!("SELECT id FROM {t}"))
                     .await
-                    .contains(&"v2".to_string()),
+                    .is_empty(),
                 "a refused atomic transaction must write nothing"
             );
         }
     });
 }
 
-/// TD-PGWIRE-VECDEL-1 (open): on a vector-profile pgwire table, `DELETE`
-/// reports `DELETE 1` and writes a tombstone, yet `SELECT` still returns the
-/// row — with the atomic-commit gate on or off. The root cause is not yet
-/// located; it likely shares the tenant/collection addressing question of
-/// TD-PGWIRE-VECTENANT-1. Kept as an executable reproduction; remove
-/// `#[ignore]` when the TD is fixed.
+/// TD-PGWIRE-VECDEL-1 regression: a vector-profile pgwire table is scanned
+/// through `VectorOpsTableRecordStore`, whose scan read the RAW unflushed
+/// delta (every physical version) and only dropped dead records. A DELETE's
+/// tombstone was dropped as dead while the older live version survived, so
+/// every scan-shaped read (`SELECT`, `COUNT(*)`, a non-key predicate) still
+/// returned the row; only the by-key lookup honoured the delete.
 #[test]
-#[ignore = "TD-PGWIRE-VECDEL-1: a deleted vector-table row is still returned by SELECT"]
-fn vector_table_delete_is_invisible_to_select() {
+fn vector_table_delete_is_invisible_to_every_read_e2e() {
     run(async {
         let server = Server::start().await.expect("server");
         let client = server.connect().await;
         let t = unique("vecdel");
         exec(
             &client,
-            &format!("CREATE TABLE {t} (id VARCHAR PRIMARY KEY, embedding VECTOR(1))"),
+            &format!(
+                "CREATE TABLE {t} (id VARCHAR PRIMARY KEY, label VARCHAR, embedding VECTOR(1))"
+            ),
+        )
+        .await;
+        for (id, label, v) in [("v1", "a", 1), ("v2", "b", 2)] {
+            exec(
+                &client,
+                &format!(
+                    "INSERT INTO {t} (id, label, embedding) VALUES ('{id}', '{label}', '[{v}]'::vector)"
+                ),
+            )
+            .await;
+        }
+        // Each statement is a separate network round-trip, so the DELETE's batch
+        // lands in a later millisecond than the INSERT's. The memtable's MVCC
+        // winner rule depends on that today (TD-MEMTABLE-MVCC-1).
+        exec(&client, &format!("DELETE FROM {t} WHERE id = 'v1'")).await;
+
+        // DML target selection reads the same scan: a non-key UPDATE must not
+        // match the deleted row, and so must not resurrect it.
+        let resurrected = client
+            .execute(
+                &format!("UPDATE {t} SET label = 'x' WHERE label = 'a'"),
+                &[],
+            )
+            .await
+            .expect("non-key update");
+        assert_eq!(
+            resurrected, 0,
+            "a non-key UPDATE must not match a deleted row"
+        );
+
+        let fresh = server.connect().await;
+        for c in [&client, &fresh] {
+            assert_eq!(
+                column(c, &format!("SELECT id FROM {t}")).await,
+                vec!["v2".to_string()],
+                "full scan must not return the deleted row (mandate #16)"
+            );
+            assert_eq!(
+                column(c, &format!("SELECT id FROM {t} WHERE id <> 'zz'")).await,
+                vec!["v2".to_string()],
+                "a non-key predicate scan must not return the deleted row"
+            );
+            assert!(
+                column(c, &format!("SELECT id FROM {t} WHERE id = 'v1'"))
+                    .await
+                    .is_empty(),
+                "the by-key read must not return the deleted row"
+            );
+            assert_eq!(
+                column(c, &format!("SELECT COUNT(*) FROM {t}")).await,
+                vec!["1".to_string()],
+                "COUNT(*) must not count the deleted row"
+            );
+        }
+    });
+}
+
+/// pgwire INSERT carried `updated_at_ns = 0` (only DELETE tombstones were
+/// stamped), so any "newer stamp wins" rule lost to the tombstone. After
+/// INSERT → flush → DELETE → re-INSERT → flush, the memtable keeps only the
+/// tombstone (flush retains tombstone-only batches) and storage holds both
+/// zero-stamped versions: the by-key read hid the live re-insert, or served the
+/// deleted original. Writes are now stamped at the WAL write boundary.
+#[test]
+fn vector_table_reinsert_after_delete_survives_flush_e2e() {
+    run(async {
+        let server = Server::start().await.expect("server");
+        let client = server.connect().await;
+        let t = unique("vecreins");
+        exec(
+            &client,
+            &format!(
+                "CREATE TABLE {t} (id VARCHAR PRIMARY KEY, label VARCHAR, embedding VECTOR(1))"
+            ),
         )
         .await;
         exec(
             &client,
-            &format!("INSERT INTO {t} (id, embedding) VALUES ('v1', '[1]'::vector)"),
+            &format!("INSERT INTO {t} (id, label, embedding) VALUES ('v1', 'old', '[1]'::vector)"),
         )
         .await;
+        server.flush(&t).await;
         exec(&client, &format!("DELETE FROM {t} WHERE id = 'v1'")).await;
-        assert!(
-            column(&client, &format!("SELECT id FROM {t}"))
-                .await
-                .is_empty(),
-            "a deleted row must not be returned (mandate #16)"
+        exec(
+            &client,
+            &format!("INSERT INTO {t} (id, label, embedding) VALUES ('v1', 'new', '[2]'::vector)"),
+        )
+        .await;
+        server.flush(&t).await;
+
+        assert_eq!(
+            column(&client, &format!("SELECT label FROM {t} WHERE id = 'v1'")).await,
+            vec!["new".to_string()],
+            "the by-key read must return the re-inserted row, not hide it or serve the deleted one"
+        );
+    });
+}
+
+/// Same root cause as TD-PGWIRE-VECDEL-1: without per-row winner selection an
+/// UPDATE on a vector-profile table left the superseded version visible next
+/// to the new one, so a scan returned the row twice.
+#[test]
+fn vector_table_update_returns_only_the_current_version_e2e() {
+    run(async {
+        let server = Server::start().await.expect("server");
+        let client = server.connect().await;
+        let t = unique("vecupd");
+        exec(
+            &client,
+            &format!(
+                "CREATE TABLE {t} (id VARCHAR PRIMARY KEY, label VARCHAR, embedding VECTOR(1))"
+            ),
+        )
+        .await;
+        exec(
+            &client,
+            &format!("INSERT INTO {t} (id, label, embedding) VALUES ('v1', 'old', '[1]'::vector)"),
+        )
+        .await;
+        exec(
+            &client,
+            &format!("UPDATE {t} SET label = 'new' WHERE id = 'v1'"),
+        )
+        .await;
+        assert_eq!(
+            column(&client, &format!("SELECT label FROM {t}")).await,
+            vec!["new".to_string()],
+            "a scan must return exactly the current version of an updated row"
+        );
+        assert_eq!(
+            column(&client, &format!("SELECT COUNT(*) FROM {t}")).await,
+            vec!["1".to_string()]
         );
     });
 }
