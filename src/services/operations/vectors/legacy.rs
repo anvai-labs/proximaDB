@@ -1240,6 +1240,47 @@ impl VectorOperationsService {
         Ok(records)
     }
 
+    /// Internal (system) sample: up to `cap` unflushed (WAL/memtable) records of
+    /// `collection_id`, unscoped. For the owner backfill.
+    pub async fn sample_unflushed_records_internal(
+        &self,
+        collection_id: &str,
+        cap: usize,
+    ) -> Result<Vec<ProximaRecord>> {
+        let collection_id = self
+            .validate_tenant_collection_access(collection_id, None)
+            .await?
+            .to_string();
+        let mut records = self
+            .wal_manager
+            .get_collection_vectors_raw(&collection_id)
+            .await?;
+        records.truncate(cap);
+        Ok(records)
+    }
+
+    /// Internal (system): the collection's recorded record count, if known.
+    pub async fn recorded_collection_size_internal(
+        &self,
+        collection_id: &str,
+    ) -> Result<Option<i64>> {
+        Ok(self
+            .collection_port
+            .get_collection_internal(collection_id)
+            .await?
+            .and_then(|collection| collection.stats.map(|stats| stats.vector_count)))
+    }
+
+    /// Internal (system): every record of `collection_id` (WAL + flushed
+    /// storage), unscoped. Callers bound the collection size first.
+    pub async fn list_all_records_internal(
+        &self,
+        collection_id: &str,
+    ) -> Result<Vec<ProximaRecord>> {
+        self.list_all_records_with_tenant_context(collection_id, None)
+            .await
+    }
+
     /// Paginated storage-inclusive record scan. Returns up to `limit` records
     /// with canonical key `(updated_at_ns, oid)` strictly greater than `cursor`,
     /// in ascending order, plus the next cursor (when the page is full).
@@ -1750,7 +1791,7 @@ impl VectorOperationsService {
         // collection metadata that this service already has access to.
         if let Ok(Some(collection)) = self
             .collection_port
-            .get_collection(&collection_id, None)
+            .get_collection_internal(&collection_id)
             .await
             && let Some(cfg) = collection.config.as_ref()
             && let Some(precision_value) = cfg.canonical_embedding_precision
@@ -6857,9 +6898,22 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
 
     async fn batch_upsert(
         &self,
-        request: crate::proto::proximadb_v1::VectorBatchRequest,
+        mut request: crate::proto::proximadb_v1::VectorBatchRequest,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::VectorOperationResponse> {
+        // Resolved within the request tenant (absent ⇒ the default tenant): a
+        // collection the tenant may not resolve is answered as missing.
+        let request_tenant = tenant_id
+            .filter(|t| !t.is_empty())
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+        let collection = self
+            .collection_port
+            .get_collection(&request.collection_id, Some(request_tenant))
+            .await?
+            .ok_or_else(|| {
+                super::input_validation::CollectionNotFound::new(request.collection_id.as_str())
+            })?;
+        request.collection_id = collection.id;
         // Was `_tenant_id` — the caller's tenant was plumbed the whole way down this
         // port and then discarded here, so every record inserted through it landed with
         // an empty `tenant_id`, which the read filters treat as matching every tenant.
@@ -6872,10 +6926,19 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
         vector_id: &str,
         include_vector: bool,
         include_metadata: bool,
-        _tenant_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::VectorOperationResponse> {
+        // Resolved within the request tenant (absent ⇒ the default tenant).
+        let request_tenant = tenant_id
+            .filter(|t| !t.is_empty())
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+        let collection = self
+            .collection_port
+            .get_collection(collection_id, Some(request_tenant))
+            .await?
+            .ok_or_else(|| super::input_validation::CollectionNotFound::new(collection_id))?;
         let req = crate::proto::proximadb_v1::VectorGetRequest {
-            collection_id: collection_id.to_string(),
+            collection_id: collection.id,
             vector_id: vector_id.to_string(),
             include_vector: Some(include_vector),
             include_metadata: Some(include_metadata),

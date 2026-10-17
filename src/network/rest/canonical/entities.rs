@@ -24,6 +24,62 @@ use crate::storage::entity_store::{EntityStore, ProximaEntityStore};
 pub struct EntityApiState {
     /// Shared entity store for SKS operations
     pub store: Arc<ProximaEntityStore>,
+    /// Resolves the backing collection within the request tenant before any
+    /// entity operation. `None` (tests) skips the check.
+    pub collections: Option<Arc<dyn proximadb_runtime::CollectionPort>>,
+}
+
+type EntityRejection = (StatusCode, Json<ErrorResponse>);
+
+/// The request tenant (absent ⇒ the default tenant).
+fn request_tenant(
+    tenant: &Option<axum::Extension<crate::network::middleware::tenant::TenantContext>>,
+) -> String {
+    tenant
+        .as_ref()
+        .map(|axum::Extension(t)| t.tenant_id.clone())
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string())
+}
+
+/// The response for a collection that does not resolve for this request —
+/// missing, or not resolvable by its tenant (one response for both).
+fn collection_not_found(collection_id: &str) -> EntityRejection {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "Collection not found".to_string(),
+            details: Some(
+                crate::services::operations::vectors::CollectionNotFound::new(collection_id)
+                    .to_string(),
+            ),
+        }),
+    )
+}
+
+/// Resolve the backing collection within the request tenant before any
+/// entity operation touches it.
+async fn require_collection(
+    state: &EntityApiState,
+    tenant: &str,
+    collection_id: &str,
+) -> Result<(), EntityRejection> {
+    let Some(collections) = &state.collections else {
+        return Ok(());
+    };
+    match collections
+        .get_collection(collection_id, Some(tenant))
+        .await
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(collection_not_found(collection_id)),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Collection lookup failed".to_string(),
+                details: Some(e.to_string()),
+            }),
+        )),
+    }
 }
 
 /// Request body for entity upsert
@@ -92,9 +148,11 @@ pub struct ErrorResponse {
 pub async fn upsert_entity(
     Path(collection_id): Path<String>,
     State(state): State<EntityApiState>,
+    tenant: Option<axum::Extension<crate::network::middleware::tenant::TenantContext>>,
     Json(request): Json<UpsertEntityRequest>,
 ) -> impl IntoResponse {
     info!("REST: Upserting entity in collection: {}", collection_id);
+    require_collection(&state, &request_tenant(&tenant), &collection_id).await?;
 
     // Validate collection_id
     if collection_id.is_empty() {
@@ -144,7 +202,9 @@ pub async fn get_entity(
     Path((collection_id, entity_id)): Path<(String, String)>,
     Query(params): Query<GetEntityQuery>,
     State(state): State<EntityApiState>,
+    tenant: Option<axum::Extension<crate::network::middleware::tenant::TenantContext>>,
 ) -> impl IntoResponse {
+    require_collection(&state, &request_tenant(&tenant), &collection_id).await?;
     debug!(
         "REST: Getting entity {} from collection {}",
         entity_id, collection_id
@@ -210,7 +270,9 @@ pub async fn delete_entity(
     Path((collection_id, entity_id)): Path<(String, String)>,
     Query(params): Query<DeleteEntityQuery>,
     State(state): State<EntityApiState>,
+    tenant: Option<axum::Extension<crate::network::middleware::tenant::TenantContext>>,
 ) -> impl IntoResponse {
+    require_collection(&state, &request_tenant(&tenant), &collection_id).await?;
     info!(
         "REST: Deleting entity {} from collection {} (hard_delete: {})",
         entity_id,
@@ -281,9 +343,7 @@ pub async fn search_entities(
 ) -> impl IntoResponse {
     // The backing collection is resolved within the request tenant (absent ⇒
     // the default tenant).
-    let request_tenant = tenant
-        .map(|axum::Extension(t)| t.tenant_id)
-        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    let request_tenant = request_tenant(&tenant);
     let top_k = request.top_k.unwrap_or(10);
 
     info!(
@@ -397,13 +457,7 @@ pub async fn search_entities(
         }
         Err(e) => {
             if let Some(missing) = crate::services::operations::vectors::collection_not_found(&e) {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: "Collection not found".to_string(),
-                        details: Some(missing.to_string()),
-                    }),
-                ));
+                return Err(collection_not_found(&missing.identifier));
             }
             // Wrong-dimension / empty / non-finite query vector or over-cap
             // top_k: the client's argument (TD-SECSCAN-1 §5), not a server fault.
@@ -434,7 +488,9 @@ pub async fn list_entities(
     Path(collection_id): Path<String>,
     Query(params): Query<ListEntitiesQuery>,
     State(state): State<EntityApiState>,
+    tenant: Option<axum::Extension<crate::network::middleware::tenant::TenantContext>>,
 ) -> impl IntoResponse {
+    require_collection(&state, &request_tenant(&tenant), &collection_id).await?;
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(1000); // Cap at 1000
 

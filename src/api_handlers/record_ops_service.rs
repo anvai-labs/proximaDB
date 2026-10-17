@@ -423,22 +423,17 @@ impl RecordOpsService {
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
         request_tenant: Option<&str>,
     ) -> Result<Option<String>> {
-        if let Some(tenant_ctx) = tenant_context {
-            Ok(self
-                .collection_service
-                .collection_for_tenant(collection_identifier, Some(&tenant_ctx.tenant_id))
-                .await?
-                .map(|collection| collection.id))
-        } else if request_tenant.is_some() {
-            Ok(self
-                .collection_service
-                .collection_for_tenant(collection_identifier, request_tenant)
-                .await?
-                .map(|collection| collection.id))
-        } else {
-            self.resolve_collection_id_cached(collection_identifier)
-                .await
-        }
+        // Always resolved within a tenant: the context's, else the request's,
+        // else the default tenant — never unscoped.
+        let scope = tenant_context
+            .map(|ctx| ctx.tenant_id.as_str())
+            .or(request_tenant)
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+        Ok(self
+            .collection_service
+            .collection_for_tenant(collection_identifier, Some(scope))
+            .await?
+            .map(|collection| collection.id))
     }
 
     /// Resolve BOTH the canonical collection id AND its display name from a
@@ -455,28 +450,23 @@ impl RecordOpsService {
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
         request_tenant: Option<&str>,
     ) -> Result<Option<(String, String)>> {
+        // Always resolved within a tenant (see `resolve_collection_id_internal`).
         let scope = tenant_context
             .map(|ctx| ctx.tenant_id.as_str())
-            .or(request_tenant);
-        if scope.is_some() {
-            Ok(self
-                .collection_service
-                .collection_for_tenant(collection_identifier, scope)
-                .await?
-                .map(|collection| {
-                    let name = collection
-                        .config
-                        .as_ref()
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| collection_identifier.to_string());
-                    (collection.id, name)
-                }))
-        } else {
-            Ok(self
-                .resolve_collection_id_cached(collection_identifier)
-                .await?
-                .map(|id| (id, collection_identifier.to_string())))
-        }
+            .or(request_tenant)
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+        Ok(self
+            .collection_service
+            .collection_for_tenant(collection_identifier, Some(scope))
+            .await?
+            .map(|collection| {
+                let name = collection
+                    .config
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| collection_identifier.to_string());
+                (collection.id, name)
+            }))
     }
 
     /// Resolve name or object id to one canonical identity for protocol

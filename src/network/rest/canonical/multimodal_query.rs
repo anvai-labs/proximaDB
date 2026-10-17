@@ -438,7 +438,7 @@ async fn scope_request_tenant(
         .get::<crate::network::middleware::tenant::TenantContext>()
         .map(|tenant| tenant.tenant_id.clone())
         .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
-    crate::query::request_scope::with_request_tenant(Some(tenant), next.run(request)).await
+    crate::query::request_scope::with_request_tenant(tenant, next.run(request)).await
 }
 
 /// Execute a unified SQL-like query

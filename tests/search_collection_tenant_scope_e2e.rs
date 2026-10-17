@@ -863,3 +863,340 @@ async fn search_resolution_is_scoped_to_the_request_tenant() {
         failures.join("\n  ")
     );
 }
+
+/// One REST probe: `(label, method, path for collection c, body for c)`.
+type RestProbe = (
+    &'static str,
+    reqwest::Method,
+    fn(&str) -> String,
+    fn(&str) -> Option<Value>,
+);
+
+fn sql_vector_search(c: &str) -> String {
+    format!("SELECT * FROM VECTOR_SEARCH('{c}', '[1.0,0.0,0.0,0.0]', 5)")
+}
+
+fn beyond_search_probes() -> Vec<RestProbe> {
+    vec![
+        (
+            "REST /api/v2/sql VECTOR_SEARCH",
+            reqwest::Method::POST,
+            |_| "/api/v2/sql".to_string(),
+            |c| Some(json!({ "query": sql_vector_search(c) })),
+        ),
+        (
+            "REST /api/v2/query federated",
+            reqwest::Method::POST,
+            |_| "/api/v2/query".to_string(),
+            |c| Some(json!({ "language": "federated", "query": sql_vector_search(c) })),
+        ),
+        (
+            "REST /api/v2/query uql",
+            reqwest::Method::POST,
+            |_| "/api/v2/query".to_string(),
+            |c| {
+                Some(json!({
+                    "language": "uql",
+                    "query": format!("SELECT * FROM vectors.{c} WHERE VECTOR_SIMILAR(embedding, ?, 0.0) LIMIT 5"),
+                    "parameters": [vector()],
+                }))
+            },
+        ),
+        (
+            "REST document ingest",
+            reqwest::Method::POST,
+            |c| format!("/api/v2/collections/{c}/documents"),
+            |_| {
+                Some(json!({
+                    "documents": [{ "id": "planted-doc", "text": "planted text", "vector": vector() }]
+                }))
+            },
+        ),
+        (
+            "REST discovery dedup create",
+            reqwest::Method::POST,
+            |c| format!("/api/v2/collections/{c}/discovery-jobs"),
+            |_| Some(json!({ "kind": "dedup" })),
+        ),
+        (
+            "REST discovery list",
+            reqwest::Method::GET,
+            |c| format!("/api/v2/collections/{c}/discovery-jobs"),
+            |_| None,
+        ),
+        (
+            "REST v1 entity upsert",
+            reqwest::Method::POST,
+            |c| format!("/api/v1/collections/{c}/entities"),
+            |_| {
+                Some(json!({ "entity": {
+                    "id": "planted-entity",
+                    "embeddings": [{ "model_id": "m", "modality": "Text", "dimension": 4,
+                                     "vector": [0.0, 0.0, 0.0, 1.0] }]
+                }}))
+            },
+        ),
+        (
+            "REST v1 entity list",
+            reqwest::Method::GET,
+            |c| format!("/api/v1/collections/{c}/entities"),
+            |_| None,
+        ),
+        (
+            "REST v1 entity get",
+            reqwest::Method::GET,
+            |c| format!("/api/v1/collections/{c}/entities/{GLOBEX}-r0"),
+            |_| None,
+        ),
+        (
+            "REST v1 entity delete",
+            reqwest::Method::DELETE,
+            |c| format!("/api/v1/collections/{c}/entities/{GLOBEX}-r1"),
+            |_| None,
+        ),
+        (
+            "REST hybrid index",
+            reqwest::Method::POST,
+            |_| "/api/v2/hybrid/index".to_string(),
+            |c| {
+                Some(json!({
+                    "collection": c,
+                    "documents": [{ "id": "planted-bm25", "text": "quarterly planted" }]
+                }))
+            },
+        ),
+    ]
+}
+
+/// Surfaces beyond vector search — SQL/federated/UQL queries, document
+/// ingest, discovery jobs, legacy entities, BM25 indexing, and the Arrow
+/// Flight actions — also resolve collections within the request tenant: a
+/// foreign collection is answered exactly like a missing one, nothing in it
+/// changes, and listings omit it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_collection_surface_is_scoped_to_the_request_tenant() {
+    let server = Server::start().await.expect("server start");
+    let rest = Rest {
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .expect("http client"),
+        base: format!("http://127.0.0.1:{}", server.rest_port),
+    };
+    rest.create(Some(ACME), ACME_DOCS).await;
+    let globex_id = rest.create(Some(GLOBEX), GLOBEX_DOCS).await;
+    rest.insert(Some(ACME), ACME_DOCS, ACME).await;
+    rest.insert(Some(GLOBEX), GLOBEX_DOCS, GLOBEX).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let globex_snapshot = |rest: &Rest| {
+        let http = rest.http.clone();
+        let base = rest.base.clone();
+        async move {
+            let response = http
+                .post(format!(
+                    "{base}/api/v2/collections/{GLOBEX_DOCS}/records/scan"
+                ))
+                .header("X-Tenant-ID", GLOBEX)
+                .json(&json!({ "limit": 100 }))
+                .send()
+                .await
+                .expect("globex scan");
+            let body: Value = response.json().await.unwrap_or(Value::Null);
+            let mut ids: Vec<String> = body["records"]
+                .as_array()
+                .map(|records| {
+                    records
+                        .iter()
+                        .filter_map(|r| r["id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            ids.sort();
+            ids
+        }
+    };
+    let before = globex_snapshot(&rest).await;
+    assert!(!before.is_empty(), "globex must see its own records");
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for (label, method, path, body) in beyond_search_probes() {
+        for (how, foreign, missing) in [
+            ("by name", GLOBEX_DOCS, MISSING_DOCS),
+            ("by object id", globex_id.as_str(), MISSING_OBJECT_ID),
+        ] {
+            let (s1, b1) = rest
+                .call(Some(ACME), method.clone(), &path(foreign), body(foreign))
+                .await;
+            let (s2, b2) = rest
+                .call(Some(ACME), method.clone(), &path(missing), body(missing))
+                .await;
+            let foreign_seen = normalise(s1.to_string(), &b1, foreign);
+            let missing_seen = normalise(s2.to_string(), &b2, missing);
+            // Document ingest auto-creates a missing collection, so for it the
+            // check is that the foreign collection is neither served nor
+            // written (the record snapshot below).
+            if foreign_seen != missing_seen && label != "REST document ingest" {
+                failures.push(format!(
+                    "{label} {how}: foreign {foreign_seen:?}\n      vs missing {missing_seen:?}"
+                ));
+            }
+            if s1.is_success() {
+                failures.push(format!("{label} {how}: acme was served: {s1} {b1}"));
+            }
+            // A missing collection named by NAME is a client error. (A bare
+            // numeric object id is not a valid UQL source name, so that
+            // probe fails as a malformed query — identically for both.)
+            if s1.is_server_error() && how == "by name" {
+                failures.push(format!(
+                    "{label} {how}: a missing collection must be a client error, got {s1} {b1}"
+                ));
+            }
+        }
+    }
+    // The owner still gets served on the query surfaces.
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            "/api/v2/sql",
+            Some(json!({ "query": sql_vector_search(GLOBEX_DOCS) })),
+        )
+        .await;
+    if !status.is_success() {
+        failures.push(format!("REST /api/v2/sql as owner: {status} {body}"));
+    }
+
+    // --- Arrow Flight actions.
+    let channel =
+        tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", server.flight_port))
+            .expect("flight endpoint")
+            .connect()
+            .await
+            .expect("flight channel");
+    let mut flight = FlightServiceClient::new(channel);
+    let mut act = async |tenant: &str, kind: &str, body: Value, identifier: &str| -> Observed {
+        let action = arrow_flight::Action {
+            r#type: kind.to_string(),
+            body: serde_json::to_vec(&body).unwrap_or_default().into(),
+        };
+        let outcome = match flight.do_action(with_tenant(action, tenant)).await {
+            Ok(stream) => stream
+                .into_inner()
+                .try_collect::<Vec<_>>()
+                .await
+                .map(|results| {
+                    results
+                        .iter()
+                        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                }),
+            Err(status) => Err(status),
+        };
+        match outcome {
+            Ok(served) => {
+                let mut normalised = normalise("OK".to_string(), &served, identifier);
+                normalised.status = "OK".to_string();
+                normalised
+            }
+            Err(status) => Observed {
+                status: format!("{:?}", status.code()),
+                body: mask(status.message(), identifier),
+            },
+        }
+    };
+    let flight_actions: Vec<(&str, fn(&str) -> Value)> = vec![
+        ("get_collection", |c| json!({ "collection_id": c })),
+        (
+            "get_vectors",
+            |c| json!({ "collection_id": c, "vector_ids": [format!("{GLOBEX}-r0")] }),
+        ),
+        ("list_arrow_files", |c| json!({ "collection_id": c })),
+        ("flush_collection", |c| json!({ "collection_id": c })),
+        ("compact_collection", |c| json!({ "collection_id": c })),
+        ("flush_and_compact", |c| json!({ "collection_id": c })),
+        (
+            "delete_vectors",
+            |c| json!({ "collection_id": c, "vector_ids": [format!("{GLOBEX}-r2")] }),
+        ),
+        (
+            "rank_features_export",
+            |c| json!({ "collection": c, "query_vector": vector(), "k": 5 }),
+        ),
+        ("delete_collection", |c| json!({ "collection_id": c })),
+    ];
+    for (kind, body) in flight_actions {
+        for (how, foreign, missing) in [
+            ("by name", GLOBEX_DOCS, MISSING_DOCS),
+            ("by object id", globex_id.as_str(), MISSING_OBJECT_ID),
+        ] {
+            let foreign_seen = act(ACME, kind, body(foreign), foreign).await;
+            let missing_seen = act(ACME, kind, body(missing), missing).await;
+            if foreign_seen != missing_seen {
+                failures.push(format!(
+                    "Flight {kind} {how}: foreign {foreign_seen:?}\n      vs missing {missing_seen:?}"
+                ));
+            }
+        }
+    }
+    let listed = act(ACME, "list_collections", json!({}), "").await;
+    if listed.body.contains(GLOBEX_DOCS) || !listed.body.contains(ACME_DOCS) {
+        failures.push(format!("Flight list_collections as acme: {listed:?}"));
+    }
+    match flight
+        .list_flights(with_tenant(arrow_flight::Criteria::default(), ACME))
+        .await
+    {
+        Ok(stream) => {
+            let infos = stream.into_inner().try_collect::<Vec<_>>().await;
+            if format!("{infos:?}").contains(GLOBEX_DOCS) {
+                failures.push("Flight list_flights as acme lists globex_docs".to_string());
+            }
+        }
+        Err(status) => failures.push(format!("Flight list_flights as acme: {status:?}")),
+    }
+
+    // Nothing in globex's collection changed, and it still exists.
+    sleep(Duration::from_secs(3)).await;
+    let after = globex_snapshot(&rest).await;
+    if after != before {
+        failures.push(format!(
+            "globex_docs records changed: before {before:?}, after {after:?}"
+        ));
+    }
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::GET,
+            &format!("/api/v2/collections/{GLOBEX_DOCS}"),
+            None,
+        )
+        .await;
+    if !status.is_success() {
+        failures.push(format!(
+            "globex_docs gone after acme's delete: {status} {body}"
+        ));
+    }
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            "/api/v2/hybrid/search",
+            Some(json!({ "collection": GLOBEX_DOCS, "text_query": "quarterly", "vector": vector(), "top_k": 5 })),
+        )
+        .await;
+    if body.contains("planted-bm25") {
+        failures.push(format!(
+            "BM25 index of globex_docs was written by acme: {status} {body}"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "every collection surface must be scoped to the request tenant:\n  {}",
+        failures.join("\n  ")
+    );
+}

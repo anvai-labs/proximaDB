@@ -57,6 +57,22 @@ mod tests {
         ),
     ];
 
+    /// Same contract for the owned form's tenant-less default.
+    const ALLOWED_OWNED_DEFAULT: &[(&str, usize, &str)] = &[
+        (
+            "src/datafusion/mod.rs",
+            2,
+            "create_session_context registers no vector/graph function (the identity is \
+             unused); create_session_context_with_vector_ops has no production caller",
+        ),
+        (
+            "src/datafusion/cross_modal.rs",
+            2,
+            "VectorSearchTableFunction::new (test constructor) and a unit test; production \
+             registers with_identity",
+        ),
+    ];
+
     fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
@@ -82,10 +98,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn anonymous_port_identity_uses_are_all_listed() {
-        // Built so this file does not match itself.
-        let needle = format!("PortIdentity::{}()", "anonymous");
+    fn check(needle: &str, allowlist: &[(&str, usize, &str)]) {
         let root = workspace_root();
         let mut files = Vec::new();
         for top in ["src", "crates", "apps"] {
@@ -110,7 +123,7 @@ mod tests {
             "guard scanned nothing under {}: the workspace layout changed",
             root.display()
         );
-        let allowed: BTreeMap<String, usize> = ALLOWED
+        let allowed: BTreeMap<String, usize> = allowlist
             .iter()
             .map(|(file, count, _)| (file.to_string(), *count))
             .collect();
@@ -127,5 +140,19 @@ mod tests {
             }
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn anonymous_port_identity_uses_are_all_listed() {
+        // Built so this file does not match itself.
+        check(&format!("PortIdentity::{}()", "anonymous"), ALLOWED);
+    }
+
+    #[test]
+    fn tenant_less_owned_identity_defaults_are_all_listed() {
+        check(
+            &format!("OwnedPortIdentity::{}()", "default"),
+            ALLOWED_OWNED_DEFAULT,
+        );
     }
 }

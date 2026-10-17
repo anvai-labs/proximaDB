@@ -77,12 +77,17 @@ use proximadb_rank_profile::CompiledRankProfile;
 pub async fn export_rank_features_to_arrow_ipc(
     services: &Arc<RankServices>,
     body: &[u8],
+    request_tenant: &str,
 ) -> Result<Vec<u8>, RankError> {
-    let request: RankSearchRequest = serde_json::from_slice(body).map_err(|e| {
+    let mut request: RankSearchRequest = serde_json::from_slice(body).map_err(|e| {
         RankError::InvalidProfile(format!(
             "rank_features_export: request body must be JSON RankSearchRequest: {e}"
         ))
     })?;
+
+    // The collection is resolved within the caller's tenant (never from the
+    // request body).
+    request.request_tenant = Some(request_tenant.to_string());
 
     // Resolve match_features + summary_features column order from the
     // active profile BEFORE the pipeline runs — we need stable Arrow
@@ -526,7 +531,7 @@ mod tests {
         }))
         .unwrap();
 
-        let ipc = export_rank_features_to_arrow_ipc(&services, &body)
+        let ipc = export_rank_features_to_arrow_ipc(&services, &body, "default")
             .await
             .unwrap();
         let mut reader = StreamReader::try_new(ipc.as_slice(), None).unwrap();
@@ -567,7 +572,7 @@ mod tests {
             "k": 2,
         }))
         .unwrap();
-        let ipc = export_rank_features_to_arrow_ipc(&services, &body)
+        let ipc = export_rank_features_to_arrow_ipc(&services, &body, "default")
             .await
             .unwrap();
         let mut reader = StreamReader::try_new(ipc.as_slice(), None).unwrap();
@@ -580,7 +585,7 @@ mod tests {
     async fn export_with_bad_body_returns_invalid_profile_error() {
         let candidates: Arc<dyn CandidateProvider> = Arc::new(FixedCandidates(vec![DocHandle(1)]));
         let services = Arc::new(RankServices::new(candidates));
-        let err = export_rank_features_to_arrow_ipc(&services, b"not json")
+        let err = export_rank_features_to_arrow_ipc(&services, b"not json", "default")
             .await
             .err()
             .unwrap();
@@ -603,7 +608,7 @@ mod tests {
             "rank_profile": "ghost",
         }))
         .unwrap();
-        let err = export_rank_features_to_arrow_ipc(&services, &body)
+        let err = export_rank_features_to_arrow_ipc(&services, &body, "default")
             .await
             .err()
             .unwrap();
@@ -792,7 +797,7 @@ mod tests {
             "rank_profile": "both",
         }))
         .unwrap();
-        let ipc = export_rank_features_to_arrow_ipc(&services, &body)
+        let ipc = export_rank_features_to_arrow_ipc(&services, &body, "default")
             .await
             .unwrap();
         let mut reader = StreamReader::try_new(ipc.as_slice(), None).unwrap();

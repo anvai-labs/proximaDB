@@ -6235,9 +6235,11 @@ impl PostgresProtocol {
 
         debug!("Dropping collection '{}'", table_name);
 
+        // Scoped to the connection's tenant (startup `database`).
+        let tenant = self.pgwire_resolve_write_tenant().await;
         match self
             .collection_port
-            .delete_collection(&table_name, None)
+            .delete_collection(&table_name, Some(&tenant))
             .await
         {
             Ok(_) => {

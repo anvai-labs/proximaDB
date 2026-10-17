@@ -274,15 +274,19 @@ impl FederatedQueryContext {
 
     /// Execute a federated query with optional caching
     pub async fn execute(&self, sql: &str) -> Result<ExecutionResult> {
+        // Fail closed: a federated query runs only within a request scope
+        // (a tenant, or explicitly internal) — see `request_scope`.
+        if crate::query::request_scope::current_scope().is_none() {
+            return Err(anyhow::anyhow!(
+                "federated query has no request scope; the caller must act as a tenant"
+            ));
+        }
         crate::query::utils::metrics::record_query_start("federated");
         let start = std::time::Instant::now();
 
         // Check cache first if enabled
         if let Some(ref cache) = self.cache {
-            let key = match crate::query::request_scope::current_request_tenant() {
-                Some(tenant) => QueryKey::from_sql_with_params(sql, &[tenant.as_str()]),
-                None => QueryKey::from_sql(sql),
-            };
+            let key = federated_cache_key(sql);
             if let Some(cached) = cache.get(&key) {
                 debug!(
                     query_fingerprint = key.fingerprint,
@@ -325,10 +329,7 @@ impl FederatedQueryContext {
 
             // Cache the result if caching is enabled
             if let Some(ref cache) = self.cache {
-                let key = match crate::query::request_scope::current_request_tenant() {
-                Some(tenant) => QueryKey::from_sql_with_params(sql, &[tenant.as_str()]),
-                None => QueryKey::from_sql(sql),
-            };
+                let key = federated_cache_key(sql);
                 // Clone the result for caching
                 let cached_result = ExecutionResult {
                     batches: result.batches.clone(),
@@ -1008,6 +1009,30 @@ mod tests {
         }
     }
 
+    /// A federated query outside any request scope fails closed instead of
+    /// running unscoped; an explicitly internal scope runs it.
+    #[tokio::test]
+    async fn federated_query_without_a_request_scope_fails_closed() {
+        let ctx = FederatedQueryContext::new(Arc::new(MultiModelStorageFacade::new()));
+        let denied = ctx.execute("SELECT 1").await;
+        assert!(
+            denied
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("no request scope")),
+            "no scope must fail closed"
+        );
+        let internal =
+            crate::query::request_scope::with_internal_scope("test", ctx.execute("SELECT 1")).await;
+        assert!(
+            internal
+                .as_ref()
+                .err()
+                .is_none_or(|e| !e.to_string().contains("no request scope")),
+            "an internal scope is not denied"
+        );
+    }
+
     #[test]
     fn test_federated_context_creation() {
         let storage = Arc::new(MultiModelStorageFacade::new());
@@ -1092,10 +1117,14 @@ mod tests {
             collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>,
         );
 
-        let result = ctx
-            .execute_uncached("SELECT id, score FROM VECTOR_SEARCH('productsaa', '[0.1, 0.2]', 1)")
-            .await
-            .expect("vector search should execute");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached(
+                "SELECT id, score FROM VECTOR_SEARCH('productsaa', '[0.1, 0.2]', 1)",
+            ),
+        )
+        .await
+        .expect("vector search should execute");
 
         assert_eq!(result.row_count(), 1);
         assert_eq!(
@@ -1157,10 +1186,12 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_vector_store(vector_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached("SELECT id, score FROM VECTOR_SEARCH('products', '[0.1]', 2)")
-            .await
-            .expect("vector search should execute");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT id, score FROM VECTOR_SEARCH('products', '[0.1]', 2)"),
+        )
+        .await
+        .expect("vector search should execute");
 
         let batch = result
             .batches
@@ -1239,10 +1270,12 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new());
         let ctx = FederatedQueryContext::new(storage);
 
-        let error = ctx
-            .execute_uncached("SELECT * FROM users")
-            .await
-            .expect_err("plain SQL should not execute through federated context");
+        let error = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT * FROM users"),
+        )
+        .await
+        .expect_err("plain SQL should not execute through federated context");
 
         assert!(
             error
@@ -1256,10 +1289,12 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new());
         let ctx = FederatedQueryContext::new(storage);
 
-        let error = ctx
-            .execute_uncached("SELECT * FROM VECTOR_SEARCH('products', '[0.1, 0.2]', 2)")
-            .await
-            .expect_err("vector search should fail without a configured vector store");
+        let error = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT * FROM VECTOR_SEARCH('products', '[0.1, 0.2]', 2)"),
+        )
+        .await
+        .expect_err("vector search should fail without a configured vector store");
 
         assert!(error.to_string().contains("Vector store is not configured"));
     }
@@ -1313,10 +1348,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM VECTOR_SEARCH('products', '[0.1]', 1), DOCUMENT_QUERY('docs', 'status = \"active\"')",
-            )
+            ))
             .await
             .expect("cross-source join should execute for function-backed sources");
 
@@ -1344,12 +1379,14 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_vector_store(vector_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached(
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached(
                 "SELECT id FROM VECTOR_SEARCH('products', '[0.1]', 2) WHERE id = 'doc-2' LIMIT 1",
-            )
-            .await
-            .expect("projection/filter/limit should execute for vector search");
+            ),
+        )
+        .await
+        .expect("projection/filter/limit should execute for vector search");
 
         assert_eq!(result.row_count(), 1);
         let field_names: Vec<String> = result
@@ -1385,10 +1422,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_vector_store(vector_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT id, score FROM VECTOR_SEARCH('products', '[0.1]', 2) ORDER BY score DESC LIMIT 1",
-            )
+            ))
             .await
             .expect("order by should execute for vector search");
 
@@ -1426,10 +1463,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_vector_store(vector_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT COUNT(*) AS total, MAX(score) AS best_score, AVG(score) AS avg_score FROM VECTOR_SEARCH('products', '[0.1]', 3) WHERE score > 0.2",
-            )
+            ))
             .await
             .expect("global aggregates should execute for vector search");
 
@@ -1482,10 +1519,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_vector_store(vector_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT id AS doc_id, COUNT(*) AS matches FROM VECTOR_SEARCH('products', '[0.1]', 3) GROUP BY id ORDER BY matches DESC LIMIT 1",
-            )
+            ))
             .await
             .expect("group by should execute for grouped federated aggregates");
 
@@ -1531,10 +1568,12 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_vector_store(vector_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached("SELECT DISTINCT id FROM VECTOR_SEARCH('products', '[0.1]', 2)")
-            .await
-            .expect("distinct should execute for simple federated projections");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT DISTINCT id FROM VECTOR_SEARCH('products', '[0.1]', 2)"),
+        )
+        .await
+        .expect("distinct should execute for simple federated projections");
 
         assert_eq!(result.row_count(), 1);
         let batch = result
@@ -1560,10 +1599,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_vector_store(vector_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT id AS doc_id, score AS similarity FROM VECTOR_SEARCH('products', '[0.1]', 1)",
-            )
+            ))
             .await
             .expect("projection aliases should execute for simple federated projections");
 
@@ -1591,10 +1630,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_vector_store(vector_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT id AS doc_id, score AS similarity FROM VECTOR_SEARCH('products', '[0.1]', 2) ORDER BY similarity DESC LIMIT 1",
-            )
+            ))
             .await
             .expect("order by projection alias should execute");
 
@@ -1670,10 +1709,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('profiles') p JOIN LATERAL VECTOR_SEARCH('products', p.document.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("function-backed lateral join should execute");
 
@@ -1747,10 +1786,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('profiles') p JOIN LATERAL VECTOR_SEARCH('products', p.document.profile.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("nested function-backed lateral join should execute");
 
@@ -1825,10 +1864,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM GRAPH_QUERY('MATCH (n:Entity) RETURN n') g JOIN LATERAL VECTOR_SEARCH('products', g.properties.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("graph-backed correlated vector search should execute");
 
@@ -1895,10 +1934,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('profiles') p JOIN LATERAL VECTOR_SEARCH('products', p.document.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("lateral join should skip rows without a correlated vector");
 
@@ -1956,10 +1995,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM GRAPH_QUERY('MATCH (n:Entity) RETURN n') g JOIN LATERAL VECTOR_SEARCH('products', g.properties.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("lateral join should skip graph rows without a correlated vector property");
 
@@ -1999,10 +2038,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let error = ctx
+        let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('profiles') p JOIN LATERAL VECTOR_SEARCH('products', p.document.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect_err("malformed correlated vectors should still fail");
 
@@ -2079,10 +2118,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('left_profiles') p, DOCUMENT_QUERY('right_profiles') q JOIN LATERAL VECTOR_SEARCH('products', q.document.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("multi-document lateral join should execute");
 
@@ -2161,10 +2200,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('left_profiles') p, DOCUMENT_QUERY('right_profiles') q JOIN LATERAL VECTOR_SEARCH('products', Q.document.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("multi-document lateral join should treat aliases case-insensitively");
 
@@ -2243,10 +2282,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('left_profiles') \"LeftAlias\", DOCUMENT_QUERY('right_profiles') \"RightAlias\" JOIN LATERAL VECTOR_SEARCH('products', \"RightAlias\".document.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("multi-document lateral join should support quoted aliases");
 
@@ -2325,10 +2364,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('left_profiles') \"Left.Alias\", DOCUMENT_QUERY('right_profiles') \"Right.Alias\" JOIN LATERAL VECTOR_SEARCH('products', \"Right.Alias\".document.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("multi-document lateral join should support quoted dotted aliases");
 
@@ -2393,10 +2432,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let error = ctx
+        let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('left_profiles') \"LeftAlias\", DOCUMENT_QUERY('right_profiles') \"RightAlias\" JOIN LATERAL VECTOR_SEARCH('products', \"RIGHTALIAS\".document.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect_err("quoted document alias case mismatch should not silently bind another source");
 
@@ -2466,10 +2505,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM GRAPH_QUERY('MATCH (n:Left) RETURN n') p, GRAPH_QUERY('MATCH (n:Right) RETURN n') q JOIN LATERAL VECTOR_SEARCH('products', q.properties.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("multi-graph lateral join should execute");
 
@@ -2541,10 +2580,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM GRAPH_QUERY('MATCH (n:Left) RETURN n') \"LeftAlias\", GRAPH_QUERY('MATCH (n:Right) RETURN n') \"RightAlias\" JOIN LATERAL VECTOR_SEARCH('products', \"RightAlias\".properties.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("multi-graph lateral join should support quoted aliases");
 
@@ -2616,10 +2655,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM GRAPH_QUERY('MATCH (n:Left) RETURN n') \"Left.Alias\", GRAPH_QUERY('MATCH (n:Right) RETURN n') \"Right.Alias\" JOIN LATERAL VECTOR_SEARCH('products', \"Right.Alias\".properties.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("multi-graph lateral join should support quoted dotted aliases");
 
@@ -2678,10 +2717,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let error = ctx
+        let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM GRAPH_QUERY('MATCH (n:Left) RETURN n') \"LeftAlias\", GRAPH_QUERY('MATCH (n:Right) RETURN n') \"RightAlias\" JOIN LATERAL VECTOR_SEARCH('products', \"RIGHTALIAS\".properties.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect_err("quoted graph alias case mismatch should not silently bind another source");
 
@@ -2751,10 +2790,10 @@ mod tests {
         );
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM GRAPH_QUERY('MATCH (n:Left) RETURN n') p, GRAPH_QUERY('MATCH (n:Right) RETURN n') q JOIN LATERAL VECTOR_SEARCH('products', Q.properties.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect("multi-graph lateral join should treat aliases case-insensitively");
 
@@ -2786,10 +2825,12 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_document_store(document_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached("SELECT * FROM DOCUMENT_QUERY('profiles')")
-            .await
-            .expect("plain document query should execute");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT * FROM DOCUMENT_QUERY('profiles')"),
+        )
+        .await
+        .expect("plain document query should execute");
 
         let field_names: Vec<String> = result
             .schema
@@ -2850,12 +2891,14 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_document_store(document_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached(
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached(
                 "SELECT id FROM DOCUMENT_QUERY('orders', 'status = \"pending\" AND price >= 100')",
-            )
-            .await
-            .expect("document comparison filters should execute");
+            ),
+        )
+        .await
+        .expect("document comparison filters should execute");
 
         assert_eq!(result.row_count(), 1);
         let ids = result.batches[0]
@@ -2904,10 +2947,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_document_store(document_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
+        let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT id FROM DOCUMENT_QUERY('orders', 'status contains \"pend\" and price >= 100')",
-            )
+            ))
             .await
             .expect("document filter keywords should be case-insensitive");
 
@@ -2941,10 +2984,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_document_store(document_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let error = ctx
+        let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('orders', 'status = \"pending\" OR status = \"shipped\"')",
-            )
+            ))
             .await
             .expect_err("unsupported OR filters should fail explicitly");
 
@@ -2976,10 +3019,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new().with_document_store(document_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let error = ctx
+        let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM DOCUMENT_QUERY('orders', 'status = \"pending\" or status = \"shipped\"')",
-            )
+            ))
             .await
             .expect_err("lowercase OR filters should fail explicitly");
 
@@ -3015,10 +3058,12 @@ mod tests {
             Arc::new(MultiModelStorageFacade::new().with_observability_store(observability_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached("SELECT * FROM LOGS('production')")
-            .await
-            .expect("logs query should execute against the observability store");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT * FROM LOGS('production')"),
+        )
+        .await
+        .expect("logs query should execute against the observability store");
 
         assert_eq!(result.row_count(), 1);
         let timestamp = result.batches[0]
@@ -3070,10 +3115,12 @@ mod tests {
             Arc::new(MultiModelStorageFacade::new().with_observability_store(observability_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached("SELECT * FROM METRICS('production')")
-            .await
-            .expect("metrics query should execute against the observability store");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT * FROM METRICS('production')"),
+        )
+        .await
+        .expect("metrics query should execute against the observability store");
 
         assert_eq!(result.row_count(), 1);
         let timestamp = result.batches[0]
@@ -3146,10 +3193,14 @@ mod tests {
             Arc::new(MultiModelStorageFacade::new().with_observability_store(observability_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached("SELECT * FROM METRICS('production') WHERE metric_name = 'cpu_usage'")
-            .await
-            .expect("metrics query should apply SQL filters after store execution");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached(
+                "SELECT * FROM METRICS('production') WHERE metric_name = 'cpu_usage'",
+            ),
+        )
+        .await
+        .expect("metrics query should apply SQL filters after store execution");
 
         assert_eq!(result.row_count(), 1);
         let metric_name = result.batches[0]
@@ -3191,10 +3242,12 @@ mod tests {
             Arc::new(MultiModelStorageFacade::new().with_observability_store(observability_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached("SELECT * FROM TRACES('production')")
-            .await
-            .expect("traces query should execute against the observability store");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT * FROM TRACES('production')"),
+        )
+        .await
+        .expect("traces query should execute against the observability store");
 
         assert_eq!(result.row_count(), 1);
         let trace_id = result.batches[0]
@@ -3270,10 +3323,12 @@ mod tests {
             Arc::new(MultiModelStorageFacade::new().with_observability_store(observability_store));
         let ctx = FederatedQueryContext::new(storage);
 
-        let result = ctx
-            .execute_uncached("SELECT * FROM TRACES('production') WHERE duration_ns >= 1000")
-            .await
-            .expect("trace query should apply SQL duration filters after store execution");
+        let result = crate::query::request_scope::with_internal_scope(
+            "test",
+            ctx.execute_uncached("SELECT * FROM TRACES('production') WHERE duration_ns >= 1000"),
+        )
+        .await
+        .expect("trace query should apply SQL duration filters after store execution");
 
         assert_eq!(result.row_count(), 1);
         let trace_id = result.batches[0]
@@ -3295,10 +3350,10 @@ mod tests {
         let storage = Arc::new(MultiModelStorageFacade::new());
         let ctx = FederatedQueryContext::new(storage);
 
-        let error = ctx
+        let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
                 "SELECT * FROM users u JOIN LATERAL VECTOR_SEARCH('products', u.embedding, 1) v ON true",
-            )
+            ))
             .await
             .expect_err("generic relational outer scans should still fail explicitly");
 
@@ -3308,5 +3363,17 @@ mod tests {
             "Expected scan error for 'users' but got: {}",
             msg
         );
+    }
+}
+
+/// Result-cache key for `sql` in the current request scope: a tenant's
+/// results are keyed by that tenant, so one tenant never reads another's
+/// cached rows.
+fn federated_cache_key(sql: &str) -> QueryKey {
+    match crate::query::request_scope::current_scope() {
+        Some(crate::query::request_scope::RequestScope::Tenant(tenant)) => {
+            QueryKey::from_sql_with_params(sql, &["tenant", tenant.as_str()])
+        }
+        _ => QueryKey::from_sql(sql),
     }
 }

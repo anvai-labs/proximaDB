@@ -26,16 +26,50 @@ use proximadb_runtime::bm25_port::{BM25Document, BM25IndexPort, BM25IndexResult}
 /// `HybridFullTextIndexMap`.
 pub struct Bm25IndexPortImpl {
     indexes: HybridFullTextIndexMap,
+    /// Resolves the target collection within the request tenant before any
+    /// document is indexed. `None` (tests) skips the check.
+    collection_port: Option<Arc<dyn proximadb_runtime::CollectionPort>>,
 }
 
 impl Bm25IndexPortImpl {
     pub fn new(indexes: HybridFullTextIndexMap) -> Self {
-        Self { indexes }
+        Self {
+            indexes,
+            collection_port: None,
+        }
+    }
+
+    /// Resolve the target collection within the request tenant before indexing.
+    pub fn with_collection_port(
+        mut self,
+        collection_port: Arc<dyn proximadb_runtime::CollectionPort>,
+    ) -> Self {
+        self.collection_port = Some(collection_port);
+        self
     }
 }
 
 #[async_trait]
 impl BM25IndexPort for Bm25IndexPortImpl {
+    async fn index_documents_for_tenant(
+        &self,
+        collection: String,
+        documents: Vec<BM25Document>,
+        request_tenant: &str,
+    ) -> Result<BM25IndexResult> {
+        if let Some(collection_port) = &self.collection_port
+            && collection_port
+                .get_collection(&collection, Some(request_tenant))
+                .await?
+                .is_none()
+        {
+            return Err(
+                crate::services::operations::vectors::CollectionNotFound::new(collection.as_str())
+                    .into(),
+            );
+        }
+        self.index_documents(collection, documents).await
+    }
     async fn index_documents(
         &self,
         collection: String,

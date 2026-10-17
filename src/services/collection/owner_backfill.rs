@@ -12,15 +12,21 @@
 //!
 //! Safety properties:
 //! * **Never re-assigns.** Only unattributed collections are considered, and
-//!   the write itself re-checks (`assign_owner_if_unattributed`), so a
-//!   collection that gained an owner meanwhile is left alone.
+//!   the write itself re-checks under the catalog's read-modify-write lock
+//!   (`assign_owner_if_unattributed`), so a collection that gained an owner
+//!   meanwhile is left alone.
 //! * **Idempotent / safe to interrupt.** Each collection is one independent
 //!   catalog write; a re-run skips everything already assigned.
-//! * **Bounded inspection.** At most `sample_cap` records per collection.
-//! * **Fail closed on ambiguity.** Records from more than one tenant ⇒ the
-//!   collection stays unattributed (default tenant only) and one error is
-//!   logged for the operator.
-//! * **Non-fatal.** Any failure is logged; that collection stays unattributed.
+//! * **Bounded inspection.** At most `sample_cap` records per collection, read
+//!   from unflushed records first; flushed storage is read only when the
+//!   collection's recorded size is within [`STORAGE_SAMPLE_MAX_RECORDS`].
+//!   Larger (or unsized) collections are left to the default tenant.
+//! * **Decided once.** A collection the backfill cannot attribute (records
+//!   from several tenants, or too large to sample) is marked with an
+//!   [`OWNER_BACKFILL_TAG`] tag, logged once, and skipped by later runs.
+//! * **Fail closed.** Every undecided or failed case leaves the collection
+//!   owned by the default tenant only.
+//! * **Non-fatal.** Any failure is logged; the run continues.
 
 use std::collections::BTreeSet;
 
@@ -29,6 +35,14 @@ use async_trait::async_trait;
 
 /// Records inspected per collection.
 pub const DEFAULT_SAMPLE_CAP: usize = 1_000;
+
+/// Largest recorded collection size whose flushed storage the backfill reads
+/// to sample record tenants (storage engines expose whole-collection reads).
+pub const STORAGE_SAMPLE_MAX_RECORDS: i64 = 10_000;
+
+/// Tag prefix recording that the backfill could not attribute a collection;
+/// later runs skip it. Removing the tag has it re-examined.
+pub const OWNER_BACKFILL_TAG: &str = "owner_backfill:";
 
 /// What the sampled record tenants say about a collection's owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,38 +62,44 @@ pub fn infer_owner(sampled_tenants: &BTreeSet<String>) -> OwnerInference {
         .filter(|tenant| !tenant.is_empty())
         .map(str::to_string)
         .collect();
-    match tenants.len() {
-        0 => OwnerInference::Assign(proximadb_tenant::DEFAULT_TENANT.to_string()),
-        1 => tenants
+    if tenants.len() > 1 {
+        return OwnerInference::Ambiguous(tenants);
+    }
+    OwnerInference::Assign(
+        tenants
             .into_iter()
             .next()
-            .map(OwnerInference::Assign)
-            .unwrap_or_else(|| {
-                OwnerInference::Assign(proximadb_tenant::DEFAULT_TENANT.to_string())
-            }),
-        _ => OwnerInference::Ambiguous(tenants),
-    }
+            .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string()),
+    )
+}
+
+/// What sampling a collection's records produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordSample {
+    /// The distinct tenants seen on up to `cap` records.
+    Tenants(BTreeSet<String>),
+    /// The collection is too large (or of unknown size) to sample.
+    TooLarge,
 }
 
 /// Source of the tenants recorded on a collection's records.
 #[async_trait]
 pub trait RecordTenantSampler: Send + Sync {
     /// Distinct `tenant_id`s of up to `cap` records of `collection_id`.
-    async fn sample_record_tenants(
-        &self,
-        collection_id: &str,
-        cap: usize,
-    ) -> Result<BTreeSet<String>>;
+    async fn sample_record_tenants(&self, collection_id: &str, cap: usize) -> Result<RecordSample>;
 }
 
 /// The catalog side of the backfill.
 #[async_trait]
 pub trait CollectionOwnerStore: Send + Sync {
-    /// Ids of collections that record no owner.
+    /// Ids of collections that record no owner and are not yet marked.
     async fn unattributed_collections(&self) -> Result<Vec<String>>;
     /// Record `tenant` as owner unless the collection already records one.
     async fn assign_owner_if_unattributed(&self, collection_id: &str, tenant: &str)
     -> Result<bool>;
+    /// Record that the backfill could not attribute the collection (it stays
+    /// owned by the default tenant) so later runs skip it.
+    async fn mark_unattributable(&self, collection_id: &str, reason: &str) -> Result<()>;
 }
 
 /// Outcome counts of one backfill run.
@@ -87,6 +107,7 @@ pub trait CollectionOwnerStore: Send + Sync {
 pub struct BackfillReport {
     pub assigned: usize,
     pub ambiguous: usize,
+    pub too_large: usize,
     pub skipped: usize,
     pub failed: usize,
 }
@@ -111,7 +132,17 @@ pub async fn backfill_collection_owners(
             .sample_record_tenants(&collection_id, sample_cap.max(1))
             .await
         {
-            Ok(sampled) => sampled,
+            Ok(RecordSample::Tenants(sampled)) => sampled,
+            Ok(RecordSample::TooLarge) => {
+                tracing::error!(
+                    collection = %collection_id,
+                    "collection owner backfill: collection too large to sample; it stays \
+                     owned by the default tenant until its owner is recorded"
+                );
+                mark(store, &collection_id, "unsampled").await;
+                report.too_large += 1;
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(
                     collection = %collection_id,
@@ -154,14 +185,24 @@ pub async fn backfill_collection_owners(
                     collection = %collection_id,
                     tenants = ?tenants,
                     "collection owner backfill: records belong to several tenants; the \
-                     collection stays owned by the default tenant until an operator records \
-                     its owner"
+                     collection stays owned by the default tenant until its owner is recorded"
                 );
+                mark(store, &collection_id, "ambiguous").await;
                 report.ambiguous += 1;
             }
         }
     }
     report
+}
+
+async fn mark(store: &dyn CollectionOwnerStore, collection_id: &str, reason: &str) {
+    if let Err(error) = store.mark_unattributable(collection_id, reason).await {
+        tracing::warn!(
+            collection = %collection_id,
+            %error,
+            "collection owner backfill: recording the outcome failed"
+        );
+    }
 }
 
 #[async_trait]
@@ -174,6 +215,12 @@ impl CollectionOwnerStore for crate::services::collection::manager::CollectionSe
             .filter(|collection| {
                 proximadb_tenant::collection_owner(collection)
                     == proximadb_tenant::CollectionOwner::Unattributed
+                    && !collection.config.as_ref().is_some_and(|config| {
+                        config
+                            .tags
+                            .iter()
+                            .any(|tag| tag.starts_with(OWNER_BACKFILL_TAG))
+                    })
             })
             .map(|collection| collection.id)
             .collect())
@@ -191,24 +238,49 @@ impl CollectionOwnerStore for crate::services::collection::manager::CollectionSe
         )
         .await
     }
+
+    async fn mark_unattributable(&self, collection_id: &str, reason: &str) -> Result<()> {
+        crate::services::collection::manager::CollectionService::mark_owner_unattributable(
+            self,
+            collection_id,
+            &format!("{OWNER_BACKFILL_TAG}{reason}"),
+        )
+        .await
+    }
 }
 
 #[async_trait]
 impl RecordTenantSampler for crate::services::operations::vectors::VectorOperationsService {
-    async fn sample_record_tenants(
-        &self,
-        collection_id: &str,
-        cap: usize,
-    ) -> Result<BTreeSet<String>> {
-        // Internal (unscoped) read of WAL + flushed storage.
-        let records = self
-            .list_all_records_with_tenant_context(collection_id, None)
+    async fn sample_record_tenants(&self, collection_id: &str, cap: usize) -> Result<RecordSample> {
+        // Unflushed records first: in memory, and capped here.
+        let unflushed = self
+            .sample_unflushed_records_internal(collection_id, cap)
             .await?;
-        Ok(records
-            .into_iter()
-            .take(cap)
-            .map(|record| record.tenant_id)
-            .collect())
+        if !unflushed.is_empty() {
+            return Ok(RecordSample::Tenants(
+                unflushed
+                    .into_iter()
+                    .map(|record| record.tenant_id)
+                    .collect(),
+            ));
+        }
+        // Flushed storage is read whole by the engines, so only within a
+        // recorded size bound; unknown or larger ⇒ not sampled.
+        let within_bound = self
+            .recorded_collection_size_internal(collection_id)
+            .await?
+            .is_some_and(|count| count <= STORAGE_SAMPLE_MAX_RECORDS);
+        if !within_bound {
+            return Ok(RecordSample::TooLarge);
+        }
+        let records = self.list_all_records_internal(collection_id).await?;
+        Ok(RecordSample::Tenants(
+            records
+                .into_iter()
+                .take(cap)
+                .map(|record| record.tenant_id)
+                .collect(),
+        ))
     }
 }
 
@@ -254,54 +326,63 @@ mod tests {
         ));
     }
 
-    /// In-memory catalog: collection id → recorded owner (None = unattributed).
+    /// In-memory catalog: collection id → (recorded owner, marked reason).
     struct FakeStore {
-        owners: Mutex<HashMap<String, Option<String>>>,
+        entries: Mutex<HashMap<String, (Option<String>, Option<String>)>>,
         writes: Mutex<usize>,
     }
 
     impl FakeStore {
         fn new(entries: &[(&str, Option<&str>)]) -> Self {
             Self {
-                owners: Mutex::new(
+                entries: Mutex::new(
                     entries
                         .iter()
-                        .map(|(id, owner)| (id.to_string(), owner.map(str::to_string)))
+                        .map(|(id, owner)| (id.to_string(), (owner.map(str::to_string), None)))
                         .collect(),
                 ),
                 writes: Mutex::new(0),
             }
         }
         fn owner(&self, id: &str) -> Option<String> {
-            self.owners
+            self.entries
                 .lock()
                 .ok()
-                .and_then(|owners| owners.get(id).cloned().flatten())
+                .and_then(|entries| entries.get(id).and_then(|(owner, _)| owner.clone()))
+        }
+        fn marked(&self, id: &str) -> Option<String> {
+            self.entries
+                .lock()
+                .ok()
+                .and_then(|entries| entries.get(id).and_then(|(_, mark)| mark.clone()))
+        }
+        fn writes(&self) -> usize {
+            self.writes.lock().map(|w| *w).unwrap_or(0)
         }
     }
 
     #[async_trait]
     impl CollectionOwnerStore for FakeStore {
         async fn unattributed_collections(&self) -> Result<Vec<String>> {
-            let owners = self
-                .owners
+            let entries = self
+                .entries
                 .lock()
                 .map_err(|_| anyhow::anyhow!("poisoned"))?;
-            let mut ids: Vec<String> = owners
+            let mut ids: Vec<String> = entries
                 .iter()
-                .filter(|(_, owner)| owner.is_none())
+                .filter(|(_, (owner, mark))| owner.is_none() && mark.is_none())
                 .map(|(id, _)| id.clone())
                 .collect();
             ids.sort();
             Ok(ids)
         }
         async fn assign_owner_if_unattributed(&self, id: &str, tenant: &str) -> Result<bool> {
-            let mut owners = self
-                .owners
+            let mut entries = self
+                .entries
                 .lock()
                 .map_err(|_| anyhow::anyhow!("poisoned"))?;
-            match owners.get_mut(id) {
-                Some(slot @ None) => {
+            match entries.get_mut(id) {
+                Some((slot @ None, _)) => {
                     *slot = Some(tenant.to_string());
                     *self
                         .writes
@@ -312,17 +393,31 @@ mod tests {
                 _ => Ok(false),
             }
         }
+        async fn mark_unattributable(&self, id: &str, reason: &str) -> Result<()> {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?;
+            if let Some((None, mark)) = entries.get_mut(id) {
+                *mark = Some(reason.to_string());
+                *self
+                    .writes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("poisoned"))? += 1;
+            }
+            Ok(())
+        }
     }
 
-    struct FakeSampler(HashMap<String, Result<BTreeSet<String>, String>>);
+    struct FakeSampler(HashMap<String, Result<RecordSample, String>>);
 
     #[async_trait]
     impl RecordTenantSampler for FakeSampler {
-        async fn sample_record_tenants(&self, id: &str, _cap: usize) -> Result<BTreeSet<String>> {
+        async fn sample_record_tenants(&self, id: &str, _cap: usize) -> Result<RecordSample> {
             match self.0.get(id) {
-                Some(Ok(tenants)) => Ok(tenants.clone()),
+                Some(Ok(sample)) => Ok(sample.clone()),
                 Some(Err(e)) => Err(anyhow::anyhow!(e.clone())),
-                None => Ok(BTreeSet::new()),
+                None => Ok(RecordSample::Tenants(BTreeSet::new())),
             }
         }
     }
@@ -334,17 +429,20 @@ mod tests {
             ("defaults", None),
             ("empty", None),
             ("mixed", None),
+            ("huge", None),
             ("owned", Some("globex")),
             ("broken", None),
         ]);
+        let tenants = |items: &[&str]| Ok(RecordSample::Tenants(set(items)));
         let sampler = FakeSampler(HashMap::from([
-            ("single".to_string(), Ok(set(&["acme"]))),
-            ("defaults".to_string(), Ok(set(&["default"]))),
-            ("empty".to_string(), Ok(set(&[]))),
-            ("mixed".to_string(), Ok(set(&["acme", "globex"]))),
+            ("single".to_string(), tenants(&["acme"])),
+            ("defaults".to_string(), tenants(&["default"])),
+            ("empty".to_string(), tenants(&[])),
+            ("mixed".to_string(), tenants(&["acme", "globex"])),
+            ("huge".to_string(), Ok(RecordSample::TooLarge)),
             // Sampling the already-owned collection would say "acme": it must
             // never be consulted, let alone re-assigned.
-            ("owned".to_string(), Ok(set(&["acme"]))),
+            ("owned".to_string(), tenants(&["acme"])),
             ("broken".to_string(), Err("io".to_string())),
         ]));
         let report = backfill_collection_owners(&store, &sampler, DEFAULT_SAMPLE_CAP).await;
@@ -352,6 +450,9 @@ mod tests {
         assert_eq!(store.owner("defaults").as_deref(), Some("default"));
         assert_eq!(store.owner("empty").as_deref(), Some("default"));
         assert_eq!(store.owner("mixed"), None, "ambiguous stays unattributed");
+        assert_eq!(store.marked("mixed").as_deref(), Some("ambiguous"));
+        assert_eq!(store.owner("huge"), None, "unsampled stays unattributed");
+        assert_eq!(store.marked("huge").as_deref(), Some("unsampled"));
         assert_eq!(
             store.owner("owned").as_deref(),
             Some("globex"),
@@ -359,21 +460,33 @@ mod tests {
         );
         assert_eq!(store.owner("broken"), None, "failure stays unattributed");
         assert_eq!(
+            store.marked("broken"),
+            None,
+            "a failure is retried next run"
+        );
+        assert_eq!(
             report,
             BackfillReport {
                 assigned: 3,
                 ambiguous: 1,
+                too_large: 1,
                 skipped: 0,
                 failed: 1
             }
         );
 
-        // Re-run: idempotent — nothing assigned twice, ambiguous still left.
-        let writes_before = store.writes.lock().map(|w| *w).unwrap_or(0);
+        // Re-run: idempotent — nothing assigned twice, decided collections
+        // are not rescanned; only the failed one is retried.
+        let writes_before = store.writes();
         let again = backfill_collection_owners(&store, &sampler, DEFAULT_SAMPLE_CAP).await;
-        assert_eq!(again.assigned, 0);
-        assert_eq!(again.ambiguous, 1);
-        assert_eq!(store.writes.lock().map(|w| *w).unwrap_or(0), writes_before);
+        assert_eq!(
+            again,
+            BackfillReport {
+                failed: 1,
+                ..BackfillReport::default()
+            }
+        );
+        assert_eq!(store.writes(), writes_before);
     }
 
     /// A collection that gains an owner between listing and the write is left
@@ -389,9 +502,15 @@ mod tests {
             async fn assign_owner_if_unattributed(&self, id: &str, t: &str) -> Result<bool> {
                 self.0.assign_owner_if_unattributed(id, t).await
             }
+            async fn mark_unattributable(&self, id: &str, reason: &str) -> Result<()> {
+                self.0.mark_unattributable(id, reason).await
+            }
         }
         let store = RacingStore(FakeStore::new(&[("raced", Some("globex"))]));
-        let sampler = FakeSampler(HashMap::from([("raced".to_string(), Ok(set(&["acme"])))]));
+        let sampler = FakeSampler(HashMap::from([(
+            "raced".to_string(),
+            Ok(RecordSample::Tenants(set(&["acme"]))),
+        )]));
         let report = backfill_collection_owners(&store, &sampler, 10).await;
         assert_eq!(report.skipped, 1);
         assert_eq!(store.0.owner("raced").as_deref(), Some("globex"));

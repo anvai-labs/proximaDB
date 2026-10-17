@@ -267,9 +267,11 @@ async fn ingest_documents_inner(
     // accepted against a collection that cannot hold it (missing, dimension
     // 0, or a mismatched dimension) and then silently dropped by the batch
     // processor after the response has gone out.
+    // Resolved within the request tenant: another tenant's collection is
+    // treated exactly like a missing one.
     let tenant_ctx = state
         .collection_service
-        .load_tenant_context(Some(&tenant_id))
+        .request_tenant_context(Some(&tenant_id))
         .map_err(|e| ApiError::InvalidArgument(format!("tenant resolution failed: {e}")))?;
     let existing_dimension: Option<u32> = state
         .collection_service

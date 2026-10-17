@@ -963,8 +963,8 @@ pub async fn execute_sql(
         .map(|Extension(t)| t.tenant_id)
         .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
     crate::query::request_scope::with_request_tenant(
-        Some(request_tenant),
-        execute_sql_in_scope(state, request),
+        request_tenant.clone(),
+        execute_sql_in_scope(state, request, request_tenant),
     )
     .await
 }
@@ -972,6 +972,7 @@ pub async fn execute_sql(
 async fn execute_sql_in_scope(
     state: AppState,
     request: SqlQueryRequest,
+    scoped_tenant: String,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
     let start_time = std::time::Instant::now();
     let request_id = Uuid::new_v4().to_string();
@@ -1035,7 +1036,7 @@ async fn execute_sql_in_scope(
             }
             Err(e) => {
                 error!("SQL query {} (port) failed: {}", request_id, e);
-                Err(ApiError::Internal(e.to_string()))
+                Err(sql_error_to_api(e))
             }
         };
     }
@@ -1066,7 +1067,7 @@ async fn execute_sql_in_scope(
             }
             Err(e) => {
                 error!("SQL query {} (adapter) failed: {}", request_id, e);
-                Err(ApiError::Internal(e.to_string()))
+                Err(sql_error_to_api(e))
             }
         };
     }
@@ -1075,8 +1076,6 @@ async fn execute_sql_in_scope(
     // Optional: read seeding strategy from HTTP header (X-Seeding-Strategy) or from request.parameters via a special key
     let _seeding_strategy = crate::query::execution::SeedingStrategy::Average; // default
 
-    let scoped_tenant = crate::query::request_scope::current_request_tenant()
-        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
     let query_with_hint = if let Some(seeding) = &request.seeding {
         let seed_upper = seeding.to_ascii_uppercase();
         format!("-- SEEDING: {}\n{}", seed_upper, request.query)
@@ -1144,8 +1143,18 @@ async fn execute_sql_in_scope(
                     None => resource,
                 }));
             }
-            Err(ApiError::Internal(e.to_string()))
+            Err(sql_error_to_api(e))
         }
+    }
+}
+
+/// A statement addressing a collection that does not resolve for the request
+/// (missing, or not resolvable by its tenant) is 404 — one response for both;
+/// anything else stays a server error.
+fn sql_error_to_api(error: anyhow::Error) -> ApiError {
+    match crate::services::operations::vectors::collection_not_found(&error) {
+        Some(missing) => ApiError::CollectionNotFound(missing.identifier.clone()),
+        None => ApiError::Internal(error.to_string()),
     }
 }
 
@@ -1753,7 +1762,12 @@ pub fn create_router(state: AppState) -> axum::Router {
         let store = legacy_arc.clone();
         // Register store globally for hybrid executor access (embedding catalog)
         crate::storage::entity_store::ProximaEntityStore::register_global(store.clone());
-        let entity_state = EntityApiState { store };
+        let entity_state = EntityApiState {
+            store,
+            collections: Some(
+                state.collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>
+            ),
+        };
         entities::configure_routes().with_state(entity_state)
     };
 
@@ -1858,7 +1872,9 @@ pub fn create_router(state: AppState) -> axum::Router {
             ),
         );
         let bm25_port: Arc<dyn proximadb_runtime::BM25IndexPort> =
-            Arc::new(Bm25IndexPortImpl::new(indexes));
+            Arc::new(Bm25IndexPortImpl::new(indexes).with_collection_port(
+                state.collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>,
+            ));
         let hybrid_state = HybridRestState {
             hybrid_port,
             bm25_port: Some(bm25_port),

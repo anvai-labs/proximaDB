@@ -64,6 +64,11 @@
 //! - **Smart Defaults**: Automatic selection of optimal configurations
 
 use anyhow::{Context, Result};
+
+/// Serializes collection-config read-modify-write (`update_collection`, the
+/// owner backfill) so a stamped owner can never be overwritten by a write that
+/// read the record before the stamp.
+static COLLECTION_CONFIG_RMW: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -467,23 +472,39 @@ impl CollectionService {
     /// `Some(tenant)` (a request; blank = the default tenant) returns the
     /// collection only when that tenant may resolve it under the one ownership
     /// rule (`proximadb_tenant::collection_visible_to`); otherwise `None`,
-    /// exactly as for a collection that does not exist. `None` is an internal /
-    /// system lookup and is not scoped.
+    /// exactly as for a collection that does not exist. `None` (no tenant)
+    /// denies; internal lookups use [`Self::collection_internal`].
     pub async fn collection_for_tenant(
         &self,
         identifier: &str,
         request_tenant: Option<&str>,
     ) -> Result<Option<Collection>> {
-        let ctx = self.load_tenant_context(request_tenant)?;
-        let found = self
-            .get_collection_with_tenant_context(identifier, ctx.as_ref())
-            .await?;
-        Ok(match request_tenant {
-            Some(tenant) => found.filter(|collection| {
-                proximadb_tenant::collection_visible_to(collection, Some(tenant))
+        // No request tenant ⇒ deny. Internal lookups use `collection_internal`.
+        let Some(tenant) = request_tenant else {
+            return Ok(None);
+        };
+        let ctx = self.request_tenant_context(Some(tenant))?;
+        self.get_collection_with_tenant_context(identifier, ctx.as_ref())
+            .await
+    }
+
+    /// The tenant context a request acting as `request_tenant` resolves
+    /// collections in: the managed context when a TenantManager is wired,
+    /// else a context for the tenant itself. `None` tenant ⇒ `None` (deny).
+    pub fn request_tenant_context(
+        &self,
+        request_tenant: Option<&str>,
+    ) -> Result<Option<crate::storage::tenant::TenantContext>> {
+        let Some(tenant) = request_tenant else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.load_tenant_context(Some(tenant))?.unwrap_or_else(|| {
+                crate::storage::tenant::TenantContext::for_tenant_id(
+                    proximadb_tenant::resolve_request_tenant(Some(tenant)),
+                )
             }),
-            None => found,
-        })
+        ))
     }
 
     /// Record `tenant` as the owner of a collection that has no recorded owner,
@@ -495,6 +516,9 @@ impl CollectionService {
         identifier: &str,
         tenant: &str,
     ) -> Result<bool> {
+        // Serialized with `update_collection` so the read and the write see
+        // the same record (no lost owner, no lost update).
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
         // Under tenant-prefixed catalog namespaces (TD-CAT-2b gate) an owner
         // change would move the catalog asset to another namespace; leave such
         // collections to the default tenant (fail closed) rather than rewrite
@@ -525,29 +549,74 @@ impl CollectionService {
         Ok(true)
     }
 
+    /// Record that the owner backfill could not attribute a collection (it stays
+    /// owned by the default tenant): adds `marker` to its tags unless it
+    /// meanwhile gained an owner. Same catalog write and lock as
+    /// [`Self::assign_owner_if_unattributed`].
+    pub async fn mark_owner_unattributable(&self, identifier: &str, marker: &str) -> Result<()> {
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
+        let Some(mut record) = self.collection(identifier).await? else {
+            return Ok(());
+        };
+        if proximadb_tenant::collection_owner(&record)
+            != proximadb_tenant::CollectionOwner::Unattributed
+        {
+            return Ok(());
+        }
+        let Some(config) = record.config.as_mut() else {
+            return Ok(());
+        };
+        if config.tags.iter().any(|tag| tag == marker) {
+            return Ok(());
+        }
+        config.tags.push(marker.to_string());
+        let name = config.name.clone();
+        record.updated_at = chrono::Utc::now().timestamp_millis();
+        self.upsert_collection_catalog_asset(&record, None)
+            .await
+            .context("Failed to record collection owner backfill outcome")?;
+        let _ = crate::catalog::CorpusVersionRegistry::global()
+            .bump(Self::DEFAULT_VERSION_TENANT, &name)
+            .await;
+        Ok(())
+    }
+
     /// Get collection with tenant validation
     pub async fn get_collection_with_tenant_context(
         &self,
         collection_name: &str,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
     ) -> Result<Option<crate::proto::proximadb_v1::Collection>> {
-        if let Some(tenant_ctx) = tenant_context.filter(|_| self.tenant_manager.is_some()) {
-            let collection = self
-                .validate_tenant_collection_access(collection_name, tenant_ctx)
-                .await?;
-
-            if collection.is_some() {
-                debug!(
-                    "✅ Tenant ownership validation passed for collection access: tenant={}, collection={}",
-                    tenant_ctx.tenant_id, collection_name
-                );
-            }
-
-            return Ok(collection);
+        // No tenant context ⇒ deny. Internal (system) lookups use
+        // `collection_internal`.
+        let Some(tenant_ctx) = tenant_context else {
+            return Ok(None);
+        };
+        if self.tenant_manager.is_none() {
+            return Ok(self
+                .collection(collection_name)
+                .await?
+                .filter(|collection| {
+                    proximadb_tenant::collection_visible_to(collection, Some(&tenant_ctx.tenant_id))
+                }));
         }
+        let collection = self
+            .validate_tenant_collection_access(collection_name, tenant_ctx)
+            .await?;
+        if collection.is_some() {
+            debug!(
+                "✅ Tenant ownership validation passed for collection access: tenant={}, collection={}",
+                tenant_ctx.tenant_id, collection_name
+            );
+        }
+        Ok(collection)
+    }
 
-        // Proceed with normal collection retrieval
-        self.collection(collection_name).await
+    /// Internal (system) lookup by name or id, not scoped to any tenant: for
+    /// background flush, compaction, recovery and the owner backfill. Request
+    /// paths resolve through `collection_for_tenant`.
+    pub async fn collection_internal(&self, identifier: &str) -> Result<Option<Collection>> {
+        self.collection(identifier).await
     }
 
     /// List all collections, filtered to the given tenant context if multi-tenant mode is active.
@@ -557,7 +626,19 @@ impl CollectionService {
     ) -> Result<Vec<Collection>> {
         let collections = self.list_collections().await?;
 
-        if let Some(tenant_ctx) = tenant_context.filter(|_| self.tenant_manager.is_some()) {
+        // No tenant context ⇒ deny (an empty listing).
+        let Some(tenant_ctx) = tenant_context else {
+            return Ok(Vec::new());
+        };
+        if self.tenant_manager.is_none() {
+            return Ok(collections
+                .into_iter()
+                .filter(|collection| {
+                    proximadb_tenant::collection_visible_to(collection, Some(&tenant_ctx.tenant_id))
+                })
+                .collect());
+        }
+        {
             if let Some(ref tenant_manager) = self.tenant_manager
                 && !tenant_manager.is_tenant_active(&tenant_ctx.tenant_id)
             {
@@ -568,16 +649,13 @@ impl CollectionService {
                 return Ok(Vec::new());
             }
 
-            let filtered = collections
+            Ok(collections
                 .into_iter()
                 .filter(|collection| {
                     proximadb_tenant::collection_visible_to(collection, Some(&tenant_ctx.tenant_id))
                 })
-                .collect();
-            return Ok(filtered);
+                .collect())
         }
-
-        Ok(collections)
     }
 
     /// Delete collection with tenant validation
@@ -588,25 +666,21 @@ impl CollectionService {
     ) -> Result<CollectionServiceResponse> {
         debug!("🗑️ Deleting collection: {}", collection_name);
 
-        if let Some(tenant_ctx) = tenant_context.filter(|_| self.tenant_manager.is_some()) {
-            let collection = self
-                .validate_tenant_collection_access(collection_name, tenant_ctx)
-                .await?;
-
-            if collection.is_none() {
-                return Ok(CollectionServiceResponse::error(
-                    format!(
-                        "TENANT_ACCESS_DENIED: collection {} is not accessible to tenant {}",
-                        collection_name, tenant_ctx.tenant_id
-                    ),
-                    0,
-                ));
-            }
-
-            debug!(
-                "✅ Tenant ownership validation passed for collection deletion: tenant={}, collection={}",
-                tenant_ctx.tenant_id, collection_name
-            );
+        // Resolve within the request tenant (no context ⇒ deny). A collection
+        // this tenant may not resolve is answered exactly like a missing one,
+        // and nothing is touched.
+        if self
+            .get_collection_with_tenant_context(collection_name, tenant_context)
+            .await?
+            .is_none()
+        {
+            return Ok(CollectionServiceResponse {
+                success: false,
+                collection: None,
+                storage_path: None,
+                error_code: Some("COLLECTION_NOT_FOUND".to_string()),
+                processing_time_us: 0,
+            });
         }
 
         let response = self.delete_collection(collection_name).await?;
@@ -1813,6 +1887,9 @@ impl CollectionService {
     ) -> Result<CollectionServiceResponse> {
         info!("📝 Updating collection: {}", identifier);
         let start_time = std::time::Instant::now();
+        // One read-modify-write at a time (shared with the owner backfill), so
+        // the recorded owner carried over below is the current one.
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
 
         // Get current record (supports both names and UUIDs) through xCatalog first.
         let mut record = match self.collection(identifier).await? {
@@ -2919,6 +2996,11 @@ impl proximadb_storage_ports::CollectionMetadataPort for CollectionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default tenant's request context (tenant-less callers act as it).
+    fn default_tenant_ctx() -> crate::storage::tenant::TenantContext {
+        crate::storage::tenant::TenantContext::for_tenant_id(proximadb_tenant::DEFAULT_TENANT)
+    }
     use crate::catalog::TableIdentifier;
     use crate::proto::proximadb_v1::CollectionConfig;
     use crate::proto::proximadb_v1::{FilterableDataType, IndexingAlgorithm};
@@ -3183,7 +3265,7 @@ mod tests {
 
         // delete (tenant-less)
         service
-            .delete_collection_with_tenant_context(name, None)
+            .delete_collection_with_tenant_context(name, Some(&default_tenant_ctx()))
             .await
             .context("delete")?;
         let v_delete = CorpusVersionRegistry::global().current(tenant, name).await;
@@ -3326,7 +3408,7 @@ mod tests {
         // no longer matches → the next read must reflect the delete (None), not a
         // stale hit.
         service
-            .delete_collection_with_tenant_context(name, None)
+            .delete_collection_with_tenant_context(name, Some(&default_tenant_ctx()))
             .await
             .context("delete")?;
         assert!(
@@ -3510,8 +3592,14 @@ mod tests {
             assert!(
                 CollectionPort::get_collection(&service, reference, None)
                     .await?
+                    .is_none(),
+                "no tenant is denied"
+            );
+            assert!(
+                CollectionPort::get_collection_internal(&service, reference)
+                    .await?
                     .is_some(),
-                "internal"
+                "internal lookup"
             );
             assert!(
                 CollectionPort::get_collection(&service, reference, Some(""))
@@ -4295,7 +4383,7 @@ mod tests {
                 .success
         );
         svc_a
-            .set_collection_schema_columns(name, &columns, None)
+            .set_collection_schema_columns(name, &columns, Some("default"))
             .await
             .context("set canonical columns")?;
         drop(svc_a);
@@ -4313,7 +4401,7 @@ mod tests {
             .with_catalog_manager(mgr_b);
 
         let restored = svc_b
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await
             .context("read canonical columns after restart")?
             .expect("canonical columns persisted across catalog restart");
@@ -4340,7 +4428,7 @@ mod tests {
         );
         assert_eq!(
             svc_b
-                .get_collection_schema_columns("canon_legacy", None)
+                .get_collection_schema_columns("canon_legacy", Some("default"))
                 .await?,
             None,
             "collection without a canonical sidecar returns None"
@@ -4381,7 +4469,7 @@ mod tests {
             canonical_col("u", ProximaType::UInt64),
             canonical_col("s", ProximaType::String),
         ];
-        svc.set_collection_schema_columns(name, &columns, None)
+        svc.set_collection_schema_columns(name, &columns, Some("default"))
             .await
             .context("set canonical columns")?;
 
@@ -4417,7 +4505,7 @@ mod tests {
 
         // And the trait read returns them.
         let restored = svc
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await?
             .expect("typed columns read back");
         assert_eq!(restored, columns);
@@ -4470,17 +4558,17 @@ mod tests {
 
         // Transitional read returns the legacy sidecar.
         let restored = svc
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await?
             .expect("transitional read of the legacy sidecar");
         assert_eq!(restored, columns);
 
         // A subsequent set migrates it to typed columns (property removed).
         let columns2 = vec![canonical_col("n", ProximaType::Int64)];
-        svc.set_collection_schema_columns(name, &columns2, None)
+        svc.set_collection_schema_columns(name, &columns2, Some("default"))
             .await?;
         let restored2 = svc
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await?
             .expect("post-migration read");
         assert_eq!(restored2, columns2);
@@ -4536,7 +4624,7 @@ mod tests {
                 fields: vec![("a".to_string(), ProximaType::Int64)],
             },
         )];
-        svc.set_collection_schema_columns(name, &columns, None)
+        svc.set_collection_schema_columns(name, &columns, Some("default"))
             .await
             .context("set canonical columns")?;
 
@@ -4554,7 +4642,7 @@ mod tests {
         );
 
         let restored = svc
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await
             .context("read canonical after update")?
             .expect("canonical sidecar survived unrelated update_collection");
@@ -4686,7 +4774,8 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         config: crate::proto::proximadb_v1::CollectionConfig,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::Collection> {
-        if tenant_id.is_some() && self.collection_for_tenant(id, tenant_id).await?.is_none() {
+        // Scoped to the request tenant (no tenant ⇒ deny).
+        if self.collection_for_tenant(id, tenant_id).await?.is_none() {
             return Err(
                 proximadb_search_types::client_argument::CollectionNotFound::new(id).into(),
             );
@@ -4701,10 +4790,8 @@ impl proximadb_runtime::CollectionPort for CollectionService {
     }
 
     async fn delete_collection(&self, id: &str, tenant_id: Option<&str>) -> anyhow::Result<bool> {
-        if tenant_id.is_some() && self.collection_for_tenant(id, tenant_id).await?.is_none() {
-            return Ok(false);
-        }
-        let ctx = self.load_tenant_context(tenant_id)?;
+        // Scoped to the request tenant (no tenant ⇒ deny).
+        let ctx = self.request_tenant_context(tenant_id)?;
         let resp = self
             .delete_collection_with_tenant_context(id, ctx.as_ref())
             .await?;
@@ -4715,23 +4802,27 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         &self,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<Vec<crate::proto::proximadb_v1::Collection>> {
-        let ctx = self.load_tenant_context(tenant_id)?;
-        let collections = self
-            .list_collections_with_tenant_context(ctx.as_ref())
-            .await?;
-        Ok(match tenant_id {
-            Some(tenant) => collections
-                .into_iter()
-                .filter(|collection| {
-                    proximadb_tenant::collection_visible_to(collection, Some(tenant))
-                })
-                .collect(),
-            None => collections,
-        })
+        // Scoped to the request tenant (no tenant ⇒ an empty listing).
+        let ctx = self.request_tenant_context(tenant_id)?;
+        self.list_collections_with_tenant_context(ctx.as_ref())
+            .await
     }
 
     async fn resolve_collection_id(&self, identifier: &str) -> anyhow::Result<Option<String>> {
         CollectionService::resolve_collection_id(self, identifier).await
+    }
+
+    async fn get_collection_internal(
+        &self,
+        identifier: &str,
+    ) -> anyhow::Result<Option<crate::proto::proximadb_v1::Collection>> {
+        self.collection_internal(identifier).await
+    }
+
+    async fn list_collections_internal(
+        &self,
+    ) -> anyhow::Result<Vec<crate::proto::proximadb_v1::Collection>> {
+        self.list_collections().await
     }
 
     async fn set_collection_schema_columns(

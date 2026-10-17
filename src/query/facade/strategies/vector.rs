@@ -232,14 +232,22 @@ impl QueryStrategy for VectorSearchStrategy {
         // Resolve the collection within the request tenant (None outside a
         // request scope = internal); a collection the tenant may not resolve
         // is answered exactly like a missing one.
-        let request_tenant = crate::query::request_scope::current_request_tenant();
-        let _collection = self
-            .collection_port
-            .get_collection(collection_id, request_tenant.as_deref())
-            .await?
-            .ok_or_else(|| {
-                crate::services::operations::vectors::CollectionNotFound::new(collection_id)
-            })?;
+        let request_tenant = crate::query::request_scope::resolution_tenant(collection_id)?;
+        let _collection = match request_tenant.as_deref() {
+            Some(tenant) => {
+                self.collection_port
+                    .get_collection(collection_id, Some(tenant))
+                    .await?
+            }
+            None => {
+                self.collection_port
+                    .get_collection_internal(collection_id)
+                    .await?
+            }
+        }
+        .ok_or_else(|| {
+            crate::services::operations::vectors::CollectionNotFound::new(collection_id)
+        })?;
 
         // Convert to proto request
         let proto_request = self.to_proto_request(&request)?;

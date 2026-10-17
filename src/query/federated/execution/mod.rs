@@ -549,13 +549,18 @@ impl FederatedExecutor {
         // Resolve within the request tenant (None outside a request scope =
         // internal). A collection the tenant may not resolve is answered
         // exactly like a missing one — never by an unscoped fallback.
-        let request_tenant = crate::query::request_scope::current_request_tenant();
+        let request_tenant = crate::query::request_scope::resolution_tenant(collection)?;
         if let Some(vector_ops) = &self.vector_operations_service {
             let collection_id = if let Some(collection_port) = &self.collection_port {
-                match collection_port
-                    .get_collection(collection, request_tenant.as_deref())
-                    .await?
-                {
+                let found = match request_tenant.as_deref() {
+                    Some(tenant) => {
+                        collection_port
+                            .get_collection(collection, Some(tenant))
+                            .await?
+                    }
+                    None => collection_port.get_collection_internal(collection).await?,
+                };
+                match found {
                     Some(resolved) => resolved.id,
                     None if request_tenant.is_some() => {
                         return Err(
@@ -633,10 +638,15 @@ impl FederatedExecutor {
 
         use crate::proto::proximadb_v1::CollectionConfig;
         let collection_config = if let Some(collection_port) = &self.collection_port {
-            match collection_port
-                .get_collection(collection, request_tenant.as_deref())
-                .await?
-            {
+            let found = match request_tenant.as_deref() {
+                Some(tenant) => {
+                    collection_port
+                        .get_collection(collection, Some(tenant))
+                        .await?
+                }
+                None => collection_port.get_collection_internal(collection).await?,
+            };
+            match found {
                 Some(mut resolved) => {
                     let mut config = resolved.config.take().unwrap_or_else(|| CollectionConfig {
                         name: collection.to_string(),
@@ -846,7 +856,7 @@ impl FederatedExecutor {
             k,
             rank_profile: Some(profile_name.to_string()),
             rank_overrides: None,
-            request_tenant: crate::query::request_scope::current_request_tenant(),
+            request_tenant: crate::query::request_scope::resolution_tenant(collection)?,
         };
 
         // Resolve the per-profile second-phase scorer (may be absent —
