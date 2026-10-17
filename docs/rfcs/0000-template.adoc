@@ -6,7 +6,6 @@
 
 // Canonical RFC template. Copy to docs/rfcs/NNNN-short-title.adoc, allocate the next free
 // number (never reuse one on develop), and fill in. See the RFC process:
-// docs/_internal/roadmap/completed/103-rfc-process-documentation.adoc
 
 == Summary
 

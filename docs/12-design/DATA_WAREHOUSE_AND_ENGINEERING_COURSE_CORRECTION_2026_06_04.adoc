@@ -282,9 +282,9 @@ when warehouse phases permit; it does not block P0–P7.
 This document is a feeder to the apex `SYSTEM_MAP_2026_05_30.adoc` and refines, not
 replaces, `COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20.adoc` (route map),
 `RELATIONAL_PGWIRE_DML_COMPUTE_BLUEPRINT_2026_05_20.adoc` (active DML/compute
-tracker), and the compute spec `docs/_internal/roadmap/specifications/
-NATIVE_COMPUTE_ENGINE_SPECIFICATION.adoc` (which must gain the §5 `ComputeScheduler` /
-four-destination routing terminology as it is revised). The multi-engine routing
+tracker), and the native compute spec (since superseded by
+`docs/12-design/adr/ADR-052-analytics-execution-competitiveness-codesign.adoc`, which keeps
+DataFusion as the OLAP executor behind the `ComputeBackend` seam). The multi-engine routing
 contract (§5) must be reflected in the Convergence Audit before P1 lands a second
 physical executor.
 

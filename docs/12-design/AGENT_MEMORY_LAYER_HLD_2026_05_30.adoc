@@ -218,7 +218,7 @@ The Phase-6 active-memory gates (TD-052/053/054) are pre-existing roadmap items 
 == References
 
 * ADR-022 (decision) — `adr/ADR-022-agent-memory-layer.adoc`
-* RUBICON / AQL — `docs/_internal/roadmap/specifications/RUBICON_ALIGNMENT.adoc`, `src/query/aql/`
+* RUBICON / AQL — `docs/12-design/RUBICON_ALIGNMENT.adoc`, `src/query/aql/`
 * Graph RAG (RGL) — TD-045; `src/graph/rag/`
 * Memanto typed memory — TD-055; `ProximaRecord.memory_type`
 * mem0 — arXiv:2504.19413; `github.com/mem0ai/mem0`

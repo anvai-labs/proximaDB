@@ -32,7 +32,7 @@ These are usable but not part of the production positioning:
 
 * Hybrid retrieval (BM25 + RRF/weighted fusion).
 * Document / graph / observability stores (CRUD and query work; canonical-store WAL default
-  varies — see `MASTER_FEATURE_DASHBOARD.adoc`).
+  varies — see `SUPPORTED_SURFACE.adoc`; the feature dashboard cited here at release time was removed 2026-10-17).
 * pgwire / federated SQL (basic DML and vector-distance syntax; ADR-018 Phase 2/3 incomplete).
 * Object-economy vector route (SST sidecar directory + cache; opt-in, no published cost SLA).
 * Filtered ANN routing (ADR-011 — Inline / PostFilter / PreFilter mechanics exist; per-collection

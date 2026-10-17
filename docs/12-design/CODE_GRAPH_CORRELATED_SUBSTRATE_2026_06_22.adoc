@@ -3,7 +3,7 @@
 :toclevels: 3
 :sectnums:
 Date: 2026-06-22
-Status: **Partial (verified 2026-10-15)** — design intent; engine work tracked as TD-127..TD-134. Resolved: TD-128, TD-129, TD-133, TD-134 (closed-ledger `docs/_archive/quality/2026-06/TECHNICAL_DEBT_CLOSED_2026_06_24.adoc`); embedded parity test shipped (#308). Open: TD-127 (Partial), TD-130 (Open), TD-131 (subsumed by TD-137, In Progress), TD-132 (Partial).
+Status: **Partial (verified 2026-10-15)** — design intent; engine work tracked as TD-127..TD-134. Resolved: TD-128, TD-129, TD-133, TD-134 (closed-ledger `docs/10-quality/TECHNICAL_DEBT_CLOSED_2026_06_24.adoc`); embedded parity test shipped (#308). Open: TD-127 (Partial), TD-130 (Open), TD-131 (subsumed by TD-137, In Progress), TD-132 (Partial).
 
 toc::[]
 

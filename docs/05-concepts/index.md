@@ -3,7 +3,6 @@
 Stable conceptual documentation for ProximaDB users and contributors.
 
 Current architecture blueprints live in [Architecture and Design](../12-design/README.adoc).
-Historical or superseded concept docs live under [Archive](../_archive/README.md).
 
 ```mermaid
 %%{init: {"theme": "neutral"}}%%
@@ -52,7 +51,6 @@ flowchart TB
 |------|------------|
 | Top-down workspace and SaaS/core map | [Architecture Atlas](../12-design/ARCHITECTURE_ATLAS_2026_05_22.adoc) |
 | Module-level LLD ownership | [Module Component LLD Map](../12-design/MODULE_COMPONENT_LLD_2026_05_22.adoc) |
-| Documentation ownership and archive rules | [Documentation Consolidation Plan](../12-design/DOCUMENTATION_CONSOLIDATION_AND_ARCHIVE_PLAN_2026_05_22.adoc) |
 | Supported feature claims | [Supported Surface](../SUPPORTED_SURFACE.adoc) |
 | API and protocol references | [API Reference](../03-api-reference/index.md) |
 
