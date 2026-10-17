@@ -23,6 +23,10 @@
 #               SDK create/insert/search/delete against the image, embedded roundtrip
 #   npm         `@anvailabs/proximadb-client`: version, CJS AND ESM entry vs the image
 #   rust        crates.io `proximadb-sdk = "=X.Y.Z"` in a temp crate vs the image
+#   packages    every Release asset vs SHA256SUMS.txt; .deb on ubuntu 22.04/24.04;
+#               .rpm on fedora 41 and rockylinux 8 (its el8 name); embedded sdist
+#               == the one PyPI serves
+#   windows     zip and MSI (msiexec /qn): proximadb-server.exe --version
 #   homebrew    tap formula: version, url + sha256 equal the GitHub Release asset
 #   summary     one evidence table + `release-evidence-vX.Y.Z.json`; red if any job is
 #
@@ -177,13 +181,29 @@ jobs:
           TAG_TREE="$(gh api "repos/${{ github.repository }}/commits/v${VERSION}" --jq .commit.tree.sha)"
           REV_TREE="$(gh api "repos/${{ github.repository }}/commits/${REVISION}" --jq .commit.tree.sha)"
           HUB="https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags"
-          VER_DIGEST="$(curl -fsS "${HUB}/${VERSION}" | jq -r .digest)"
+          # hub_tag <tag> <out>: 0 = found, 4 = HTTP 404 (absent), else fatal
+          # after retries. A transient hub error is never read as "absent".
+          hub_tag() {
+            local code
+            for _ in 1 2 3 4 5; do
+              code="$(curl -sS -o "$2" -w '%{http_code}' "${HUB}/$1")" || code=000
+              case "$code" in 200) return 0 ;; 404) return 4 ;; esac
+              echo "Docker Hub ${1}: HTTP ${code}; retrying" >&2
+              sleep 10
+            done
+            echo "::error::Docker Hub ${HUB}/$1 kept failing (last HTTP ${code})"
+            exit 1
+          }
+          hub_tag "${VERSION}" ver.json
+          VER_DIGEST="$(jq -er .digest ver.json)"
           # publish-image.yml (CI redesign PR1) re-tags qa's `tree-<tree>`
           # image on a release tag instead of rebuilding. When that tag still
-          # exists it must be the very manifest the version tag points at.
+          # exists it must be the very manifest the version tag points at; a
+          # 404 means it was pruned (or predates #2057).
           TREE_TAG_DIGEST=""
-          if TREE_JSON="$(curl -fsS "${HUB}/tree-${TAG_TREE}" 2>/dev/null)"; then
-            TREE_TAG_DIGEST="$(jq -r .digest <<<"$TREE_JSON")"
+          rc=0; hub_tag "tree-${TAG_TREE}" tree.json || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            TREE_TAG_DIGEST="$(jq -er .digest tree.json)"
           fi
           echo "revision label : $REVISION (tree $REV_TREE)"
           echo "release tag    : v${VERSION} (tree $TAG_TREE)"
@@ -430,14 +450,18 @@ jobs:
           bash scripts/release_smoke/await_url.sh "crates.io proximadb-sdk ${VERSION}" \
             "https://crates.io/api/v1/crates/proximadb-sdk/${VERSION}" \
             "\"num\":\"${VERSION}\"" "$WAIT" 60
-      - name: Build a temp crate against proximadb-sdk from crates.io
+      - name: Render a temp crate on proximadb-sdk from crates.io
+        run: bash scripts/release_smoke/rust_sdk_smoke/render_manifest.sh "$VERSION" "$RUNNER_TEMP/rust-smoke"
+      - name: Build it OUTSIDE the checkout
+        # Working directory outside the repo, so the repo's rust-toolchain.toml
+        # and .cargo/config.toml (job caps, linker, target dir) do not apply:
+        # this builds the way a user's crate does.
+        working-directory: ${{ runner.temp }}/rust-smoke
         run: |
           set -euo pipefail
-          P="$RUNNER_TEMP/rust-smoke"
-          bash scripts/release_smoke/rust_sdk_smoke/render_manifest.sh "$VERSION" "$P"
           # Retried: the sparse index can lag the API right after a publish.
-          bash scripts/release_smoke/retry.sh 3 60 cargo build --manifest-path "$P/Cargo.toml"
-          python3 - "$P/Cargo.lock" "$VERSION" <<'PY'
+          bash "$GITHUB_WORKSPACE/scripts/release_smoke/retry.sh" 3 60 cargo build
+          python3 - Cargo.lock "$VERSION" <<'PY'
           import sys, tomllib
           lock = tomllib.load(open(sys.argv[1], "rb"))
           pkgs = [p for p in lock["package"] if p["name"] == "proximadb-sdk"]
@@ -450,12 +474,12 @@ jobs:
       - name: Start the released image as the SDK target
         run: bash scripts/release_smoke/start_image_server.sh "$IMAGE_REPO" "$VERSION" "$SERVER_PORT"
       - name: Health / create / insert / search / delete against the server
+        working-directory: ${{ runner.temp }}/rust-smoke
         run: |
           set -euo pipefail
-          mkdir -p evidence
-          cargo run --quiet --manifest-path "$RUNNER_TEMP/rust-smoke/Cargo.toml" -- \
-            "http://127.0.0.1:${SERVER_PORT}" "$VERSION" | tee "$RUNNER_TEMP/rust.out"
-          tail -n 1 "$RUNNER_TEMP/rust.out" > evidence/rust-sdk.json
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          cargo run --quiet -- "http://127.0.0.1:${SERVER_PORT}" "$VERSION" | tee "$RUNNER_TEMP/rust.out"
+          tail -n 1 "$RUNNER_TEMP/rust.out" > "$GITHUB_WORKSPACE/evidence/rust-sdk.json"
       - name: Server logs (on failure)
         if: failure()
         run: docker logs --tail 300 proximadb-release-smoke
@@ -467,6 +491,121 @@ jobs:
           path: evidence/
           if-no-files-found: warn
           retention-days: 90
+
+  packages:
+    name: GitHub Release packages (checksums, .deb, .rpm, sdist)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download every release asset
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rel"
+          bash scripts/release_smoke/retry.sh 5 20 gh release download "v${VERSION}" \
+            -R "${{ github.repository }}" --dir "$RUNNER_TEMP/rel" --clobber
+          ls -la "$RUNNER_TEMP/rel"
+      - name: Every asset is listed in SHA256SUMS.txt and matches it
+        working-directory: ${{ runner.temp }}/rel
+        run: |
+          set -euo pipefail
+          sha256sum -c SHA256SUMS.txt
+          for f in *; do
+            case "$f" in SHA256SUMS.txt|*.sha256) continue ;; esac
+            grep -qE "^[0-9a-f]{64}  ${f}\$" SHA256SUMS.txt || { echo "::error::${f} is published but not in SHA256SUMS.txt"; exit 1; }
+          done
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          awk '{print "{\"file\":\"" $2 "\",\"sha256\":\"" $1 "\"}"}' SHA256SUMS.txt \
+            | jq -s '{artifact: "github-release:SHA256SUMS.txt", assets: ., passed: true}' \
+            > "$GITHUB_WORKSPACE/evidence/packages-checksums.json"
+      - name: .deb installs and runs (ubuntu 22.04 and 24.04)
+        run: |
+          set -euo pipefail
+          for img in ubuntu:22.04 ubuntu:24.04; do
+            docker run --rm -v "$RUNNER_TEMP/rel:/rel:ro" -e V="$VERSION" -e IMG="$img" "$img" bash -ec '
+              apt-get update -qq >/dev/null
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "/rel/proximadb_${V}_amd64.deb" >/dev/null
+              got="$(proximadb-server --version 2>&1)" || { echo "::error::deb on ${IMG}: proximadb-server does not run: ${got}"; exit 1; }
+              [ "$got" = "proximadb-server ${V}" ] || { echo "::error::deb on ${IMG}: --version printed ${got}"; exit 1; }
+              echo "deb on ${IMG}: ${got}"'
+          done
+      - name: .rpm installs and runs (fedora 41, and rockylinux 8 -- the el8 it is named for)
+        run: |
+          set -euo pipefail
+          RPM="proximadb-${VERSION}-1.el8.x86_64.rpm"
+          for img in fedora:41 rockylinux:8; do
+            docker run --rm -v "$RUNNER_TEMP/rel:/rel:ro" -e V="$VERSION" -e RPM="$RPM" -e IMG="$img" "$img" bash -ec '
+              dnf install -y -q "/rel/${RPM}" >/dev/null
+              got="$(proximadb-server --version 2>&1)" || { echo "::error::rpm on ${IMG}: proximadb-server does not run: ${got}"; exit 1; }
+              [ "$got" = "proximadb-server ${V}" ] || { echo "::error::rpm on ${IMG}: --version printed ${got}"; exit 1; }
+              echo "rpm on ${IMG}: ${got}"'
+          done
+      - name: Embedded sdist on the release is the one PyPI serves
+        run: |
+          set -euo pipefail
+          SDIST="proximadb_embedded-${VERSION}.tar.gz"
+          REL="$(sha256sum "$RUNNER_TEMP/rel/${SDIST}" | cut -d' ' -f1)"
+          PYPI="$(curl -fsS "https://pypi.org/pypi/proximadb_embedded/${VERSION}/json" \
+            | jq -er --arg f "$SDIST" '.urls[] | select(.filename == $f) | .digests.sha256')"
+          [ "$REL" = "$PYPI" ] || { echo "::error::${SDIST}: release ${REL} != PyPI ${PYPI}"; exit 1; }
+          echo "sdist identical on GitHub Release and PyPI: ${REL}"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: evidence-packages
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  windows:
+    name: GitHub Release Windows zip + MSI
+    needs: resolve
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download the zip, MSI and checksums
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\rel" | Out-Null
+          gh release download "v$env:VERSION" -R "${{ github.repository }}" --dir "$env:RUNNER_TEMP\rel" --clobber `
+            -p "proximadb-$env:VERSION-x86_64-pc-windows-msvc.zip" -p "proximadb-$env:VERSION-x64.msi" -p SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }
+          foreach ($f in @("proximadb-$env:VERSION-x86_64-pc-windows-msvc.zip", "proximadb-$env:VERSION-x64.msi")) {
+            $want = (Select-String -Path "$env:RUNNER_TEMP\rel\SHA256SUMS.txt" -Pattern "  $([regex]::Escape($f))$").Line.Split(' ')[0]
+            $got = (Get-FileHash "$env:RUNNER_TEMP\rel\$f" -Algorithm SHA256).Hash.ToLower()
+            if (-not $want -or $got -ne $want) { throw "$f sha256 $got != SHA256SUMS.txt $want" }
+            Write-Output "$f sha256 OK $got"
+          }
+      - name: Zip -- proximadb-server.exe --version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive "$env:RUNNER_TEMP\rel\proximadb-$env:VERSION-x86_64-pc-windows-msvc.zip" -DestinationPath "$env:RUNNER_TEMP\zip"
+          $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\zip" -Recurse -Filter proximadb-server.exe | Select-Object -First 1
+          if (-not $exe) { throw "proximadb-server.exe not in the zip" }
+          $got = (& $exe.FullName --version | Out-String).Trim()
+          if ($got -ne "proximadb-server $env:VERSION") { throw "zip --version printed '$got'" }
+          Write-Output "zip: $got"
+      - name: MSI -- msiexec install, proximadb-server.exe --version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', "$env:RUNNER_TEMP\rel\proximadb-$env:VERSION-x64.msi", '/qn', '/l*v', "$env:RUNNER_TEMP\msi.log")
+          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\msi.log" -Tail 50; throw "msiexec exit $($p.ExitCode)" }
+          $exe = "$env:ProgramFiles\ProximaDB\proximadb-server.exe"
+          if (-not (Test-Path $exe)) { throw "$exe not installed" }
+          $got = (& $exe --version | Out-String).Trim()
+          if ($got -ne "proximadb-server $env:VERSION") { throw "msi --version printed '$got'" }
+          Write-Output "msi: $got"
 
   homebrew:
     name: Homebrew formula
@@ -498,7 +637,7 @@ jobs:
 
   summary:
     name: Release evidence summary
-    needs: [resolve, provenance, docker, binary, python, npm, rust, homebrew]
+    needs: [resolve, provenance, docker, binary, packages, windows, python, npm, rust, homebrew]
     # always(): a failed job must still produce the evidence table that says so.
     # Not when `resolve` was skipped (a pre-release `release` event): nothing ran.
     if: always() && needs.resolve.result != 'skipped'

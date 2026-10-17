@@ -78,6 +78,14 @@ CHANNELS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("softprops/action-gh-release",),
         ("gh release download", "sha256sum -c", "SHA256SUMS.txt", "--version", "mvp_smoke.py"),
     ),
+    "github-release-packages": (
+        ("softprops/action-gh-release",),
+        ("sha256sum -c SHA256SUMS.txt", "apt-get install", "dnf install", "pypi.org/pypi/proximadb_embedded/"),
+    ),
+    "github-release-windows": (
+        ("softprops/action-gh-release",),
+        ("proximadb-server.exe", "Start-Process msiexec.exe", "Get-FileHash"),
+    ),
     "homebrew": (
         ("scripts/release_homebrew_formula.py", "< Formula"),
         ("homebrew_check.py",),

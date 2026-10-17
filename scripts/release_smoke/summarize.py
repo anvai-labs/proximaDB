@@ -28,6 +28,8 @@ ROWS = (
     ("provenance", "(A) tag is a qa -> main merge, QA-tested tree, Pre-Release CI + CI Success green"),
     ("docker", "(B) Docker Hub image: pull, provenance label, health, MVP smoke"),
     ("binary", "(B) GitHub Release linux x86_64 binary: sha256, --version, MVP smoke"),
+    ("packages", "(B) every Release asset vs SHA256SUMS.txt; .deb, .rpm install + --version; sdist == PyPI"),
+    ("windows", "(B) Windows zip + MSI: sha256, install, --version"),
     ("python", "(B) PyPI proximadb + proximadb_embedded: install, version, SDK + embedded roundtrip"),
     ("npm", "(B) npm @anvailabs/proximadb-client: install, version, CJS + ESM against server"),
     ("rust", "(B) crates.io proximadb-sdk: build from registry, version, calls against server"),

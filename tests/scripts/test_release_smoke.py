@@ -206,6 +206,18 @@ class ReleaseSmokeGuard(unittest.TestCase):
         self._edit(SMOKE, 'sha256sum -c sums.one', 'echo skip')
         self._fails_with("no job smokes `github-release-binary`")
 
+    def test_catches_a_dropped_rpm_smoke(self) -> None:
+        self._edit(SMOKE, 'dnf install -y -q "/rel/${RPM}"', 'rpm -qp "/rel/${RPM}"')
+        self._fails_with("no job smokes `github-release-packages`")
+
+    def test_catches_a_partial_checksum(self) -> None:
+        self._edit(SMOKE, "          sha256sum -c SHA256SUMS.txt\n", "          sha256sum -c sums.one\n")
+        self._fails_with("no job smokes `github-release-packages`")
+
+    def test_catches_a_dropped_msi_smoke(self) -> None:
+        self._edit(SMOKE, "$p = Start-Process msiexec.exe", "$p = Start-Process notepad.exe")
+        self._fails_with("no job smokes `github-release-windows`")
+
     def test_catches_a_dropped_homebrew_smoke(self) -> None:
         self._edit(SMOKE, "python3 scripts/release_smoke/homebrew_check.py", "echo")
         self._fails_with("no job smokes `homebrew`")
@@ -232,8 +244,8 @@ class ReleaseSmokeGuard(unittest.TestCase):
         self._fails_with("must reuse scripts/await_prerelease_ci.sh")
 
     def test_catches_summary_not_needing_a_job(self) -> None:
-        self._edit(SMOKE, "needs: [resolve, provenance, docker, binary, python, npm, rust, homebrew]",
-                   "needs: [resolve, provenance, docker, binary, python, npm, homebrew]")
+        self._edit(SMOKE, "needs: [resolve, provenance, docker, binary, packages, windows, python, npm, rust, homebrew]",
+                   "needs: [resolve, provenance, docker, binary, packages, windows, python, npm, homebrew]")
         self._fails_with("does not need ['rust']")
 
     def test_catches_summary_without_always(self) -> None:
