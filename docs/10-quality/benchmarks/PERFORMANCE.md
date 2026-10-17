@@ -131,7 +131,6 @@ All benchmarks are run on standardized hardware following the ANN-benchmarks met
 
 ### QPS vs Recall@10 Trade-off (SIFT)
 
-image::qps_vs_recall_sift.png[QPS vs Recall@10]
 
 | Database | QPS | Recall@10 | Index Size |
 |----------|-----|-----------|------------|

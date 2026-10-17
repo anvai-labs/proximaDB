@@ -34,7 +34,7 @@ graph TB
         end
 
         subgraph "Storage Engines"
-            VECTOR_ENG["Vector Engines\nSST | HELIX | NOVA | VIPER\n- HNSW/IVF indices\n- PAX block format\n- Quantization (SQ8/RaBitQ)"]
+            VECTOR_ENG["Vector Engines\nSST | HELIX | NOVA\nVIPER: deprecated, existing collections only\n- HNSW/IVF indices\n- PAX block format\n- Quantization (SQ8/RaBitQ)"]
             ICEBERG["Iceberg Engine\n- Parquet tables\n- Iceberg manifests\n- Snapshot isolation"]
             ORION["ORION Graph Engine\n- Property graph\n- Traversal engine"]
         end

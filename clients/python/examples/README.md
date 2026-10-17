@@ -405,7 +405,7 @@ Found an issue with an example? Please report it:
 ## Additional Resources
 
 - **SDK Documentation**: `/clients/python/README.md`
-- **API Reference**: `/docs/reference/rest-api-specification.adoc`
+- **API Reference**: `docs/03-api-reference/index.md`
 - **Example Fixes Log**: `/PYTHON_SDK_EXAMPLES_FIXES.md`
 - **Server Documentation**: `/README.adoc`
 

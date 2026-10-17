@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: freshness guard (#912) and ADR-index lifecycle guard (2026-07-21) shipped; open: allowlist graduation, claim-level checking, session hygiene, `validate_docs.sh` rehabilitation.**
+| Status | **Partial: freshness guard (#912) and ADR-index lifecycle guard (2026-07-21) shipped; open: allowlist graduation, claim-level checking, session hygiene. (`validate_docs.sh` rehabilitation is moot: the unused legacy validator was deleted 2026-10-17.)**
 | Severity | Medium (trust / architecture-communication accuracy — a stale status-of-record doc misleads every reader who treats it as the baseline, including external analyses and agent sessions)
 | Component | `docs/12-design/SYSTEM_MAP_2026_05_30.adoc`, `docs/SUPPORTED_SURFACE.adoc`, `scripts/check_status_as_of.py`, `Makefile` (`status-asof-check` in `work-commit-check`)
 | Relates | link:TD-DOCS-1-public-doc-discipline.adoc[TD-DOCS-1] (public-doc honesty pass — same discipline family, public-claims slice), the `docs-claim-check` guard (marketing-phrase slice), `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc` §4 (the mis-read snapshot)
@@ -40,7 +40,8 @@ many concurrent agent sessions, docs ARE the harness, so stale status docs poiso
 3. **Session hygiene.** When a PR materially changes routing/engine/format status,
    the same PR updates SYSTEM_MAP's status sections and bumps the tag (reviewers:
    treat a status-changing PR without a SYSTEM_MAP touch as suspect).
-4. **Legacy validator rehabilitation.** `scripts/validate_docs.sh` still assumes the retired
+4. **Legacy validator rehabilitation (closed 2026-10-17 by deletion).** The validator was never wired
+   into CI and was deleted with the other unused doc scripts. The history: `scripts/validate_docs.sh` assumed the retired
    `src/storage/engines/impls/` layout, exits on its first zero-to-one counter increment under
    `set -e`, scans archives as current link authority, and conflates multiple links on one line.
    A 2026-07-21 exploratory run reached 140 errors, many parser/archive false positives. It is not a

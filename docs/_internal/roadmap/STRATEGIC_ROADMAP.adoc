@@ -7,7 +7,7 @@
 [.lead]
 **Strategic roadmap aligned with the Vision document phases. This file is authoritative for sequencing and prioritization, not for support tier by itself.**
 
-Execution tracking across sessions: link:./BEST_IN_CLASS_EXECUTION_TRACKER.adoc[Best-in-Class Foundation Execution Tracker]
+Status index across the TD, ADR and design corpus: link:../../12-design/WORK_LEDGER_2026_10_15.adoc[Work Ledger].
 
 [NOTE]
 ====
@@ -23,8 +23,7 @@ were not re-verified.
 *2026-06-24 reconciliation.* The authoritative live status for *implementation* of any item below is
 the link:../../10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register] (reconciled 2026-06-24), and the
 support contract is link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc]. Where this roadmap's
-phase markers disagree with the register, the register wins. Known reconciled drift recorded in
-link:./RECONCILIATION_2026_06_24.adoc[RECONCILIATION_2026_06_24]: *Phase 2.5 is effectively complete*
+phase markers disagree with the register, the register wins. Reconciled drift at that pass: *Phase 2.5 is effectively complete*
 (TD-031/032/033/034/036/038/039/041 Resolved Mar–May 2026 — see the Phase 2.5 note); the 2026-06-04
 SaaS and 2026-06-19 co-design pivots are reflected in the register's co-design dimension tags but not
 yet re-threaded through every dashboard row.
@@ -41,7 +40,7 @@ matrix also marks that capability as supported.
 
 == Vision Alignment
 
-This roadmap implements the phased approach from link:../../05-concepts/vision.adoc[Vision Document] (historical; canonical: link:../../00-product/VISION.adoc[VISION]),
+This roadmap implements the phased approach of the link:../../00-product/VISION.adoc[Vision],
 co-optimized under the 2026-06-04 data-warehouse course correction and the 2026-06-19 co-design
 dimensional architecture (see `docs/12-design/`):
 
@@ -339,7 +338,7 @@ _Performance Credibility: Align the execution layer between storage and API with
 
 [IMPORTANT]
 ====
-Added March 21, 2026 based on architectural review (archived at `docs/_archive/roadmap/2026-05/ARCHITECTURAL_REVIEW_2026_03_21.adoc`).
+Added March 21, 2026 based on architectural review (the review document is in git history).
 The storage layer (ProximaCodec, Parquet integration, WAL) is production-grade.
 The gap is in the *query execution layer above storage* -- the layer that turns columnar storage into fast analytical queries and eliminates format conversion at model boundaries.
 ====
@@ -657,172 +656,35 @@ the full trend analysis and the alignment scorecard. These workstreams realize t
 | Elastic compute modes + resources-follow-data scheduler | 📅 Open (blocked on TD-077) | TD-089 | _Single-node suspend/resume (TD-094) shipped as the F4a first slice._ `Long-running` / `OnDemand` (minute-billed) / `OfflineBatch` modes over one logical store; warm-pool scheduler attaches a pinned snapshot on request, releases on idle, metadata stays queryable with zero resident compute. Depends on TD-077 (distributed transport); gated by TD-087/TD-088 making scale-to-zero economical first.
 |===
 
-== Documentation Status
-
-[NOTE]
-====
-*Stale paths (pre-2026-05 docs taxonomy).* The file paths in the tables below predate the docs
-reorganization into numbered sections (`03-api-reference/`, `05-concepts/`, etc.). For the current
-design-doc catalogue use link:../../12-design/DESIGN_DOC_STATUS_INDEX_2026_05_26.adoc[Design Doc Status
-Index] (reconciled 2026-06-24); for the architecture map use
-link:../../12-design/SYSTEM_MAP_2026_05_30.adoc[System Map]. This section is retained as a historical
-completeness inventory only.
-====
-
-=== Public Documentation [✅ Complete]
-
-|===
-| Document | Status | Notes
-
-| README.adoc | ✅ Complete | Main project readme
-| INDEX.adoc | ✅ Complete | Documentation index
-| concepts/architecture.adoc | ✅ Complete | Architecture overview
-| concepts/vision.adoc | ✅ Complete | Vision and strategy
-| concepts/storage-engines.adoc | ✅ Complete | Engine selection guide
-| concepts/graph-engines.adoc | ✅ Complete | Graph engine guide
-| api/rest.adoc | ✅ Complete | REST API reference
-| api/graph.adoc | ✅ Complete | Graph API reference
-| api/configuration.adoc | ✅ Complete | Configuration guide
-| operations/deployment.adoc | ✅ Complete | Deployment guide
-| operations/monitoring.adoc | ✅ Complete | Monitoring guide
-| operations/security.adoc | ✅ Complete | Security guide
-|===
-
-=== Internal Documentation [✅ Complete]
-
-|===
-| Document | Status | Notes
-
-| MASTER_FEATURE_DASHBOARD.adoc | ✅ Complete | Feature tracking
-| roadmap/completed/* | ✅ Complete | 35+ completed guides
-| roadmap/specifications/* | ✅ Complete | Future feature specs
-| roadmap/implementation/* | ✅ Complete | Implementation roadmaps
-|===
-
-=== Obsolete Documentation [⚠️ Archive]
-
-|===
-| Document | Status | Action
-
-| docs/_internal/archive/* | ⚠️ Obsolete | Keep for historical reference
-| Q1_2025_IMPLEMENTATION.adoc | ⚠️ Obsolete | Moved to archive/
-| Q2_2025_IMPLEMENTATION.adoc | ⚠️ Obsolete | Moved to archive/
-|===
-
-== MVP Definition (v1.0)
-
-For v1.0 release, the following must be complete:
-
-=== Required for MVP
-
-* [x] All 6 storage engines
-* [x] Core infrastructure (WAL, REST, gRPC)
-* [x] Index algorithms (HNSW, IVF, AXIS)
-* [x] Quantization (Binary, INT8, PQ)
-* [x] Graph database (ORION)
-* [x] Document store
-* [x] Observability store
-* [x] Unified query engine
-* [x] Cross-model joins
-* [x] Python SDK
-* [x] Docker deployment
-* [x] Basic security (JWT, RBAC)
-
-=== Deferred Post-MVP
-
-[WARNING]
-====
-*Internal contradiction (flagged 2026-10-15):* this list marks external catalogs, Streaming/CDC and
-Enterprise SSO as not done. The Phase 1 "Catalog System" and Phase 3 "Streaming & CDC" tables mark
-them ✅ Complete, and SSO is Partial. "All 6 storage engines" above is also no longer true as a
-support claim (see the engine tiers). The tables are the more recent source. This MVP checklist is
-the original v1.0 definition.
-====
-
-* [ ] External catalog integration
-* [ ] Distributed operations (Raft, multi-region)
-* [ ] Streaming/CDC
-* [ ] Enterprise SSO
-* [ ] Additional SDKs
-
 == Quarterly Focus
 
-=== Q1 2025 [Complete]
-
-* Storage engine consolidation
-* Unified quantization framework
-* DataFusion integration foundation
-
-=== Q2 2025 [Complete]
-
-* Cross-model query optimization
-* Go SDK development started
-* PULSAR/QUASAR engine foundation
-
-=== Q3 2025 [Complete]
-
-* External catalog integration foundation (Iceberg, Delta stubs)
-* Streaming specification complete
-* Enterprise security foundation
-
-=== Q4 2025 [Complete]
-
-* Strategic analysis and gap identification
-* Documentation comprehensive overhaul
-* CI/CD pipeline hardening
-
-=== Q1 2026 [Complete]
-
-* Hybrid search (BM25) implementation landed; support maturity remains Beta until gRPC/live-smoke and benchmark evidence close.
-* Event sourcing engine foundation landed (TD-010 resolved).
-* Framework integrations landed for LangChain, LlamaIndex, Haystack, CrewAI, DSPy, and AutoGen.
-* ibkrtrading replacement path began with event-sourcing/document-store foundations; documented 30-day dogfood evidence remains TD-030.
-
-=== Q2 2026 [Current hardening]
-
-* Time-series engine (TST) implementation is complete at engine level (TD-009 resolved); product packaging, API parity, and at-scale validation keep the surface Beta.
-* Backup / restore infrastructure is complete (TD-014 resolved); read-as-of-LSN time travel is the separate TD-116 (planned).
-* mTLS infrastructure is complete (TD-006 resolved); remaining security work is admin/status and stronger online revocation policy.
-* Pre-release foundations focus: dashboard/support-surface honesty, multi-tenant safety hardening, canonical WAL authority, ADR-012 minimum branch merge, and hybrid gRPC parity.
-
-=== Q3 2026 [Planned — reconciled 2026-10-15: TD-030 dogfood still Open; TD-064 residual (a) shipped, (b)/(c) open; benchmark baselines partially recorded in BENCHMARK_EVIDENCE.toml]
+=== Q3 2026 [Closed quarter; the items below remain open — reconciled 2026-10-15: TD-030 dogfood still Open; TD-064 residual (a) shipped, (b)/(c) open; benchmark baselines partially recorded in BENCHMARK_EVIDENCE.toml]
 
 * v0.2 GA validation: run the ibkrtrading dogfood window and publish documented results (TD-030).
 * Complete ADR-012 minimum branch merge write-back and close the remaining pgwire/SQL Phase 2 parity gaps from ADR-018.
 * Predicate-aware vector search correctness and planner disclosure work (TD-064).
 * Publish benchmark baselines tied to the support-surface and projection-retention criteria.
 
-=== Q4 2026 [Planned]
+=== Q4 2026 [Current]
 
+* PostgreSQL-compatible OLTP on object storage (link:../../12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095]): atomic COMMIT and writer-epoch fencing shipped default-off; next are TD-PGOLTP-1 S3/S4b and TD-PGOLTP-2 S3.
+* Read-path correctness: TD-MEMTABLE-MVCC-1 (the memtable winner rule is not a total order).
+* Carried open from the vision sprint plan (removed 2026-10-17): isolate the legacy federated query
+  paths behind flags (M1; one engine-selection seam already exists in `ComputeScheduler::route_select`);
+  lineage hooks for vector, document and graph writes, which today exist only for MLOps (M5,
+  TD-MLOPS-1); cost-based Arrow Flight provider selection (M8); multi-node failure-injection
+  validation for HA and rebalancing (M9); cross-model policy-matrix tests (M10; relational ABAC is
+  enforced in-plan per ADR-090).
+* Carried open from the best-in-class tracker (removed 2026-10-17): security admin/status APIs and
+  stronger online revocation (CRL/OCSP).
 * Competitive platform Phase 7 follow-through: storage authority planner integration, relational capability cataloging, and vector correctness hardening.
 * Distributed cluster execution: move from Experimental transport/remote-execution foundations toward validated multi-node behavior.
 * DiskANN / advanced ANN evaluation only after predicate-aware top-k correctness is explicit.
 * CNCF submission preparation after supported-surface claims, benchmark evidence, and operator docs converge.
 
-== Metrics and Success Criteria
-
-=== Phase 1 Success Criteria
-
-* [x] All storage engines pass correctness tests
-* [x] WAL recovery handles all failure modes
-* [x] API latency < 10ms for simple queries
-* [x] Documentation coverage > 90%
-
-=== Phase 2 Success Criteria
-
-* [x] Cross-model queries execute correctly
-* [x] Query latency < 100ms for joins across 2 models
-* [ ] Unified query supports 10+ concurrent users
-
-=== Phase 3 Success Criteria
-
-* [ ] External catalog integration works with Iceberg
-* [ ] Distributed operations support 3-node cluster
-* [ ] Streaming handles 10K events/sec
-
 ---
 
-_Last Updated_: 2026-10-15 (targeted status-cell reconciliation; previous full reconciliation 2026-06-24 vs the Technical Debt Register + the 2026-06-04 / 2026-06-19 pivots)
+_Last Updated_: 2026-10-17 (historical documentation-status, MVP-checklist, 2025 quarterly and success-criteria sections removed; 2026-10-15 targeted status-cell reconciliation; previous full reconciliation 2026-06-24 vs the Technical Debt Register + the 2026-06-04 / 2026-06-19 pivots)
 _Version_: 0.2.0
 _Authoritative live status_: link:../../10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register] (implementation) + link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] (support contract)
 _Next Review_: End of Phase 6 Design Review

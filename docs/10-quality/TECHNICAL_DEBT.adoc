@@ -5,7 +5,7 @@
 
 The single live tracker for *open* technical-debt, feature, and vision items. Resolved/closed
 items are indexed in
-link:../_archive/quality/2026-06/TECHNICAL_DEBT_CLOSED_2026_06_24.adoc[the Closed Items Archive]
+link:TECHNICAL_DEBT_CLOSED_2026_06_24.adoc[the Closed Items Archive]
 (full historical prose preserved in git history of this file before the 2026-06-24 reconciliation).
 
 NOTE: **New TDs are filed one-file-per-entry under `td/`** (`docs/10-quality/td/`), not appended
@@ -35,7 +35,7 @@ framework integrations ship in the SDK but are Not a v0.2 supported surface (see
 [NOTE]
 ====
 *2026-06-24 reconciliation.* This register was split into a lean live tracker (this file) plus a
-link:../_archive/quality/2026-06/TECHNICAL_DEBT_CLOSED_2026_06_24.adoc[closed archive]. Changes made:
+link:TECHNICAL_DEBT_CLOSED_2026_06_24.adoc[closed archive]. Changes made:
 
 * *Status reconciled against `origin/develop` HEAD* — TD-129 (ON CONFLICT upsert, `258943f3`),
   TD-134 (KEU meter + per-repo RBAC, `05b920f0`) flipped Open→Resolved; TD-132 (CPG-fragment PAX
@@ -268,8 +268,8 @@ Co-design D1/D3 work — the dominant cloud-DB cost term. See `PROXIMADB_AS_LAKE
 | TD-122 | gRPC v2 parity services (graph/document/entity) | HIGH | Partial | D4 | OE
 | *Graph done 2026-06-21* (`proximadb.v2.ProximaGraphService` + `src/network/grpc/v2/graph_service.rs`, registered + SDK-consumed). *Reconciled 2026-06-28 — row was STALE:* on develop BOTH `ProximaDocumentService` (`grpc/v2/document_service.rs`, 6 RPCs) and `ProximaEntityService` (`grpc/v2/entity_service.rs`, 4 RPCs) are fully implemented, registered (`multi_server.rs:184-228,636`), and thin transports over the canonical service ports (landed across #266/#267/#317/#324/#344/#371/#381/#392). **Entity is 100% done** (server+proto+Rust/Python codegen+`entity_v2.py` facade+`test_entity_v2.py`). The ENTIRE residual is the **Document Python-SDK leg (size S, Python-only, zero Rust):** regenerate+commit `document_pb2{,_grpc}.py` under both `proximadb/v2/` and `proximadb_sdk/v2/` (proto already in `generate_v2_protos.py:34`), add a `document_v2.py` facade + `_execute_document_with_pool` cloning the entity exemplar, **remove the resolved `missing-servicer:...document...` line from `grpc_drift_baseline.json`** (the drift gate ratchets and fails on a stale baseline entry — same gate reddening #462/#469), and add `test_document_v2.py`. *Unblocks* TD-121 (confirm TD-121's RPC needs vs the shipped 6 — value-bearing `QueryDocuments` filters / aggregation `$match` are TD-124-deferred). Deferred RPCs → TD-124.
 
-| TD-124 | Deferred RPCs on v2 ProximaGraphService | LOW | Open | D4 | OE
-| Deferred from the first v2 graph surface: `GetConnectedComponents`, `HasCycle`, `BatchCreate*`, `StreamTraverse`, unique-constraint DDL, `ExecuteQuery` (Cypher/Gremlin), `ExecuteHybridQuery`. Do NOT port PULSAR/QUASAR. Relates to TD-122 (parent), TD-121.
+| TD-124 | Deferred RPCs on v2 ProximaGraphService | LOW | Resolved | D4 | OE
+| *Reconciled 2026-10-17 — row was STALE:* `StreamTraverse`, `GetConnectedComponents`, `HasCycle`, `BatchCreateNodes/Edges`, `Add/RemoveUniqueConstraint` and `ExecuteQuery` (Cypher subset) are on v2 `ProximaGraphService` (`src/network/grpc/v2/graph_service.rs`, test `td124_batch_analytics_constraint_stream`). Residual, tracked in link:../../roadmap/techdebt/TD_124_DEFERRED_GRAPH_GRPC_V2_RPCS_2026_06_21.adoc[the TD-124 plan]: `ExecuteHybridQuery` has no v2 wire surface (backing logic exists), and `GREMLIN` is reserved but unbacked. `CreateGraphWithEngine`/`GetPulsarStats` are intentionally not ported (PULSAR/QUASAR retired). Relates to TD-122 (parent), TD-121.
 
 | TD-123 | Full proximadb.v1→v2 message-type migration | MED | Open | D4 | OE
 | *Keystone STEP 1 done 2026-06-21 (graph):* transport-agnostic `src/graph/model.rs` + `proto_convert.rs`; `GraphOperationsService` speaks only the neutral model (was using v1 proto AS its domain type — a dependency inversion). *Ratchet gate DONE 2026-07-01:* `scripts/check_v1_proto_usage.py` + `docs/_internal/roadmap/V1_PROTO_USAGE_BASELINE.json` (baseline 2928 refs / 490 files on develop@d234db90d) + CI `v1-proto-usage-no-regression` job (blocking, in ci-success needs) — fails on any net INCREASE of v1 proto references, so the migration only moves one direction; refresh the baseline only for intentional increases via `make v1-proto-usage-baseline`. Residual: same neutral-model pattern for record/vector/collection services; typed `GraphRef{tenant,graph_id}` to replace `effective_graph_id` string-prefix isolation; drive the ratchet count to 0. *Must precede* TD-121. Depends on TD-122.
@@ -518,7 +518,7 @@ PR #265). Moved to the closed archive.
 | Open (not started / scoping) | ~33 | Lead candidates: fusion seam (TD-136/137 In Progress), HTAP (TD-110), cost-routing (TD-115), storage spine (TD-114/116/118).
 | In Progress | 5 | TD-136, TD-137, TD-101, TD-064, TD-029.
 | Partial (foundation landed, residual named) | ~22 | TD-060/066/097/099/106/111/112/117/119/120/122/123/132/044/040/046/085/102/005/126/094-adjacent.
-| Resolved/Closed (archived) | ~80 | See link:../_archive/quality/2026-06/TECHNICAL_DEBT_CLOSED_2026_06_24.adoc[Closed Items Archive].
+| Resolved/Closed (archived) | ~80 | See link:TECHNICAL_DEBT_CLOSED_2026_06_24.adoc[Closed Items Archive].
 |===
 
 *Highest-leverage open work by co-design dimension* (move the dominant cost term first):
@@ -528,7 +528,7 @@ PR #265). Moved to the closed archive.
 * *D5 (governance / isolation)* — TD-064 (predicate-aware correctness, CRIT/SEC), TD-061/073/074 (cataloged capabilities). (TD-133 cross-modal atomicity Resolved 2026-06-24.)
 
 *Cross-references:* roadmap status reconciliation (Phase 2.5 marked complete; SaaS/co-design pivot
-integration) is tracked in
-link:../_internal/roadmap/RECONCILIATION_2026_06_24.adoc[RECONCILIATION_2026_06_24]. Architecture
+integration) was recorded in
+the 2026-06-24 reconciliation (removed 2026-10-17; in git history). Architecture
 ground truth: link:../12-design/SYSTEM_MAP_2026_05_30.adoc[System Map] and
-link:../12-design/DESIGN_DOC_STATUS_INDEX_2026_05_26.adoc[Design Doc Status Index].
+link:../12-design/WORK_LEDGER_2026_10_15.adoc[Work Ledger].

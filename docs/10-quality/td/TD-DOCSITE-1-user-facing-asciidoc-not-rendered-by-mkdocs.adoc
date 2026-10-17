@@ -53,6 +53,11 @@ site's entry point is `docs/index.md`. An earlier revision of this table recorde
 the root as 1 `.adoc` and so summed to 30 by *undercounting* rather than by
 reconciling — the two numbers are both right and count different things.
 
+NOTE: *2026-10-17 docs prune.* `05-concepts/vision.adoc` (superseded by `00-product/VISION.adoc`)
+and `docs/INDEX.adoc` (a third, redundant index) were deleted, as were two internal strategy pages
+filed under guides (`02-guides/unified-rust-ecosystem-strategy.adoc`, `02-guides/SYNERGY_SUMMARY.adoc`);
+`docs/09-roadmap/` and `docs/_archive/` were removed (and dropped from `exclude_docs`). The baseline is now **27**, and the table above is a 2026-10-16 snapshot.
+
 So the site's exclusion of `10-quality`/`12-design`/`_archive` is **correct and
 deliberate**: publishing the internal debt register would make the product's docs
 site a changelog of our own TODOs. The genuine gap is the **30 user-facing

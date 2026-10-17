@@ -3,7 +3,8 @@
 :toclevels: 2
 
 This directory holds current architectural decisions and active implementation blueprints.
-Historical phase reports, superseded visions, and one-off audits belong under `docs/_archive/`.
+Historical phase reports, superseded visions and one-off audits do not belong here: delete them and
+repoint their links to the successor. Git history keeps the old text.
 
 [IMPORTANT]
 ====
@@ -18,7 +19,7 @@ Gate in link:CONVERGENCE_AUDIT_2026_05_30.adoc[CONVERGENCE_AUDIT_2026_05_30].
 ====
 **For current status across the whole corpus** — completed / in progress / pending work by area, the highest-priority open items, the canonical document for every overlapping topic, and the governance decisions pending — see
 link:WORK_LEDGER_2026_10_15.adoc[WORK_LEDGER_2026_10_15] (reconciled against git and code on 2026-10-15).
-It supersedes the older bookkeeping snapshot link:DESIGN_DOC_STATUS_INDEX_2026_05_26.adoc[DESIGN_DOC_STATUS_INDEX_2026_05_26], kept only for history.
+It supersedes the 2026-05-26 bookkeeping snapshot (removed; in git history).
 ====
 
 == Canonical Architecture Path
@@ -184,8 +185,6 @@ Read these in order for future-shaping architecture work:
   "Recursive src Module Decomposition" (component, class, sequence, and activity UML diagrams for
   every `src/` subsystem) and the write/search "Critical-Path Sequence And Activity Diagrams". All
   diagrams are mermaid; render via the asciidoctor/kroki pipeline.
-* `DOCUMENTATION_CONSOLIDATION_AND_ARCHIVE_PLAN_2026_05_22.adoc` - OSS documentation taxonomy,
-  duplicate-doc findings, and archive batch plan.
 * `DESIGN_PATTERNS.adoc` - general design patterns and implementation references.
 * `SUPPORTED_SURFACES.adoc` - supported API/projection status and retirement candidates.
 * `NATIVE_OLAP_ENGINE_BLUEPRINT_2026_06_22.adoc` - the native Rust columnar OLAP engine blueprint
@@ -218,25 +217,18 @@ Accepted ADRs live under `adr/`.
 * `adr/ADR-019-relational-query-architecture.adoc` — five-layer relational query architecture (algebra, executor, transaction, storage) refining Phase 2.
 * `adr/ADR-070-axis-not-needed-for-codesign-collections.adoc` — AXIS not the default for co-design collections (PAX scan + memtable cover everything; recall@10=0.999).
 
-== Archived From This Directory
+== Removed From This Directory
 
-The May 2026 cleanup moved superseded or progress-only documents to
-`docs/_archive/design/2026-05/`.
-
-Archived categories:
-
-* superseded platform vision replaced by the architecture anchor;
-* old module architecture guide replaced by repository guidelines and workspace refactor plan;
-* phase-specific quantization, gRPC, platform-runtime, and workspace-refactor progress reports;
-* historical workspace-layering ADR superseded operationally by
-  `roadmap/techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`.
+The May 2026 cleanup archived superseded or progress-only documents, and the 2026-10-17 prune
+deleted that archive (superseded platform vision, old module architecture guide, phase progress
+reports, the historical workspace-layering ADR). They remain in git history.
 
 == Maintenance Rules
 
 * Add new future-shaping architecture as either an ADR or an active blueprint with owner, scope,
   status, and implementation tracker.
-* Do not add phase reports or one-off session summaries to this directory; archive them after they
-  are no longer the active tracker.
+* Do not add phase reports or one-off session summaries to this directory; once they are no longer
+  the active tracker, delete them.
 * Keep protocol-specific behavior aligned with the canonical record/type/catalog/storage mandates.
 * LLM-generated or agent-generated code changes must cite the active blueprint they implement and
   must not introduce new catalog, record, WAL, policy, or compute-routing authority outside the
@@ -244,5 +236,5 @@ Archived categories:
 * If generated code adds a route, reader, writer, projection, or external adapter, the owning doc
   must name its authority mode, policy boundary, freshness behavior, repair source, and supported
   maturity before the path is enabled by default.
-* When a blueprint is superseded, move it to `docs/_archive/design/<yyyy-mm>/` and update this
+* When a blueprint is superseded, delete it, repoint its links to the successor, and update this
   index.

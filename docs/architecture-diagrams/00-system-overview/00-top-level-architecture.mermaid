@@ -20,7 +20,7 @@ graph TB
     end
 
     subgraph "Storage Layer"
-        STORE["💾 StorageEngine → Factory → Engines\nSST · HELIX · NOVA · VIPER · RAPTOR(exp)\n+ ORION Graph Engine\n+ Iceberg/DataWarehouse Engine"]
+        STORE["💾 StorageEngine → Factory → Engines\nSST · HELIX · NOVA · VIPER(deprecated) · RAPTOR(exp)\n+ ORION Graph Engine\n+ Iceberg/DataWarehouse Engine"]
         PAX["📦 PAX Block Format\nColumnar layout · Zone maps · Footer metadata"]
         WAL["📝 WAL → Memtable → FlushMaterializer\nDelta management · LSN ordering"]
         CACHE["⚡ Cache Layer\nHot Cache · Footer Cache · Query Result Cache"]

@@ -466,7 +466,7 @@ The index is complete and is enforced by `scripts/check_design_status_index.py`.
 
 == Relationship to Design Resolution Doc
 
-These ADRs formalize and extend the decisions in `docs/_internal/roadmap/implementation/active/E1_E3_OPEN_TICKET_DESIGN_RESOLUTION_2026_04_01.adoc`. The design resolution doc remains the authoritative source for E1-E3 sequencing and sprint board semantics. ADRs govern the implementation contracts.
+These ADRs formalize and extend the decisions of the 2026-04-01 E1–E3 open-ticket design resolution (removed 2026-10-17; in git history). These ADRs are now the authoritative record; the resolution doc was the source for E1-E3 sequencing and sprint board semantics. ADRs govern the implementation contracts.
 
 == Issue Coverage
 

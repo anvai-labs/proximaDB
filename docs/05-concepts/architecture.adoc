@@ -342,4 +342,4 @@ link:../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] and wins for any product 
 | Agentic Intelligence | P5 | 📅 Planned | Research frontier (arXiv:2604)
 |===
 
-See link:vision.adoc[Vision Document (legacy)] and link:../00-product/VISION.adoc[Refined Vision Document] for phase definitions.
+See the link:../00-product/VISION.adoc[Vision] for phase definitions.

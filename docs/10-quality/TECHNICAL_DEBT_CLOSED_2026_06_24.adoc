@@ -4,7 +4,7 @@
 
 [NOTE]
 ====
-This is the *closed-items archive* for the link:../../../10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register].
+This is the *closed-items archive* for the link:TECHNICAL_DEBT.adoc[Technical Debt Register].
 It indexes every item that reached *Resolved* / *Closed* / *Done* so the live register can
 stay lean and show only current (Open / In Progress / Partial) work.
 

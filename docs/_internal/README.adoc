@@ -1,42 +1,33 @@
 = Internal Documentation
 :toc: left
 :toclevels: 2
-:icons: font
 
 [.lead]
-This folder contains internal notes, roadmaps, and archived materials. It is not part of the public developer documentation.
+Engineering records that back the public docs. Nothing here is a support claim: the support
+contract is link:../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc].
 
-== Key Internal Documents
-
-|===
-| Document | Purpose
-
-| link:roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] | Vision-aligned phase planning
-| link:roadmap/MASTER_FEATURE_DASHBOARD.adoc[Feature Dashboard] | All features with status
-| link:DOCUMENTATION_STATUS.adoc[Documentation Status] | All docs with status and phase
-| link:roadmap/CURRENT_ROADMAP.adoc[Current Roadmap] | Active quarterly focus
-|===
-
-== Vision Phase Summary
+== Contents
 
 |===
-| Phase | Focus | Status
+| Path | What it is
 
-| Phase 1 | Format & Catalog Contract | ✅ Complete
-| Phase 2 | Cross-Model Query | ✅ Complete
-| Phase 3 | Ecosystem Integration | 🔄 In Progress
+| link:roadmap/STRATEGIC_ROADMAP.adoc[roadmap/STRATEGIC_ROADMAP.adoc] | The roadmap: phases, sequencing, current quarter.
+| link:roadmap/README.adoc[roadmap/] | The roadmap plus the CI-enforced ledgers and baselines (benchmark evidence, capability matrix, panic/silent-failure/v1-proto/coverage baselines).
+| `status/` | Dated records (`*_YYYY_MM_DD.adoc`): mostly measurements, many cited as evidence by `roadmap/BENCHMARK_EVIDENCE.toml`, plus a few May-2026 release-readiness trackers kept as history. Each is a point-in-time record and is not updated.
+| `design/`, `review/` | Internal design notes not yet promoted to `docs/12-design/`.
+| `enterprise/` | Open-core boundary notes (see `OPEN_CORE.md`).
+| `operations/RUNBOOK.md` | Internal operations runbook.
+| `cross-model-review-adr-077-fa-track-identity.md` | Cross-model review cited by TD-DML-1 and TD-DML-2.
 |===
 
-== Public Documentation
+== Where status lives
 
-* link:../INDEX.adoc[Documentation Index]
-* link:../concepts/architecture.adoc[Architecture]
-* link:../concepts/vision.adoc[Vision Document]
-* link:../api/rest.adoc[REST API]
+* Implementation status: each TD's own status row, indexed by
+  link:../12-design/WORK_LEDGER_2026_10_15.adoc[the Work Ledger] and the
+  link:../10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register].
+* Architecture: link:../12-design/SYSTEM_MAP_2026_05_30.adoc[System Map] and
+  link:../12-design/adr/README.adoc[the ADR index].
+* Vision: link:../00-product/VISION.adoc[VISION.adoc].
 
-== Guidance
-
-* Treat archive/ content as historical reference only.
-* Public-facing docs live in `docs/` (top-level) and `README.adoc`.
-* Use link:DOCUMENTATION_STATUS.adoc[Documentation Status] to track doc updates.
-
+Superseded plans, completed-phase guides and the former `archive/` trees were removed on
+2026-10-17; they remain in git history.

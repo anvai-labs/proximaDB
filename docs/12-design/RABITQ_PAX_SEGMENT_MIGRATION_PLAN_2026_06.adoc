@@ -7,7 +7,7 @@
 | Field | Value
 | Status | **Done (2026-06-30).** SST vector segments are written as PAX with RaBitQ codes by default, read mixed-format, compacted, and recall-gated (#106, #109, #111, #116, #120, #580). ADR-049 M1-3 later made PAX the only flush format; the legacy opt-outs now select recall-exact `RawF32` PAX.
 | Component | `src/storage/engines/sst/{flush,readers,compaction}`, `crates/storage/proximadb-block-format`
-| Relates to | link:RABITQ_ANN_INTEGRATION_SCOPING_2026_06.adoc[RaBitQ scoping] (superseded by this plan), link:adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026], link:adr/ADR-062-coalesced-rabitq-header-self-describing-footer-pax-layout.adoc[ADR-062], link:adr/ADR-049-v1-to-v2-migration-to-native-model.adoc[ADR-049]
+| Relates to | RaBitQ scoping (superseded by this plan; removed), link:adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026], link:adr/ADR-062-coalesced-rabitq-header-self-describing-footer-pax-layout.adoc[ADR-062], link:adr/ADR-049-v1-to-v2-migration-to-native-model.adoc[ADR-049]
 |===
 
 == History

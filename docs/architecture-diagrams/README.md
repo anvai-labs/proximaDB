@@ -49,7 +49,7 @@ natively on GitHub).
 | File | Type | Description |
 |---|---|---|
 | `01-storage-component.mermaid` | Component | Storage-layer component diagram |
-| `02-storage-engine-internals.mermaid` | Component | Storage-engine internal architecture (SST / HELIX / NOVA / VIPER) |
+| `02-storage-engine-internals.mermaid` | Component | Storage-engine internal architecture (SST / HELIX / NOVA; VIPER deprecated) |
 | `03-write-path-sequence.mermaid` | Sequence | WriteLane routing: WAL → memtable → PAX flush |
 | `04-wal-internals.mermaid` | Component | WAL internal component diagram (god-file) |
 | `05-pax-block-format.mermaid` | Class | PAX block-format class diagram (custom columnar storage) |
