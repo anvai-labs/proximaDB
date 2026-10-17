@@ -52,6 +52,15 @@ impl Drop for Server {
 }
 
 impl Server {
+    /// Start with the test-only commit fault armed BEFORE any server thread
+    /// exists, so no env mutation races the server's env reads (review S4a F10).
+    async fn start_with_fault(fault: &str) -> anyhow::Result<Self> {
+        // SAFETY: called before the server (or any other thread) starts;
+        // nextest runs each test in its own process.
+        unsafe { std::env::set_var(FAULT, fault) };
+        Self::start().await
+    }
+
     async fn start() -> anyhow::Result<Self> {
         // Arm the gate unless the runner pinned it (to demonstrate the legacy RED).
         if std::env::var(GATE).is_err() {
@@ -279,21 +288,66 @@ fn atomic_commit_spans_tables_and_sees_its_own_earlier_statements() {
     });
 }
 
+/// The fault seam is compiled only into debug builds; a release-profile run
+/// has nothing to inject, so these tests have nothing to prove there.
+fn fault_seam_available() -> bool {
+    cfg!(debug_assertions)
+}
+
+async fn cascade_fixture(client: &tokio_postgres::Client) -> (String, String) {
+    let parent = unique("par");
+    let child = unique("chi");
+    exec(
+        client,
+        &format!("CREATE TABLE {parent} (id VARCHAR PRIMARY KEY, label VARCHAR)"),
+    )
+    .await;
+    exec(
+        client,
+        &format!(
+            "CREATE TABLE {child} (id VARCHAR PRIMARY KEY, pid VARCHAR, \
+             FOREIGN KEY (pid) REFERENCES {parent}(id) ON DELETE CASCADE)"
+        ),
+    )
+    .await;
+    exec(
+        client,
+        &format!("INSERT INTO {parent} (id, label) VALUES ('p1', 'x')"),
+    )
+    .await;
+    exec(
+        client,
+        &format!("INSERT INTO {child} (id, pid) VALUES ('c1', 'p1')"),
+    )
+    .await;
+    exec(
+        client,
+        &format!("INSERT INTO {child} (id, pid) VALUES ('c2', 'p1')"),
+    )
+    .await;
+    (parent, child)
+}
+
+/// A fault injected before the durable append fails an explicit COMMIT and
+/// leaves nothing; INSERT … SELECT inside an atomic transaction is refused.
 #[test]
 fn atomic_commit_fault_before_append_and_insert_select_refusal() {
+    if !fault_seam_available() {
+        return;
+    }
     run(async {
-        let server = Server::start().await.expect("server");
+        let server = Server::start_with_fault("fail_before_append")
+            .await
+            .expect("server");
         let client = server.connect().await;
         let t = unique("acct");
+        // DDL and single-statement autocommit writes take the direct path, so
+        // the armed fault does not touch them.
         exec(
             &client,
             &format!("CREATE TABLE {t} (id BIGINT PRIMARY KEY, label VARCHAR)"),
         )
         .await;
-
-        // SAFETY: single test per process under nextest; the fault is read per
-        // append and cleared immediately after this COMMIT.
-        unsafe { std::env::set_var(FAULT, "fail_before_append") };
         let state = batch_sqlstate(
             &client,
             &format!(
@@ -302,7 +356,6 @@ fn atomic_commit_fault_before_append_and_insert_select_refusal() {
             ),
         )
         .await;
-        unsafe { std::env::remove_var(FAULT) };
         assert!(
             state.is_some(),
             "an injected append failure must fail COMMIT"
@@ -314,7 +367,6 @@ fn atomic_commit_fault_before_append_and_insert_select_refusal() {
                 .is_empty()
         );
 
-        // The executor-backed INSERT … SELECT would bypass staging: refused.
         let src = unique("src");
         exec(
             &client,
@@ -343,54 +395,29 @@ fn atomic_commit_fault_before_append_and_insert_select_refusal() {
     });
 }
 
-/// TD-PGOLTP-1 S4: with the gate on, an AUTOCOMMIT statement is a one-statement
-/// atomic transaction — a cascading DELETE writes child and parent rows as ONE
-/// WAL group frame. An append failure must therefore leave parent AND children
-/// intact (the legacy path wrote children, then the parent, as separate appends,
-/// and bypassed the atomic append entirely).
+/// TD-PGOLTP-1 S4a: an autocommit cascading DELETE writes child and parent rows
+/// as ONE atomic unit, so a failed append leaves parent AND children intact.
+/// Red before S4a: the direct path bypassed the atomic append entirely.
 #[test]
-fn autocommit_cascade_delete_is_one_atomic_unit() {
+fn autocommit_cascade_delete_failure_leaves_parent_and_children() {
+    if !fault_seam_available() {
+        return;
+    }
     run(async {
-        let server = Server::start().await.expect("server");
+        let server = Server::start_with_fault("fail_before_append")
+            .await
+            .expect("server");
         let client = server.connect().await;
-        let parent = unique("par");
-        let child = unique("chi");
-        exec(
-            &client,
-            &format!("CREATE TABLE {parent} (id VARCHAR PRIMARY KEY, label VARCHAR)"),
-        )
-        .await;
-        exec(
-            &client,
-            &format!(
-                "CREATE TABLE {child} (id VARCHAR PRIMARY KEY, pid VARCHAR, \
-                 FOREIGN KEY (pid) REFERENCES {parent}(id) ON DELETE CASCADE)"
-            ),
-        )
-        .await;
-        exec(
-            &client,
-            &format!("INSERT INTO {parent} (id, label) VALUES ('p1', 'x')"),
-        )
-        .await;
-        exec(
-            &client,
-            &format!("INSERT INTO {child} (id, pid) VALUES ('c1', 'p1')"),
-        )
-        .await;
-        exec(
-            &client,
-            &format!("INSERT INTO {child} (id, pid) VALUES ('c2', 'p1')"),
-        )
-        .await;
-
-        // SAFETY: one test per process under nextest; cleared right after.
-        unsafe { std::env::set_var(FAULT, "fail_before_append") };
+        let (parent, child) = cascade_fixture(&client).await;
         let state = batch_sqlstate(&client, &format!("DELETE FROM {parent} WHERE id = 'p1'")).await;
-        unsafe { std::env::remove_var(FAULT) };
         assert!(
             state.is_some(),
-            "an autocommit DELETE must go through the atomic append (and fail with it)"
+            "an autocommit cascading DELETE must go through the atomic append (and fail with it)"
+        );
+        assert_ne!(
+            state.as_deref(),
+            Some("25P02"),
+            "no transaction block exists to be aborted"
         );
         assert_eq!(
             column(&client, &format!("SELECT id FROM {parent}")).await,
@@ -401,9 +428,21 @@ fn autocommit_cascade_delete_is_one_atomic_unit() {
             vec!["c1", "c2"],
             "a failed cascading DELETE must not have removed any child"
         );
+    });
+}
 
-        // Without a fault the cascade commits whole.
-        exec(&client, &format!("DELETE FROM {parent} WHERE id = 'p1'")).await;
+/// Without a fault the cascade commits whole.
+#[test]
+fn autocommit_cascade_delete_commits_whole() {
+    run(async {
+        let server = Server::start().await.expect("server");
+        let client = server.connect().await;
+        let (parent, child) = cascade_fixture(&client).await;
+        let deleted = client
+            .execute(&format!("DELETE FROM {parent} WHERE id = 'p1'"), &[])
+            .await
+            .expect("cascade delete");
+        assert_eq!(deleted, 1);
         assert!(
             column(&client, &format!("SELECT id FROM {parent}"))
                 .await
@@ -417,9 +456,36 @@ fn autocommit_cascade_delete_is_one_atomic_unit() {
     });
 }
 
-/// Autocommit through the atomic path keeps the wire contract: command tags
-/// report the rows each statement affected, and constraint errors keep their
-/// SQLSTATE.
+/// Review S4a F2: when the durable outcome of an autocommit unit is unknown
+/// (fsync failed → appender poisoned), the server sends FATAL 08007 and CLOSES
+/// the connection over the simple-query protocol — it must not follow the
+/// FATAL with an ERROR + ReadyForQuery and keep serving.
+#[test]
+fn autocommit_outcome_unknown_is_fatal_and_closes_the_connection() {
+    if !fault_seam_available() {
+        return;
+    }
+    run(async {
+        let server = Server::start_with_fault("fail_sync").await.expect("server");
+        let client = server.connect().await;
+        let (parent, _child) = cascade_fixture(&client).await;
+        let err = client
+            .simple_query(&format!("DELETE FROM {parent} WHERE id = 'p1'"))
+            .await
+            .err()
+            .expect("an indeterminate commit must fail");
+        let code = err.as_db_error().map(|db| db.code().code().to_string());
+        assert_eq!(code.as_deref(), Some("08007"), "{err:?}");
+        assert!(
+            client.simple_query("SELECT 1").await.is_err() || client.is_closed(),
+            "the connection must be closed after FATAL"
+        );
+    });
+}
+
+/// Autocommit keeps the wire contract: command tags report affected rows and a
+/// duplicate key reports 23505 (review S4a F10: assert the code, not just "some
+/// error").
 #[test]
 fn autocommit_statements_keep_their_tags_and_sqlstates() {
     run(async {
@@ -446,7 +512,7 @@ fn autocommit_statements_keep_their_tags_and_sqlstates() {
             &format!("INSERT INTO {t} (id, label) VALUES (1, 'dup')"),
         )
         .await;
-        assert!(dup.is_some(), "a duplicate primary key must fail");
+        assert_eq!(dup.as_deref(), Some("23505"), "duplicate primary key");
         assert_eq!(
             column(&client, &format!("SELECT label FROM {t}")).await,
             vec!["b"]
@@ -456,5 +522,98 @@ fn autocommit_statements_keep_their_tags_and_sqlstates() {
             .await
             .expect("delete");
         assert_eq!(deleted, 1);
+    });
+}
+
+/// Review S4a F1: a vector-profile table routes to a store that cannot commit
+/// atomically. Autocommit writes must keep working with the gate on (they take
+/// the direct path); an explicit transaction fails closed with 0A000 and
+/// writes nothing — never a partial commit.
+#[test]
+fn vector_tables_keep_working_with_the_gate_on() {
+    run(async {
+        let server = Server::start().await.expect("server");
+        let client = server.connect().await;
+        let t = unique("vec");
+        // VECTOR(1): a pgwire `VECTOR(n)` table currently gets a 1-dimension
+        // backing collection whatever `n` is (TD-PGWIRE-COPY-1, pre-existing).
+        // Dimension 1 still exercises the vector route this test is about.
+        exec(
+            &client,
+            &format!("CREATE TABLE {t} (id VARCHAR PRIMARY KEY, embedding VECTOR(1))"),
+        )
+        .await;
+        exec(
+            &client,
+            &format!("INSERT INTO {t} (id, embedding) VALUES ('v1', '[1]'::vector)"),
+        )
+        .await;
+        assert_eq!(
+            column(&client, &format!("SELECT id FROM {t}")).await,
+            vec!["v1"]
+        );
+        let deleted = client
+            .execute(&format!("DELETE FROM {t} WHERE id = 'v1'"), &[])
+            .await
+            .expect("delete");
+        assert_eq!(
+            deleted, 1,
+            "the DELETE must find the row it is asked to delete"
+        );
+        // Visibility of the delete to SELECT is TD-PGWIRE-VECDEL-1 — see
+        // `vector_table_delete_is_invisible_to_select` (ignored until fixed).
+
+        if std::env::var(GATE).as_deref() == Ok("1") {
+            let state = batch_sqlstate(
+                &client,
+                &format!(
+                    "BEGIN; INSERT INTO {t} (id, embedding) VALUES ('v2', '[4]'::vector); COMMIT"
+                ),
+            )
+            .await;
+            assert_eq!(state.as_deref(), Some("0A000"));
+            exec(&client, "ROLLBACK").await;
+            // Fail closed: the refused transaction wrote nothing. (Check `v2`
+            // specifically — `v1`'s delete visibility is TD-PGWIRE-VECDEL-1.)
+            assert!(
+                !column(&client, &format!("SELECT id FROM {t}"))
+                    .await
+                    .contains(&"v2".to_string()),
+                "a refused atomic transaction must write nothing"
+            );
+        }
+    });
+}
+
+/// TD-PGWIRE-VECDEL-1 (open): on a vector-profile pgwire table, `DELETE`
+/// reports `DELETE 1` and writes a tombstone, yet `SELECT` still returns the
+/// row — with the atomic-commit gate on or off. The root cause is not yet
+/// located; it likely shares the tenant/collection addressing question of
+/// TD-PGWIRE-VECTENANT-1. Kept as an executable reproduction; remove
+/// `#[ignore]` when the TD is fixed.
+#[test]
+#[ignore = "TD-PGWIRE-VECDEL-1: a deleted vector-table row is still returned by SELECT"]
+fn vector_table_delete_is_invisible_to_select() {
+    run(async {
+        let server = Server::start().await.expect("server");
+        let client = server.connect().await;
+        let t = unique("vecdel");
+        exec(
+            &client,
+            &format!("CREATE TABLE {t} (id VARCHAR PRIMARY KEY, embedding VECTOR(1))"),
+        )
+        .await;
+        exec(
+            &client,
+            &format!("INSERT INTO {t} (id, embedding) VALUES ('v1', '[1]'::vector)"),
+        )
+        .await;
+        exec(&client, &format!("DELETE FROM {t} WHERE id = 'v1'")).await;
+        assert!(
+            column(&client, &format!("SELECT id FROM {t}"))
+                .await
+                .is_empty(),
+            "a deleted row must not be returned (mandate #16)"
+        );
     });
 }

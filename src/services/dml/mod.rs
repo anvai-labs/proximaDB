@@ -906,6 +906,12 @@ pub struct DmlService {
     /// queued here instead of applied, so a transaction that fails at COMMIT
     /// never moves row counts / min-max / NDV. `None` ⇒ apply immediately.
     deferred_stats: Option<Arc<parking_lot::Mutex<Vec<DeferredStatBump>>>>,
+    /// ADR-095 review (S4a) F5: in a transaction fork, the cross-pod DML lease
+    /// guards a statement took are RETAINED here instead of released when the
+    /// statement finishes staging. The commit task releases them only after the
+    /// durable write, preserving the TD-110 guarantee that a cascade's child
+    /// leases are held across the parent's write. `None` ⇒ release immediately.
+    retained_dml_guards: Option<Arc<parking_lot::Mutex<Vec<DmlLockGuard>>>>,
 }
 
 /// A catalog-statistics update captured during a staged transaction, applied
@@ -1157,14 +1163,16 @@ impl DmlService {
             abac_enforcer: None,
             held_op_locks: None,
             deferred_stats: None,
+            retained_dml_guards: None,
         }
     }
 
     /// ADR-095 D3: a copy of this service for executing one transaction's
     /// statements against `record_store` (the staging store) while the caller
     /// holds `held_op_locks`. Everything else (catalog, DML leases, ABAC) is
-    /// shared. The table-write executor is kept, but INSERT…SELECT is refused
-    /// before it is reached (it would bypass staging).
+    /// shared. The table-write executor is kept but never reached from a fork:
+    /// INSERT … SELECT is refused inside an atomic transaction (pgwire buffer
+    /// time) and runs on the direct path in autocommit (it would bypass staging).
     pub fn fork_for_transaction(
         &self,
         record_store: Arc<dyn TableRecordStore>,
@@ -1180,6 +1188,7 @@ impl DmlService {
             abac_enforcer: self.abac_enforcer.clone(),
             held_op_locks: Some(Arc::new(held_op_locks)),
             deferred_stats: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+            retained_dml_guards: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
         }
     }
 
@@ -1191,6 +1200,28 @@ impl DmlService {
             .as_ref()
             .map(|queue| std::mem::take(&mut *queue.lock()))
             .unwrap_or_default()
+    }
+
+    /// Drain the DML lease guards this transaction fork retained; release them
+    /// after the commit is durable (or on failure).
+    pub fn take_retained_dml_guards(&self) -> Vec<DmlLockGuard> {
+        self.retained_dml_guards
+            .as_ref()
+            .map(|guards| std::mem::take(&mut *guards.lock()))
+            .unwrap_or_default()
+    }
+
+    /// End-of-statement handling for DML lease guards: release them now, or —
+    /// in a transaction fork — retain them until the durable commit.
+    async fn finish_dml_guards(&self, guards: impl IntoIterator<Item = DmlLockGuard>) {
+        match &self.retained_dml_guards {
+            Some(retained) => retained.lock().extend(guards),
+            None => {
+                for guard in guards {
+                    guard.release().await;
+                }
+            }
+        }
     }
 
     /// Apply statistics bumps queued by a committed transaction, in order.
@@ -1243,10 +1274,14 @@ impl DmlService {
     /// plus its ON DELETE cascade closure, resolved in each entry's tenant scope.
     pub async fn transaction_op_lock_set(
         &self,
-        tables: &[(String, Option<TenantContext>)],
+        tables: &[(String, Option<TenantContext>, bool)],
     ) -> Result<std::collections::HashSet<TableIdentifier>> {
         let mut set = std::collections::HashSet::new();
-        for (table_name, tenant_context) in tables {
+        // The bool asks for the ON DELETE cascade closure — only DELETE walks
+        // it; INSERT/UPDATE/UPSERT hold just their target (`ensure_held` fails
+        // closed if that is ever too small). Skipping it avoids a tenant-wide
+        // catalog scan per statement (review S4a F7).
+        for (table_name, tenant_context, with_cascade_closure) in tables {
             let (catalog, table_id) = self
                 .catalog_manager
                 .resolve_table_scoped(
@@ -1254,7 +1289,7 @@ impl DmlService {
                     tenant_context.as_ref().map(|t| t.tenant_id.as_str()),
                 )
                 .await?;
-            if catalog.table_exists(&table_id).await? {
+            if *with_cascade_closure && catalog.table_exists(&table_id).await? {
                 let schema = catalog.get_table(&table_id).await?;
                 for (namespace, name) in self
                     .discover_cascade_child_set(
@@ -3890,14 +3925,21 @@ impl DmlService {
             .write_mutations(&table_schema, mutations, tenant_context)
             .await?;
         if !batch_result.success {
-            return Err(anyhow!(
-                "Insert failed: {}",
-                batch_result
-                    .errors
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            ));
+            let detail = batch_result
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown error".to_string());
+            // A store-level key conflict is a duplicate primary key: keep it typed
+            // so every surface reports 23505, even if a pre-check missed it.
+            if batch_result.error_code.as_deref() == Some("INSERT_CONFLICT") {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::Unique,
+                    format!("duplicate key value violates primary key: {detail}"),
+                )
+                .into());
+            }
+            return Err(anyhow!("Insert failed: {detail}"));
         }
 
         info!(
@@ -3916,9 +3958,7 @@ impl DmlService {
         let result =
             DmlResult::success(num_records as u64, format!("Inserted {} rows", num_records))
                 .with_inserted_ids(inserted_ids);
-        if let Some(guard) = dml_lock_guard {
-            guard.release().await;
-        }
+        self.finish_dml_guards(dml_lock_guard).await;
         Ok(result)
     }
 
@@ -4065,9 +4105,7 @@ impl DmlService {
             format!("Updated {} rows", updated_count),
         );
         result.warnings = warnings;
-        if let Some(guard) = dml_lock_guard {
-            guard.release().await;
-        }
+        self.finish_dml_guards(dml_lock_guard).await;
         Ok(result)
     }
 
@@ -4134,7 +4172,7 @@ impl DmlService {
             .collect();
         op_lock_tables.push(table_id.clone()); // parent is in the critical section too
         let _cascade_op_locks = self.op_locks_sorted(op_lock_tables).await?;
-        let _cascade_child_dml_locks = self
+        let cascade_child_dml_locks = self
             .acquire_cascade_child_dml_locks(&child_closure, tenant_context)
             .await?;
 
@@ -4235,9 +4273,8 @@ impl DmlService {
             deleted_count as u64,
             format!("Deleted {} rows", deleted_count),
         );
-        if let Some(guard) = dml_lock_guard {
-            guard.release().await;
-        }
+        self.finish_dml_guards(dml_lock_guard.into_iter().chain(cascade_child_dml_locks))
+            .await;
         Ok(result)
     }
 
@@ -4340,9 +4377,7 @@ impl DmlService {
         let result =
             DmlResult::success(num_records as u64, format!("Upserted {} rows", num_records))
                 .with_inserted_ids(inserted_ids);
-        if let Some(guard) = dml_lock_guard {
-            guard.release().await;
-        }
+        self.finish_dml_guards(dml_lock_guard).await;
         Ok(result)
     }
 
@@ -5306,7 +5341,12 @@ impl DmlService {
                                 include_vector: false,
                                 include_props: false,
                             },
-                            None,
+                            // The tenant's partition — the one this INSERT writes.
+                            // Probing with `None` looked in the default partition,
+                            // missed the existing row in every tenant-scoped
+                            // session, and let the duplicate surface later as an
+                            // untyped store conflict (42P01 instead of 23505).
+                            tenant_context,
                             #[cfg(feature = "abac-policy")]
                             &ReadContext::system(
                                 SystemReadReason::ForeignKeyResolution,

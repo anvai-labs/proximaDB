@@ -114,19 +114,88 @@ transaction never moves planner statistics. Covered by
 (`cfg!(debug_assertions)`), so a production server cannot be aborted through it (review
 finding 10).
 
-**S4a: autocommit is atomic too.** With the gate on, every pgwire autocommit INSERT / UPDATE /
-DELETE runs as a one-statement atomic unit through the same core as COMMIT
-(`services::atomic_txn::execute_atomically`, shared by both paths). A cascading DELETE's child and
-parent rows therefore land in one group frame. Ordinary statement errors keep each call site's
-existing mapping (55P03 lock conflicts, constraint SQLSTATEs). An outcome-unknown failure is
-FATAL 08007, as for COMMIT. Evidence:
-* `autocommit_cascade_delete_is_one_atomic_unit` (red before the change)
-* `autocommit_statements_keep_their_tags_and_sqlstates`
-* the existing `pgwire_fk_referential_actions_e2e` and `pgwire_transaction_e2e` suites pass with
-  the gate on (7/7)
+**S4a: autocommit, narrowed after the third review (2026-10-16).** With the gate on, the canonical
+WAL writes each `write_mutations` call as one group frame. An autocommit statement that makes a
+**single** write call is therefore already crash-atomic on the direct path: INSERT, UPDATE, UPSERT,
+and a DELETE with no ON DELETE children. Only a **DELETE whose cascade closure is non-empty**
+writes several tables in several calls. That one runs as a one-statement atomic unit through the
+shared core (`services::atomic_txn`, also used by COMMIT), so child and parent rows commit
+together. The first S4a cut staged every autocommit statement; narrowing removed a tenant-wide
+catalog scan per INSERT and most of the defects below.
 
-The REST `/api/v2/sql` and gRPC `ExecuteQuery` DML paths still call `DmlService` directly and are
-not yet atomic.
+**Exceptions, all documented gaps:**
+
+* **INSERT … SELECT is not atomic** (fourth review, finding 1). The table-write executor writes
+  1024-row batches, one `write_mutations` call per batch, and checks UNIQUE/FK per batch. A large
+  INSERT … SELECT can therefore leave a partial insert on a crash or a mid-statement conflict.
+  That is pre-existing; staging it needs a staging-aware executor. A store PK conflict on this
+  path is also still untyped (not 23505).
+* **A cascading DELETE that cannot form an atomic unit runs non-atomically on the direct path.**
+  This happens when lock-set resolution fails, or when the unit is refused as unsupported (a
+  vector child, the `oltp-integrity` key store). The fallback is logged at `warn`.
+* **With the gate on, every DELETE pays the cascade-closure catalog scan twice**: once to decide
+  the route, once inside `execute_delete`. RESTRICT- and SET NULL-only children also route
+  atomically.
+
+Third adversarial review (of `706dd630e` and `3467cf1ec`) — findings and resolution:
+
+* **F1** Vector-profile tables were refused with `0A000` on autocommit. They now take the direct
+  path. An atomic unit that is refused as unsupported (nothing written) retries on the direct
+  path. An explicit transaction into a vector table still fails closed with `0A000` rather than
+  committing partially (`vector_tables_keep_working_with_the_gate_on`).
+* **F2** An outcome-unknown autocommit on the simple-query path was swallowed: FATAL, then ERROR,
+  then ReadyForQuery, and the connection stayed open. `handle_query` now propagates it and the
+  connection closes (`autocommit_outcome_unknown_is_fatal_and_closes_the_connection`).
+* **F3** With `oltp-integrity`, every autocommit was refused. Now fixed by the narrowing plus the
+  unsupported fallback.
+* **F4** Autocommit INSERT … SELECT was staged. It now takes the direct path, so the
+  `fork_for_transaction` doc comment is true again.
+* **F5** Cross-pod DML leases were released before the durable write. A fork now **retains** its
+  lease guards (cascade children included), and the commit task releases them after
+  `commit_atomic` (`transaction_fork_retains_dml_leases_until_released`, with a second pod as the
+  competitor and a typed conflict asserted).
+  * **Qualified (fourth review, finding 3, pre-existing):** DML leases are pod-reentrant and not
+    reference-counted.
+  * A same-pod writer can therefore take the same lease reentrantly. When the unit releases it,
+    the durable lease is tombstoned while that writer still runs.
+  * Retention widens that window. Fix: reference-count per (pod, scope), or take leases after the
+    op-locks.
+* **F6** Deferred statistics were applied after the op-locks were dropped, so concurrent bumps
+  were lost. They are now applied inside the commit task, before the locks are released, which is
+  also cancellation-safe.
+* **F7** The lock set walked the cascade closure for every statement kind. It now does so only for
+  DELETE.
+* **F8** Setup/commit failures reported 25P02 on autocommit. They now use the caller's fallback
+  (XX000 on autocommit; 25P02 on COMMIT).
+* **F9** A poisoned appender's refusal was reported as outcome-unknown. A new
+  `WalAppenderPoisoned` type maps it to "nothing written".
+* **F10** Test fixes:
+  ** faults are armed before server start (no `set_var` racing server threads);
+  ** the duplicate-key code is asserted as `23505`;
+  ** fault-dependent tests skip in release builds, where the debug-only seam does not exist.
+* **F11** Caches are invalidated for every table a unit wrote, cascade children included, for both
+  COMMIT and autocommit.
+
+The REST `/api/v2/sql` and gRPC `ExecuteQuery` DML paths still call `DmlService` directly.
+
+**Pre-existing defects surfaced by the new tests** (each fails identically with the gate off):
+
+* **Fixed: a duplicate primary key reported `42P01`, not `23505`, in every tenant-scoped session.**
+  * The existing-row PK probe in `enforce_row_write_constraints_inner` passed `tenant_context =
+    None`, so it read the default partition and missed the row.
+  * The duplicate then surfaced as the store's untyped `INSERT_CONFLICT` ("Insert failed", 42P01).
+  * Fix: the probe uses the session's tenant, and a store `INSERT_CONFLICT` is mapped to the typed
+    unique violation (23505) as a backstop.
+  * Proven by `autocommit_statements_keep_their_tags_and_sqlstates`, which asserts `23505`.
+* **Not fixed here: DELETE on a vector-profile table reports success and leaves the row
+  visible**, with the gate on or off (a mandate #16 violation).
+  * Tracked in TD-PGWIRE-VECDEL-1, with an `#[ignore]`d executable reproduction.
+  * An attempted "write-side fix" (sending DELETE runs to `delete_records_with_tenant_context`)
+    was **reverted** after the fourth review. The old path already wrote a tombstone, so the change
+    was unproven. Its blast radius was also every relational DELETE on `DmlService::new` surfaces,
+    and the reproduction still failed with it.
+* **Not fixed here: a pgwire `CREATE TABLE … VECTOR(n)` gets a 1-dimension backing collection.**
+  This is TD-PGWIRE-COPY-1. The vector-route test uses `VECTOR(1)`.
 
 **Known gaps.**
 * UNIQUE races with writers that take no op-locks (INSERT…SELECT, DDL, graph merge-back)
