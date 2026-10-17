@@ -71,6 +71,9 @@ COPY = (
     "scripts/version-sync.sh",
     # The Pre-Release CI gate both release workflows call before publishing.
     "scripts/await_prerelease_ci.sh",
+    # Portable Linux build + its check (check_portable_linux_build).
+    "scripts/build_portable_linux.sh",
+    "scripts/check_linux_portability.sh",
 )
 
 
@@ -721,9 +724,11 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         """
         p = self.tree / ".github/workflows/release.yml"
         text = p.read_text(encoding="utf-8")
-        old = '            features: "cloud-full"\n'
-        self.assertEqual(text.count(old), 2)
-        p.write_text(text.replace(old, replacement + "\n", 1), encoding="utf-8")
+        # The Linux target also carries `vendored-openssl` (portable build), so
+        # match each live entry by its `cloud-full` prefix, not the exact value.
+        entries = re.findall(r'^            features: "cloud-full[^"]*"\n', text, flags=re.M)
+        self.assertEqual(len(entries), 2)
+        p.write_text(text.replace(entries[-1], replacement + "\n", 1), encoding="utf-8")
 
     def test_rejects_every_empty_features_spelling(self) -> None:
         """Each of these is legal YAML that ships a feature-less binary.
@@ -744,6 +749,36 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
                 result = _run(self.tree)
                 self.assertEqual(result.returncode, 1, spelling)
                 self.assertIn("must include `cloud-full`", result.stdout)
+
+    # ---- portable Linux binaries (v0.4.1 .el8.rpm could not start on EL8/9) ----
+    def test_catches_linux_target_without_vendored_openssl(self) -> None:
+        p = self.tree / ".github/workflows/prerelease-ci.yml"
+        text = p.read_text(encoding="utf-8")
+        self.assertIn('features: "cloud-full,vendored-openssl"', text)
+        p.write_text(text.replace('features: "cloud-full,vendored-openssl"', 'features: "cloud-full"', 1), encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must include `vendored-openssl`", result.stdout)
+
+    def test_catches_linux_build_on_the_host(self) -> None:
+        p = self.tree / ".github/workflows/release.yml"
+        text = p.read_text(encoding="utf-8")
+        old = 'bash scripts/build_portable_linux.sh "$FEATURES"'
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, "cargo build --release", 1), encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("are not built by scripts/build_portable_linux.sh", result.stdout)
+
+    def test_catches_rpm_packaging_without_portability_check(self) -> None:
+        p = self.tree / ".github/workflows/release.yml"
+        text = p.read_text(encoding="utf-8")
+        old = "          bash scripts/check_linux_portability.sh rpm_build/usr/bin\n"
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, ""), encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("job `build-rpm` does not run scripts/check_linux_portability.sh", result.stdout)
 
     def test_accepts_every_legal_spelling_of_the_right_value(self) -> None:
         for spelling in (

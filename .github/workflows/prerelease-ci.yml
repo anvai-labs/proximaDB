@@ -158,10 +158,13 @@ jobs:
       matrix:
         include:
           # Linux x86_64 (glibc)
+          # Built in the manylinux_2_28 container with OpenSSL vendored
+          # (scripts/build_portable_linux.sh), so the archive, .deb, .rpm and
+          # Homebrew formula run on glibc >= 2.28 with any system OpenSSL.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
-            features: "cloud-full"
+            features: "cloud-full,vendored-openssl"
 
           # Linux x86_64 (musl - static) - DISABLED for v0.2.0
           # Target installation issue - requires manual musl target setup
@@ -239,6 +242,11 @@ jobs:
       - name: Build Binaries
         run: |
           FEATURES="${{ matrix.features }}"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            # glibc 2.28 + vendored OpenSSL; fails unless the result is portable.
+            bash scripts/build_portable_linux.sh "$FEATURES"
+            exit 0
+          fi
           if [ -n "$FEATURES" ]; then
             FEATURES_FLAG="--features $FEATURES"
           else

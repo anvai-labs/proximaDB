@@ -879,6 +879,50 @@ def check_npm_oidc_publish(msgs: list[str]) -> None:
             _fail(msgs, f"{rel}: job `{job}` must preflight the npm OIDC exchange (`POST {NPM_EXCHANGE_PATH}...`) before `npm publish` -- npm hides an exchange refusal behind ENEEDAUTH")
 
 
+# ---- Portable Linux binaries (v0.4.1: the .el8.rpm could not start on EL8/EL9) --
+# The x86_64 Linux archive is repackaged as the .deb, the .rpm and the Homebrew
+# formula, so it must run on the oldest distro any of them claims: glibc 2.28
+# (EL8) and whatever OpenSSL major the distro ships. v0.4.1 was built on
+# ubuntu-22.04 and needed GLIBC_2.35 + libssl.so.3.
+PORTABLE_BUILD = "scripts/build_portable_linux.sh"
+PORTABILITY_CHECK = "scripts/check_linux_portability.sh"
+LINUX_TARGET = "x86_64-unknown-linux-gnu"
+
+
+def check_portable_linux_build(msgs: list[str]) -> None:
+    for rel in RELEASE_WORKFLOWS:
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines()
+        live = [l for l in lines if _live(l)]
+        if not any(PORTABLE_BUILD in l for l in live):
+            _fail(msgs, f"{rel}: the {LINUX_TARGET} binaries are not built by {PORTABLE_BUILD} "
+                        f"(manylinux_2_28 + vendored OpenSSL) -- they would need the build host's glibc/libssl")
+        # The Linux matrix entry's features must vendor OpenSSL.
+        for i, l in enumerate(lines):
+            if _live(l) and l.strip() == f"- target: {LINUX_TARGET}":
+                block = []
+                for nxt in lines[i + 1:]:
+                    if nxt.strip().startswith("- target:"):
+                        break
+                    block.append(nxt)
+                feats = [_scalar(m.group("rest")) for b in block if _live(b) and (m := FEATURES_RE.match(b))]
+                if not feats or "vendored-openssl" not in [f.strip() for f in feats[0].split(",")]:
+                    _fail(msgs, f"{rel}:{i + 1}: {LINUX_TARGET} features {feats} must include `vendored-openssl` "
+                                f"-- otherwise the binary links the build host's libssl")
+    rel = ".github/workflows/release.yml"
+    path = ROOT / rel
+    if path.exists():
+        jobs = _jobs(path.read_text(encoding="utf-8").splitlines())
+        for job in ("build-binaries", "build-rpm", "build-deb"):
+            if not any(_live(b) and PORTABILITY_CHECK in b for b in jobs.get(job, [])):
+                _fail(msgs, f"{rel}: job `{job}` does not run {PORTABILITY_CHECK} on the Linux binaries it ships")
+    for script in (PORTABLE_BUILD, PORTABILITY_CHECK):
+        if not (ROOT / script).exists():
+            _fail(msgs, f"{script}: missing")
+
+
 def main() -> int:
     msgs: list[str] = []
     check_workflow_features(msgs)
@@ -890,6 +934,7 @@ def main() -> int:
     check_prerelease_gate(msgs)
     check_release_binary_reuse(msgs)
     check_npm_oidc_publish(msgs)
+    check_portable_linux_build(msgs)
     if msgs:
         print("release-build-features: FAILED")
         for m in msgs:
@@ -902,7 +947,8 @@ def main() -> int:
         "bounded, runtime config copied --chown, one release tag gated "
         "against every published manifest, every publish behind Pre-Release CI, "
         "release binaries reused from Pre-Release CI only after a SHA-256 check, "
-        "npm published by OIDC alone behind an exchange preflight)"
+        "npm published by OIDC alone behind an exchange preflight, Linux binaries "
+        "portable to glibc 2.28 with OpenSSL vendored)"
     )
     return 0
 

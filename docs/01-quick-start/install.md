@@ -25,7 +25,23 @@ flowchart LR
 
 ## Platform Packages
 
-### Linux (RPM - RHEL/CentOS/Fedora)
+### Linux requirements (archive, .deb, .rpm, Homebrew)
+
+The Linux x86_64 binaries are built against **glibc 2.28** with **OpenSSL
+statically linked**, so they need no system OpenSSL. Each package is installed,
+started and health-checked on these distributions for every release
+(`release-smoke.yml`, `packages` job):
+
+| Package | Minimum (verified) |
+|---|---|
+| `.rpm` | RHEL / Rocky / Alma **8** and 9, Fedora 41 |
+| `.deb` | **Debian 11** and 12, **Ubuntu 20.04**, 22.04, 24.04 |
+
+Older releases differ: **v0.4.1 and earlier** were built on Ubuntu 22.04 and
+need glibc 2.35 and `libssl.so.3` -- their `.el8.rpm` does **not** run on
+RHEL/Rocky 8 or 9, and their `.deb` needs Ubuntu 22.04+ / Debian 12+.
+
+### Linux (RPM - RHEL/Rocky/Alma 8+, Fedora)
 
 ```bash
 # Download
@@ -49,7 +65,7 @@ curl http://localhost:5678/health
 - Data: `/var/lib/proximadb/`
 - Logs: `/var/log/proximadb/`
 
-### Linux (DEB - Debian/Ubuntu)
+### Linux (DEB - Debian 11+, Ubuntu 20.04+)
 
 ```bash
 # Download

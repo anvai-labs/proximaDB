@@ -254,10 +254,13 @@ jobs:
       matrix:
         include:
           # Linux x86_64 (glibc)
+          # Built in the manylinux_2_28 container with OpenSSL vendored
+          # (scripts/build_portable_linux.sh), so the archive, .deb, .rpm and
+          # Homebrew formula run on glibc >= 2.28 with any system OpenSSL.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
-            features: "cloud-full"
+            features: "cloud-full,vendored-openssl"
 
           # Linux x86_64 (musl - static) - DISABLED for v0.2.0
           # Target installation issue - requires manual musl target setup
@@ -368,6 +371,11 @@ jobs:
         if: steps.fetch.outcome != 'success'
         run: |
           FEATURES="${{ matrix.features }}"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            # glibc 2.28 + vendored OpenSSL; fails unless the result is portable.
+            bash scripts/build_portable_linux.sh "$FEATURES"
+            exit 0
+          fi
           if [ -n "$FEATURES" ]; then
             FEATURES_FLAG="--features $FEATURES"
           else
@@ -431,6 +439,16 @@ jobs:
           "$($hash.Hash.ToLower())  ${ARCHIVE_NAME}.zip" | Out-File -Encoding ascii "${ARCHIVE_NAME}.zip.sha256"
 
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}.zip" >> $env:GITHUB_ENV
+
+      # Whether fetched from Pre-Release CI or rebuilt: the archive every Linux
+      # package repackages must run on glibc 2.28 without a system OpenSSL.
+      - name: Linux binaries are portable (glibc <= 2.28, no system OpenSSL)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          mkdir -p portable-check
+          tar -xzf "$ARCHIVE_NAME" -C portable-check --strip-components=1
+          bash scripts/check_linux_portability.sh portable-check
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v7
@@ -523,7 +541,12 @@ jobs:
           mkdir -p rpm_build/var/log/proximadb
           mkdir -p rpm_build/tmp
 
-          tar -xzf binary/proximadb-*.tar.gz -C rpm_build/usr/bin --strip-components=1
+          # Only the three binaries go to /usr/bin (the archive's README,
+          # LICENSE and config/ used to land there too); config ships as
+          # /etc/proximadb/config.toml below.
+          tar -xzf binary/proximadb-*.tar.gz -C rpm_build/usr/bin --strip-components=1 \
+            --wildcards '*/proximadb-server' '*/proximadb-bench' '*/proximadb-migrate'
+          bash scripts/check_linux_portability.sh rpm_build/usr/bin
           cp config/config.toml rpm_build/etc/proximadb/
           cp deploy/packaging/systemd/proximadb.service rpm_build/usr/lib/systemd/system/
           cp deploy/packaging/scripts/postinstall.sh rpm_build/tmp/postinstall.sh
@@ -538,6 +561,7 @@ jobs:
             --license "Apache-2.0" \
             --vendor "ProximaDB" \
             --rpm-dist "el8" \
+            --depends xz-libs \
             --after-install rpm_build/tmp/postinstall.sh \
             --before-remove rpm_build/tmp/preremove.sh \
             rpm_build/=/
@@ -580,7 +604,12 @@ jobs:
           mkdir -p deb_build/tmp
           mkdir -p deb_build/lib/systemd/system
 
-          tar -xzf binary/proximadb-*.tar.gz -C deb_build/usr/bin --strip-components=1
+          # Only the three binaries go to /usr/bin (the archive's README,
+          # LICENSE and config/ used to land there too); config ships as
+          # /etc/proximadb/config.toml below.
+          tar -xzf binary/proximadb-*.tar.gz -C deb_build/usr/bin --strip-components=1 \
+            --wildcards '*/proximadb-server' '*/proximadb-bench' '*/proximadb-migrate'
+          bash scripts/check_linux_portability.sh deb_build/usr/bin
           cp config/config.toml deb_build/etc/proximadb/
           cp deploy/packaging/systemd/proximadb.service deb_build/lib/systemd/system/
           cp deploy/packaging/scripts/postinstall.sh deb_build/tmp/postinstall.sh
@@ -596,6 +625,7 @@ jobs:
             --license "Apache-2.0" \
             --vendor "ProximaDB" \
             --deb-priority "optional" \
+            --depends liblzma5 \
             --after-install deb_build/tmp/postinstall.sh \
             --before-remove deb_build/tmp/preremove.sh \
             deb_build/=/
@@ -960,13 +990,13 @@ jobs:
 
           #### Platform Packages (RPM/DEB/MSI)
 
-          **Linux (RPM - RHEL/CentOS/Fedora):**
+          **Linux (RPM - RHEL/Rocky/Alma 8+, Fedora; glibc 2.28, OpenSSL built in):**
           ```bash
           sudo rpm -ivh proximadb-${{ needs.prepare.outputs.version }}-1.el8.x86_64.rpm
           sudo systemctl start proximadb
           ```
 
-          **Linux (DEB - Debian/Ubuntu):**
+          **Linux (DEB - Debian 11+, Ubuntu 20.04+):**
           ```bash
           sudo dpkg -i proximadb_${{ needs.prepare.outputs.version }}_amd64.deb
           sudo systemctl start proximadb
