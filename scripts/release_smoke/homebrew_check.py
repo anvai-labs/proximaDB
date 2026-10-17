@@ -28,6 +28,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 from typing import Any
 
 URL_RE = re.compile(r'^\s*url\s+"(?P<url>[^"]+)"')
@@ -115,15 +116,7 @@ def evaluate(repo: str, version: str, formula: str | None, sums: dict[str, str],
     return checks
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo", required=True)
-    ap.add_argument("--version", required=True)
-    ap.add_argument("--tap", required=True)
-    ap.add_argument("--formula", default="Formula/proximadb.rb")
-    ap.add_argument("--out", type=pathlib.Path)
-    args = ap.parse_args()
-
+def gather_and_evaluate(args: argparse.Namespace) -> list[dict[str, Any]]:
     formula: str | None
     try:
         blob = gh_json(f"repos/{args.tap}/contents/{args.formula}")
@@ -132,9 +125,32 @@ def main() -> int:
         formula = None
     try:
         sums, assets = release_sums(args.repo, f"v{args.version}")
-        checks = evaluate(args.repo, args.version, formula, sums, assets)
+        return evaluate(args.repo, args.version, formula, sums, assets)
     except LookupError as exc:
-        checks = [{"name": "release_assets", "ok": False, "detail": str(exc)}]
+        return [{"name": "release_assets", "ok": False, "detail": str(exc)}]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--version", required=True)
+    ap.add_argument("--tap", required=True)
+    ap.add_argument("--formula", default="Formula/proximadb.rb")
+    ap.add_argument("--out", type=pathlib.Path)
+    ap.add_argument("--wait-minutes", type=int, default=0,
+                    help="re-check every 60s up to this bound: release.yml's update-homebrew "
+                         "lands the formula through a tap PR, which the tap's CI must pass first")
+    args = ap.parse_args()
+
+    deadline = time.monotonic() + args.wait_minutes * 60
+    attempt = 0
+    while True:
+        attempt += 1
+        checks = gather_and_evaluate(args)
+        if all(c["ok"] for c in checks) or time.monotonic() >= deadline:
+            break
+        print(f"...  homebrew formula not yet serving v{args.version} (attempt {attempt}); retrying in 60s")
+        time.sleep(60)
     doc = {
         "artifact": f"homebrew:{args.tap}/{args.formula}",
         "version": args.version,

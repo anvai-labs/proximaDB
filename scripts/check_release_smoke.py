@@ -79,7 +79,7 @@ CHANNELS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("gh release download", "sha256sum -c", "SHA256SUMS.txt", "--version", "mvp_smoke.py"),
     ),
     "homebrew": (
-        ("< Formula",),
+        ("scripts/release_homebrew_formula.py", "< Formula"),
         ("homebrew_check.py",),
     ),
 }
@@ -88,7 +88,8 @@ CHANNELS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 # url, since both use the same action); otherwise it is an unsmoked channel.
 PUBLISH_LIKE = re.compile(
     r"cargo publish|npm publish|pypi-publish|twine upload|action-gh-release|gh release (?:create|upload)"
-    r"|imagetools create|docker push|push:\s*true|push=true|< Formula|helm push|oras push"
+    r"|imagetools create|docker push|push:\s*true|push=true|< Formula|release_homebrew_formula\.py"
+    r"|helm push|oras push"
 )
 # TestPyPI is advisory (continue-on-error in release-python.yml) and is not a
 # channel users install from.

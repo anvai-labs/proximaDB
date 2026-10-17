@@ -472,9 +472,12 @@ jobs:
     name: Homebrew formula
     needs: resolve
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Bound = registry wait (the formula lands via a tap PR gated on the tap's
+    # brew install CI) + the check itself.
+    timeout-minutes: 180
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
+      WAIT: ${{ needs.resolve.outputs.wait }}
     steps:
       - uses: actions/checkout@v7
       - name: Tap formula references this release with matching url + sha256
@@ -483,7 +486,7 @@ jobs:
         run: |
           python3 scripts/release_smoke/homebrew_check.py --repo "${{ github.repository }}" \
             --version "$VERSION" --tap "$HOMEBREW_TAP" --formula "$HOMEBREW_FORMULA" \
-            --out evidence/homebrew-formula.json
+            --out evidence/homebrew-formula.json --wait-minutes "$WAIT"
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7

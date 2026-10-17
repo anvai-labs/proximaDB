@@ -101,8 +101,8 @@ class ReleaseSmokeGuard(unittest.TestCase):
         self._fails_with("must fail hard")
 
     def test_catches_continue_on_error(self) -> None:
-        self._edit(SMOKE, "    timeout-minutes: 15\n    env:\n      VERSION",
-                   "    timeout-minutes: 15\n    continue-on-error: true\n    env:\n      VERSION")
+        self._edit(SMOKE, "    timeout-minutes: 15\n    permissions:",
+                   "    timeout-minutes: 15\n    continue-on-error: true\n    permissions:")
         self._fails_with("must fail hard")
 
     def test_catches_or_true_in_a_helper_script(self) -> None:
@@ -283,16 +283,39 @@ class HomebrewVerdicts(unittest.TestCase):
     def test_stale_version_fails(self) -> None:
         self.assertIn(f"url:{self.ASSET}", self._failed(self._formula(self.SHA, tag="v0.4.0")))
 
-    def test_release_yml_generated_formula_fails(self) -> None:
-        """The heredoc release.yml writes, rendered for 0.4.1: macOS urls name
-        assets the release never built, and no url carries a sha256."""
+    def test_formula_rendered_by_release_yml_passes_the_smoke(self) -> None:
+        """scripts/release_homebrew_formula.py (release.yml update-homebrew)
+        produces exactly what the strict smoke accepts -- from the tap's current
+        formula and from the fresh template."""
+        render = _load("scripts/release_homebrew_formula.py")
+        assets = {self.ASSET, "SHA256SUMS.txt", "proximadb-0.4.1-x86_64-pc-windows-msvc.zip"}
+        asset, sha = render.select_asset("0.4.1", assets, {self.ASSET: self.SHA})
+        self.assertEqual((asset, sha), (self.ASSET, self.SHA))
+        # The tap's shape (top-level url/sha256), still at the previous release.
+        old_base = render.TEMPLATE.format(
+            repo=self.REPO, sha="1" * 64,
+            url=f"https://github.com/{self.REPO}/releases/download/v0.4.0/proximadb-0.4.0-x86_64-unknown-linux-gnu.tar.gz")
+        for base in (None, old_base):
+            formula = render.rewrite(base, self.REPO, "0.4.1", asset, sha)
+            self.assertEqual(self._failed(formula), [], formula)
+
+    def test_renderer_refuses_unbuilt_or_extra_platforms_and_downgrades(self) -> None:
+        render = _load("scripts/release_homebrew_formula.py")
+        with self.assertRaises(render.RenderError):
+            render.select_asset("0.4.1", {"SHA256SUMS.txt"}, {})
+        with self.assertRaises(render.RenderError):  # a second unix archive needs per-OS blocks
+            render.select_asset("0.4.1", {self.ASSET, "proximadb-0.4.1-aarch64-apple-darwin.tar.gz"},
+                                {self.ASSET: self.SHA})
+        with self.assertRaises(render.RenderError):
+            render.select_asset("0.4.1", {self.ASSET}, {})
+        current = render.rewrite(None, self.REPO, "0.4.1", self.ASSET, self.SHA)
+        with self.assertRaises(render.RenderError):  # downgrade
+            render.rewrite(current, self.REPO, "0.4.0", self.ASSET, self.SHA)
+
+    def test_release_yml_no_longer_ships_an_unpinned_formula(self) -> None:
         text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-        start = text.index("class Proximadb < Formula")
-        body = text[start:text.index("          EOF", start)]
-        body = body.replace("${{ github.repository }}", self.REPO).replace("$VERSION", "0.4.1")
-        failed = self._failed(body)
-        self.assertIn(f"sha256:{self.ASSET}", failed)
-        self.assertTrue(any("apple-darwin" in f for f in failed), failed)
+        self.assertNotIn("sha256 will be updated after release", text)
+        self.assertIn("scripts/release_homebrew_formula.py", text)
 
 
 class SummaryVerdicts(unittest.TestCase):

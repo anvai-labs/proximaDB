@@ -46,7 +46,7 @@
 #   │     tag; its trusted publisher is bound to that file name.)            │
 #   │     ├── publish-crates    crates.io (stable only)                      │
 #   │     ├── publish-npm       npm via OIDC (stable only)                   │
-#   │     └── update-homebrew   Homebrew formula artifact                    │
+#   │     └── update-homebrew   anvai-labs/homebrew-tap PR (HOMEBREW_TAP_TOKEN)│
 #   ├─────────────────────────────────────────────────────────────────────────┤
 #   │  5. VERIFY             Registries list the version (verify-release),   │
 #   │                        then release-smoke.yml installs + exercises     │
@@ -1274,70 +1274,55 @@ jobs:
           exit 1
 
   # ============================================================================
-  # UPDATE HOMEBREW FORMULA - macOS package manager
+  # UPDATE HOMEBREW FORMULA - anvai-labs/homebrew-tap Formula/proximadb.rb
   # ============================================================================
+  # Users install with `brew install anvai-labs/tap/proximadb` (Linux x86_64:
+  # the only unix archive this workflow builds). This job used to write a
+  # formula with NO sha256 and macOS/aarch64 urls for archives that are never
+  # built, and only uploaded it as a workflow artifact -- nothing reached the
+  # tap. Now:
+  #   1. scripts/release_homebrew_formula.py rewrites the tap's CURRENT formula
+  #      (url + sha256 only) for the archive the release actually has, with the
+  #      sha256 checked against SHA256SUMS.txt AND the downloaded bytes;
+  #   2. with the HOMEBREW_TAP_TOKEN secret (a fine-grained PAT on
+  #      anvai-labs/homebrew-tap: Contents + Pull requests read/write), it opens
+  #      a PR on the tap, waits for the tap's `CI Success` (brew audit + install
+  #      tests) and merges it. The tap's main is protected by that check, so the
+  #      formula only lands if brew can install it.
+  #   Without the secret the rendered formula is still uploaded and the step
+  #   summary says the tap was not updated (its own 6-hourly update-data-tools
+  #   workflow will open the same PR); release-smoke.yml's `homebrew` job stays
+  #   strict and reports the tap as stale until it lands.
   update-homebrew:
-    timeout-minutes: 30
+    timeout-minutes: 90
     name: Update Homebrew Formula
     needs: [prepare, create-release]
     runs-on: ubuntu-latest
     if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true'
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAP: anvai-labs/homebrew-tap
+      FORMULA: Formula/proximadb.rb
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Generate Homebrew Formula
+      - name: Render the formula for this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          cat << EOF > proximadb.rb
-          class Proximadb < Formula
-            desc "Multi-model vector database for AI applications"
-            homepage "https://github.com/${{ github.repository }}"
-            version "$VERSION"
-            license "Apache-2.0"
-
-            on_macos do
-              on_intel do
-                url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/proximadb-$VERSION-x86_64-apple-darwin.tar.gz"
-                # sha256 will be updated after release
-              end
-              on_arm do
-                url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/proximadb-$VERSION-aarch64-apple-darwin.tar.gz"
-                # sha256 will be updated after release
-              end
-            end
-
-            on_linux do
-              on_intel do
-                url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/proximadb-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
-                # sha256 will be updated after release
-              end
-              on_arm do
-                url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/proximadb-$VERSION-aarch64-unknown-linux-gnu.tar.gz"
-                # sha256 will be updated after release
-              end
-            end
-
-            def install
-              bin.install "proximadb-server"
-              bin.install "proximadb-bench"
-              bin.install "proximadb-migrate"
-              etc.install "config" => "proximadb"
-            end
-
-            service do
-              run [opt_bin/"proximadb-server", "--config", etc/"proximadb/config.toml"]
-              keep_alive true
-              working_dir var/"proximadb"
-              log_path var/"log/proximadb.log"
-              error_log_path var/"log/proximadb.error.log"
-            end
-
-            test do
-              system bin/"proximadb-server", "--version"
-            end
-          end
-          EOF
+          set -euo pipefail
+          # The tap is public: read its current formula without the tap token.
+          if gh api "repos/${TAP}/contents/${FORMULA}" --jq .content > tap.b64 2>/dev/null; then
+            base64 -d tap.b64 > tap-current.rb
+            BASE=(--base tap-current.rb)
+          else
+            echo "::warning::${TAP} has no ${FORMULA}; rendering a fresh formula"
+            BASE=()
+          fi
+          python3 scripts/release_homebrew_formula.py --repo "${{ github.repository }}" \
+            --version "$VERSION" "${BASE[@]}" --out proximadb.rb
+          cat proximadb.rb
 
       - name: Upload Homebrew Formula
         uses: actions/upload-artifact@v7
@@ -1345,6 +1330,59 @@ jobs:
           name: homebrew-formula
           path: proximadb.rb
           retention-days: 30
+
+      - name: Publish to the tap (PR, tap CI, merge)
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set: ${TAP} was NOT updated to ${VERSION}."
+            {
+              echo "### Homebrew tap NOT updated"
+              echo "Secret \`HOMEBREW_TAP_TOKEN\` is missing (fine-grained PAT on ${TAP}: Contents + Pull requests read/write)."
+              echo "The rendered formula is the \`homebrew-formula\` artifact; the tap's update-data-tools workflow opens the same PR within 6h."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -f tap-current.rb ] && cmp -s tap-current.rb proximadb.rb; then
+            echo "${TAP} already serves ${VERSION}"; exit 0
+          fi
+          BRANCH="automation/proximadb-v${VERSION}"
+          MAIN_SHA="$(gh api "repos/${TAP}/git/ref/heads/main" --jq .object.sha)"
+          if gh api "repos/${TAP}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${TAP}/git/refs/heads/${BRANCH}" -f sha="$MAIN_SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/${TAP}/git/refs" -f ref="refs/heads/${BRANCH}" -f sha="$MAIN_SHA" >/dev/null
+          fi
+          ARGS=(-f message="proximadb v${VERSION}" -f branch="$BRANCH" -f content="$(base64 -w0 proximadb.rb)")
+          if BLOB="$(gh api "repos/${TAP}/contents/${FORMULA}?ref=${BRANCH}" --jq .sha 2>/dev/null)"; then
+            ARGS+=(-f sha="$BLOB")
+          fi
+          gh api -X PUT "repos/${TAP}/contents/${FORMULA}" "${ARGS[@]}" >/dev/null
+          PR="$(gh pr list -R "$TAP" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$PR" ]; then
+            gh pr create -R "$TAP" --base main --head "$BRANCH" --title "proximadb v${VERSION}" \
+              --body "Automated from ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}: url + sha256 for the v${VERSION} linux x86_64 archive, verified against SHA256SUMS.txt and the downloaded bytes."
+            PR="$(gh pr list -R "$TAP" --head "$BRANCH" --state open --json number --jq '.[0].number')"
+          fi
+          echo "tap PR #${PR}; waiting for its CI Success (bounded)"
+          deadline=$(( $(date +%s) + 75 * 60 ))
+          while :; do
+            STATE="$(gh pr view -R "$TAP" "$PR" --json statusCheckRollup \
+              --jq '[.statusCheckRollup[] | select(.name == "CI Success")][0] | (.conclusion // .status // "")')"
+            case "$STATE" in
+              SUCCESS) break ;;
+              FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED|STARTUP_FAILURE)
+                echo "::error::${TAP} PR #${PR} CI Success concluded ${STATE}; the formula did not land"; exit 1 ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::${TAP} PR #${PR} CI Success not green within 75 min"; exit 1
+            fi
+            sleep 60
+          done
+          gh pr merge -R "$TAP" "$PR" --squash --delete-branch
+          echo "${TAP}: ${FORMULA} now serves ${VERSION} (PR #${PR})"
 
   # ============================================================================
   # DRY RUN SUMMARY - Report when running in dry-run mode
@@ -1549,7 +1587,7 @@ jobs:
   # long (150 min) and bounded.
   release-smoke:
     name: Release Smoke (evidence)
-    needs: [prepare, create-release, verify-release]
+    needs: [prepare, create-release, verify-release, update-homebrew]
     if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true'
     permissions:
       contents: read

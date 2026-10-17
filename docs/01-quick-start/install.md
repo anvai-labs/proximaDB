@@ -10,9 +10,9 @@ flowchart LR
   A --> D[macOS]
   A --> E[Docker]
 
-  B --> B1[RPM / DEB]
+  B --> B1[RPM / DEB / Homebrew]
   C --> C1[MSI]
-  D --> D1[Homebrew]
+  D --> D1[Docker or source]
   E --> E1[Docker Hub]
 
   style B1 fill:#4a90e2,color:#fff
@@ -85,14 +85,18 @@ Start-Service proximadb
 - Config: `C:\ProgramData\ProximaDB\config.toml`
 - Data: `C:\ProgramData\ProximaDB\data\`
 
-### macOS (Homebrew)
+### Linux x86_64 (Homebrew)
+
+The release publishes a prebuilt server archive for **Linux x86_64 only**, and
+the Homebrew formula in the `anvai-labs/tap` tap installs exactly that archive.
+There is no macOS binary or formula: on macOS use Docker or build from source
+(below).
 
 ```bash
-# Install
-brew install proximadb
+brew install anvai-labs/tap/proximadb
 
-# Start service
-brew services start proximadb
+# Example configs are in $(brew --prefix)/share/proximadb/config; copy one, then
+proximadb-server --config <path-to-config.toml>
 
 # Verify
 curl http://localhost:5678/health
@@ -358,12 +362,11 @@ Stop-Service proximadb
 msiexec /x proximadb-0.2.0-x64.msi
 ```
 
-### macOS
+### Homebrew (Linux x86_64)
 
 ```bash
-brew services stop proximadb
-brew uninstall proximadb
-rm -rf /usr/local/var/proximadb
+brew uninstall anvai-labs/tap/proximadb
+# Data lives wherever your config's data_dir / storage urls point; remove it separately.
 ```
 
 ---

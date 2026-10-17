@@ -21,6 +21,7 @@ per-package version hold.
 | npm `@anvailabs/proximadb-client` | `release.yml` (`vX.Y.Z`, stable only) | `clients/nodejs-embedded/package.json` | `prepare` gate + per-job assert before `npm publish` |
 | PyPI `proximadb` | `release-python.yml` (`vX.Y.Z`, stable only) | `clients/python/pyproject.toml` | `version-gate`: `version-sync.sh check-tag` |
 | PyPI `proximadb_embedded` | `release-python.yml` (`vX.Y.Z`, stable only) | root `pyproject.toml` (maturin) | `version-gate`: `version-sync.sh check-tag` |
+| Homebrew `anvai-labs/tap/proximadb` (Linux x86_64 only) | `release.yml` `update-homebrew` (stable only): PR to `anvai-labs/homebrew-tap`, merged after the tap's `CI Success` | url + sha256 rendered by `scripts/release_homebrew_formula.py` from `SHA256SUMS.txt` and the downloaded archive | needs the `HOMEBREW_TAP_TOKEN` secret (fine-grained PAT on `anvai-labs/homebrew-tap`: Contents + Pull requests read/write); without it the tap's 6-hourly `update-data-tools` workflow opens the same PR |
 | TestPyPI (advisory) | `release-python.yml` (any `vX.Y.Z[-pre]`, or dispatch) | as above | as above |
 
 A tag with a hyphen (`v0.5.0-rc.1`) is a pre-release in both workflows: it builds
@@ -123,8 +124,11 @@ runner shutdown); the released image and binary both fail `mvp_smoke.py` --
 a deleted record is still returned by a **filtered** vector search (any
 collection; unfiltered search, filtered scan and get-by-id are correct); the
 npm package's ESM entry (`exports.import` -> `dist/index.mjs`) does not exist
-in the tarball, so `import` fails for every ESM consumer; and the Homebrew tap
-has no `proximadb` formula (`release.yml`'s `update-homebrew` only uploads an
-unpinned formula as a workflow artifact). The PyPI, crates.io and npm-CommonJS
-smokes passed.
+in the tarball, so `import` fails for every ESM consumer (fixed after 0.4.1: an
+ESM wrapper over the CommonJS build, gated by `tests/package_entry.test.ts`
+against `npm pack`); and the Homebrew tap had no `proximadb` formula
+(`release.yml`'s `update-homebrew` only uploaded an unpinned formula, with
+macOS urls for archives never built, as a workflow artifact). The tap formula
+was added by hand on 2026-10-17 and now passes; `update-homebrew` publishes it
+for later releases. The PyPI, crates.io and npm-CommonJS smokes passed.
 

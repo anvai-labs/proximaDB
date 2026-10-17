@@ -60,12 +60,13 @@ sudo systemctl start proximadb
 msiexec /i proximadb-0.2.0-x64.msi
 ```
 
-### Install (macOS)
+### Install (Homebrew, Linux x86_64 only)
 
 ```bash
-brew install proximadb
-brew services start proximadb
+brew install anvai-labs/tap/proximadb
 ```
+
+No macOS binary is published; on macOS use Docker (below) or build from source.
 
 ### Install (Docker)
 
