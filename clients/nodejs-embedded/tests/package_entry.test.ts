@@ -16,6 +16,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { VERSION } from "../src/index";
 
 const PKG_DIR = path.resolve(__dirname, "..");
@@ -51,6 +52,7 @@ describe("published package entry points", () => {
   it("routes consumers only to files the tarball contains", () => {
     const paths = entryPaths();
     expect(paths).toContain("dist/index.mjs");
+    expect(paths).toContain("dist/index.d.mts");
     const missing = paths.filter((p) => !packed.has(p));
     expect(missing, `package.json points at files npm pack does not ship: ${missing}`).toEqual([]);
   });
@@ -74,6 +76,37 @@ describe("published package entry points", () => {
     expect(out.sameClass).toBe(true);
     expect(out.defaultOk).toBe(true);
   });
+
+  it("types the ESM entry as the runtime: default import is constructable", () => {
+    // A node16 ESM consumer of the BUILT package (dist/index.d.mts via the
+    // `import` condition). With CommonJS types on the import path, the
+    // default import is typed as the module object and `new Client()` fails.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pkg-esm-types-"));
+    try {
+      const nm = path.join(dir, "node_modules", "@anvailabs");
+      fs.mkdirSync(nm, { recursive: true });
+      fs.symlinkSync(PKG_DIR, path.join(nm, "proximadb-client"), "dir");
+      fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ type: "module" }));
+      fs.writeFileSync(
+        path.join(dir, "c.mts"),
+        'import Client, { connectRest, VERSION, ProximaDBClient } from "@anvailabs/proximadb-client";\n' +
+          "const c: ProximaDBClient = new Client();\nconst v: string = VERSION;\n" +
+          'export const r = [c, v, connectRest("http://x")];\n',
+      );
+      fs.writeFileSync(
+        path.join(dir, "tsconfig.json"),
+        JSON.stringify({
+          compilerOptions: { module: "node16", moduleResolution: "node16", strict: true, noEmit: true,
+            skipLibCheck: true, types: [] },
+          files: ["c.mts"],
+        }),
+      );
+      const tsc = path.join(PKG_DIR, "node_modules", "typescript", "bin", "tsc");
+      execFileSync(process.execPath, [tsc, "-p", dir], { encoding: "utf8", stdio: "pipe" });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it("exports VERSION equal to package.json version", () => {
     expect(VERSION).toBe(pkg.version);

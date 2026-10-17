@@ -16,10 +16,18 @@ try {
   console.log(`::error::npm smoke (ESM) FAILED: \`import "${PKG}"\` does not load: ${e.message}`);
   process.exit(1);
 }
+if (mod.VERSION !== want) {
+  console.log(`::error::npm smoke (ESM) FAILED: exported VERSION ${mod.VERSION} != ${want}`);
+  process.exit(1);
+}
+if (mod.default !== mod.ProximaDBClient) {
+  console.log("::error::npm smoke (ESM) FAILED: default export is not ProximaDBClient");
+  process.exit(1);
+}
 const client = mod.connectRest(baseUrl);
 const health = await client.health();
 if (health.status !== "healthy" || health.version !== want) {
   console.log(`::error::npm smoke (ESM) FAILED: health ${JSON.stringify(health)}; expected healthy ${want}`);
   process.exit(1);
 }
-console.log(JSON.stringify({ artifact: `npm:${PKG}`, entry: "import", steps: ["import", "health"], passed: true }));
+console.log(JSON.stringify({ artifact: `npm:${PKG}`, entry: "import", steps: ["import", "version", "default_export", "health"], passed: true }));
