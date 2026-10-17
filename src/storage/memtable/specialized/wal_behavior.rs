@@ -886,6 +886,18 @@ impl WALBehaviorWrapper {
         self.inner.vector_by_id(collection_id, vector_id).await
     }
 
+    /// The unflushed MVCC winner for an id, tombstones included (distinguishes
+    /// "deleted here" from "not here").
+    pub async fn latest_version_by_id(
+        &self,
+        collection_id: &str,
+        vector_id: &str,
+    ) -> Result<Option<ProximaRecord>> {
+        self.inner
+            .latest_version_by_id(collection_id, vector_id)
+            .await
+    }
+
     /// Clear flushed entries for a specific collection
     pub async fn clear_flushed_by_collection_id(&self, collection_id: &str) -> Result<usize> {
         // Delegate to the string-based method

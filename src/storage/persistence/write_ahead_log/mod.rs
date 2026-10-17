@@ -2639,6 +2639,21 @@ impl WriteAheadLogManager {
         wal_behavior.vector_by_id(collection_id, vector_id).await
     }
 
+    /// The unflushed MVCC winner for an id, tombstones and TTL-expired versions
+    /// included. A by-id read that falls back to flushed storage on a miss must
+    /// use this, so an unflushed delete is not mistaken for "not in the WAL".
+    pub async fn search_latest_version_by_id(
+        &self,
+        collection_id: &str,
+        vector_id: &VectorId,
+    ) -> Result<Option<proximadb_records::ProximaRecord>> {
+        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
+        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        wal_behavior
+            .latest_version_by_id(collection_id, vector_id)
+            .await
+    }
+
     /// TD-WLP-8 (ADR-061 D4): current resident **working-set bytes** for a
     /// collection — the sum of its unflushed WAL/memtable batch sizes. This is
     /// the same quantity `MemtableManager::get_collection_memory_usage` reports

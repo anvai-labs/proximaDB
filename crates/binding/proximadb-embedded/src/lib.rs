@@ -2172,9 +2172,8 @@ impl EmbeddedProximaDB {
         })
     }
 
-    /// Scan one page of records via the same canonical pipeline used
-    /// by the REST `scanRecords` handler — `UnifiedHandlers::handle_record_scan_for_tenant`
-    /// then [`apply_scan_cursor`](proximadb::services::scan_cursor::apply_scan_cursor)
+    /// Scan one page of records via the same storage-inclusive
+    /// `scan_records_paginated` seam the REST `scanRecords` handler uses,
     /// for stable-sorted, cursor-paginated output. Returns
     /// `(records, next_cursor)`: the cursor is `None` when the page is
     /// short (definite end-of-scan).

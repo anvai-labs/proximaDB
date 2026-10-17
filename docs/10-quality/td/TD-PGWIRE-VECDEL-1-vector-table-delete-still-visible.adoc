@@ -5,42 +5,190 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-16). Root cause not yet located.
-| Priority | **HIGH**: violates mandate #16a (every read boundary filters dead records) on a pgwire surface. The client is told `DELETE 1`, yet the row stays visible.
-| Component | `src/services/record_store.rs` (`VectorOpsTableRecordStore`), the pgwire SELECT path for vector-profile tables (`src/network/postgres/`), `src/services/operations/vectors/legacy.rs` (`delete_records_with_tenant_context`, `validate_tenant_collection_access`)
-| Relates to | link:TD-PGWIRE-VECTENANT-1-pgwire-vector-collections-outside-tenant-boundary.adoc[TD-PGWIRE-VECTENANT-1] (pgwire vector collections are created tenant-less and resolved by name: the likely cause), link:TD-PGWIRE-COPY-1-copy-and-write-gate-tenant-parity.adoc[TD-PGWIRE-COPY-1] (`VECTOR(n)` gets a 1-dimension collection), TD-PGOLTP-1 (found by its S4a follow-up tests)
+| Status | **Resolved** (filed 2026-10-16, fixed 2026-10-17). Root cause verified; regression tests added.
+| Priority | **HIGH**: violated mandate #16a/#16d (every read boundary filters dead records; a tombstone suppresses its live copy) on a pgwire surface. The client was told `DELETE 1`, yet the row stayed visible.
+| Component | `src/services/operations/vectors/legacy.rs` (`scan_records_with_tenant_context`), reached through `src/services/record_store.rs` (`VectorOpsTableRecordStore::scan_records`)
+| Relates to | TD-PGOLTP-1 (found by its S4a follow-up tests). link:TD-PGWIRE-VECTENANT-1-pgwire-vector-collections-outside-tenant-boundary.adoc[TD-PGWIRE-VECTENANT-1] was the first hypothesis and turned out **not** to be the cause.
 |===
 
 == Observed (reproduced 2026-10-16, gate on and off)
 
 ----
-CREATE TABLE t (id VARCHAR PRIMARY KEY, embedding VECTOR(1));   -- vector-profile route
-INSERT INTO t (id, embedding) VALUES ('v1', '[1]'::vector);     -- ok, SELECT shows v1
-DELETE FROM t WHERE id = 'v1';                                  -- DELETE 1
-SELECT id FROM t;                                               -- still returns v1
+CREATE TABLE t (id VARCHAR PRIMARY KEY, label VARCHAR, embedding VECTOR(1));
+INSERT INTO t VALUES ('v1', 'a', '[1]'::vector), ('v2', 'b', '[2]'::vector);
+DELETE FROM t WHERE id = 'v1';            -- DELETE 1
+SELECT id FROM t;                         -- returned v1, v2
+SELECT COUNT(*) FROM t;                   -- returned 2
+SELECT id FROM t WHERE id = 'v1';         -- returned nothing (by-key read was correct)
+
+UPDATE t SET label = 'new' WHERE id = 'v2';
+SELECT label FROM t WHERE id <> 'zz';     -- returned the old AND the new version
 ----
 
-Executable reproduction: `tests/pgwire_atomic_commit_e2e.rs::vector_table_delete_is_invisible_to_select`
-(`#[ignore]` until fixed).
+The pattern held on the issuing connection and on a fresh one, and for query text never run
+before the DELETE, so no result or plan cache was involved.
 
-== What is known
+== Root cause
 
-* DML resolves and processes the row (`DELETE 1`).
-* The DELETE reaches `VectorOpsTableRecordStore::write_mutations` with a DML-built tombstone
-  (`valid_to_ns = Some(0)`), which goes through the insert path. That path writes the tombstone, so
-  this is a delete expressed as an insert, not a missing write.
-* An attempt to route DELETE runs to `delete_records_with_tenant_context` instead was **reverted**
-  (2026-10-16 review). It did not change the outcome; the reproduction still failed. It also
-  altered every relational DELETE on surfaces built with `DmlService::new`, which route all tables
-  through this store.
-* So the SELECT path for vector-profile rows either does not apply `is_dead`, or reads a different
-  copy than the one the tombstone lands in.
-  link:TD-PGWIRE-VECTENANT-1-pgwire-vector-collections-outside-tenant-boundary.adoc[TD-PGWIRE-VECTENANT-1]
-  (tenant-less creation, by-name resolution) suggests the latter. **Not yet verified.**
+`scan_records_with_tenant_context` (the scan behind every scan-shaped read of a vector-profile
+table) read `get_collection_vectors_raw`. That reader returns **every physical version** of every
+row in the unflushed delta: tombstones, TTL-expired rows and superseded versions. Its own doc says
+callers "must perform their own cross-source winner selection and dead filtering".
 
-== Next step
+The scan did only the second half. It applied `is_dead` to the raw versions, which dropped the
+DELETE's tombstone (the newest version) and kept the older live copy beside it, violating
+invariant #16d. An UPDATE likewise returned both versions. The by-key read was unaffected because
+it resolves the latest version first.
 
-Trace one row through the pgwire vector SELECT path. Confirm which store or collection it reads
-and whether the canonical `is_dead` predicate is applied. Then fix it at the read boundary, which
-mandate #16a requires at every surface, and remove the `#[ignore]`. If the cause is the tenant
-addressing, fold the fix into TD-PGWIRE-VECTENANT-1's design.
+The scan had used the deduplicating `get_collection_vectors` until `1a424f3c6` switched it to the
+raw reader. The scan does no cross-source merge, so it never needed the raw delta.
+
+`1a424f3c6` almost certainly edited the wrong function. The function that needs the raw delta is
+`list_unflushed_raw_with_tenant_context`, the unflushed half of the storage-inclusive
+`documents()` PAX merge. Its doc promises that tombstones are retained, so an unflushed delete can
+suppress a still-flushed live copy. Yet it read the **deduplicating** reader, which drops a
+tombstoned winner. So in production a flushed-then-deleted document came back from
+`documents()` (invariant #16d).
+
+The ratchet `flushed_live_plus_raw_memtable_delete_returns_zero_rows` did not catch this. It drives
+the merge through a test-only route that calls the memtable's raw reader directly, bypassing the
+production function.
+
+== Fix
+
+Each of the two functions now uses the reader its contract needs.
+
+*Scan.* The scan reads `get_collection_vectors` again. That reader applies the MVCC winner rule per `oid`
+(highest `record_version`, then latest batch) before dropping tombstoned or expired winners. The
+canonical `is_dead` filter stays after it as defense-in-depth.
+
+*documents() unflushed half.* `list_unflushed_raw_with_tenant_context` now reads
+`get_collection_vectors_raw`, as its doc always said. Superseded versions are mostly safe there:
+the merge keeps the freshest per id by `updated_at_ns`, and delete tombstones are stamped
+`updated_at_ns = now` in nanoseconds. One exception: REST v2 record and v3 document ingest stamp
+`updated_at_ns` truncated to milliseconds. A delete followed by a re-ingest of the same id within
+one millisecond gives the re-ingest an older stamp than the tombstone, so `documents()` hides the
+re-inserted document. That falls under TD-MEMTABLE-MVCC-1.
+
+*Storage-inclusive list.* `list_all_records_with_tenant_context` (behind REST v2 `scanRecords`,
+the embedded paginated scan, the discovery passes and the recall observer) merges the unflushed
+delta with flushed storage but read the deduplicating reader. It is the same resurrection as
+`documents()`: a record flushed and then deleted came back from `records/scan`. It now reads the
+raw delta and applies `is_dead` to the merged set.
+
+*By-id read.* `vector()` (get-by-id, and `contains()` for insert-only conflict detection) asked the
+memtable for a live record and, on `None`, fell back to a storage point lookup. The memtable
+returns `None` for both "absent" and "deleted here", so an unflushed delete fell through to the
+flushed live copy: `GET /records/{id}` returned 200 for a deleted record. The partition now exposes
+`latest_version_by_id`, the MVCC winner with tombstones included. A live winner is served from
+the WAL.
+
+A dead winner is **not** authoritative on its own. Flush retires vector batches but deliberately
+retains tombstone-only batches (tombstone persistence is still open, TD-USUB-1). So after
+delete, re-insert and flush, the memtable holds only the stale tombstone while storage holds the
+newer live copy. A dead winner therefore still consults storage, and the stored copy wins only if
+it is live **and** strictly newer (`updated_at_ns`; the WAL wins ties). An earlier draft returned
+not-found on any dead winner; review caught that it hid re-inserted records (404 for a live row,
+and `contains()` reporting it absent).
+
+*Flushed versions (lost update, pre-existing).* Storage can hold several versions of one id
+flushed together. The SST `point_lookup` returns all of them unordered (it filters
+`read_all_records` by oid), and `vector()` took the first. **Update, flush, GET returned the
+pre-update record** on `develop` (`[0.0]` instead of `[1.0]`). Delete, re-insert, flush returned
+the deleted original's data. `vector()` now takes the freshest stored version by
+(`updated_at_ns`, `record_version`) through the shared `read::freshest_version`. The storage half
+of `list_all_records_with_tenant_context` used a blind last-wins insert and now uses the same
+`is_fresher` rule. Its WAL half now resolves multiple raw WAL versions of one oid with
+`is_fresher` too (so `record_version` breaks an `updated_at_ns` tie) before the WAL winner meets
+storage, where the WAL wins ties.
+
+*Storage-only hits are dead-filtered.* On a WAL miss, `vector()` now drops a dead stored version,
+so a TTL-expired flushed id no longer satisfies `contains()` (insert-only conflict checks). GET
+already filtered it. The WAL-hit liveness check is now the canonical `is_dead`, which also treats
+a future `valid_from_ns` as not yet visible; the old memtable check looked only at `valid_to_ns`.
+
+*Also fixed by the scan change.* DML target selection (`scan_records_filtered` in `DmlService`)
+and the INSERT ... SELECT source read the same scan. A non-key `UPDATE ... WHERE label = 'a'` could
+match a deleted row and **resurrect** it. That path is now tested too.
+
+*Tenant ordering.* Winner selection now runs before the tenant filter (in the scan, the
+storage-inclusive list and `vector()`), matching the behaviour before `1a424f3c6`. A foreign tenant's newer version of the same `oid` in one collection partition
+(possible only through grants or an empty `tenant_id`) would hide this tenant's row, where the raw
+reader would have shown a stale version of it. Both are wrong in that edge case; it belongs to
+TD-TENANT-2 (retire the per-row tenant predicate).
+
+The DML side needed no change: the DELETE already wrote a correct tombstone
+(`valid_to_ns = Some(0)`). The earlier write-side attempt (routing DELETE to
+`delete_records_with_tenant_context`) was correctly reverted; it addressed a non-cause.
+
+== Regression tests
+
+In `tests/pgwire_atomic_commit_e2e.rs`:
+
+* `vector_table_delete_is_invisible_to_every_read_e2e`: full scan, non-key predicate scan, by-key
+  read and `COUNT(*)`, each on the issuing connection and on a fresh one.
+* `vector_table_update_returns_only_the_current_version_e2e`: a scan returns exactly the current
+  version of an updated row.
+* `vector_tables_keep_working_with_the_gate_on` now asserts the deleted row is gone, and that a
+  refused atomic transaction leaves the table empty.
+* The delete test also asserts that a non-key `UPDATE ... WHERE label = 'a'` affects 0 rows.
+
+The e2e tests failed before the fix with exactly the defect above (`["v1", "v2"]`,
+`["new", "old"]`).
+
+In `src/services/operations/vectors/legacy.rs` (`index_first_search_tests`), service-level tests of
+the two production functions:
+
+* `scan_hides_a_deleted_record_and_returns_one_version_per_oid`.
+* `unflushed_raw_listing_retains_the_delete_tombstone`. Before the fix it returned only
+  `[("v2", None)]`: the tombstone never reached the `documents()` merge.
+
+In `tests/v2_post_flush_search_e2e.rs`, through REST over a real flush:
+
+* `v2_scan_hides_a_record_deleted_after_flush`: insert, force-flush, delete. Then `records/scan`
+  (returned `{"gone", "keep"}` before the fix), `GET /records/gone` (returned 200 before the fix)
+  and vector search must all omit the deleted record. Vector search was already correct and is
+  kept as a guard.
+* `v2_get_returns_a_record_reinserted_after_delete_and_flush`: delete, re-insert, flush. GET must
+  be 200 with the **re-inserted** vector. On `develop` it returned the deleted original (`[0.0]`);
+  with the earlier draft of this fix, 404.
+* `v2_get_returns_the_newer_of_two_flushed_versions`: update, flush. GET must return the newer
+  vector (`develop` returned the older), and the scan must serve one version per id, the newer
+  (a guard; not shown to fail on `develop`, where the winner depended on iteration order).
+* `read::tests::freshest_version_prefers_later_update_then_higher_version` (unit, order-independent).
+* pgwire: `vector_table_reinsert_after_delete_survives_flush_e2e` (INSERT, flush, DELETE,
+  re-INSERT, flush, by-key SELECT returns the new row). A review traced that pgwire INSERT leaves
+  `updated_at_ns = 0` and predicted this would fail. It passes: instrumenting the read showed the
+  flushes happened (the in-memory winner was the tombstone) and the stored re-insert was stamped
+  newer than it. The test stays as the regression guard for the pgwire shape.
+
+Not covered by a test: the production `documents()` UDTF end to end (flush, delete, query). The
+ratchet still drives the merge through a test-only route; the service-level test covers the
+production function that fed it.
+
+The suite's server harness now anchors `storage_locations`, `metadata_url` and the WAL
+`write_buffer_directory` in its tempdir (the TD-CONV-1 pattern). Without that, the defaults are
+CWD-relative (`file://./data`), and vector-profile tables from concurrently running test servers
+shared one directory. Boot-time WAL recovery then failed intermittently with "recovery segment
+collision". That was the first-try failure seen while verifying this fix, not the fix itself.
+
+== Residual hazards (not fixed here)
+
+* `StorageEngine::exists` (`src/storage/engine.rs`) still checks the dead-filtered memtable read and
+  then SST `contains_vector`, the same fall-through pattern fixed in `vector()`. No production
+  caller was found by search; fix it, or remove it, before anything calls it.
+* The storage-inclusive merges (`documents()`, `list_all_records_with_tenant_context`) and now the
+  flushed-version choice in `vector()` order versions by `updated_at_ns`. A writer can set that to
+  an older value than the version it replaces (a client-supplied proto `updated_at` or
+  `timestamp`; DML `UPDATE ... SET timestamp = <past>`), and REST v2/v3 stamp it in milliseconds.
+  Those surfaces can then disagree with the pgwire scan, which orders by `record_version` and
+  batch time. One total order is TD-MEMTABLE-MVCC-1's fix.
+
+These tests rely on each write landing in a later millisecond than the one before. The memtable's
+MVCC winner rule is not a total order, and a delete can be lost:
+
+* deterministically, for a live row with `record_version > 0`;
+* by timing, for same-millisecond writes, where the outcome can even flip over time.
+
+Tracked in
+link:TD-MEMTABLE-MVCC-1-memtable-winner-rule-not-a-total-order.adoc[TD-MEMTABLE-MVCC-1].

@@ -187,9 +187,10 @@ The REST `/api/v2/sql` and gRPC `ExecuteQuery` DML paths still call `DmlService`
   * Fix: the probe uses the session's tenant, and a store `INSERT_CONFLICT` is mapped to the typed
     unique violation (23505) as a backstop.
   * Proven by `autocommit_statements_keep_their_tags_and_sqlstates`, which asserts `23505`.
-* **Not fixed here: DELETE on a vector-profile table reports success and leaves the row
-  visible**, with the gate on or off (a mandate #16 violation).
-  * Tracked in TD-PGWIRE-VECDEL-1, with an `#[ignore]`d executable reproduction.
+* **DELETE on a vector-profile table reported success and left the row visible**, with the gate
+  on or off (a mandate #16 violation). **Fixed 2026-10-17 in TD-PGWIRE-VECDEL-1**: the scan read
+  the raw unflushed delta (every version) without per-row winner selection, so the tombstone was
+  dropped as dead and the older live copy survived. Read-side fix; regression tests un-ignored.
   * An attempted "write-side fix" (sending DELETE runs to `delete_records_with_tenant_context`)
     was **reverted** after the fourth review. The old path already wrote a tombstone, so the change
     was unproven. Its blast radius was also every relational DELETE on `DmlService::new` surfaces,
