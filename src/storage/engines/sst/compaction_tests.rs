@@ -44,6 +44,7 @@ async fn test_compaction_task_scheduling() {
         compression_config: None,
         precision_hint: None,
         rg_layout: None,
+        vector_quant: None,
     };
 
     assert!(manager.schedule_compaction(task).await.is_ok());
@@ -70,6 +71,7 @@ async fn td_compact6_schedule_dedups_same_output_at_enqueue() {
         compression_config: None,
         precision_hint: None,
         rg_layout: None,
+        vector_quant: None,
     };
     assert!(manager.schedule_compaction(mk_task()).await.unwrap());
     // Second schedule for the same output file is deduped at enqueue (the
@@ -111,6 +113,7 @@ async fn compaction_morsel_admission_rejects_overlapping_inputs() {
         compression_config: None,
         precision_hint: None,
         rg_layout: None,
+        vector_quant: None,
     };
 
     assert!(manager.schedule_compaction(task(1)).await.unwrap());
@@ -163,6 +166,7 @@ async fn td_compact6_worker_clears_training_in_flight_after_completion() {
         compression_config: None,
         precision_hint: None,
         rg_layout: None,
+        vector_quant: None,
     };
     manager.schedule_compaction(task).await.unwrap();
 
@@ -304,6 +308,7 @@ async fn test_sst_compaction_expired_deletion_unit() -> anyhow::Result<()> {
         compression_config: None,
         precision_hint: None,
         rg_layout: None,
+        vector_quant: None,
     };
 
     // Create config and perform compaction
@@ -679,6 +684,7 @@ async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()
         compression_config: None,
         precision_hint: None,
         rg_layout: None,
+        vector_quant: None,
     };
     let stats = compaction
         .perform_compaction_enhanced(&task, &config, None, None)
@@ -840,6 +846,7 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
         compression_config: None,
         precision_hint: None,
         rg_layout: None,
+        vector_quant: None,
     };
     let assert_no_task_scratch = |root: &std::path::Path| -> anyhow::Result<()> {
         for owner in std::fs::read_dir(root)? {

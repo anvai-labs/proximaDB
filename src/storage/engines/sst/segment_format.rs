@@ -867,11 +867,13 @@ struct PaxInputTierProbe {
 /// every real deployment — the exact tier was dropped at the first compaction).
 ///
 /// Co-design (I/O round-trips): a coalesced segment declares `has_f32_tier` in
-/// its footer, so it is answered from three small ranged reads (header magic,
-/// tail, footer) instead of a whole-object GET. Legacy block-layout PAX (whose
-/// exactness is per block) and anything the ranged probe cannot classify (e.g.
-/// an encrypted object, whose ranged bytes are ciphertext) fall back to ONE
-/// whole read through the port that answers both questions. Unreadable inputs
+/// its footer, so it is answered from two small ranged reads (header prefix,
+/// footer) instead of a whole-object GET. Legacy block-layout PAX (whose
+/// exactness is per block) and anything the ranged probe cannot classify fall
+/// back to ONE whole read through the port that answers both questions. (Under
+/// local encryption the port's `EncryptedFilesystem::read_range` decrypts the
+/// whole object and slices it, so the probe sees plaintext but each ranged read
+/// costs a whole read + decrypt; TD-COMPACT-IO-1.) Unreadable inputs
 /// fail closed (no exact tier) and are logged.
 pub async fn pax_compaction_input_tiers(
     port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
@@ -906,6 +908,25 @@ pub async fn pax_compaction_input_tiers(
         f32_tier: saw_pax && all_exact,
         rerank_quant: rerank_quant.unwrap_or(VectorQuant::Sq8),
     }
+}
+
+/// [`pax_compaction_input_tiers`] for a canonical compaction that already holds
+/// the merged `records`. When no record carries an embedding (relational or
+/// document collections) neither answer is used — there is no vector column to
+/// tier or rerank — so the probe is skipped with zero I/O instead of paying a
+/// whole read per block-layout input (TD-COMPACT-IO-1).
+pub async fn pax_compaction_input_tiers_for_records(
+    port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
+    input_files: &[std::path::PathBuf],
+    records: &[ProximaRecord],
+) -> PaxCompactionInputTiers {
+    if !records.iter().any(|record| !record.embeddings.is_empty()) {
+        return PaxCompactionInputTiers {
+            f32_tier: false,
+            rerank_quant: VectorQuant::Sq8,
+        };
+    }
+    pax_compaction_input_tiers(port, input_files).await
 }
 
 async fn probe_pax_input_tiers(
@@ -953,55 +974,39 @@ async fn probe_pax_input_tiers(
 }
 
 /// Read a coalesced segment's footer index through the filesystem port with
-/// ranged reads only: `Ok(None)` when the object is not a coalesced segment
-/// (legacy block layout, encrypted ciphertext, too small), so the caller can
-/// fall back to a whole read.
+/// two ranged reads: the fixed-size header prefix (magic + the footer extent
+/// mirror, as `pax_filtered_row_allow` uses it), then the footer body. No HEAD
+/// and no tail read. `Ok(None)` when the object is not a coalesced segment
+/// (legacy block layout, too small), so the caller falls back to a whole read.
 async fn read_coalesced_segment_footer(
     port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
     url: &str,
 ) -> anyhow::Result<Option<proximadb_storage_common::segment_layout::SegmentFooterIndex>> {
-    use proximadb_storage_common::pax_block::SEGMENT_MAGIC;
     use proximadb_storage_common::segment_layout::{
-        SEG_HEADER_MAGIC, SEG_TAIL_LEN, SegmentFooterIndex, is_coalesced_segment,
+        SEG_HEADER_PREFIX_LEN, SegmentFooterIndex, SegmentHeaderPrefix, is_coalesced_segment,
     };
     let fs = port
         .get_filesystem(url)
         .map_err(|e| anyhow::anyhow!("filesystem for {url}: {e}"))?;
-    let size = fs
-        .metadata(url)
-        .await
-        .map_err(|e| anyhow::anyhow!("metadata for {url}: {e}"))?
-        .size;
-    let header_len = SEG_HEADER_MAGIC.len() as u64;
-    let tail_len = SEG_TAIL_LEN as u64;
-    if size < header_len + tail_len {
-        return Ok(None);
-    }
-    let header = fs
-        .read_range(url, 0, header_len)
+    let prefix = fs
+        .read_range(url, 0, SEG_HEADER_PREFIX_LEN as u64)
         .await
         .map_err(|e| anyhow::anyhow!("header read for {url}: {e}"))?;
-    if !is_coalesced_segment(&header) {
+    if !is_coalesced_segment(&prefix) {
         return Ok(None);
     }
-    let tail_off = size - tail_len;
-    let tail = fs
-        .read_range(url, tail_off, tail_len)
-        .await
-        .map_err(|e| anyhow::anyhow!("tail read for {url}: {e}"))?;
-    if tail.len() != SEG_TAIL_LEN || tail[8..] != SEGMENT_MAGIC[..] {
-        return Ok(None);
-    }
-    let mut footer_len_bytes = [0u8; 8];
-    footer_len_bytes.copy_from_slice(&tail[..8]);
-    let footer_len = u64::from_le_bytes(footer_len_bytes);
-    if footer_len == 0 || footer_len > tail_off.saturating_sub(header_len) {
-        anyhow::bail!("coalesced footer length {footer_len} overruns segment {url}");
+    let header = SegmentHeaderPrefix::parse(&prefix)
+        .map_err(|e| anyhow::anyhow!("header parse for {url}: {e}"))?;
+    if header.footer_len == 0 {
+        anyhow::bail!("coalesced segment {url} declares an empty footer");
     }
     let footer = fs
-        .read_range(url, tail_off - footer_len, footer_len)
+        .read_range(url, header.footer_off, header.footer_len)
         .await
         .map_err(|e| anyhow::anyhow!("footer read for {url}: {e}"))?;
+    if footer.len() as u64 != header.footer_len {
+        anyhow::bail!("coalesced footer extent overruns segment {url}");
+    }
     SegmentFooterIndex::parse(&footer)
         .map(Some)
         .map_err(|e| anyhow::anyhow!("footer parse for {url}: {e}"))
@@ -7177,8 +7182,8 @@ mod tests {
         );
         assert_eq!(
             store.ranged_reads.load(Ordering::SeqCst),
-            3,
-            "header magic + tail + footer"
+            2,
+            "header prefix + footer"
         );
 
         let tiers = pax_compaction_input_tiers(
@@ -7200,6 +7205,32 @@ mod tests {
             1,
             "only the legacy block-layout input needs a whole read"
         );
+    }
+
+    /// TD-COMPACT-IO-1 mitigation: a compaction whose merged records carry no
+    /// embeddings (relational / document) skips the tier probe with ZERO I/O.
+    #[tokio::test]
+    async fn non_vector_compaction_skips_the_tier_probe() {
+        use std::sync::atomic::Ordering;
+        let store = std::sync::Arc::new(CountingObjectStore::default());
+        let port: std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort> =
+            std::sync::Arc::new(CountingPort(store.clone()));
+        let row = ProximaRecord {
+            oid: "row".into(),
+            ..Default::default()
+        };
+        let tiers = pax_compaction_input_tiers_for_records(
+            &port,
+            &[std::path::PathBuf::from(
+                "s3://bucket/data/t/n/c/L0_rel.pax",
+            )],
+            std::slice::from_ref(&row),
+        )
+        .await;
+        assert!(!tiers.f32_tier);
+        assert_eq!(tiers.rerank_quant, VectorQuant::Sq8);
+        assert_eq!(store.whole_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(store.ranged_reads.load(Ordering::SeqCst), 0);
     }
 
     #[test]

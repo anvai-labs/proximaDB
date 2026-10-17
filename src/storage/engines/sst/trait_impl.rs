@@ -240,6 +240,10 @@ impl UnifiedStorageFormat for SstEngine {
                 l0_threshold,
                 precision_hint,
                 Some(super::flush::resolve_pax_rg_layout(rg_tags)),
+                // TD-READFID-2 review: same base-quant resolution as flush.
+                Some(super::flush::resolve_pax_vector_quant(
+                    params.collection_config.as_ref(),
+                )),
             )
             .await?;
 

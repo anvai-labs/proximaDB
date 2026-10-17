@@ -1,0 +1,33 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-COMPACT-IO-1: compaction's input-tier probe reads bytes compaction already holds
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Cheap mitigations are in place (see <<shipped>>); the structural fix is not done.
+| Priority | MEDIUM. This is a dimensional cost (I/O round trips and transient memory) on every vector compaction. It does not affect correctness.
+| Component | `src/storage/engines/sst/segment_format.rs` (`pax_compaction_input_tiers`, `probe_pax_input_tiers`, `read_coalesced_segment_footer`); `src/storage/engines/sst/compaction.rs` (the three PAX write sites and `read_all_records_from_file_unified`); `crates/storage/proximadb-storage-encryption/src/filesystem.rs` (`EncryptedFilesystem::read_range`).
+| Relates to | TD-READFID-2 (introduced the port-based tier probe), TD-READFID-1, TD-COMPACT-2 (compaction memory amplification), the co-design mandate (I/O round trips are the dominant cost term).
+| Found | 2026-10-16, fresh-context review of fix/readfid2-compaction-f32-tier
+|===
+
+== Observation (verified by reading the code; not measured)
+
+TD-READFID-2 made compaction read each input's vector-tier declarations (exact-f32 tier and tier-2 rerank quant) through the filesystem port. Those reads happen *in addition to* the reads compaction already does to merge the records:
+
+. **A second read of each block-layout input.** The canonical arms read every `.pax` input whole (`read_all_records_from_file_unified` -> `read_object_bytes`) to merge it, then drop the bytes. The tier probe then reads a legacy block-layout input whole a second time, because its exactness is declared per block. Coalesced inputs cost 2 small ranged reads instead (header prefix, then footer).
+. **About 2x transient memory on the whole-read path.** `pax_segment_has_exact_vector_authority(&bytes)` hands `bytes.to_vec()` to `PaxSegmentScanner::from_bytes`, so the probe briefly holds two copies of the segment.
+. **Encrypted local storage turns ranged reads into whole reads.** `EncryptedFilesystem::read_range` decrypts the whole object and slices it (`filesystem.rs`, `read_range`). The probe therefore sees plaintext and stays correct, but each coalesced input costs **2 whole read+decrypt passes** instead of 2 small ranged reads.
+. **The spill executor also probes separately.** It streams inputs through its own external-MVCC reader, so its probe is extra I/O too.
+
+[[shipped]]
+== Mitigations shipped with TD-READFID-2's review fixes
+
+* **Non-vector compactions skip the probe with zero I/O.** `pax_compaction_input_tiers_for_records` checks the merged records first. When no record carries an embedding (relational or document collections), it skips the probe, since there is nothing to tier or rerank. Test: `non_vector_compaction_skips_the_tier_probe`.
+* **The coalesced probe takes 2 ranged reads, down from 3 (plus a HEAD).** It reads the fixed-size header prefix, which mirrors the footer extent, then the footer body. This is the same pattern `pax_filtered_row_allow` uses. Test: `object_store_inputs_resolve_through_the_port_footer_first` asserts 0 whole and 2 ranged reads.
+* **One whole read answers both questions.** A block-layout input pays one fallback read for both tier and rerank, not two.
+
+== Fix direction
+
+Derive the tier declarations from the bytes the merge already reads. `read_all_records_from_file_unified` can return each input's `(exact, rerank_quant)` next to its records, computed from the same buffer with `pax_segment_has_exact_vector_authority` / `pax_segment_rerank_quant`. That leaves zero extra round trips for every layout and every backend, encrypted included. Also make the exactness predicate borrow (`PaxSegmentScanner` over `&[u8]` or `Bytes`) so it stops copying the segment. The spill executor can record the same two facts while its MVCC reader streams each input. Verify with a per-compaction io_trace (bytes and range_gets per input) before and after, per the trace-before-tune mandate.

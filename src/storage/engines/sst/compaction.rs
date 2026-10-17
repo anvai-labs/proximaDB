@@ -211,6 +211,44 @@ pub struct SstCompactionTask {
     /// value is honored at BOTH compaction executors (spill + atomic/in-place)
     /// so an opted-out collection's rewrite output stays intent-matched.
     pub rg_layout: Option<bool>,
+    /// TD-READFID-2 review: the collection's base vector quant, resolved by the
+    /// task producer with the flush resolver (`resolve_pax_vector_quant`:
+    /// kill-switch / `pax_vector_format:off` -> RawF32 > `pax_vector_quant` >
+    /// env > RaBitQ). `None` = resolve with no collection config (env > RaBitQ),
+    /// exactly what flush does without a config. Compaction used to hardcode
+    /// RaBitQ, silently re-encoding an sq8 or RawF32 collection on its first
+    /// compaction.
+    pub vector_quant: Option<proximadb_block_format::VectorQuant>,
+}
+
+impl SstCompactionTask {
+    /// Base quant and exact-tier decision for this task's PAX output, given
+    /// whether every input carries an exact f32 authority (the intersection
+    /// rule). Mirrors flush: a RawF32 base is already exact, so it never adds
+    /// the duplicate tier. A RawF32 output is only written when every input is
+    /// exact; otherwise it would relabel lossy reconstructions as authoritative
+    /// raw f32, so the output falls back to the default RaBitQ (no tier).
+    pub(crate) fn pax_output_encoding(
+        &self,
+        inputs_exact: bool,
+    ) -> (proximadb_block_format::VectorQuant, bool) {
+        use proximadb_block_format::VectorQuant;
+        let quant = self
+            .vector_quant
+            .unwrap_or_else(|| super::flush::resolve_pax_vector_quant(None));
+        if quant == VectorQuant::RawF32 {
+            if inputs_exact {
+                return (VectorQuant::RawF32, false);
+            }
+            warn!(
+                output = %self.output_file.display(),
+                "compaction: collection resolves a RawF32 base but not every input is exact; \
+                 writing RaBitQ instead of relabelling lossy vectors as raw f32"
+            );
+            return (VectorQuant::RaBitQ, false);
+        }
+        (quant, inputs_exact)
+    }
 }
 
 fn training_follow_up_threshold(
@@ -922,6 +960,7 @@ impl Compaction {
         l0_threshold: usize,
         precision_hint: Option<proximadb_records::EmbeddingScalarType>,
         rg_layout: Option<bool>,
+        vector_quant: Option<proximadb_block_format::VectorQuant>,
     ) -> Result<bool> {
         let Some(mut task) = self
             .check_compaction_needed(
@@ -935,6 +974,7 @@ impl Compaction {
             return Ok(false);
         };
         task.rg_layout = rg_layout;
+        task.vector_quant = vector_quant;
         task.collection_identity = collection_identity;
         // TD-COMPACT-6 D1: the worker clears the shared training_in_flight guard
         // for this collection on completion. It derives the collection dir from
@@ -1055,6 +1095,7 @@ impl Compaction {
                 compression_config: None, // Use server default
                 precision_hint,
                 rg_layout: None,
+                vector_quant: None,
             }));
         }
 
@@ -1607,6 +1648,20 @@ impl Compaction {
             return Err(crate::core::StorageError::SstEngine(
                 "local-spill compaction currently requires PAX-only inputs".to_string(),
             ));
+        }
+        // TD-READFID-2 review: the spill writer emits coalesced RaBitQ only. A
+        // collection whose flush resolves another base quant (sq8, or RawF32 via
+        // `pax_vector_format:off`) must not be silently re-encoded as RaBitQ, so
+        // decline before touching any input; the inputs stay authoritative.
+        let resolved_quant = task
+            .vector_quant
+            .unwrap_or_else(|| super::flush::resolve_pax_vector_quant(None));
+        if resolved_quant != proximadb_block_format::VectorQuant::RaBitQ {
+            return Err(crate::core::StorageError::SstEngine(format!(
+                "local-spill compaction writes coalesced RaBitQ only; this collection \
+                 resolves base quant {resolved_quant:?}, so it is declined rather than \
+                 silently re-encoded"
+            )));
         }
         let scratch_owner = self.spill_scratch_owner.as_ref().ok_or_else(|| {
             crate::core::StorageError::SstEngine(
@@ -2456,13 +2511,17 @@ impl Compaction {
                     // inputs through the filesystem port — inputs are storage
                     // URLs, which `std::fs` cannot open.
                     let crate::storage::engines::sst::segment_format::PaxCompactionInputTiers {
-                        f32_tier,
+                        f32_tier: inputs_exact,
                         rerank_quant,
-                    } = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers(
+                    } = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers_for_records(
                         &self.filesystem_port(),
                         &task.input_files,
+                        &records,
                     )
                     .await;
+                    // TD-READFID-2 review: the collection's base quant, resolved
+                    // exactly as flush resolves it (never a hardcoded RaBitQ).
+                    let (base_quant, f32_tier) = task.pax_output_encoding(inputs_exact);
                     // TD-COMPACT-2 root cause: this argument is the collection's
                     // embedding-MODALITY count, not the record count. Passing
                     // `records.len()` made the block writer allocate one embedding
@@ -2494,7 +2553,7 @@ impl Compaction {
                                 &records,
                                 &collection_id,
                                 embedding_count,
-                                proximadb_block_format::VectorQuant::RaBitQ,
+                                base_quant,
                                 rerank_quant,
                                 f32_tier,
                                 None,
@@ -2513,7 +2572,7 @@ impl Compaction {
                             &records,
                             &collection_id,
                             embedding_count,
-                            proximadb_block_format::VectorQuant::RaBitQ,
+                            base_quant,
                             rerank_quant,
                             f32_tier,
                             None,
@@ -2625,13 +2684,17 @@ impl Compaction {
                     // inputs through the filesystem port — inputs are storage
                     // URLs, which `std::fs` cannot open.
                     let crate::storage::engines::sst::segment_format::PaxCompactionInputTiers {
-                        f32_tier,
+                        f32_tier: inputs_exact,
                         rerank_quant,
-                    } = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers(
+                    } = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers_for_records(
                         &self.filesystem_port(),
                         &task.input_files,
+                        &records,
                     )
                     .await;
+                    // TD-READFID-2 review: the collection's base quant, resolved
+                    // exactly as flush resolves it (never a hardcoded RaBitQ).
+                    let (base_quant, f32_tier) = task.pax_output_encoding(inputs_exact);
                     // TD-COMPACT-2 root cause: embedding-MODALITY count, not the
                     // record count — see the atomic-path call above.
                     let embedding_count = records
@@ -2655,7 +2718,7 @@ impl Compaction {
                                 &records,
                                 &collection_id,
                                 embedding_count,
-                                proximadb_block_format::VectorQuant::RaBitQ,
+                                base_quant,
                                 rerank_quant,
                                 f32_tier,
                                 None,
@@ -2674,7 +2737,7 @@ impl Compaction {
                             &records,
                             &collection_id,
                             embedding_count,
-                            proximadb_block_format::VectorQuant::RaBitQ,
+                            base_quant,
                             rerank_quant,
                             f32_tier,
                             None,
@@ -3232,6 +3295,56 @@ mod tests;
 mod compaction_format_tests {
     use super::BlockFormat;
     use super::compaction_output_format;
+    use super::{CompactionPriority, SstCompactionTask};
+    use std::path::PathBuf;
+
+    fn quant_task(vector_quant: Option<proximadb_block_format::VectorQuant>) -> SstCompactionTask {
+        SstCompactionTask {
+            collection_object_id: 7,
+            collection_identity: crate::core::stable_id::CollectionIdentity::default(),
+            level: 0,
+            input_files: Vec::new(),
+            input_bytes: 0,
+            output_file: PathBuf::from("/tmp/out.pax"),
+            priority: CompactionPriority::Medium,
+            block_size_kb: None,
+            compression_config: None,
+            precision_hint: None,
+            rg_layout: None,
+            vector_quant,
+        }
+    }
+
+    /// TD-READFID-2 review: the PAX output encoding follows the collection's
+    /// resolved base quant, never a hardcoded RaBitQ — and a RawF32 output is
+    /// only written when every input is exact, so lossy reconstructions are
+    /// never relabelled as authoritative raw f32.
+    #[test]
+    fn pax_output_encoding_follows_the_resolved_base_quant() {
+        use proximadb_block_format::VectorQuant;
+        assert_eq!(
+            quant_task(Some(VectorQuant::Sq8)).pax_output_encoding(true),
+            (VectorQuant::Sq8, true)
+        );
+        assert_eq!(
+            quant_task(Some(VectorQuant::Sq8)).pax_output_encoding(false),
+            (VectorQuant::Sq8, false)
+        );
+        assert_eq!(
+            quant_task(Some(VectorQuant::RaBitQ)).pax_output_encoding(true),
+            (VectorQuant::RaBitQ, true)
+        );
+        // RawF32 is already exact: no duplicate tier.
+        assert_eq!(
+            quant_task(Some(VectorQuant::RawF32)).pax_output_encoding(true),
+            (VectorQuant::RawF32, false)
+        );
+        // Lossy inputs must not be relabelled exact.
+        assert_eq!(
+            quant_task(Some(VectorQuant::RawF32)).pax_output_encoding(false),
+            (VectorQuant::RaBitQ, false)
+        );
+    }
 
     /// M1-3 (ADR-049): compaction output format follows the INPUT segments' format
     /// — PAX is the only vector write format, so `.pax` inputs compact to `.pax`

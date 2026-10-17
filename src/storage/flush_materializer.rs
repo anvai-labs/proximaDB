@@ -1714,6 +1714,89 @@ mod tests {
         );
     }
 
+    /// Flush two batches with `l0_threshold:2` (plus `extra` knobs) through the
+    /// production materializer, wait for the compaction that flush enqueues, and
+    /// return the single merged segment's bytes.
+    async fn compacted_segment(collection_object_id: u64, config: CollectionConfig) -> Vec<u8> {
+        let flushed = flush_via_materializer(collection_object_id, config, 2).await;
+        let compaction = flushed
+            .engine
+            .compaction_manager()
+            .expect("sst compaction manager")
+            .clone();
+        assert!(
+            compaction
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await,
+            "compaction must quiesce"
+        );
+        flushed.only_segment()
+    }
+
+    /// TD-READFID-2 review: compaction must re-encode with the base quant flush
+    /// resolved for the collection. It used to hardcode RaBitQ, so the first
+    /// compaction silently turned an sq8 collection into RaBitQ (recall
+    /// downgrade) and a `pax_vector_format:off` collection into RaBitQ + tier.
+    #[tokio::test]
+    async fn compaction_keeps_the_sq8_base_quant() {
+        use proximadb_block_format::vparam::QUANT_SQ8;
+        let merged = compacted_segment(
+            251,
+            CollectionConfig {
+                tags: vec!["l0_threshold:2".into()],
+                pax_vector_quant: Some("sq8".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            block0_vector_quants(&merged).0,
+            Some(QUANT_SQ8),
+            "a compacted pax_vector_quant=sq8 collection must keep its SQ8 base"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_the_raw_f32_base_for_pax_vector_format_off() {
+        use crate::storage::engines::sst::segment_format::pax_segment_has_exact_vector_authority;
+        use proximadb_block_format::vparam::QUANT_RAW_F32;
+        let merged = compacted_segment(
+            252,
+            CollectionConfig {
+                tags: vec!["l0_threshold:2".into(), "pax_vector_format:off".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            !proximadb_storage_common::segment_layout::is_coalesced_segment(&merged),
+            "a RawF32 collection must not be compacted into coalesced RaBitQ"
+        );
+        assert_eq!(
+            block0_vector_quants(&merged).0,
+            Some(QUANT_RAW_F32),
+            "a compacted pax_vector_format:off collection must keep its RawF32 base"
+        );
+        assert!(pax_segment_has_exact_vector_authority(&merged));
+    }
+
+    /// Default unchanged: an untagged collection still compacts to coalesced RaBitQ.
+    #[tokio::test]
+    async fn untagged_compaction_still_writes_rabitq() {
+        let merged = compacted_segment(
+            253,
+            CollectionConfig {
+                tags: vec!["l0_threshold:2".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            proximadb_storage_common::segment_layout::is_coalesced_segment(&merged),
+            "the default compaction output is the coalesced RaBitQ layout"
+        );
+    }
+
     #[test]
     fn flush_plan_preserves_catalog_storage_identity() {
         let mut collection = Collection {
