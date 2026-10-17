@@ -142,6 +142,13 @@ pub struct BackgroundFlushContext {
     /// `(tenant, collection)` ownership. `None` when the collection is not
     /// tenant-scoped ⇒ the fence fails open.
     pub tenant_id: Option<String>,
+
+    /// The catalog collection meta this context was built from, when known.
+    /// TD-READFID-2 review: compaction resolves the output encoding (base
+    /// quant, rg layout, arming) from its tags + `pax_vector_quant`, which the
+    /// synthesized proto below cannot carry. `None` (test contexts) marks the
+    /// meta as incomplete so the SST engine defers instead of guessing.
+    pub collection_meta: Option<std::sync::Arc<crate::proto::proximadb_v1::Collection>>,
 }
 
 impl BackgroundFlushContext {
@@ -189,6 +196,11 @@ impl BackgroundFlushContext {
     /// This provides all necessary information for flush and compaction operations
     /// without requiring additional service calls
     pub fn to_collection_proto(&self) -> crate::proto::proximadb_v1::Collection {
+        // The real catalog meta, when known, is the authority (tags,
+        // `pax_vector_quant`, precision, typed identity all intact).
+        if let Some(meta) = &self.collection_meta {
+            return meta.as_ref().clone();
+        }
         use crate::proto::proximadb_v1::{
             Collection, CollectionConfig, CollectionStats, StorageAssignment,
         };
@@ -245,7 +257,15 @@ impl BackgroundFlushContext {
             .await
             .context("Failed to fetch collection from service")?
             .ok_or_else(|| anyhow!("Collection '{}' not found", collection_id))?;
+        Self::from_collection(collection_id, collection)
+    }
 
+    /// Build the context from an already-fetched catalog collection meta. The
+    /// meta itself is retained so compaction resolves from the real tags.
+    pub fn from_collection(
+        collection_id: &str,
+        collection: crate::proto::proximadb_v1::Collection,
+    ) -> Result<Self> {
         let config = collection
             .config
             .as_ref()
@@ -333,6 +353,7 @@ impl BackgroundFlushContext {
             timeout_ms: Some(300_000), // 5 minutes default
             extra_metadata: HashMap::new(),
             tenant_id,
+            collection_meta: Some(std::sync::Arc::new(collection)),
         })
     }
 
@@ -352,6 +373,7 @@ impl BackgroundFlushContext {
             timeout_ms: Some(60_000),
             extra_metadata: HashMap::new(),
             tenant_id: None,
+            collection_meta: None,
         }
     }
 

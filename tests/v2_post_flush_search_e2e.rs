@@ -582,3 +582,132 @@ async fn v2_fp32_point_read_is_byte_exact_after_flush() {
         );
     }
 }
+
+/// TD-READFID-2: the exact-f32 tier must SURVIVE compaction on the production
+/// path. Compaction inputs reach the tier predicates as `file://{abs}` URLs;
+/// before the fix the predicates `std::fs::read` those URLs, fail, and conclude
+/// "no input has the tier", so the merged segment was written lossy and an
+/// `fp32` collection re-lossified at its first compaction.
+///
+/// Drives the real trigger: five forced flushes reach the default L0 threshold
+/// (`L0_COMPACTION_THRESHOLD = 5`), the flush enqueues compaction, and the
+/// background worker merges the five tier'd segments into one. No test-only
+/// compaction entry point is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = format!(
+        "v2_fp32_cmp_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dim: usize = 8;
+    let flushes: usize = 5;
+    let per_flush: usize = 3;
+
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({
+            "name": name,
+            "dimension": dim,
+            "engine": "sst",
+            "distance_metric": "euclidean",
+            "canonical_embedding_precision": "fp32",
+        }))
+        .send()
+        .await
+        .expect("create");
+    let create_status = create.status();
+    let create_body = create.text().await.expect("create response body");
+    assert!(
+        create_status.is_success(),
+        "create: {create_status} {create_body}"
+    );
+
+    let written: Vec<Vec<f32>> = (0..flushes * per_flush)
+        .map(|i| {
+            (0..dim)
+                .map(|j| ((i * dim + j) as f32 * 0.017_291).cos() * 0.613 + j as f32 * 0.011)
+                .collect()
+        })
+        .collect();
+
+    for flush in 0..flushes {
+        let records: Vec<serde_json::Value> = (flush * per_flush..(flush + 1) * per_flush)
+            .map(|i| json!({ "id": format!("rec-{i}"), "vector": written[i] }))
+            .collect();
+        let insert = http
+            .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+            .json(&json!({ "records": records }))
+            .send()
+            .await
+            .expect("insert");
+        assert!(
+            insert.status().is_success(),
+            "insert: {} {}",
+            insert.status(),
+            insert.text().await.unwrap_or_default()
+        );
+        server.force_flush(&name).await.expect("force flush");
+    }
+
+    // Every flushed segment carries the exact tier (TD-READFID-1). Then wait
+    // for the background compaction the fifth flush enqueued to retire them.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let merged = loop {
+        let pax = server.persisted_pax_files();
+        if pax.len() == 1 {
+            break pax[0].clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "compaction never merged the {flushes} flushed segments: {pax:?}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    };
+
+    let merged_bytes = std::fs::read(&merged).expect("read merged segment");
+    let merged_is_exact =
+        proximadb::storage::engines::sst::segment_format::pax_segment_has_exact_vector_authority(
+            &merged_bytes,
+        );
+
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let mut mismatches = Vec::new();
+    for (i, want) in written.iter().enumerate() {
+        let id = format!("rec-{i}");
+        let resp = http
+            .get(format!("{base}/api/v2/collections/{name}/records/{id}"))
+            .send()
+            .await
+            .expect("get");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("get json");
+        assert!(status.is_success(), "get {id}: {status} {body}");
+        let got: Vec<f32> = body
+            .get("vector")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("get {id}: no vector in {body}"))
+            .iter()
+            .map(|x| x.as_f64().expect("numeric component") as f32)
+            .collect();
+        if bits(&got) != bits(want) {
+            mismatches.push(format!("{id}: got {got:?} want {want:?}"));
+        }
+    }
+    assert!(
+        merged_is_exact && mismatches.is_empty(),
+        "POST-COMPACTION fp32 fidelity lost (TD-READFID-2): merged segment {merged} \
+         has_exact_authority={merged_is_exact}; {} of {} records differ: {mismatches:#?}",
+        mismatches.len(),
+        written.len()
+    );
+}
