@@ -6,21 +6,124 @@
 //! matching the Layer 0 spine described by ADR-010.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use crc32fast::Hasher as Crc32Hasher;
+use lazy_static::lazy_static;
+use prometheus::{IntCounter, register_int_counter};
 use proximadb_storage_common::{CanonicalOperation, CanonicalWalEntry};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::services::record_store::TableWalAppender;
+use crate::services::writer_fence::WriterFence;
 
 const FRAME_MAGIC: &[u8; 8] = b"PXWAL001";
 const FRAME_VERSION: u16 = 1;
+/// ADR-095 D3: one frame carrying a whole transaction (`Vec<CanonicalWalEntry>`
+/// payload, one CRC). Readers expand it into ordinary entries, so replay, CDC
+/// and every `CanonicalOperation` consumer are unchanged. Binaries that predate
+/// it reject the version rather than apply part of a transaction.
+const FRAME_VERSION_GROUP: u16 = 2;
 const CODEC_MSGPACK_NAMED: u8 = 1;
 const FRAME_HEADER_LEN: usize = 8 + 2 + 1 + 1 + 8 + 4 + 4;
+
+/// Test-only fault injection for the atomic commit path (TD-PGOLTP-1 crash
+/// matrix). Read per append so a test server can arm it through its env.
+const COMMIT_FAULT_ENV: &str = "PROXIMADB_TEST_TXN_COMMIT_FAULT";
+
+fn torn_tail_counter() -> IntCounter {
+    register_int_counter!(
+        "proximadb_canonical_wal_torn_tail_truncations_total",
+        "Canonical WAL opens that truncated an unacknowledged torn tail (bytes quarantined beside the WAL)"
+    )
+    .unwrap_or_else(|_| {
+        IntCounter::new("proximadb_canonical_wal_torn_tail_truncations_total_fallback", "fallback")
+            .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
+    })
+}
+
+lazy_static! {
+    static ref TORN_TAIL_TRUNCATIONS: IntCounter = torn_tail_counter();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppendFault {
+    FailBefore,
+    AbortAfter,
+    Torn,
+    /// Write part of the frame, then fail as ENOSPC would.
+    FailMidWrite,
+    /// Write everything, then fail `sync_data`.
+    FailSync,
+}
+
+fn armed_commit_fault() -> Option<AppendFault> {
+    match std::env::var(COMMIT_FAULT_ENV).ok()?.as_str() {
+        "fail_before_append" => Some(AppendFault::FailBefore),
+        "abort_after_append" => Some(AppendFault::AbortAfter),
+        "torn_append" => Some(AppendFault::Torn),
+        "fail_mid_write" => Some(AppendFault::FailMidWrite),
+        "fail_sync" => Some(AppendFault::FailSync),
+        _ => None,
+    }
+}
+
+/// Where the bytes dropped by a torn-tail truncation are kept, for forensics.
+pub(crate) fn torn_tail_path(path: &Path, offset: u64) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    // Offset + time: a second torn tail at the same offset never overwrites the
+    // first one's evidence.
+    name.push(format!(".torn-{offset}-{nanos}"));
+    path.with_file_name(name)
+}
+
+/// An append failed after bytes may have reached the WAL and they could not be
+/// proven rolled back (or `sync_data` itself failed). The write may or may not
+/// be durable; the appender is poisoned and refuses further appends until a
+/// restart re-reads the file. Callers must report "outcome unknown" (08007),
+/// never "nothing was committed".
+#[derive(Debug)]
+pub struct WalAppendIndeterminate(pub String);
+
+impl std::fmt::Display for WalAppendIndeterminate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "canonical WAL append outcome is indeterminate: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for WalAppendIndeterminate {}
+
+/// An append was refused because an EARLIER append left the appender poisoned
+/// (see [`WalAppendIndeterminate`]). Nothing from THIS append was written, so
+/// callers report "nothing committed", not "outcome unknown".
+#[derive(Debug)]
+pub struct WalAppenderPoisoned;
+
+impl std::fmt::Display for WalAppenderPoisoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "canonical WAL appender is poisoned by an earlier indeterminate write; \
+             nothing was written; restart the server to recover",
+        )
+    }
+}
+
+impl std::error::Error for WalAppenderPoisoned {}
 
 /// Framed binary canonical WAL appender.
 ///
@@ -30,11 +133,20 @@ const FRAME_HEADER_LEN: usize = 8 + 2 + 1 + 1 + 8 + 4 + 4;
 /// Payloads currently use MessagePack named-field encoding for compact,
 /// language-readable, schema-tolerant storage. The frame header keeps codec and
 /// version explicit so later protobuf/Avro encodings can be introduced without
-/// changing the `TableWalAppender` contract.
+/// changing the `TableWalAppender` contract. Version 1 carries one entry;
+/// version 2 carries an all-or-nothing group (ADR-095).
 pub struct FramedTableWalAppender {
     path: PathBuf,
     next_sequence: AtomicU64,
     append_lock: Mutex<()>,
+    /// ADR-095 M5: per-appender, so only the shared pgwire canonical WAL opts in.
+    /// When set, a multi-operation `append_operations` is one group frame.
+    atomic_groups: AtomicBool,
+    /// Checked before every append; tripped by the writer-epoch watchdog.
+    fence: Arc<WriterFence>,
+    /// Set when an append failed in a way whose durability cannot be proven
+    /// (see [`WalAppendIndeterminate`]); every later append is refused.
+    poisoned: AtomicBool,
     /// TD-OLAP-17: per-collection high-water sequence_number, bumped atomically
     /// under `append_lock` on every append, AND seeded from the recovered entries
     /// on `open` (so read-only-after-restart tables fast-path immediately). Lets
@@ -67,6 +179,27 @@ impl FramedTableWalAppender {
 
         let recovery = recover_wal_state(&path).await?;
         if recovery.valid_len < recovery.file_len {
+            // An unacknowledged torn tail (appends ack only after `sync_data`).
+            // Keep the dropped bytes beside the WAL before truncating, so a
+            // truncation is never silent.
+            // Best effort: a torn tail is most likely right when the disk is
+            // full, and failing to keep forensics must not block recovery.
+            let quarantine = torn_tail_path(&path, recovery.valid_len);
+            if let Err(err) = write_synced(&quarantine, &recovery.tail).await {
+                tracing::warn!(
+                    quarantine = %quarantine.display(),
+                    error = %err,
+                    "canonical WAL: could not keep the torn tail for forensics; truncating anyway"
+                );
+            }
+            TORN_TAIL_TRUNCATIONS.inc();
+            tracing::warn!(
+                wal = %path.display(),
+                valid_len = recovery.valid_len,
+                dropped_bytes = recovery.file_len - recovery.valid_len,
+                quarantine = %quarantine.display(),
+                "canonical WAL: truncating unacknowledged torn tail"
+            );
             truncate_wal(&path, recovery.valid_len).await?;
         }
 
@@ -74,8 +207,174 @@ impl FramedTableWalAppender {
             path,
             next_sequence: AtomicU64::new(recovery.last_sequence),
             append_lock: Mutex::new(()),
+            atomic_groups: AtomicBool::new(false),
+            fence: WriterFence::global(),
+            poisoned: AtomicBool::new(false),
             collection_max: parking_lot::Mutex::new(recovery.collection_max),
         })
+    }
+
+    /// Make every multi-operation `append_operations` a single all-or-nothing
+    /// group frame (ADR-095; `[oltp] atomic_commit`). Set only on the shared
+    /// pgwire canonical WAL.
+    pub fn enable_atomic_groups(&self) {
+        self.atomic_groups.store(true, Ordering::SeqCst);
+    }
+
+    /// Replace the writer fence (tests inject their own; production uses the
+    /// process-wide one).
+    pub fn with_writer_fence(mut self, fence: Arc<WriterFence>) -> Self {
+        self.fence = fence;
+        self
+    }
+
+    /// Assign sequences, encode, write, `sync_data`, then publish the new
+    /// sequence floor and per-collection high-water marks. `group` writes one
+    /// version-2 frame; otherwise one version-1 frame per entry. Fault hooks run
+    /// only on the atomic path.
+    async fn append_entries(
+        &self,
+        operations: Vec<(CanonicalOperation, Option<String>)>,
+        group: bool,
+        fault_hooks: bool,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _guard = self.append_lock.lock().await;
+        // Checked under the append lock so no write races past a tripped fence.
+        self.fence.ensure_owner()?;
+        if self.poisoned.load(Ordering::SeqCst) {
+            bail!(WalAppenderPoisoned);
+        }
+        // Test seams only exist in debug builds: a release server can never be
+        // aborted through an environment variable.
+        let fault = if fault_hooks && cfg!(debug_assertions) {
+            armed_commit_fault()
+        } else {
+            None
+        };
+        if fault == Some(AppendFault::FailBefore) {
+            bail!("injected fault: {COMMIT_FAULT_ENV}=fail_before_append");
+        }
+
+        let base_sequence = self.next_sequence.load(Ordering::SeqCst);
+        let entries: Vec<CanonicalWalEntry> = operations
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (operation, tenant_id))| {
+                CanonicalWalEntry::new(base_sequence + offset as u64 + 1, operation, tenant_id)
+            })
+            .collect();
+
+        let mut frames = Vec::new();
+        if group {
+            encode_group_frame(&entries, &mut frames)
+                .context("encoding canonical WAL group frame")?;
+        } else {
+            for entry in &entries {
+                encode_frame(entry, &mut frames).context("encoding canonical WAL frame")?;
+            }
+        }
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .with_context(|| format!("opening canonical WAL {}", self.path.display()))?;
+
+        let write_len = if matches!(fault, Some(AppendFault::Torn | AppendFault::FailMidWrite)) {
+            frames.len() / 2
+        } else {
+            frames.len()
+        };
+        let pre_len = file
+            .metadata()
+            .await
+            .with_context(|| format!("sizing canonical WAL {}", self.path.display()))?
+            .len();
+        let written = async {
+            file.write_all(&frames[..write_len])
+                .await
+                .with_context(|| format!("writing canonical WAL {}", self.path.display()))?;
+            file.flush()
+                .await
+                .with_context(|| format!("flushing canonical WAL {}", self.path.display()))?;
+            if fault == Some(AppendFault::FailMidWrite) {
+                bail!("injected fault: write failed after a partial frame (ENOSPC)");
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        // (error, failed_at_sync): which stage failed decides whether a
+        // rollback can make the outcome determinate.
+        let failure = match written {
+            Err(err) => Some((err, false)),
+            Ok(()) if fault == Some(AppendFault::FailSync) => {
+                Some((anyhow!("injected fault: sync_data failed"), true))
+            }
+            Ok(()) => match file.sync_data().await {
+                Ok(()) => None,
+                Err(err) => Some((
+                    anyhow::Error::new(err)
+                        .context(format!("syncing canonical WAL {}", self.path.display())),
+                    true,
+                )),
+            },
+        };
+        if let Some((err, failed_at_sync)) = failure {
+            // Bytes may have reached the file. Roll the file back to its
+            // pre-append length (still under the append lock) so a partial frame
+            // can never sit in front of later, acknowledged frames. A failed
+            // `sync_data` is treated as indeterminate even after a rollback:
+            // after an fsync error the kernel's page state is not trustworthy.
+            let rolled_back = async {
+                file.set_len(pre_len).await?;
+                file.sync_data().await
+            }
+            .await;
+            if rolled_back.is_err() || failed_at_sync {
+                self.poisoned.store(true, Ordering::SeqCst);
+                tracing::error!(
+                    wal = %self.path.display(),
+                    error = %format!("{err:#}"),
+                    rollback = ?rolled_back.err(),
+                    "canonical WAL append failed indeterminately; appender poisoned"
+                );
+                bail!(WalAppendIndeterminate(format!("{err:#}")));
+            }
+            return Err(
+                err.context("canonical WAL append failed and was rolled back; nothing was written")
+            );
+        }
+        if matches!(fault, Some(AppendFault::Torn | AppendFault::AbortAfter)) {
+            tracing::error!(fault = ?fault, "{COMMIT_FAULT_ENV}: aborting the process (test crash point)");
+            std::process::abort();
+        }
+
+        self.next_sequence
+            .store(base_sequence + entries.len() as u64, Ordering::SeqCst);
+
+        // TD-OLAP-17: bump the per-collection high-water so `read_changes_since`
+        // can skip the O(WAL) scan for collections that haven't advanced past a
+        // reader's `since_lsn`. Still under `append_lock` (held above) and after
+        // `sync_data`, so a reader that observes this high-water is guaranteed the
+        // entry is durable.
+        {
+            let mut maxes = self.collection_max.lock();
+            for entry in &entries {
+                if let Some(c) = collection_id_of(&entry.operation) {
+                    let cur = maxes.entry(c.to_string()).or_insert(0);
+                    if entry.sequence_number > *cur {
+                        *cur = entry.sequence_number;
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
     }
 
     /// Path backing this WAL appender.
@@ -134,68 +433,22 @@ impl TableWalAppender for FramedTableWalAppender {
         operations: Vec<CanonicalOperation>,
         tenant_id: Option<String>,
     ) -> Result<Vec<CanonicalWalEntry>> {
-        if operations.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let _guard = self.append_lock.lock().await;
-        let base_sequence = self.next_sequence.load(Ordering::SeqCst);
-
-        let entries: Vec<CanonicalWalEntry> = operations
+        let group = operations.len() > 1 && self.atomic_groups.load(Ordering::SeqCst);
+        let operations = operations
             .into_iter()
-            .enumerate()
-            .map(|(offset, operation)| {
-                CanonicalWalEntry::new(
-                    base_sequence + offset as u64 + 1,
-                    operation,
-                    tenant_id.clone(),
-                )
-            })
+            .map(|operation| (operation, tenant_id.clone()))
             .collect();
+        self.append_entries(operations, group, false).await
+    }
 
-        let mut frames = Vec::new();
-        for entry in &entries {
-            encode_frame(entry, &mut frames).context("encoding canonical WAL frame")?;
-        }
-
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await
-            .with_context(|| format!("opening canonical WAL {}", self.path.display()))?;
-
-        file.write_all(&frames)
-            .await
-            .with_context(|| format!("writing canonical WAL {}", self.path.display()))?;
-        file.flush()
-            .await
-            .with_context(|| format!("flushing canonical WAL {}", self.path.display()))?;
-        file.sync_data()
-            .await
-            .with_context(|| format!("syncing canonical WAL {}", self.path.display()))?;
-
-        self.next_sequence
-            .store(base_sequence + entries.len() as u64, Ordering::SeqCst);
-
-        // TD-OLAP-17: bump the per-collection high-water so `read_changes_since`
-        // can skip the O(WAL) scan for collections that haven't advanced past a
-        // reader's `since_lsn`. Still under `append_lock` (held above) and after
-        // `sync_data`, so a reader that observes this high-water is guaranteed the
-        // entry is durable.
-        {
-            let mut maxes = self.collection_max.lock();
-            for entry in &entries {
-                if let Some(c) = collection_id_of(&entry.operation) {
-                    let cur = maxes.entry(c.to_string()).or_insert(0);
-                    if entry.sequence_number > *cur {
-                        *cur = entry.sequence_number;
-                    }
-                }
-            }
-        }
-
-        Ok(entries)
+    async fn append_operations_atomic(
+        &self,
+        operations: Vec<(CanonicalOperation, Option<String>)>,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        // A single operation is already atomic as a version-1 frame; using it
+        // keeps one-row commits readable by binaries that predate groups.
+        let group = operations.len() > 1;
+        self.append_entries(operations, group, true).await
     }
 
     fn collection_max_sequence_for(&self, collection_id: &str) -> Option<u64> {
@@ -277,6 +530,43 @@ impl TableWalAppender for MemoryTableWalAppender {
         Ok(entries)
     }
 
+    /// All-or-nothing by construction (one push under the entries lock); the
+    /// lock is taken BEFORE allocating sequences so concurrent appends cannot
+    /// interleave inside a group.
+    async fn append_operations_atomic(
+        &self,
+        operations: Vec<(CanonicalOperation, Option<String>)>,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stored = self.entries.lock().await;
+        let base = self.next_sequence.load(Ordering::SeqCst);
+        let entries: Vec<CanonicalWalEntry> = operations
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (op, tenant))| {
+                CanonicalWalEntry::new(base + offset as u64 + 1, op, tenant)
+            })
+            .collect();
+        self.next_sequence
+            .store(base + entries.len() as u64, Ordering::SeqCst);
+        stored.extend(entries.clone());
+        drop(stored);
+        {
+            let mut maxes = self.collection_max.lock();
+            for entry in &entries {
+                if let Some(c) = collection_id_of(&entry.operation) {
+                    let cur = maxes.entry(c.to_string()).or_insert(0);
+                    if entry.sequence_number > *cur {
+                        *cur = entry.sequence_number;
+                    }
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     /// TD-OLAP-17: surface the in-memory entries through the trait so
     /// `read_changes_since` (the CDC feed + OLAP delta merge) works on the
     /// `opt_config = None` boot path that uses this appender. Without this
@@ -299,6 +589,8 @@ struct WalRecoveryState {
     collection_max: std::collections::HashMap<String, u64>,
     valid_len: u64,
     file_len: u64,
+    /// Bytes after `valid_len` (the torn tail), quarantined before truncation.
+    tail: Vec<u8>,
 }
 
 async fn recover_wal_state(path: &Path) -> Result<WalRecoveryState> {
@@ -310,6 +602,7 @@ async fn recover_wal_state(path: &Path) -> Result<WalRecoveryState> {
                 collection_max: std::collections::HashMap::new(),
                 valid_len: 0,
                 file_len: 0,
+                tail: Vec::new(),
             });
         }
         Err(err) => {
@@ -344,6 +637,7 @@ async fn recover_wal_state(path: &Path) -> Result<WalRecoveryState> {
         collection_max,
         valid_len: scan.valid_len as u64,
         file_len: bytes.len() as u64,
+        tail: bytes[scan.valid_len..].to_vec(),
     })
 }
 
@@ -356,6 +650,14 @@ async fn read_entries_from_path(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
         }
     };
     Ok(scan_wal_bytes(&bytes, path)?.entries)
+}
+
+/// Write `bytes` to a new file and fsync it.
+async fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    Ok(())
 }
 
 async fn truncate_wal(path: &Path, valid_len: u64) -> Result<()> {
@@ -380,15 +682,27 @@ fn scan_wal_bytes(bytes: &[u8], path: &Path) -> Result<WalScan> {
     let mut offset = 0;
 
     while offset < bytes.len() {
-        match decode_frame(&bytes[offset..]).with_context(|| {
-            format!(
-                "decoding canonical WAL frame at byte {} in {}",
-                offset,
-                path.display()
-            )
-        })? {
-            Some((entry, consumed)) => {
-                entries.push(entry);
+        let decoded = match decode_frame(&bytes[offset..]) {
+            Ok(decoded) => decoded,
+            // A zero-extended tail (the file grew but the data blocks never
+            // landed) is a torn, unacknowledged write — not corruption. Every
+            // other decode failure stays a hard error: a non-zero bad frame may
+            // be a committed frame from a newer binary or real corruption, and
+            // must never be silently dropped (ADR-095 review B2).
+            Err(_) if bytes[offset..].iter().all(|byte| *byte == 0) => break,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "decoding canonical WAL frame at byte {} in {}",
+                        offset,
+                        path.display()
+                    )
+                });
+            }
+        };
+        match decoded {
+            Some((frame_entries, consumed)) => {
+                entries.extend(frame_entries);
                 offset += consumed;
             }
             None => break,
@@ -414,6 +728,33 @@ fn encode_frame(entry: &CanonicalWalEntry, out: &mut Vec<u8>) -> Result<()> {
     out.push(CODEC_MSGPACK_NAMED);
     out.push(0);
     out.extend_from_slice(&entry.sequence_number.to_le_bytes());
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&payload_crc.to_le_bytes());
+    out.extend_from_slice(&payload);
+
+    Ok(())
+}
+
+/// Encode `entries` as ONE version-2 frame: one header, one CRC over the whole
+/// group. A crash anywhere inside it leaves an incomplete frame, which recovery
+/// drops whole — never a prefix of the group.
+fn encode_group_frame(entries: &[CanonicalWalEntry], out: &mut Vec<u8>) -> Result<()> {
+    let first = entries
+        .first()
+        .ok_or_else(|| anyhow!("canonical WAL group frame needs at least one entry"))?;
+    let payload =
+        rmp_serde::to_vec_named(entries).context("serializing canonical WAL group payload")?;
+    let payload_len: u32 = payload
+        .len()
+        .try_into()
+        .context("canonical WAL group payload exceeds u32 frame size")?;
+    let payload_crc = checksum(&payload);
+
+    out.extend_from_slice(FRAME_MAGIC);
+    out.extend_from_slice(&FRAME_VERSION_GROUP.to_le_bytes());
+    out.push(CODEC_MSGPACK_NAMED);
+    out.push(0);
+    out.extend_from_slice(&first.sequence_number.to_le_bytes());
     out.extend_from_slice(&payload_len.to_le_bytes());
     out.extend_from_slice(&payload_crc.to_le_bytes());
     out.extend_from_slice(&payload);
@@ -464,7 +805,9 @@ pub async fn rewrite_canonical_wal(path: &Path, entries: &[CanonicalWalEntry]) -
     Ok(())
 }
 
-fn decode_frame(bytes: &[u8]) -> Result<Option<(CanonicalWalEntry, usize)>> {
+/// Decode one frame. Version 1 yields one entry; version 2 yields its whole
+/// group. `Ok(None)` = an incomplete trailing frame (torn write).
+fn decode_frame(bytes: &[u8]) -> Result<Option<(Vec<CanonicalWalEntry>, usize)>> {
     if bytes.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
@@ -478,7 +821,7 @@ fn decode_frame(bytes: &[u8]) -> Result<Option<(CanonicalWalEntry, usize)>> {
     }
 
     let version = read_u16(bytes, &mut offset)?;
-    if version != FRAME_VERSION {
+    if version != FRAME_VERSION && version != FRAME_VERSION_GROUP {
         bail!("unsupported canonical WAL frame version {version}");
     }
 
@@ -508,6 +851,25 @@ fn decode_frame(bytes: &[u8]) -> Result<Option<(CanonicalWalEntry, usize)>> {
         bail!("canonical WAL payload checksum mismatch");
     }
 
+    if version == FRAME_VERSION_GROUP {
+        let entries: Vec<CanonicalWalEntry> =
+            rmp_serde::from_slice(payload).context("deserializing canonical WAL group payload")?;
+        if entries.is_empty() {
+            bail!("canonical WAL group frame at sequence {header_sequence} is empty");
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            let expected = header_sequence + index as u64;
+            if entry.sequence_number != expected {
+                bail!(
+                    "canonical WAL group frame sequences are not contiguous: expected {}, found {}",
+                    expected,
+                    entry.sequence_number
+                );
+            }
+        }
+        return Ok(Some((entries, frame_len)));
+    }
+
     let entry: CanonicalWalEntry =
         rmp_serde::from_slice(payload).context("deserializing canonical WAL payload")?;
     if entry.sequence_number != header_sequence {
@@ -518,7 +880,7 @@ fn decode_frame(bytes: &[u8]) -> Result<Option<(CanonicalWalEntry, usize)>> {
         );
     }
 
-    Ok(Some((entry, frame_len)))
+    Ok(Some((vec![entry], frame_len)))
 }
 
 fn checksum(payload: &[u8]) -> u32 {
@@ -575,6 +937,7 @@ mod tests {
     use super::*;
     use proximadb_records::ProximaRecord;
     use proximadb_storage_common::ProjectionDirective;
+    use std::sync::Arc;
 
     fn upsert_operation(collection_id: &str, oid: &str) -> CanonicalOperation {
         CanonicalOperation::RecordUpsert {
@@ -633,12 +996,366 @@ mod tests {
 
         let mut offset = 0;
         let mut decoded_entries = Vec::new();
-        while let Some((entry, consumed)) = decode_frame(&bytes[offset..])? {
-            decoded_entries.push(entry);
+        while let Some((entries, consumed)) = decode_frame(&bytes[offset..])? {
+            decoded_entries.extend(entries);
             offset += consumed;
         }
         assert_eq!(decoded_entries.len(), 3);
 
+        Ok(())
+    }
+
+    /// Frame versions of every frame in a WAL file, in order.
+    fn frame_versions(bytes: &[u8]) -> Result<Vec<u16>> {
+        let mut offset = 0;
+        let mut versions = Vec::new();
+        while let Some((_, consumed)) = decode_frame(&bytes[offset..])? {
+            let mut cursor = offset + FRAME_MAGIC.len();
+            versions.push(read_u16(bytes, &mut cursor)?);
+            offset += consumed;
+        }
+        Ok(versions)
+    }
+
+    fn tenant_op(
+        collection_id: &str,
+        oid: &str,
+        tenant: &str,
+    ) -> (CanonicalOperation, Option<String>) {
+        (
+            upsert_operation(collection_id, oid),
+            Some(tenant.to_string()),
+        )
+    }
+
+    // ADR-095 D3 / TD-PGOLTP-1: a transaction is ONE frame. Every entry keeps its
+    // own tenant and sequence, and the file holds a single version-2 frame.
+    #[tokio::test]
+    async fn atomic_group_round_trips_as_one_frame() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("group.wal");
+
+        let appender = FramedTableWalAppender::open(&wal_path).await?;
+        let entries = appender
+            .append_operations_atomic(vec![
+                tenant_op("accounts", "a1", "t1"),
+                tenant_op("accounts", "a2", "t1"),
+                tenant_op("history", "h1", "t2"),
+            ])
+            .await?;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let bytes = tokio::fs::read(&wal_path).await?;
+        assert_eq!(frame_versions(&bytes)?, vec![FRAME_VERSION_GROUP]);
+
+        let reopened = FramedTableWalAppender::open(&wal_path).await?;
+        let recovered = reopened.read_entries().await?;
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered[2].tenant_id.as_deref(), Some("t2"));
+        assert_eq!(reopened.collection_max_sequence_for("accounts"), Some(2));
+        assert_eq!(reopened.collection_max_sequence_for("history"), Some(3));
+        Ok(())
+    }
+
+    // Mixed-read safety (mandate #8): version-1 and version-2 frames coexist and
+    // replay in sequence order.
+    #[tokio::test]
+    async fn mixed_single_and_group_frames_replay_in_order() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("mixed.wal");
+
+        let appender = FramedTableWalAppender::open(&wal_path).await?;
+        appender
+            .append_operations(vec![upsert_operation("t", "r1")], None)
+            .await?;
+        appender
+            .append_operations_atomic(vec![tenant_op("t", "r2", "x"), tenant_op("t", "r3", "x")])
+            .await?;
+        appender
+            .append_operations(vec![upsert_operation("t", "r4")], None)
+            .await?;
+
+        let bytes = tokio::fs::read(&wal_path).await?;
+        assert_eq!(
+            frame_versions(&bytes)?,
+            vec![FRAME_VERSION, FRAME_VERSION_GROUP, FRAME_VERSION]
+        );
+        let reopened = FramedTableWalAppender::open(&wal_path).await?;
+        assert_eq!(
+            reopened
+                .read_entries()
+                .await?
+                .iter()
+                .map(|e| e.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        Ok(())
+    }
+
+    // A crash mid-write of a group must lose the WHOLE group, never a prefix.
+    #[tokio::test]
+    async fn torn_group_frame_drops_the_whole_group() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("torn.wal");
+
+        let appender = FramedTableWalAppender::open(&wal_path).await?;
+        appender
+            .append_operations(vec![upsert_operation("t", "committed")], None)
+            .await?;
+        let committed_len = tokio::fs::metadata(&wal_path).await?.len();
+
+        let group: Vec<CanonicalWalEntry> = (0..3)
+            .map(|i| CanonicalWalEntry::new(2 + i, upsert_operation("t", &format!("g{i}")), None))
+            .collect();
+        let mut frame = Vec::new();
+        encode_group_frame(&group, &mut frame)?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .await?;
+        file.write_all(&frame[..frame.len() / 2]).await?;
+        file.flush().await?;
+        drop(file);
+
+        let reopened = FramedTableWalAppender::open(&wal_path).await?;
+        let recovered = reopened.read_entries().await?;
+        assert_eq!(recovered.len(), 1, "no member of a torn group may survive");
+        assert_eq!(tokio::fs::metadata(&wal_path).await?.len(), committed_len);
+        let next = reopened
+            .append_operations(vec![upsert_operation("t", "after")], None)
+            .await?;
+        assert_eq!(next[0].sequence_number, 2);
+        Ok(())
+    }
+
+    // A zero-extended tail (file size grew, data blocks never landed) is a torn
+    // write, not corruption: boot must succeed, and the dropped bytes are kept.
+    #[tokio::test]
+    async fn zero_extended_tail_is_quarantined_and_truncated() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("zeros.wal");
+
+        let appender = FramedTableWalAppender::open(&wal_path).await?;
+        appender
+            .append_operations(vec![upsert_operation("t", "r1")], None)
+            .await?;
+        let valid_len = tokio::fs::metadata(&wal_path).await?.len();
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .await?;
+        file.write_all(&[0u8; 4096]).await?;
+        file.flush().await?;
+        drop(file);
+
+        let reopened = FramedTableWalAppender::open(&wal_path).await?;
+        assert_eq!(reopened.read_entries().await?.len(), 1);
+        assert_eq!(tokio::fs::metadata(&wal_path).await?.len(), valid_len);
+        let prefix = format!("zeros.wal.torn-{valid_len}-");
+        let mut quarantined = Vec::new();
+        for entry in std::fs::read_dir(dir.path())? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                quarantined.push(std::fs::read(entry.path())?);
+            }
+        }
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].len(), 4096);
+        Ok(())
+    }
+
+    // Corruption that is NOT a torn tail stays a hard error: a bad frame followed
+    // by more data must never be silently dropped.
+    #[tokio::test]
+    async fn corrupt_frame_before_valid_data_is_still_an_error() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("midfile.wal");
+
+        let appender = FramedTableWalAppender::open(&wal_path).await?;
+        appender
+            .append_operations(vec![upsert_operation("t", "r1")], None)
+            .await?;
+        let first_len = tokio::fs::metadata(&wal_path).await?.len() as usize;
+        appender
+            .append_operations(vec![upsert_operation("t", "r2")], None)
+            .await?;
+
+        let mut bytes = tokio::fs::read(&wal_path).await?;
+        bytes[first_len - 1] ^= 0x01;
+        tokio::fs::write(&wal_path, bytes).await?;
+
+        assert!(FramedTableWalAppender::open(&wal_path).await.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn group_frame_with_non_contiguous_sequences_is_rejected() -> Result<()> {
+        let group = vec![
+            CanonicalWalEntry::new(5, upsert_operation("t", "a"), None),
+            CanonicalWalEntry::new(7, upsert_operation("t", "b"), None),
+        ];
+        let mut frame = Vec::new();
+        encode_group_frame(&group, &mut frame)?;
+        assert!(decode_frame(&frame).is_err());
+        Ok(())
+    }
+
+    // ADR-095 D2 pre-ack self-fence: once a newer writer epoch has been observed,
+    // this process must not make another write durable.
+    #[tokio::test]
+    async fn fenced_appender_refuses_every_append() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("fenced.wal");
+        let fence = Arc::new(WriterFence::default());
+
+        let appender = FramedTableWalAppender::open(&wal_path)
+            .await?
+            .with_writer_fence(fence.clone());
+        appender
+            .append_operations(vec![upsert_operation("t", "before")], None)
+            .await?;
+        fence.mark_lost();
+
+        let plain = appender
+            .append_operations(vec![upsert_operation("t", "after")], None)
+            .await;
+        let atomic = appender
+            .append_operations_atomic(vec![tenant_op("t", "after2", "x")])
+            .await;
+        for result in [plain.map(|_| ()), atomic.map(|_| ())] {
+            let err = result.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(err.contains("writer fenced"), "got: {err}");
+        }
+        assert_eq!(appender.read_entries().await?.len(), 1);
+        Ok(())
+    }
+
+    // M5: the group flag is per appender. When it is on, a plain multi-op append
+    // (one multi-row statement) is also a single frame; when off, nothing changes.
+    #[tokio::test]
+    async fn multi_op_append_uses_one_group_frame_only_when_enabled() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let off_path = dir.path().join("off.wal");
+        let on_path = dir.path().join("on.wal");
+        let ops = || vec![upsert_operation("t", "a"), upsert_operation("t", "b")];
+
+        FramedTableWalAppender::open(&off_path)
+            .await?
+            .append_operations(ops(), None)
+            .await?;
+        let on = FramedTableWalAppender::open(&on_path).await?;
+        on.enable_atomic_groups();
+        on.append_operations(ops(), Some("t1".to_string())).await?;
+
+        assert_eq!(
+            frame_versions(&tokio::fs::read(&off_path).await?)?,
+            vec![FRAME_VERSION, FRAME_VERSION]
+        );
+        assert_eq!(
+            frame_versions(&tokio::fs::read(&on_path).await?)?,
+            vec![FRAME_VERSION_GROUP]
+        );
+        assert_eq!(on.read_entries().await?[1].tenant_id.as_deref(), Some("t1"));
+        Ok(())
+    }
+
+    // Review finding 1: a write that fails part-way must not leave a partial
+    // frame in front of later, acknowledged frames. ENOSPC mid-write → the
+    // file is rolled back and the next append (and a reopen) is clean.
+    #[tokio::test]
+    async fn failed_mid_write_is_rolled_back_and_later_appends_survive() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("enospc.wal");
+        let appender = FramedTableWalAppender::open(&wal_path).await?;
+        appender
+            .append_operations(vec![upsert_operation("t", "before")], None)
+            .await?;
+        let before_len = tokio::fs::metadata(&wal_path).await?.len();
+
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var(COMMIT_FAULT_ENV, "fail_mid_write") };
+        let failed = appender
+            .append_operations_atomic(vec![tenant_op("t", "x", "a"), tenant_op("t", "y", "a")])
+            .await;
+        unsafe { std::env::remove_var(COMMIT_FAULT_ENV) };
+        let err = failed
+            .err()
+            .ok_or_else(|| anyhow!("the injected write must fail"))?;
+        assert!(
+            err.downcast_ref::<WalAppendIndeterminate>().is_none(),
+            "rolled back = determinate"
+        );
+        assert_eq!(tokio::fs::metadata(&wal_path).await?.len(), before_len);
+
+        let next = appender
+            .append_operations(vec![upsert_operation("t", "after")], None)
+            .await?;
+        assert_eq!(
+            next[0].sequence_number, 2,
+            "sequence not consumed by the failed write"
+        );
+        let reopened = FramedTableWalAppender::open(&wal_path).await?;
+        assert_eq!(reopened.read_entries().await?.len(), 2);
+        Ok(())
+    }
+
+    // fsyncgate: after a failed sync_data the outcome is unknowable → typed
+    // indeterminate error, and the appender refuses everything afterwards.
+    #[tokio::test]
+    async fn failed_sync_poisons_the_appender() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal_path = dir.path().join("fsync.wal");
+        let appender = FramedTableWalAppender::open(&wal_path).await?;
+
+        unsafe { std::env::set_var(COMMIT_FAULT_ENV, "fail_sync") };
+        let failed = appender
+            .append_operations_atomic(vec![tenant_op("t", "x", "a"), tenant_op("t", "y", "a")])
+            .await;
+        unsafe { std::env::remove_var(COMMIT_FAULT_ENV) };
+        let err = failed
+            .err()
+            .ok_or_else(|| anyhow!("the injected sync must fail"))?;
+        assert!(
+            err.downcast_ref::<WalAppendIndeterminate>().is_some(),
+            "{err:#}"
+        );
+
+        let later = appender
+            .append_operations(vec![upsert_operation("t", "later")], None)
+            .await
+            .err()
+            .ok_or_else(|| anyhow!("a poisoned appender must refuse"))?;
+        // Refused before writing: "nothing written", not "outcome unknown".
+        assert!(later.downcast_ref::<WalAppenderPoisoned>().is_some());
+        assert!(later.downcast_ref::<WalAppendIndeterminate>().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_appender_atomic_assigns_contiguous_sequences() -> Result<()> {
+        let appender = MemoryTableWalAppender::new();
+        appender
+            .append_operations(vec![upsert_operation("t", "a")], None)
+            .await?;
+        let entries = appender
+            .append_operations_atomic(vec![tenant_op("t", "b", "x"), tenant_op("u", "c", "y")])
+            .await?;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.sequence_number)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(appender.entries().await.len(), 3);
+        assert_eq!(appender.collection_max_sequence_for("u"), Some(3));
         Ok(())
     }
 

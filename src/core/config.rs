@@ -66,6 +66,75 @@ pub struct Config {
     /// sink (TD-TRACE-2 / ADR-066). Absent ⇒ the sink is off (default).
     #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
+    /// Postgres-compatible OLTP (`[oltp]`, ADR-095). Absent ⇒ every gate off.
+    #[serde(default)]
+    pub oltp: Option<OltpConfig>,
+}
+
+/// `[oltp]` (ADR-095). Default OFF (mandate #8).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OltpConfig {
+    /// pgwire COMMIT is one all-or-nothing WAL group frame (TD-PGOLTP-1).
+    /// Env override: `PROXIMADB_OLTP_ATOMIC_COMMIT`.
+    #[serde(default)]
+    pub atomic_commit: bool,
+    /// The reattachable durable volume holding all non-object-store durable
+    /// state, fenced by a writer epoch (TD-PGOLTP-2). Absent ⇒ no fencing.
+    #[serde(default)]
+    pub durable_volume: Option<DurableVolumeConfig>,
+}
+
+/// `[oltp.durable_volume]` (ADR-095 D1/D2). Env overrides:
+/// `PROXIMADB_OLTP_DURABLE_VOLUME` (root), `PROXIMADB_OLTP_DEPLOYMENT_ID`,
+/// `PROXIMADB_OLTP_CONTROL_URL`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DurableVolumeConfig {
+    /// Absolute local path of the mounted volume (EBS / Azure Disk / PD / EFS).
+    pub root: String,
+    /// Names the epoch log; every host that may own this volume uses the same
+    /// id. Required: a shared default would let two deployments that share a
+    /// `control_url` fence each other.
+    #[serde(default)]
+    pub deployment_id: Option<String>,
+    /// Object-store URL of the writer-epoch authority. Must be reachable by
+    /// every host that may own the volume and must NOT live on the volume.
+    #[serde(default)]
+    pub control_url: Option<String>,
+    /// How often the watchdog re-checks ownership.
+    #[serde(default = "default_fence_check_interval_ms")]
+    pub fence_check_interval_ms: u64,
+}
+
+fn default_fence_check_interval_ms() -> u64 {
+    1000
+}
+
+impl OltpConfig {
+    /// `[oltp.durable_volume]` with env overrides applied; `None` when neither
+    /// the TOML section nor `PROXIMADB_OLTP_DURABLE_VOLUME` is set.
+    pub fn resolve_durable_volume(config: Option<&Self>) -> Option<DurableVolumeConfig> {
+        let env = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+        let mut volume = config.and_then(|c| c.durable_volume.clone());
+        if let Some(root) = env("PROXIMADB_OLTP_DURABLE_VOLUME") {
+            volume = Some(match volume {
+                Some(existing) => DurableVolumeConfig { root, ..existing },
+                None => DurableVolumeConfig {
+                    root,
+                    deployment_id: None,
+                    control_url: None,
+                    fence_check_interval_ms: default_fence_check_interval_ms(),
+                },
+            });
+        }
+        let mut volume = volume?;
+        if let Some(id) = env("PROXIMADB_OLTP_DEPLOYMENT_ID") {
+            volume.deployment_id = Some(id);
+        }
+        if let Some(url) = env("PROXIMADB_OLTP_CONTROL_URL") {
+            volume.control_url = Some(url);
+        }
+        Some(volume)
+    }
 }
 
 pub use proximadb_config::{HardwareConfig, SksConfig, TlsConfig};
@@ -90,6 +159,7 @@ impl Default for Config {
             llm: None,
             queue: None,
             observability: None,
+            oltp: None,
         }
     }
 }

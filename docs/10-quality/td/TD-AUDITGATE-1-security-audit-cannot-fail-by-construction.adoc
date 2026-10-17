@@ -6,7 +6,7 @@
 |===
 | Field | Value
 | Status | **Done (2026-10-13).** `cargo audit -D warnings --no-yanked` now gates both `ci.yml` and `tdd.yml` against a committed, per-entry-rationale baseline (`.cargo/audit.toml`), and `scripts/check_lockfile_no_downgrade.py` fails any PR that moves a `Cargo.lock` package backwards (#2010, #2012, #2015).
-| Component | `.github/workflows/ci.yml` (`security-audit`), `.github/workflows/tdd.yml`, `.cargo/audit.toml`, `scripts/check_lockfile_no_downgrade.py`
+| Component | `.github/workflows/ci.yml` (`security-audit`), `.cargo/audit.toml`, `scripts/check_lockfile_no_downgrade.py` (the `tdd.yml` copy of the gate went with that workflow in the CI redesign, PR1; `ci.yml`'s gate is unchanged)
 | Pillar | SECURITY / CI
 | Found | 2026-10-13
 |===

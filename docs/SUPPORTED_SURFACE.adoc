@@ -154,7 +154,7 @@ query endpoint, and `/api/v2/query` is *not* SQL-over-REST. Route by language:
   through the same pipeline as pgwire (ComputeScheduler → DataFusion/Volcano);
   DDL/DML route through the same tenant-scoped `DdlService`/`DmlService` seams —
   all scoped to the `x-tenant-id` tenant (TD-064). This RPC is single-statement;
-  pgwire is also autocommit-only and rejects transaction control with SQLSTATE `0A000`.
+  multi-statement transactions are a pgwire capability (ADR-018 P2.D, see the note below).
 | Beta — programmatic SQL exists, but broader relational and cross-modal parity is not in the MVP corridor
 
 | *REST `POST /api/v2/query`* (unified query port)
@@ -521,7 +521,9 @@ must not list them under "supported", "production", or "ready":
 * Full SQL parity (ADR-018 Phase 2/3 — Postgres parity).
 * PostgreSQL-style OLTP/HTAP parity: full MVCC transactions, FK/PK/unique/check enforcement,
   native row/delta indexes, DataFusion snapshot-plus-delta reads, and distributed consistency gates
-  are tracked in TD-110 and are not part of v0.2.
+  are tracked in TD-110 and are not part of v0.2. The storage and transaction design for
+  Postgres-compatible OLTP (atomic commit record, reattachable durable WAL volume with epoch
+  fencing, LSN-snapshot MVCC, row locks) is planned in ADR-095 (TD-PGOLTP-1..10).
 * External-table execution (Iceberg / Delta / Hudi as Proxima-owned hot authority).
 * Iceberg v3 interop _write/export_ — `ALTER TABLE … MATERIALIZE` over pgwire emits a
   spec-shaped Iceberg v3 table (`v*.metadata.json` referencing an Avro manifest list + manifest)

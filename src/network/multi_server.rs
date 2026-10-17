@@ -423,6 +423,11 @@ impl MultiServer {
                     })?,
             )
         };
+        // ADR-095: one group frame per multi-row append when atomic commit is
+        // on (idempotent for the shared appender, which SharedServices armed).
+        if crate::services::oltp_gate::atomic_commit_enabled() {
+            wal_appender.enable_atomic_groups();
+        }
         // TD-064: the canonical store is per-(tenant, collection) partitioned and
         // shared across all pgwire connections. Build it once, recover its
         // partitions from the canonical WAL (routing each entry by its

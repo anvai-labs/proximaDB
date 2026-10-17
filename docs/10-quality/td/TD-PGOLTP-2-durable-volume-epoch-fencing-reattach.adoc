@@ -1,0 +1,112 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-2: Durable WAL volume root, writer-epoch fencing, and reattach recovery
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **In progress.** S1, S2 and the S4 crash/reattach tests are implemented and opt-in via `[oltp.durable_volume]`. S3 (epoch stamping in WAL/manifest) and S5 (cloud lane, RTO evidence) are open. **Priority 2** of ADR-095.
+| Severity | High. This is the core of the ask: the WAL must survive compute loss, and a replacement machine must resume without split-brain.
+| Component | `apps/proximadb-server/src/writer_epoch.rs` (boot + watchdog), `src/cluster/writer_epoch.rs` (`ObjectStoreEpochStore`), `crates/storage/proximadb-storage-ports/src/writer_epoch.rs` (`EpochStore` port), `src/services/writer_fence.rs`, `apps/proximadb-server/src/{storage_ownership,durable_locations}.rs`, `src/storage/persistence/write_ahead_log/{recovery_token,recovery_manager,disk_manager}.rs`, `crates/storage/proximadb-iceberg-engine/src/manifest*`, `crates/storage/proximadb-wal-segment-header`
+| Realizes | ADR-095 D1, D2, D6 (checkpoint + RTO measurement)
+| Relates to | ADR-063 (`RecoveryToken.epoch`), ADR-069 (`wal_local_dir`), ADR-084 D2 (orchestration is commercial), TD-WAL-5 (resolved: config-file WAL dir replay), TD-CONV-1 (CWD-relative metadata)
+|===
+
+== Premise (verified 2026-10-16)
+
+* `StorageOwnershipLease` is an advisory `flock` per local root. It excludes a second process **on
+  the same host**. It is not a fence across hosts: NFS locks are leases, and multi-attach block
+  devices have no `flock` semantics.
+* `RecoveryToken { tenant_id, epoch, sequence }` exists for **object-store WAL objects** only.
+  Local-disk WAL segments and manifest commits do not carry a writer epoch.
+* `proximadb-wal-segment-header` has `precision_epoch`. That is the quantization-policy epoch and
+  is **not** a writer epoch.
+* `root_plan(config)` already enumerates durable roles (`WalLocalDir`, `WalWriteBuffer`,
+  `Metadata`, …), which makes D1's "every durable root lies on the volume" check cheap.
+
+== Design as built (S1, S2, ownership lease) — revised after review 2026-10-16
+
+1. **Config.** `[oltp.durable_volume]` takes `root`, `deployment_id` (**required**),
+   `control_url` (required) and `fence_check_interval_ms` (default 1000). Env overrides:
+   `PROXIMADB_OLTP_DURABLE_VOLUME`, `PROXIMADB_OLTP_DEPLOYMENT_ID`, `PROXIMADB_OLTP_CONTROL_URL`.
+   Absent means no fencing and unchanged behaviour. `deployment_id` has no default, because a
+   shared default lets two deployments that share a `control_url` fence each other.
+2. **The root is never created.** It must already exist as a directory; only `_control/` inside it
+   is created. Auto-creating the root would turn an unmounted mount point into an empty database on
+   the root filesystem.
+3. **Volume check.** Every `root_plan` local root except `SstCache`, plus every local
+   `effective_durable_locations` entry, must resolve under the canonical root (the nearest
+   existing ancestor is canonicalised). Otherwise boot refuses, naming each offender.
+4. **`control_url`** must be explicit, absolute or remote, and not on the volume. A `file://`
+   URL fences across hosts only if it is a **shared mount**; boot warns. An implicit CWD-relative
+   default would give each host its own log.
+5. **Volume identity.** The newest grant in the log carries the owning volume's id
+   (`WriterClaim.volume_id`), and the volume holds `_control/volume.id`. A claimant whose volume
+   presents a different id is refused, and so is one with no id while the log names one (the
+   unmounted-volume case). An identity is only ever minted when the log has nothing to compare
+   against.
+6. **Epoch log.** `ObjectStoreEpochStore` writes create-only successor slots
+   `_control/{deployment_id}/writer/v{n}.manifest` through `ManifestCommitter::commit_fenced` with
+   `LegacyEncoding::GenerationPrefixed`; epoch = slot + 1. Create-only is atomic on `file://`,
+   `memory://`, S3/MinIO, Azure and GCS. A conflict **or** an error is reconciled by reading the
+   slot back and comparing the nonce.
+7. **Fence file.** `_control/epoch.fence` is written by byte-CAS (`compare_exchange_file`, which
+   fsyncs the file and its directory). Boot refuses if the file already holds an equal or newer
+   epoch.
+8. **Ownership lease** (`WriterFence`).
+   * The canonical WAL refuses appends unless the lease is unexpired.
+   * The lease is `2 × interval`, stamped from the **start** of the claim, and renewed only by a
+     check in which **both** the fence file and the authority were read and neither names a newer
+     epoch.
+   * Each authority call is bounded by a `1 × interval` timeout; a hung call counts as a failure.
+   * The monotonic clock keeps running across SIGSTOP and VM pauses. A paused, partitioned or
+     stalled owner therefore stops acknowledging within one lease of its last good check, without
+     having to observe anything.
+9. **Takeover grace.** A new owner (epoch > 1) waits `lease + 500 ms` before opening the WAL. Its
+   watchdog runs during the wait, so its own lease stays alive. Any previous owner's last good check
+   started before the claim, so its lease, and every acknowledgement it can make, ends inside that
+   wait.
+10. **Watchdog.** On a newer epoch, or on three failed checks in a row, it trips the fence and calls
+    `std::process::exit(75)`. That skips graceful shutdown, so the fenced writer never flushes.
+11. **Metric.** `proximadb_writer_epoch` (0 = no volume configured).
+
+**What the lease does not cover until S3.** It gates only the canonical (pgwire) WAL appender.
+Flush, compaction, spill, the vector/collection WAL and the catalog WAL are not yet fenced; S3
+(epoch stamped into frames and manifest commits, with lower epochs rejected) closes that.
+Single-attach volumes block a detached writer's I/O at the cloud layer. On multi-attach volumes
+and NFS, these other writers are the remaining exposure.
+
+**Operator note (verified by running the binary).** The default `[[storage.storage_locations]]`
+is `./data`, which is off the volume, so a durable-volume boot refuses it by name
+(`StorageLocation(0) (./data)`). Point every storage location, `metadata_url`, the WAL
+directories and `data_dir` at the volume explicitly.
+
+== Acceptance (the reattach crash matrix)
+
+Runs on the **server binary** with two separate data/cache dirs (two "hosts") sharing one
+"volume" directory and one object-store bucket (MinIO, or the local object store):
+
+[cols="3,2", options="header"]
+|===
+| Scenario | Expected
+| A acks N commits, SIGKILL, B boots on the volume | All N present; B's epoch = A's + 1
+| A partitioned (still running), B takes over | A's next manifest commit is rejected; A acks nothing after B's fence
+| A and B race to boot | Exactly one serves
+| Durable role outside the volume root | Boot refuses, naming the role
+| Torn last WAL record | Truncated; no partial transaction
+| WAL tail at the budget limit | Replay time recorded in `BENCHMARK_EVIDENCE.toml`, which is the RTO evidence
+|===
+
+A cloud lane (EBS gp3 detach/attach, plus Azure Premium SSD) runs at the qa→main tier. It reports
+measured RTO and does not gate develop PRs.
+
+== Slices
+
+. S1 ✅: volume root + boot check + `durable_locations` integration.
+. S2 ✅: epoch log + fence file + watchdog + self-fence + gauge.
+. S3: epoch stamping (segment header field, commit record, manifest CAS rejection), which closes
+  the multi-attach/NFS window above.
+. S4 ✅ (core rows): `apps/proximadb-server/tests/oltp_reattach_e2e.rs` covers the crash matrix,
+  SIGSTOP→copy volume→B boots→SIGCONT A exits 75, and the refusals. The MinIO smoke
+  (`scripts/smoke_oltp_reattach_minio.sh`) runs the same flow with the epoch log in real S3.
+. S5: cloud reattach lane + RTO evidence + operator runbook (`docs/04-operations/`).

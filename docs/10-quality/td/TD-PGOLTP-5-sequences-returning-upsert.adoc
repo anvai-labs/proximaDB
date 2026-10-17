@@ -1,0 +1,39 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-5: Sequences / SERIAL / IDENTITY, DML RETURNING, and ON CONFLICT parity
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open (filed 2026-10-16). **Priority 5** of ADR-095.
+| Severity | High (compatibility). These block pgbench initialisation, ORM migrations, and the ubiquitous `INSERT … RETURNING id`.
+| Component | `src/query/sql_frontend/parser.rs`, `src/query/ddl_dml/`, `src/services/{ddl,dml}/mod.rs`, `src/network/postgres/protocol.rs` (row description for DML results), catalog (`proximadb-catalog`)
+| Realizes | ADR-095 D8 (PG-OLTP-1 contract); ADR-018 P3.F (sequences)
+|===
+
+== Premise (verified 2026-10-16)
+
+* `grep` finds no `CREATE SEQUENCE` / `nextval` / `IDENTITY` handling in the SQL frontend or the
+  services.
+* There is no DML `RETURNING` in the frontend. `DmlStatement::Upsert { conflict_columns,
+  update_assignments }` exists, so the `ON CONFLICT` plumbing is present and needs a parity check,
+  not a rebuild.
+
+== Design
+
+* **Sequences** are catalog objects. `nextval` allocates from an in-memory range reserved in
+  blocks (for example 32) by a `SeqAdvance` entry in the commit record. After a crash, values in
+  the unused part of a block are skipped, which Postgres also permits (sequences are not
+  gap-free). `SERIAL`, `BIGSERIAL` and `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY` desugar to an
+  owned sequence plus a column default. Add `currval`, `setval`, and `pg_get_serial_sequence`.
+* **RETURNING** `* | expr-list` for INSERT/UPDATE/DELETE returns the post-image (pre-image for
+  DELETE) via a pgwire `RowDescription` + `DataRow`s, with tag `INSERT 0 n`.
+* **ON CONFLICT** (`DO NOTHING`, `DO UPDATE SET … EXCLUDED.col … WHERE`, conflict target by
+  columns or `ON CONSTRAINT`) is verified against the PG semantics on the existing `Upsert`.
+
+== Acceptance
+
+* `pgbench -i` initialises unmodified.
+* SQLAlchemy, Prisma and sqlx migrations for a schema with `SERIAL` and `IDENTITY` keys apply, and
+  `INSERT … RETURNING id` round-trips.
+* After a crash, sequences never hand out a value that was already returned.

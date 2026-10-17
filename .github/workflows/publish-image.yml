@@ -54,10 +54,65 @@ permissions:
   contents: read
 
 jobs:
+  # CI redesign PR1: a release tag re-publishes the image qa already built for
+  # the SAME git tree instead of rebuilding it. A qa
+  # push tags each variant `tree-<git tree hash>[-full]`; on a tag push this job
+  # looks those up and, when BOTH variants exist, `merge` re-tags their
+  # manifest lists and the build matrix is skipped. Any miss (the tree differs
+  # from what qa built, the qa publish was path-skipped or failed, or the
+  # registry lookup errors) falls through to the normal build -- fail-safe.
+  resolve:
+    name: Resolve qa image for this tree
+    if: ${{ github.repository == 'anvai-labs/proximaDB' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # a checkout + two registry lookups; no measured history
+    outputs:
+      tree: ${{ steps.tree.outputs.tree }}
+      reuse: ${{ steps.lookup.outputs.reuse }}
+    env:
+      IMAGE_REPO: ${{ vars.DOCKERHUB_IMAGE || 'vjsingh1984/proximadb' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute git tree hash
+        id: tree
+        run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+        if: github.ref_type == 'tag'
+
+      - name: Look up tree-<tree> images (tag push only)
+        id: lookup
+        if: github.ref_type == 'tag'
+        env:
+          TREE: ${{ steps.tree.outputs.tree }}
+        run: |
+          set -uo pipefail
+          reuse=true
+          for suffix in "" "-full"; do
+            ref="${IMAGE_REPO}:tree-${TREE}${suffix}"
+            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+              echo "found   $ref"
+            else
+              echo "missing $ref -- this tag will build its images"
+              reuse=false
+            fi
+          done
+          echo "reuse=${reuse}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: resolve
     # Only the canonical repo publishes — forks lack the credentials anyway.
-    if: ${{ github.repository == 'anvai-labs/proximaDB' }}
+    # Skipped when `resolve` found qa's images of this exact tree.
+    if: ${{ github.repository == 'anvai-labs/proximaDB' && needs.resolve.outputs.reuse != 'true' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     # Per (target,platform) cell: never cancel an in-flight push; a new run's
@@ -132,8 +187,15 @@ jobs:
 
   merge:
     name: Merge ${{ matrix.target }} manifest
-    needs: build
-    if: ${{ github.repository == 'anvai-labs/proximaDB' }}
+    needs: [resolve, build]
+    # Runs after a build, or -- with `build` skipped -- to re-tag the qa image
+    # `resolve` found. `!cancelled()` is needed because a skipped need would
+    # otherwise skip this job too.
+    if: >-
+      ${{ !cancelled() && github.repository == 'anvai-labs/proximaDB' &&
+      needs.resolve.result == 'success' &&
+      (needs.build.result == 'success' ||
+       (needs.build.result == 'skipped' && needs.resolve.outputs.reuse == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30  # manifest-list merge; no measured history, bounded conservatively
     # One merge per target → two manifest lists (runtime, runtime-full), each
@@ -148,10 +210,13 @@ jobs:
     env:
       IMAGE_REPO: ${{ vars.DOCKERHUB_IMAGE || 'vjsingh1984/proximadb' }}
       TARGET: ${{ matrix.target }}
+      TREE: ${{ needs.resolve.outputs.tree }}
+      REUSE: ${{ needs.resolve.outputs.reuse }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Download digests
+        if: needs.resolve.outputs.reuse != 'true'
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
@@ -182,7 +247,9 @@ jobs:
 
           # Tag list per trigger (same scheme as single-arch):
           #  - release tag v*  -> <version>, sha-<sha>, latest
-          #  - qa push (develop→qa promotion) -> qa, sha-<sha>  (rolling, no latest)
+          #  - qa push (develop→qa promotion) -> qa, sha-<sha>, tree-<git tree>
+          #    (rolling, no latest; `tree-` is what a release tag on the same
+          #    tree re-tags instead of rebuilding -- see the `resolve` job)
           #  - manual dispatch -> <version>, sha-<sha> [, latest if requested]
           #
           # NOTE: publish is gated to the develop→qa boundary (not every develop push) — see the
@@ -197,6 +264,8 @@ jobs:
             add "${VERSION}${SUFFIX}"; add "sha-${SHORT_SHA}${SUFFIX}"; add "latest${SUFFIX}"
           elif [ "${GITHUB_REF_NAME}" = "qa" ]; then
             add "qa${SUFFIX}"; add "sha-${SHORT_SHA}${SUFFIX}"
+            [ -n "${TREE}" ] || { echo "::error::resolve produced no tree hash"; exit 1; }
+            add "tree-${TREE}${SUFFIX}"
           else
             add "${VERSION}${SUFFIX}"; add "sha-${SHORT_SHA}${SUFFIX}"
             if [ "${{ github.event.inputs.tag_latest }}" = "true" ]; then add "latest${SUFFIX}"; fi
@@ -206,6 +275,7 @@ jobs:
           echo "Tags:${ARGS}"
 
       - name: Create multi-arch manifest
+        if: needs.resolve.outputs.reuse != 'true'
         working-directory: ${{ runner.temp }}/digests
         run: |
           set -euo pipefail
@@ -216,6 +286,19 @@ jobs:
           docker buildx imagetools create ${{ steps.tags.outputs.tag_args }} \
             $(printf "${IMAGE_REPO}@sha256:%s " *)
 
+      # Release tag on a tree qa already published: point the release tags at
+      # that manifest list (both arches) instead of a rebuild.
+      - name: Re-tag the qa image of this tree
+        if: needs.resolve.outputs.reuse == 'true'
+        run: |
+          set -euo pipefail
+          SUFFIX=""
+          if [ "${TARGET}" = "runtime-full" ]; then SUFFIX="-full"; fi
+          SOURCE="${IMAGE_REPO}:tree-${TREE}${SUFFIX}"
+          echo "Re-tagging ${SOURCE}"
+          # shellcheck disable=SC2086
+          docker buildx imagetools create ${{ steps.tags.outputs.tag_args }} "${SOURCE}"
+
       - name: Inspect + summary
         run: |
           set -euo pipefail
@@ -223,6 +306,10 @@ jobs:
           docker buildx imagetools inspect "$REF"
           {
             echo "### Published multi-arch \`${TARGET}\` image"
+            if [ "${REUSE}" = "true" ]; then
+              echo ""
+              echo "Re-tagged from \`tree-${TREE}\` (built on qa for this exact git tree); no rebuild."
+            fi
             echo ""
             echo "Platforms: linux/amd64 + linux/arm64"
             echo ""
@@ -234,10 +321,12 @@ jobs:
             echo "Pin downstream (anvaiops, ADR-0016) by the manifest-list digest from the inspect output above."
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Reclaim Docker Hub storage: delete superseded rolling `sha-*` tags, keeping
-  # only the most recent N. Never touches semver, `latest`, or `develop`.
+  # Reclaim Docker Hub storage: delete superseded rolling `sha-*` and `tree-*`
+  # tags, keeping the most recent N of EACH family (a `tree-` tag only has to
+  # outlive the qa->main promotion of its tree). Never touches semver, `latest`,
+  # `qa`, or `develop`.
   prune:
-    name: Prune old sha- tags
+    name: Prune old sha- and tree- tags
     needs: merge
     if: ${{ github.repository == 'anvai-labs/proximaDB' }}
     runs-on: ubuntu-latest
@@ -246,7 +335,7 @@ jobs:
       IMAGE_REPO: ${{ vars.DOCKERHUB_IMAGE || 'vjsingh1984/proximadb' }}
       KEEP: ${{ vars.DOCKERHUB_PRUNE_KEEP || '10' }}
     steps:
-      - name: Delete stale sha- tags via Docker Hub API
+      - name: Delete stale sha- and tree- tags via Docker Hub API
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -257,21 +346,23 @@ jobs:
             https://hub.docker.com/v2/users/login | jq -r .token)"
           [ -n "$JWT" ] && [ "$JWT" != "null" ] || { echo "Hub login failed"; exit 1; }
 
-          mapfile -t SHA_TAGS < <(
-            curl -fsSL -H "Authorization: JWT ${JWT}" \
-              "https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags?page_size=100&ordering=last_updated" \
-            | jq -r '.results[].name' | grep -E '^sha-' || true)
+          ALL_TAGS="$(curl -fsSL -H "Authorization: JWT ${JWT}" \
+            "https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags?page_size=100&ordering=last_updated" \
+            | jq -r '.results[].name')"
 
-          echo "Found ${#SHA_TAGS[@]} sha- tags; keeping newest ${KEEP}."
-          i=0
-          for tag in "${SHA_TAGS[@]}"; do
-            i=$((i+1))
-            if [ "$i" -le "${KEEP}" ]; then
-              echo "keep   ${tag}"
-              continue
-            fi
-            echo "delete ${tag}"
-            curl -fsSL -X DELETE -H "Authorization: JWT ${JWT}" \
-              "https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags/${tag}/" || \
-              echo "  (delete failed for ${tag}, continuing)"
+          for family in sha tree; do
+            mapfile -t TAGS < <(grep -E "^${family}-" <<<"${ALL_TAGS}" || true)
+            echo "Found ${#TAGS[@]} ${family}- tags; keeping newest ${KEEP}."
+            i=0
+            for tag in "${TAGS[@]}"; do
+              i=$((i+1))
+              if [ "$i" -le "${KEEP}" ]; then
+                echo "keep   ${tag}"
+                continue
+              fi
+              echo "delete ${tag}"
+              curl -fsSL -X DELETE -H "Authorization: JWT ${JWT}" \
+                "https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags/${tag}/" || \
+                echo "  (delete failed for ${tag}, continuing)"
+            done
           done

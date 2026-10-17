@@ -6,121 +6,258 @@
 [.lead]
 **Object-storage-native context serving for SQL, JSON, and vectors**
 
-ProximaDB's MVP gives AI application teams one typed record and one canonical REST API for
-metadata-aware vector retrieval. The broader document, graph, time-series, event, observability,
-and SQL-extension architecture remains the product direction, but it graduates only through the
-link:docs/00-product/MVP_TRUST_CORRIDOR.toml[machine-checked MVP trust corridor].
+ProximaDB is a Rust database that keeps **one governed record** on object storage and serves it
+through standard interfaces: PostgreSQL wire, REST, gRPC and Arrow Flight. Each workload runs on
+an engine built for it: vector search, SQL analytics, document, graph and time series today, and
+Postgres-compatible OLTP next.
+
+What you can adopt **today** is narrower than that vision, and it is stated exactly: one typed
+record and one canonical REST API for metadata-aware vector retrieval. Every other capability
+graduates only through the link:docs/00-product/MVP_TRUST_CORRIDOR.toml[machine-checked MVP trust corridor] and the support contract in link:docs/SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`].
+Where this README and that contract disagree, the contract wins.
 
 ---
 
-== Why Developers Use ProximaDB
+== The Vision: One Record, Every Workload, Object-Storage Economics
 
-* **One canonical record** for an identifier, typed JSON properties, and an embedding
-* **One supported API path** for create, batch write, get, scan, vector search, and delete
-* **Metadata filters on both scan and vector search**, proven by the same first-run smoke
-* **SST as the safe default**, backed by the canonical WAL on the single-node path
-* **Object-storage-aware internals** with measured request, byte, cache, and compute signals
+AI applications and agents need semantic retrieval, transactional state, analytics,
+relationships and history over the **same** data. Today that means five databases and the
+pipelines between them. ProximaDB's approach:
 
-=== Context Serving: The MVP Differentiator
-
-Modern vector systems increasingly include document payloads, metadata filters, hybrid search,
-and distributed operation. ProximaDB therefore does not differentiate by pretending those features
-are absent. Its wager is narrower: one typed context record, served through standard interfaces,
-with workload-specific projections and object-economics evidence behind it.
-
-|===
-| Capability | MVP trust corridor | Broader ProximaDB direction
-
-| Typed context records | *Supported* | Canonical authority for every modality
-| Metadata scan + vector search | *Supported* | Hybrid and cross-modal retrieval
-| SST single-node storage | *Supported* | Object-storage-aware projection placement
-| pgwire SQL subset | Beta | Wider relational/context query surface
-| Document, graph, observability | Beta | Rebuildable projections over canonical records
-| Distributed execution | Excluded | Evidence-gated post-MVP capability
-|===
-
-*Beta vision example — outside the MVP trust corridor:*
-[source,sql]
-----
--- Find similar products for a user, then get reviews from the document store
-SELECT u.name, v.product_id, v.score, d.review_text
-FROM users u
-JOIN LATERAL VECTOR_SEARCH('products', u.preference_vector, 10) v ON true
-JOIN LATERAL DOCUMENT_QUERY('reviews', 'product_id = "' || v.product_id || '"') d ON true;
-----
-
----
-
-== Architecture At A Glance
+* **One canonical record.** An identifier, typed properties and embeddings. Documents, graphs
+  and time series are projections of it, not copies.
+* **Standard outside, co-designed inside.** Clients speak pgwire, REST, gRPC or Arrow Flight.
+  Inside, storage format, cache, engine and network are optimised together against the cost that
+  dominates in the cloud: **object-store round trips and egress**, not CPU
+  (link:docs/12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc[co-design architecture]).
+* **The engine routes; the client does not choose.** One SQL statement goes to the engine that
+  fits it.
+* **Tenancy is structural.** Every byte lives under `data/{tenant}/{namespace}/…` and every I/O
+  boundary carries the tenant for isolation and metering.
 
 [source,mermaid]
 ----
 %%{init: {"theme": "neutral"}}%%
 flowchart TB
-  subgraph API[API Layer]
-    REST[Canonical REST v2]
-    BETA[Beta gRPC / pgwire / multimodel APIs]
+  subgraph Clients["Clients"]
+    PSQL["psql · JDBC<br/>ORMs · BI"]
+    SDK["SDKs<br/>Python · Node · Go · Rust"]
+    AGENT["Agents · MCP"]
   end
 
-  subgraph Services[Services]
-    RECORD[Typed Context Record Ops]
-    PROJ[Beta Projection Services]
+  subgraph Front["Interfaces"]
+    PGW["PostgreSQL wire :5433"]
+    REST["REST v2 :5678"]
+    GRPC["gRPC v2 :5678"]
+    FLIGHT["Arrow Flight :5678"]
   end
 
-  subgraph DataPlane[Data Plane]
-    WAL[Canonical WAL]
-    MEM[Memtables]
-    SST["SST / PAX<br/>(Supported default)"]
-    BETAENG["Graph / document / observability / alternate engines<br/>(Beta; recovery parity incomplete)"]
+  GOV["Governance<br/>tenant isolation<br/>ABAC · row policies<br/>OIDC · SCRAM<br/>metering"]
+
+  subgraph Engines["Engine per workload"]
+    VEC["Vector / ANN<br/>SST · HELIX · NOVA"]
+    OLAP["SQL analytics<br/>DataFusion"]
+    OLTP["SQL OLTP<br/>txns · row locks"]
+    DOC["Document"]
+    GRAPH["Graph · ORION"]
+    TS["Time series · events"]
   end
 
-  REST --> RECORD --> WAL --> MEM --> SST
-  BETA -.-> PROJ -.-> BETAENG
+  SUB["Storage substrate<br/>WAL (local / durable volume) → memtable →<br/>PAX / Parquet segments + manifests"]
+
+  OBJ[("Object storage<br/>S3 · Blob · GCS<br/>source of truth")]
+
+  PSQL --> PGW
+  SDK --> REST
+  SDK --> GRPC
+  AGENT --> REST
+  SDK --> FLIGHT
+  PGW & REST & GRPC & FLIGHT --> GOV
+  GOV --> VEC & OLAP & OLTP & DOC & GRAPH & TS
+  VEC & OLAP & OLTP & DOC & GRAPH & TS --> SUB
+  SUB --> OBJ
+
+  classDef supported fill:#d9f2e3,stroke:#2e7d4f,color:#123
+  classDef beta fill:#fff1cc,stroke:#a77b00,color:#321
+  classDef planned fill:#e8e8f4,stroke:#5b5b8a,color:#223,stroke-dasharray: 4 3
+  class REST,VEC,SUB,OBJ supported
+  class PGW,GRPC,OLAP,DOC,GRAPH,TS,GOV beta
+  class FLIGHT,OLTP planned
 ----
+
+_Legend: green = Supported, amber = Beta, dashed = Experimental or Planned. Tiers follow
+link:docs/SUPPORTED_SURFACE.adoc[`SUPPORTED_SURFACE.adoc`]. "SQL OLTP" is dashed because
+Postgres-compatible OLTP is planned (see <<oltp-roadmap>>), even though autocommit DML and basic
+transactions over pgwire work today at Beta._
+
+---
+
+== Where It Stands Today
+
+[cols="2,1,4", options="header"]
+|===
+| Capability | Tier | Notes
+
+| Vector CRUD + search with metadata filters (REST v2, gRPC v2)
+| *Supported*
+| SST is the default engine. Filters apply on both scan and vector search.
+
+| Hybrid retrieval (dense + BM25, RRF / weighted fusion)
+| Beta
+| Canonical REST `/api/v2/collections/{id}/search`.
+
+| PostgreSQL wire (pgwire)
+| Beta
+| ANSI SQL for psql/JDBC/ORM clients, SCRAM-SHA-256 auth, pgvector `<->` operator. `BEGIN` / `COMMIT` / `ROLLBACK` run per ADR-018 P2.D. With the opt-in `[oltp] atomic_commit`, COMMIT is all-or-nothing (one WAL group frame, ADR-095). Without it, a mid-COMMIT failure can leave earlier statements durable. In both modes, statements inside a transaction do not see its own writes until COMMIT. Savepoints and DDL inside a transaction return `0A000`. OLTP parity is planned in link:docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095].
+
+| SQL analytics (DataFusion over Parquet / Iceberg)
+| Beta
+| Parquet-backed tables route to DataFusion. TPC-H / TPC-DS over pgwire are counted ratchets.
+
+| Federated SQL functions (`VECTOR_SEARCH`, `GRAPH_QUERY`, `DOCUMENT_QUERY`, `LOGS`, `METRICS`)
+| Beta
+| Strongest on function-backed sources.
+
+| Document, graph (ORION), observability, time series / events
+| Beta
+| Canonical-record convergence and recovery parity are still in progress (TD-WAL-2).
+
+| HELIX / NOVA engines
+| Beta
+| VIPER is **deprecated** (ADR-093). Do not create new VIPER collections.
+
+| Arrow Flight as a customer transport, distributed cluster execution, SWIFT / RAPTOR
+| Experimental
+| Feature-gated; no product claims.
+
+| MLflow-compatible tracking / registry wire
+| Opt-in
+| Off unless `PROXIMADB_MLFLOW_COMPAT_ENABLE` is set.
+
+| Postgres-compatible OLTP on object storage
+| Planned
+| <<oltp-roadmap>>
+|===
+
+---
+
+== How a Query Flows
+
+[source,mermaid]
+----
+%%{init: {"theme": "neutral"}}%%
+flowchart LR
+  C["Client SQL / REST / gRPC"] --> T["Tenant context<br/>(auth → TenantContext)"]
+  T --> L["Parse · bind · lower<br/>(relational pipeline)"]
+  L --> S{"ComputeScheduler<br/>route_select"}
+  S -- "Parquet-backed scan / agg / join" --> DF["DataFusion<br/>vectorized kernels"]
+  S -- "point / short / native table" --> NV["Native Volcano<br/>PK fast path"]
+  S -- "ORDER BY embedding &lt;-&gt; q / VECTOR_SEARCH" --> AN["Vector engines<br/>SST · HELIX · NOVA"]
+  S -- "GRAPH_QUERY" --> OR["ORION graph"]
+  DF & NV & AN & OR --> R["Read = memtable ∪ segments<br/>minus dead records (is_dead)"]
+  R --> O[("Object storage<br/>ranged GETs · footer pruning · cache")]
+----
+
+The scheduler owns engine selection, and every route emits a per-query I/O trace (requests,
+bytes, cache hits). That trace is how routing costs are measured instead of guessed
+(link:docs/12-design/adr/ADR-064-query-engine-pipeline-decision-dispatch-lowering-trace.adoc[ADR-064]).
+
+== The Storage Spine
+
+[source,mermaid]
+----
+%%{init: {"theme": "neutral"}}%%
+flowchart LR
+  W["Write<br/>(INSERT / UPDATE / DELETE / upsert)"] --> WAL["WAL append<br/>fsync per sync_mode"]
+  WAL --> M["Memtable<br/>(bounded; spills)"]
+  M -- "flush: size · time · capacity budget" --> SEG["Immutable segments<br/>PAX (vector / multimodal)<br/>Parquet Layer A (relational)"]
+  SEG --> MAN["Manifest commit (CAS)<br/>Iceberg-readable"]
+  MAN -- "only after durable" --> TR["WAL truncation<br/>at unflushed minimum"]
+  SEG -- "compaction" --> SEG
+  subgraph Paths["Every key built by DrPathBuilder"]
+    P["data/{tenant}/{namespace}/{collection}/…"]
+  end
+  SEG -.-> P
+----
+
+* **Durability:** the WAL lives on local disk or a durable volume (ADR-069). Segments and
+  manifests live on object storage, and a manifest commit must be durable before WAL truncation
+  (ADR-094).
+* **Read correctness:** every read surface filters tombstoned and TTL-expired records with one
+  predicate, every write invalidates caches after commit, and `Strong` reads bypass the cache.
+* **Formats:** PAX for vector and random access, Parquet for relational scans and interop.
+  Changes are mixed-read-safe and version-marked (ADR-010, ADR-094).
+
+---
+
+[[oltp-roadmap]]
+== Roadmap: Postgres-Compatible OLTP on Object Storage
+
+*Planned — link:docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095].*
+The goal is to serve OLTP SQL with PostgreSQL semantics while data stays on object storage. Only
+the uncheckpointed WAL tail lives on a network-attached volume (EBS, Azure Disk, GCP PD/Hyperdisk,
+or EFS) that survives compute loss and **reattaches to a replacement machine**.
+
+[source,mermaid]
+----
+%%{init: {"theme": "neutral"}}%%
+flowchart LR
+  APP["Apps · ORMs · pgbench"] --> N1
+  subgraph N1["Compute (replaceable)"]
+    TX["Transactions<br/>LSN snapshots · row locks"]
+  end
+  TX -- "1 commit record,<br/>group-commit fsync" --> VOL[("Durable WAL volume<br/>EBS · Azure Disk · PD · EFS")]
+  TX -- "checkpoint" --> OBJ[("Object storage<br/>segments · manifests · WAL archive")]
+  N1 -- "boot: win writer epoch (CAS)" --> OBJ
+  VOL -. "compute lost → reattach<br/>to a new machine, replay tail" .-> N2["Compute (new)"]
+----
+
+How this compares: Aurora, Neon/Lakebase, Azure HorizonDB and AlloyDB make "the log is the
+database" with a storage fleet. Classic RDS, Cloud SQL and Azure Flexible Server fsync to an
+attached volume and recover by reattaching it. ProximaDB takes the reattach model for **only the
+WAL tail** and keeps everything else on object storage. The volume stays small and fast to move,
+and the analytics and vector engines read the same data with no CDC copy.
+
+Ranked plan (each step is default-OFF until its conformance ratchet passes):
+
+. **Atomic commit record.** A transaction is one WAL record (TD-PGOLTP-1). *Available opt-in:*
+  `[oltp] atomic_commit = true`. Cross-session group commit is next.
+. **Durable volume + writer-epoch fencing + reattach recovery.** No split-brain (TD-PGOLTP-2).
+  *Available opt-in:* `[oltp.durable_volume]` (root, `control_url`). Epoch stamping in the WAL is
+  next.
+. **PK / UNIQUE / FK on by default, inside the commit** (TD-PGOLTP-3).
+. **MVCC snapshots, read-your-writes, row locks, `FOR UPDATE`, REPEATABLE READ** (TD-PGOLTP-4).
+. **Sequences / `SERIAL` / `IDENTITY`, `RETURNING`, `ON CONFLICT`** (TD-PGOLTP-5).
+. **Conformance ratchet:** pgbench invariant, isolation anomalies, ORM matrix, reattach crash
+  matrix (TD-PGOLTP-6).
+. Secondary indexes, WAL archive for PITR and cross-AZ restore, savepoints and transactional DDL
+  (TD-PGOLTP-7..9).
 
 ---
 
 == Performance
 
-*Vector search optimised for single-node, low-latency workloads. Numbers below
-are reference points from internal benchmarks on a single arm64 macOS host —
-treat as headroom indicators, not a published SLA.*
+Only figures recorded as *measured* in the evidence ledger
+(`docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`) are quoted here. They are reference points,
+not an SLA.
 
-[.table-striped]
-[cols="1,1"]
+[cols="1,2", options="header"]
 |===
-|Metric|Reference (10M vectors, 768-d, single-node, internal arm64 macOS bench)
-
-|Recall@10|~97% (historical internal HNSW reference; not an SLA — see SUPPORTED_SURFACE)
-|Memory efficiency|~1.2 GB for 10M vectors (PQ-quantised path)
+| Metric | Measured reference
+| Recall@10 | ~97% (historical internal HNSW reference; not an SLA). HNSW M=32, SST engine, 100K vectors, single host: ledger entry `recall_at_10`
 |===
 
-[NOTE]
-====
-**v0.2 positioning**: this release is a narrow single-node cut. Hybrid retrieval,
-document/graph/observability, pgwire/federated SQL, object-economy and
-filtered-ANN routes are **Beta**. Distributed cluster execution, full SQL parity,
-external-table execution, Arrow Flight as a customer-facing transport, the
-SWIFT/RAPTOR storage engines, and conditional/filter writes are
-**Experimental** and must not be inferred from the numbers above. (The PULSAR and
-QUASAR graph engine names are *retired* — use ORION.) See
-link:docs/SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`] for the support
-contract and
-link:docs/release-notes/v0.2.0.adoc[`docs/release-notes/v0.2.0.adoc`] for the
-release split.
-====
-
-* link:docs/10-quality/benchmarks/BENCHMARKS.adoc[Detailed benchmark notes] — methodology, hardware, scaling characteristics
-* link:docs/10-quality/benchmarks/ENGINE_PERFORMANCE_BENCHMARK.adoc[Engine performance] — storage-engine benchmarks
-* link:docs/_internal/status/OBJECT_ECONOMY_BENCH_REPORT_2026_05_28.adoc[Object-economy bench report (2026-05-28)] — building-block CPU costs
-* link:scripts/run_benchmarks.sh[Run benchmarks yourself] — reproduction script
+* link:docs/10-quality/benchmarks/BENCHMARKS.adoc[Benchmark notes]: methodology, hardware, scaling
+* link:docs/10-quality/benchmarks/ENGINE_PERFORMANCE_BENCHMARK.adoc[Engine performance]
+* link:scripts/run_benchmarks.sh[Run the benchmarks yourself]
 
 ---
 
 == Quick Start
 
-The supported first-run path is Docker plus the canonical v2 smoke. It fails on any incorrect
-status, missing record, filter leak, unsupported write-contract signal, or deprecated route.
+The supported first-run path is Docker plus the canonical v2 smoke test. The smoke fails on any
+incorrect status, missing record, filter leak, unsupported write-contract signal or deprecated
+route.
 
 [source,bash]
 ----
@@ -129,8 +266,8 @@ python3 scripts/mvp_smoke.py --base-url http://127.0.0.1:5678
 ----
 
 See link:docs/01-quick-start/CONTEXT_SERVING_MVP.adoc[Context Serving MVP Quickstart] for the
-verified request sequence and production caveats. Release archives currently cover Linux x86_64
-(glibc) and Windows x86_64; the release page is authoritative for available assets.
+verified request sequence and production caveats. The release page is authoritative for available
+binary assets.
 
 === From Source (Rust)
 
@@ -138,30 +275,14 @@ verified request sequence and production caveats. Release archives currently cov
 ----
 git clone https://github.com/anvai-labs/proximaDB
 cd proximaDB
-cargo run --release --bin proximadb-server
+cargo run --release --bin proximadb-server   # REST/gRPC/Flight on 5678, pgwire on 5433
 ----
 
 ---
 
-== Core Models
+== API Examples (REST v2)
 
-=== Vectors
-Embeddings + metadata with similarity search and filtering.
-
-=== Documents
-Beta JSON/document projection; canonical-record convergence and recovery parity are incomplete.
-
-=== Graphs
-Beta nodes/edges and traversal through ORION; shared-WAL replay parity is incomplete.
-
-=== Observability
-Beta logs, metrics, and traces with modality-specific ingestion and incomplete canonical recovery.
-
----
-
-== API Examples (REST)
-
-=== Vector Search
+=== Vector Search (Supported)
 
 [source,bash]
 ----
@@ -176,7 +297,7 @@ curl -X POST http://localhost:5678/api/v2/collections/docs/search \
   }'
 ----
 
-=== Document Insert
+=== Document Insert (Beta)
 
 [source,bash]
 ----
@@ -187,7 +308,7 @@ curl -X POST http://localhost:5678/api/v2/document-collections/docs/documents \
   }'
 ----
 
-=== Graph Traverse
+=== Graph Traverse (Beta)
 
 [source,bash]
 ----
@@ -199,7 +320,7 @@ curl -X POST http://localhost:5678/api/v2/graphs/topology/traverse \
   }'
 ----
 
-=== Log Ingestion
+=== Log Ingestion (Beta)
 
 [source,bash]
 ----
@@ -212,7 +333,7 @@ curl -X POST http://localhost:5678/api/v2/observability/namespaces/prod/logs \
   }'
 ----
 
-=== Federated SQL Query (Multi-Model)
+=== Federated SQL (Beta)
 
 [source,bash]
 ----
@@ -225,155 +346,73 @@ curl -X POST http://localhost:5678/api/v2/unified/federated \
 
 ---
 
-== SQL Extensions
+== SQL Extensions (Beta)
 
-ProximaDB extends standard SQL with functions for each data model:
-
-=== Vector Search
+ProximaDB extends standard SQL with functions for each data model. All of these are Beta.
 
 [source,sql]
 ----
--- pgvector-compatible distance operator
-SELECT * FROM products ORDER BY embedding <-> '[0.1,0.2,...]'::vector LIMIT 10;
-
--- Explicit function call
+-- Vector: pgvector-compatible operator, or the explicit function
+SELECT * FROM products ORDER BY embedding <-> '[0.1,0.2,0.3]'::vector LIMIT 10;
 SELECT * FROM VECTOR_SEARCH('products', '[0.1, 0.2, 0.3]', 10);
-----
 
-=== Graph Traversal
-
-[source,sql]
-----
--- Embedded Cypher syntax
-SELECT * FROM GRAPH_QUERY('MATCH (a:Person)-[:KNOWS]->(b) RETURN b.name');
-
--- Find friends-of-friends
+-- Graph: embedded openCypher subset
 SELECT * FROM GRAPH_QUERY('MATCH (a:Person {name: "Alice"})-[:KNOWS*2]->(fof) RETURN fof');
-----
 
-=== Document Query
-
-[source,sql]
-----
--- Query with JSON path filter
+-- Document: JSON path filter
 SELECT * FROM DOCUMENT_QUERY('orders', 'status = "pending"');
-----
 
-=== Observability
-
-[source,sql]
-----
--- Query logs
+-- Observability
 SELECT * FROM LOGS('production') WHERE timestamp > now() - interval '1h';
-
--- Query metrics
 SELECT * FROM METRICS('system') WHERE metric_name = 'cpu_usage';
-----
 
-=== Cross-Model Joins
-
-[source,sql]
-----
--- Vector + Document: Similar products with reviews
+-- Cross-model: similar products with their reviews
 SELECT v.product_id, v.score, d.review_text
 FROM VECTOR_SEARCH('products', '[0.1,0.2]', 10) v
 JOIN LATERAL DOCUMENT_QUERY('reviews', 'product_id = "' || v.product_id || '"') d ON true;
-
--- Vector + Graph: Similar items filtered by category relationships
-SELECT * FROM VECTOR_SEARCH('products', '[0.1,0.2]', 100)
-WHERE id IN (
-  SELECT target FROM GRAPH_QUERY('MATCH (:Category {name:"Electronics"})-[:CONTAINS]->(p) RETURN p.id')
-);
-
--- Logs + Graph: Errors with service dependencies
-SELECT l.timestamp, l.message, g.dependency
-FROM LOGS('errors') l
-JOIN LATERAL GRAPH_QUERY('MATCH (s:Service {name: "' || l.service || '"})-[:DEPENDS_ON]->(d) RETURN d.name as dependency') g ON true;
 ----
 
 ---
 
-== Feature Status (Builder View)
-
-Statuses use the support-contract ladder from
-link:docs/SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`]:
-*Supported* / *Beta* / *Experimental* / *Planned*.
-
-|===
-| Capability | Status | Notes
-
-| Vector search + filters | Supported | SST is the supported storage engine; VIPER/HELIX/NOVA are Beta. AXIS (HNSW/IVF) indexes and metadata filters
-| Document store | Beta | WAL‑backed, JSON path queries, full‑text search; canonical record storage is the convergence path
-| Graph traversal | Beta | ORION (in‑memory CSR), WAL persistence, algorithms; some v1-only RPCs deferred
-| Observability logs | Beta | WAL‑backed, partitioned storage, 6 SIEM adapters
-| Observability metrics | Beta | Time‑series aggregation, downsampling
-| Unified multi‑model query | Beta | Cross‑model joins, parallel execution; strongest on function-backed sources
-| Postgres wire protocol | Supported | ANSI SQL for SQL clients (psql/JDBC/ORM), autocommit statements, pgvector-compatible operator; transaction control returns `0A000` and full Postgres/SQL parity remains Experimental
-| Unified port mode | Experimental | Arrow Flight / gRPC service multiplexing is an experimental customer-facing transport
-| Web UI dashboard | Beta | SQL editor, graph visualization, dark/light theme; fronts Beta surfaces
-| Python SDK | Beta | Graph analytics, AutoML, observability, security; wraps Beta surfaces
-|===
-
-Authoritative status: link:docs/SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`] — where
-this table and that contract disagree, the contract wins.
-
-NOTE: Tier detail lives in link:docs/SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`]. A
-few capabilities in the tree are *not* in the supported surface above: the SWIFT and RAPTOR
-storage engines are **experimental** (off by default behind the `experimental-engines` cargo
-feature), Arrow Flight is an **experimental** customer-facing transport, and distributed
-cluster execution is **experimental**.
-
----
-
-== Web UI Dashboard
-
-ProximaDB includes a built‑in React dashboard for data exploration:
+== Web UI Dashboard (Beta)
 
 [source,bash]
 ----
 cd ui && npm install && npm start   # Vite dev server on :3000, proxies /api to :5678
 ----
 
-Features:
-
-* **SQL Query Editor** - Monaco editor with ProximaDB syntax highlighting
-* **Graph Explorer** - Cytoscape.js visualization with multiple layouts
-* **System Metrics** - Real‑time performance monitoring
-* **Dark/Light Theme** - Toggle between themes
+SQL editor (Monaco), graph explorer (Cytoscape.js), system metrics, dark/light theme.
 
 ---
 
 == Documentation
 
-* link:docs/README.md[Documentation] - Complete documentation with infographic guides
-* link:docs/01-quick-start/[Quick Start] - Get running in 5 minutes
-* link:docs/02-guides/[Guides] - Vector search, multi-model joins, platform packages
-* link:docs/05-concepts/[Concepts] - Storage engines, graph engines, WAL architecture
-* link:docs/03-api-reference/[API Reference] - REST, gRPC, PostgreSQL wire, Python SDK
-* link:docs/04-operations/[Operations] - Deployment, monitoring, security
-* link:docs/06-internals/[Internals] - Contributing, testing, architecture decisions
-
-**v0.2.0 Release** (June 2026):
-* Platform packages: link:docs/02-guides/platform-packages.md[RPM, DEB, MSI]
-* Unified port architecture (single port 5678)
-* Multi-model query engine with cross-model joins
-
-**Key Guides**:
-* link:docs/02-guides/vector-search.md[Vector Search] - Semantic search, filtering, hybrid search
-* link:docs/02-guides/multi-model-joins.md[Multi-Model Joins] - Cross-model SQL queries
-* link:docs/05-concepts/storage-engines.adoc[Storage Engines] - SST, VIPER, HELIX, NOVA (SWIFT/RAPTOR experimental)
-* link:docs/06-internals/GRAPH_ENGINES_GUIDE.adoc[Graph Engines Guide] - ORION
+* link:docs/README.md[Documentation home]
+* link:docs/SUPPORTED_SURFACE.adoc[Support contract]: what is Supported / Beta / Experimental / Planned
+* link:docs/00-product/VISION.adoc[Vision]: the Context Database
+* link:docs/12-design/README.adoc[Architecture index] and
+  link:docs/12-design/SYSTEM_MAP_2026_05_30.adoc[system map]
+* link:docs/12-design/adr/README.adoc[Architecture decision records], including
+  link:docs/12-design/adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094 (storage substrate)] and
+  link:docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095 (Postgres-compatible OLTP)]
+* link:docs/01-quick-start/[Quick start] · link:docs/02-guides/[Guides] ·
+  link:docs/05-concepts/[Concepts] · link:docs/03-api-reference/[API reference] ·
+  link:docs/04-operations/[Operations] · link:docs/06-internals/[Internals]
+* link:CHANGELOG.md[Changelog]
 
 ---
 
 == License
 
-Apache License 2.0 - See link:LICENSE[LICENSE]
+Apache License 2.0. See link:LICENSE[LICENSE].
 
-Open-core boundary: the full single-node engine is free forever with no feature gates — see link:OPEN_CORE.md[OPEN_CORE.md] for what the commercial layer sells (operations, never features).
+Open-core boundary: the full single-node engine is free forever with no feature gates. See
+link:OPEN_CORE.md[OPEN_CORE.md] for what the commercial layer sells (operations, never features).
 
 == Branching and Releases
 
-- `develop` is the integration branch: feature branches open PRs into `develop` (CI-gated).
-- Promotion is staged: `develop` -> `qa` (staging validation) -> `main` (release); releases are tagged on `main`.
-- `qa` and `main` always reflect promoted states; nothing merges directly to either without passing through the previous stage.
+* `develop` is the integration branch. Feature branches open PRs into `develop` (CI-gated).
+* Promotion is staged: `develop` → `qa` (staging validation) → `main` (release). Releases are
+  tagged on `main`.
+* `qa` and `main` always reflect promoted states. Nothing merges directly to either without
+  passing through the previous stage.

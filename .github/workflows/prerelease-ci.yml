@@ -310,7 +310,9 @@ jobs:
           path: |
             proximadb-*.${{ matrix.archive }}
             proximadb-*.${{ matrix.archive }}.sha256
-          retention-days: 7
+          # 14, not 7: release.yml's build-binaries downloads these exact archives
+          # (CI redesign PR1) and falls back to a rebuild once they expire.
+          retention-days: 14
 
   # ============================================================================
   # BUILD PYTHON EMBEDDED WHEELS - DISABLED for v0.2.0
@@ -435,7 +437,9 @@ jobs:
         with:
           name: sdist
           path: clients/python/dist/*.tar.gz
-          retention-days: 7
+          # 14, not 7: release.yml's build-binaries downloads these exact archives
+          # (CI redesign PR1) and falls back to a rebuild once they expire.
+          retention-days: 14
 
   # ============================================================================
   # VALIDATE ARTIFACTS - Pre-release validation gate

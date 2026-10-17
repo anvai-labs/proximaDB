@@ -58,10 +58,10 @@ TIMED_WORKFLOWS = RELEASE_WORKFLOWS + (
     # caller. The bound is a property of a job, not of a workflow's tier, so the
     # list is now every workflow in the directory and `check_every_workflow_is_timed`
     # below fails if a new file is added without being named here.
-    ".github/workflows/_platform-packages.yml",
-    ".github/workflows/_shared-build.yml",
+    # (CI redesign PR1 deleted tdd.yml, capability-contract-tests.yml and the
+    # two caller-less `workflow_call` libraries _shared-build.yml and
+    # _platform-packages.yml, so they left this list with the files.)
     ".github/workflows/branch-route-guard.yml",
-    ".github/workflows/capability-contract-tests.yml",
     ".github/workflows/codeql.yml",
     ".github/workflows/docs-site.yml",
     ".github/workflows/flake-rerun.yml",
@@ -72,7 +72,6 @@ TIMED_WORKFLOWS = RELEASE_WORKFLOWS + (
     ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
     ".github/workflows/public-overflow-runner-smoke.yml",
     ".github/workflows/release-python.yml",
-    ".github/workflows/tdd.yml",
     ".github/workflows/tier-config-fingerprint.yml",
     ".github/workflows/windows-compile-ratchet.yml",
 )
@@ -687,6 +686,197 @@ def check_dockerfiles(msgs: list[str]) -> None:
         )
 
 
+PRERELEASE_GATE = "scripts/await_prerelease_ci.sh"
+# Only a building Pre-Release CI run may satisfy the gate: a push to qa also
+# triggers prerelease-ci.yml but skips every build, concluding `success` in ~15 s.
+PRERELEASE_RUN_FILTER = (
+    'select((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")'
+)
+# A live line with one of these makes a job a registry publish.
+PUBLISH_MARKERS = (
+    "pypa/gh-action-pypi-publish",
+    "cargo publish",
+    "npm publish",
+    "softprops/action-gh-release",
+)
+# TestPyPI is advisory (continue-on-error) and deliberately not gated. The
+# exemption keys on the publish action's own `repository-url:` input, not on the
+# string appearing anywhere in the job: a stray mention (an env var, a URL in a
+# step) must not exempt a real PyPI publish.
+ADVISORY_REPOSITORY_URL = "repository-url: https://test.pypi.org/legacy/"
+
+
+def check_prerelease_gate(msgs: list[str]) -> None:
+    """Every registry publish waits for Pre-Release CI on the tagged commit.
+
+    v0.4.1 (2026-10-16): release-python.yml published PyPI with no Pre-Release
+    CI gate at all, and release.yml's gate failed instead of waiting.
+    """
+    gate = ROOT / PRERELEASE_GATE
+    if not gate.exists():
+        _fail(msgs, f"{PRERELEASE_GATE}: missing -- both release workflows wait on it before publishing")
+    elif PRERELEASE_RUN_FILTER not in gate.read_text(encoding="utf-8"):
+        _fail(
+            msgs,
+            f"{PRERELEASE_GATE}: no longer restricts to building runs (push to main or dispatch) -- "
+            f"a qa-push run skips every build yet concludes success",
+        )
+    for rel in PUBLISH_WORKFLOWS:
+        path = ROOT / rel
+        if not path.exists():
+            continue  # check_unified_release_tag already reports it
+        jobs = _jobs(path.read_text(encoding="utf-8").splitlines())
+        gates = {j for j, body in jobs.items() if any(_live(b) and PRERELEASE_GATE in b for b in body)}
+        if not gates:
+            _fail(msgs, f"{rel}: no job runs `{PRERELEASE_GATE}` -- it can publish a commit whose Pre-Release CI failed")
+            continue
+        needs = {j: _needs(body) for j, body in jobs.items()}
+
+        def reaches(job: str, seen: frozenset = frozenset()) -> bool:
+            if job in gates:
+                return True
+            return any(reaches(d, seen | {job}) for d in needs.get(job, ()) if d not in seen)
+
+        for job, body in jobs.items():
+            live = [b for b in body if _live(b)]
+            publishes = any(m in b for b in live for m in PUBLISH_MARKERS)
+            advisory = any(b.strip() == ADVISORY_REPOSITORY_URL for b in live)
+            if publishes and not advisory and not reaches(job):
+                _fail(
+                    msgs,
+                    f"{rel}: job `{job}` publishes but does not wait (directly or transitively) "
+                    f"for Pre-Release CI (`{PRERELEASE_GATE}`)",
+                )
+
+
+# ---- CI redesign PR1: release.yml reuses the Pre-Release CI binaries -----------
+# `build-binaries` downloads the archives prerelease-ci.yml built for the same
+# commit and only rebuilds when there is nothing to download. Each clause below
+# is a way that reuse could ship the WRONG bytes, or silently stop rebuilding:
+REUSE_JOB = "build-binaries"
+REUSE_RUN_ID = "run-id: ${{ needs.prepare.outputs.prerelease_run_id }}"
+PRERELEASE_WORKFLOW = ".github/workflows/prerelease-ci.yml"
+MIN_PRERELEASE_RETENTION_DAYS = 14
+ARTIFACT_NAME_RE = re.compile(r"^\s+name:\s*(?P<name>binaries-.+?)\s*$")
+RETENTION_RE = re.compile(r"^\s+retention-days:\s*(?P<days>\d+)\s*(?:#.*)?$")
+
+
+def _step_blocks(body: list[str]) -> list[list[str]]:
+    """A job body split into its `- ` steps (6-space bullets)."""
+    steps: list[list[str]] = []
+    for line in body:
+        if re.match(r"^      - ", line):
+            steps.append([line])
+        elif steps:
+            steps[-1].append(line)
+    return steps
+
+
+def check_release_binary_reuse(msgs: list[str]) -> None:
+    rel = ".github/workflows/release.yml"
+    path = ROOT / rel
+    if not path.exists():
+        return  # check_unified_release_tag already reports it
+    jobs = _jobs(path.read_text(encoding="utf-8").splitlines())
+    prepare = [b for b in jobs.get("prepare", []) if _live(b)]
+    body = [b for b in jobs.get(REUSE_JOB, []) if _live(b)]
+    if not any(REUSE_RUN_ID in b for b in body):
+        # The pre-reuse form (always build) is still a correct release.
+        return
+    if not any(re.match(r"^\s+prerelease_run_id:\s*\$\{\{\s*steps\.\w+\.outputs\.run_id\s*}}", b) for b in prepare):
+        _fail(msgs, f"{rel}: `prepare` must output `prerelease_run_id` from the await step's `run_id` -- {REUSE_JOB} downloads from that run")
+    if not any(re.match(r"^\s+actions:\s*read\b", b) for b in body):
+        _fail(msgs, f"{rel}: job `{REUSE_JOB}` needs `permissions: actions: read` to download another run's artifacts")
+    steps = _step_blocks(body)
+    fetch = [st for st in steps if any(REUSE_RUN_ID in l for l in st)]
+    fetch_id = None
+    for st in fetch:
+        m = next((re.match(r"^\s+(?:- )?id:\s*(?P<id>[\w-]+)", l) for l in st if re.match(r"^\s+(?:- )?id:", l)), None)
+        fetch_id = m.group("id") if m else None
+        if not any(re.match(r"^\s+continue-on-error:\s*true\b", l) for l in st):
+            _fail(msgs, f"{rel}: the {REUSE_JOB} download must be `continue-on-error: true` -- an expired artifact must fall back to a build, not fail the release")
+        if not any(re.search(r"\bdry_run\b", l) for l in st if re.match(r"^\s+(?:- )?if:", l)):
+            _fail(msgs, f"{rel}: the {REUSE_JOB} download must be skipped on a dry run (its `if:` must test `dry_run`)")
+    if fetch_id is None:
+        _fail(msgs, f"{rel}: the {REUSE_JOB} download step has no `id:` -- the fallback cannot test its outcome")
+        return
+    reused = f"steps.{fetch_id}.outcome == 'success'"
+    fallback = f"steps.{fetch_id}.outcome != 'success'"
+    # A hashing COMMAND, not a mention: `echo "... .sha256"` verifies nothing.
+    hashes = re.compile(r"(?:^|[\s(\"$|;&])(?:sha256sum|shasum -a 256)\b")
+    verified = any(
+        any(reused in l for l in st)
+        and any(hashes.search(l) and not l.lstrip().startswith(("echo", "#")) for l in st)
+        and not any(re.match(r"^\s+continue-on-error:\s*true\b", l) for l in st)
+        for st in steps
+    )
+    if not verified:
+        _fail(msgs, f"{rel}: {REUSE_JOB} must verify downloaded archives' SHA-256 in a step gated on `{reused}` (and not continue-on-error) -- a corrupt download would otherwise ship")
+    build = [st for st in steps if any("cargo build --release" in l for l in st)]
+    if not build:
+        _fail(msgs, f"{rel}: {REUSE_JOB} lost its fallback `cargo build --release` -- dry runs and expired artifacts would ship nothing")
+    for st in build:
+        if not any(fallback in l for l in st if re.match(r"^\s+(?:- )?if:", l)):
+            _fail(msgs, f"{rel}: the {REUSE_JOB} fallback build must be gated on `{fallback}` -- otherwise it overwrites (or races) the verified Pre-Release archives")
+    for st in steps:
+        if any(l.strip().startswith("- name: Create Archive") for l in st[:1]) and not any(fallback in l for l in st):
+            _fail(msgs, f"{rel}: `{st[0].strip()[8:]}` must be gated on `{fallback}` -- after a fetch there is no target/ to archive")
+    # The name downloaded must be the name prerelease-ci.yml uploads, and it
+    # must still be there when a release runs.
+    wanted = {m.group("name") for st in fetch for l in st if (m := ARTIFACT_NAME_RE.match(l))}
+    pre = ROOT / PRERELEASE_WORKFLOW
+    if not pre.exists():
+        _fail(msgs, f"{PRERELEASE_WORKFLOW}: missing -- release.yml downloads its binaries")
+        return
+    pre_jobs = _jobs(pre.read_text(encoding="utf-8").splitlines())
+    uploads = [st for st in _step_blocks([b for b in pre_jobs.get(REUSE_JOB, []) if _live(b)]) if any("actions/upload-artifact" in l for l in st)]
+    uploaded = {m.group("name") for st in uploads for l in st if (m := ARTIFACT_NAME_RE.match(l))}
+    for name in sorted(wanted - uploaded):
+        _fail(msgs, f"{rel}: downloads artifact `{name}` that {PRERELEASE_WORKFLOW} {REUSE_JOB} never uploads -- every release would silently rebuild")
+    for st in uploads:
+        days = [int(m.group("days")) for l in st if (m := RETENTION_RE.match(l))]
+        if not days or days[0] < MIN_PRERELEASE_RETENTION_DAYS:
+            _fail(msgs, f"{PRERELEASE_WORKFLOW}: {REUSE_JOB} artifacts must be kept >= {MIN_PRERELEASE_RETENTION_DAYS} days (got {days[0] if days else 'default'}) -- release.yml reuses them")
+
+
+# ---- npm trusted publishing (v0.4.1: ENEEDAUTH twice, no reason logged) -------
+NPM_EXCHANGE_PATH = "/-/npm/v1/oidc/token/exchange/package/"
+
+
+def check_npm_oidc_publish(msgs: list[str]) -> None:
+    """The job that runs `npm publish` authenticates ONLY by OIDC, and says why
+    when that fails.
+
+    * `id-token: write`, or npm never attempts the exchange;
+    * no setup-node `registry-url:` -- it writes an `_authToken=${NODE_AUTH_TOKEN}`
+      .npmrc, the stale-token line that 404'd v0.4.0 (#1990);
+    * no npm token secret at all (`NPM_TOKEN`, or NODE_AUTH_TOKEN from a secret);
+    * an exchange preflight before the publish, because npm itself logs an
+      exchange refusal only at `verbose` and then reports a bare ENEEDAUTH.
+    """
+    rel = ".github/workflows/release.yml"
+    path = ROOT / rel
+    if not path.exists():
+        return
+    for job, body in _jobs(path.read_text(encoding="utf-8").splitlines()).items():
+        live = [b for b in body if _live(b)]
+        steps = _step_blocks(live)
+        publish_at = [i for i, st in enumerate(steps) if any(re.search(r"\bnpm publish\b", l) for l in st)]
+        if not publish_at:
+            continue
+        if not any(re.match(r"^\s+id-token:\s*write\b", l) for l in live):
+            _fail(msgs, f"{rel}: job `{job}` runs `npm publish` without `permissions: id-token: write` -- npm cannot attempt the OIDC exchange")
+        for st in steps:
+            if any("actions/setup-node" in l for l in st) and any(re.match(r"^\s+registry-url:", l) for l in st):
+                _fail(msgs, f"{rel}: job `{job}` sets setup-node `registry-url:`, which writes an `_authToken=${{NODE_AUTH_TOKEN}}` .npmrc that npm prefers over OIDC (#1990)")
+        for l in live:
+            if re.search(r"secrets\.NPM_TOKEN|NODE_AUTH_TOKEN:\s*\$\{\{\s*secrets\.", l):
+                _fail(msgs, f"{rel}: job `{job}` feeds npm a token secret (`{l.strip()}`) -- publishing is OIDC trusted publishing only")
+        preflight = [i for i, st in enumerate(steps) if any(NPM_EXCHANGE_PATH in l for l in st)]
+        if not preflight or min(preflight) > min(publish_at):
+            _fail(msgs, f"{rel}: job `{job}` must preflight the npm OIDC exchange (`POST {NPM_EXCHANGE_PATH}...`) before `npm publish` -- npm hides an exchange refusal behind ENEEDAUTH")
+
+
 def main() -> int:
     msgs: list[str] = []
     check_workflow_features(msgs)
@@ -695,6 +885,9 @@ def main() -> int:
     check_dockerfiles(msgs)
     check_runtime_config_ownership(msgs)
     check_unified_release_tag(msgs)
+    check_prerelease_gate(msgs)
+    check_release_binary_reuse(msgs)
+    check_npm_oidc_publish(msgs)
     if msgs:
         print("release-build-features: FAILED")
         for m in msgs:
@@ -705,7 +898,9 @@ def main() -> int:
         f"(both release workflows and {PUBLISHED_DOCKERFILE} build with "
         f"`{REQUIRED_FEATURE}`, every job in {len(TIMED_WORKFLOWS)} workflows "
         "bounded, runtime config copied --chown, one release tag gated "
-        "against every published manifest)"
+        "against every published manifest, every publish behind Pre-Release CI, "
+        "release binaries reused from Pre-Release CI only after a SHA-256 check, "
+        "npm published by OIDC alone behind an exchange preflight)"
     )
     return 0
 

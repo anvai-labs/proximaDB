@@ -897,6 +897,44 @@ pub struct DmlService {
     /// filter rows by the subject's policy. Absent by default.
     #[cfg(feature = "abac-policy")]
     abac_enforcer: Option<Arc<crate::security::rls::AbacEnforcer>>,
+    /// ADR-095 D3 transaction fork: the table op-locks the COMMIT routine holds
+    /// for the whole commit. `Some` ⇒ statements must NOT re-acquire them (the
+    /// registry is non-reentrant) and any table outside the set fails closed —
+    /// never written without its lock. `None` ⇒ acquire per statement (legacy).
+    held_op_locks: Option<Arc<std::collections::HashSet<TableIdentifier>>>,
+    /// ADR-095 review F8: in a transaction fork, catalog-statistics bumps are
+    /// queued here instead of applied, so a transaction that fails at COMMIT
+    /// never moves row counts / min-max / NDV. `None` ⇒ apply immediately.
+    deferred_stats: Option<Arc<parking_lot::Mutex<Vec<DeferredStatBump>>>>,
+    /// ADR-095 review (S4a) F5: in a transaction fork, the cross-pod DML lease
+    /// guards a statement took are RETAINED here instead of released when the
+    /// statement finishes staging. The commit task releases them only after the
+    /// durable write, preserving the TD-110 guarantee that a cascade's child
+    /// leases are held across the parent's write. `None` ⇒ release immediately.
+    retained_dml_guards: Option<Arc<parking_lot::Mutex<Vec<DmlLockGuard>>>>,
+}
+
+/// A catalog-statistics update captured during a staged transaction, applied
+/// by [`DmlService::apply_deferred_stats`] only once the commit is durable.
+#[derive(Debug, Clone)]
+pub enum DeferredStatBump {
+    RowCount {
+        table: String,
+        delta: i64,
+    },
+    NullCounts {
+        table: String,
+        columns: Vec<String>,
+        null_counts: Vec<u64>,
+    },
+    MinMax {
+        table: String,
+        column_minmax: HashMap<String, (String, String)>,
+    },
+    Ndv {
+        table: String,
+        ndv_per_column: HashMap<String, u64>,
+    },
 }
 
 /// ADR-025: `DmlService` is the authoritative post-snapshot delta source for the
@@ -1123,7 +1161,208 @@ impl DmlService {
             conditional_key_store: None,
             #[cfg(feature = "abac-policy")]
             abac_enforcer: None,
+            held_op_locks: None,
+            deferred_stats: None,
+            retained_dml_guards: None,
         }
+    }
+
+    /// ADR-095 D3: a copy of this service for executing one transaction's
+    /// statements against `record_store` (the staging store) while the caller
+    /// holds `held_op_locks`. Everything else (catalog, DML leases, ABAC) is
+    /// shared. The table-write executor is kept but never reached from a fork:
+    /// INSERT … SELECT is refused inside an atomic transaction (pgwire buffer
+    /// time) and runs on the direct path in autocommit (it would bypass staging).
+    pub fn fork_for_transaction(
+        &self,
+        record_store: Arc<dyn TableRecordStore>,
+        held_op_locks: std::collections::HashSet<TableIdentifier>,
+    ) -> Self {
+        Self {
+            catalog_manager: self.catalog_manager.clone(),
+            record_store,
+            table_write_executor: self.table_write_executor.clone(),
+            dml_lock_service: self.dml_lock_service.clone(),
+            conditional_key_store: self.conditional_key_store.clone(),
+            #[cfg(feature = "abac-policy")]
+            abac_enforcer: self.abac_enforcer.clone(),
+            held_op_locks: Some(Arc::new(held_op_locks)),
+            deferred_stats: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+            retained_dml_guards: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+        }
+    }
+
+    /// Drain the statistics bumps this transaction fork queued (empty when not
+    /// a fork). Hand them to [`Self::apply_deferred_stats`] after the commit is
+    /// durable; drop them if it fails.
+    pub fn take_deferred_stats(&self) -> Vec<DeferredStatBump> {
+        self.deferred_stats
+            .as_ref()
+            .map(|queue| std::mem::take(&mut *queue.lock()))
+            .unwrap_or_default()
+    }
+
+    /// Drain the DML lease guards this transaction fork retained; release them
+    /// after the commit is durable (or on failure).
+    pub fn take_retained_dml_guards(&self) -> Vec<DmlLockGuard> {
+        self.retained_dml_guards
+            .as_ref()
+            .map(|guards| std::mem::take(&mut *guards.lock()))
+            .unwrap_or_default()
+    }
+
+    /// End-of-statement handling for DML lease guards: release them now, or —
+    /// in a transaction fork — retain them until the durable commit.
+    async fn finish_dml_guards(&self, guards: impl IntoIterator<Item = DmlLockGuard>) {
+        match &self.retained_dml_guards {
+            Some(retained) => retained.lock().extend(guards),
+            None => {
+                for guard in guards {
+                    guard.release().await;
+                }
+            }
+        }
+    }
+
+    /// Apply statistics bumps queued by a committed transaction, in order.
+    /// Best-effort, like every statistics update (planner-only, never data).
+    pub async fn apply_deferred_stats(&self, bumps: Vec<DeferredStatBump>) {
+        for bump in bumps {
+            match bump {
+                DeferredStatBump::RowCount { table, delta } => {
+                    self.bump_row_count_stats(&table, delta).await
+                }
+                DeferredStatBump::NullCounts {
+                    table,
+                    columns,
+                    null_counts,
+                } => {
+                    self.bump_column_null_counts(&table, &columns, &null_counts)
+                        .await
+                }
+                DeferredStatBump::MinMax {
+                    table,
+                    column_minmax,
+                } => self.bump_column_minmax(&table, column_minmax).await,
+                DeferredStatBump::Ndv {
+                    table,
+                    ndv_per_column,
+                } => self.bump_column_ndv(&table, ndv_per_column).await,
+            }
+        }
+    }
+
+    /// Queue `bump` when this is a transaction fork; `false` ⇒ apply it now.
+    fn defer_stat(&self, bump: impl FnOnce() -> DeferredStatBump) -> bool {
+        match &self.deferred_stats {
+            Some(queue) => {
+                queue.lock().push(bump());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a fenced `ConditionalKeyStore` is wired (`oltp-integrity`). Its
+    /// claims live in a second log, so a transaction cannot commit atomically
+    /// with it yet (TD-PGOLTP-3) — callers fail closed.
+    pub fn has_conditional_key_store(&self) -> bool {
+        self.conditional_key_store.is_some()
+    }
+
+    /// The op-lock set a transaction touching `tables` must hold: each table
+    /// plus its ON DELETE cascade closure, resolved in each entry's tenant scope.
+    pub async fn transaction_op_lock_set(
+        &self,
+        tables: &[(String, Option<TenantContext>, bool)],
+    ) -> Result<std::collections::HashSet<TableIdentifier>> {
+        let mut set = std::collections::HashSet::new();
+        // The bool asks for the ON DELETE cascade closure — only DELETE walks
+        // it; INSERT/UPDATE/UPSERT hold just their target (`ensure_held` fails
+        // closed if that is ever too small). Skipping it avoids a tenant-wide
+        // catalog scan per statement (review S4a F7).
+        for (table_name, tenant_context, with_cascade_closure) in tables {
+            let (catalog, table_id) = self
+                .catalog_manager
+                .resolve_table_scoped(
+                    table_name,
+                    tenant_context.as_ref().map(|t| t.tenant_id.as_str()),
+                )
+                .await?;
+            if *with_cascade_closure && catalog.table_exists(&table_id).await? {
+                let schema = catalog.get_table(&table_id).await?;
+                for (namespace, name) in self
+                    .discover_cascade_child_set(
+                        &catalog,
+                        &table_id,
+                        &schema,
+                        tenant_context.as_ref(),
+                    )
+                    .await?
+                {
+                    set.insert(TableIdentifier { namespace, name });
+                }
+            }
+            set.insert(table_id);
+        }
+        Ok(set)
+    }
+
+    /// Acquire a transaction's whole op-lock set, in the registry's deterministic
+    /// order (the same order cascade DELETE uses, so no lock-order inversion).
+    pub async fn acquire_transaction_op_locks(
+        &self,
+        tables: &std::collections::HashSet<TableIdentifier>,
+    ) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>> {
+        self.catalog_manager
+            .op_locks()
+            .acquire_sorted(tables.iter().cloned().collect())
+            .await
+    }
+
+    /// Acquire `table_id`'s op-lock, or — in a transaction fork — confirm the
+    /// caller already holds it (fail closed otherwise).
+    async fn op_lock(
+        &self,
+        table_id: &TableIdentifier,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        match &self.held_op_locks {
+            Some(held) => {
+                Self::ensure_held(held, std::slice::from_ref(table_id))?;
+                Ok(None)
+            }
+            None => Ok(Some(
+                self.catalog_manager.op_locks().acquire(table_id).await?,
+            )),
+        }
+    }
+
+    /// Sorted multi-table form of [`Self::op_lock`].
+    async fn op_locks_sorted(
+        &self,
+        tables: Vec<TableIdentifier>,
+    ) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>> {
+        match &self.held_op_locks {
+            Some(held) => {
+                Self::ensure_held(held, &tables)?;
+                Ok(Vec::new())
+            }
+            None => self.catalog_manager.op_locks().acquire_sorted(tables).await,
+        }
+    }
+
+    fn ensure_held(
+        held: &std::collections::HashSet<TableIdentifier>,
+        tables: &[TableIdentifier],
+    ) -> Result<()> {
+        if let Some(missing) = tables.iter().find(|table| !held.contains(*table)) {
+            return Err(anyhow!(
+                "transaction commit does not hold the operation lock for table '{}' \
+                 (its lock set changed while committing); refusing to write it unlocked",
+                missing.name
+            ));
+        }
+        Ok(())
     }
 
     /// F2 (ADR-072 D3/D5): wire a fenced `ConditionalKeyStore` so composite-PK
@@ -3619,7 +3858,7 @@ impl DmlService {
         // held for the whole INSERT. Pairs with the same lock a cascading
         // parent DELETE takes on its child set, so a child INSERT concurrent
         // with a parent DELETE serializes (blocks) rather than orphaning.
-        let _op_lock = self.catalog_manager.op_locks().acquire(&table_id).await?;
+        let _op_lock = self.op_lock(&table_id).await?;
         let (write_intent, write_lane_decision) = Self::route_row_dml_write_intent(
             &table_schema,
             WriteOperationKind::Insert,
@@ -3686,14 +3925,21 @@ impl DmlService {
             .write_mutations(&table_schema, mutations, tenant_context)
             .await?;
         if !batch_result.success {
-            return Err(anyhow!(
-                "Insert failed: {}",
-                batch_result
-                    .errors
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            ));
+            let detail = batch_result
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown error".to_string());
+            // A store-level key conflict is a duplicate primary key: keep it typed
+            // so every surface reports 23505, even if a pre-check missed it.
+            if batch_result.error_code.as_deref() == Some("INSERT_CONFLICT") {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::Unique,
+                    format!("duplicate key value violates primary key: {detail}"),
+                )
+                .into());
+            }
+            return Err(anyhow!("Insert failed: {detail}"));
         }
 
         info!(
@@ -3712,9 +3958,7 @@ impl DmlService {
         let result =
             DmlResult::success(num_records as u64, format!("Inserted {} rows", num_records))
                 .with_inserted_ids(inserted_ids);
-        if let Some(guard) = dml_lock_guard {
-            guard.release().await;
-        }
+        self.finish_dml_guards(dml_lock_guard).await;
         Ok(result)
     }
 
@@ -3744,7 +3988,7 @@ impl DmlService {
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
         // TD-110 S1: non-reentrant in-process operation lock (see execute_insert).
-        let _op_lock = self.catalog_manager.op_locks().acquire(&table_id).await?;
+        let _op_lock = self.op_lock(&table_id).await?;
         let ids_to_update = if let Some(ref wc) = where_clause {
             self.resolve_matching_ids(&table_schema, &table_id.name, wc, tenant_context)
                 .await?
@@ -3861,9 +4105,7 @@ impl DmlService {
             format!("Updated {} rows", updated_count),
         );
         result.warnings = warnings;
-        if let Some(guard) = dml_lock_guard {
-            guard.release().await;
-        }
+        self.finish_dml_guards(dml_lock_guard).await;
         Ok(result)
     }
 
@@ -3929,12 +4171,8 @@ impl DmlService {
             })
             .collect();
         op_lock_tables.push(table_id.clone()); // parent is in the critical section too
-        let _cascade_op_locks = self
-            .catalog_manager
-            .op_locks()
-            .acquire_sorted(op_lock_tables)
-            .await?;
-        let _cascade_child_dml_locks = self
+        let _cascade_op_locks = self.op_locks_sorted(op_lock_tables).await?;
+        let cascade_child_dml_locks = self
             .acquire_cascade_child_dml_locks(&child_closure, tenant_context)
             .await?;
 
@@ -4035,9 +4273,8 @@ impl DmlService {
             deleted_count as u64,
             format!("Deleted {} rows", deleted_count),
         );
-        if let Some(guard) = dml_lock_guard {
-            guard.release().await;
-        }
+        self.finish_dml_guards(dml_lock_guard.into_iter().chain(cascade_child_dml_locks))
+            .await;
         Ok(result)
     }
 
@@ -4069,7 +4306,7 @@ impl DmlService {
         // TD-DML-1: the same non-reentrant in-process op-lock INSERT holds (see
         // execute_insert) — the constraint probes below and the write must not
         // interleave with a concurrent writer or a cascading parent DELETE.
-        let _op_lock = self.catalog_manager.op_locks().acquire(&table_id).await?;
+        let _op_lock = self.op_lock(&table_id).await?;
         let (write_intent, write_lane_decision) = Self::route_row_dml_write_intent(
             &table_schema,
             WriteOperationKind::Upsert,
@@ -4140,9 +4377,7 @@ impl DmlService {
         let result =
             DmlResult::success(num_records as u64, format!("Upserted {} rows", num_records))
                 .with_inserted_ids(inserted_ids);
-        if let Some(guard) = dml_lock_guard {
-            guard.release().await;
-        }
+        self.finish_dml_guards(dml_lock_guard).await;
         Ok(result)
     }
 
@@ -4165,6 +4400,12 @@ impl DmlService {
     /// Called by DML paths and by fast-lane (gRPC/REST/Arrow Flight) write paths for
     /// collections that are registered as relational tables in xCatalog.
     pub(crate) async fn bump_row_count_stats(&self, table_name: &str, delta: i64) {
+        if self.defer_stat(|| DeferredStatBump::RowCount {
+            table: table_name.to_string(),
+            delta,
+        }) {
+            return;
+        }
         let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
             return;
         };
@@ -4212,6 +4453,13 @@ impl DmlService {
         null_counts: &[u64],
     ) {
         if columns.is_empty() || null_counts.iter().all(|&c| c == 0) {
+            return;
+        }
+        if self.defer_stat(|| DeferredStatBump::NullCounts {
+            table: table_name.to_string(),
+            columns: columns.to_vec(),
+            null_counts: null_counts.to_vec(),
+        }) {
             return;
         }
         let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
@@ -4293,6 +4541,16 @@ impl DmlService {
         if column_minmax.is_empty() {
             return;
         }
+        let column_minmax = match &self.deferred_stats {
+            Some(queue) => {
+                queue.lock().push(DeferredStatBump::MinMax {
+                    table: table_name.to_string(),
+                    column_minmax,
+                });
+                return;
+            }
+            None => column_minmax,
+        };
         let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
             return;
         };
@@ -4373,6 +4631,16 @@ impl DmlService {
         if ndv_per_column.is_empty() {
             return;
         }
+        let ndv_per_column = match &self.deferred_stats {
+            Some(queue) => {
+                queue.lock().push(DeferredStatBump::Ndv {
+                    table: table_name.to_string(),
+                    ndv_per_column,
+                });
+                return;
+            }
+            None => ndv_per_column,
+        };
         let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
             return;
         };
@@ -5073,7 +5341,12 @@ impl DmlService {
                                 include_vector: false,
                                 include_props: false,
                             },
-                            None,
+                            // The tenant's partition — the one this INSERT writes.
+                            // Probing with `None` looked in the default partition,
+                            // missed the existing row in every tenant-scoped
+                            // session, and let the duplicate surface later as an
+                            // untyped store conflict (42P01 instead of 23505).
+                            tenant_context,
                             #[cfg(feature = "abac-policy")]
                             &ReadContext::system(
                                 SystemReadReason::ForeignKeyResolution,
