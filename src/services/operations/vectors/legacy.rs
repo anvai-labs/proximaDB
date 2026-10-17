@@ -6078,7 +6078,7 @@ mod index_first_search_tests {
 
         assert!(
             err.to_string()
-                .contains("Query vector has dimension 2 but collection '1001' expects dimension 3")
+                .contains("Query vector has dimension 2 but the collection expects dimension 3")
         );
     }
 
