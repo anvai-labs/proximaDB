@@ -94,7 +94,31 @@ PUBLISH_LIKE = re.compile(
 # TestPyPI is advisory (continue-on-error in release-python.yml) and is not a
 # channel users install from.
 ADVISORY = "repository-url: https://test.pypi.org/legacy/"
-SOFT_FAIL = re.compile(r"\|\|\s*(?:true|:)(?:\s|;|$)|continue-on-error")
+# Ways a failing command is turned into a passing step. In the WORKFLOW a bare
+# `exit 0` is also banned (nothing there needs it, and `; exit 0` after the
+# aggregation step would whitewash the verdict); the helper scripts exit 0 on
+# success by design, so for them only the `|| exit 0` form is banned.
+SOFT_FAIL = re.compile(
+    r"\|\|\s*(?:true|:|exit\s+0|return\s+0|echo\b)(?:\s|;|$|\))"
+    r"|continue-on-error|\bset\s+\+[a-z]*e"
+)
+WORKFLOW_SOFT_FAIL = re.compile(SOFT_FAIL.pattern + r"|\bexit\s+0\b")
+# The only `if:` conditions a smoke job or step may carry. Anything else
+# (`if: false`, an event filter, `failure()` on a smoke step) can skip the
+# smoke while the run stays green.
+JOB_IF_ALLOWED = {
+    "resolve": "github.event_name != 'release' || !github.event.release.prerelease",
+    "summary": "always() && needs.resolve.result != 'skipped'",
+}
+# release.yml's caller job: pinned exactly.
+CALLER_IF = (
+    "always() && needs.create-release.result == 'success' && "
+    "needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true'"
+)
+PIP_OPTS = {"--no-cache-dir", "--upgrade", "-U", "--pre"}
+NPM_OPTS = {"--no-audit", "--no-fund", "--prefer-online"}
+PIP_SPEC = re.compile(r'^"?(?:pip|[A-Za-z0-9_.-]+==\$\{VERSION\})"?$')
+NPM_SPEC = re.compile(r'^"?\$\{PKG\}@\$\{VERSION\}"?$')
 JOB_RE = re.compile(r"^  (?P<job>[_A-Za-z][A-Za-z0-9_-]*):\s*(?:#.*)?$")
 
 
@@ -139,6 +163,38 @@ def _needs(body: list[str]) -> set[str]:
     return set()
 
 
+def _strip_expr(cond: str) -> str:
+    cond = cond.split(" #", 1)[0].strip()
+    m = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", cond)
+    return m.group(1) if m else cond
+
+
+def _step_blocks(body: list[str]) -> list[list[str]]:
+    steps: list[list[str]] = []
+    for line in body:
+        if re.match(r"^      - ", line):
+            steps.append([line])
+        elif steps:
+            steps[-1].append(line)
+    return steps
+
+
+def _logical_lines(body: list[str]) -> list[str]:
+    """Shell lines with backslash continuations joined."""
+    out: list[str] = []
+    buf = ""
+    for line in body:
+        s = line.strip()
+        if s.endswith("\\"):
+            buf += s[:-1] + " "
+            continue
+        out.append(buf + s)
+        buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
 def check(msgs: list[str]) -> None:
     smoke_path = ROOT / SMOKE
     if not smoke_path.exists():
@@ -150,7 +206,7 @@ def check(msgs: list[str]) -> None:
 
     # ---- fail-hard
     for n, line in enumerate(lines, 1):
-        if _live(line) and SOFT_FAIL.search(line):
+        if _live(line) and WORKFLOW_SOFT_FAIL.search(line):
             msgs.append(f"{SMOKE}:{n}: `{line.strip()}` -- a smoke step must fail hard (no `|| true`, `|| :`, `continue-on-error`)")
     scripts_dir = ROOT / SMOKE_SCRIPTS
     for script in sorted(scripts_dir.glob("*.sh")) if scripts_dir.is_dir() else []:
@@ -158,6 +214,54 @@ def check(msgs: list[str]) -> None:
             if _live(line) and SOFT_FAIL.search(line):
                 rel = script.relative_to(ROOT).as_posix()
                 msgs.append(f"{rel}:{n}: `{line.strip()}` -- smoke helpers must fail hard")
+
+    # ---- no conditional skipping
+    for job, body in jobs.items():
+        for b in body:
+            m = re.match(r"^    if:\s*(?P<cond>.*?)\s*$", b)
+            if m and JOB_IF_ALLOWED.get(job) != _strip_expr(m.group("cond")):
+                msgs.append(f"{SMOKE}: job `{job}` has `if: {m.group('cond')}` -- only {JOB_IF_ALLOWED} are allowed")
+        if job in JOB_IF_ALLOWED and not any(re.match(r"^    if:", b) for b in body):
+            msgs.append(f"{SMOKE}: job `{job}` lost its pinned `if:` ({JOB_IF_ALLOWED[job]})")
+        for step in _step_blocks(body):
+            cond = next((_strip_expr(m.group(1)) for s in step
+                         if (m := re.match(r"^\s+(?:- )?if:\s*(.*?)\s*$", s))), None)
+            if cond is None:
+                continue
+            name = next((s.split("name:", 1)[1].strip() for s in step if re.match(r"^\s+(?:- )?name:", s)), "")
+            uploads = any("actions/upload-artifact@" in s for s in step)
+            if cond == "always()" and uploads:
+                continue
+            if cond == "failure()" and name.endswith("(on failure)"):
+                continue
+            msgs.append(
+                f"{SMOKE}: job `{job}` step `{name or step[0].strip()}` has `if: {cond}` -- steps may only be "
+                "`if: always()` on an upload-artifact step or `if: failure()` on a '(on failure)' log step"
+            )
+
+    # ---- installs come from the registry, never the checkout
+    for job, body in jobs.items():
+        for cmd in _logical_lines(body):
+            for tool, opts, spec in (("pip", PIP_OPTS, PIP_SPEC), ("npm", NPM_OPTS, NPM_SPEC)):
+                m = re.search(rf"\b{tool} install\b(?P<args>.*)$", cmd)
+                if not m:
+                    continue
+                args = m.group("args").split()
+                i = 0
+                while i < len(args):
+                    a = args[i]
+                    if tool == "npm" and a == "--prefix":
+                        i += 2
+                        continue
+                    if a in opts or (tool == "pip" and a.startswith("--only-binary=")):
+                        i += 1
+                        continue
+                    if not spec.match(a):
+                        msgs.append(
+                            f"{SMOKE}: job `{job}` `{tool} install` argument `{a}` is not a registry spec "
+                            f"pinned to ${{VERSION}} (local paths, -e, git/file URLs are not allowed)"
+                        )
+                    i += 1
 
     # ---- coverage: every published channel has a smoke job
     published: set[str] = set()
@@ -215,12 +319,16 @@ def check(msgs: list[str]) -> None:
     caller = ROOT / CALLER
     if caller.exists():
         caller_jobs = _jobs(caller.read_text(encoding="utf-8").splitlines())
-        if not any(
-            re.match(r"^    uses:\s*\./\.github/workflows/release-smoke\.yml\s*$", b)
-            for body in caller_jobs.values()
-            for b in body
-        ):
+        callers = [
+            (j, body) for j, body in caller_jobs.items()
+            if any(re.match(r"^    uses:\s*\./\.github/workflows/release-smoke\.yml\s*$", b) for b in body)
+        ]
+        if not callers:
             msgs.append(f"{CALLER}: no job `uses: ./{SMOKE}` -- a red smoke would leave the release green")
+        for j, body in callers:
+            conds = [_strip_expr(m.group(1)) for b in body if (m := re.match(r"^    if:\s*(.*?)\s*$", b))]
+            if conds != [CALLER_IF]:
+                msgs.append(f"{CALLER}: job `{j}` must carry exactly `if: {CALLER_IF}` (found {conds})")
 
 
 def main() -> int:

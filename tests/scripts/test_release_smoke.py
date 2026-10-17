@@ -106,6 +106,84 @@ class ReleaseSmokeGuard(unittest.TestCase):
                    "    timeout-minutes: 15\n    continue-on-error: true\n    permissions:")
         self._fails_with("must fail hard")
 
+    # ---- review M2: every soft-fail the first guard missed --------------------
+    def test_catches_or_exit_0(self) -> None:
+        self._edit(SMOKE, 'sha256sum -c sums.one\n', 'sha256sum -c sums.one || exit 0\n')
+        self._fails_with("must fail hard")
+
+    def test_catches_or_echo(self) -> None:
+        self._edit(SMOKE, 'sha256sum -c sums.one\n', 'sha256sum -c sums.one || echo "checksum mismatch"\n')
+        self._fails_with("must fail hard")
+
+    def test_catches_set_plus_e(self) -> None:
+        self._edit(SMOKE, "          set -euo pipefail\n          mkdir -p evidence\n          IMAGE=",
+                   "          set +e\n          mkdir -p evidence\n          IMAGE=")
+        self._fails_with("must fail hard")
+
+    def test_catches_exit_0_after_summarize(self) -> None:
+        self._edit(SMOKE, '--sha "${{ github.sha }}"\n', '--sha "${{ github.sha }}"; exit 0\n')
+        self._fails_with("must fail hard")
+
+    def test_catches_or_exit_0_in_a_helper(self) -> None:
+        self._edit("scripts/release_smoke/wait_healthy.sh", 'sleep 2\n', 'sleep 2 || exit 0\n')
+        self._fails_with("smoke helpers must fail hard")
+
+    def test_catches_if_false_on_the_esm_step(self) -> None:
+        self._edit(SMOKE, "      - name: ESM entry -- import + health\n",
+                   "      - name: ESM entry -- import + health\n        if: false\n")
+        self._fails_with("has `if: false`")
+
+    def test_catches_failure_only_on_a_smoke_step(self) -> None:
+        self._edit(SMOKE, "      - name: ESM entry -- import + health\n",
+                   "      - name: ESM entry -- import + health\n        if: failure()\n")
+        self._fails_with("has `if: failure()`")
+
+    def test_catches_if_false_on_the_npm_job(self) -> None:
+        self._edit(SMOKE, "    name: npm client\n", "    name: npm client\n    if: false\n")
+        self._fails_with("job `npm` has `if: false`")
+
+    def test_catches_if_false_on_the_aggregate_step(self) -> None:
+        self._edit(SMOKE, "      - name: Aggregate (fails unless every job succeeded)\n",
+                   "      - name: Aggregate (fails unless every job succeeded)\n        if: false\n")
+        self._fails_with("has `if: false`")
+
+    def test_catches_a_changed_summary_condition(self) -> None:
+        self._edit(SMOKE, "    if: always() && needs.resolve.result != 'skipped'\n",
+                   "    if: needs.resolve.result == 'never'\n")
+        self._fails_with("job `summary` has `if:")
+
+    def test_catches_local_path_pip_install(self) -> None:
+        self._edit(SMOKE, '"proximadb==${VERSION}" "proximadb_embedded==${VERSION}"',
+                   './clients/python "proximadb_embedded==${VERSION}"')
+        self._fails_with("argument `./clients/python` is not a registry spec")
+
+    def test_catches_editable_pip_install(self) -> None:
+        self._edit(SMOKE, '"proximadb==${VERSION}" "proximadb_embedded==${VERSION}"',
+                   '-e clients/python "proximadb_embedded==${VERSION}"')
+        self._fails_with("argument `-e` is not a registry spec")
+
+    def test_catches_unpinned_pip_install(self) -> None:
+        self._edit(SMOKE, '"proximadb==${VERSION}" "proximadb_embedded==${VERSION}"',
+                   'proximadb "proximadb_embedded==${VERSION}"')
+        self._fails_with("argument `proximadb` is not a registry spec")
+
+    def test_catches_local_npm_install(self) -> None:
+        self._edit(SMOKE, '--no-audit --no-fund --prefer-online "${PKG}@${VERSION}"',
+                   '--no-audit --no-fund --prefer-online ./clients/nodejs-embedded')
+        self._fails_with("argument `./clients/nodejs-embedded` is not a registry spec")
+
+    def test_catches_if_false_on_the_release_yml_caller(self) -> None:
+        text = (self.tree / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        start = text.index("  release-smoke:")
+        line = next(l for l in text[start:].splitlines() if l.startswith("    if:"))
+        self._edit(".github/workflows/release.yml", line + "\n", "    if: false\n")
+        self._fails_with("must carry exactly `if:")
+
+    def test_catches_caller_dropping_always(self) -> None:
+        self._edit(".github/workflows/release.yml", "    if: always() && needs.create-release.result == 'success' && ",
+                   "    if: needs.create-release.result == 'success' && ")
+        self._fails_with("must carry exactly `if:")
+
     def test_catches_or_true_in_a_helper_script(self) -> None:
         self._edit("scripts/release_smoke/wait_healthy.sh", 'sleep 2\n', 'sleep 2 || true\n')
         self._fails_with("smoke helpers must fail hard")
