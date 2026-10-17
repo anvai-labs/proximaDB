@@ -1,0 +1,530 @@
+# =============================================================================
+# Release Smoke: hard evidence that a published release is QA-based and works
+# =============================================================================
+#
+# Every release `vX.Y.Z` must evidence two things:
+#   (A) the released artifacts were built from a QA-proven tree;
+#   (B) every published artifact actually installs and works.
+#
+# `verify-release` in release.yml only asks crates.io and npm whether they LIST
+# the version, and release-python.yml smokes the embedded wheel BEFORE it is
+# published. Nothing installed the published artifacts from the registries and
+# exercised them. This workflow does, one job per registry the two release
+# workflows publish to:
+#
+#   provenance  (A) tag -> qa->main merge commit on main, qa head tree == tag
+#               tree, Pre-Release CI passed (scripts/await_prerelease_ci.sh),
+#               `CI Success` green on the qa push AND on the qa->main PR
+#   docker      Docker Hub `<image>:X.Y.Z`: pull, revision label's tree == tag
+#               tree, tree-<tree> tag digest == version tag digest, health, MVP smoke
+#   binary      GitHub Release linux x86_64 archive: sha256 (.sha256 + SHA256SUMS),
+#               `--version`, start on a temp data dir, MVP smoke
+#   python      PyPI `proximadb` + `proximadb_embedded` in a fresh venv: version,
+#               SDK create/insert/search/delete against the image, embedded roundtrip
+#   npm         `@anvailabs/proximadb-client`: version, CJS AND ESM entry vs the image
+#   rust        crates.io `proximadb-sdk = "=X.Y.Z"` in a temp crate vs the image
+#   homebrew    tap formula: version, url + sha256 equal the GitHub Release asset
+#   summary     one evidence table + `release-evidence-vX.Y.Z.json`; red if any job is
+#
+# TRIGGERS
+#   workflow_call      release.yml's final job `release-smoke` calls this, so a red
+#                      smoke makes the RELEASE run red (a `workflow_run` trigger
+#                      cannot: it starts a separate run and leaves release.yml green,
+#                      which is why there is no workflow_run trigger here).
+#   release: published a release published by a person (the GITHUB_TOKEN-created
+#                      release from release.yml does not fire this; the call does).
+#   workflow_dispatch  `version: X.Y.Z` -- re-run the evidence for any past release:
+#                      gh workflow run release-smoke.yml -f version=0.4.1
+#
+# RULES (guarded by scripts/check_release_smoke.py)
+#   * every step fails hard: no `|| true`, no `continue-on-error`;
+#   * registry propagation is a BOUNDED wait (scripts/release_smoke/await_url.sh,
+#     retry.sh), never a single probe and never an unbounded loop;
+#   * the smoke scripts live in scripts/release_smoke/ and run against the
+#     registry install only -- never against the repo's own client sources.
+#
+# Runbook: docs/04-operations/release/release-procedure.md ("Release evidence").
+# =============================================================================
+
+name: Release Smoke
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Released version to smoke, without the v (e.g. 0.4.1)'
+        required: true
+        type: string
+      registry_wait_minutes:
+        description: 'Max minutes to wait for each registry to serve the version'
+        required: false
+        type: string
+        default: '20'
+  workflow_call:
+    inputs:
+      version:
+        description: 'Released version to smoke, without the v'
+        required: true
+        type: string
+      registry_wait_minutes:
+        description: 'Max minutes to wait for each registry (release-python.yml publishes PyPI in parallel)'
+        required: false
+        type: string
+        default: '150'
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: ${{ vars.DOCKERHUB_IMAGE || 'vjsingh1984/proximadb' }}
+  HOMEBREW_TAP: anvai-labs/homebrew-tap
+  HOMEBREW_FORMULA: Formula/proximadb.rb
+  # Off the well-known ports so a local re-run never collides with a dev server.
+  SERVER_PORT: '47678'
+
+jobs:
+  resolve:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A pre-release never reaches crates.io, npm or PyPI, so most jobs below
+    # would fail on it for the wrong reason.
+    if: github.event_name != 'release' || !github.event.release.prerelease
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      wait: ${{ steps.v.outputs.wait }}
+    steps:
+      - name: Resolve and validate the version
+        id: v
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          REL_TAG: ${{ github.event.release.tag_name }}
+          IN_WAIT: ${{ inputs.registry_wait_minutes }}
+        run: |
+          set -euo pipefail
+          V="${IN_VERSION:-}"
+          if [ -z "$V" ]; then V="${REL_TAG:-}"; fi
+          V="${V#v}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'${V}' is not a stable X.Y.Z release version (pre-releases are not published to the registries)"
+            exit 1
+          fi
+          WAIT="${IN_WAIT:-20}"
+          [[ "$WAIT" =~ ^[0-9]+$ ]] || { echo "::error::registry_wait_minutes must be an integer"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "wait=$WAIT" >> "$GITHUB_OUTPUT"
+          echo "Release under test: v$V (registry wait bound ${WAIT} min)"
+
+  provenance:
+    name: Provenance (QA-based release)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prove the tag is a QA-proven qa->main merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          python3 scripts/release_smoke/provenance.py \
+            --repo "${{ github.repository }}" --version "$VERSION" \
+            --out evidence/provenance.json --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: evidence-provenance
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+  docker:
+    name: Docker Hub image
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Bound = registry wait (publish-image.yml runs in parallel with the release
+    # and may rebuild) + pull/run/smoke.
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      WAIT: ${{ needs.resolve.outputs.wait }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Await the version tag on Docker Hub
+        run: |
+          bash scripts/release_smoke/await_url.sh "Docker Hub ${IMAGE_REPO}:${VERSION}" \
+            "https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags/${VERSION}" \
+            '"digest"' "$WAIT" 60
+      - name: Start the released image and wait for health
+        run: bash scripts/release_smoke/start_image_server.sh "$IMAGE_REPO" "$VERSION" "$SERVER_PORT"
+      - name: Image was built from the released tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          IMAGE="${IMAGE_REPO}:${VERSION}"
+          REVISION="$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          LOCAL_DIGEST="$(docker image inspect "$IMAGE" --format '{{ index .RepoDigests 0 }}')"
+          [ -n "$REVISION" ] || { echo "::error::$IMAGE has no org.opencontainers.image.revision label"; exit 1; }
+          TAG_TREE="$(gh api "repos/${{ github.repository }}/commits/v${VERSION}" --jq .commit.tree.sha)"
+          REV_TREE="$(gh api "repos/${{ github.repository }}/commits/${REVISION}" --jq .commit.tree.sha)"
+          HUB="https://hub.docker.com/v2/repositories/${IMAGE_REPO}/tags"
+          VER_DIGEST="$(curl -fsS "${HUB}/${VERSION}" | jq -r .digest)"
+          # publish-image.yml (CI redesign PR1) re-tags qa's `tree-<tree>`
+          # image on a release tag instead of rebuilding. When that tag still
+          # exists it must be the very manifest the version tag points at.
+          TREE_TAG_DIGEST=""
+          if TREE_JSON="$(curl -fsS "${HUB}/tree-${TAG_TREE}" 2>/dev/null)"; then
+            TREE_TAG_DIGEST="$(jq -r .digest <<<"$TREE_JSON")"
+          fi
+          echo "revision label : $REVISION (tree $REV_TREE)"
+          echo "release tag    : v${VERSION} (tree $TAG_TREE)"
+          echo "version digest : $VER_DIGEST; pulled $LOCAL_DIGEST"
+          echo "tree- digest   : ${TREE_TAG_DIGEST:-<tag pruned or never published>}"
+          jq -n --arg image "$IMAGE" --arg revision "$REVISION" --arg rev_tree "$REV_TREE" \
+            --arg tag_tree "$TAG_TREE" --arg ver_digest "$VER_DIGEST" --arg pulled "$LOCAL_DIGEST" \
+            --arg tree_digest "$TREE_TAG_DIGEST" \
+            '{artifact: ("docker:" + $image), revision_label: $revision, revision_tree: $rev_tree,
+              release_tree: $tag_tree, hub_digest: $ver_digest, pulled: $pulled,
+              tree_tag_digest: (if $tree_digest == "" then null else $tree_digest end),
+              passed: (($rev_tree == $tag_tree) and ($pulled | endswith($ver_digest))
+                       and ($tree_digest == "" or $tree_digest == $ver_digest))}' \
+            > evidence/docker-image.json
+          if [ "$REV_TREE" != "$TAG_TREE" ]; then
+            echo "::error::$IMAGE was built from tree $REV_TREE, not the release tree $TAG_TREE"; exit 1
+          fi
+          case "$LOCAL_DIGEST" in *"@${VER_DIGEST}") ;; *)
+            echo "::error::pulled $LOCAL_DIGEST but Docker Hub serves $VER_DIGEST for $VERSION"; exit 1 ;;
+          esac
+          if [ -n "$TREE_TAG_DIGEST" ] && [ "$TREE_TAG_DIGEST" != "$VER_DIGEST" ]; then
+            echo "::error::tree-${TAG_TREE} is $TREE_TAG_DIGEST but $VERSION is $VER_DIGEST -- the release did not re-tag qa's image"; exit 1
+          fi
+      - name: MVP smoke against the released image
+        run: |
+          python3 scripts/mvp_smoke.py --base-url "http://127.0.0.1:${SERVER_PORT}" \
+            --output evidence/docker-mvp-smoke.json
+      - name: Server logs (on failure)
+        if: failure()
+        run: docker logs --tail 300 proximadb-release-smoke
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: evidence-docker
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  binary:
+    name: GitHub Release binary (linux x86_64)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download the release asset + checksums
+        run: |
+          set -euo pipefail
+          ASSET="proximadb-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/dl"
+          bash scripts/release_smoke/retry.sh 5 20 gh release download "v${VERSION}" \
+            -R "${{ github.repository }}" --dir "$RUNNER_TEMP/dl" --clobber \
+            -p "$ASSET" -p "${ASSET}.sha256" -p SHA256SUMS.txt
+          ls -la "$RUNNER_TEMP/dl"
+      - name: Verify sha256 against BOTH published checksum files
+        working-directory: ${{ runner.temp }}/dl
+        run: |
+          set -euo pipefail
+          sha256sum -c "${ASSET}.sha256"
+          grep -E "^[0-9a-f]{64}  ${ASSET}\$" SHA256SUMS.txt > sums.one
+          [ "$(wc -l < sums.one)" -eq 1 ] || { echo "::error::SHA256SUMS.txt has no single entry for ${ASSET}"; exit 1; }
+          sha256sum -c sums.one
+          echo "SHA256=$(cut -d' ' -f1 sums.one)" >> "$GITHUB_ENV"
+      - name: Extract and check --version
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/x"
+          tar -xzf "$RUNNER_TEMP/dl/${ASSET}" -C "$RUNNER_TEMP/x"
+          DIR="$RUNNER_TEMP/x/proximadb-${VERSION}-x86_64-unknown-linux-gnu"
+          echo "DIR=$DIR" >> "$GITHUB_ENV"
+          GOT="$("$DIR/proximadb-server" --version)"
+          echo "$GOT"
+          [ "$GOT" = "proximadb-server ${VERSION}" ] || { echo "::error::--version printed '$GOT', expected 'proximadb-server ${VERSION}'"; exit 1; }
+      - name: Start the server on a temp data dir
+        run: |
+          set -euo pipefail
+          DATA="$RUNNER_TEMP/data"
+          mkdir -p "$DATA"
+          bash scripts/release_smoke/binary_config.sh "$DIR/config/config.toml" "$DATA" "$SERVER_PORT" > "$RUNNER_TEMP/config.toml"
+          # The redirect is on the whole subshell: a background process holding
+          # the step's stdout keeps the step from ever finishing.
+          (cd "$DATA" && exec "$DIR/proximadb-server" -c "$RUNNER_TEMP/config.toml") \
+            > "$RUNNER_TEMP/server.log" 2>&1 < /dev/null &
+          bash scripts/release_smoke/wait_healthy.sh "http://127.0.0.1:${SERVER_PORT}" "$VERSION" 120
+      - name: MVP smoke against the released binary
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 scripts/mvp_smoke.py --base-url "http://127.0.0.1:${SERVER_PORT}" \
+            --output evidence/binary-mvp-smoke.json
+          jq -n --arg asset "$ASSET" --arg sha "$SHA256" --arg v "$VERSION" \
+            '{artifact: ("github-release:" + $asset), sha256: $sha, version: $v, passed: true}' \
+            > evidence/binary-asset.json
+      - name: Server log (on failure)
+        if: failure()
+        run: tail -n 300 "$RUNNER_TEMP/server.log"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: evidence-binary
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  python:
+    name: PyPI packages (Python ${{ matrix.python }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    # Bound = registry wait (release-python.yml publishes PyPI in parallel,
+    # after its own embedded-wheel builds) + install + smoke.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both distributions declare requires-python >=3.11 (clients/python and
+        # root pyproject.toml), so 3.10 cannot install them; these are the
+        # floor and the version release-python.yml builds with.
+        python: ['3.11', '3.12']
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      WAIT: ${{ needs.resolve.outputs.wait }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Await both distributions on PyPI
+        run: |
+          set -euo pipefail
+          for pkg in proximadb proximadb_embedded; do
+            bash scripts/release_smoke/await_url.sh "PyPI ${pkg}==${VERSION}" \
+              "https://pypi.org/pypi/${pkg}/${VERSION}/json" "\"version\":\"${VERSION}\"" "$WAIT" 60
+          done
+      - name: Install from PyPI into a fresh venv (no cache)
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --no-cache-dir --upgrade pip
+          # --only-binary: a wheel that is not visible yet must not silently
+          # fall back to building the embedded sdist from source.
+          bash scripts/release_smoke/retry.sh 4 60 "$RUNNER_TEMP/venv/bin/python" -m pip install \
+            --no-cache-dir --only-binary=proximadb_embedded \
+            "proximadb==${VERSION}" "proximadb_embedded==${VERSION}"
+      - name: Start the released image as the SDK target
+        run: bash scripts/release_smoke/start_image_server.sh "$IMAGE_REPO" "$VERSION" "$SERVER_PORT"
+      - name: SDK create / insert / search / delete against the server
+        run: |
+          # -I: isolated mode, so neither the checkout nor PYTHONPATH can stand
+          # in for the registry install.
+          "$RUNNER_TEMP/venv/bin/python" -I scripts/release_smoke/pypi_sdk_smoke.py \
+            "http://127.0.0.1:${SERVER_PORT}" "$VERSION" --out "evidence/python-sdk-${{ matrix.python }}.json"
+      - name: Embedded engine graph + typed-property roundtrip
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -I scripts/release_smoke/embedded_smoke.py \
+            "$VERSION" --out "evidence/python-embedded-${{ matrix.python }}.json"
+      - name: Server logs (on failure)
+        if: failure()
+        run: docker logs --tail 300 proximadb-release-smoke
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: evidence-python-${{ matrix.python }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  npm:
+    name: npm client
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      WAIT: ${{ needs.resolve.outputs.wait }}
+      PKG: '@anvailabs/proximadb-client'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Await the version on npm
+        run: |
+          bash scripts/release_smoke/await_url.sh "npm ${PKG}@${VERSION}" \
+            "https://registry.npmjs.org/@anvailabs%2fproximadb-client/${VERSION}" \
+            "\"version\":\"${VERSION}\"" "$WAIT" 60
+      - name: Install from npm into a temp project
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/npm-smoke"
+          mkdir -p "$P"
+          echo '{"name":"release-smoke","private":true}' > "$P/package.json"
+          bash scripts/release_smoke/retry.sh 4 60 npm install --prefix "$P" \
+            --no-audit --no-fund --prefer-online "${PKG}@${VERSION}"
+          # Node resolves a bare specifier from the SCRIPT's directory, so the
+          # smoke scripts run from inside the install, never from the repo.
+          cp scripts/release_smoke/npm_smoke.cjs scripts/release_smoke/npm_esm_smoke.mjs "$P/"
+      - name: Start the released image as the client target
+        run: bash scripts/release_smoke/start_image_server.sh "$IMAGE_REPO" "$VERSION" "$SERVER_PORT"
+      - name: CommonJS entry -- health / create / insert / search / delete
+        working-directory: ${{ runner.temp }}/npm-smoke
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          node npm_smoke.cjs "http://127.0.0.1:${SERVER_PORT}" "$VERSION" "$GITHUB_WORKSPACE/evidence/npm-cjs.json"
+      - name: ESM entry -- import + health
+        working-directory: ${{ runner.temp }}/npm-smoke
+        run: node npm_esm_smoke.mjs "http://127.0.0.1:${SERVER_PORT}" "$VERSION"
+      - name: Server logs (on failure)
+        if: failure()
+        run: docker logs --tail 300 proximadb-release-smoke
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: evidence-npm
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  rust:
+    name: crates.io SDK
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      WAIT: ${{ needs.resolve.outputs.wait }}
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: '10'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          toolchain: stable
+      - name: Await the version on crates.io
+        run: |
+          bash scripts/release_smoke/await_url.sh "crates.io proximadb-sdk ${VERSION}" \
+            "https://crates.io/api/v1/crates/proximadb-sdk/${VERSION}" \
+            "\"num\":\"${VERSION}\"" "$WAIT" 60
+      - name: Build a temp crate against proximadb-sdk from crates.io
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/rust-smoke"
+          bash scripts/release_smoke/rust_sdk_smoke/render_manifest.sh "$VERSION" "$P"
+          # Retried: the sparse index can lag the API right after a publish.
+          bash scripts/release_smoke/retry.sh 3 60 cargo build --manifest-path "$P/Cargo.toml"
+          python3 - "$P/Cargo.lock" "$VERSION" <<'PY'
+          import sys, tomllib
+          lock = tomllib.load(open(sys.argv[1], "rb"))
+          pkgs = [p for p in lock["package"] if p["name"] == "proximadb-sdk"]
+          assert len(pkgs) == 1, pkgs
+          p = pkgs[0]
+          assert p["version"] == sys.argv[2], p
+          assert p.get("source", "").startswith("registry+"), f"proximadb-sdk not from a registry: {p}"
+          print("proximadb-sdk", p["version"], "from", p["source"])
+          PY
+      - name: Start the released image as the SDK target
+        run: bash scripts/release_smoke/start_image_server.sh "$IMAGE_REPO" "$VERSION" "$SERVER_PORT"
+      - name: Health / create / insert / search / delete against the server
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cargo run --quiet --manifest-path "$RUNNER_TEMP/rust-smoke/Cargo.toml" -- \
+            "http://127.0.0.1:${SERVER_PORT}" "$VERSION" | tee "$RUNNER_TEMP/rust.out"
+          tail -n 1 "$RUNNER_TEMP/rust.out" > evidence/rust-sdk.json
+      - name: Server logs (on failure)
+        if: failure()
+        run: docker logs --tail 300 proximadb-release-smoke
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: evidence-rust
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  homebrew:
+    name: Homebrew formula
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tap formula references this release with matching url + sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release_smoke/homebrew_check.py --repo "${{ github.repository }}" \
+            --version "$VERSION" --tap "$HOMEBREW_TAP" --formula "$HOMEBREW_FORMULA" \
+            --out evidence/homebrew-formula.json
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: evidence-homebrew
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  summary:
+    name: Release evidence summary
+    needs: [resolve, provenance, docker, binary, python, npm, rust, homebrew]
+    # always(): a failed job must still produce the evidence table that says so.
+    # Not when `resolve` was skipped (a pre-release `release` event): nothing ran.
+    if: always() && needs.resolve.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Collect per-job evidence
+        uses: actions/download-artifact@v8
+        with:
+          pattern: evidence-*
+          path: evidence
+          merge-multiple: true
+      - name: Aggregate (fails unless every job succeeded)
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 scripts/release_smoke/summarize.py --version "${VERSION:-unknown}" \
+            --needs-json "$NEEDS_JSON" --evidence-dir evidence \
+            --out "release-evidence-v${VERSION:-unknown}.json" --summary "$GITHUB_STEP_SUMMARY" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --sha "${{ github.sha }}"
+      - name: Upload release-evidence-vX.Y.Z.json
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-evidence-v${{ needs.resolve.outputs.version || 'unknown' }}
+          path: release-evidence-v*.json
+          if-no-files-found: error
+          retention-days: 90

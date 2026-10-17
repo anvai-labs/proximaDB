@@ -72,6 +72,8 @@ TIMED_WORKFLOWS = RELEASE_WORKFLOWS + (
     ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
     ".github/workflows/public-overflow-runner-smoke.yml",
     ".github/workflows/release-python.yml",
+    # Post-publish release evidence, called by release.yml (workflow_call).
+    ".github/workflows/release-smoke.yml",
     ".github/workflows/tier-config-fingerprint.yml",
     ".github/workflows/windows-compile-ratchet.yml",
 )

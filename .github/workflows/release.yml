@@ -48,7 +48,10 @@
 #   │     ├── publish-npm       npm via OIDC (stable only)                   │
 #   │     └── update-homebrew   Homebrew formula artifact                    │
 #   ├─────────────────────────────────────────────────────────────────────────┤
-#   │  5. VERIFY             Post-release installation verification          │
+#   │  5. VERIFY             Registries list the version (verify-release),   │
+#   │                        then release-smoke.yml installs + exercises     │
+#   │                        every published artifact and proves the tag is  │
+#   │                        a QA-proven qa->main merge (release evidence)   │
 #   ├─────────────────────────────────────────────────────────────────────────┤
 #   │  6. CLEANUP            Remove workflow artifacts                       │
 #   └─────────────────────────────────────────────────────────────────────────┘
@@ -1528,6 +1531,30 @@ jobs:
             exit 1
           fi
           echo "All registries serve ${VERSION}."
+
+  # ============================================================================
+  # RELEASE SMOKE - evidence that the PUBLISHED artifacts are QA-based and work
+  # ============================================================================
+  # `verify-release` only proves crates.io and npm LIST the version. This calls
+  # release-smoke.yml, which installs every published artifact from its registry
+  # (Docker Hub, GitHub Release binary, PyPI x2, npm, crates.io, Homebrew tap),
+  # exercises it against a live server, and proves the tag is a QA-proven
+  # qa->main merge. It is a `workflow_call`, not a `workflow_run`, on purpose: a
+  # red smoke must turn THIS run red, and a workflow_run would leave it green.
+  # PyPI is published by release-python.yml in parallel, so the registry wait is
+  # long (150 min) and bounded.
+  release-smoke:
+    name: Release Smoke (evidence)
+    needs: [prepare, create-release, verify-release]
+    if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true'
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      registry_wait_minutes: '150'
 
   # ============================================================================
   # CLEANUP - Remove old artifacts

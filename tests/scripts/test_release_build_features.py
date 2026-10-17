@@ -61,6 +61,7 @@ COPY = (
     ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
     ".github/workflows/public-overflow-runner-smoke.yml",
     ".github/workflows/release-python.yml",
+    ".github/workflows/release-smoke.yml",
     ".github/workflows/tier-config-fingerprint.yml",
     ".github/workflows/windows-compile-ratchet.yml",
     # TD-RELTAG-1: the unified-tag check reads the gate's implementation and
