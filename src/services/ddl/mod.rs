@@ -3265,6 +3265,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::network::rest::canonical::rank::HybridSearchBackend for NoopHybridBackend {
+        async fn scope_collection(
+            &self,
+            _collection: &str,
+            _request_tenant: &str,
+        ) -> proximadb_rank_core::RankResult<()> {
+            Ok(())
+        }
         async fn bm25_search(
             &self,
             _collection: &str,

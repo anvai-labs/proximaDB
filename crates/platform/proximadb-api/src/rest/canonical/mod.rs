@@ -20,6 +20,7 @@ pub mod catalog;
 pub mod document;
 pub mod entities;
 pub mod graph;
+pub mod graph_tenant_scope;
 pub mod hybrid;
 pub mod multimodal_query;
 pub mod observability;

@@ -282,7 +282,7 @@ impl AqlSource for MemoryAqlSource {
             .vector_ops
             .unified_search_v1_for_tenant(
                 &scope.collection,
-                ctx.request_tenant.as_deref(),
+                ctx.resolution_tenant(&scope.collection)?,
                 scope.query_vector.clone(),
                 recall_k,
                 scope_filter,

@@ -856,7 +856,9 @@ impl FederatedExecutor {
             k,
             rank_profile: Some(profile_name.to_string()),
             rank_overrides: None,
-            request_tenant: crate::query::request_scope::resolution_tenant(collection)?,
+            scope: crate::network::rest::canonical::rank::RankScope::from_resolution_tenant(
+                crate::query::request_scope::resolution_tenant(collection)?,
+            ),
         };
 
         // Resolve the per-profile second-phase scorer (may be absent —

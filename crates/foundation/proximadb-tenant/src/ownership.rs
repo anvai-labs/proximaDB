@@ -110,6 +110,16 @@ pub fn stamp_collection_owner(
     config.owner = Some(tenant);
 }
 
+/// Remove every owner signal from a collection config about to be created
+/// without a creating tenant: a client can never choose the owner, so a config
+/// arriving with owner tags or an `owner` field is created unowned (default).
+pub fn clear_collection_owner(config: &mut proximadb_proto::proximadb_v1::CollectionConfig) {
+    config
+        .tags
+        .retain(|tag| !tag.starts_with(OWNER_TAG_PREFIX) && tag != TENANT_ISOLATED_TAG);
+    config.owner = None;
+}
+
 /// Keep a collection's recorded owner signals across a config update: the
 /// owner tags and the `owner` field of `updated` are reset to exactly those of
 /// `previous`. Ownership changes only through [`stamp_collection_owner`] at
@@ -135,6 +145,22 @@ pub fn carry_over_owner(
 mod tests {
     use super::*;
     use proximadb_proto::proximadb_v1::CollectionConfig;
+
+    #[test]
+    fn clear_collection_owner_drops_client_supplied_owner_signals() {
+        let mut config = CollectionConfig {
+            tags: vec![
+                format!("{OWNER_TAG_PREFIX}globex"),
+                TENANT_ISOLATED_TAG.to_string(),
+                "keep".to_string(),
+            ],
+            owner: Some("globex".to_string()),
+            ..Default::default()
+        };
+        clear_collection_owner(&mut config);
+        assert_eq!(config.tags, vec!["keep".to_string()]);
+        assert_eq!(config.owner, None);
+    }
 
     fn collection(tags: &[&str], owner: Option<&str>) -> Collection {
         Collection {

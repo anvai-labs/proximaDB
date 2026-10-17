@@ -57,11 +57,9 @@ async fn execute_aql(
 
     // Sources resolve collections within the request tenant (absent ⇒ the
     // default tenant, as for every request surface).
-    let request_tenant = Some(
-        tenant
-            .map(|axum::Extension(t)| t.tenant_id)
-            .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string()),
-    );
+    let request_tenant = tenant
+        .map(|axum::Extension(t)| t.tenant_id)
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
     match state
         .executor
         .execute_for_tenant(request.query, request_tenant)

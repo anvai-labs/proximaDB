@@ -4,6 +4,9 @@
 //! reflects writes made on a DIFFERENT protocol (pgwire), because every surface now shares one
 //! canonical record store. Also exercises the `since_lsn` cursor.
 //!
+//! The pgwire database names the tenant (`proximadb` here), and the feed is
+//! tenant-scoped, so the REST reads act as that same tenant.
+//!
 //!   cargo test --test cdc_rest_changefeed_e2e -- --nocapture
 
 use std::net::TcpListener;
@@ -134,6 +137,7 @@ async fn pgwire_writes_are_visible_on_the_rest_change_feed() {
             "{}/api/v2/collections/crfeed/changes?since_lsn=0",
             server.base()
         ))
+        .header("X-Tenant-ID", "proximadb")
         .send()
         .await
         .expect("changes GET");
@@ -175,6 +179,7 @@ async fn pgwire_writes_are_visible_on_the_rest_change_feed() {
             server.base(),
             lsns[0]
         ))
+        .header("X-Tenant-ID", "proximadb")
         .send()
         .await
         .expect("changes GET 2");

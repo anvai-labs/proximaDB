@@ -232,14 +232,34 @@ pub enum AuditOutcome {
     Failure { reason: String },
 }
 
+/// The error a source returns for a collection it may not resolve: the same
+/// client error a missing collection produces, so the two are indistinguishable.
+pub(crate) fn collection_not_found(collection: &str) -> ProximaDBError {
+    sources::vector::VectorAqlSource::vector_search_error(
+        proximadb_search_types::client_argument::CollectionNotFound::new(collection).into(),
+    )
+}
+
+/// Which collections an AQL execution may resolve. There is no implicit
+/// "unscoped": a context that was never given a scope denies.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AqlScope {
+    /// No scope was set; sources refuse to resolve anything.
+    #[default]
+    Unset,
+    /// A request acting as this tenant; collections resolve within it.
+    Tenant(String),
+    /// Explicit internal (system) execution, unscoped by tenant.
+    Internal,
+}
+
 /// Context passed through the executor to collect audit frames.
 pub struct AuditContext {
     pub query_id: Uuid,
     pub frames: Vec<AuditFrame>,
     pub next_frame_id: u64,
-    /// The tenant the request acts as; sources resolve collections within it.
-    /// `None` = internal (unscoped) execution.
-    pub request_tenant: Option<String>,
+    /// What the execution acts as; see [`AqlScope`].
+    pub scope: AqlScope,
 }
 
 impl Default for AuditContext {
@@ -254,7 +274,18 @@ impl AuditContext {
             query_id: Uuid::new_v4(),
             frames: Vec::new(),
             next_frame_id: 1,
-            request_tenant: None,
+            scope: AqlScope::Unset,
+        }
+    }
+
+    /// The tenant sources resolve collections within: `Some(tenant)` for a
+    /// request, `None` for explicit internal execution. An unset scope is an
+    /// error, reported as the collection being absent so it reveals nothing.
+    pub fn resolution_tenant(&self, collection: &str) -> Result<Option<&str>> {
+        match &self.scope {
+            AqlScope::Tenant(tenant) if !tenant.is_empty() => Ok(Some(tenant.as_str())),
+            AqlScope::Internal => Ok(None),
+            AqlScope::Tenant(_) | AqlScope::Unset => Err(collection_not_found(collection)),
         }
     }
 

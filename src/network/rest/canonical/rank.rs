@@ -68,11 +68,35 @@ pub struct RankSearchRequest {
     /// Per-phase overrides applied on top of the profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank_overrides: Option<RankOverrides>,
-    /// The tenant the request acts as (set by the route from the request
-    /// context, never from the wire). Candidate providers resolve the
-    /// collection within it; `None` = internal, unscoped.
+    /// What the request acts as (set by the route from the request context,
+    /// never from the wire). Candidate providers resolve the collection within
+    /// it; an unset scope denies.
     #[serde(skip)]
-    pub request_tenant: Option<String>,
+    pub scope: RankScope,
+}
+
+/// Which collections a rank request may resolve. There is no implicit
+/// "unscoped": a request that was never given a scope is denied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RankScope {
+    /// No scope was set; the collection reads as not found.
+    #[default]
+    Unset,
+    /// A request acting as this tenant.
+    Tenant(String),
+    /// Explicit internal (system) execution, unscoped by tenant.
+    Internal,
+}
+
+impl RankScope {
+    /// The scope of a resolution tenant from `request_scope`: `Some` ⇒ that
+    /// tenant, `None` ⇒ explicit internal execution.
+    pub fn from_resolution_tenant(tenant: Option<String>) -> Self {
+        match tenant {
+            Some(tenant) => Self::Tenant(tenant),
+            None => Self::Internal,
+        }
+    }
 }
 
 fn default_top_k() -> usize {
@@ -746,14 +770,9 @@ pub trait HybridSearchBackend: Send + Sync {
 
     /// Resolve `collection` within `request_tenant` before either leg runs:
     /// `Err(RankError::CollectionNotFound)` when the tenant may not resolve it
-    /// (answered exactly like a missing collection). Default: no scoping.
-    async fn scope_collection(
-        &self,
-        _collection: &str,
-        _request_tenant: Option<&str>,
-    ) -> RankResult<()> {
-        Ok(())
-    }
+    /// (answered exactly like a missing collection). Every backend decides;
+    /// there is no unscoped default.
+    async fn scope_collection(&self, collection: &str, request_tenant: &str) -> RankResult<()>;
 }
 
 /// `CandidateProvider` that delegates to a real
@@ -828,44 +847,57 @@ impl CandidateProvider for HybridCoordinatorAdapter {
         let query_text = request.query_text.clone().unwrap_or_default();
 
         // Resolve the collection within the request tenant before either leg.
-        self.backend
-            .scope_collection(&request.collection, request.request_tenant.as_deref())
-            .await?;
+        match &request.scope {
+            RankScope::Tenant(tenant) if !tenant.is_empty() => {
+                self.backend
+                    .scope_collection(&request.collection, tenant)
+                    .await?;
+            }
+            RankScope::Internal => {}
+            RankScope::Tenant(_) | RankScope::Unset => {
+                return Err(RankError::CollectionNotFound(request.collection.clone()));
+            }
+        }
 
-        let results = self
-            .coordinator
-            .execute_hybrid_search(
-                move |q: String| async move {
-                    backend_bm25
-                        .bm25_search(&collection_for_bm25, &q)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))
+        let search = self.coordinator.execute_hybrid_search(
+            move |q: String| async move {
+                backend_bm25
+                    .bm25_search(&collection_for_bm25, &q)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            },
+            move |v: Vec<f32>| async move {
+                backend_vec
+                    .vector_search(&collection_for_vec, &v)
+                    .await
+                    // Keep the typed `RankError` in the chain so a
+                    // client-argument error survives the coordinator.
+                    .map_err(anyhow::Error::new)
+            },
+            &query_text,
+            &request.query_vector,
+        );
+        // Both legs run in the request's scope, so a tenant-less identity
+        // inside a backend resolves within the same tenant the check used.
+        let results = match &request.scope {
+            RankScope::Tenant(tenant) => {
+                crate::query::request_scope::with_request_tenant(tenant.clone(), search).await
+            }
+            _ => crate::query::request_scope::with_internal_scope("rank internal", search).await,
+        };
+        let results = results.map_err(|e| {
+            let client_argument = e.chain().find_map(|cause| match cause.downcast_ref() {
+                Some(RankError::InvalidArgument(message)) => Some(message.clone()),
+                _ => None,
+            });
+            match client_argument {
+                Some(message) => RankError::InvalidArgument(message),
+                None => RankError::ModelInference {
+                    model_id: "hybrid_coordinator".into(),
+                    reason: format!("hybrid search failed: {e}"),
                 },
-                move |v: Vec<f32>| async move {
-                    backend_vec
-                        .vector_search(&collection_for_vec, &v)
-                        .await
-                        // Keep the typed `RankError` in the chain so a
-                        // client-argument error survives the coordinator.
-                        .map_err(anyhow::Error::new)
-                },
-                &query_text,
-                &request.query_vector,
-            )
-            .await
-            .map_err(|e| {
-                let client_argument = e.chain().find_map(|cause| match cause.downcast_ref() {
-                    Some(RankError::InvalidArgument(message)) => Some(message.clone()),
-                    _ => None,
-                });
-                match client_argument {
-                    Some(message) => RankError::InvalidArgument(message),
-                    None => RankError::ModelInference {
-                        model_id: "hybrid_coordinator".into(),
-                        reason: format!("hybrid search failed: {e}"),
-                    },
-                }
-            })?;
+            }
+        })?;
 
         // R-7c.3.2: build CandidateBatch with sequential synthetic
         // DocHandles + the original string ids in `original_ids`. This
@@ -990,7 +1022,7 @@ mod tests {
     #[test]
     fn request_round_trips_through_json() {
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![0.1, 0.2, 0.3],
             query_text: None,
@@ -1024,7 +1056,7 @@ mod tests {
     #[test]
     fn request_omits_optionals_from_json_when_unset() {
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1209,7 +1241,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(5), DocHandle(2)]);
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1357,7 +1389,7 @@ mod tests {
         );
         let candidates = FixedCandidates(vec![DocHandle(7), DocHandle(4)]);
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1409,7 +1441,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1), DocHandle(2), DocHandle(3)]);
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1500,7 +1532,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1), DocHandle(2)]);
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1569,7 +1601,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(11)]);
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1598,7 +1630,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1)]);
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1622,7 +1654,7 @@ mod tests {
         let candidates = FixedCandidates(vec![DocHandle(1), DocHandle(2), DocHandle(3)]);
         let factory = factory_with_docid();
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1646,7 +1678,7 @@ mod tests {
         let candidates = FixedCandidates(vec![DocHandle(1)]);
         let factory = factory_with_docid();
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1669,7 +1701,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1), DocHandle(2), DocHandle(3)]);
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1700,7 +1732,7 @@ mod tests {
 
         let candidates = FixedCandidates((1..=20).map(DocHandle).collect());
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1726,7 +1758,7 @@ mod tests {
 
         let candidates = FixedCandidates(vec![DocHandle(1)]);
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![0.5; 384],
             query_text: None,
@@ -1761,7 +1793,7 @@ mod tests {
     async fn mock_range_candidate_provider_returns_configured_count() {
         let p = MockRangeCandidateProvider { count: 7 };
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "x".into(),
             query_vector: vec![],
             query_text: None,
@@ -1803,7 +1835,7 @@ mod tests {
 
         let candidates = FixedCandidates((1..=20).map(DocHandle).collect());
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1863,7 +1895,7 @@ mod tests {
 
         let candidates = FixedCandidates((1..=5).map(DocHandle).collect());
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1920,7 +1952,7 @@ mod tests {
 
         let candidates = FixedCandidates((1..=5).map(DocHandle).collect());
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -1977,7 +2009,7 @@ mod tests {
             Arc::new(ConstantMultiplierSecondPhaseScorer { factor: 0.1 });
         let candidates = FixedCandidates((1..=5).map(DocHandle).collect());
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![],
             query_text: None,
@@ -2065,6 +2097,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HybridSearchBackend for MockHybridBackend {
+        async fn scope_collection(&self, _c: &str, _t: &str) -> RankResult<()> {
+            Ok(())
+        }
         async fn bm25_search(
             &self,
             _collection: &str,
@@ -2106,7 +2141,7 @@ mod tests {
 
     fn rank_req(collection: &str, query_vector: Vec<f32>, k: usize) -> RankSearchRequest {
         RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: collection.into(),
             query_vector,
             query_text: None,
@@ -2177,6 +2212,9 @@ mod tests {
         struct BrokenBackend;
         #[async_trait::async_trait]
         impl HybridSearchBackend for BrokenBackend {
+            async fn scope_collection(&self, _c: &str, _t: &str) -> RankResult<()> {
+                Ok(())
+            }
             async fn bm25_search(&self, _c: &str, _q: &str) -> RankResult<Vec<BM25Result>> {
                 Err(RankError::ModelInference {
                     model_id: "bm25".into(),
@@ -2209,6 +2247,9 @@ mod tests {
         struct WrongDimensionBackend;
         #[async_trait::async_trait]
         impl HybridSearchBackend for WrongDimensionBackend {
+            async fn scope_collection(&self, _c: &str, _t: &str) -> RankResult<()> {
+                Ok(())
+            }
             async fn bm25_search(&self, _c: &str, _q: &str) -> RankResult<Vec<BM25Result>> {
                 Ok(Vec::new())
             }
@@ -2289,6 +2330,9 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl HybridSearchBackend for CapturingBackend {
+            async fn scope_collection(&self, _c: &str, _t: &str) -> RankResult<()> {
+                Ok(())
+            }
             async fn bm25_search(&self, _c: &str, query: &str) -> RankResult<Vec<BM25Result>> {
                 *self.last_bm25_query.lock().unwrap() = Some(query.to_string());
                 Ok(vec![BM25Result {
@@ -2330,6 +2374,9 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl HybridSearchBackend for CapturingBackend {
+            async fn scope_collection(&self, _c: &str, _t: &str) -> RankResult<()> {
+                Ok(())
+            }
             async fn bm25_search(&self, _c: &str, query: &str) -> RankResult<Vec<BM25Result>> {
                 *self.last_bm25_query.lock().unwrap() = Some(query.to_string());
                 Ok(Vec::new())
@@ -2354,7 +2401,7 @@ mod tests {
     #[test]
     fn request_query_text_round_trips_through_json() {
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![0.1],
             query_text: Some("hello world".into()),
@@ -2371,7 +2418,7 @@ mod tests {
     #[test]
     fn request_query_text_omitted_from_json_when_none() {
         let req = RankSearchRequest {
-            request_tenant: None,
+            scope: RankScope::Internal,
             collection: "docs".into(),
             query_vector: vec![0.1],
             query_text: None,

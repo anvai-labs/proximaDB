@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::query::aql::{
-    AqlFrom, AqlPredicate, AqlQuery, AqlResult, AqlSource, AqlValue, AuditContext, AuditFrame,
-    AuditOp, AuditOutcome, AuditTrail, JoinType, Result, is_query_vector_field,
+    AqlFrom, AqlPredicate, AqlQuery, AqlResult, AqlScope, AqlSource, AqlValue, AuditContext,
+    AuditFrame, AuditOp, AuditOutcome, AuditTrail, JoinType, Result, is_query_vector_field,
 };
 
 use crate::services::audit_sink::{AuditEventSink, AuditRecord, EventLogAuditSink};
@@ -45,22 +45,31 @@ impl AqlExecutor {
         self.sources.insert(name, source);
     }
 
-    /// Execute an AQL query and return results along with an audit trail.
-    /// Internal (unscoped) execution; request handlers use
+    /// Execute an AQL query as explicit internal (system) work: sources resolve
+    /// collections without a tenant. Request handlers use
     /// [`Self::execute_for_tenant`].
-    pub async fn execute(&self, query: AqlQuery) -> Result<(AqlResult, AuditTrail)> {
-        self.execute_for_tenant(query, None).await
+    pub async fn execute_as_internal(&self, query: AqlQuery) -> Result<(AqlResult, AuditTrail)> {
+        self.execute_in_scope(query, AqlScope::Internal).await
     }
 
     /// Execute an AQL query for a request acting as `request_tenant`: sources
-    /// resolve collections within that tenant.
+    /// resolve collections within that tenant. An empty tenant denies.
     pub async fn execute_for_tenant(
         &self,
         query: AqlQuery,
-        request_tenant: Option<String>,
+        request_tenant: String,
+    ) -> Result<(AqlResult, AuditTrail)> {
+        self.execute_in_scope(query, AqlScope::Tenant(request_tenant))
+            .await
+    }
+
+    async fn execute_in_scope(
+        &self,
+        query: AqlQuery,
+        scope: AqlScope,
     ) -> Result<(AqlResult, AuditTrail)> {
         let mut ctx = AuditContext::new();
-        ctx.request_tenant = request_tenant;
+        ctx.scope = scope;
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

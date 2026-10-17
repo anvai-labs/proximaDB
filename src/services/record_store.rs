@@ -807,16 +807,17 @@ pub trait TableRecordStore: Send + Sync {
     /// with `None`/empty treated as the unscoped/default tenant). Required for the
     /// OLAP read-merge because the WAL `collection_id` is the bare table name (not
     /// tenant-unique), so two tenants sharing a table name would otherwise share
-    /// the feed. The default delegates to the tenant-agnostic [`read_changes_since`];
-    /// the WAL-backed store overrides it to enforce isolation.
+    /// the feed. The default returns nothing: a store that cannot filter its change
+    /// log by tenant must not serve one (never the tenant-agnostic feed). The
+    /// WAL-backed store and every store that routes to it override this.
     async fn read_changes_since_scoped(
         &self,
         collection_id: &str,
         tenant: Option<&str>,
         since_lsn: u64,
     ) -> Result<Vec<ChangeRow>> {
-        let _ = tenant;
-        self.read_changes_since(collection_id, since_lsn).await
+        let _ = (collection_id, tenant, since_lsn);
+        Ok(Vec::new())
     }
 }
 
@@ -1302,6 +1303,19 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
     ) -> Result<Vec<ChangeRow>> {
         self.iceberg_store
             .read_changes_since(collection_id, since_lsn)
+            .await
+    }
+
+    /// The tenant-filtered feed routes to the same store as the unfiltered one;
+    /// without this override the routing store would serve nothing for it.
+    async fn read_changes_since_scoped(
+        &self,
+        collection_id: &str,
+        tenant: Option<&str>,
+        since_lsn: u64,
+    ) -> Result<Vec<ChangeRow>> {
+        self.iceberg_store
+            .read_changes_since_scoped(collection_id, tenant, since_lsn)
             .await
     }
 }

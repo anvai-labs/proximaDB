@@ -953,11 +953,35 @@ impl RecordOpsService {
             .await
     }
 
-    /// Change feed: rows changed since `since_lsn` (delegates to the DML service).
-    pub async fn table_changes(&self, table: &str, since_lsn: u64) -> Result<Vec<ChangeRow>> {
+    /// Change feed: rows of `tenant`'s table changed since `since_lsn` (delegates to
+    /// the DML service). `Ok(None)` when the table is not visible to `tenant`.
+    pub async fn table_changes_for_tenant(
+        &self,
+        table: &str,
+        tenant: &str,
+        since_lsn: u64,
+    ) -> Result<Option<Vec<ChangeRow>>> {
+        // Collection catalog assets are registered in the unprefixed namespace,
+        // which is also where the default tenant's tables resolve. For the
+        // default tenant, a name that is another tenant's collection is not its
+        // table. (Named tenants resolve under their own prefix.)
+        if tenant == proximadb_tenant::DEFAULT_TENANT
+            && self
+                .collection_service
+                .collection_for_tenant(table, Some(tenant))
+                .await?
+                .is_none()
+            && self
+                .collection_service
+                .collection_internal(table)
+                .await?
+                .is_some()
+        {
+            return Ok(None);
+        }
         match self.get_dml_service() {
-            Some(dml) => dml.changes_since(table, since_lsn).await,
-            None => Ok(Vec::new()),
+            Some(dml) => dml.changes_since_for_tenant(table, tenant, since_lsn).await,
+            None => Ok(None),
         }
     }
 }

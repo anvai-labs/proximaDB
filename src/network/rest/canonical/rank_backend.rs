@@ -78,13 +78,10 @@ impl ProductionHybridBackend {
 
 #[async_trait]
 impl HybridSearchBackend for ProductionHybridBackend {
-    async fn scope_collection(
-        &self,
-        collection: &str,
-        request_tenant: Option<&str>,
-    ) -> RankResult<()> {
-        let (Some(collection_port), Some(tenant)) = (&self.collection_port, request_tenant) else {
-            return Ok(());
+    async fn scope_collection(&self, collection: &str, tenant: &str) -> RankResult<()> {
+        // Without a collection port nothing can be resolved within a tenant.
+        let Some(collection_port) = &self.collection_port else {
+            return Err(RankError::CollectionNotFound(collection.to_string()));
         };
         match collection_port
             .get_collection(collection, Some(tenant))

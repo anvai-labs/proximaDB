@@ -4559,10 +4559,11 @@ impl EmbeddedProximaDB {
                         .collect()
                 });
 
-            let response = self
-                .shared_services
-                .api_handlers
-                .execute_sql_v1(
+            // Embedded single-process use: no request tenant exists, so the
+            // statement runs as explicit internal execution.
+            let response = proximadb::query::request_scope::with_internal_scope(
+                "embedded library",
+                self.shared_services.api_handlers.execute_sql_v1(
                     query.to_string(),
                     proto_params.as_ref().map(|values| {
                         values
@@ -4572,11 +4573,12 @@ impl EmbeddedProximaDB {
                     }),
                     collection.map(str::to_string),
                     proximadb_runtime::PortIdentity::anonymous(),
-                )
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::other(e.to_string()))
-                })?;
+                ),
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::other(e.to_string()))
+            })?;
 
             Ok(Self::sql_response_to_embedded(response))
         })

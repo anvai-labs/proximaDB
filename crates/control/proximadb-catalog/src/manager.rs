@@ -771,7 +771,9 @@ impl CatalogManager {
                 .await
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.name.eq_ignore_ascii_case(&id.name))
+                // Only a table in exactly this namespace: a listing must never
+                // hand back another tenant's table.
+                .filter(|t| t.namespace == id.namespace && t.name.eq_ignore_ascii_case(&id.name))
                 .collect();
             if let [declared] = candidates.as_slice() {
                 return Ok((catalog, declared.clone()));

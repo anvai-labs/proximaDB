@@ -226,10 +226,105 @@ pub fn validate_request_tenant(tenant: &str) -> Result<(), TenantError> {
     Ok(())
 }
 
+/// Why a tenant-scoped resource key could not be composed. Returned by
+/// [`scoped_resource_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedKeyError {
+    /// The tenant is not a safe key segment (see [`validate_request_tenant`]).
+    Tenant(TenantError),
+    /// The resource name is empty.
+    EmptyName,
+    /// The resource name contains a separator or control character. A `/` in a
+    /// name would let it address another tenant's `{tenant}/{name}` key.
+    InvalidNameChar(char),
+}
+
+impl std::fmt::Display for ScopedKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScopedKeyError::Tenant(e) => write!(f, "invalid tenant: {e}"),
+            ScopedKeyError::EmptyName => write!(f, "name must not be empty"),
+            ScopedKeyError::InvalidNameChar(c) => {
+                write!(f, "name contains an invalid character: {c:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScopedKeyError {}
+
+/// Validate a tenant-clean resource name (document collection, graph id) before
+/// it is folded into a tenant-scoped key: non-empty, and free of `/`, `\` and
+/// control characters. Callers pass the name exactly as the client sent it
+/// (after URL decoding), so an encoded separator is rejected too.
+pub fn validate_scoped_resource_name(name: &str) -> Result<(), ScopedKeyError> {
+    if name.is_empty() {
+        return Err(ScopedKeyError::EmptyName);
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|&c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(ScopedKeyError::InvalidNameChar(c));
+    }
+    Ok(())
+}
+
+/// THE composition of a tenant-scoped resource key: `{tenant}/{name}`, with the
+/// default tenant left bare (`name`). Both the tenant and the name are validated
+/// first, so the first `/` of a key is always the tenant separator and a name can
+/// never address another tenant's key.
+pub fn scoped_resource_key(tenant: &str, name: &str) -> Result<String, ScopedKeyError> {
+    validate_request_tenant(tenant).map_err(ScopedKeyError::Tenant)?;
+    validate_scoped_resource_name(name)?;
+    if tenant == DEFAULT_TENANT {
+        return Ok(name.to_string());
+    }
+    Ok(format!("{tenant}/{name}"))
+}
+
+/// Inverse of [`scoped_resource_key`] for keys visible to `tenant`: the clean name
+/// when `key` belongs to `tenant`, `None` otherwise.
+pub fn unscoped_resource_name<'a>(tenant: &str, key: &'a str) -> Option<&'a str> {
+    if tenant == DEFAULT_TENANT {
+        return (!key.contains('/')).then_some(key);
+    }
+    key.strip_prefix(tenant)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proximadb_proto::proximadb_v1::CollectionConfig;
+
+    #[test]
+    fn scoped_resource_key_composes_and_rejects_separators() {
+        assert_eq!(scoped_resource_key(DEFAULT_TENANT, "docs").unwrap(), "docs");
+        assert_eq!(scoped_resource_key("acme", "docs").unwrap(), "acme/docs");
+        for name in ["", "globex/docs", "a\\b", "a\0b"] {
+            assert!(scoped_resource_key("acme", name).is_err(), "{name:?}");
+            assert!(
+                scoped_resource_key(DEFAULT_TENANT, name).is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(matches!(
+            scoped_resource_key("_sys", "docs"),
+            Err(ScopedKeyError::Tenant(_))
+        ));
+    }
+
+    #[test]
+    fn unscoped_resource_name_keeps_only_the_tenants_own_keys() {
+        assert_eq!(unscoped_resource_name("acme", "acme/docs"), Some("docs"));
+        assert_eq!(unscoped_resource_name("acme", "globex/docs"), None);
+        assert_eq!(unscoped_resource_name("acme", "acmex/docs"), None);
+        assert_eq!(unscoped_resource_name("acme", "docs"), None);
+        assert_eq!(unscoped_resource_name(DEFAULT_TENANT, "docs"), Some("docs"));
+        assert_eq!(unscoped_resource_name(DEFAULT_TENANT, "acme/docs"), None);
+    }
 
     fn collection(tags: &[&str], owner: Option<&str>) -> Collection {
         Collection {
@@ -454,6 +549,6 @@ pub use claim_vocabulary::{
 // ============================================================================
 pub mod ownership;
 pub use ownership::{
-    CollectionOwner, collection_owner, collection_visible_to, effective_owner,
-    stamp_collection_owner,
+    CollectionOwner, clear_collection_owner, collection_owner, collection_visible_to,
+    effective_owner, stamp_collection_owner,
 };

@@ -4753,9 +4753,12 @@ impl proximadb_runtime::CollectionPort for CollectionService {
     ) -> anyhow::Result<crate::proto::proximadb_v1::Collection> {
         let ctx = self.load_tenant_context(tenant_id)?;
         // Stamp the creating tenant as owner (the tenant-context path below
-        // does the same when a context exists).
-        if let Some(tenant) = tenant_id {
-            proximadb_tenant::stamp_collection_owner(&mut config, tenant);
+        // does the same when a context exists). Without a creating tenant the
+        // owner is never taken from the config: client-supplied owner signals
+        // are dropped.
+        match tenant_id {
+            Some(tenant) => proximadb_tenant::stamp_collection_owner(&mut config, tenant),
+            None => proximadb_tenant::clear_collection_owner(&mut config),
         }
         let resp = self
             .create_collection_with_tenant_context(&config, ctx.as_ref())

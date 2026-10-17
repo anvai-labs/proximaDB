@@ -73,7 +73,7 @@ impl RankServiceImpl {
         let request_tenant = crate::network::grpc::auth::resolved_tenant_id(&request)?;
         let proto_req = request.into_inner();
         let mut rest_req = proto_to_rest_request(proto_req);
-        rest_req.request_tenant = Some(request_tenant);
+        rest_req.scope = crate::network::rest::canonical::rank::RankScope::Tenant(request_tenant);
         let second_phase_scorer = rest_req
             .rank_profile
             .as_deref()
@@ -109,7 +109,7 @@ fn proto_to_rest_request(p: proto_ranking::RankSearchRequest) -> RankSearchReque
         k: p.k as usize,
         rank_profile: p.rank_profile,
         rank_overrides: p.rank_overrides.map(proto_to_rest_overrides),
-        request_tenant: None,
+        scope: crate::network::rest::canonical::rank::RankScope::Unset,
     }
 }
 

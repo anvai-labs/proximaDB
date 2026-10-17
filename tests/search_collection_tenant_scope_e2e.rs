@@ -1200,3 +1200,471 @@ async fn every_collection_surface_is_scoped_to_the_request_tenant() {
         failures.join("\n  ")
     );
 }
+
+/// Compares a probe at a foreign resource with the same probe at a missing
+/// one; records a failure when they differ, when the owner's value is visible, or —
+/// with `served_is_failure` — when the probe succeeded. (A write that creates
+/// the resource in the caller's own namespace succeeds for both.)
+fn compare_probe(
+    failures: &mut Vec<String>,
+    secret: &str,
+    label: &str,
+    foreign: (reqwest::StatusCode, String),
+    missing: (reqwest::StatusCode, String),
+    foreign_id: &str,
+    missing_id: &str,
+    served_is_failure: bool,
+) {
+    let foreign_seen = normalise(foreign.0.to_string(), &foreign.1, foreign_id);
+    let missing_seen = normalise(missing.0.to_string(), &missing.1, missing_id);
+    if foreign_seen != missing_seen {
+        failures.push(format!(
+            "{label}: foreign {foreign_seen:?}\n      vs missing {missing_seen:?}"
+        ));
+    }
+    if served_is_failure && foreign.0.is_success() {
+        failures.push(format!("{label}: served: {} {}", foreign.0, foreign.1));
+    }
+    if foreign.1.contains(secret) {
+        failures.push(format!("{label}: owner's value visible: {}", foreign.1));
+    }
+}
+
+/// Tenant-owned resources beyond collection records — the change feed,
+/// document collections, graphs, collection pins and cache affinity, and the
+/// AQL document source — are reachable only by their owner: another tenant (or
+/// a request with no tenant header) sees them exactly as it sees something
+/// missing, cannot change them, and does not see them listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
+    const SECRET: &str = "owner-only-value";
+    let server = Server::start().await.expect("server start");
+    let rest = Rest {
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .expect("http client"),
+        base: format!("http://127.0.0.1:{}", server.rest_port),
+    };
+    let mut failures: Vec<String> = Vec::new();
+    // --- Change feed. globex and acme each own a table named `orders`;
+    // globex alone owns `gx_orders`.
+    let pg = |tenant: &'static str| {
+        let conn = format!(
+            "host=127.0.0.1 port={} user=postgres dbname={tenant} sslmode=disable",
+            server.pg_port
+        );
+        async move {
+            let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+                .await
+                .expect("pgwire connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        }
+    };
+    let globex_pg = pg(GLOBEX).await;
+    let acme_pg = pg(ACME).await;
+    for sql in [
+        "CREATE TABLE gx_orders (id INT PRIMARY KEY, note TEXT)".to_string(),
+        format!("INSERT INTO gx_orders (id, note) VALUES (1, '{SECRET}')"),
+        "CREATE TABLE orders (id INT PRIMARY KEY, note TEXT)".to_string(),
+        format!("INSERT INTO orders (id, note) VALUES (1, '{SECRET}')"),
+    ] {
+        globex_pg.simple_query(&sql).await.expect("globex pgwire");
+    }
+    for sql in [
+        "CREATE TABLE orders (id INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO orders (id, note) VALUES (2, 'acme-row')",
+    ] {
+        acme_pg.simple_query(sql).await.expect("acme pgwire");
+    }
+    sleep(Duration::from_millis(300)).await;
+    let feed = |c: &str| format!("/api/v2/collections/{c}/changes?since_lsn=0");
+    for (who, tenant) in [("acme", Some(ACME)), ("no tenant header", None)] {
+        compare_probe(
+            &mut failures,
+            SECRET,
+            &format!("change feed as {who}"),
+            rest.call(tenant, reqwest::Method::GET, &feed("gx_orders"), None)
+                .await,
+            rest.call(tenant, reqwest::Method::GET, &feed("missing_orders"), None)
+                .await,
+            "gx_orders",
+            "missing_orders",
+            true,
+        );
+    }
+    let (status, body) = rest
+        .call(Some(ACME), reqwest::Method::GET, &feed("orders"), None)
+        .await;
+    if !status.is_success() || body.contains(SECRET) || !body.contains("acme-row") {
+        failures.push(format!(
+            "change feed of acme's own `orders` must carry only acme's rows: {status} {body}"
+        ));
+    }
+    let (status, body) = rest
+        .call(Some(GLOBEX), reqwest::Method::GET, &feed("gx_orders"), None)
+        .await;
+    if !status.is_success() || !body.contains(SECRET) {
+        failures.push(format!("change feed as owner: {status} {body}"));
+    }
+    // The default tenant reads its own feed: pgwire database `default` and a
+    // REST request with no tenant header are both the default tenant.
+    let default_pg = pg("default").await;
+    for sql in [
+        "CREATE TABLE df_orders (id INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO df_orders (id, note) VALUES (7, 'default-row')",
+    ] {
+        default_pg.simple_query(sql).await.expect("default pgwire");
+    }
+    sleep(Duration::from_millis(300)).await;
+    let (status, body) = rest
+        .call(None, reqwest::Method::GET, &feed("df_orders"), None)
+        .await;
+    if !status.is_success() || !body.contains("default-row") {
+        failures.push(format!(
+            "change feed for the default tenant: {status} {body}"
+        ));
+    }
+    let (status, body) = rest
+        .call(Some(ACME), reqwest::Method::GET, &feed("df_orders"), None)
+        .await;
+    if status.is_success() || body.contains("default-row") {
+        failures.push(format!(
+            "default tenant's change feed as acme: {status} {body}"
+        ));
+    }
+
+    // --- Document collections. globex owns `gxdocs` and the AQL-addressable
+    // collection `document`.
+    let docs = "/api/v2/document-collections";
+    for collection in ["gxdocs", "document"] {
+        let (status, body) = rest
+            .call(
+                Some(GLOBEX),
+                reqwest::Method::POST,
+                &format!("{docs}/{collection}/documents"),
+                Some(json!({ "id": "doc1", "document": { "secret": SECRET } })),
+            )
+            .await;
+        assert!(
+            status.is_success(),
+            "globex document insert into {collection}: {status} {body}"
+        );
+    }
+    let globex_doc = |rest: &Rest| {
+        let http = rest.http.clone();
+        let url = format!("{}{docs}/gxdocs/documents/doc1", rest.base);
+        async move {
+            let response = http
+                .get(url)
+                .header("X-Tenant-ID", GLOBEX)
+                .send()
+                .await
+                .expect("globex doc get");
+            (response.status(), response.text().await.unwrap_or_default())
+        }
+    };
+    let (status, body) = globex_doc(&rest).await;
+    assert!(
+        status.is_success() && body.contains(SECRET),
+        "owner reads its document: {status} {body}"
+    );
+    // Listings and lookups first, before acme's own writes below create
+    // same-named collections in acme's namespace.
+    let (status, body) = rest
+        .call(Some(ACME), reqwest::Method::GET, docs, None)
+        .await;
+    if body.contains("gxdocs") || body.contains("globex") {
+        failures.push(format!(
+            "document collection listing as acme: {status} {body}"
+        ));
+    }
+    compare_probe(
+        &mut failures,
+        SECRET,
+        "document collection info",
+        rest.call(
+            Some(ACME),
+            reqwest::Method::GET,
+            &format!("{docs}/gxdocs"),
+            None,
+        )
+        .await,
+        rest.call(
+            Some(ACME),
+            reqwest::Method::GET,
+            &format!("{docs}/missing_gxdocs"),
+            None,
+        )
+        .await,
+        "gxdocs",
+        "missing_gxdocs",
+        true,
+    );
+    for (label, method, payload) in [
+        ("get document", reqwest::Method::GET, None),
+        (
+            "insert document",
+            reqwest::Method::POST,
+            Some(json!({ "id": "planted", "document": { "planted": true } })),
+        ),
+        ("delete document", reqwest::Method::DELETE, None),
+    ] {
+        let path = |c: &str| match method {
+            reqwest::Method::POST => format!("{docs}/{c}/documents"),
+            _ => format!("{docs}/{c}/documents/doc1"),
+        };
+        compare_probe(
+            &mut failures,
+            SECRET,
+            &format!("document {label} by name"),
+            rest.call(Some(ACME), method.clone(), &path("gxdocs"), payload.clone())
+                .await,
+            rest.call(
+                Some(ACME),
+                method.clone(),
+                &path("missing_gxdocs"),
+                payload.clone(),
+            )
+            .await,
+            "gxdocs",
+            "missing_gxdocs",
+            method == reqwest::Method::GET,
+        );
+        // A separator in the name, literal-encoded or not, never addresses
+        // another tenant's storage key — for a named tenant or the default one.
+        for tenant in [Some(ACME), None] {
+            for encoded in ["globex%2Fgxdocs", "globex%252Fgxdocs"] {
+                let (status, body) = rest
+                    .call(tenant, method.clone(), &path(encoded), payload.clone())
+                    .await;
+                // The single-encoded form decodes to a name with a separator,
+                // which is rejected; the double-encoded form is an ordinary
+                // (if odd) name in the caller's own namespace.
+                let separator = encoded == "globex%2Fgxdocs";
+                if (separator && status.is_success()) || body.contains(SECRET) {
+                    failures.push(format!(
+                        "document {label} via {encoded} as {tenant:?}: {status} {body}"
+                    ));
+                }
+            }
+        }
+    }
+    let (status, body) = globex_doc(&rest).await;
+    if !status.is_success() || !body.contains(SECRET) || body.contains("planted") {
+        failures.push(format!(
+            "globex's document changed after acme's probes: {status} {body}"
+        ));
+    }
+    // The AQL document source reads only the request tenant's collection.
+    let aql = json!({ "query": {
+        "find": { "projections": [] },
+        "from": { "Source": { "name": "document", "alias": null } },
+        "where_clause": { "predicate": null },
+    }});
+    let (status, body) = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::POST,
+            "/api/v2/aql/execute",
+            Some(aql.clone()),
+        )
+        .await;
+    if body.contains(SECRET) {
+        failures.push(format!("AQL document source as acme: {status} {body}"));
+    }
+
+    // --- Graphs. The default tenant (no header) owns `gx_graph`.
+    let (status, body) = rest
+        .call(
+            None,
+            reqwest::Method::POST,
+            "/api/v2/graphs",
+            Some(json!({ "graph_id": "gx_graph" })),
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "default-tenant graph create: {status} {body}"
+    );
+    let (status, body) = rest
+        .call(
+            None,
+            reqwest::Method::POST,
+            "/api/v2/graphs/gx_graph/nodes",
+            Some(json!({ "node": { "id": "n1", "labels": ["L"], "properties": { "secret": SECRET } } })),
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "default-tenant node create: {status} {body}"
+    );
+    let (status, body) = rest
+        .call(Some(ACME), reqwest::Method::GET, "/api/v2/graphs", None)
+        .await;
+    if body.contains("gx_graph") {
+        failures.push(format!("graph listing as acme: {status} {body}"));
+    }
+    for (label, method, path, payload) in [
+        (
+            "graph get",
+            reqwest::Method::GET,
+            (|g: &str| format!("/api/v2/graphs/{g}")) as fn(&str) -> String,
+            None,
+        ),
+        (
+            "graph node get",
+            reqwest::Method::GET,
+            |g| format!("/api/v2/graphs/{g}/nodes/n1"),
+            None,
+        ),
+        (
+            "graph node delete",
+            reqwest::Method::DELETE,
+            |g| format!("/api/v2/graphs/{g}/nodes/n1"),
+            None,
+        ),
+        (
+            "graph stats",
+            reqwest::Method::GET,
+            |g| format!("/api/v2/graphs/{g}/stats"),
+            None,
+        ),
+        (
+            "graph node create",
+            reqwest::Method::POST,
+            |g| format!("/api/v2/graphs/{g}/nodes"),
+            Some(json!({ "node": { "id": "planted", "labels": ["L"] } })),
+        ),
+    ] {
+        compare_probe(
+            &mut failures,
+            SECRET,
+            label,
+            rest.call(
+                Some(ACME),
+                method.clone(),
+                &path("gx_graph"),
+                payload.clone(),
+            )
+            .await,
+            rest.call(
+                Some(ACME),
+                method.clone(),
+                &path("missing_graph"),
+                payload.clone(),
+            )
+            .await,
+            "gx_graph",
+            "missing_graph",
+            !matches!(label, "graph stats" | "graph node create"),
+        );
+    }
+    let (status, body) = rest
+        .call(
+            None,
+            reqwest::Method::GET,
+            "/api/v2/graphs/gx_graph/nodes/n1",
+            None,
+        )
+        .await;
+    if !status.is_success() || !body.contains(SECRET) {
+        failures.push(format!(
+            "graph node changed after acme's probes: {status} {body}"
+        ));
+    }
+
+    // --- Pinning and cache affinity on globex's collection.
+    rest.create(Some(GLOBEX), GLOBEX_DOCS).await;
+    let pin = |c: &str| format!("/api/v2/collections/{c}/pin");
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::PATCH,
+            &pin(GLOBEX_DOCS),
+            Some(json!({ "pinned": true, "target": "nvme_ssd" })),
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "globex pins its collection: {status} {body}"
+    );
+    for (label, method, path, payload) in [
+        (
+            "pin read",
+            reqwest::Method::GET,
+            pin as fn(&str) -> String,
+            None,
+        ),
+        (
+            "unpin",
+            reqwest::Method::PATCH,
+            pin,
+            Some(json!({ "pinned": false })),
+        ),
+        (
+            "affinity read",
+            reqwest::Method::GET,
+            |c| format!("/api/v2/collections/{c}/affinity"),
+            None,
+        ),
+        (
+            "affinity drop",
+            reqwest::Method::DELETE,
+            |c| format!("/api/v2/collections/{c}/affinity"),
+            None,
+        ),
+    ] {
+        compare_probe(
+            &mut failures,
+            SECRET,
+            label,
+            rest.call(
+                Some(ACME),
+                method.clone(),
+                &path(GLOBEX_DOCS),
+                payload.clone(),
+            )
+            .await,
+            rest.call(
+                Some(ACME),
+                method.clone(),
+                &path(MISSING_DOCS),
+                payload.clone(),
+            )
+            .await,
+            GLOBEX_DOCS,
+            MISSING_DOCS,
+            true,
+        );
+    }
+    for listing in [
+        "/api/v2/collections/pinning",
+        "/api/v2/collections/affinity",
+    ] {
+        let (status, body) = rest
+            .call(Some(ACME), reqwest::Method::GET, listing, None)
+            .await;
+        if body.contains(GLOBEX_DOCS) {
+            failures.push(format!("{listing} as acme: {status} {body}"));
+        }
+    }
+    let (status, body) = rest
+        .call(Some(GLOBEX), reqwest::Method::GET, &pin(GLOBEX_DOCS), None)
+        .await;
+    if !body.contains("\"pinned\"") {
+        failures.push(format!(
+            "globex's pin changed after acme's probes: {status} {body}"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "tenant-owned resources must be reachable only by their owner:\n  {}",
+        failures.join("\n  ")
+    );
+}

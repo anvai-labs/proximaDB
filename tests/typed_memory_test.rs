@@ -114,7 +114,7 @@ async fn test_aql_type_filtering_logic() {
         },
     };
 
-    let (result, trail) = executor.execute(query).await.unwrap();
+    let (result, trail) = executor.execute_as_internal(query).await.unwrap();
 
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
@@ -196,7 +196,7 @@ async fn test_aql_jsonb_filtering() {
         },
     };
 
-    let (result, _) = executor.execute(query).await.unwrap();
+    let (result, _) = executor.execute_as_internal(query).await.unwrap();
 
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
@@ -292,7 +292,10 @@ async fn test_aql_type_filtering_reduces_topic_bleed() {
         },
     };
 
-    let (unfiltered, _) = executor.execute(query_without_type).await.unwrap();
+    let (unfiltered, _) = executor
+        .execute_as_internal(query_without_type)
+        .await
+        .unwrap();
     assert_eq!(unfiltered.rows.len(), 3);
 
     let query_with_type = AqlQuery {
@@ -319,7 +322,7 @@ async fn test_aql_type_filtering_reduces_topic_bleed() {
         },
     };
 
-    let (filtered, _) = executor.execute(query_with_type).await.unwrap();
+    let (filtered, _) = executor.execute_as_internal(query_with_type).await.unwrap();
     assert_eq!(filtered.rows.len(), 1);
     assert_eq!(
         filtered.rows[0].get("id"),
@@ -416,7 +419,10 @@ async fn test_aql_type_filtering_preserves_intent_recall() {
         },
     };
 
-    let (decision_rows, _) = executor.execute(decision_context_query).await.unwrap();
+    let (decision_rows, _) = executor
+        .execute_as_internal(decision_context_query)
+        .await
+        .unwrap();
     assert_eq!(
         decision_rows.rows.len(),
         2,
@@ -553,7 +559,7 @@ async fn test_aql_type_filtering_integration_full_path() {
         },
     };
 
-    let (result, trail) = executor.execute(query).await.unwrap();
+    let (result, trail) = executor.execute_as_internal(query).await.unwrap();
 
     assert_eq!(
         result.rows.len(),

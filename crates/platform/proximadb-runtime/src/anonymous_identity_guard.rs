@@ -98,18 +98,85 @@ mod tests {
         }
     }
 
+    /// Uses of the borrowed form's tenant-less default (`Default` is derived).
+    /// Excludes the owned form, whose name ends with the same text.
+    const ALLOWED_BORROWED_DEFAULT: &[(&str, usize, &str)] = &[(
+        "src/services/dml/tests.rs",
+        4,
+        "unit tests of the identity carrier",
+    )];
+
+    /// Struct literals of either identity spelling `tenant_id: None`.
+    const ALLOWED_TENANTLESS_LITERAL: &[(&str, usize, &str)] = &[];
+
     fn check(needle: &str, allowlist: &[(&str, usize, &str)]) {
+        check_with(|text| text.matches(needle).count(), allowlist);
+    }
+
+    /// The borrowed form's `default()` constructor, excluding the owned form.
+    fn borrowed_defaults(text: &str) -> usize {
+        let needle = format!("PortIdentity::{}()", "default");
+        text.match_indices(&needle)
+            .filter(|(at, _)| !text[..*at].ends_with("Owned"))
+            .count()
+    }
+
+    /// Struct literals `PortIdentity { .. }` / `OwnedPortIdentity { .. }` whose
+    /// body sets `tenant_id: None` (whitespace-insensitive).
+    fn tenantless_literals(text: &str) -> usize {
+        let opener = format!("PortIdentity {}", "{");
+        let mut count = 0;
+        for (at, _) in text.match_indices(&opener) {
+            // Skip the type definitions and impl headers.
+            let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+            let line = &text[line_start..at];
+            if line.contains("struct ") || line.contains("impl") || line.contains("for ") {
+                continue;
+            }
+            let body_start = at + opener.len();
+            let mut depth = 1usize;
+            let mut end = body_start;
+            for (offset, c) in text[body_start..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = body_start + offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let body: String = text[body_start..end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if body.contains(&format!("tenant_id:{}", "None")) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn check_with(count_in: impl Fn(&str) -> usize, allowlist: &[(&str, usize, &str)]) {
         let root = workspace_root();
         let mut files = Vec::new();
         for top in ["src", "crates", "apps"] {
             rust_files(&root.join(top), &mut files);
         }
+        assert!(
+            !files.is_empty(),
+            "guard found no sources under {}: the workspace layout changed",
+            root.display()
+        );
         let mut found: BTreeMap<String, usize> = BTreeMap::new();
         for file in files {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            let count = text.matches(&needle).count();
+            let count = count_in(&text);
             if count > 0 {
                 let rel = file
                     .strip_prefix(&root)
@@ -118,9 +185,11 @@ mod tests {
                 found.insert(rel, count);
             }
         }
+        // A guard with listed uses must still find them; one with none listed
+        // passes on finding none.
         assert!(
-            !found.is_empty(),
-            "guard scanned nothing under {}: the workspace layout changed",
+            allowlist.is_empty() || !found.is_empty(),
+            "guard matched nothing under {}: the pattern or layout changed",
             root.display()
         );
         let allowed: BTreeMap<String, usize> = allowlist
@@ -154,5 +223,32 @@ mod tests {
             &format!("OwnedPortIdentity::{}()", "default"),
             ALLOWED_OWNED_DEFAULT,
         );
+    }
+
+    #[test]
+    fn tenant_less_borrowed_identity_defaults_are_all_listed() {
+        check_with(borrowed_defaults, ALLOWED_BORROWED_DEFAULT);
+    }
+
+    #[test]
+    fn tenant_less_identity_literals_are_all_listed() {
+        check_with(tenantless_literals, ALLOWED_TENANTLESS_LITERAL);
+    }
+
+    #[test]
+    fn tenantless_literal_detector_catches_the_spellings() {
+        let src = format!(
+            "let a = PortIdentity {{ tenant_id: {n}, subject }};\n\
+             let b = proximadb_runtime::OwnedPortIdentity {{\n    tenant_id:   {n},\n}};\n\
+             let c = PortIdentity {{ tenant_id: Some(t) }};\n\
+             pub struct PortIdentity {{ pub tenant_id: Option<u8> }}\n",
+            n = "None"
+        );
+        assert_eq!(tenantless_literals(&src), 2);
+        let defaults = format!(
+            "PortIdentity::{d}(); OwnedPortIdentity::{d}();",
+            d = "default"
+        );
+        assert_eq!(borrowed_defaults(&defaults), 1);
     }
 }

@@ -3063,10 +3063,16 @@ impl VectorOperationsService {
         tenant_stable_id: Option<u64>,
         auth_class: proximadb_tenant::AuthClass,
     ) -> Result<Vec<crate::proto::proximadb_v1::SearchResult>> {
-        let resolved = match request_tenant {
+        // No tenant: the scope in force decides (internal ⇒ unscoped; a request
+        // scope ⇒ its tenant; no scope ⇒ not found).
+        let scope_tenant = match request_tenant.filter(|t| !t.is_empty()) {
+            Some(tenant) => Some(tenant.to_string()),
+            None => crate::query::request_scope::resolution_tenant(collection_id)?,
+        };
+        let resolved = match scope_tenant {
             Some(tenant) => self
                 .collection_port
-                .get_collection(collection_id, Some(tenant))
+                .get_collection(collection_id, Some(&tenant))
                 .await?
                 .map(|collection| collection.id)
                 .ok_or_else(|| super::input_validation::CollectionNotFound::new(collection_id))?,
@@ -6816,7 +6822,13 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
         // A request resolves the collection within its tenant; a collection
         // this tenant may not resolve is answered exactly like a missing one
         // (no fallback to an unscoped lookup).
-        if let Some(tid) = tenant_id.filter(|t| !t.is_empty()) {
+        // A tenant-less identity takes the scope in force: internal ⇒ unscoped,
+        // a request scope ⇒ its tenant, no scope ⇒ not found.
+        let scope_tenant = match tenant_id.filter(|t| !t.is_empty()) {
+            Some(tid) => Some(tid.to_string()),
+            None => crate::query::request_scope::resolution_tenant(&requested_collection)?,
+        };
+        if let Some(tid) = scope_tenant.as_deref() {
             let collection = self
                 .collection_port
                 .get_collection(&request.collection_id, Some(tid))
@@ -6861,9 +6873,13 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
             "{}",
             route.explain_line()
         );
-        let tenant_ctx = identity
-            .tenant_id
-            .filter(|t| !t.is_empty())
+        // A tenant-less identity takes the scope in force (see `search`).
+        let scope_tenant = match identity.tenant_id.filter(|t| !t.is_empty()) {
+            Some(tid) => Some(tid.to_string()),
+            None => crate::query::request_scope::resolution_tenant(&search.collection)?,
+        };
+        let tenant_ctx = scope_tenant
+            .as_deref()
             .map(crate::storage::tenant::context::TenantContext::for_tenant_id);
 
         #[cfg(feature = "abac-policy")]

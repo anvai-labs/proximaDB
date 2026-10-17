@@ -166,8 +166,8 @@ pub use vector_search::{SearchParameters, VectorSearchQuery, VectorSearchResult}
 
 // Re-export AQL types - TD-050 RUBICON
 pub use aql::{
-    AqlFind, AqlFrom, AqlPredicate, AqlProjection, AqlQuery, AqlResult, AqlSource, AqlValue,
-    AqlWhere, AuditContext, AuditFrame, AuditOp, AuditOutcome, AuditTrail,
+    AqlFind, AqlFrom, AqlPredicate, AqlProjection, AqlQuery, AqlResult, AqlScope, AqlSource,
+    AqlValue, AqlWhere, AuditContext, AuditFrame, AuditOp, AuditOutcome, AuditTrail,
     DataModel as AqlDataModel, JoinType as AqlJoinType,
 };
 

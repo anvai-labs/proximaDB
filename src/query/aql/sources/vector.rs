@@ -158,6 +158,7 @@ impl AqlSource for VectorAqlSource {
                     .to_string(),
             ));
         }
+        let tenant = ctx.resolution_tenant(&collection)?;
         let start = Instant::now();
 
         // Perform vector search
@@ -166,7 +167,7 @@ impl AqlSource for VectorAqlSource {
             .vector_ops
             .unified_search_v1_for_tenant(
                 &collection,
-                ctx.request_tenant.as_deref(),
+                tenant,
                 vector,
                 top_k as usize,
                 None, // No filter pushdown implemented in this skeleton

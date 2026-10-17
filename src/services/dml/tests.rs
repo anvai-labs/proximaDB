@@ -1309,11 +1309,23 @@ async fn cdc_change_feed_reports_ops_since_lsn() {
     .expect("create namespace");
 
     let parser = crate::query::sql_frontend::SqlFrontendParser::new();
-    let ddl_stmt = parser
-        .parse_ddl("CREATE TABLE acct (id TEXT NOT NULL, bal INT, PRIMARY KEY (id));")
-        .expect("parse create")
-        .expect("ddl");
-    ddl.execute(ddl_stmt).await.expect("create table");
+    // The default tenant and acme each own a table named `acct`; only globex
+    // owns `gxonly`.
+    for (tenant, table) in [
+        (proximadb_tenant::DEFAULT_TENANT, "acct"),
+        ("acme", "acct"),
+        ("globex", "gxonly"),
+    ] {
+        let ddl_stmt = parser
+            .parse_ddl(&format!(
+                "CREATE TABLE {table} (id TEXT NOT NULL, bal INT, PRIMARY KEY (id));"
+            ))
+            .expect("parse create")
+            .expect("ddl");
+        ddl.execute_scoped(ddl_stmt, Some(tenant))
+            .await
+            .expect("create table");
+    }
 
     let wal_appender = Arc::new(
         FramedTableWalAppender::open(&wal_path)
@@ -1330,21 +1342,30 @@ async fn cdc_change_feed_reports_ops_since_lsn() {
         Arc::new(PlannedOnlyTableWriteExecutor::new()),
     );
 
-    let run = |sql: &str| {
+    let run = |sql: &str, tenant: &str| {
         let parser = &parser;
         let dml = &dml;
         let sql = sql.to_string();
+        let ctx = TenantContext::for_tenant_id(tenant);
         async move {
             let stmt = parser.parse_dml(&sql).expect("parse dml").expect("dml");
-            dml.execute(stmt).await.expect("execute dml")
+            dml.execute_scoped(stmt, Some(&ctx))
+                .await
+                .expect("execute dml")
         }
     };
-    run("INSERT INTO acct (id, bal) VALUES ('a', 100);").await;
-    run("UPDATE acct SET bal = 150 WHERE id = 'a';").await;
-    run("DELETE FROM acct WHERE id = 'a';").await;
+    let default = proximadb_tenant::DEFAULT_TENANT;
+    run("INSERT INTO acct (id, bal) VALUES ('a', 100);", default).await;
+    run("INSERT INTO acct (id, bal) VALUES ('z', 1);", "acme").await;
+    run("UPDATE acct SET bal = 150 WHERE id = 'a';", default).await;
+    run("DELETE FROM acct WHERE id = 'a';", default).await;
 
     // Full feed from the beginning: upsert, upsert (update), delete — lsn-ordered.
-    let changes = dml.changes_since("acct", 0).await.expect("changes");
+    let changes = dml
+        .changes_since_for_tenant("acct", proximadb_tenant::DEFAULT_TENANT, 0)
+        .await
+        .expect("changes")
+        .expect("table visible to the default tenant");
     assert_eq!(changes.len(), 3, "three changes: insert, update, delete");
     assert_eq!(changes[0].op, "upsert");
     assert_eq!(changes[1].op, "upsert");
@@ -1357,17 +1378,52 @@ async fn cdc_change_feed_reports_ops_since_lsn() {
 
     // Incremental: only changes after the first lsn (the two later ops).
     let tail = dml
-        .changes_since("acct", changes[0].lsn)
+        .changes_since_for_tenant("acct", proximadb_tenant::DEFAULT_TENANT, changes[0].lsn)
         .await
-        .expect("tail");
+        .expect("tail")
+        .expect("visible");
     assert_eq!(tail.len(), 2, "since first lsn → update + delete only");
 
-    // A different table sees nothing.
+    // A table that does not exist is not visible.
     assert!(
-        dml.changes_since("other", 0)
+        dml.changes_since_for_tenant("other", proximadb_tenant::DEFAULT_TENANT, 0)
             .await
             .expect("other")
-            .is_empty()
+            .is_none()
+    );
+
+    // Each tenant's feed of its own `acct` carries only its own writes, and a
+    // tenant with no such table sees it as missing.
+    let acme = dml
+        .changes_since_for_tenant("acct", "acme", 0)
+        .await
+        .expect("acme")
+        .expect("acme's own table");
+    assert_eq!(
+        acme.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+        vec!["z"]
+    );
+    assert!(changes.iter().all(|c| c.key == "a"), "{changes:?}");
+    assert!(
+        dml.changes_since_for_tenant("acct", "globex", 0)
+            .await
+            .expect("globex")
+            .is_none()
+    );
+    for tenant in [proximadb_tenant::DEFAULT_TENANT, "acme"] {
+        assert!(
+            dml.changes_since_for_tenant("gxonly", tenant, 0)
+                .await
+                .expect("gxonly")
+                .is_none(),
+            "{tenant} must not resolve globex's table"
+        );
+    }
+    assert!(
+        dml.changes_since_for_tenant("acct", "", 0)
+            .await
+            .expect("empty tenant")
+            .is_none()
     );
 }
 

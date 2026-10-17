@@ -87,7 +87,8 @@ pub async fn export_rank_features_to_arrow_ipc(
 
     // The collection is resolved within the caller's tenant (never from the
     // request body).
-    request.request_tenant = Some(request_tenant.to_string());
+    request.scope =
+        crate::network::rest::canonical::rank::RankScope::Tenant(request_tenant.to_string());
 
     // Resolve match_features + summary_features column order from the
     // active profile BEFORE the pipeline runs — we need stable Arrow

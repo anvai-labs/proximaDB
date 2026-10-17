@@ -150,6 +150,9 @@ pub type EdgeId = String;
 pub fn scoped_graph_id(tenant: &str, graph_id: &str) -> anyhow::Result<String> {
     proximadb_tenant::validate_request_tenant(tenant)
         .map_err(|e| anyhow::anyhow!("invalid tenant '{tenant}': {e}"))?;
+    // A `/` in the graph id would address another tenant's `{tenant}/{graph_id}` key.
+    proximadb_tenant::validate_scoped_resource_name(graph_id)
+        .map_err(|e| anyhow::anyhow!("invalid graph id: {e}"))?;
     // The default tenant stays UNSCOPED (bare `graph_id`). Graph node/edge ops resolve the
     // backing engine through `get_or_create_graph_engine`, which requires the collection to
     // already exist in `collection_service` — and graph collection CREATION is not yet

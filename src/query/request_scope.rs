@@ -50,17 +50,17 @@ pub async fn with_internal_scope<F: std::future::Future>(
 }
 
 /// Run `future` in the scope of a port identity: its tenant when it carries
-/// one; otherwise the scope already in force; otherwise internal (an
-/// anonymous identity — every request-path use is listed by the
-/// anonymous-identity guard).
+/// one; otherwise the scope already in force; otherwise **no scope**, so
+/// collection resolution inside denies. A tenant-less identity never becomes
+/// internal on its own: internal execution is established explicitly with
+/// [`with_internal_scope`].
 pub async fn with_identity_scope<F: std::future::Future>(
     tenant: Option<&str>,
     future: F,
 ) -> F::Output {
-    match (tenant, current_scope()) {
-        (Some(tenant), _) => with_request_tenant(tenant, future).await,
-        (None, Some(_)) => future.await,
-        (None, None) => with_internal_scope("anonymous port identity", future).await,
+    match tenant.filter(|tenant| !tenant.is_empty()) {
+        Some(tenant) => with_request_tenant(tenant, future).await,
+        None => future.await,
     }
 }
 
@@ -127,7 +127,17 @@ mod tests {
         })
         .await;
         assert_eq!(explicit, Some(RequestScope::Tenant("globex".into())));
-        let bare = with_identity_scope(None, async { current_scope() }).await;
-        assert!(matches!(bare, Some(RequestScope::Internal(_))));
+        // A tenant-less identity with no outer scope stays unscoped and denies.
+        let bare =
+            with_identity_scope(None, async { (current_scope(), resolution_tenant("docs")) }).await;
+        assert_eq!(bare.0, None);
+        assert!(bare.1.is_err(), "no scope must deny");
+        let empty = with_identity_scope(Some(""), async { current_scope() }).await;
+        assert_eq!(empty, None);
+        let internal = with_internal_scope("test", async {
+            with_identity_scope(None, async { current_scope() }).await
+        })
+        .await;
+        assert!(matches!(internal, Some(RequestScope::Internal(_))));
     }
 }

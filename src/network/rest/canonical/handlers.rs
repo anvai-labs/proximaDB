@@ -1616,10 +1616,12 @@ fn operator_and_control_v2_routes() -> axum::Router<AppState> {
                         Ok(Json(mut req)) => {
                             // Candidates resolve the collection within the
                             // request tenant (absent ⇒ the default tenant).
-                            req.request_tenant =
-                                Some(tenant.map(|axum::Extension(t)| t.tenant_id).unwrap_or_else(
-                                    || proximadb_tenant::DEFAULT_TENANT.to_string(),
-                                ));
+                            req.scope =
+                                crate::network::rest::canonical::rank::RankScope::Tenant(
+                                    tenant.map(|axum::Extension(t)| t.tenant_id).unwrap_or_else(
+                                        || proximadb_tenant::DEFAULT_TENANT.to_string(),
+                                    ),
+                                );
                             match crate::network::rest::canonical::rank::rank_search_dispatch(
                                 state, req,
                             )

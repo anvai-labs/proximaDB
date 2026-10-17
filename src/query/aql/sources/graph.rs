@@ -85,10 +85,17 @@ impl AqlSource for GraphAqlSource {
 
     async fn execute(&self, query: &AqlQuery, ctx: &mut AuditContext) -> Result<AqlResult> {
         let (graph_id, depth) = self.extract_graph_params(query);
+        // The engine key is composed within the request tenant (as the graph
+        // surfaces do); internal execution reads the id as given.
+        let engine_key = match ctx.resolution_tenant(&graph_id)? {
+            Some(tenant) => crate::graph::scoped_graph_id(tenant, &graph_id)
+                .map_err(|_| crate::query::aql::collection_not_found(&graph_id))?,
+            None => graph_id.clone(),
+        };
         let start = Instant::now();
 
         let traversal_request = crate::proto::proximadb_v1::TraversalRequest {
-            graph_id: graph_id.clone(),
+            graph_id: engine_key.clone(),
             start_node_id: "root".to_string(),
             max_depth: depth,
             edge_types: Vec::new(),
@@ -102,7 +109,7 @@ impl AqlSource for GraphAqlSource {
 
         let traversal_result = self
             .graph_svc
-            .traverse(&graph_id, traversal_request)
+            .traverse(&engine_key, traversal_request)
             .await
             .map_err(|e| {
                 // Not an SST engine error — wraps a downstream graph
