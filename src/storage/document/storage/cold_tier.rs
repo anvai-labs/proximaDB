@@ -17,6 +17,10 @@ use crate::storage::document::DocumentRecord;
 use crate::storage::traits::{StorageQueryContext, UnifiedStorageFormat};
 use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
 
+/// Most ids one cold-tier engine lookup may carry: the engine's result limit
+/// (`SearchParams::top_k`) is a `u16`.
+const COLD_TIER_MAX_IDS_PER_LOOKUP: usize = u16::MAX as usize;
+
 // =============================================================================
 // TRAIT: ColdTierRetriever (Dependency Inversion Principle)
 // =============================================================================
@@ -276,40 +280,44 @@ impl ColdTierRetriever for StorageEngineColdTierRetriever {
             collection
         );
 
-        // Build the filter expression
-        let filter =
-            DocumentMetadataFilterBuilder::build_document_retrieval_filter(collection, ids);
+        // `SearchParams::top_k` is a `u16` and here it is the RESULT LIMIT: a
+        // batch larger than `u16::MAX` ids used to wrap (`ids.len() as u16`:
+        // 65,536 → 0) and silently drop documents. Look the ids up in batches
+        // the `u16` can carry so every id is fetched (TD-SECSCAN-1 §5).
+        let mut documents = Vec::new();
+        for batch in ids.chunks(COLD_TIER_MAX_IDS_PER_LOOKUP) {
+            let filter =
+                DocumentMetadataFilterBuilder::build_document_retrieval_filter(collection, batch);
+            let top_k = u16::try_from(batch.len()).map_err(|_| {
+                anyhow::anyhow!("cold-tier batch of {} ids exceeds u16", batch.len())
+            })?;
 
-        // Create search parameters with the filter
-        // We use a placeholder vector since documents don't have real vectors
-        let search_params = Arc::new(SearchParams {
-            vector: Some(vec![0.0]),       // Placeholder vector for document retrieval
-            top_k: Some(ids.len() as u16), // We want at most as many results as IDs requested
-            filter_expression: Some(filter),
-            include_expired: Some(false),
-            ..Default::default()
-        });
+            // Create search parameters with the filter
+            // We use a placeholder vector since documents don't have real vectors
+            let search_params = Arc::new(SearchParams {
+                vector: Some(vec![0.0]), // Placeholder vector for document retrieval
+                top_k: Some(top_k),      // At most as many results as ids in this batch
+                filter_expression: Some(filter),
+                include_expired: Some(false),
+                ..Default::default()
+            });
 
-        // Create collection config
-        let collection_config = Self::create_document_collection_config(collection);
+            let collection_config = Self::create_document_collection_config(collection);
+            let ctx = StorageQueryContext::new(search_params, collection_config);
+            let results = self.storage_engine.search_vectors_unified(&ctx).await?;
 
-        // Create search context
-        let ctx = StorageQueryContext::new(search_params, collection_config);
+            tracing::debug!(
+                "Cold tier: Retrieved {} results from storage for {} requested IDs",
+                results.len(),
+                batch.len()
+            );
 
-        // Execute search
-        let results = self.storage_engine.search_vectors_unified(&ctx).await?;
-
-        tracing::debug!(
-            "Cold tier: Retrieved {} results from storage for {} requested IDs",
-            results.len(),
-            ids.len()
-        );
-
-        // Convert search results to documents
-        let documents: Vec<DocumentRecord> = results
-            .iter()
-            .filter_map(|r| self.search_record_to_document(r))
-            .collect();
+            documents.extend(
+                results
+                    .iter()
+                    .filter_map(|r| self.search_record_to_document(r)),
+            );
+        }
 
         Ok(documents)
     }
@@ -395,6 +403,94 @@ mod tests {
                 assert_eq!(conditions.len(), 2, "Expected 2 filter conditions");
             }
             _ => panic!("Expected AND filter expression"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // TD-SECSCAN-1 §5 residual: `SearchParams::top_k` is a `u16`. The id-batch
+    // lookup used `ids.len() as u16`, so a batch of 65,536 ids asked the engine
+    // for 0 results (70,000 → 4,464) and silently DROPPED documents. Every id
+    // must be looked up: the batch is split so each engine call's `top_k`
+    // covers exactly the ids it filters on.
+    // ---------------------------------------------------------------------
+
+    use crate::storage::traits::{
+        CompactionParameters, CompactionResult, FlushParameters, FlushResult, StorageFormatStrategy,
+    };
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Records the `top_k` of every `search_vectors_unified` call.
+    #[derive(Default)]
+    struct TopKRecordingEngine {
+        top_ks: Mutex<Vec<Option<u16>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UnifiedStorageFormat for TopKRecordingEngine {
+        fn engine_name(&self) -> &'static str {
+            "TopKRecordingEngine"
+        }
+        fn engine_version(&self) -> &'static str {
+            "1.0.0"
+        }
+        fn strategy(&self) -> StorageFormatStrategy {
+            StorageFormatStrategy::Sst
+        }
+        async fn do_flush(&self, _params: &FlushParameters) -> Result<FlushResult> {
+            anyhow::bail!("not used")
+        }
+        async fn do_compact(&self, _params: &CompactionParameters) -> Result<CompactionResult> {
+            anyhow::bail!("not used")
+        }
+        async fn collect_engine_metrics(&self) -> Result<HashMap<String, serde_json::Value>> {
+            Ok(HashMap::new())
+        }
+        async fn vector_by_id(
+            &self,
+            _collection_id: &str,
+            _base_path: &str,
+            _vector_id: &str,
+        ) -> Result<Option<proximadb_records::ProximaRecord>> {
+            Ok(None)
+        }
+        async fn search_vectors_unified(
+            &self,
+            ctx: &StorageQueryContext,
+        ) -> Result<Vec<crate::core::search::results::OptimizedSearchRecord>> {
+            self.top_ks
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .push(ctx.search_params.top_k);
+            Ok(Vec::new())
+        }
+    }
+
+    async fn requested_top_ks(n: usize) -> Vec<Option<u16>> {
+        let engine = Arc::new(TopKRecordingEngine::default());
+        let retriever = StorageEngineColdTierRetriever::new(engine.clone());
+        let owned: Vec<String> = (0..n).map(|i| format!("doc-{i}")).collect();
+        let ids: Vec<&str> = owned.iter().map(String::as_str).collect();
+        retriever
+            .retrieve_documents("docs", &ids)
+            .await
+            .expect("retrieve");
+        engine.top_ks.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn every_id_is_looked_up_across_the_u16_boundary() {
+        for n in [65_535usize, 65_536, 70_000] {
+            let top_ks = requested_top_ks(n).await;
+            let covered: usize = top_ks.iter().map(|k| k.map_or(0, usize::from)).sum();
+            assert_eq!(
+                covered, n,
+                "{n} ids: engine calls asked for {top_ks:?} results in total — ids were dropped"
+            );
+            assert!(
+                top_ks.iter().all(|k| k.is_some_and(|k| k > 0)),
+                "{n} ids: no lookup may ask for zero results: {top_ks:?}"
+            );
         }
     }
 }

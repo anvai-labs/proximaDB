@@ -845,3 +845,311 @@ async fn wrong_dimension_query_vectors_are_client_errors() {
         failures.join("\n  ")
     );
 }
+
+/// True when a client-facing error names a collection by its internal
+/// numeric object id (`collection '16'`) instead of the name the client used.
+fn names_collection_by_internal_id(message: &str) -> bool {
+    message.match_indices("collection '").any(|(i, m)| {
+        message[i + m.len()..]
+            .split('\'')
+            .next()
+            .is_some_and(|quoted| !quoted.is_empty() && quoted.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// TD-SECSCAN-1 §5 residuals: a wrong-dimension query vector is the client's
+/// error on EVERY search route — HTTP 400 / gRPC `InvalidArgument`, never 500
+/// / `Internal` — and the message carries the cause (the dimension) and the
+/// collection name the client used, never the internal numeric object id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_dimension_is_a_client_error_on_every_search_route() {
+    use proximadb::proto::proximadb_v2 as pv2;
+    use pv2::proxima_entity_service_client::ProximaEntityServiceClient;
+    use pv2::proxima_fusion_service_client::ProximaFusionServiceClient;
+
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+    let name = "secscan1_route";
+
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({
+            "name": name, "dimension": DIM, "engine": "sst",
+            "distance_metric": "cosine", "enable_proxima_record": false,
+        }))
+        .send()
+        .await
+        .expect("create");
+    assert!(create.status().is_success(), "create {name} failed");
+    // The canonical object id the server assigned (create returns it).
+    let created: serde_json::Value = create.json().await.expect("create response json");
+    let object_id = created["collection_id"]
+        .as_str()
+        .filter(|id| !id.is_empty() && *id != name)
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("create must return the object id: {created}"));
+    let records: Vec<serde_json::Value> = (0..3)
+        .map(|i| {
+            let mut v = vec![0.0f32; DIM];
+            v[i % DIM] = 1.0;
+            let topic = if i % 2 == 0 { "alpha" } else { "beta" };
+            json!({ "id": format!("{name}-{i}"), "vector": v, "props": { "topic": topic } })
+        })
+        .collect();
+    let insert = http
+        .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+        .json(&json!({ "records": records }))
+        .send()
+        .await
+        .expect("insert");
+    assert!(insert.status().is_success(), "insert into {name} failed");
+    sleep(Duration::from_millis(300)).await;
+
+    let short = vec![1.0f32; DIM - 1];
+    let mut failures: Vec<String> = Vec::new();
+
+    let rest_cases = [
+        (
+            "REST v2 collection search",
+            format!("{base}/api/v2/collections/{name}/search"),
+            json!({ "vector": short, "top_k": 5 }),
+        ),
+        (
+            "REST v1 progressive search",
+            format!("{base}/api/v2/progressive/search/{name}"),
+            json!({ "collection_id": name, "queries": [{ "vector": short }], "top_k": 5 }),
+        ),
+        (
+            "REST hybrid search",
+            format!("{base}/api/v2/hybrid/search"),
+            json!({ "collection": name, "vector": short, "top_k": 5 }),
+        ),
+        (
+            "REST v1 entity search",
+            format!("{base}/api/v1/collections/{name}/entities/search"),
+            json!({ "query_vector": short, "top_k": 5 }),
+        ),
+        (
+            "REST v2 entity search",
+            format!("{base}/api/v2/collections/{name}/entities/search"),
+            json!({ "query_vector": short, "top_k": 5 }),
+        ),
+        (
+            "REST graph fusion-search",
+            format!("{base}/api/v2/graphs/{name}/fusion-search"),
+            json!({ "vector_collection": name, "query_vector": short, "limit": 5 }),
+        ),
+        (
+            "REST rank search",
+            format!("{base}/api/v2/rank/search"),
+            json!({ "collection": name, "query_vector": short, "k": 5 }),
+        ),
+    ];
+    for (label, url, body) in rest_cases {
+        match http.post(url).json(&body).send().await {
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                if label == "REST rank search" && status == reqwest::StatusCode::NOT_IMPLEMENTED {
+                    // RankServices not injected in this server mode.
+                    eprintln!("REST rank search: not wired here (501), skipped");
+                    continue;
+                }
+                if status != reqwest::StatusCode::BAD_REQUEST {
+                    failures.push(format!("{label}: got {status}: {text}"));
+                    continue;
+                }
+                if !text.contains("dimension") {
+                    failures.push(format!("{label}: 400 hides the dimension cause: {text}"));
+                }
+                if !text.contains(name) {
+                    failures.push(format!(
+                        "{label}: message does not name the collection '{name}': {text}"
+                    ));
+                }
+                if names_collection_by_internal_id(&text) {
+                    failures.push(format!(
+                        "{label}: message names the internal object id: {text}"
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{label}: connection failed ({e})")),
+        }
+    }
+
+    // A request that addresses the collection by its object id reaches it and
+    // gets the dimension error, built only from what the request sent: the
+    // collection's name, which the request did not contain, must not appear.
+    let by_id = [
+        (
+            "REST v1 progressive search by object id",
+            format!("{base}/api/v2/progressive/search/{object_id}"),
+            json!({ "collection_id": object_id, "queries": [{ "vector": short }], "top_k": 5 }),
+        ),
+        (
+            "REST v2 collection search by object id",
+            format!("{base}/api/v2/collections/{object_id}/search"),
+            json!({ "vector": short, "top_k": 5 }),
+        ),
+    ];
+    for (label, url, body) in by_id {
+        match http.post(url).json(&body).send().await {
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                if status != reqwest::StatusCode::BAD_REQUEST || !text.contains("dimension") {
+                    failures.push(format!(
+                        "{label}: expected 400 with the dimension cause, got {status}: {text}"
+                    ));
+                }
+                if text.contains(name) {
+                    failures.push(format!(
+                        "{label}: echoed a name the request did not contain: {text}"
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{label}: request failed ({e})")),
+        }
+    }
+
+    // Arrow Flight DoGet `vector_search` ticket.
+    let channel =
+        tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", server.flight_port))
+            .expect("flight endpoint")
+            .connect()
+            .await
+            .expect("flight channel");
+    let mut flight = FlightServiceClient::new(channel);
+    let ticket = Ticket {
+        ticket: serde_json::to_vec(&json!({
+            "type": "vector_search",
+            "collection_id": name,
+            "query_vector": short,
+            "top_k": 5,
+            "include_vector": false,
+        }))
+        .expect("ticket json")
+        .into(),
+    };
+    match flight.do_get(ticket).await {
+        Err(status)
+            if status.code() == tonic::Code::InvalidArgument
+                && status.message().contains("dimension")
+                && status.message().contains(name) => {}
+        Err(status) => failures.push(format!("Flight DoGet: got {status:?}")),
+        Ok(_) => failures.push("Flight DoGet: accepted a wrong-dim vector".to_string()),
+    }
+
+    // Analytics entanglement loads records through `unified_search_native`
+    // with an EMPTY query vector by design; the query-vector gate must not
+    // break it (it may still 400 for data reasons, never 500 / "is empty").
+    match http
+        .get(format!(
+            "{base}/api/v2/analytics/collections/{name}/entanglement?topic_field=topic&limit=10"
+        ))
+        .send()
+        .await
+    {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            eprintln!("analytics entanglement: {status}: {text}");
+            if status.is_server_error() || text.contains("is empty") {
+                failures.push(format!("analytics entanglement: got {status}: {text}"));
+            }
+        }
+        Err(e) => failures.push(format!("analytics entanglement: connection failed ({e})")),
+    }
+
+    let grpc_endpoint = format!("http://127.0.0.1:{}", server.grpc_port);
+    let mut fusion = ProximaFusionServiceClient::connect(grpc_endpoint.clone())
+        .await
+        .expect("fusion gRPC connect");
+    let outcome = fusion
+        .fusion_search(pv2::FusionSearchRequest {
+            graph_id: name.to_string(),
+            vector_collection: name.to_string(),
+            query_vector: short.clone(),
+            limit: 5,
+            ..Default::default()
+        })
+        .await;
+    match outcome {
+        Err(status)
+            if status.code() == tonic::Code::InvalidArgument
+                && status.message().contains("dimension")
+                && !names_collection_by_internal_id(status.message()) => {}
+        Err(status) => failures.push(format!("gRPC FusionSearch: got {status:?}")),
+        Ok(_) => failures.push("gRPC FusionSearch: accepted a wrong-dim vector".to_string()),
+    }
+
+    let mut entities = ProximaEntityServiceClient::connect(grpc_endpoint)
+        .await
+        .expect("entity gRPC connect");
+    let outcome = entities
+        .search_entities(pv2::SearchEntitiesRequest {
+            collection_id: name.to_string(),
+            similar: Some(pv2::SimilarQuery {
+                query: Some(pv2::similar_query::Query::Vector(pv2::VectorData {
+                    values: short.clone(),
+                })),
+                ..Default::default()
+            }),
+            top_k: 5,
+            ..Default::default()
+        })
+        .await;
+    match outcome {
+        Err(status)
+            if status.code() == tonic::Code::InvalidArgument
+                && status.message().contains("dimension") => {}
+        Err(status) => failures.push(format!("gRPC SearchEntities: got {status:?}")),
+        Ok(_) => failures.push("gRPC SearchEntities: accepted a wrong-dim vector".to_string()),
+    }
+
+    // Still alive and serving a correct-dimension query on the same routes.
+    let alive = http
+        .post(format!("{base}/api/v2/progressive/search/{name}"))
+        .json(&json!({ "collection_id": name, "queries": [{ "vector": query_vector() }], "top_k": 5 }))
+        .send()
+        .await;
+    match alive {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => failures.push(format!("follow-up progressive search: got {}", r.status())),
+        Err(e) => failures.push(format!("follow-up progressive search: server gone ({e})")),
+    }
+    let alive = http
+        .post(format!("{base}/api/v2/graphs/{name}/fusion-search"))
+        .json(&json!({ "vector_collection": name, "query_vector": query_vector(), "limit": 5 }))
+        .send()
+        .await;
+    match alive {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => failures.push(format!("follow-up fusion search: got {}", r.status())),
+        Err(e) => failures.push(format!("follow-up fusion search: server gone ({e})")),
+    }
+
+    assert!(
+        failures.is_empty(),
+        "wrong-dimension query vectors must be client errors on every route:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+#[test]
+fn internal_id_detector() {
+    assert!(names_collection_by_internal_id(
+        "Query vector has dimension 3 but collection '16' expects dimension 4"
+    ));
+    assert!(!names_collection_by_internal_id(
+        "Query vector has dimension 3 but the collection expects dimension 4"
+    ));
+    assert!(!names_collection_by_internal_id(
+        "Query vector has dimension 3 but collection 'secscan1_route' expects dimension 4"
+    ));
+}

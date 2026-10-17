@@ -824,15 +824,26 @@ impl CandidateProvider for HybridCoordinatorAdapter {
                     backend_vec
                         .vector_search(&collection_for_vec, &v)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))
+                        // Keep the typed `RankError` in the chain so a
+                        // client-argument error survives the coordinator.
+                        .map_err(anyhow::Error::new)
                 },
                 &query_text,
                 &request.query_vector,
             )
             .await
-            .map_err(|e| RankError::ModelInference {
-                model_id: "hybrid_coordinator".into(),
-                reason: format!("hybrid search failed: {e}"),
+            .map_err(|e| {
+                let client_argument = e.chain().find_map(|cause| match cause.downcast_ref() {
+                    Some(RankError::InvalidArgument(message)) => Some(message.clone()),
+                    _ => None,
+                });
+                match client_argument {
+                    Some(message) => RankError::InvalidArgument(message),
+                    None => RankError::ModelInference {
+                        model_id: "hybrid_coordinator".into(),
+                        reason: format!("hybrid search failed: {e}"),
+                    },
+                }
             })?;
 
         // R-7c.3.2: build CandidateBatch with sequential synthetic
@@ -890,13 +901,21 @@ pub async fn rank_search_dispatch(
         services.rerank_config.clone(),
     )
     .await
-    .map_err(|e| match e {
+    .map_err(rank_error_to_api)
+}
+
+/// The rank route's error contract: profile-not-found → 404, a client's own
+/// argument (an invalid profile, or e.g. a wrong-dimension query vector,
+/// TD-SECSCAN-1 §5) → 400, anything else → 500.
+fn rank_error_to_api(error: RankError) -> ApiError {
+    match error {
         RankError::ProfileNotFound(name) => {
             ApiError::NotFound(format!("rank profile not found: {name}"))
         }
         RankError::InvalidProfile(msg) => ApiError::InvalidArgument(msg),
+        RankError::InvalidArgument(msg) => ApiError::InvalidArgument(msg),
         other => ApiError::Internal(format!("rank pipeline failed: {other}")),
-    })
+    }
 }
 
 /// Lift an optional `Arc<[(Arc<str>, f32)]>` feature snapshot into the
@@ -2139,6 +2158,49 @@ mod tests {
             Err(_) => panic!("expected ModelInference"),
             Ok(_) => panic!("expected error"),
         }
+    }
+
+    /// TD-SECSCAN-1 §5: a client-argument error from the vector leg survives
+    /// the hybrid coordinator (it is found anywhere in the error chain) and the
+    /// rank route answers it as HTTP 400, not a 500 pipeline failure.
+    #[tokio::test]
+    async fn hybrid_adapter_maps_vector_leg_client_argument_to_400() {
+        struct WrongDimensionBackend;
+        #[async_trait::async_trait]
+        impl HybridSearchBackend for WrongDimensionBackend {
+            async fn bm25_search(&self, _c: &str, _q: &str) -> RankResult<Vec<BM25Result>> {
+                Ok(Vec::new())
+            }
+            async fn vector_search(&self, _c: &str, _v: &[f32]) -> RankResult<Vec<VectorResult>> {
+                Err(RankError::InvalidArgument(
+                    "Query vector has dimension 1 but collection 'docs' expects dimension 4".into(),
+                ))
+            }
+        }
+        let adapter = HybridCoordinatorAdapter::new(
+            FusionStrategy::ReciprocalRank { k: 60 },
+            Arc::new(WrongDimensionBackend),
+        );
+        let err = match adapter.candidates(&rank_req("docs", vec![0.5], 10)).await {
+            Err(err) => err,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(
+            matches!(&err, RankError::InvalidArgument(m) if m.contains("dimension 1")),
+            "expected InvalidArgument, got {err:?}"
+        );
+        assert!(matches!(
+            rank_error_to_api(err),
+            ApiError::InvalidArgument(m) if m.contains("dimension 1")
+        ));
+        // A server-side failure stays a 500.
+        assert!(matches!(
+            rank_error_to_api(RankError::ModelInference {
+                model_id: "m".into(),
+                reason: "down".into(),
+            }),
+            ApiError::Internal(_)
+        ));
     }
 
     #[tokio::test]

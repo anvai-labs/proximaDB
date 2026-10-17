@@ -798,6 +798,9 @@ impl RecordOpsService {
         let tenant_context = self
             .collection_service
             .load_tenant_context(identity.tenant_id)?;
+        // The identifier as the caller supplied it: the only collection
+        // reference a client-facing error may echo (TD-SECSCAN-1 §5).
+        let requested_collection = request.collection_id.clone();
         let request = RichSearchRequest {
             collection_id: match self
                 .resolve_collection_id_internal(&request.collection_id, tenant_context.as_ref())
@@ -814,6 +817,12 @@ impl RecordOpsService {
         self.vector_operations_service
             .search_records_with_tenant_context(request, tenant_context.as_ref(), identity)
             .await
+            .map_err(|e| {
+                crate::services::operations::vectors::label_client_collection(
+                    e,
+                    &requested_collection,
+                )
+            })
     }
 
     /// Canonical rich-record get handler used by v2 REST/gRPC/internal callers.

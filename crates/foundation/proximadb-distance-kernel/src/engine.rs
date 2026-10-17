@@ -1920,6 +1920,40 @@ impl UnifiedDistanceCompute {
             if centroid_end <= codebook[subvector_idx].len() {
                 let centroid = &codebook[subvector_idx][centroid_start..centroid_end];
 
+                // Same backstop as `compute_distance_simd` (TD-SECSCAN-1 §5):
+                // the SIMD kernels below index both slices by `a.len()` inside
+                // `unsafe`, so equal length is a memory-safety precondition.
+                // Both slices are `subvector_dim` long by construction today;
+                // this keeps that a checked invariant rather than an
+                // unchecked assumption. It is not routed through
+                // `compute_distance_simd` because PQ scores its metrics
+                // differently (negated dot product, Manhattan inline, Euclidean
+                // fallback for every other metric), so delegating would change
+                // results. Cost: one predictable `usize` compare per
+                // subvector, next to the bounds-checked slicing above; the
+                // mismatch path is out of line and `#[cold]`.
+                //
+                // Worst-score convention: PQ accumulates a DISTANCE for every
+                // metric (dot product as `-dot`), so the worst value is
+                // `+inf` regardless of `metric`. `dimension_mismatch_score`
+                // returns `-inf` for dot product (the kernel's similarity
+                // convention), which here would be the BEST distance, so it is
+                // asked for the distance-convention value (Euclidean) and
+                // used for its one-time log. (The PQ result is then fed to
+                // `SimilarityResult::new` with the caller's metric, which for
+                // dot product reinterprets the accumulated `-dot` — a
+                // pre-existing PQ/INT8 sign inconsistency, TD-SECSCAN-1 §5.)
+                if query_subvector.len() != centroid.len() {
+                    return SimilarityResult::new(
+                        dimension_mismatch_score(
+                            query_subvector.len(),
+                            centroid.len(),
+                            &DistanceMetric::Euclidean,
+                        ),
+                        *metric,
+                    );
+                }
+
                 // Compute distance between query subvector and centroid
                 let subvector_distance = match metric {
                     DistanceMetric::Euclidean => {
@@ -2117,6 +2151,27 @@ mod tests {
         );
         // Matching dimensions are unaffected.
         assert_eq!(compute.distance_with_metric(&a, &a, &dot), 1.0);
+    }
+
+    /// TD-SECSCAN-1 §5: the length backstop added to `calculate_pq_distance`
+    /// must not change PQ scoring on well-formed input. 4-dim query, 2
+    /// subvectors of dim 2, codes picking centroid 1 then centroid 0.
+    #[test]
+    fn pq_distance_unchanged_by_length_backstop() {
+        let metric = DistanceMetric::Euclidean;
+        let compute = UnifiedDistanceCompute::new(metric);
+        let query = [1.0f32, 0.0, 0.0, 1.0];
+        let codebook = vec![
+            vec![0.0f32, 0.0, 1.0, 0.0], // subvector 0: centroid 0 = (0,0), 1 = (1,0)
+            vec![0.0f32, 1.0, 5.0, 5.0], // subvector 1: centroid 0 = (0,1), 1 = (5,5)
+        ];
+        let result = compute.calculate_pq_distance(&query, &[1, 0], &codebook, &metric);
+        // Both subvectors match their centroid exactly.
+        assert!(result.raw_value.abs() < 1e-6, "{}", result.raw_value);
+        let result = compute.calculate_pq_distance(&query, &[0, 1], &codebook, &metric);
+        let expected = compute.distance_with_metric(&[1.0, 0.0], &[0.0, 0.0], &metric)
+            + compute.distance_with_metric(&[0.0, 1.0], &[5.0, 5.0], &metric);
+        assert!((result.raw_value - expected).abs() < 1e-5);
     }
 
     #[test]
@@ -3274,12 +3329,11 @@ mod tests {
     #[test]
     fn test_nan_and_infinity_handling() {
         let _ = proximadb_hardware::hardware_capabilities(); // OnceLock auto-init
-        use std::f32::{INFINITY, NAN, NEG_INFINITY};
 
         let normal = vec![1.0, 2.0, 3.0];
-        let with_nan = vec![1.0, NAN, 3.0];
-        let with_inf = vec![1.0, INFINITY, 3.0];
-        let with_neg_inf = vec![1.0, NEG_INFINITY, 3.0];
+        let with_nan = vec![1.0, f32::NAN, 3.0];
+        let with_inf = vec![1.0, f32::INFINITY, 3.0];
+        let with_neg_inf = vec![1.0, f32::NEG_INFINITY, 3.0];
 
         let euclidean_calc = UnifiedDistanceCompute::new(DistanceMetric::Euclidean);
 

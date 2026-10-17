@@ -902,4 +902,22 @@ mod tests {
         assert_eq!(stripped_fields, vec!["id", "document"]);
         assert_eq!(preserved_fields, vec!["id", "document", "embedding"]);
     }
+
+    /// TD-SECSCAN-1 §5 residual: the SQL vector-search node's `top_k` is the
+    /// RESULT LIMIT, not a hint — a bare `as u16` wrapped 65,536 to 0 and
+    /// 70,000 to 4,464, silently dropping results. A limit the engine's `u16`
+    /// cannot carry is an error instead.
+    #[test]
+    fn engine_result_limit_rejects_values_the_u16_cannot_carry() {
+        use crate::query::federated::execution::engine_result_limit;
+        assert_eq!(engine_result_limit(10).ok(), Some(10));
+        assert_eq!(engine_result_limit(65_535).ok(), Some(u16::MAX));
+        for over in [65_536usize, 70_000] {
+            let err = engine_result_limit(over).err().map(|e| e.to_string());
+            assert!(
+                err.as_deref().is_some_and(|m| m.contains("65535")),
+                "top_k={over} must be rejected, got {err:?}"
+            );
+        }
+    }
 }

@@ -6,7 +6,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: triage complete (5 criticals dismissed with evidence, #1981); `path-injection` host-path read closed (#1992); unbounded `top_k` allocation (§5), IMDSv1 call site (§4) and ReDoS regex (§8) CLOSED 2026-10-15 (`fix/secscan1-topk-clamp`). Open: external-collection tenant isolation (§6, TD-AUTHZ-1 L3.4) and process recommendations 4–5.**
+| Status | **Partial: triage complete (5 criticals dismissed with evidence, #1981); `path-injection` host-path read closed (#1992); unbounded `top_k` allocation (§5), IMDSv1 call site (§4) and ReDoS regex (§8) CLOSED 2026-10-15 (`fix/secscan1-topk-clamp`); §5 residuals (400-not-500 on every search route, user-facing collection names, fusion cause, AQL consumed predicate, `as u16` narrowings, PQ length backstop) CLOSED 2026-10-16 (`fix/secscan1-residuals`). Open: external-collection tenant isolation (§6, TD-AUTHZ-1 L3.4) and process recommendations 4–5.**
 | Severity | High — `rust/uncontrolled-allocation-size` is an unbounded `top_k` allocation on every non-REST search surface; the `path-injection` residual is a tenant-isolation (not host-path) gap
 | Component | `crates/foundation/proximadb-search-types/src/{bounded_queue,top_k_limit}.rs`, `src/core/utils/aws_imds.rs`, `src/services/external_collection/source_reader.rs`, `src/deployment/discovery/environment_detector.rs`, `.github/workflows/codeql.yml`
 | Relates to | link:TD-AUTHZ-1-adr090-program-tracker.adoc[TD-AUTHZ-1] (overlap: L3.4 per-tenant location policy is canonical there)
@@ -295,45 +295,163 @@ the shared sinks (no third constant anywhere):
    (`optimizer_top_k_hint`) instead of `k as u16` truncating. Results are
    never truncated by any of these layers.
 
-Residual (out of scope, filed here): bare `as u16` narrowing of a `top_k`
-into `SearchParams::top_k: Option<u16>` remains at
-`src/query/federated/execution/mod.rs:637`,
-`src/storage/engines/nova/engine.rs:1224`,
-`src/storage/engines/sst/readers/sst_query_engine.rs:2326/2462/2591/2754`,
-`src/storage/engines/viper/engine.rs:1535/2645` and
-`src/storage/document/storage/cold_tier.rs:287` (`ids.len() as u16`).
-Narrowing can only shrink the value (≤ 65,535), so none of these is an
-allocation risk. On the capped surfaces `top_k` is ≤ the cap, so the engine
-sites (NOVA/SST/VIPER) truncate only if an operator raises the override above
-65,535; the federated SQL vector-search node (`top_k` from the SQL extension
-parse) and the cold-tier id-batch lookup are not `top_k`-capped boundaries, so
-there a value > 65,535 wraps silently — a result-correctness wart, not a
-memory one. Fix by routing through `optimizer_top_k_hint`-style saturating
-clamping when the `u16` field is next touched.
-Residual (non-blocking review findings on the query-vector fix, 2026-10-16;
-none can abort the process — they are error-quality gaps):
+==== Residuals: CLOSED (2026-10-16, `fix/secscan1-residuals`)
 
-* An invalid query vector still returns HTTP 500, not 400, on v1 progressive
-  search, hybrid search (`unified_search_native`), v1/v2 entity search and
-  graph fusion-search: the typed `InvalidQueryVector` reaches those handlers,
-  but they do not map it through `is_client_argument_error`.
-* Client-facing dimension errors name the collection by its internal numeric
-  object id (e.g. `'16'`) rather than the user-facing name, because the
-  validator runs after catalog resolution in `unified_search_v1_inner` /
-  `unified_search_native`.
-* Graph fusion's error ("vector search failed for fusion") hides the
-  dimension cause.
-* AQL consumed-predicate edge case: the executor treats a vector-valued
-  `Equals` on `vector` / `embedding` / `query_vector` as satisfied, so
-  `Not { Equals vector }` drops every row and `Or { Equals vector, X }` is
-  always true. Unrealistic query shapes; noted only.
+Two sets of residuals were recorded here when the clamp closed. One was the
+bare `as u16` narrowing of a `top_k` into `SearchParams::top_k: Option<u16>`.
+The other was the non-blocking review findings on the query-vector fix.
+Neither could abort the process: one was a result-correctness wart, the other
+error quality. All are now closed.
 
-Also noted (not a defect today): `calculate_pq_distance` in the same kernel
-calls the SIMD kernels directly rather than through `compute_distance_simd`,
-so it does not get the mismatch backstop. Both slices it passes are
-`subvector_dim` long by construction (the centroid slice is bounds-checked),
-so the lengths cannot differ; it should still share the checked entry point
-when next touched.
+1. **Invalid query vector → 400, not 500.** The typed errors
+   (`InvalidQueryVector`, `TopKLimitExceeded`) and the classifier moved down
+   to `proximadb_search_types::client_argument`. The root crate re-exports
+   them, so the API crate's handlers (which cannot see the root crate) apply
+   the same check. `client_argument_message` returns the typed cause's own
+   text and walks the whole `anyhow` chain. Newly mapped to HTTP 400 /
+   `InvalidArgument`:
+   * v1 progressive search (`progressive_search_handler.rs`);
+   * hybrid search (`proximadb-api` `hybrid.rs`): `RestHybridPortImpl` also
+     re-wrapped the vector leg's error with `anyhow!("..: {}", e)`, which
+     flattened the type. It now uses `.context(..)`;
+   * the legacy v1 entity search (`canonical/entities.rs`) and v2 entity
+     search (`rest/v2/entities.rs`);
+   * REST graph fusion-search (`rest/v2/graphs.rs`);
+   * gRPC `FusionSearch` and gRPC `SearchEntities`;
+   * Arrow Flight `DoGet` `vector_search` tickets (`arrow_ipc/service.rs`);
+   * REST rank search (`POST /api/v2/rank/search`). `ProductionHybridBackend`
+     maps the vector leg's typed error to a new `RankError::InvalidArgument`,
+     the rank route answers it as 400, and the coordinator closure keeps the
+     typed `RankError` in the chain (`anyhow::Error::new`, not
+     `anyhow!("{e}")`). This is unit-tested at the backend; the e2e skips it
+     because `RankServices` is not injected in the test server (501).
+
+   Every other failure stays 500 / `Internal`. Already 400 before this work:
+   REST v2 collection search, gRPC v2 `Search` / `SearchStream`, AQL
+   `vector` / `memory` and MCP memory.
+
+   Still not a client error (documented, not fixed here):
+   * **pgwire `<->` / `vector_search(...)` UDTF.** `relational_pipeline.rs`
+     stringifies the error as `native collection vector search failed: <cause>`.
+     The SQL client gets the dimension cause in the message, but under the
+     generic server SQLSTATE rather than a 22xxx/42xxx class. A client
+     SQLSTATE needs a typed error path through `protocol.rs`, which several
+     open PRs are touching.
+   * **Arrow Flight `bulk_search` DoExchange** reports per-query failures as
+     in-band error frames rather than a call status. This is unchanged and
+     not a 500.
+
+   Analytics entanglement
+   (`GET /api/v2/analytics/collections/{id}/entanglement`) deliberately calls
+   `unified_search_native` with an EMPTY vector to load records. That path is
+   exempt from the gate and still works: the e2e test records `200 OK` with
+   an Entanglement Index on current code. Static reading agrees, since only
+   `unified_search_v1_inner` rejects an empty vector and the native path
+   never calls it.
+2. **User-facing collection name, and only one the caller supplied.**
+   `InvalidQueryVector` is now structured: an optional `collection` label plus
+   a `QueryVectorProblem` (`Empty` / `NonFinite` / `Dimension` / `Other`).
+   * **The validator labels conservatively.** `client_collection_label` uses
+     the identifier the validator received only when it is not the internal
+     object id. Otherwise the message says "the collection".
+   * **Rewrite sites restore the caller's name.** Authorities that rewrite the
+     caller's name to the object id before validating add the caller's own
+     identifier on the way out with `label_client_collection`. They are
+     `handle_record_search_for_tenant` (REST v2 / gRPC v2 / Flight),
+     `VectorOpsPort::search` (progressive and other v1 port callers) and
+     `unified_search_native_with_tenant_context` (fusion seed, v2 entities).
+     `unified_search_with_tenant_context` keeps the requested identifier in
+     scope. `label_client_collection` fills only a missing label.
+   * **The catalog name is never used.** An error message echoes only what
+     the request contained. A first draft of this fix used the catalog name;
+     review finding F1 replaced it, because a request that addressed a
+     collection by object id would get back a name it never sent.
+   * Pinned by `object_id_reference_never_echoes_the_catalog_name` (unit) and
+     an e2e check that requests addressing collections by object id never get
+     the collection's name back.
+3. **Graph fusion keeps the cause.** `retry_vector_search` used to re-format
+   the last error into a string (losing the type) and retried client errors
+   twice (≈300 ms of backoff for a guaranteed failure). It now returns a
+   client-argument error at once and keeps the last server error's chain via
+   `.context(..)`. A genuine server failure on fusion-search (REST and gRPC)
+   or hybrid search logs the full chain server-side and returns a stable
+   generic message ("fusion search failed" / "hybrid search failed"; the REST
+   envelope carries the request id). Internal detail is kept out of the body.
+4. **AQL consumed predicate.** `executor::post_filter_predicate` replaces the
+   always-true special case in `evaluate_predicate`. A vector-valued `Equals`
+   on `vector` / `embedding` / `query_vector` is stripped from the WHERE
+   post-filter at the top level or as an AND conjunct, which are the only
+   positions `VectorAqlSource::walk_predicate` consumes. Under `Not` or `Or`
+   it is rejected as `InvalidInput` (HTTP 400) before the source runs. A
+   scalar `Equals` on those field names is still an ordinary filter.
+5. **`as u16` narrowings.** The saturating idiom of `optimizer_top_k_hint` was
+   hoisted to `top_k_limit::u16_top_k_hint`, which `optimizer_top_k_hint` now
+   delegates to. The NOVA, SST (4) and VIPER (2) engine sites use it, because
+   their `k` is already within the cap. The two boundaries that are not capped
+   needed a different fix, because there the `u16` is a hard result limit and
+   saturating would silently truncate results:
+   * The federated SQL vector-search node now calls `check_top_k` on the full
+     `usize` before either leg narrows it. Previously the `as u32` on the
+     `search_v1` leg could also wrap. The engine leg converts with
+     `engine_result_limit`, which errors above 65,535.
+   * The cold-tier id lookup splits `ids` into batches of at most `u16::MAX`,
+     so every id is looked up. Before, 65,536 ids asked the engine for 0
+     results.
+6. **`calculate_pq_distance`** got the same length check as
+   `compute_distance_simd`, sharing the `#[cold]` `dimension_mismatch_score`.
+   It was not routed through `compute_distance_simd` because PQ scores metrics
+   differently (negated dot product, Manhattan inline, Euclidean fallback for
+   all other metrics), so delegating would change results. The added cost is
+   one predictable `usize` compare per subvector, next to slicing that is
+   already bounds-checked. The two slices are equal-length by construction,
+   so the check is a backstop that keeps this invariant checked rather than
+   assumed. No input reaches it today.
+   * **Mismatch score: `+inf` for every metric.** PQ accumulates a DISTANCE
+     for every metric, including dot product (as `-dot`), so `+inf` is the
+     worst value under its own convention.
+     `dimension_mismatch_score`'s dot-product value (`-inf`, the kernel's
+     similarity convention) would have been the best.
+   * **Pre-existing sign inconsistency, not changed here.** PQ hands its
+     accumulated `-dot` to `SimilarityResult::new(.., DotProduct)`, which
+     treats the raw value as a similarity. INT8 passes a raw dot product, so
+     PQ and INT8 disagree on the sign of the dot-product raw value.
+
+Evidence (each new test FAILED on the unfixed tree, PASSES after):
+
+* `tests/search_top_k_cap_e2e.rs::wrong_dimension_is_a_client_error_on_every_search_route`.
+  Before: progressive, hybrid, v1 entity, v2 entity and fusion-search all
+  returned 500, and gRPC `FusionSearch` and `SearchEntities` returned
+  `Internal`. The v2 entity and fusion messages hid the cause ("entity fusion
+  search", "vector search failed for fusion (..)"), and REST v2 and
+  progressive named the collection `'1'`, its object id. After: all of them
+  return 400 / `InvalidArgument` with the dimension cause and the
+  `'secscan1_route'` name, and the server keeps serving correct queries.
+* Unit tests:
+  * `input_validation::tests::{dimension_error_names_the_collection_not_its_internal_id, nameless_collection_never_echoes_its_object_id}`;
+  * `fusion_service::tests::retry_keeps_client_argument_errors_typed_and_does_not_retry_them`;
+  * `hybrid_search::tests::rest_hybrid_port_keeps_the_vector_legs_client_error_typed`;
+  * `aql::executor_test` `query_vector_under_{not,or}_is_rejected_as_invalid_input`
+    (before: no error; `Not` dropped every row and `Or` was always true);
+  * `cold_tier::tests::every_id_is_looked_up_across_the_u16_boundary`
+    (before: 65,536 ids → `[Some(0)]`);
+  * `federated::execution` `engine_result_limit_rejects_values_the_u16_cannot_carry`;
+  * `top_k_limit::tests::u16_top_k_hint_saturates_at_the_boundary`.
+
+  Added in the review round (2026-10-16):
+  * the e2e test above extended with Flight `DoGet`, rank search, the
+    by-object-id message check and the analytics-entanglement check (Flight returned
+    `Internal` before its mapping);
+  * `input_validation::tests::object_id_reference_never_echoes_the_catalog_name`;
+  * `client_argument::tests::label_client_collection_fills_only_a_missing_label`;
+  * `rank_backend::tests::vector_search_keeps_client_argument_errors_distinct`;
+  * `rank::tests::hybrid_adapter_maps_vector_leg_client_argument_to_400`;
+  * `aql::executor_test` `query_vector_under_not_of_and_is_rejected_as_invalid_input`
+    and `rejected_query_vector_never_runs_the_source`.
+
+  Kept green, as regression guards: `retry_still_retries_server_errors`, the
+  AQL top-level / AND-conjunct / scalar-`Equals` cases,
+  `client_argument::tests::server_errors_are_not_client_arguments` and
+  `pq_distance_unchanged_by_length_backstop`.
 
 Evidence:
 

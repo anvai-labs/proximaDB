@@ -1532,17 +1532,14 @@ impl VectorOperationsService {
     /// boundary is clamped here with a warning instead of silently wrapping
     /// (the old `k as u16` truncated e.g. 65_536 → 0).
     fn optimizer_top_k_hint(k: usize) -> u16 {
-        const U16_MAX: usize = u16::MAX as usize;
-        if k > U16_MAX {
+        if k > usize::from(u16::MAX) {
             tracing::warn!(
                 k,
                 "top_k exceeds the optimizer's u16 hint range; clamping to {}",
                 u16::MAX
             );
-            u16::MAX
-        } else {
-            k as u16
         }
+        proximadb_search_types::top_k_limit::u16_top_k_hint(k)
     }
 
     /// Public v1 boundary: execute vector search and return v1 response
@@ -2725,6 +2722,9 @@ impl VectorOperationsService {
         config: Option<UnifiedSearchConfig>,
         tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
     ) -> Result<Vec<crate::proto::proximadb_v1::SearchResult>> {
+        // The identifier as the caller supplied it — the only collection
+        // reference a client-facing error may echo (TD-SECSCAN-1 §5).
+        let requested_collection = collection_id;
         let collection_object_id = self
             .validate_tenant_collection_access(collection_id, tenant_context)
             .await?;
@@ -2746,7 +2746,7 @@ impl VectorOperationsService {
         let config = config.clone();
         let collection = self.get_or_load_collection(collection_id).await?;
         super::input_validation::validate_query_vector_for_search(
-            collection_id,
+            requested_collection,
             &collection,
             &query_vector,
         )?;
@@ -3061,13 +3061,7 @@ impl VectorOperationsService {
         // client's error, typed so every boundary answers 400 /
         // InvalidArgument. REST v2, gRPC v2, v1 progressive, AQL, MCP memory,
         // the SQL executor and the legacy entity store all land here.
-        if query_vector.is_empty() {
-            return Err(super::input_validation::InvalidQueryVector(format!(
-                "Query vector for collection '{collection_id}' is empty"
-            ))
-            .into());
-        }
-        super::input_validation::validate_query_vector_for_search(
+        super::input_validation::validate_query_vector_presence_and_shape(
             collection_id,
             &collection,
             &query_vector,
@@ -3324,6 +3318,9 @@ impl VectorOperationsService {
             read_context,
         )
         .await
+        // `resolved` is the internal object id; label a query-vector error
+        // with the identifier the caller supplied (TD-SECSCAN-1 §5).
+        .map_err(|e| super::input_validation::label_client_collection(e, collection_id))
     }
 
     /// Native variant: returns optimized native records for internal callers.
@@ -6081,7 +6078,7 @@ mod index_first_search_tests {
 
         assert!(
             err.to_string()
-                .contains("Query vector has dimension 2 but collection '1001' expects dimension 3")
+                .contains("Query vector has dimension 2 but the collection expects dimension 3")
         );
     }
 
@@ -6744,6 +6741,9 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
         // registry, misses, and the search returns 0 rows even though the data exists. The
         // resolved id is idempotent for `search_v1`'s own resolution, so tenant-less callers
         // (`None`) are unaffected.
+        // The identifier as the caller supplied it: the only collection
+        // reference a client-facing error may echo (TD-SECSCAN-1 §5).
+        let requested_collection = request.collection_id.clone();
         if let Some(tid) = tenant_id.filter(|t| !t.is_empty())
             && let Ok(Some(collection)) = self
                 .collection_port
@@ -6752,7 +6752,9 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
         {
             request.collection_id = collection.id;
         }
-        self.search_v1(request, identity).await
+        self.search_v1(request, identity)
+            .await
+            .map_err(|e| super::input_validation::label_client_collection(e, &requested_collection))
     }
 
     /// TD-XMODAL-4 S2: the single canonical native kernel for both the pgvector
