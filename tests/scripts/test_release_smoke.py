@@ -248,6 +248,96 @@ class ProvenanceVerdicts(unittest.TestCase):
         self.assertEqual(self._failed(facts), ["qa_push_ci"])
 
 
+class ProvenanceOverrides(unittest.TestCase):
+    """ci/release-overrides.toml: strict by default, a documented exception only
+    for a CI verdict, tied to the exact failed run, and never shown as a pass."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = _load("scripts/release_smoke/provenance.py")
+
+    def _checks(self, pr_ok: bool = False, run_id: int = 38905751066):
+        return [
+            {"name": "qa_merge", "ok": True, "detail": "", },
+            {"name": "qa_push_ci", "ok": True, "detail": "", "run_id": 38905730109},
+            {"name": "qa_pr_ci", "ok": pr_ok, "detail": "", "run_id": run_id},
+        ]
+
+    def _entry(self, **over):
+        e = {"version": "0.4.1", "check": "qa_pr_ci", "reason": "runner OOM", "approver": "owner",
+             "evidence": "https://github.com/o/r/actions/runs/38905751066/job/1", "followup": "#2055",
+             "recorded": "2026-10-17"}
+        e.update(over)
+        return e
+
+    def _write(self, text: str) -> pathlib.Path:
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        p = d / "release-overrides.toml"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_the_real_file_is_valid_and_covers_v041(self) -> None:
+        entries = self.mod.load_overrides(ROOT / "ci/release-overrides.toml")
+        v041 = [e for e in entries if e["version"] == "0.4.1"]
+        self.assertEqual([e["check"] for e in v041], ["qa_pr_ci"])
+        self.assertIn("38905751066", v041[0]["evidence"])
+        checks = self._checks()
+        self.assertEqual(self.mod.apply_overrides(checks, "0.4.1", entries), [])
+        self.assertEqual(self.mod.status(checks[2]), "overridden")
+        self.assertFalse(checks[2]["ok"], "an override must not rewrite the failure into a pass")
+
+    def test_no_entry_means_fail(self) -> None:
+        checks = self._checks()
+        self.assertEqual(self.mod.apply_overrides(checks, "0.4.1", []), [])
+        self.assertEqual(self.mod.status(checks[2]), "fail")
+
+    def test_other_version_does_not_apply(self) -> None:
+        checks = self._checks()
+        self.mod.apply_overrides(checks, "0.4.2", [self._entry()])
+        self.assertEqual(self.mod.status(checks[2]), "fail")
+
+    def test_evidence_must_name_the_failed_run(self) -> None:
+        checks = self._checks(run_id=99999)
+        problems = self.mod.apply_overrides(checks, "0.4.1", [self._entry()])
+        self.assertEqual(self.mod.status(checks[2]), "fail")
+        self.assertTrue(any("does not name the failed run" in p for p in problems), problems)
+
+    def test_stale_override_on_a_passing_check_is_a_problem(self) -> None:
+        problems = self.mod.apply_overrides(self._checks(pr_ok=True), "0.4.1", [self._entry()])
+        self.assertTrue(any("stale" in p for p in problems), problems)
+
+    def test_structural_checks_are_not_overridable(self) -> None:
+        p = self._write('[[override]]\nversion="0.4.1"\ncheck="qa_tree_equal"\nreason="r"\napprover="a"\n'
+                        'evidence="https://x/1"\nfollowup="f"\nrecorded="2026-10-17"\n')
+        with self.assertRaises(self.mod.OverrideError):
+            self.mod.load_overrides(p)
+
+    def test_missing_field_is_an_error_not_a_silent_skip(self) -> None:
+        p = self._write('[[override]]\nversion="0.4.1"\ncheck="qa_pr_ci"\nreason="r"\n'
+                        'evidence="https://x/1"\nfollowup="f"\nrecorded="2026-10-17"\n')
+        with self.assertRaisesRegex(self.mod.OverrideError, "approver"):
+            self.mod.load_overrides(p)
+
+    def test_summary_reports_overridden_not_passed(self) -> None:
+        summ = _load("scripts/release_smoke/summarize.py")
+        needs = {j: {"result": "success"} for j, _ in summ.ROWS}
+        prov = {"overridden": ["qa_pr_ci"], "checks": [
+            {"name": "qa_pr_ci", "ok": False, "overridden": {"approver": "owner", "evidence": "https://e/1"}}]}
+        doc = summ.build("0.4.1", needs, {"provenance": [{"file": "provenance.json", "evidence": prov}]}, None, None)
+        self.assertEqual(doc["verdict"], "OVERRIDDEN")
+        self.assertFalse(doc["passed"])
+        self.assertTrue(doc["accepted"])
+        row = next(j for j in doc["jobs"] if j["job"] == "provenance")
+        self.assertEqual(row["result"], "overridden")
+        table = summ.render(doc)
+        self.assertIn("OVERRIDDEN, not passed", table)
+        self.assertIn("| **OVERRIDDEN** |", table)
+        # An override never rescues a job that actually failed.
+        needs["docker"] = {"result": "failure"}
+        self.assertEqual(summ.build("0.4.1", needs, {}, None, None)["verdict"], "FAILED")
+
+
 class HomebrewVerdicts(unittest.TestCase):
     REPO = "anvai-labs/proximaDB"
     ASSET = "proximadb-0.4.1-x86_64-unknown-linux-gnu.tar.gz"

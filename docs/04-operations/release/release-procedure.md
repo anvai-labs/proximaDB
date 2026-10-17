@@ -101,6 +101,22 @@ skipped job is missing evidence, not a pass). Every step fails hard (no
 `|| true`, no `continue-on-error`) and registry propagation is a bounded wait
 (`scripts/release_smoke/await_url.sh`, `retry.sh`).
 
+**Overrides (documented, never silent).** The provenance checks stay strict.
+The only exception is a CI verdict (`qa_push_ci`, `qa_pr_ci`) that failed for a
+reason the release owner reviewed and accepted, such as a runner killed by
+infrastructure. It is accepted only when
+[`ci/release-overrides.toml`](https://github.com/anvai-labs/proximaDB/blob/develop/ci/release-overrides.toml)
+records `version`, `check`, `reason`, `approver`, `evidence` (a URL that must
+name the failed run's id), `followup` and `recorded`. Such a release is reported
+as **OVERRIDDEN**, never as passed: the check row, the job row and the overall
+verdict all say so, and `release-evidence-vX.Y.Z.json` carries `passed: false`,
+`accepted: true` and the override record. Structural checks (tag on `main`,
+qa -> main merge, tree equality, Pre-Release CI) cannot be overridden. A stale
+entry (the check now passes) or one that names a different run is itself a
+failure. The file is read from the ref the workflow runs on, so an override
+recorded after the release takes effect by re-running the evidence on demand
+(below) from `develop`.
+
 **How it runs.** `release.yml` calls it as its final job (`workflow_call`), so a
 red smoke makes the release run red; a `workflow_run` trigger could not, so
 there is none. It also runs on a manually published GitHub Release, and on
@@ -119,8 +135,10 @@ A new publish channel in `release.yml`, `release-python.yml` or
 `publish-image.yml` fails that guard until it has a smoke job.
 
 **First run, v0.4.1 (2026-10-17, from a workstation).** Red, on real defects:
-the qa -> main PR #2053 was merged over a red `CI Success` (a `Feature Matrix`
-runner shutdown); the released image and binary both fail `mvp_smoke.py` --
+the qa -> main PR #2053 was merged over a red `CI Success` (a `Feature Matrix
+(enterprise-catalogs)` runner shutdown, exit 143; recorded in
+`ci/release-overrides.toml` as an owner-authorized override, so provenance now
+reports OVERRIDDEN); the released image and binary both fail `mvp_smoke.py` --
 a deleted record is still returned by a **filtered** vector search (any
 collection; unfiltered search, filtered scan and get-by-id are correct); the
 npm package's ESM entry (`exports.import` -> `dist/index.mjs`) does not exist

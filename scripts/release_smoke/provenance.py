@@ -21,8 +21,13 @@ QA-based only when ALL of these hold:
                       PR (the full tier). Branch protection requires it; a merge
                       over a red run is exactly what this evidence must surface.
 
+A failed CI verdict (qa_push_ci / qa_pr_ci only) is accepted when
+ci/release-overrides.toml documents it (approver, reason, evidence URL naming
+the failed run). It is then reported as OVERRIDDEN -- `passed` stays false,
+`accepted` is true -- never as a pass.
+
 Writes a JSON evidence document (always, also on failure) and a Markdown table
-to --summary. Exit 1 when any check fails.
+to --summary. Exit 1 when any check fails without a valid override.
 
 Usage:
   provenance.py --repo OWNER/NAME --version X.Y.Z --out evidence.json [--summary FILE]
@@ -279,11 +284,86 @@ def evaluate(facts: dict[str, Any]) -> list[dict[str, Any]]:
         else f"await_prerelease_ci.sh exit {pre.get('gate_exit_code')}: {pre.get('gate_output', '')[-300:]}",
     )
     ci = facts.get("qa_ci") or {}
-    ok, detail = _ci_ok(ci.get("push"))
-    add("qa_push_ci", ok, detail)
-    ok, detail = _ci_ok(ci.get("pull_request"))
-    add("qa_pr_ci", ok, detail)
+    for name, key in (("qa_push_ci", "push"), ("qa_pr_ci", "pull_request")):
+        ok, detail = _ci_ok(ci.get(key))
+        add(name, ok, detail)
+        checks[-1]["run_id"] = (ci.get(key) or {}).get("run_id")
     return checks
+
+
+# ---------------------------------------------------------------------- overrides
+
+OVERRIDES_FILE = ROOT / "ci" / "release-overrides.toml"
+# Only CI verdicts can be overridden (an infrastructure kill can turn one red
+# without saying anything about the code). The structural facts -- the tag is
+# on main, it is a qa->main merge, the tree is the tested tree, Pre-Release CI
+# passed -- are never negotiable.
+OVERRIDABLE = frozenset({"qa_push_ci", "qa_pr_ci"})
+OVERRIDE_FIELDS = ("version", "check", "reason", "approver", "evidence", "followup", "recorded")
+
+
+class OverrideError(ValueError):
+    pass
+
+
+def load_overrides(path: pathlib.Path = OVERRIDES_FILE) -> list[dict[str, str]]:
+    """Parse and validate ci/release-overrides.toml. A malformed entry is an
+    error, never ignored: a typo must not silently turn an override off (or on)."""
+    if not path.exists():
+        return []
+    import tomllib
+
+    doc = tomllib.loads(path.read_text(encoding="utf-8"))
+    entries = doc.get("override", [])
+    if not isinstance(entries, list):
+        raise OverrideError(f"{path.name}: `override` must be an array of tables")
+    seen: set[tuple[str, str]] = set()
+    for i, e in enumerate(entries):
+        where = f"{path.name} override #{i + 1}"
+        for field in OVERRIDE_FIELDS:
+            if not isinstance(e.get(field), str) or not e[field].strip():
+                raise OverrideError(f"{where}: `{field}` is required and must be a non-empty string")
+        if e["check"] not in OVERRIDABLE:
+            raise OverrideError(f"{where}: check `{e['check']}` is not overridable (only {sorted(OVERRIDABLE)})")
+        if not e["evidence"].startswith("https://"):
+            raise OverrideError(f"{where}: evidence must be an https URL of the failed run")
+        if not _dt.date.fromisoformat(e["recorded"]):
+            raise OverrideError(f"{where}: recorded must be YYYY-MM-DD")
+        key = (e["version"], e["check"])
+        if key in seen:
+            raise OverrideError(f"{where}: duplicate override for {key}")
+        seen.add(key)
+    return entries
+
+
+def apply_overrides(checks: list[dict[str, Any]], version: str, entries: list[dict[str, str]]) -> list[str]:
+    """Pure: mark failed checks that a valid entry covers as overridden.
+
+    An override applies only to a check that FAILED, and only when its evidence
+    URL names the run id that failed. Returns problems (stale or mismatched
+    entries for this version), which the caller reports as failures.
+    """
+    problems: list[str] = []
+    by_name = {c["name"]: c for c in checks}
+    for e in entries:
+        if e["version"] != version:
+            continue
+        c = by_name.get(e["check"])
+        if c is None:
+            problems.append(f"override for `{e['check']}`: no such check ran")
+        elif c["ok"]:
+            problems.append(f"override for `{e['check']}` is stale: the check passes -- delete the entry")
+        elif not c.get("run_id") or str(c["run_id"]) not in e["evidence"]:
+            problems.append(
+                f"override for `{e['check']}`: evidence {e['evidence']} does not name the failed run {c.get('run_id')}"
+            )
+        else:
+            c["overridden"] = {k: e[k] for k in ("reason", "approver", "evidence", "followup", "recorded")}
+    return problems
+
+
+def status(c: dict[str, Any]) -> str:
+    return "pass" if c["ok"] else ("overridden" if c.get("overridden") else "fail")
 
 
 def render_summary(doc: dict[str, Any]) -> str:
@@ -296,9 +376,20 @@ def render_summary(doc: dict[str, Any]) -> str:
         "|---|---|---|",
     ]
     for c in doc["checks"]:
-        mark = "PASS" if c["ok"] else "**FAIL**"
+        mark = {"pass": "PASS", "fail": "**FAIL**", "overridden": "**OVERRIDDEN**"}[status(c)]
         lines.append(f"| `{c['name']}` | {mark} | {c['detail'].replace('|', '/')} |")
     lines.append("")
+    for c in doc["checks"]:
+        o = c.get("overridden")
+        if o:
+            lines += [
+                f"> **OVERRIDDEN `{c['name']}`** -- this check FAILED and is accepted only by a documented override "
+                f"(`ci/release-overrides.toml`).",
+                f"> Approver: `{o['approver']}` ({o['recorded']}). Evidence: {o['evidence']}",
+                f"> Reason: {' '.join(o['reason'].split())}",
+                f"> Follow-up: {o['followup']}",
+                "",
+            ]
     return "\n".join(lines)
 
 
@@ -317,11 +408,23 @@ def main() -> int:
     except (GhError, KeyError, ValueError) as exc:
         facts = {"repo": args.repo, "version": args.version, "tag": f"v{args.version}"}
         checks = [{"name": "gather", "ok": False, "detail": f"could not collect facts: {exc}"}]
+    try:
+        problems = apply_overrides(checks, args.version, load_overrides())
+    except (OverrideError, ValueError) as exc:  # tomllib.TOMLDecodeError is a ValueError
+        problems = [f"ci/release-overrides.toml is invalid: {exc}"]
+    for msg in problems:
+        checks.append({"name": "overrides", "ok": False, "detail": msg})
+    overridden = [c["name"] for c in checks if status(c) == "overridden"]
     doc = {
         "schema_version": 1,
         "kind": "release-provenance",
         "generated_at": started,
+        # A release with overrides is NOT reported as clean: `passed` is false
+        # whenever any check failed, and `accepted` says whether every failure
+        # is covered by a documented override.
         "passed": all(c["ok"] for c in checks),
+        "accepted": all(status(c) != "fail" for c in checks),
+        "overridden": overridden,
         "checks": checks,
         "facts": facts,
     }
@@ -332,10 +435,13 @@ def main() -> int:
         with args.summary.open("a", encoding="utf-8") as fh:
             fh.write(summary + "\n")
     print(summary)
-    if not doc["passed"]:
-        failed = ", ".join(c["name"] for c in checks if not c["ok"])
+    if not doc["accepted"]:
+        failed = ", ".join(c["name"] for c in checks if status(c) == "fail")
         print(f"::error::release provenance FAILED for v{args.version}: {failed}")
         return 1
+    if overridden:
+        print(f"::warning::release provenance for v{args.version} is OVERRIDDEN, not passed: "
+              f"{', '.join(overridden)} (ci/release-overrides.toml)")
     return 0
 
 

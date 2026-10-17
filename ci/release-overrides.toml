@@ -1,0 +1,34 @@
+# Documented overrides of release-evidence checks (scripts/release_smoke/provenance.py).
+#
+# The provenance checks stay strict: a release whose evidence is red is red.
+# The ONE exception is a CI-verdict check (`qa_push_ci`, `qa_pr_ci`) that failed
+# for a reason the release owner reviewed and explicitly accepted at the time --
+# typically a runner killed by infrastructure, not a code defect. Such a release
+# is reported as OVERRIDDEN, never as passed, and only when an entry here records:
+#
+#   version   the release, X.Y.Z
+#   check     the failed check's name (only qa_push_ci / qa_pr_ci are overridable;
+#             structural checks -- tag on main, qa->main merge, tree equality,
+#             Pre-Release CI -- never are)
+#   reason    what failed and why it did not invalidate the release
+#   approver  the GitHub login that authorized it
+#   evidence  a URL of the FAILED run/job; it must contain that run's id, so an
+#             entry cannot be re-pointed at a different failure
+#   followup  what fixed the underlying cause (PR URL), or why none is needed
+#   recorded  date the override was written down (YYYY-MM-DD)
+#
+# Adding an entry is a reviewed change to this file like any other.
+
+[[override]]
+version = "0.4.1"
+check = "qa_pr_ci"
+reason = """CI Success on the qa->main PR #2053 run was red only because the job \
+`Feature Matrix (enterprise-catalogs)` lost its runner (the runner received a \
+shutdown signal, exit 143: memory exhaustion during the build). Every other \
+required job passed, the qa push CI for the same head (run 38905730109) was green, \
+and Pre-Release CI on the tag commit (run 38934957068) was green. The owner \
+merged the promotion over that single infrastructure failure."""
+approver = "vjsingh1984"
+evidence = "https://github.com/anvai-labs/proximaDB/actions/runs/38905751066/job/117020211299"
+followup = "https://github.com/anvai-labs/proximaDB/pull/2055 (swap headroom for Feature Matrix (enterprise-catalogs); merged to develop 2026-10-16, after the v0.4.1 tree was cut)"
+recorded = "2026-10-17"

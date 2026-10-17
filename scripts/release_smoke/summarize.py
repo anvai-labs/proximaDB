@@ -6,7 +6,9 @@ Inputs: the workflow's `needs` context as JSON (job -> {result, outputs}) and a
 directory of per-job evidence files (`*.json`, one or more per job, uploaded as
 `evidence-*` artifacts). Output: `release-evidence-vX.Y.Z.json` and a Markdown
 table appended to --summary. Exit 1 unless EVERY job's result is `success` --
-a skipped or cancelled job is missing evidence, not a pass.
+a skipped or cancelled job is missing evidence, not a pass. A job that
+succeeded only through a documented override (provenance.py,
+ci/release-overrides.toml) is reported as OVERRIDDEN, and so is the release.
 
 Usage: summarize.py --version X.Y.Z --needs-json '<json>' --evidence-dir DIR
                     --out release-evidence-vX.Y.Z.json [--summary FILE]
@@ -59,6 +61,18 @@ def build(version: str, needs: dict[str, Any], evidence: dict[str, list[dict[str
         if job not in {j for j, _ in ROWS}:
             jobs.append({"job": job, "proves": "", "result": (info or {}).get("result", "absent"),
                          "evidence": evidence.get(job, [])})
+    # A job that succeeded only because a check was overridden (provenance.py,
+    # ci/release-overrides.toml) is shown as OVERRIDDEN, never as a pass.
+    overrides = []
+    for j in jobs:
+        for e in j["evidence"]:
+            for name in (e["evidence"] or {}).get("overridden", []) if isinstance(e["evidence"], dict) else []:
+                check = next((c for c in e["evidence"].get("checks", []) if c.get("name") == name), {})
+                overrides.append({"job": j["job"], "check": name, **(check.get("overridden") or {})})
+                if j["result"] == "success":
+                    j["result"] = "overridden"
+    accepted = all(j["result"] in ("success", "overridden") for j in jobs)
+    verdict = "FAILED" if not accepted else ("OVERRIDDEN" if overrides else "PASSED")
     return {
         "schema_version": 1,
         "kind": "release-evidence",
@@ -67,16 +81,26 @@ def build(version: str, needs: dict[str, Any], evidence: dict[str, list[dict[str
         "workflow_run": run_url,
         "workflow_sha": sha,
         "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "passed": all(j["result"] == "success" for j in jobs),
+        "verdict": verdict,
+        # `passed` is true only for a clean release; `accepted` also admits
+        # documented overrides, which are listed in `overrides`.
+        "passed": verdict == "PASSED",
+        "accepted": accepted,
+        "overrides": overrides,
         "jobs": jobs,
     }
 
 
 def render(doc: dict[str, Any]) -> str:
-    verdict = "PASSED" if doc["passed"] else "FAILED"
-    lines = [
-        f"## Release evidence: {doc['tag']} -- {verdict}",
-        "",
+    lines = [f"## Release evidence: {doc['tag']} -- {doc['verdict']}", ""]
+    if doc["overrides"]:
+        lines.append("> [!WARNING]")
+        lines.append(f"> **OVERRIDDEN, not passed.** {len(doc['overrides'])} check(s) FAILED and are accepted "
+                     "only by documented overrides in `ci/release-overrides.toml`:")
+        for o in doc["overrides"]:
+            lines.append(f"> - `{o['job']}/{o['check']}` -- approver `{o.get('approver')}`, evidence {o.get('evidence')}")
+        lines.append("")
+    lines += [
         "| Artifact / claim | Result | Evidence files |",
         "|---|---|---|",
     ]
@@ -108,8 +132,9 @@ def main() -> int:
         with args.summary.open("a", encoding="utf-8") as fh:
             fh.write(table + "\n")
     print(table)
-    if not doc["passed"]:
-        bad = ", ".join(f"{j['job']}={j['result']}" for j in doc["jobs"] if j["result"] != "success")
+    if not doc["accepted"]:
+        bad = ", ".join(f"{j['job']}={j['result']}" for j in doc["jobs"]
+                        if j["result"] not in ("success", "overridden"))
         print(f"::error::release evidence for v{args.version} is NOT complete: {bad}")
         return 1
     return 0
