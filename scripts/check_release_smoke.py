@@ -109,8 +109,20 @@ ADVISORY = "repository-url: https://test.pypi.org/legacy/"
 # success by design, so for them only the `|| exit 0` form is banned.
 SOFT_FAIL = re.compile(
     r"\|\|\s*(?:true|:|exit\s+0|return\s+0|echo\b)(?:\s|;|$|\))"
-    r"|continue-on-error|\bset\s+\+[a-z]*e"
+    r"|continue-on-error|\bset\s+\+[a-z]*e|\bset\s+\+o\s+(?:errexit|pipefail)"
 )
+# A pipe hides the exit code of every stage but the last (`smoke | cat`) unless
+# pipefail is on. GitHub's default bash for a step WITHOUT `shell:` is
+# `bash -e {0}` -- no pipefail -- so a run step containing a pipe must set it.
+PIPE_RE = re.compile(r"(?<!\|)\|(?![|])")
+PIPEFAIL_RE = re.compile(r"\bset\s+-[a-z]*o\s+pipefail\b|\bset\s+-o\s+pipefail\b")
+# The exact distro lists the install guide states as verified minimums.
+PINNED_DISTRO_LOOPS = (
+    "for img in ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 debian:11 debian:12; do",
+    "for img in rockylinux:8 rockylinux:9 fedora:41; do",
+)
+WIN_STOP = "$ErrorActionPreference = 'Stop'"
+WIN_EXIT = "if ($LASTEXITCODE -ne 0)"
 WORKFLOW_SOFT_FAIL = re.compile(SOFT_FAIL.pattern + r"|\bexit\s+0\b")
 # The only `if:` conditions a smoke job or step may carry. Anything else
 # (`if: false`, an event filter, `failure()` on a smoke step) can skip the
@@ -247,6 +259,36 @@ def check(msgs: list[str]) -> None:
                 f"{SMOKE}: job `{job}` step `{name or step[0].strip()}` has `if: {cond}` -- steps may only be "
                 "`if: always()` on an upload-artifact step or `if: failure()` on a '(on failure)' log step"
             )
+
+    # ---- pipes must not hide a failing stage
+    for job, body in jobs.items():
+        if any(re.match(r"^    runs-on:\s*windows", b) for b in body):
+            continue
+        for step in _step_blocks(body):
+            run_at = next((i for i, s in enumerate(step) if re.match(r"^\s+(?:- )?run:", s)), None)
+            if run_at is None or any(re.match(r"^\s+shell:\s*bash\s*$", s) for s in step):
+                continue
+            first = re.sub(r"^\s+(?:- )?run:\s*\|?\s*", "", step[run_at])
+            script = [first] + step[run_at + 1:]
+            if any(PIPE_RE.search(l) for l in script) and not any(PIPEFAIL_RE.search(l) for l in script):
+                name = next((s.split("name:", 1)[1].strip() for s in step if re.match(r"^\s+(?:- )?name:", s)), "")
+                msgs.append(f"{SMOKE}: job `{job}` step `{name}` pipes without `set -o pipefail` -- "
+                            "a failing stage before the last `|` would pass")
+
+    # ---- the distro matrix the docs promise, exactly
+    packages = jobs.get("packages", [])
+    for loop in PINNED_DISTRO_LOOPS:
+        if not any(b.strip() == loop for b in packages):
+            msgs.append(f"{SMOKE}: job `packages` must run `{loop}` (the minimums docs/01-quick-start/install.md states)")
+
+    # ---- Windows: native-command failures must stop the step
+    windows = jobs.get("windows", [])
+    for step in _step_blocks(windows):
+        if any(re.match(r"^\s+(?:- )?run:", s) for s in step) and not any(WIN_STOP in s for s in step):
+            name = next((s.split("name:", 1)[1].strip() for s in step if re.match(r"^\s+(?:- )?name:", s)), "")
+            msgs.append(f"{SMOKE}: job `windows` step `{name}` lacks `{WIN_STOP}`")
+    if windows and not any(WIN_EXIT in b for b in windows):
+        msgs.append(f"{SMOKE}: job `windows` must check `{WIN_EXIT}` after native commands (pwsh does not stop on them)")
 
     # ---- installs come from the registry, never the checkout
     for job, body in jobs.items():

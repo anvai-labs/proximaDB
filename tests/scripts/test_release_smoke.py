@@ -185,6 +185,49 @@ class ReleaseSmokeGuard(unittest.TestCase):
                    "    if: needs.create-release.result == 'success' && ")
         self._fails_with("must carry exactly `if:")
 
+    # ---- delta review: pipes, errexit, pinned distros, Windows exit codes ----
+    def test_catches_pipe_to_cat_without_pipefail(self) -> None:
+        self._edit(SMOKE, 'node npm_smoke.cjs "http://127.0.0.1:${SERVER_PORT}" "$VERSION" "$GITHUB_WORKSPACE/evidence/npm-cjs.json"\n',
+                   'node npm_smoke.cjs "http://127.0.0.1:${SERVER_PORT}" "$VERSION" "$GITHUB_WORKSPACE/evidence/npm-cjs.json" | cat\n')
+        self._fails_with("pipes without `set -o pipefail`")
+
+    def test_pipe_with_pipefail_is_accepted(self) -> None:
+        self._edit(SMOKE, '          mkdir -p "$GITHUB_WORKSPACE/evidence"\n          node npm_smoke.cjs "http://127.0.0.1:${SERVER_PORT}" "$VERSION" "$GITHUB_WORKSPACE/evidence/npm-cjs.json"\n',
+                   '          set -euo pipefail\n          mkdir -p "$GITHUB_WORKSPACE/evidence"\n          node npm_smoke.cjs "http://127.0.0.1:${SERVER_PORT}" "$VERSION" "$GITHUB_WORKSPACE/evidence/npm-cjs.json" | tee /dev/null\n')
+        self.assertEqual(_run(self.tree).returncode, 0)
+
+    def test_catches_set_plus_o_errexit(self) -> None:
+        self._edit(SMOKE, "          set -euo pipefail\n          mkdir -p evidence\n          IMAGE=",
+                   "          set -euo pipefail\n          set +o errexit\n          mkdir -p evidence\n          IMAGE=")
+        self._fails_with("must fail hard")
+
+    def test_catches_set_plus_o_pipefail(self) -> None:
+        self._edit(SMOKE, "          set -euo pipefail\n          mkdir -p evidence\n          IMAGE=",
+                   "          set -euo pipefail\n          set +o pipefail\n          mkdir -p evidence\n          IMAGE=")
+        self._fails_with("must fail hard")
+
+    def test_catches_a_shrunk_deb_distro_list(self) -> None:
+        self._edit(SMOKE, "for img in ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 debian:11 debian:12; do",
+                   "for img in ubuntu:24.04; do")
+        self._fails_with("must run `for img in ubuntu:20.04")
+
+    def test_catches_a_shrunk_rpm_distro_list(self) -> None:
+        self._edit(SMOKE, "for img in rockylinux:8 rockylinux:9 fedora:41; do",
+                   "for img in rockylinux:8 fedora:41; do")
+        self._fails_with("must run `for img in rockylinux:8 rockylinux:9 fedora:41; do`")
+
+    def test_catches_windows_without_lastexitcode(self) -> None:
+        self._edit(SMOKE, '          if ($LASTEXITCODE -ne 0) { throw "gh release download failed" }\n', "")
+        self._fails_with("must check `if ($LASTEXITCODE -ne 0)`")
+
+    def test_catches_windows_step_without_stop(self) -> None:
+        text = (self.tree / SMOKE).read_text(encoding="utf-8")
+        i = text.index("      - name: Zip -- proximadb-server.exe --version")
+        j = text.index("$ErrorActionPreference = 'Stop'", i)
+        (self.tree / SMOKE).write_text(text[:j] + "$ErrorActionPreference = 'Continue'" +
+                                       text[j + len("$ErrorActionPreference = 'Stop'"):], encoding="utf-8")
+        self._fails_with("step `Zip -- proximadb-server.exe --version` lacks")
+
     def test_catches_or_true_in_a_helper_script(self) -> None:
         self._edit("scripts/release_smoke/wait_healthy.sh", 'sleep 2\n', 'sleep 2 || true\n')
         self._fails_with("smoke helpers must fail hard")

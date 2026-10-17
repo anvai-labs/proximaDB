@@ -37,11 +37,15 @@ PORT="${PORT:-5678}"
 proximadb-server --config "$CONFIG" >/tmp/server.log 2>&1 &
 SERVER=$!
 
+# One bounded GET: `timeout` (coreutils, present in every image tested) kills a
+# connection that accepts but never answers, so a wedged server cannot hang the
+# smoke.
 health() {
-  exec 3<>"/dev/tcp/127.0.0.1/${PORT}" || return 1
-  printf 'GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3
-  cat <&3
-  exec 3<&-
+  # shellcheck disable=SC2016  # $1 expands in the inner shell, by design
+  timeout 5 bash -c '
+    exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1
+    printf "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3
+    cat <&3' _ "$PORT"
 }
 body=""
 for _ in $(seq 1 60); do

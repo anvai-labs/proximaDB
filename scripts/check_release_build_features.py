@@ -889,7 +889,19 @@ PORTABILITY_CHECK = "scripts/check_linux_portability.sh"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
 
 
+def _portable_image_digest() -> str | None:
+    """First 12 hex of the image digest pinned in build_portable_linux.sh."""
+    path = ROOT / PORTABLE_BUILD
+    if not path.exists():
+        return None
+    m = re.search(r"@sha256:([0-9a-f]{12})", path.read_text(encoding="utf-8"))
+    return m.group(1) if m else None
+
+
 def check_portable_linux_build(msgs: list[str]) -> None:
+    digest = _portable_image_digest()
+    if (ROOT / PORTABLE_BUILD).exists() and digest is None:
+        _fail(msgs, f"{PORTABLE_BUILD}: the build image is not pinned by @sha256 digest")
     for rel in RELEASE_WORKFLOWS:
         path = ROOT / rel
         if not path.exists():
@@ -907,10 +919,21 @@ def check_portable_linux_build(msgs: list[str]) -> None:
                     if nxt.strip().startswith("- target:"):
                         break
                     block.append(nxt)
+                # Its rust-cache namespace must be its own and name the build
+                # image: a host target/ restored into the container reuses -sys
+                # objects built against the host's newer glibc.
+                prefixes = [_scalar(b.split("cache_prefix:", 1)[1]) for b in block
+                            if _live(b) and b.strip().startswith("cache_prefix:")]
+                if digest and (not prefixes or f"manylinux_2_28-{digest}" not in prefixes[0]):
+                    _fail(msgs, f"{rel}:{i + 1}: {LINUX_TARGET} `cache_prefix` {prefixes} must contain the "
+                                f"build image digest prefix `manylinux_2_28-{digest}` from {PORTABLE_BUILD}")
                 feats = [_scalar(m.group("rest")) for b in block if _live(b) and (m := FEATURES_RE.match(b))]
                 if not feats or "vendored-openssl" not in [f.strip() for f in feats[0].split(",")]:
                     _fail(msgs, f"{rel}:{i + 1}: {LINUX_TARGET} features {feats} must include `vendored-openssl` "
                                 f"-- otherwise the binary links the build host's libssl")
+        if not any(_live(l) and "prefix-key:" in l and "matrix.cache_prefix" in l for l in lines):
+            _fail(msgs, f"{rel}: the build-binaries rust-cache prefix-key must be `${{{{ matrix.cache_prefix }}}}` "
+                        "so the portable Linux build never restores a host-built target/")
     rel = ".github/workflows/release.yml"
     path = ROOT / rel
     if path.exists():

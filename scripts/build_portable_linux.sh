@@ -46,6 +46,10 @@ docker run --rm \
   -e FEATURES="$FEATURES" -e TRIPLE="$TRIPLE" \
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   "$IMAGE" bash -euo pipefail -c '
+    # Hand every file the container (root) writes back to the host user on ANY
+    # exit: root-owned target/ or registry files left by a failed build break
+    # the next step (rust-cache post) and the next run.
+    trap '"'"'chown -R "$HOST_UID:$HOST_GID" /target /cargo/registry /cargo/git'"'"' EXIT
     # vendored OpenSSL builds with perl (IPC::Cmd etc.).
     dnf install -y -q perl-IPC-Cmd perl-core >/dev/null
     curl --proto =https --tlsv1.2 -sSf --retry 5 https://sh.rustup.rs \
@@ -56,8 +60,6 @@ docker run --rm \
     [ -n "${CARGO_BUILD_JOBS}" ] || unset CARGO_BUILD_JOBS
     cargo build --locked --release --target "$TRIPLE" --features "$FEATURES" \
       -p proximadb-server -p proximadb-bench -p proximadb-migrate
-    # Give the host user back the files the container (root) wrote.
-    chown -R "$HOST_UID:$HOST_GID" /target /cargo/registry /cargo/git
   '
 
 bash "$REPO/scripts/check_linux_portability.sh" "$TARGET_DIR/$TRIPLE/release" "$MAX_GLIBC"

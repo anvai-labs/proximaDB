@@ -780,6 +780,34 @@ class ReleaseBuildFeaturesGuard(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("job `build-rpm` does not run scripts/check_linux_portability.sh", result.stdout)
 
+    def test_catches_linux_cache_shared_with_host_builds(self) -> None:
+        p = self.tree / ".github/workflows/prerelease-ci.yml"
+        text = p.read_text(encoding="utf-8")
+        old = 'cache_prefix: "v1-rust-x86_64-unknown-linux-gnu-manylinux_2_28-'
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, 'cache_prefix: "v1-rust-x86_64-unknown-linux-gnu-host-', 1), encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must contain the build image digest prefix", result.stdout)
+
+    def test_catches_cache_key_not_using_the_prefix(self) -> None:
+        p = self.tree / ".github/workflows/release.yml"
+        text = p.read_text(encoding="utf-8")
+        old = 'prefix-key: "${{ matrix.cache_prefix }}"'
+        self.assertIn(old, text)
+        p.write_text(text.replace(old, 'prefix-key: "v1-rust-${{ matrix.target }}"', 1), encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("prefix-key must be", result.stdout)
+
+    def test_catches_a_new_image_digest_without_a_new_cache(self) -> None:
+        p = self.tree / "scripts/build_portable_linux.sh"
+        text = p.read_text(encoding="utf-8")
+        p.write_text(text.replace("@sha256:1e7b8460ad8f", "@sha256:0000000000ff", 1), encoding="utf-8")
+        result = _run(self.tree)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("0000000000ff", result.stdout)
+
     def test_accepts_every_legal_spelling_of_the_right_value(self) -> None:
         for spelling in (
             "            features: cloud-full",
