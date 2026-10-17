@@ -23,9 +23,9 @@
 #               SDK create/insert/search/delete against the image, embedded roundtrip
 #   npm         `@anvailabs/proximadb-client`: version, CJS AND ESM entry vs the image
 #   rust        crates.io `proximadb-sdk = "=X.Y.Z"` in a temp crate vs the image
-#   packages    every Release asset vs SHA256SUMS.txt; .deb on ubuntu 22.04/24.04;
-#               .rpm on fedora 41 and rockylinux 8 (its el8 name); embedded sdist
-#               == the one PyPI serves
+#   packages    every Release asset vs SHA256SUMS.txt; .deb on ubuntu 20.04-24.04
+#               and debian 11/12, .rpm on rockylinux 8/9 and fedora 41 (install,
+#               --version, start, /health); embedded sdist == the one PyPI serves
 #   windows     zip and MSI (msiexec /qn): proximadb-server.exe --version
 #   homebrew    tap formula: version, url + sha256 equal the GitHub Release asset
 #   summary     one evidence table + `release-evidence-vX.Y.Z.json`; red if any job is
@@ -522,27 +522,24 @@ jobs:
           awk '{print "{\"file\":\"" $2 "\",\"sha256\":\"" $1 "\"}"}' SHA256SUMS.txt \
             | jq -s '{artifact: "github-release:SHA256SUMS.txt", assets: ., passed: true}' \
             > "$GITHUB_WORKSPACE/evidence/packages-checksums.json"
-      - name: .deb installs and runs (ubuntu 22.04 and 24.04)
+      # The minimums the docs state (docs/01-quick-start/install.md): glibc
+      # >= 2.28 and no system OpenSSL, i.e. Debian 11+/Ubuntu 20.04+ for the
+      # .deb (Debian 10 is archived upstream and cannot apt-get update) and
+      # EL 8+/Fedora for the .rpm. Each: package-manager install, --version,
+      # server start on the installed /etc/proximadb/config.toml, /health.
+      - name: .deb install + start + /health (ubuntu 20.04/22.04/24.04, debian 11/12)
         run: |
           set -euo pipefail
-          for img in ubuntu:22.04 ubuntu:24.04; do
-            docker run --rm -v "$RUNNER_TEMP/rel:/rel:ro" -e V="$VERSION" -e IMG="$img" "$img" bash -ec '
-              apt-get update -qq >/dev/null
-              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "/rel/proximadb_${V}_amd64.deb" >/dev/null
-              got="$(proximadb-server --version 2>&1)" || { echo "::error::deb on ${IMG}: proximadb-server does not run: ${got}"; exit 1; }
-              [ "$got" = "proximadb-server ${V}" ] || { echo "::error::deb on ${IMG}: --version printed ${got}"; exit 1; }
-              echo "deb on ${IMG}: ${got}"'
+          for img in ubuntu:20.04 ubuntu:22.04 ubuntu:24.04 debian:11 debian:12; do
+            docker run --rm -v "$RUNNER_TEMP/rel:/rel:ro" -v "$GITHUB_WORKSPACE/scripts/release_smoke:/smoke:ro" \
+              "$img" bash /smoke/package_smoke.sh deb "/rel/proximadb_${VERSION}_amd64.deb" "$VERSION"
           done
-      - name: .rpm installs and runs (fedora 41, and rockylinux 8 -- the el8 it is named for)
+      - name: .rpm install + start + /health (rockylinux 8 and 9, fedora 41)
         run: |
           set -euo pipefail
-          RPM="proximadb-${VERSION}-1.el8.x86_64.rpm"
-          for img in fedora:41 rockylinux:8; do
-            docker run --rm -v "$RUNNER_TEMP/rel:/rel:ro" -e V="$VERSION" -e RPM="$RPM" -e IMG="$img" "$img" bash -ec '
-              dnf install -y -q "/rel/${RPM}" >/dev/null
-              got="$(proximadb-server --version 2>&1)" || { echo "::error::rpm on ${IMG}: proximadb-server does not run: ${got}"; exit 1; }
-              [ "$got" = "proximadb-server ${V}" ] || { echo "::error::rpm on ${IMG}: --version printed ${got}"; exit 1; }
-              echo "rpm on ${IMG}: ${got}"'
+          for img in rockylinux:8 rockylinux:9 fedora:41; do
+            docker run --rm -v "$RUNNER_TEMP/rel:/rel:ro" -v "$GITHUB_WORKSPACE/scripts/release_smoke:/smoke:ro" \
+              "$img" bash /smoke/package_smoke.sh rpm "/rel/proximadb-${VERSION}-1.el8.x86_64.rpm" "$VERSION"
           done
       - name: Embedded sdist on the release is the one PyPI serves
         run: |

@@ -37,6 +37,7 @@ COPY = (
     "scripts/release_smoke/wait_healthy.sh",
     "scripts/release_smoke/start_image_server.sh",
     "scripts/release_smoke/binary_config.sh",
+    "scripts/release_smoke/package_smoke.sh",
 )
 
 
@@ -207,7 +208,7 @@ class ReleaseSmokeGuard(unittest.TestCase):
         self._fails_with("no job smokes `github-release-binary`")
 
     def test_catches_a_dropped_rpm_smoke(self) -> None:
-        self._edit(SMOKE, 'dnf install -y -q "/rel/${RPM}"', 'rpm -qp "/rel/${RPM}"')
+        self._edit(SMOKE, "for img in rockylinux:8 rockylinux:9 fedora:41; do", "for img in fedora:41; do")
         self._fails_with("no job smokes `github-release-packages`")
 
     def test_catches_a_partial_checksum(self) -> None:

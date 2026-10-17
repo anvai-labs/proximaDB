@@ -90,7 +90,7 @@ say-so):
 | (A) built from a QA-proven tree | `provenance` | `vX.Y.Z` -> commit on `main`; it is the merge commit of a merged `qa` -> `main` PR; the `qa` head has the **same git tree** as the tag; a building Pre-Release CI run passed on it (`scripts/await_prerelease_ci.sh`); `CI Success` passed on the `qa` push run **and** on the qa -> main PR run |
 | (B) Docker Hub image | `docker` | pull `<image>:X.Y.Z`; its `org.opencontainers.image.revision` has the tag's tree; the pulled digest is the hub's; a surviving `tree-<tree>` tag points at the same manifest; `/health` reports `X.Y.Z`; `scripts/mvp_smoke.py` |
 | (B) GitHub Release binary | `binary` | download the linux x86_64 archive; `sha256sum -c` against both the `.sha256` and `SHA256SUMS.txt`; `proximadb-server --version`; start it on a temp data dir (shipped config, relocated); `scripts/mvp_smoke.py` |
-| (B) every GitHub Release asset | `packages` | `sha256sum -c` over the whole `SHA256SUMS.txt`, and every published asset must be listed in it; `.deb` installed with apt on ubuntu 22.04 and 24.04, `.rpm` with dnf on fedora 41 and rockylinux 8 (the el8 in its name), each then `proximadb-server --version`; the embedded sdist on the Release is byte-identical to PyPI's |
+| (B) every GitHub Release asset | `packages` | `sha256sum -c` over the whole `SHA256SUMS.txt`, and every published asset must be listed in it; `.deb` installed with apt on Ubuntu 20.04/22.04/24.04 and Debian 11/12, `.rpm` with dnf on Rocky Linux 8 and 9 and Fedora 41 -- each then `proximadb-server --version`, a server start on the installed `/etc/proximadb/config.toml`, and `/health` at the release version (`scripts/release_smoke/package_smoke.sh`); the embedded sdist on the Release is byte-identical to PyPI's |
 | (B) Windows zip + MSI | `windows` (windows-latest) | sha256 against `SHA256SUMS.txt`; zip `proximadb-server.exe --version`; `msiexec /qn` install, then `--version` from `Program Files\ProximaDB` |
 | (B) PyPI `proximadb` + `proximadb_embedded` | `python` (3.11, 3.12) | fresh venv, `pip install --no-cache-dir`, `importlib.metadata.version == X.Y.Z`; SDK create / insert / search / delete against the released image; embedded graph + typed-property roundtrip |
 | (B) npm `@anvailabs/proximadb-client` | `npm` | `npm install` into a temp project; installed version; health / create / insert / search / delete through the CommonJS entry; health through the ESM (`import`) entry |
@@ -151,8 +151,14 @@ against `npm pack`); and the Homebrew tap had no `proximadb` formula
 macOS urls for archives never built, as a workflow artifact). The tap formula
 was added by hand on 2026-10-17 and now passes; `update-homebrew` publishes it
 for later releases. The PyPI, crates.io and npm-CommonJS smokes passed. The `packages` job (added after review) is red on one more real
-defect: the `.el8.rpm` does not run on Rocky Linux 8 (no `libssl.so.3`; the
-binary also needs `GLIBC_2.35`, so it fails on EL9 too) -- it runs on Fedora 41.
-The `.deb` runs on Ubuntu 22.04 and 24.04, all six assets match
-`SHA256SUMS.txt`, and the Release's embedded sdist is identical to PyPI's.
+defect: the `.el8.rpm` does not run on Rocky Linux 8 (no `libssl.so.3`) or 9
+(the binary needs `GLIBC_2.35`), and the `.deb` does not run on Ubuntu 20.04 or
+Debian 11 -- the binaries were built on Ubuntu 22.04 against its glibc and
+OpenSSL 3. All six assets match `SHA256SUMS.txt`, and the Release's embedded
+sdist is identical to PyPI's. Fixed for later releases: the Linux binaries
+are now built in the manylinux_2_28 container (glibc 2.28) with OpenSSL
+vendored (`scripts/build_portable_linux.sh`, server feature
+`vendored-openssl`), and `scripts/check_linux_portability.sh` gates the
+archive, the `.rpm` and the `.deb` in `release.yml`; minimums are in the
+[install guide](../../01-quick-start/install.md).
 

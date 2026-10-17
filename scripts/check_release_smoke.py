@@ -80,7 +80,8 @@ CHANNELS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ),
     "github-release-packages": (
         ("softprops/action-gh-release",),
-        ("sha256sum -c SHA256SUMS.txt", "apt-get install", "dnf install", "pypi.org/pypi/proximadb_embedded/"),
+        ("sha256sum -c SHA256SUMS.txt", "package_smoke.sh deb", "package_smoke.sh rpm", "rockylinux:8",
+         "pypi.org/pypi/proximadb_embedded/"),
     ),
     "github-release-windows": (
         ("softprops/action-gh-release",),
