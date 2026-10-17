@@ -684,6 +684,17 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 }
 
 fn err_response<T: Serialize>(err: anyhow::Error) -> Response {
+    if err
+        .chain()
+        .any(|cause| cause.is::<proximadb_tenant::ScopedKeyError>())
+    {
+        let graph_error = GraphError::new(ErrorCode::InvalidArgument, err.to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(GraphResponse::<T>::error(graph_error)),
+        )
+            .into_response();
+    }
     if is_not_found(&err) {
         let graph_error = GraphError::new(ErrorCode::NotFound, err.to_string());
         (

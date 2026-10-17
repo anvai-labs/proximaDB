@@ -94,6 +94,35 @@ pub fn collection_visible_to(collection: &Collection, request_tenant: Option<&st
     effective_owner(collection).is_some_and(|owner| owner == request)
 }
 
+/// [`collection_visible_to`] for a collection read from its catalog entry's
+/// persisted properties: `owner` (the config's owner field) and `tags` (the
+/// config's tags, comma-joined). The same rule, so a catalog entry and the
+/// collection it records can never disagree.
+pub fn collection_entry_visible_to(
+    owner: Option<&str>,
+    tags_csv: Option<&str>,
+    request_tenant: Option<&str>,
+) -> bool {
+    let tags = tags_csv
+        .map(|tags| {
+            tags.split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let collection = Collection {
+        config: Some(proximadb_proto::proximadb_v1::CollectionConfig {
+            owner: owner.map(str::to_string),
+            tags,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    collection_visible_to(&collection, request_tenant)
+}
+
 /// Record `tenant` as the owner of a collection config about to be created:
 /// replaces any owner signals the caller supplied (the owner is the creating
 /// tenant, never a client-chosen value).
@@ -145,6 +174,36 @@ pub fn carry_over_owner(
 mod tests {
     use super::*;
     use proximadb_proto::proximadb_v1::CollectionConfig;
+
+    #[test]
+    fn collection_entry_visibility_follows_the_collection_rule() {
+        let owned = format!("x,{OWNER_TAG_PREFIX}globex,{TENANT_ISOLATED_TAG}");
+        assert!(collection_entry_visible_to(
+            Some("globex"),
+            Some(&owned),
+            Some("globex")
+        ));
+        assert!(!collection_entry_visible_to(
+            Some("globex"),
+            Some(&owned),
+            Some("default")
+        ));
+        assert!(!collection_entry_visible_to(
+            Some("globex"),
+            Some(&owned),
+            None
+        ));
+        // Nothing recorded: the default tenant's.
+        assert!(collection_entry_visible_to(None, None, Some("default")));
+        assert!(!collection_entry_visible_to(None, None, Some("acme")));
+        // Conflicting owners: no one's.
+        let conflicting = format!("{OWNER_TAG_PREFIX}a,{OWNER_TAG_PREFIX}b");
+        assert!(!collection_entry_visible_to(
+            None,
+            Some(&conflicting),
+            Some("a")
+        ));
+    }
 
     #[test]
     fn clear_collection_owner_drops_client_supplied_owner_signals() {

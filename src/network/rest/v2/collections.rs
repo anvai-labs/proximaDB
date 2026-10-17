@@ -1396,7 +1396,7 @@ pub async fn delete_collection_v2(
         migration_config: Default::default(),
     };
 
-    state
+    let response = state
         .api_handlers
         .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
         .await
@@ -1407,6 +1407,11 @@ pub async fn delete_collection_v2(
                 ApiError::Internal(format!("Failed to delete collection: {}", e))
             }
         })?;
+    // Nothing deleted: the collection is not one this tenant can resolve
+    // (missing, or another tenant's) — answered identically.
+    if !response.success {
+        return Err(ApiError::CollectionNotFound(collection_id));
+    }
 
     Ok(Json(DeleteCollectionV2Response {
         success: true,

@@ -50,16 +50,14 @@ pub struct AqlResponse {
 /// Execute an AQL query and return results with an audit trail.
 async fn execute_aql(
     State(state): State<AqlApiState>,
-    tenant: Option<axum::Extension<crate::network::middleware::tenant::TenantContext>>,
+    axum::Extension(tenant): axum::Extension<crate::network::middleware::tenant::TenantContext>,
     Json(request): Json<AqlRequest>,
 ) -> ApiResult<JsonResponse<AqlResponse>> {
     info!("Executing AQL query: {:?}", request.query);
 
-    // Sources resolve collections within the request tenant (absent ⇒ the
-    // default tenant, as for every request surface).
-    let request_tenant = tenant
-        .map(|axum::Extension(t)| t.tenant_id)
-        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    // Sources resolve collections within the request tenant, which the tenant
+    // middleware always establishes (a request without one is rejected).
+    let request_tenant = tenant.tenant_id;
     match state
         .executor
         .execute_for_tenant(request.query, request_tenant)

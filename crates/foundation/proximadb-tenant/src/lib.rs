@@ -549,6 +549,6 @@ pub use claim_vocabulary::{
 // ============================================================================
 pub mod ownership;
 pub use ownership::{
-    CollectionOwner, clear_collection_owner, collection_owner, collection_visible_to,
-    effective_owner, stamp_collection_owner,
+    CollectionOwner, clear_collection_owner, collection_entry_visible_to, collection_owner,
+    collection_visible_to, effective_owner, stamp_collection_owner,
 };

@@ -961,24 +961,6 @@ impl RecordOpsService {
         tenant: &str,
         since_lsn: u64,
     ) -> Result<Option<Vec<ChangeRow>>> {
-        // Collection catalog assets are registered in the unprefixed namespace,
-        // which is also where the default tenant's tables resolve. For the
-        // default tenant, a name that is another tenant's collection is not its
-        // table. (Named tenants resolve under their own prefix.)
-        if tenant == proximadb_tenant::DEFAULT_TENANT
-            && self
-                .collection_service
-                .collection_for_tenant(table, Some(tenant))
-                .await?
-                .is_none()
-            && self
-                .collection_service
-                .collection_internal(table)
-                .await?
-                .is_some()
-        {
-            return Ok(None);
-        }
         match self.get_dml_service() {
             Some(dml) => dml.changes_since_for_tenant(table, tenant, since_lsn).await,
             None => Ok(None),

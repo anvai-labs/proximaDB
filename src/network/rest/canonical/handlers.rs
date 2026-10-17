@@ -1605,8 +1605,8 @@ fn operator_and_control_v2_routes() -> axum::Router<AppState> {
             "/api/v2/rank/search",
             post(
                 |State(state): State<AppState>,
-                 tenant: Option<
-                    axum::Extension<crate::network::middleware::tenant::TenantContext>,
+                 axum::Extension(tenant): axum::Extension<
+                    crate::network::middleware::tenant::TenantContext,
                 >,
                  payload: Result<
                     Json<crate::network::rest::canonical::rank::RankSearchRequest>,
@@ -1615,13 +1615,10 @@ fn operator_and_control_v2_routes() -> axum::Router<AppState> {
                     match payload {
                         Ok(Json(mut req)) => {
                             // Candidates resolve the collection within the
-                            // request tenant (absent ⇒ the default tenant).
-                            req.scope =
-                                crate::network::rest::canonical::rank::RankScope::Tenant(
-                                    tenant.map(|axum::Extension(t)| t.tenant_id).unwrap_or_else(
-                                        || proximadb_tenant::DEFAULT_TENANT.to_string(),
-                                    ),
-                                );
+                            // request tenant set by the tenant middleware.
+                            req.scope = crate::network::rest::canonical::rank::RankScope::Tenant(
+                                tenant.tenant_id,
+                            );
                             match crate::network::rest::canonical::rank::rank_search_dispatch(
                                 state, req,
                             )

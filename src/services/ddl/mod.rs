@@ -978,10 +978,21 @@ impl DdlService {
         properties: HashMap<String, String>,
         tenant: Option<&str>,
     ) -> Result<DdlResult> {
-        let (catalog, table_id) = self
+        let resolved = self
             .catalog_manager
             .resolve_table_scoped(table_name, tenant)
-            .await?;
+            .await;
+        // The name is held by an entry this tenant may not see: creating it is
+        // refused exactly as for a name that already exists.
+        if let Err(error) = &resolved
+            && proximadb_catalog::TableNotVisible::is(error)
+        {
+            if if_not_exists {
+                return Ok(DdlResult::already_exists("Table", table_name));
+            }
+            return Err(anyhow!("Table '{}' already exists", table_name));
+        }
+        let (catalog, table_id) = resolved?;
 
         // Check if table exists
         if catalog.table_exists(&table_id).await? {
@@ -1025,10 +1036,18 @@ impl DdlService {
         purge: bool,
         tenant: Option<&str>,
     ) -> Result<DdlResult> {
-        let (catalog, table_id) = self
+        let resolved = self
             .catalog_manager
             .resolve_table_scoped(table_name, tenant)
-            .await?;
+            .await;
+        // An entry this tenant may not see is answered exactly as a missing one.
+        if let Err(error) = &resolved
+            && proximadb_catalog::TableNotVisible::is(error)
+            && if_exists
+        {
+            return Ok(DdlResult::not_found("Table", table_name));
+        }
+        let (catalog, table_id) = resolved?;
 
         // Check if table exists
         if !catalog.table_exists(&table_id).await? {

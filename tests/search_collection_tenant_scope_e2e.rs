@@ -908,7 +908,7 @@ fn beyond_search_probes() -> Vec<RestProbe> {
             |c| format!("/api/v2/collections/{c}/documents"),
             |_| {
                 Some(json!({
-                    "documents": [{ "id": "planted-doc", "text": "planted text", "vector": vector() }]
+                    "documents": [{ "id": "probe-doc", "text": "probe text", "vector": vector() }]
                 }))
             },
         ),
@@ -930,7 +930,7 @@ fn beyond_search_probes() -> Vec<RestProbe> {
             |c| format!("/api/v1/collections/{c}/entities"),
             |_| {
                 Some(json!({ "entity": {
-                    "id": "planted-entity",
+                    "id": "probe-entity",
                     "embeddings": [{ "model_id": "m", "modality": "Text", "dimension": 4,
                                      "vector": [0.0, 0.0, 0.0, 1.0] }]
                 }}))
@@ -961,7 +961,7 @@ fn beyond_search_probes() -> Vec<RestProbe> {
             |c| {
                 Some(json!({
                     "collection": c,
-                    "documents": [{ "id": "planted-bm25", "text": "quarterly planted" }]
+                    "documents": [{ "id": "probe-bm25", "text": "quarterly probe" }]
                 }))
             },
         ),
@@ -1188,7 +1188,7 @@ async fn every_collection_surface_is_scoped_to_the_request_tenant() {
             Some(json!({ "collection": GLOBEX_DOCS, "text_query": "quarterly", "vector": vector(), "top_k": 5 })),
         )
         .await;
-    if body.contains("planted-bm25") {
+    if body.contains("probe-bm25") {
         failures.push(format!(
             "BM25 index of globex_docs was written by acme: {status} {body}"
         ));
@@ -1207,7 +1207,7 @@ async fn every_collection_surface_is_scoped_to_the_request_tenant() {
 /// the resource in the caller's own namespace succeeds for both.)
 fn compare_probe(
     failures: &mut Vec<String>,
-    secret: &str,
+    owner_value: &str,
     label: &str,
     foreign: (reqwest::StatusCode, String),
     missing: (reqwest::StatusCode, String),
@@ -1225,7 +1225,7 @@ fn compare_probe(
     if served_is_failure && foreign.0.is_success() {
         failures.push(format!("{label}: served: {} {}", foreign.0, foreign.1));
     }
-    if foreign.1.contains(secret) {
+    if foreign.1.contains(owner_value) {
         failures.push(format!("{label}: owner's value visible: {}", foreign.1));
     }
 }
@@ -1237,7 +1237,7 @@ fn compare_probe(
 /// missing, cannot change them, and does not see them listed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
-    const SECRET: &str = "owner-only-value";
+    const OWNER_VALUE: &str = "owner-value";
     let server = Server::start().await.expect("server start");
     let rest = Rest {
         http: reqwest::Client::builder()
@@ -1269,9 +1269,9 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
     let acme_pg = pg(ACME).await;
     for sql in [
         "CREATE TABLE gx_orders (id INT PRIMARY KEY, note TEXT)".to_string(),
-        format!("INSERT INTO gx_orders (id, note) VALUES (1, '{SECRET}')"),
+        format!("INSERT INTO gx_orders (id, note) VALUES (1, '{OWNER_VALUE}')"),
         "CREATE TABLE orders (id INT PRIMARY KEY, note TEXT)".to_string(),
-        format!("INSERT INTO orders (id, note) VALUES (1, '{SECRET}')"),
+        format!("INSERT INTO orders (id, note) VALUES (1, '{OWNER_VALUE}')"),
     ] {
         globex_pg.simple_query(&sql).await.expect("globex pgwire");
     }
@@ -1286,7 +1286,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
     for (who, tenant) in [("acme", Some(ACME)), ("no tenant header", None)] {
         compare_probe(
             &mut failures,
-            SECRET,
+            OWNER_VALUE,
             &format!("change feed as {who}"),
             rest.call(tenant, reqwest::Method::GET, &feed("gx_orders"), None)
                 .await,
@@ -1300,7 +1300,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
     let (status, body) = rest
         .call(Some(ACME), reqwest::Method::GET, &feed("orders"), None)
         .await;
-    if !status.is_success() || body.contains(SECRET) || !body.contains("acme-row") {
+    if !status.is_success() || body.contains(OWNER_VALUE) || !body.contains("acme-row") {
         failures.push(format!(
             "change feed of acme's own `orders` must carry only acme's rows: {status} {body}"
         ));
@@ -1308,7 +1308,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
     let (status, body) = rest
         .call(Some(GLOBEX), reqwest::Method::GET, &feed("gx_orders"), None)
         .await;
-    if !status.is_success() || !body.contains(SECRET) {
+    if !status.is_success() || !body.contains(OWNER_VALUE) {
         failures.push(format!("change feed as owner: {status} {body}"));
     }
     // The default tenant reads its own feed: pgwire database `default` and a
@@ -1347,7 +1347,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
                 Some(GLOBEX),
                 reqwest::Method::POST,
                 &format!("{docs}/{collection}/documents"),
-                Some(json!({ "id": "doc1", "document": { "secret": SECRET } })),
+                Some(json!({ "id": "doc1", "document": { "value": OWNER_VALUE } })),
             )
             .await;
         assert!(
@@ -1370,7 +1370,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
     };
     let (status, body) = globex_doc(&rest).await;
     assert!(
-        status.is_success() && body.contains(SECRET),
+        status.is_success() && body.contains(OWNER_VALUE),
         "owner reads its document: {status} {body}"
     );
     // Listings and lookups first, before acme's own writes below create
@@ -1385,7 +1385,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
     }
     compare_probe(
         &mut failures,
-        SECRET,
+        OWNER_VALUE,
         "document collection info",
         rest.call(
             Some(ACME),
@@ -1410,7 +1410,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
         (
             "insert document",
             reqwest::Method::POST,
-            Some(json!({ "id": "planted", "document": { "planted": true } })),
+            Some(json!({ "id": "probe", "document": { "probe": true } })),
         ),
         ("delete document", reqwest::Method::DELETE, None),
     ] {
@@ -1420,7 +1420,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
         };
         compare_probe(
             &mut failures,
-            SECRET,
+            OWNER_VALUE,
             &format!("document {label} by name"),
             rest.call(Some(ACME), method.clone(), &path("gxdocs"), payload.clone())
                 .await,
@@ -1435,27 +1435,20 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
             "missing_gxdocs",
             method == reqwest::Method::GET,
         );
-        // A separator in the name, literal-encoded or not, never addresses
-        // another tenant's storage key — for a named tenant or the default one.
+        // Name validation: a collection name may not contain a path separator.
         for tenant in [Some(ACME), None] {
-            for encoded in ["globex%2Fgxdocs", "globex%252Fgxdocs"] {
-                let (status, body) = rest
-                    .call(tenant, method.clone(), &path(encoded), payload.clone())
-                    .await;
-                // The single-encoded form decodes to a name with a separator,
-                // which is rejected; the double-encoded form is an ordinary
-                // (if odd) name in the caller's own namespace.
-                let separator = encoded == "globex%2Fgxdocs";
-                if (separator && status.is_success()) || body.contains(SECRET) {
-                    failures.push(format!(
-                        "document {label} via {encoded} as {tenant:?}: {status} {body}"
-                    ));
-                }
+            let (status, body) = rest
+                .call(tenant, method.clone(), &path("a%2Fb"), payload.clone())
+                .await;
+            if status != reqwest::StatusCode::BAD_REQUEST {
+                failures.push(format!(
+                    "document {label} with an invalid name as {tenant:?}: {status} {body}"
+                ));
             }
         }
     }
     let (status, body) = globex_doc(&rest).await;
-    if !status.is_success() || !body.contains(SECRET) || body.contains("planted") {
+    if !status.is_success() || !body.contains(OWNER_VALUE) || body.contains("probe") {
         failures.push(format!(
             "globex's document changed after acme's probes: {status} {body}"
         ));
@@ -1474,7 +1467,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
             Some(aql.clone()),
         )
         .await;
-    if body.contains(SECRET) {
+    if body.contains(OWNER_VALUE) {
         failures.push(format!("AQL document source as acme: {status} {body}"));
     }
 
@@ -1496,7 +1489,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
             None,
             reqwest::Method::POST,
             "/api/v2/graphs/gx_graph/nodes",
-            Some(json!({ "node": { "id": "n1", "labels": ["L"], "properties": { "secret": SECRET } } })),
+            Some(json!({ "node": { "id": "n1", "labels": ["L"], "properties": { "value": OWNER_VALUE } } })),
         )
         .await;
     assert!(
@@ -1538,12 +1531,12 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
             "graph node create",
             reqwest::Method::POST,
             |g| format!("/api/v2/graphs/{g}/nodes"),
-            Some(json!({ "node": { "id": "planted", "labels": ["L"] } })),
+            Some(json!({ "node": { "id": "probe", "labels": ["L"] } })),
         ),
     ] {
         compare_probe(
             &mut failures,
-            SECRET,
+            OWNER_VALUE,
             label,
             rest.call(
                 Some(ACME),
@@ -1572,7 +1565,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
             None,
         )
         .await;
-    if !status.is_success() || !body.contains(SECRET) {
+    if !status.is_success() || !body.contains(OWNER_VALUE) {
         failures.push(format!(
             "graph node changed after acme's probes: {status} {body}"
         ));
@@ -1621,7 +1614,7 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
     ] {
         compare_probe(
             &mut failures,
-            SECRET,
+            OWNER_VALUE,
             label,
             rest.call(
                 Some(ACME),
@@ -1665,6 +1658,222 @@ async fn tenant_owned_resources_are_reachable_only_by_their_owner() {
     assert!(
         failures.is_empty(),
         "tenant-owned resources must be reachable only by their owner:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// The outcome of one pgwire statement as a client sees it, with `name`
+/// masked: `OK`, or the server's error message.
+async fn pg_outcome(client: &tokio_postgres::Client, sql: &str, name: &str) -> String {
+    match client.simple_query(sql).await {
+        Ok(_) => "OK".to_string(),
+        Err(error) => mask(
+            error
+                .as_db_error()
+                .map(|db| db.message().to_string())
+                .unwrap_or_else(|| error.to_string())
+                .as_str(),
+            name,
+        ),
+    }
+}
+
+/// The default tenant resolves names in the unprefixed catalog namespace,
+/// where every tenant's collection is also recorded. Another tenant's
+/// collection must still read as missing there — for reads, writes and DDL,
+/// over pgwire and REST — and stay intact for its owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_tenant_sees_other_tenants_collections_as_missing() {
+    let server = Server::start().await.expect("server start");
+    let rest = Rest {
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .expect("http client"),
+        base: format!("http://127.0.0.1:{}", server.rest_port),
+    };
+    rest.create(Some(GLOBEX), GLOBEX_DOCS).await;
+    rest.insert(Some(GLOBEX), GLOBEX_DOCS, GLOBEX).await;
+    sleep(Duration::from_millis(300)).await;
+    let mut failures: Vec<String> = Vec::new();
+
+    // pgwire as the default tenant.
+    let conn = format!(
+        "host=127.0.0.1 port={} user=postgres dbname=default sslmode=disable",
+        server.pg_port
+    );
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .expect("pgwire connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let statements: Vec<(&str, fn(&str) -> String)> = vec![
+        ("select", |t| format!("SELECT * FROM {t}")),
+        ("insert", |t| {
+            format!("INSERT INTO {t} (oid, tenant_id) VALUES ('probe-row', 'default')")
+        }),
+        ("update", |t| {
+            format!("UPDATE {t} SET tenant_id = 'x' WHERE oid = 'x'")
+        }),
+        ("delete", |t| format!("DELETE FROM {t} WHERE oid = 'x'")),
+        ("alter", |t| format!("ALTER TABLE {t} ADD COLUMN extra INT")),
+        ("drop if exists", |t| format!("DROP TABLE IF EXISTS {t}")),
+        ("drop", |t| format!("DROP TABLE {t}")),
+    ];
+    for (label, sql) in &statements {
+        let foreign = pg_outcome(&client, &sql(GLOBEX_DOCS), GLOBEX_DOCS).await;
+        let missing = pg_outcome(&client, &sql(MISSING_DOCS), MISSING_DOCS).await;
+        if foreign != missing {
+            failures.push(format!(
+                "pgwire {label} as default: foreign {foreign:?} vs missing {missing:?}"
+            ));
+        }
+    }
+    // REST SQL and collection delete with no tenant header.
+    for statement in ["SELECT * FROM {}", "DROP TABLE {}"] {
+        let foreign = rest
+            .call(
+                None,
+                reqwest::Method::POST,
+                "/api/v2/sql",
+                Some(json!({ "query": statement.replace("{}", GLOBEX_DOCS) })),
+            )
+            .await;
+        let missing = rest
+            .call(
+                None,
+                reqwest::Method::POST,
+                "/api/v2/sql",
+                Some(json!({ "query": statement.replace("{}", MISSING_DOCS) })),
+            )
+            .await;
+        compare_probe(
+            &mut failures,
+            &format!("{GLOBEX}-r0"),
+            &format!("REST sql `{statement}` with no tenant header"),
+            foreign,
+            missing,
+            GLOBEX_DOCS,
+            MISSING_DOCS,
+            true,
+        );
+    }
+    let delete = |c: &str| format!("/api/v2/collections/{c}");
+    compare_probe(
+        &mut failures,
+        &format!("{GLOBEX}-r0"),
+        "REST collection delete with no tenant header",
+        rest.call(None, reqwest::Method::DELETE, &delete(GLOBEX_DOCS), None)
+            .await,
+        rest.call(None, reqwest::Method::DELETE, &delete(MISSING_DOCS), None)
+            .await,
+        GLOBEX_DOCS,
+        MISSING_DOCS,
+        true,
+    );
+    // A case variant of the name reads as missing too (change feed).
+    let feed = |c: &str| format!("/api/v2/collections/{c}/changes?since_lsn=0");
+    compare_probe(
+        &mut failures,
+        &format!("{GLOBEX}-r0"),
+        "change feed of a case variant with no tenant header",
+        rest.call(
+            None,
+            reqwest::Method::GET,
+            &feed(&GLOBEX_DOCS.to_uppercase()),
+            None,
+        )
+        .await,
+        rest.call(
+            None,
+            reqwest::Method::GET,
+            &feed(&MISSING_DOCS.to_uppercase()),
+            None,
+        )
+        .await,
+        &GLOBEX_DOCS.to_uppercase(),
+        &MISSING_DOCS.to_uppercase(),
+        true,
+    );
+
+    // The owner's collection is intact: listed, readable, and its records
+    // unchanged.
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::GET,
+            "/api/v2/collections",
+            None,
+        )
+        .await;
+    if !body.contains(GLOBEX_DOCS) {
+        failures.push(format!(
+            "globex's listing after the probes: {status} {body}"
+        ));
+    }
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::GET,
+            &format!("/api/v2/collections/{GLOBEX_DOCS}"),
+            None,
+        )
+        .await;
+    if !status.is_success() {
+        failures.push(format!(
+            "globex's collection after the probes: {status} {body}"
+        ));
+    }
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            &format!("/api/v2/collections/{GLOBEX_DOCS}/records/scan"),
+            Some(json!({ "limit": 100 })),
+        )
+        .await;
+    if !body.contains(&format!("{GLOBEX}-r0")) || body.contains("probe-row") {
+        failures.push(format!(
+            "globex's records after the probes: {status} {body}"
+        ));
+    }
+
+    // Graphs: reading a graph that was never created does not create it, and a
+    // graph id with a path separator is a client error.
+    let (status, body) = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::GET,
+            "/api/v2/graphs/never_created/nodes/n1",
+            None,
+        )
+        .await;
+    if status != reqwest::StatusCode::NOT_FOUND {
+        failures.push(format!("read of a never-created graph: {status} {body}"));
+    }
+    let (status, body) = rest
+        .call(Some(ACME), reqwest::Method::GET, "/api/v2/graphs", None)
+        .await;
+    if body.contains("never_created") {
+        failures.push(format!("a read created a graph: {status} {body}"));
+    }
+    let (status, body) = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::GET,
+            "/api/v2/graphs/a%2Fb/nodes/n1",
+            None,
+        )
+        .await;
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        failures.push(format!("graph id with a separator: {status} {body}"));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the default tenant must see other tenants' collections as missing:\n  {}",
         failures.join("\n  ")
     );
 }

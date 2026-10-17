@@ -17,6 +17,31 @@ use proximadb_storage_filesystem_types::FileSystem;
 use crate::cache::CatalogCache;
 use crate::{Catalog, TableIdentifier};
 
+/// A table name that resolves, for the requesting tenant, to an entry it may
+/// not see. Displays exactly like a missing table so the two are
+/// indistinguishable; callers that treat "missing" specially (`DROP ... IF
+/// EXISTS`, `CREATE`) downcast to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableNotVisible {
+    /// The name as the caller supplied it.
+    pub table: String,
+}
+
+impl std::fmt::Display for TableNotVisible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Table '{}' does not exist", self.table)
+    }
+}
+
+impl std::error::Error for TableNotVisible {}
+
+impl TableNotVisible {
+    /// Whether `error` (or anything it wraps) is a [`TableNotVisible`].
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<TableNotVisible>())
+    }
+}
+
 /// Resolves a [`FileSystem`] backend for an object-store catalog URL
 /// (`s3://`, `gs://`, `az://`). Implemented by the root composition root (which
 /// wraps `FilesystemFactory`); injected via
@@ -776,10 +801,57 @@ impl CatalogManager {
                 .filter(|t| t.namespace == id.namespace && t.name.eq_ignore_ascii_case(&id.name))
                 .collect();
             if let [declared] = candidates.as_slice() {
-                return Ok((catalog, declared.clone()));
+                let declared = declared.clone();
+                Self::ensure_visible_to(catalog.as_ref(), &declared, fqn, tenant).await?;
+                return Ok((catalog, declared));
             }
         }
+        Self::ensure_visible_to(catalog.as_ref(), &id, fqn, tenant).await?;
         Ok((catalog, id))
+    }
+
+    /// A request acting as `tenant` may resolve a catalog entry that records a
+    /// collection only when that collection is visible to it (the
+    /// `proximadb_tenant` ownership rule). Collection entries can sit in a
+    /// namespace shared by every tenant, so without this an unprefixed lookup
+    /// would reach another tenant's collection. Refused entries surface as
+    /// [`TableNotVisible`], which reads exactly like a missing table. Internal
+    /// resolution (`tenant` = `None`) is not filtered.
+    async fn ensure_visible_to(
+        catalog: &dyn Catalog,
+        id: &TableIdentifier,
+        fqn: &str,
+        tenant: Option<&str>,
+    ) -> Result<()> {
+        let Some(tenant) = tenant.filter(|tenant| !tenant.is_empty()) else {
+            return Ok(());
+        };
+        if !catalog.table_exists(id).await.unwrap_or(false) {
+            return Ok(());
+        }
+        let schema = catalog.get_table(id).await?;
+        let records_collection = schema.properties.contains_key("collection.id")
+            && (schema
+                .properties
+                .get("asset.kind")
+                .is_some_and(|kind| kind == "collection")
+                || schema
+                    .properties
+                    .get("asset.capability.vector")
+                    .is_some_and(|flag| flag == "true"));
+        if records_collection
+            && !proximadb_tenant::collection_entry_visible_to(
+                schema.properties.get("owner").map(String::as_str),
+                schema.properties.get("tags").map(String::as_str),
+                Some(tenant),
+            )
+        {
+            return Err(TableNotVisible {
+                table: fqn.to_string(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Get cache reference for direct access

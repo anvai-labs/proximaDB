@@ -42,15 +42,33 @@ impl TenantScopedGraphPort {
         }
     }
 
-    /// The engine key for a tenant-clean graph id.
+    /// The engine key for a tenant-clean graph id. A malformed id fails with a
+    /// [`proximadb_tenant::ScopedKeyError`] in the chain (a client error).
     fn key(&self, graph_id: &str) -> Result<String> {
         proximadb_tenant::scoped_resource_key(&self.tenant, graph_id)
-            .map_err(|e| anyhow!("invalid graph id: {e}"))
+            .map_err(|e| anyhow::Error::new(e).context("invalid graph id"))
     }
 
     /// Rewrite a request's graph id to the tenant's engine key in place.
     fn scope(&self, graph_id: &mut String) -> Result<()> {
         *graph_id = self.key(graph_id)?;
+        Ok(())
+    }
+
+    /// Like [`Self::scope`], for operations on an existing graph: a graph this
+    /// tenant has not created is answered as not found, and is never created
+    /// as a side effect of the call.
+    async fn scope_existing(&self, graph_id: &mut String) -> Result<()> {
+        let key = self.key(graph_id)?;
+        if self
+            .inner
+            .get_graph_collection(key.clone())
+            .await?
+            .is_none()
+        {
+            return Err(anyhow!("Graph collection '{graph_id}' not found"));
+        }
+        *graph_id = key;
         Ok(())
     }
 
@@ -80,15 +98,15 @@ impl GraphPort for TenantScopedGraphPort {
         self.inner.create_node(request).await
     }
     async fn get_node(&self, mut request: GetNodeRequest) -> Result<Node> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.get_node(request).await
     }
     async fn update_node(&self, mut request: UpdateNodeRequest) -> Result<Node> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.update_node(request).await
     }
     async fn delete_node(&self, mut request: DeleteNodeRequest) -> Result<Node> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.delete_node(request).await
     }
     async fn create_edge(&self, mut request: CreateEdgeRequest) -> Result<Edge> {
@@ -96,27 +114,27 @@ impl GraphPort for TenantScopedGraphPort {
         self.inner.create_edge(request).await
     }
     async fn get_edge(&self, mut request: GetEdgeRequest) -> Result<Edge> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.get_edge(request).await
     }
     async fn update_edge(&self, mut request: UpdateEdgeRequest) -> Result<Edge> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.update_edge(request).await
     }
     async fn delete_edge(&self, mut request: DeleteEdgeRequest) -> Result<Edge> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.delete_edge(request).await
     }
     async fn query_nodes(&self, mut request: NodeQuery) -> Result<BatchResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.query_nodes(request).await
     }
     async fn query_edges(&self, mut request: EdgeQuery) -> Result<BatchResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.query_edges(request).await
     }
     async fn execute_query(&self, mut request: GraphQueryRequest) -> Result<GraphQueryResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.execute_query(request).await
     }
     async fn execute_query_json(
@@ -124,41 +142,42 @@ impl GraphPort for TenantScopedGraphPort {
         graph_id: &str,
         query: &str,
     ) -> Result<Vec<serde_json::Value>> {
-        let key = self.key(graph_id)?;
+        let mut key = graph_id.to_string();
+        self.scope_existing(&mut key).await?;
         self.inner.execute_query_json(&key, query).await
     }
     async fn get_neighbors(&self, mut request: GetNeighborsRequest) -> Result<BatchResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.get_neighbors(request).await
     }
     async fn traverse_graph(&self, mut request: TraversalRequest) -> Result<TraversalResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.traverse_graph(request).await
     }
     async fn stream_traverse(&self, mut request: TraversalRequest) -> Result<Vec<TraversalChunk>> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.stream_traverse(request).await
     }
     async fn get_graph_stats(&self, mut request: GetStatsRequest) -> Result<GraphStats> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.get_graph_stats(request).await
     }
     async fn shortest_path(
         &self,
         mut request: ShortestPathRequest,
     ) -> Result<ShortestPathResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.shortest_path(request).await
     }
     async fn get_connected_components(
         &self,
         mut request: GetStatsRequest,
     ) -> Result<ConnectedComponentsResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.get_connected_components(request).await
     }
     async fn has_cycle(&self, mut request: GetStatsRequest) -> Result<CycleCheckResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.has_cycle(request).await
     }
     async fn add_unique_constraint(
@@ -172,7 +191,7 @@ impl GraphPort for TenantScopedGraphPort {
         &self,
         mut request: UniqueConstraintRequest,
     ) -> Result<UniqueConstraintResponse> {
-        self.scope(&mut request.graph_id)?;
+        self.scope_existing(&mut request.graph_id).await?;
         self.inner.remove_unique_constraint(request).await
     }
     async fn batch_create_nodes(&self, mut request: BatchNodeRequest) -> Result<BatchResponse> {
@@ -261,6 +280,17 @@ impl FromRequestParts<GraphRestState> for TenantGraph {
             .map(|t| t.tenant_id.clone())
             .filter(|t| !t.is_empty())
             .ok_or_else(|| RestError::Unauthorized("request tenant is required".to_string()))?;
+        // A malformed graph id in the path is a client error, rejected before
+        // any graph operation runs.
+        if let Ok(axum::extract::Path(params)) = axum::extract::Path::<
+            std::collections::HashMap<String, String>,
+        >::from_request_parts(parts, state)
+        .await
+            && let Some(graph_id) = params.get("graph_id")
+        {
+            proximadb_tenant::validate_scoped_resource_name(graph_id)
+                .map_err(|e| RestError::InvalidArgument(format!("invalid graph id: {e}")))?;
+        }
         Ok(Self::for_tenant(state, &tenant))
     }
 }

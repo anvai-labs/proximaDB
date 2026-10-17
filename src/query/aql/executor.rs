@@ -75,7 +75,19 @@ impl AqlExecutor {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        let result = self.execute_internal(&query, &query.from, &mut ctx).await;
+        // The request scope matches the AQL scope, so anything a source calls
+        // without an explicit tenant resolves the same way.
+        let scope = ctx.scope.clone();
+        let run = self.execute_internal(&query, &query.from, &mut ctx);
+        let result = match scope {
+            AqlScope::Tenant(tenant) if !tenant.is_empty() => {
+                crate::query::request_scope::with_request_tenant(tenant, run).await
+            }
+            AqlScope::Internal => {
+                crate::query::request_scope::with_internal_scope("aql internal", run).await
+            }
+            AqlScope::Tenant(_) | AqlScope::Unset => run.await,
+        };
 
         let finished_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
