@@ -1,0 +1,37 @@
+# ProximaDB server WITH native ONNX embeddings — the production-shaped demo build.
+# Same stages as the root Dockerfile; the only delta is `--features onnx` so the
+# server embeds text server-side (BAAI/bge-small-en-v1.5) instead of requiring
+# client-supplied vectors. Model files are NOT baked in — mount them via
+# docker-compose.yml (fetch-models.sh downloads them).
+#
+# Build context: repository root.   docker build -f demo/agent-memory/Dockerfile.onnx .
+
+FROM rust:1.95-slim AS builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY . .
+# GHA-style resource caps — keeps the build inside laptop memory.
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
+    CARGO_PROFILE_RELEASE_OPT_LEVEL=1 \
+    CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_DEBUG=false
+RUN cargo build --release -p proximadb-server --jobs=2 --features onnx
+
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1001 -s /bin/bash proximadb
+WORKDIR /app
+COPY --from=builder /build/target/release/proximadb-server /app/proximadb-server
+COPY config /app/config
+RUN mkdir -p /var/lib/proximadb/models /var/lib/proximadb/data \
+    && chown -R proximadb:proximadb /app /var/lib/proximadb
+USER proximadb
+ENV PROXIMADB_EMBED_MODEL_DIR=/var/lib/proximadb/models \
+    PROXIMADB_TOKENIZER_PATH=/var/lib/proximadb/models/tokenizer.json
+EXPOSE 5678 5679
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 \
+  CMD curl -sf http://localhost:5678/health || exit 1
+ENTRYPOINT ["/app/proximadb-server"]
+CMD ["--config", "/app/config/config.toml", "--port", "5678", "--data-dir", "/var/lib/proximadb/data"]
