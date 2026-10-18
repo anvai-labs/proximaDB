@@ -344,7 +344,7 @@ let nearby = helix_engine.range_search(
 **Not Recommended For**:
 
 * **Random Access Patterns**: HELIX optimizes for spatial locality. Random point lookups should use SST or SWIFT.
-* **Heavy Write Workloads**: PCA computation adds overhead to flushes. VIPER or SST handle writes better.
+* **Heavy Write Workloads**: PCA computation adds overhead to flushes. SST handles writes better.
 * **Small Collections**: Overhead not justified for <10K vectors. Use SST for small datasets.
 * **Frequent Schema Changes**: PCA model becomes outdated when data distribution changes dramatically.
 * **Uniform Query Distribution**: If all regions are queried equally, liquid clustering provides no benefit.
@@ -353,7 +353,7 @@ let nearby = helix_engine.range_search(
 
 * **SST**: Random access, write-heavy workloads
 * **SWIFT**: Hierarchical organization, multi-tenant
-* **VIPER**: Analytics, batch operations
+* **Analytics**: a relational table materialized for DataFusion (VIPER is deprecated, ADR-093)
 * **RAPTOR**: Dynamic adaptive access patterns
 
 == Key Components
@@ -653,7 +653,7 @@ In `config.toml`:
 [source,toml]
 ----
 [storage]
-default_engine = "helix"  # Use HELIX for new collections
+# The engine is chosen per collection at create time: engine = "helix"
 
 [storage.helix]
 # LSM Configuration
@@ -803,7 +803,7 @@ Via API:
 **When to Choose Alternatives**:
 
 * **SST**: Random access, write-heavy, small collections
-* **VIPER**: Analytics, batch processing, columnar operations
+* **Analytics**: a relational table materialized for DataFusion (VIPER is deprecated, ADR-093)
 * **SWIFT**: Multi-tenant, hierarchical organization, billions of vectors
 * **RAPTOR**: Dynamic adaptive access, graph-like relationships
 

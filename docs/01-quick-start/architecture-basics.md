@@ -24,10 +24,9 @@ flowchart TB
     MEM[Memtables]
     CACHE[Block Cache]
 
-    subgraph Engines["Storage Engines<br/>(SST, VIPER, HELIX, NOVA)"]
+    subgraph Engines["Vector engines<br/>(SST Supported; HELIX, NOVA Beta)"]
       SST[SST]
       HELIX[HELIX]
-      VIPER[VIPER]
       NOVA[NOVA]
     end
 
@@ -102,37 +101,39 @@ All writes (vectors, documents, graphs, logs) go through a single WAL:
 ```mermaid
 %%{init: {"theme": "neutral"}}%%
 flowchart TB
-  subgraph Write["Write-Optimized"]
-    SST[SST<br/>~5ms]
+  subgraph Default["Supported (default)"]
+    SST[SST]
   end
 
-  subgraph Read["Read-Optimized"]
-    HELIX[HELIX<br/>~13ms]
+  subgraph Beta["Beta options"]
+    HELIX[HELIX]
+    NOVA[NOVA]
   end
 
-  subgraph Analytics["Analytics"]
-    VIPER[VIPER<br/>~89ms]
-    NOVA[NOVA<br/>~101ms]
+  subgraph SQLA["Analytical SQL"]
+    DF["Relational table + MATERIALIZE<br/>DataFusion over Parquet"]
   end
 
   style SST fill:#27ae60,color:#fff
   style HELIX fill:#e67e22,color:#fff
-  style VIPER fill:#9b59b6,color:#fff
-  style NOVA fill:#9b59b6,color:#fff
+  style NOVA fill:#e67e22,color:#fff
+  style DF fill:#9b59b6,color:#fff
 ```
 
-SST is the Supported storage engine. VIPER, HELIX, and NOVA are Beta options for
-different workloads. SWIFT and RAPTOR are **experimental**, off by default behind
-the `experimental-engines` cargo feature and not part of the supported surface:
+SST is the Supported storage engine. Today a vector collection created without `engine` (and without an index or quantization) is auto-routed to HELIX, which is Beta; pass `engine="sst"` for the Supported tier. SST becomes the automatic default in v0.5 (TD-ENGSEL-1). HELIX and NOVA are Beta
+options. VIPER is deprecated (new VIPER collections are rejected). SWIFT and RAPTOR are
+**experimental**, off by default behind the `experimental-engines` cargo feature, and are deleted
+in roadmap release v0.6. Analytical SQL is not an engine choice: it runs on DataFusion over
+Parquet once a relational table is materialized.
 
-| Engine | Best For | Performance |
-|--------|----------|-------------|
-| **SST** | Real-time, write-heavy | Fastest writes |
-| **HELIX** | Locality-optimized reads | Spatial queries |
-| **VIPER** | Columnar analytics | Aggregations |
-| **NOVA** | Mixed workloads | Balanced |
+| Engine | Tier | Best for |
+|--------|------|----------|
+| **SST** | Supported | Real-time ingestion and filtered vector search |
+| **HELIX** | Beta | Locality-ordered high-dimensional embeddings (measure recall first) |
+| **NOVA** | Beta | Mixed read/write workloads |
 
-**Why it matters:** Pick the right engine for your workload. Don't use analytics engine for real-time writes.
+**Why it matters:** start on SST; switch only after measuring a need on your own data
+([storage engine guide](../05-concepts/storage-engines.adoc)).
 
 ---
 
@@ -193,6 +194,9 @@ flowchart TB
 ```
 
 SQL extensions for multi-model queries:
+
+These table functions run through the federated REST endpoint, not over pgwire (TD-FEDPATH-1);
+see the README's SQL Extensions for what works today.
 
 ```sql
 -- Vector search

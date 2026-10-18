@@ -60,6 +60,9 @@ client.create_collection(CollectionConfig(
 
 | pgwire SQL `CREATE TABLE ... WITH (...)`
 a|
+NOTE: In a table without a JSON or JSONB column, a `VECTOR(n)` column created over pgwire is checked against
+dimension 1 today, so inserts of `n`-dimensional vectors fail (TD-SQLCOLL-1). Set precision on a REST-created collection instead.
+
 [source,sql]
 ----
 CREATE TABLE docs_fp16 (

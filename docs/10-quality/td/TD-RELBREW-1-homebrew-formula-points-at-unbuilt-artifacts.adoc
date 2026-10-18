@@ -1,0 +1,24 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RELBREW-1: the release workflow's Homebrew formula points at artifacts that are never built
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-10-18, #2065).** The formula is now rendered for the one archive the release builds (Linux x86_64) by `scripts/release_homebrew_formula.py`, published to the `anvai-labs/tap` tap, and checked by the release smoke (`scripts/release_smoke/homebrew_check.py`). The tap formula was added by hand for v0.4.1; the release automation takes over from the next release.
+| Priority | **LOW** — `brew install anvai-labs/tap/proximadb` works for v0.4.1 (formula added to the tap by hand on 2026-10-17).
+| Component | `.github/workflows/release.yml` job `update-homebrew`
+|===
+
+== Problem
+
+Before #2065, `update-homebrew` generated `proximadb.rb` as a workflow artifact. The formula's URLs pointed at
+`x86_64-apple-darwin`, `aarch64-apple-darwin` and `aarch64-unknown-linux-gnu` archives, which the
+release does not build (v0.4.1 ships Linux x86_64 and Windows x86_64 archives plus RPM, DEB and
+MSI). No tap repository published the formula, so `brew install proximadb` never worked,
+although the install guide advertised `brew install proximadb` until 2026-10-17.
+
+== Fix options
+
+* Build the macOS (and Linux ARM) archives and publish the formula to a tap, or
+* remove the job until those archives exist.

@@ -1,0 +1,25 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGVEC-1: projecting a pgvector distance over pgwire returns a catalog row
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-18). Reproduced against the 0.4.1 image.
+| Priority | **HIGH** — wrong result with no error on the SQL front door.
+| Component | pgwire relational lowering of `<->` (`src/network/postgres/relational_pipeline.rs`)
+| Relates to | TD-XMODAL-4 (one vector-SQL plan), TD-SQLCOLL-1
+|===
+
+== Problem
+
+Over pgwire, against a collection created through REST,
+`SELECT * FROM products ORDER BY embedding <-> '[0.1,0.2,0.3]'::vector LIMIT 10` returns the right
+rows in the right order. But `SELECT id, embedding <-> '[1,0,0]' AS distance FROM products ORDER BY
+distance LIMIT 10` returns a catalog row (`collection_name | dimension | vector_count`) instead.
+
+== Fix
+
+Lower a projected `<->` to the same canonical vector-search node as the `ORDER BY` form (the
+TD-XMODAL-4 plan) and return the distance column; until then, refuse it with a specific error.
+Test both forms end to end over pgwire.

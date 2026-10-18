@@ -40,7 +40,7 @@ These are in-process Python embedded measurements. They are useful for choosing 
 | Generic `db.search(..., query=list/array)` | Python generic vector search | 652 queries/s | 76.73 ms / 50 searches | Simple scripts and compatibility. | Slower because it uses generic Python object/list conversion. |
 | Record-wire `search_numpy` profiled | NumPy-native search after canonical record insert | 26.6k queries/s | 1.88 ms / 50 searches | Fast record-shaped ingestion plus fast vector search. | Same native search path, with data inserted through `ProximaRecord`. |
 | Record-wire generic `db.search` | Generic search after record insert | 339 queries/s | 147.50 ms / 50 searches | Compatibility checks. | Use NumPy-native search for performance. |
-| SQL `VECTOR_SEARCH(...)` | Embedded SQL extension | 13.0k queries/s | 3.84 ms / 50 searches | SQL users, server-side query composition, pgwire/REST parity. | About 2x slower than native profiled search, but much more composable. |
+| SQL `VECTOR_SEARCH(...)` | Embedded SQL extension | 13.0k queries/s | 3.84 ms / 50 searches | SQL users and server-side query composition (embedded engine; on the server, only through the federated REST endpoint, TD-FEDPATH-1). | About 2x slower than native profiled search, but much more composable. |
 | UQL `execute_unified_query(...)` | Unified query facade | 11.5k queries/s | 4.37 ms / 50 searches | Cross-model query routing and language-neutral plans. | Slightly slower than SQL extension due to unified result shaping. |
 | Cypher `execute_cypher(...)` | Lowers to SQL `GRAPH_QUERY(...)` | 4.1k queries/s | 12.07 ms / 50 queries | Graph pattern queries and graph-native user workflows. | Use graph traversal API for simple fixed-depth traversals. |
 | Document indexed path query | Document facade | 2.25k queries/s | 22.23 ms / 50 queries | JSON path lookup and document-centric workflows. | Prefer cataloged projections/indexes for heavy analytical scans. |
@@ -74,7 +74,7 @@ These are in-process Python embedded measurements. They are useful for choosing 
 | If You Need | Use | Rationale |
 |---|---|---|
 | Fast vector search inside Python | `search_numpy` | Avoids generic object conversion and keeps query vectors contiguous. |
-| Vector search from SQL clients | `VECTOR_SEARCH(...)` | Composable and compatible with pgwire/SQL workflows. |
+| Vector search from SQL clients | `VECTOR_SEARCH(...)` | Composable and available through the federated REST endpoint, not over pgwire (TD-FEDPATH-1). |
 | Vector + document + graph + observability planning | `execute_unified_query` / UQL | One facade over shared logical query planning. |
 | Graph pattern syntax | `execute_cypher` or `GRAPH_QUERY(...)` | Cypher is clearer for graph users and still lowers into the shared query/storage stack. |
 | Simple graph neighborhood walk | `traverse_graph` | Lower overhead than Cypher for fixed traversal operations. |

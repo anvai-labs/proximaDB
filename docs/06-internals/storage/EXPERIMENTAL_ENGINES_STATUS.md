@@ -4,6 +4,9 @@
 
 This document describes the current status of ProximaDB's experimental storage engines and provides guidance for users and developers.
 
+> **Decision (2026-10-17, ADR-006 §3 via ADR-096):** SWIFT and RAPTOR are deleted in roadmap
+> release v0.6. Do not start new work on them. Migrate to SST, the supported engine.
+
 ## Experimental Engines
 
 ### SWIFT (Storage With Indexed Fast Traversal)
@@ -29,7 +32,7 @@ This document describes the current status of ProximaDB's experimental storage e
 4. No tenant isolation enforcement
 5. Inefficient metadata serialization
 
-**Recommended Use**: None - use SST, VIPER, HELIX, or NOVA instead
+**Recommended Use**: None - use SST (supported), or HELIX / NOVA (Beta)
 
 ### RAPTOR (Row-Aligned Predicated Tensor Optimized Repository)
 
@@ -54,7 +57,7 @@ This document describes the current status of ProximaDB's experimental storage e
 4. Limited matrix compression
 5. Experimental clustering algorithms
 
-**Recommended Use**: Research and development only - use SST, VIPER, HELIX, or NOVA for production
+**Recommended Use**: None - use SST (supported), or HELIX / NOVA (Beta)
 
 ## Production Alternatives
 
@@ -64,7 +67,7 @@ This document describes the current status of ProximaDB's experimental storage e
 - **Custom application-level hierarchy**: Build hierarchy using multiple collections
 
 ### For Adaptive Workloads (RAPTOR alternative):
-- **VIPER**: Vector storage with Proxima encoding and compression
+- **SST**: the supported default; start here
 - **HELIX**: High-dimensional data with PCA dimension reduction
 - **SST**: Efficient for static workloads with good performance
 
@@ -84,15 +87,14 @@ let sales_collection = sst_engine.create_collection("sales").await?;
 // Use collection naming conventions for hierarchy
 ```
 
-### From RAPTOR to VIPER:
+### From RAPTOR to SST:
 ```rust,ignore
 // Instead of:
 let raptor_engine = RaptorEngine::new(config).await?;
 raptor_engine.enable_adaptive_mode(true).await?;
 
-// Use VIPER with optimized configuration:
-let viper_config = ViperConfig::optimized_for_workload(&your_workload);
-let viper_engine = ViperEngine::new(viper_config).await?;
+// Use an SST collection (the supported default); VIPER is deprecated (ADR-093):
+let collection = sst_engine.create_collection("vectors").await?;
 ```
 
 ## Development Status
@@ -147,7 +149,7 @@ If you want to help complete these engines:
 
 ### For Users:
 1. **Do not use** SWIFT or RAPTOR in production
-2. **Use** SST, VIPER, HELIX, or NOVA instead
+2. **Use** SST (supported), or HELIX / NOVA (Beta) instead
 3. **Monitor** this document for completion status updates
 4. **Test** production engines for your specific workload
 

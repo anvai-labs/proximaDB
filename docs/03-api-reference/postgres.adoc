@@ -5,7 +5,7 @@
 
 [.lead]
 ProximaDB exposes the PostgreSQL wire protocol on port `5433` by default, bound to
-`127.0.0.1`. This reference covers v0.2's supported SQL surface and the v2 record-typed
+`127.0.0.1`. This reference covers the current release's SQL surface and the v2 record-typed
 INSERT syntax that closes TD-084.
 
 == Connection
@@ -68,19 +68,41 @@ one tenant is invisible to another even under an identical logical
 collection/table name. See link:./client-surface-map.adoc[Client Surface Map]
 for the tenant-identity-per-transport table.
 
-== Supported in v0.2
+== Supported today
 
-* `CREATE TABLE` with typed columns (BIGINT, VARCHAR, FLOAT, BOOLEAN, JSON,
-  VECTOR, etc.). See `crates/control/proximadb-catalog/src/lib.rs::CatalogDataType`
-  for the full list.
-* `CREATE TABLE ... WITH (canonical_embedding_precision = 'fp16')` — table
-  property maps to the v2 precision-schema field on the catalog row.
-* `INSERT INTO table (cols) VALUES (...)` — values land as typed
-  `ProximaValue` entries in `ProximaRecord.props` via the catalog
-  `to_proxima_record()` projection. Cross-protocol verified by
-  `tests/pgwire_insert_props_e2e.rs`.
-* `DROP TABLE IF EXISTS`.
-* Basic vector-distance syntax (pgvector-compatible `<->` operator).
+The pgwire surface is **Beta** (see link:../SUPPORTED_SURFACE.adoc[the support contract]). Each
+line below names the test that proves it.
+
+* **DDL** — `CREATE TABLE` with typed columns (BIGINT, VARCHAR, FLOAT, BOOLEAN, JSON, VECTOR, …;
+  full list in `crates/control/proximadb-catalog/src/lib.rs::CatalogDataType`), including
+  `WITH (canonical_embedding_precision = 'fp16')`; `DROP TABLE IF EXISTS`; `ALTER TABLE …
+  MATERIALIZE` to publish a Parquet-backed copy that analytical queries route to DataFusion.
+* **Queries** — ANSI `SELECT` with joins, aggregates, `GROUP BY`, `ORDER BY` and subqueries.
+  TPC-H (22) and TPC-DS run over pgwire as counted ratchets (`tests/tpch_pgwire_e2e.rs`,
+  `tests/tpcds_pgwire_e2e.rs`).
+* **Writes** — single- and multi-row `INSERT … VALUES` (`tests/pgwire_fk_referential_actions_e2e.rs`);
+  `UPDATE` and `DELETE` (`tests/pgwire_relational_native_read_after_write_e2e.rs`); `INSERT … SELECT`
+  (implemented, but no end-to-end pgwire test yet); `INSERT … ON CONFLICT … DO UPDATE` with UNIQUE and
+  foreign-key enforcement (`tests/pgwire_upsert_constraints_e2e.rs`); `COPY … FROM STDIN`
+  (`tests/pgwire_td064_write_tenant_isolation_e2e.rs`). Typed values land in `ProximaRecord.props`
+  (`tests/pgwire_insert_props_e2e.rs`).
+* **Foreign keys** — `ON DELETE RESTRICT | CASCADE | SET NULL` on single-column keys
+  (`tests/pgwire_fk_referential_actions_e2e.rs`).
+* **Transactions** — `BEGIN` / `COMMIT` / `ROLLBACK` and read-only transactions (ADR-018 P2.D,
+  `tests/pgwire_transaction_e2e.rs`). *Unreleased (on `develop`, ships in v0.5):* with the opt-in
+  `[oltp] atomic_commit`, COMMIT is all-or-nothing and crash-atomic (ADR-095,
+  `tests/pgwire_atomic_commit_e2e.rs`).
+* **Vectors (Beta)** — `ORDER BY embedding <-> '<literal>'::vector LIMIT k`, over a collection
+  created through REST or the SDK, and over a pgwire table that also has a JSON or JSONB column, such as
+  `(id VARCHAR PRIMARY KEY, embedding VECTOR(n), payload JSONB)` (`tests/mem0_pgwire_filter_e2e.rs`).
+  Not yet: projecting the distance as a column (wrong result, TD-PGVEC-1), the `vector_search()`
+  table function over pgwire, and `VECTOR(n)` in a table without a JSON or JSONB column, where inserts are
+  checked against dimension 1 and fail (TD-XMODAL-4, TD-SQLCOLL-1).
+* **Protocol** — the extended query protocol with bound parameters for vector search through
+  tokio-postgres and asyncpg (`tests/pgwire_extended_param_e2e.rs`; see TD-PGEXT-1 for the drivers
+  that fail), query cancellation (`tests/pgwire_cancel_e2e.rs`),
+  SCRAM-SHA-256 authentication (`tests/pgwire_scram_auth_e2e.rs`), and the `pg_catalog` views psql
+  needs for `\d` (`tests/pgwire_psql_introspection_e2e.rs`).
 
 [NOTE]
 ====
@@ -121,26 +143,60 @@ Each non-primary-key column lands in `ProximaRecord.props` as a typed
 `ProximaValue`. The `id` column populates `ProximaRecord.oid`; vector columns
 (if any) populate `ProximaRecord.embeddings[]`.
 
-== Not Supported in v0.2
+== Not supported today
 
-The pgwire surface is **Beta** in v0.2. ADR-018 Phase 2/3 work covers most of
-the items below; they will return SQL-conformant errors if you try them:
+=== Refused with an error
 
-* Multi-row INSERT (`INSERT INTO t VALUES (...), (...), (...)`) — only
-  single-row VALUES land cleanly in v0.2.
-* `ORDER BY` semantics (parsed but ignored in some shapes — TD-076).
-* Aggregates (`COUNT(*)`, `SUM(...)`, `GROUP BY`).
-* Joins.
-* System tables (`pg_class`, `xcatalog.namespaces`).
-* Prepared statements / Bind / Execute pipelining for parameterised queries.
-* Transactions. pgwire is autocommit-only; `BEGIN`, `COMMIT`, `ROLLBACK`, and
-  savepoint control return SQLSTATE `0A000`. A simple-query batch containing
-  transaction control is rejected before any statement in that batch executes.
-* PostgreSQL-style OLTP parity: full MVCC transactions, foreign-key enforcement, unique/check
-  constraint enforcement, trigger/stored-procedure behavior, and cross-shard consistency. These
-  require the TD-110 storage/constraint foundation.
-* Optimistic versioning / conditional writes (see
-  link:./rest.adoc[REST API Reference] "Not supported in v0.2").
+These return a specific SQLSTATE instead of running:
+
+* **Savepoints and two-phase commit** (`SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE`,
+  `PREPARE TRANSACTION`) — `0A000`; ADR-018 defers them to Phase 3.
+* **DDL and `COPY` inside a transaction** — `0A000` (ADR-018 P2.D).
+* **`INSERT … SELECT` inside an atomic transaction** — `0A000`, only when the unreleased
+  `[oltp] atomic_commit` gate is on (TD-PGOLTP-1).
+* **Literal-only predicates on vector-profile tables** (`WHERE 1 = 1`) — `XX000`
+  (TD-PGWIRE-LITPRED-1).
+* **Triggers, stored procedures and PL/pgSQL** — not on the ADR-095 path.
+* **`ON UPDATE` foreign-key actions and composite foreign keys** — TD-110.
+
+=== Known divergences from PostgreSQL
+
+These run, but the result can differ from what PostgreSQL would return:
+
+* **`WHERE id = <value>` misses rows in a table without a primary key** that has a column named
+  `id` or `record_id` (also `IN (...)`): `SELECT` returns no rows while `count(*)` counts them,
+  and `UPDATE` / `DELETE` report 0 rows and change nothing (TD-RELIDEQ-1). Declare a primary key.
+* **Extended-protocol clients fail on many queries.** The server describes relational SELECTs as
+  returning zero columns and every `$N` parameter as `text` (TD-PGEXT-1). Observed on 0.4.1:
+  asyncpg cannot read a relational table (parameterized vector search works); psycopg 3 fails on
+  any parameterized query, vector search included, and on a repeated query once it auto-prepares
+  it (6th execution; `prepare_threshold=None` or `ClientCursor` avoids that); psql `\bind` fails on
+  both. JDBC and ORMs use the same protocol and are expected to be affected (not
+  yet tested). The simple query protocol (psql, psycopg 2, `simple_query`) works.
+* **No read-your-own-writes for `SELECT` inside a transaction.** A `SELECT` in an open transaction
+  does not see the transaction's own uncommitted writes. DML is buffered until COMMIT and then
+  applied in order, so later statements do act on earlier ones' rows. This holds in v0.4.x and on
+  `develop`, with or without `[oltp] atomic_commit` (ADR-018 P2.D; TD-PGOLTP-4).
+* **`UPDATE`, `DELETE` and `INSERT … SELECT` report zero rows inside a transaction.** Buffered
+  statements are acknowledged as `UPDATE 0` / `DELETE 0` / `INSERT 0 0` whatever they will affect
+  (`INSERT … VALUES` reports its real count), so ORM
+  rowcount checks (SQLAlchemy, Django) fail inside transactions.
+* **Constraint violations inside a transaction surface at COMMIT**, not at the statement that
+  causes them.
+* **No snapshot isolation or row locks.** Concurrent readers can observe a committed transaction
+  while it is being applied (TD-PGOLTP-4).
+* **COMMIT is not atomic.** A COMMIT that fails partway leaves its earlier statements durable. v0.4.x
+  has no opt-in; on `develop`, `[oltp] atomic_commit` (unreleased, ships in v0.5) makes it
+  all-or-nothing (TD-PGOLTP-1).
+* **`INSERT … SELECT` is not one atomic unit** — it writes in 1,024-row batches (TD-PGOLTP-1).
+* **`RETURNING` is not implemented** — the clause is not applied to DML results; sequences are
+  also missing (TD-PGOLTP-5).
+
+=== Not available
+
+* **Reaching pgwire through a published container port** — in the published image pgwire listens
+  on `127.0.0.1` only until authenticated exposure lands (TD-PGWIRE-CONTAINER-1, roadmap v0.5).
+* **Optimistic versioning / conditional writes** — see link:./rest.adoc[REST API Reference].
 
 == Cross-Protocol Contract
 

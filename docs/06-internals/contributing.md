@@ -53,90 +53,66 @@ cargo test
 
 ## Development Workflow
 
-### 1. Find an Issue
+Every change follows the same loop. The roadmap's release exit criteria are executable because
+of it (ADR-096 D5).
 
-Check [GitHub Issues](https://github.com/anvai-labs/proximaDB/issues) for:
-- `good first issue` - Beginner-friendly
-- `help wanted` - Community contributions welcome
-- `enhancement` - New features
+### 1. Pick work from the plan
 
-### 2. Discuss (Optional)
+Take work from the current release in the
+[roadmap](../_internal/roadmap/STRATEGIC_ROADMAP.adoc), through its TD. A new design decision is
+an ADR and a new piece of work is a TD file; follow the
+[filing convention](../12-design/HOW_TO_FILE_TD_AND_ADR.adoc). Check open PRs first; many
+sessions work in parallel.
 
-For significant changes:
-- Comment on the issue
-- Start a [Discussion](https://github.com/anvai-labs/proximaDB/discussions)
-- Draft an RFC for major features
-
-### 3. Create Branch
+### 2. Isolate it
 
 ```bash
-# Sync with upstream
-git fetch upstream
-git checkout main
-git merge upstream/main
-
-# Create feature branch
-git checkout -b feature/your-feature-name
-
-# Or fix branch
-git checkout -b fix/issue-123
+eval "$(scripts/worktree.sh new fix/<topic>)"   # one worktree + branch off origin/develop
+scripts/worktree.sh guard                       # fails if you are in the shared checkout
 ```
 
-### 4. Implement
+Never edit, stash or reset in the shared checkout or another worktree.
+
+### 3. Write the failing test first
+
+* Reproduce the defect, or specify the behaviour, as a test that fails on `origin/develop`, and
+  confirm it fails for the expected reason.
+* Test through ports and wire protocols, not internal module paths. Every test uses its own
+  temporary directory, with storage, catalog and WAL anchored inside it.
+* For a read-path change, assert the durable effect across surfaces (SQL, REST, gRPC, by-key and
+  scan) and include delete-then-reinsert and update-then-flush.
+
+### 4. Make it pass, then smoke it end to end
+
+* Durability or wire-protocol work also gets an end-to-end smoke: pgwire e2e suites, crash
+  matrices, or `scripts/smoke_oltp_reattach_minio.sh` against MinIO for object storage and volume
+  reattach.
+* Storage-format changes are mixed-read-safe, version-marked and default-off until their
+  round-trip and recall gates pass.
+
+### 5. Verify locally the way CI does
 
 ```bash
-# Watch for changes (auto-build)
-cargo watch -x build
-
-# Run specific tests
-cargo test test_name
-
-# Format as you go
-cargo fmt
+cargo fmt --check
+cargo clippy --lib --bins -- -D warnings
+cargo nextest run -p proximadb <filters>      # RUST_MIN_STACK=16777216 for pgwire e2e
+make work-commit-check                        # docs, guards, contracts
 ```
 
-### 5. Test
+A change that makes an authority document wrong fixes it in the same PR: support contract,
+roadmap, TD status, diagrams.
 
-```bash
-# Unit tests
-cargo test --lib
+### 6. Adversarial review before push
 
-# Integration tests
-cargo test --test integration
+Commit locally, then have a fresh-context reviewer attack the commit: callers and blast radius,
+invariants, test quality, and every claim in the docs and commit message. Fix or disprove each
+finding by running it, then review the delta again. CI should run once, on reviewed code.
 
-# Full suite
-cargo test --features test-full
+### 7. Open one coherent PR
 
-# Python SDK tests
-cd clients/python
-pytest tests/ -v
-```
-
-### 6. Create PR
-
-```bash
-# Push to your fork
-git push origin feature/your-feature-name
-
-# Create PR on GitHub
-# Include:
-# - Description of changes
-# - Related issue numbers
-# - Testing performed
-```
-
-### 7. Code Review
-
-- Address review comments
-- Update tests/docs as needed
-- Request re-review when ready
-
-### 8. Merge
-
-Maintainer will merge after:
-- All reviews approved
-- CI passes
-- No merge conflicts
+Batch related work into one medium-to-large PR: feature, tests and docs together. Commit and PR
+text carries no AI attribution (`scripts/check_no_agent_attribution.py`). Merge once CI passes;
+`develop` requires `CI Success`.
 
 ---
 

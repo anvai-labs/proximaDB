@@ -1,0 +1,30 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SDKENG-1: the Python SDK silently ignores an `engine=` keyword
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Reproduced: `create_collection('x', dimension=3, engine='helix')` created an SST collection; `storage_engine='helix'` created HELIX.
+| Priority | **MEDIUM** — a user who asks for an engine silently gets a different one.
+| Component | `clients/python/src/proximadb_sdk/unified_client.py`, `unified_client_v2.py` and `unified_client_async.py` (`create_collection(name, config=None, **kwargs)` builds `CollectionConfig` from keyword arguments and drops unknown ones)
+| Relates to | TD-ENGSEL-1 (engine defaults); mandate #15 (spec-driven SDKs)
+|===
+
+== Problem
+
+`create_collection` accepts arbitrary `**kwargs` and keeps only `CollectionConfig` fields. The
+field is `storage_engine`; `engine`, which the REST API and most docs use, is silently discarded,
+and the SDK's default (`storage_engine=SST`) is sent instead.
+
+Related: the SDK's `StorageEngine` docstring (`models.py`) still says "Default: VIPER", and the
+`AutoML` recommender can suggest VIPER, SWIFT or RAPTOR, which the server rejects.
+
+Wider than the engine: `create_collection(index_params=..., quantization=...)` is accepted and
+silently dropped (the server shows `index_specs: []` and default quantization), and an invalid
+`quantization` type raises a validation error only for some values. The REST API stores both.
+
+== Fix
+
+Pass index and quantization settings through; reject unknown keyword arguments with a clear error, and accept `engine` as an alias for
+`storage_engine` (or document only `storage_engine` and reject `engine`). Add a test for both.

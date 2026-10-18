@@ -29,7 +29,7 @@ flowchart TB
 
 | Concept | Description | Status |
 |---------|-------------|--------|
-| [Architecture](./architecture.adoc) | Multi-model data-plane overview and high-level flow | Current |
+| [Architecture](./architecture.adoc) | SQL-first context engine overview: interfaces, routing, write and query paths | Current |
 | [Storage Engines](./storage-engines.adoc) | Engine selection and storage tradeoffs | Current |
 | [Graph Runtime](./graph-engines.adoc) | ORION runtime and relational/storage substrate layering | Current |
 | [Unified WAL](./unified-wal.md) | Shared durability path for data models | Current |
@@ -39,7 +39,7 @@ flowchart TB
 
 ## How To Read This Section
 
-1. Start with [Architecture](./architecture.adoc) for the shared data plane.
+1. Start with [Architecture](./architecture.adoc) for the system at a glance.
 2. Use [Storage Engines](./storage-engines.adoc) and [Graph Engines](./graph-engines.adoc) to choose execution/storage paths.
 3. Read [Unified WAL](./unified-wal.md) before changing durability or recovery behavior.
 4. Read [Query Planner](./query-planner.md) before changing SQL, UQL, fusion, or multimodel planning.

@@ -12,24 +12,26 @@ Comprehensive guide to using the ProximaDB Python SDK for record-native vector s
 
 [source,bash]
 ----
-pip install proximadb-sdk
+pip install proximadb
 ----
 
-For development with all optional features:
+Optional features are extras, including `embedded`, `embeddings`, `embeddings-cloud`, `llm`,
+`chunking`, `code-chunking`, `codegraph`, `performance` and framework integrations (`langchain`,
+`llama-index`, `haystack`, `crewai`, `dspy`, `autogen`, `langgraph`). For example:
 
 [source,bash]
 ----
-pip install proximadb-sdk[full]
+pip install "proximadb[embeddings]"
 ----
 
 == Quick Start
 
 [source,python]
 ----
-from proximadb_sdk import ProximaDBClient, ProximaRecord, DistanceMetric
+from proximadb_sdk import ProximaDBClient, ProximaRecord, DistanceMetric, Protocol
 
 # Connect to ProximaDB
-client = ProximaDBClient(url="http://localhost:5678")
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 
 # Create a collection
 client.create_collection(
@@ -52,7 +54,7 @@ for r in results:
 
 == Connection Options
 
-=== REST Protocol (Default)
+=== REST Protocol (use this today)
 
 [source,python]
 ----
@@ -67,10 +69,14 @@ client = ProximaDBClient(
 
 === gRPC Protocol
 
+Without a `protocol` argument the client prefers gRPC. Until TD-GRPCCREATE-1 is fixed, a
+collection created over gRPC cannot store records, and the SDK reports the failed inserts with an
+empty error list (TD-SDKERR-1), so pass `protocol=Protocol.REST` as the examples here do.
+
 [source,python]
 ----
 client = ProximaDBClient(
-    url="localhost:5679",
+    url="localhost:5678",
     protocol=Protocol.GRPC,
 )
 ----
@@ -79,58 +85,52 @@ client = ProximaDBClient(
 
 [source,python]
 ----
-from proximadb_sdk import connect_embedded
+# In-process engine (no server); requires the [embedded] extra
+from proximadb_embedded import ProximaDB
 
-# In-process database (no network overhead)
-db = connect_embedded(data_dir="/tmp/proximadb")
-
-# Create and use collections
-db.create_collection("vectors", dimension=768)
-db.insert("vectors", ids=["v1"], vectors=[[0.1] * 768])
-results = db.search("vectors", query=[0.1] * 768, top_k=5)
+db = ProximaDB(data_dirs="./data")
+db.create_collection("vectors", dimension=4)
+db.insert("vectors", ids=["v1"], vectors=[[0.1, 0.2, 0.3, 0.4]])
+results = db.search("vectors", query=[0.1, 0.2, 0.3, 0.4], top_k=5)
 ----
 
 == Storage Engine Selection
 
-ProximaDB offers 6 specialized storage engines. Choose based on your workload:
+Choose the storage engine per collection with the `storage_engine` argument. The Python SDK sends
+`storage_engine=SST` when you omit it, so SDK users get the Supported engine by default. (A REST or
+gRPC create that omits the engine is auto-routed to Beta HELIX until v0.5, TD-ENGSEL-1.) Note that
+`create_collection` silently ignores an unknown `engine=` keyword (TD-SDKENG-1): use
+`storage_engine=`.
 
 [cols="1,2,2", options="header"]
 |===
 | Engine | Best For | Python Config
 
-| SST
-| Write-heavy, real-time ingestion
-| `engine="sst"`
+| SST (Supported)
+| Vector and context search, real-time ingestion
+| `storage_engine="sst"`
 
-| HELIX
-| Locality-optimized, spatial clustering
-| `engine="helix"`
+| HELIX (Beta)
+| Locality-ordered high-dimensional embeddings (measure recall first)
+| `storage_engine="helix"`
 
-| VIPER
-| Analytics, columnar queries
-| `engine="viper"`
-
-| SWIFT
-| Ultra-low latency (<5K vectors)
-| `engine="swift"`
-
-| NOVA
-| Mixed workloads
-| `engine="nova"`
-
-| RAPTOR
-| Adaptive, dynamic workloads
-| `engine="raptor"`
+| NOVA (Beta)
+| Mixed read/write workloads
+| `storage_engine="nova"`
 |===
+
+VIPER is deprecated (new VIPER collections are rejected), and SWIFT/RAPTOR are experimental
+engines a stock server rejects. For analytical SQL, use a relational table over pgwire and
+`ALTER TABLE … MATERIALIZE` it.
 
 [source,python]
 ----
 from proximadb_sdk import StorageEngine
 
 client.create_collection(
-    name="analytics_vectors",
+    name="knowledge_base",
     dimension=768,
-    engine=StorageEngine.VIPER,  # Best for analytics queries
+    storage_engine=StorageEngine.SST,  # the SDK sends SST when this is omitted
 )
 ----
 
@@ -168,23 +168,20 @@ client.insert_records("my_collection", records)
 
 [source,python]
 ----
-# Basic search
+results = client.search("my_collection", vector=query_embedding, top_k=10)
+for r in results:
+    print(r.id, r.score)
+----
+
+For an equality filter on properties, pass `metadata_filter`. Do not pass `filter=` or any other
+argument `search()` does not declare: today an unrecognised argument silently switches the client
+to an empty local store (TD-SDKERR-1). For ranges and `in`, use the REST API's typed `filters`
+(see the link:../03-api-reference/rest.adoc[REST reference]).
+
+[source,python]
+----
 results = client.search(
-    collection="my_collection",
-    vector=query_embedding,
-    top_k=10,
-)
-
-# Search with metadata filter
-from proximadb_sdk import FilterBuilder, eq, gt
-
-filter = FilterBuilder().add(eq("category", "electronics")).add(gt("price", 100)).build()
-
-results = client.search(
-    collection="my_collection",
-    vector=query_embedding,
-    top_k=10,
-    filter=filter,
+    "my_collection", vector=query_embedding, top_k=10, metadata_filter={"category": "books"}
 )
 ----
 
@@ -192,35 +189,36 @@ results = client.search(
 
 === Basic Graph Operations
 
+Graph methods exist on the REST client only (`protocol=Protocol.REST`).
+
 [source,python]
 ----
-# Create a graph
-client.create_graph(
-    name="knowledge",
-    engine="orion",  # In-memory, sub-ms latency
+client.create_graph("knowledge", name="Knowledge graph")
+
+client.batch_create_nodes([
+    {"id": "entity_1", "labels": ["Person"], "properties": {"name": "Alice"}},
+    {"id": "entity_2", "labels": ["Company"], "properties": {"name": "TechCorp"}},
+], graph_id="knowledge")
+
+client.batch_create_edges([
+    {"id": "e1", "from_node_id": "entity_1", "to_node_id": "entity_2",
+     "edge_type": "WORKS_AT", "weight": 1.0},
+], graph_id="knowledge")
+
+result = client.traverse_graph(
+    "entity_1", max_depth=2, edge_types=["WORKS_AT", "KNOWS"], graph_id="knowledge"
 )
-
-# Create nodes
-client.create_nodes("knowledge", [
-    {"id": "entity_1", "label": "Person", "properties": {"name": "Alice"}},
-    {"id": "entity_2", "label": "Company", "properties": {"name": "TechCorp"}},
-])
-
-# Create edges
-client.create_edges("knowledge", [
-    {"source": "entity_1", "target": "entity_2", "type": "WORKS_AT", "weight": 1.0}
-])
-
-# Traverse
-results = client.traverse(
-    "knowledge",
-    start_node="entity_1",
-    edge_types=["WORKS_AT", "KNOWS"],
-    max_depth=2
-)
+print(result)
 ----
 
 === Graph Analytics
+
+[WARNING]
+====
+The examples in this section have not been executed against a released server and several use
+call shapes the SDK does not have. They are illustrative until TD-SDKDOC-1 makes this guide's
+examples run in CI.
+====
 
 [source,python]
 ----
@@ -304,6 +302,13 @@ for record in results:
 
 === Convenience Functions
 
+[WARNING]
+====
+The examples in this section have not been executed against a released server and several use
+call shapes the SDK does not have. They are illustrative until TD-SDKDOC-1 makes this guide's
+examples run in CI.
+====
+
 [source,python]
 ----
 from proximadb_sdk import semantic_search_with_graph, knowledge_graph_search
@@ -332,40 +337,35 @@ results = knowledge_graph_search(
 
 == AutoML Features
 
-Automatic engine selection and hyperparameter optimization:
+A client-side heuristic that suggests an engine for a workload. It runs locally and does not
+measure your data; treat it as a starting point and measure recall before committing. It can
+name an engine the server rejects (VIPER is deprecated; SWIFT and RAPTOR are experimental), so
+check the suggestion against the
+link:../05-concepts/storage-engines.adoc[engine tiers].
 
 [source,python]
 ----
-from proximadb_sdk import AutoML, WorkloadType, OptimizationGoal
+from proximadb_sdk import AutoML, OptimizationGoal
 
 automl = AutoML(client)
 
-# Automatic engine recommendation
 recommendation = automl.recommend_engine(
-    dimension=768,
-    expected_count=1_000_000,
-    workload_type=WorkloadType.READ_HEAVY,
-    latency_requirement_ms=10,
-    memory_budget_gb=8,
+    vector_count=1_000_000,
+    vector_dimension=768,
+    read_ratio=0.9,
+    target_latency_ms=10,
+    memory_budget_mb=8192,
+    goal=OptimizationGoal.LATENCY,
 )
 
 print(f"Recommended: {recommendation.engine}")
 print(f"Confidence: {recommendation.confidence:.2f}")
 print(f"Reasoning: {recommendation.reasoning}")
 
-# Apply recommendation
 client.create_collection(
-    name="optimized_vectors",
+    "optimized_vectors",
     dimension=768,
-    engine=recommendation.engine,
-    engine_config=recommendation.config,
-)
-
-# Hyperparameter optimization
-optimized = automl.optimize_hyperparameters(
-    collection="my_collection",
-    goal=OptimizationGoal.LATENCY,
-    budget_minutes=10,
+    storage_engine=recommendation.engine,
 )
 ----
 
@@ -419,7 +419,7 @@ logs = obs.logger.get_logs(level="INFO", limit=100)
 
 [source,python]
 ----
-from proximadb_sdk import OAuth2Config, OAuth2Provider, OAuth2TokenManager
+from proximadb_sdk import OAuth2Config, OAuth2Provider, OAuth2TokenManager, ProximaDBClient, Protocol
 
 # Configure OAuth2
 oauth_config = OAuth2Config(
@@ -440,6 +440,7 @@ token = token_manager.client_credentials()
 # Use with client
 client = ProximaDBClient(
     url="http://localhost:5678",
+    protocol=Protocol.REST,
     api_key=token.access_token,
 )
 ----
@@ -532,6 +533,12 @@ ssl_context = mtls.create_ssl_context()
 
 === Filter Builder
 
+[WARNING]
+====
+`FilterBuilder().add` does not exist in the SDK; this block is illustrative until TD-SDKDOC-1.
+Use `metadata_filter=` for equality filters.
+====
+
 [source,python]
 ----
 from proximadb_sdk import FilterBuilder, eq, gt, lt, in_list, and_filters, or_filters
@@ -612,9 +619,12 @@ except ProximaDBError as e:
 
 [source,python]
 ----
+from proximadb_sdk import ProximaDBClient, Protocol
+
 # Use connection pooling for high throughput
 client = ProximaDBClient(
     url="http://localhost:5678",
+    protocol=Protocol.REST,
     pool_size=20,
     timeout=30.0,
 )
@@ -658,7 +668,9 @@ rec = automl.recommend_engine(
 [source,python]
 ----
 # Embedded mode - always flush before exit
-db = connect_embedded("/tmp/data")
+from proximadb_embedded import ProximaDB
+
+db = ProximaDB(data_dirs="./data")
 try:
     # ... operations ...
 finally:

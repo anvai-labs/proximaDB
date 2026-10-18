@@ -14,7 +14,7 @@ For what ProximaDB is, how to install it and a first query, start at the
 | Question | Authority |
 |---|---|
 | What is supported, beta or experimental? | [`SUPPORTED_SURFACE.adoc`](./SUPPORTED_SURFACE.adoc) — wins over every other doc |
-| Where is the product going? | [Vision](./00-product/VISION.adoc) · [PRD](./00-product/PRD.adoc) |
+| Where is the product going? | [ADR-096](./12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc) (the decision) · [Vision](./00-product/VISION.adoc) · [PRD](./00-product/PRD.adoc) |
 | What is being built next? | [Strategic Roadmap](./_internal/roadmap/STRATEGIC_ROADMAP.adoc) |
 | How is the system put together? | [System Map](./12-design/SYSTEM_MAP_2026_05_30.adoc) · [diagrams](./architecture-diagrams/README.md) |
 | Why was it built this way? | [ADR index](./12-design/adr/README.adoc) · [design index](./12-design/README.adoc) |

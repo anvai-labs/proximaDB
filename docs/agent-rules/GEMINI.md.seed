@@ -3,11 +3,13 @@
 This document serves as the foundational mandate for AI agents working on ProximaDB. It defines the project architecture, development standards, and operational workflows.
 
 ## 🚀 Project Overview
-ProximaDB is a high-performance, cloud-native vector and graph database built in Rust. It combines semantic vector search with native graph traversal for RAG and knowledge graph applications.
+ProximaDB is a SQL-first context engine on object storage, built in Rust (ADR-096): a Postgres-compatible database in which vectors, JSON documents and graph relationships are first-class, serving RAG, agent and knowledge-graph applications.
+
+**Product direction (ADR-096, 2026-10-17):** ProximaDB is a SQL-first context engine on object storage — pgwire is the front door, vectors/JSON/graph are first-class inside SQL, every data model is a projection of one canonical record (ADR-094). Take direction from `docs/12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc` and sequencing only from the release-based `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`; the 2026-06-04 course correction below is the engineering mandate, not the product framing.
 
 [WARNING]
 ====
-**🚨 CRITICAL ARCHITECTURAL PIVOT (2026-06-04) 🚨**
+**🚨 ENGINEERING MANDATE — 2026-06-04 course correction (direction: ADR-096) 🚨**
 ProximaDB has shifted from a monolithic custom WAL/PAX architecture to an **Intelligent Multi-Engine Routing** system running over decoupled **Object Storage**.
 
 When modifying architecture or execution paths, you MUST adhere to the dual-path mandate:
@@ -56,7 +58,7 @@ When changing a storage format, reader, codec, cache, or engine you MUST:
 - **Tokio & Axum/Tonic:** Asynchronous runtime and networking (REST/gRPC).
 - **Parquet/Arrow:** Columnar storage and memory representation.
 - **SIMD:** Hardware-accelerated vector operations (AVX2, AVX-512, NEON).
-- **Multi-Engine Storage:** SST, HELIX, VIPER, SWIFT, NOVA, RAPTOR.
+- **Multi-Engine Storage:** SST (Supported; becomes the auto default in v0.5, TD-ENGSEL-1), HELIX and NOVA (Beta); VIPER deprecated (ADR-093); SWIFT and RAPTOR experimental and deleted in v0.6 (ADR-006).
 
 ## 📂 Project Organization
 - `src/`: Core Rust library crate (storage, graph, query, vector, api_handlers).
