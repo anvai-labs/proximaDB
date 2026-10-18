@@ -398,6 +398,41 @@ fn dml_error_sqlstate(err: &anyhow::Error, fallback: &'static str) -> &'static s
         .unwrap_or(fallback)
 }
 
+/// Table names of a `TRUNCATE [TABLE] [ONLY] t[, ...] [RESTART IDENTITY |
+/// CONTINUE IDENTITY] [CASCADE | RESTRICT]` statement, or `None` when `query`
+/// is not a TRUNCATE.
+fn parse_truncate_tables(query: &str) -> Option<Vec<String>> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let mut words = trimmed.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("TRUNCATE") {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    let mut joined = rest.join(" ");
+    for prefix in ["TABLE ", "ONLY "] {
+        if joined.len() >= prefix.len() && joined[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            joined = joined[prefix.len()..].to_string();
+        }
+    }
+    let upper = joined.to_ascii_uppercase();
+    let cut = [
+        " RESTART IDENTITY",
+        " CONTINUE IDENTITY",
+        " CASCADE",
+        " RESTRICT",
+    ]
+    .iter()
+    .filter_map(|option| upper.find(option))
+    .min()
+    .unwrap_or(joined.len());
+    let tables: Vec<String> = joined[..cut]
+        .split(',')
+        .map(|table| table.trim().trim_matches('"').to_string())
+        .filter(|table| !table.is_empty())
+        .collect();
+    Some(tables).filter(|tables| !tables.is_empty())
+}
+
 /// Buffer-time CommandComplete summary for a DML statement: (kind, row hint,
 /// approximate serialized size for the buffer bound).
 fn dml_summary(
@@ -2970,6 +3005,10 @@ impl PostgresProtocol {
             return self.execute_explain(query).await;
         }
 
+        if let Some(tables) = parse_truncate_tables(query) {
+            return self.execute_truncate(&tables).await;
+        }
+
         if crate::services::CatalogIntrospectionService::is_catalog_query(query) {
             return self.execute_catalog_introspection_query(query).await;
         }
@@ -3303,7 +3342,9 @@ impl PostgresProtocol {
             return self.send_empty_result().await;
         };
 
+        let tenant = self.pgwire_resolve_read_tenant().await;
         let result = crate::services::CatalogIntrospectionService::new(catalog_manager)
+            .for_tenant(tenant)
             .execute_select(query)
             .await?;
         let Some(result) = result else {
@@ -5697,6 +5738,59 @@ impl PostgresProtocol {
             "Catalog-backed DML service is required for INSERT",
         )
         .await
+    }
+
+    /// `TRUNCATE [TABLE] t[, ...]`: delete every row of each table, resolved
+    /// within the connection tenant. A table the tenant cannot resolve is
+    /// reported exactly as a missing one, and nothing is changed.
+    async fn execute_truncate(&mut self, tables: &[String]) -> Result<()> {
+        let Some(dml_service) = self.dml_service.clone() else {
+            return self
+                .send_error("ERROR", "0A000", "TRUNCATE is not supported on this server")
+                .await;
+        };
+        if self.transaction_in_progress().await {
+            return self
+                .send_error(
+                    "ERROR",
+                    "0A000",
+                    "TRUNCATE inside a transaction block is not supported",
+                )
+                .await;
+        }
+        let tenant = self.pgwire_resolve_write_tenant().await;
+        // Every table must resolve before any is emptied.
+        for table in tables {
+            if !dml_service
+                .table_visible_for_tenant(table, Some(tenant.as_str()))
+                .await
+                .unwrap_or(false)
+            {
+                return self
+                    .send_error(
+                        "ERROR",
+                        "42P01",
+                        &format!("relation \"{table}\" does not exist"),
+                    )
+                    .await;
+            }
+        }
+        let tenant_ctx = crate::storage::tenant::context::TenantContext::for_tenant_id(&tenant);
+        for table in tables {
+            let statement = crate::services::DmlStatement::Delete {
+                table_name: table.clone(),
+                where_clause: None,
+            };
+            if let Err(error) = dml_service
+                .execute_scoped(statement, Some(&tenant_ctx))
+                .await
+            {
+                return self
+                    .send_error("ERROR", "XX000", &format!("TRUNCATE failed: {error}"))
+                    .await;
+            }
+        }
+        self.send_command_complete("TRUNCATE TABLE").await
     }
 
     /// Execute INSERT using the proper SQL parser and DmlService

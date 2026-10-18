@@ -55,16 +55,29 @@ struct Server {
     flight_port: u16,
     pg_port: u16,
     db: Option<ProximaDB>,
-    _tmp: TempDir,
+    tmp: Option<TempDir>,
 }
 
 impl Server {
     async fn start() -> anyhow::Result<Self> {
+        Self::start_in(TempDir::new()?).await
+    }
+
+    /// Stop the server and start a new one on the same data directory.
+    async fn restart(mut self) -> anyhow::Result<Self> {
+        if let Some(mut db) = self.db.take() {
+            db.shutdown().await?;
+        }
+        let tmp = self.tmp.take().expect("data directory");
+        sleep(Duration::from_millis(500)).await;
+        Self::start_in(tmp).await
+    }
+
+    async fn start_in(tmp: TempDir) -> anyhow::Result<Self> {
         let rest_port = free_port();
         let grpc_port = free_port();
         let flight_port = free_port();
         let pg_port = free_port();
-        let tmp = TempDir::new()?;
 
         let mut config = Config::default();
         config.server.bind_address = "127.0.0.1".to_string();
@@ -110,7 +123,7 @@ impl Server {
             flight_port,
             pg_port,
             db: Some(db),
-            _tmp: tmp,
+            tmp: Some(tmp),
         })
     }
 }
@@ -1678,10 +1691,9 @@ async fn pg_outcome(client: &tokio_postgres::Client, sql: &str, name: &str) -> S
     }
 }
 
-/// The default tenant resolves names in the unprefixed catalog namespace,
-/// where every tenant's collection is also recorded. Another tenant's
-/// collection must still read as missing there — for reads, writes and DDL,
-/// over pgwire and REST — and stay intact for its owner.
+/// For the default tenant, another tenant's collection reads as missing — for
+/// reads, writes and DDL, over pgwire and REST — and stays intact for its
+/// owner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_default_tenant_sees_other_tenants_collections_as_missing() {
     let server = Server::start().await.expect("server start");
@@ -1719,6 +1731,10 @@ async fn the_default_tenant_sees_other_tenants_collections_as_missing() {
         }),
         ("delete", |t| format!("DELETE FROM {t} WHERE oid = 'x'")),
         ("alter", |t| format!("ALTER TABLE {t} ADD COLUMN extra INT")),
+        ("truncate", |t| format!("TRUNCATE TABLE {t}")),
+        ("vector order by", |t| {
+            format!("SELECT oid FROM {t} ORDER BY embedding <-> '[1,0,0,0]' LIMIT 1")
+        }),
         ("drop if exists", |t| format!("DROP TABLE IF EXISTS {t}")),
         ("drop", |t| format!("DROP TABLE {t}")),
     ];
@@ -1730,6 +1746,16 @@ async fn the_default_tenant_sees_other_tenants_collections_as_missing() {
                 "pgwire {label} as default: foreign {foreign:?} vs missing {missing:?}"
             ));
         }
+    }
+    // TRUNCATE of a table that does not exist is an error, not a no-op.
+    let truncate_missing = pg_outcome(
+        &client,
+        &format!("TRUNCATE TABLE {MISSING_DOCS}"),
+        MISSING_DOCS,
+    )
+    .await;
+    if truncate_missing == "OK" {
+        failures.push("TRUNCATE of a missing table reported success".to_string());
     }
     // REST SQL and collection delete with no tenant header.
     for statement in ["SELECT * FROM {}", "DROP TABLE {}"] {
@@ -1874,6 +1900,245 @@ async fn the_default_tenant_sees_other_tenants_collections_as_missing() {
     assert!(
         failures.is_empty(),
         "the default tenant must see other tenants' collections as missing:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Catalog entries describe a collection only when the system wrote them,
+/// introspection and planning surfaces resolve within the request tenant, a
+/// named tenant's delete takes effect, and every owner's data survives a
+/// restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn catalog_entries_introspection_and_lifecycle_are_tenant_scoped() {
+    let server = Server::start().await.expect("server start");
+    let rest_for = |server: &Server| Rest {
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .expect("http client"),
+        base: format!("http://127.0.0.1:{}", server.rest_port),
+    };
+    let rest = rest_for(&server);
+    let globex_id = rest.create(Some(GLOBEX), GLOBEX_DOCS).await;
+    rest.insert(Some(GLOBEX), GLOBEX_DOCS, GLOBEX).await;
+    let pg = |server: &Server, tenant: &'static str| {
+        let conn = format!(
+            "host=127.0.0.1 port={} user=postgres dbname={tenant} sslmode=disable",
+            server.pg_port
+        );
+        async move {
+            let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+                .await
+                .expect("pgwire connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        }
+    };
+    let globex_pg = pg(&server, GLOBEX).await;
+    for sql in [
+        "CREATE TABLE gx_orders (id INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO gx_orders (id, note) VALUES (1, 'globex-row')",
+    ] {
+        globex_pg.simple_query(sql).await.expect("globex pgwire");
+    }
+    sleep(Duration::from_millis(300)).await;
+    let mut failures: Vec<String> = Vec::new();
+
+    // Reserved table properties are refused; nothing becomes a collection.
+    for tenant in [ACME, proximadb_tenant::DEFAULT_TENANT] {
+        let client = pg(&server, if tenant == ACME { ACME } else { "default" }).await;
+        let sql = format!(
+            "CREATE TABLE named_entry (oid TEXT PRIMARY KEY) WITH (\"asset.kind\"='collection', \
+             \"asset.capability.vector\"='true', \"collection.id\"='{globex_id}', \
+             \"collection.name\"='named_entry', \"vector.dimension\"='4', \"tags\"='tenant:{tenant}')"
+        );
+        if client.simple_query(&sql).await.is_ok() {
+            failures.push(format!("reserved table properties accepted for {tenant}"));
+        }
+        let (status, body) = rest
+            .call(
+                Some(tenant),
+                reqwest::Method::GET,
+                "/api/v2/collections/named_entry",
+                None,
+            )
+            .await;
+        if status.is_success() {
+            failures.push(format!(
+                "entry readable as a collection by {tenant}: {body}"
+            ));
+        }
+    }
+
+    // Introspection lists only the request tenant's tables.
+    let acme_pg = pg(&server, ACME).await;
+    acme_pg
+        .simple_query("CREATE TABLE ac_orders (id INT PRIMARY KEY)")
+        .await
+        .expect("acme table");
+    let listed = acme_pg
+        .simple_query("SELECT * FROM xcatalog.tables")
+        .await
+        .map(|messages| format!("{messages:?}"))
+        .unwrap_or_default();
+    if listed.contains("gx_orders") || !listed.contains("ac_orders") {
+        failures.push(format!("xcatalog.tables as acme: {listed}"));
+    }
+    let (status, body) = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::GET,
+            "/api/v2/catalog/table-routing",
+            None,
+        )
+        .await;
+    if body.contains("gx_orders") {
+        failures.push(format!("table routing as acme: {status} {body}"));
+    }
+    let explain = |t: &str| json!({ "target_table": t, "source_sql": "SELECT 1" });
+    compare_probe(
+        &mut failures,
+        "globex-row",
+        "table write explain as acme",
+        rest.call(
+            Some(ACME),
+            reqwest::Method::POST,
+            "/api/v2/catalog/table-write/explain",
+            Some(explain("gx_orders")),
+        )
+        .await,
+        rest.call(
+            Some(ACME),
+            reqwest::Method::POST,
+            "/api/v2/catalog/table-write/explain",
+            Some(explain("missing_orders")),
+        )
+        .await,
+        "gx_orders",
+        "missing_orders",
+        true,
+    );
+
+    // Flight schema lookup by a fully qualified name resolves within the caller.
+    let channel =
+        tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{}", server.flight_port))
+            .expect("flight endpoint")
+            .connect()
+            .await
+            .expect("flight channel");
+    let mut flight = FlightServiceClient::new(channel);
+    let mut schema_of = async |fqn: String| -> String {
+        let descriptor =
+            arrow_flight::FlightDescriptor::new_path(vec!["relational".to_string(), fqn]);
+        match flight.get_schema(with_tenant(descriptor, ACME)).await {
+            Ok(_) => "OK".to_string(),
+            Err(status) => format!("{:?}", status.code()),
+        }
+    };
+    let foreign = schema_of(format!("default.{GLOBEX}.default.gx_orders")).await;
+    let missing = schema_of(format!("default.{GLOBEX}.default.missing_orders")).await;
+    if foreign != missing || foreign == "OK" {
+        failures.push(format!(
+            "Flight get_schema as acme: foreign {foreign} vs missing {missing}"
+        ));
+    }
+
+    // A named tenant's delete takes effect: gone, then creatable again.
+    rest.create(Some(ACME), "acme_tmp").await;
+    let (status, body) = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::DELETE,
+            "/api/v2/collections/acme_tmp",
+            None,
+        )
+        .await;
+    if !status.is_success() {
+        failures.push(format!("acme delete: {status} {body}"));
+    }
+    let (status, body) = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::GET,
+            "/api/v2/collections/acme_tmp",
+            None,
+        )
+        .await;
+    if status != reqwest::StatusCode::NOT_FOUND {
+        failures.push(format!("acme collection after delete: {status} {body}"));
+    }
+    let (status, body) = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::POST,
+            "/api/v2/collections",
+            Some(json!({
+                "name": "acme_tmp", "dimension": DIM, "engine": "sst",
+                "distance_metric": "cosine", "enable_proxima_record": false,
+            })),
+        )
+        .await;
+    if !status.is_success() {
+        failures.push(format!("acme re-create after delete: {status} {body}"));
+    }
+
+    // A deleted record leaves filtered search too.
+    let filtered = json!({
+        "vector": vector(), "top_k": 10,
+        "filters": [{ "field": "topic", "op": "eq", "value": "alpha" }],
+    });
+    let search = format!("/api/v2/collections/{GLOBEX_DOCS}/search");
+    rest.call(
+        Some(GLOBEX),
+        reqwest::Method::DELETE,
+        &format!("/api/v2/collections/{GLOBEX_DOCS}/records/{GLOBEX}-r2"),
+        None,
+    )
+    .await;
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            &search,
+            Some(filtered.clone()),
+        )
+        .await;
+    if body.contains(&format!("{GLOBEX}-r2")) || !body.contains(&format!("{GLOBEX}-r0")) {
+        failures.push(format!("filtered search after delete: {status} {body}"));
+    }
+
+    // Owners' data survives a restart.
+    drop(globex_pg);
+    drop(acme_pg);
+    let server = server.restart().await.expect("restart");
+    let rest = rest_for(&server);
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            &format!("/api/v2/collections/{GLOBEX_DOCS}/records/scan"),
+            Some(json!({ "limit": 100 })),
+        )
+        .await;
+    if !status.is_success() || !body.contains(&format!("{GLOBEX}-r0")) {
+        failures.push(format!("globex's records after restart: {status} {body}"));
+    }
+    let globex_pg = pg(&server, GLOBEX).await;
+    let rows = globex_pg
+        .simple_query("SELECT note FROM gx_orders")
+        .await
+        .map(|messages| format!("{messages:?}"))
+        .unwrap_or_else(|error| format!("error: {error}"));
+    if !rows.contains("globex-row") {
+        failures.push(format!("globex's table after restart: {rows}"));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "catalog entries, introspection and lifecycle must be tenant-scoped:\n  {}",
         failures.join("\n  ")
     );
 }

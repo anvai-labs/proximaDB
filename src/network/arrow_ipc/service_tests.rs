@@ -93,11 +93,14 @@ async fn test_catalog_arrow_schema_for_descriptor_uses_xcatalog_schema() {
 
     let descriptor =
         FlightDescriptor::new_path(vec!["relational".to_string(), "events".to_string()]);
-    let schema =
-        ProximaFlightService::catalog_arrow_schema_for_descriptor(Some(&manager), &descriptor)
-            .await
-            .unwrap()
-            .expect("catalog schema");
+    let schema = ProximaFlightService::catalog_arrow_schema_for_descriptor(
+        Some(&manager),
+        &descriptor,
+        proximadb_tenant::DEFAULT_TENANT,
+    )
+    .await
+    .unwrap()
+    .expect("catalog schema");
 
     assert_eq!(schema.fields().len(), 3);
     assert_eq!(schema.field(0).name(), "id");
@@ -145,6 +148,7 @@ async fn test_records_for_write_batches_uses_catalog_bulk_validation_for_tables(
     let (records, catalog_result) = ProximaFlightService::records_for_write_batches(
         Some(&manager),
         Some("events"),
+        None,
         FlightWriteOperation::Upsert,
         WriteMode::WAL,
         &[batch],

@@ -807,6 +807,7 @@ impl DdlService {
                     engine,
                     if_not_exists,
                     properties,
+                    tenant,
                 )
                 .await
             }
@@ -1400,8 +1401,21 @@ impl DdlService {
         engine: Option<String>,
         if_not_exists: bool,
         mut properties: HashMap<String, String>,
+        tenant: Option<&str>,
     ) -> Result<DdlResult> {
-        let (catalog, table_id) = self.catalog_manager.resolve_table(collection_name).await?;
+        let resolved = self
+            .catalog_manager
+            .resolve_table_scoped(collection_name, tenant)
+            .await;
+        if let Err(error) = &resolved
+            && proximadb_catalog::TableNotVisible::is(error)
+        {
+            if if_not_exists {
+                return Ok(DdlResult::already_exists("Collection", collection_name));
+            }
+            return Err(anyhow!("Collection '{}' already exists", collection_name));
+        }
+        let (catalog, table_id) = resolved?;
 
         // Check if collection exists
         if catalog.table_exists(&table_id).await? {
@@ -1459,6 +1473,11 @@ impl DdlService {
 
         let schema = self.build_catalog_schema(&table_id.name, columns, Vec::new(), properties)?;
 
+        if !catalog.namespace_exists(&table_id.namespace).await? {
+            catalog
+                .create_namespace_for_tenant(&table_id.namespace, HashMap::new(), tenant)
+                .await?;
+        }
         // Create the collection/table
         catalog.create_table(&table_id, schema).await?;
 
@@ -1489,6 +1508,9 @@ impl DdlService {
         constraints: Vec<TableConstraint>,
         properties: HashMap<String, String>,
     ) -> Result<CatalogTableSchema> {
+        // System-written properties (a collection's record, its owner) are
+        // never client-settable.
+        proximadb_catalog::table_properties::ensure_no_reserved_table_properties(&properties)?;
         let mut schema = CatalogTableSchema::new(table_name);
         schema.properties = properties;
 

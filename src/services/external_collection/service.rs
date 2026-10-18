@@ -138,7 +138,13 @@ impl ExternalCollectionService {
         let snapshot_id = snapshot_fingerprint(&spec.location)
             .with_context(|| format!("fingerprint external source '{}'", spec.location))?;
 
-        let (catalog, identifier) = self.catalog_manager.resolve_table(&spec.name).await?;
+        let (catalog, identifier) = self
+            .catalog_manager
+            .resolve_table_scoped(
+                &spec.name,
+                crate::query::request_scope::resolution_tenant(&spec.name)?.as_deref(),
+            )
+            .await?;
         if catalog.table_exists(&identifier).await? {
             anyhow::bail!(
                 "a catalog table named '{}' already exists; cannot register as external",
@@ -632,7 +638,13 @@ impl ExternalCollectionService {
 
     /// Read the external-index projection (for EXPLAIN / route-health / tests).
     pub async fn projection(&self, collection_id: &str) -> Result<Option<CatalogProjection>> {
-        let (catalog, identifier) = self.catalog_manager.resolve_table(collection_id).await?;
+        let (catalog, identifier) = self
+            .catalog_manager
+            .resolve_table_scoped(
+                collection_id,
+                crate::query::request_scope::resolution_tenant(collection_id)?.as_deref(),
+            )
+            .await?;
         if !catalog.table_exists(&identifier).await? {
             return Ok(None);
         }
@@ -649,7 +661,13 @@ impl ExternalCollectionService {
     where
         F: FnOnce(&mut CatalogProjection),
     {
-        let (catalog, identifier) = self.catalog_manager.resolve_table(collection_id).await?;
+        let (catalog, identifier) = self
+            .catalog_manager
+            .resolve_table_scoped(
+                collection_id,
+                crate::query::request_scope::resolution_tenant(collection_id)?.as_deref(),
+            )
+            .await?;
         if !catalog.table_exists(&identifier).await? {
             anyhow::bail!("external collection '{collection_id}' is not cataloged");
         }
@@ -865,395 +883,475 @@ mod tests {
 
     #[tokio::test]
     async fn register_catalogs_federated_read_and_external_snapshot() {
-        let path = fixture_path();
-        write_parquet_fixture(&path, 20, 20);
-        let cat = catalog_manager_with_default().await;
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat.clone(),
-            axis_manager().await,
-        )
-        .with_axis_runtime_enabled(true);
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            write_parquet_fixture(&path, 20, 20);
+            let cat = catalog_manager_with_default().await;
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat.clone(),
+                axis_manager().await,
+            )
+            .with_axis_runtime_enabled(true);
 
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 20);
-        let ec = svc.register(spec).await.unwrap();
-        assert_eq!(ec.status, ExternalCollectionStatus::Registered);
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            );
+            let ec = svc.register(spec).await.unwrap();
+            assert_eq!(ec.status, ExternalCollectionStatus::Registered);
 
-        // Catalog shows FederatedRead authority + external location.
-        let (catalog, identifier) = cat.resolve_table("ext_docs").await.unwrap();
-        let schema = catalog.get_table(&identifier).await.unwrap();
-        let layout = &schema.storage_layouts[0];
-        assert_eq!(
-            layout.authority,
-            proximadb_catalog::CatalogAuthorityMode::FederatedRead
-        );
-        assert_eq!(layout.location.as_deref(), Some(path.to_str().unwrap()));
+            // Catalog shows FederatedRead authority + external location.
+            let (catalog, identifier) = cat.resolve_table("ext_docs").await.unwrap();
+            let schema = catalog.get_table(&identifier).await.unwrap();
+            let layout = &schema.storage_layouts[0];
+            assert_eq!(
+                layout.authority,
+                proximadb_catalog::CatalogAuthorityMode::FederatedRead
+            );
+            assert_eq!(layout.location.as_deref(), Some(path.to_str().unwrap()));
 
-        // Projection registered as ExternalSnapshotRegistered with snapshot lineage.
-        let proj = svc.projection("ext_docs").await.unwrap().unwrap();
-        assert_eq!(
-            proj.freshness_state,
-            ProjectionFreshnessState::ExternalSnapshotRegistered
-        );
-        assert_eq!(proj.source_range.as_deref(), Some(ec.snapshot_id.as_str()));
+            // Projection registered as ExternalSnapshotRegistered with snapshot lineage.
+            let proj = svc.projection("ext_docs").await.unwrap().unwrap();
+            assert_eq!(
+                proj.freshness_state,
+                ProjectionFreshnessState::ExternalSnapshotRegistered
+            );
+            assert_eq!(proj.source_range.as_deref(), Some(ec.snapshot_id.as_str()));
 
-        // Re-register is rejected.
-        let dup =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 20);
-        assert!(svc.register(dup).await.is_err());
+            // Re-register is rejected.
+            let dup = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            );
+            assert!(svc.register(dup).await.is_err());
 
-        let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn runtime_disabled_rejects_build_before_reading_the_source() {
-        let path = fixture_path();
-        write_parquet_fixture(&path, 20, 20);
-        let cat = catalog_manager_with_default().await;
-        let axis = axis_manager().await;
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat,
-            axis.clone(),
-        );
-        let spec = ExternalCollectionSpec::parquet(
-            "disabled_ext",
-            path.to_str().unwrap(),
-            "id",
-            "vector",
-            20,
-        );
-        let ec = svc.register(spec).await.unwrap();
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            write_parquet_fixture(&path, 20, 20);
+            let cat = catalog_manager_with_default().await;
+            let axis = axis_manager().await;
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat,
+                axis.clone(),
+            );
+            let spec = ExternalCollectionSpec::parquet(
+                "disabled_ext",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            );
+            let ec = svc.register(spec).await.unwrap();
 
-        std::fs::remove_file(&path).unwrap();
-        let error = svc.build(&ec.id).await.unwrap_err();
-        assert!(
-            error.to_string().contains("enable_axis_indexes=true"),
-            "runtime policy must fail before the missing source is read: {error:#}"
-        );
-        assert!(!axis.has_served_index("disabled_ext").await);
+            std::fs::remove_file(&path).unwrap();
+            let error = svc.build(&ec.id).await.unwrap_err();
+            assert!(
+                error.to_string().contains("enable_axis_indexes=true"),
+                "runtime policy must fail before the missing source is read: {error:#}"
+            );
+            assert!(!axis.has_served_index("disabled_ext").await);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn build_in_place_makes_index_queryable_and_fresh() {
-        let path = fixture_path();
-        let expect = write_parquet_fixture(&path, 32, 32);
-        let cat = catalog_manager_with_default().await;
-        let axis = axis_manager().await;
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat.clone(),
-            axis.clone(),
-        )
-        .with_axis_runtime_enabled(true);
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            let expect = write_parquet_fixture(&path, 32, 32);
+            let cat = catalog_manager_with_default().await;
+            let axis = axis_manager().await;
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat.clone(),
+                axis.clone(),
+            )
+            .with_axis_runtime_enabled(true);
 
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 32);
-        let ec = svc.register(spec).await.unwrap();
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                32,
+            );
+            let ec = svc.register(spec).await.unwrap();
 
-        let count = svc.build(&ec.id).await.unwrap();
-        assert_eq!(count, 32);
-        assert!(axis.has_ivf_index("ext_docs").await);
+            let count = svc.build(&ec.id).await.unwrap();
+            assert_eq!(count, 32);
+            assert!(axis.has_ivf_index("ext_docs").await);
 
-        // Status Ready + projection Fresh.
-        let got = svc.get(&ec.id).unwrap();
-        assert_eq!(got.status, ExternalCollectionStatus::Ready);
-        assert_eq!(got.indexed_record_count, 32);
-        let proj = svc.projection("ext_docs").await.unwrap().unwrap();
-        assert_eq!(proj.freshness_state, ProjectionFreshnessState::Fresh);
+            // Status Ready + projection Fresh.
+            let got = svc.get(&ec.id).unwrap();
+            assert_eq!(got.status, ExternalCollectionStatus::Ready);
+            assert_eq!(got.indexed_record_count, 32);
+            let proj = svc.projection("ext_docs").await.unwrap().unwrap();
+            assert_eq!(proj.freshness_state, ProjectionFreshnessState::Fresh);
 
-        // Search returns the exact nearest external row for a row's own vector.
-        let (qid, qvec) = &expect[5];
-        let hits = svc.search(&ec.id, qvec.clone(), 3).await.unwrap();
-        assert!(!hits.is_empty(), "external index must be queryable");
-        assert_eq!(&hits[0].id, qid, "top-1 must be the exact external row");
+            // Search returns the exact nearest external row for a row's own vector.
+            let (qid, qvec) = &expect[5];
+            let hits = svc.search(&ec.id, qvec.clone(), 3).await.unwrap();
+            assert!(!hits.is_empty(), "external index must be queryable");
+            assert_eq!(&hits[0].id, qid, "top-1 must be the exact external row");
 
-        let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn search_before_build_is_rejected() {
-        let path = fixture_path();
-        write_parquet_fixture(&path, 20, 20);
-        let cat = catalog_manager_with_default().await;
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat,
-            axis_manager().await,
-        )
-        .with_axis_runtime_enabled(true);
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 20);
-        let ec = svc.register(spec).await.unwrap();
-        assert!(svc.search(&ec.id, vec![0.0; 20], 3).await.is_err());
-        let _ = std::fs::remove_file(&path);
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            write_parquet_fixture(&path, 20, 20);
+            let cat = catalog_manager_with_default().await;
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat,
+                axis_manager().await,
+            )
+            .with_axis_runtime_enabled(true);
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            );
+            let ec = svc.register(spec).await.unwrap();
+            assert!(svc.search(&ec.id, vec![0.0; 20], 3).await.is_err());
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn search_returns_federated_props_from_source() {
-        let path = fixture_path();
-        write_meta_fixture(&path, 20, 20);
-        let cat = catalog_manager_with_default().await;
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat,
-            axis_manager().await,
-        )
-        .with_axis_runtime_enabled(true);
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 20);
-        let ec = svc.register(spec).await.unwrap();
-        svc.build(&ec.id).await.unwrap();
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            write_meta_fixture(&path, 20, 20);
+            let cat = catalog_manager_with_default().await;
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat,
+                axis_manager().await,
+            )
+            .with_axis_runtime_enabled(true);
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            );
+            let ec = svc.register(spec).await.unwrap();
+            svc.build(&ec.id).await.unwrap();
 
-        // Query row-3's own one-hot vector → top-1 is row-3 with its source props.
-        let mut q = vec![0.0f32; 20];
-        q[3] = 1.0;
-        let hits = svc.search(&ec.id, q, 3).await.unwrap();
-        assert_eq!(hits[0].id, "row-3");
-        let props = &hits[0].record.props;
-        match &props["text"] {
-            proximadb_records::ProximaTreeNode::Value(
-                proximadb_data_model::ProximaValue::String(s),
-            ) => assert_eq!(s, "text-3"),
-            other => panic!("text prop wrong: {other:?}"),
-        }
-        match &props["year"] {
-            proximadb_records::ProximaTreeNode::Value(
-                proximadb_data_model::ProximaValue::Int64(y),
-            ) => assert_eq!(*y, 2003),
-            other => panic!("year prop wrong: {other:?}"),
-        }
-        let _ = std::fs::remove_file(&path);
+            // Query row-3's own one-hot vector → top-1 is row-3 with its source props.
+            let mut q = vec![0.0f32; 20];
+            q[3] = 1.0;
+            let hits = svc.search(&ec.id, q, 3).await.unwrap();
+            assert_eq!(hits[0].id, "row-3");
+            let props = &hits[0].record.props;
+            match &props["text"] {
+                proximadb_records::ProximaTreeNode::Value(
+                    proximadb_data_model::ProximaValue::String(s),
+                ) => assert_eq!(s, "text-3"),
+                other => panic!("text prop wrong: {other:?}"),
+            }
+            match &props["year"] {
+                proximadb_records::ProximaTreeNode::Value(
+                    proximadb_data_model::ProximaValue::Int64(y),
+                ) => assert_eq!(*y, 2003),
+                other => panic!("year prop wrong: {other:?}"),
+            }
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn refresh_rebuilds_only_when_source_changed() {
-        let path = fixture_path();
-        write_meta_fixture(&path, 20, 24);
-        let cat = catalog_manager_with_default().await;
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat,
-            axis_manager().await,
-        )
-        .with_axis_runtime_enabled(true);
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 24);
-        let ec = svc.register(spec).await.unwrap();
-        svc.build(&ec.id).await.unwrap();
-        let snap0 = svc.get(&ec.id).unwrap().snapshot_id;
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            write_meta_fixture(&path, 20, 24);
+            let cat = catalog_manager_with_default().await;
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat,
+                axis_manager().await,
+            )
+            .with_axis_runtime_enabled(true);
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                24,
+            );
+            let ec = svc.register(spec).await.unwrap();
+            svc.build(&ec.id).await.unwrap();
+            let snap0 = svc.get(&ec.id).unwrap().snapshot_id;
 
-        // Unchanged source → not stale, refresh is a no-op.
-        assert!(!svc.is_stale(&ec.id).unwrap());
-        let r0 = svc.refresh(&ec.id).await.unwrap();
-        assert!(!r0.stale_detected && !r0.rebuilt);
-        assert_eq!(r0.snapshot_id, snap0);
+            // Unchanged source → not stale, refresh is a no-op.
+            assert!(!svc.is_stale(&ec.id).unwrap());
+            let r0 = svc.refresh(&ec.id).await.unwrap();
+            assert!(!r0.stale_detected && !r0.rebuilt);
+            assert_eq!(r0.snapshot_id, snap0);
 
-        // Mutate the source (more rows → different fingerprint).
-        write_meta_fixture(&path, 24, 24);
-        assert!(svc.is_stale(&ec.id).unwrap());
-        let r1 = svc.refresh(&ec.id).await.unwrap();
-        assert!(
-            r1.stale_detected && r1.rebuilt,
-            "changed source must rebuild"
-        );
-        assert_eq!(r1.indexed_record_count, 24);
-        assert_ne!(r1.snapshot_id, snap0, "snapshot id must advance");
+            // Mutate the source (more rows → different fingerprint).
+            write_meta_fixture(&path, 24, 24);
+            assert!(svc.is_stale(&ec.id).unwrap());
+            let r1 = svc.refresh(&ec.id).await.unwrap();
+            assert!(
+                r1.stale_detected && r1.rebuilt,
+                "changed source must rebuild"
+            );
+            assert_eq!(r1.indexed_record_count, 24);
+            assert_ne!(r1.snapshot_id, snap0, "snapshot id must advance");
 
-        let got = svc.get(&ec.id).unwrap();
-        assert_eq!(got.status, ExternalCollectionStatus::Ready);
-        assert_eq!(got.indexed_record_count, 24);
-        let proj = svc.projection("ext_docs").await.unwrap().unwrap();
-        assert_eq!(proj.freshness_state, ProjectionFreshnessState::Fresh);
-        assert_eq!(proj.source_range.as_deref(), Some(r1.snapshot_id.as_str()));
-        let _ = std::fs::remove_file(&path);
+            let got = svc.get(&ec.id).unwrap();
+            assert_eq!(got.status, ExternalCollectionStatus::Ready);
+            assert_eq!(got.indexed_record_count, 24);
+            let proj = svc.projection("ext_docs").await.unwrap().unwrap();
+            assert_eq!(proj.freshness_state, ProjectionFreshnessState::Fresh);
+            assert_eq!(proj.source_range.as_deref(), Some(r1.snapshot_id.as_str()));
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 
     // ─── F5 Slice 3: BM25 + hybrid ──────────────────────────────────────────
 
     #[tokio::test]
     async fn build_populates_bm25_index_only_when_text_column_set() {
-        let path = fixture_path();
-        write_meta_fixture(&path, 20, 20);
-        let cat = catalog_manager_with_default().await;
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            write_meta_fixture(&path, 20, 20);
+            let cat = catalog_manager_with_default().await;
 
-        // With text_column → BM25 index built.
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat.clone(),
-            axis_manager().await,
-        )
-        .with_axis_runtime_enabled(true);
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 20)
-                .with_text_column("text");
-        let ec = svc.register(spec).await.unwrap();
-        svc.build(&ec.id).await.unwrap();
-        assert!(svc.has_fulltext_index("ext_docs"));
+            // With text_column → BM25 index built.
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat.clone(),
+                axis_manager().await,
+            )
+            .with_axis_runtime_enabled(true);
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            )
+            .with_text_column("text");
+            let ec = svc.register(spec).await.unwrap();
+            svc.build(&ec.id).await.unwrap();
+            assert!(svc.has_fulltext_index("ext_docs"));
 
-        // Without text_column → no BM25 index.
-        let svc2 = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            catalog_manager_with_default().await,
-            axis_manager().await,
-        )
-        .with_axis_runtime_enabled(true);
-        let spec2 = ExternalCollectionSpec::parquet(
-            "ext_plain",
-            path.to_str().unwrap(),
-            "id",
-            "vector",
-            20,
-        );
-        let ec2 = svc2.register(spec2).await.unwrap();
-        svc2.build(&ec2.id).await.unwrap();
-        assert!(!svc2.has_fulltext_index("ext_plain"));
+            // Without text_column → no BM25 index.
+            let svc2 = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                catalog_manager_with_default().await,
+                axis_manager().await,
+            )
+            .with_axis_runtime_enabled(true);
+            let spec2 = ExternalCollectionSpec::parquet(
+                "ext_plain",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            );
+            let ec2 = svc2.register(spec2).await.unwrap();
+            svc2.build(&ec2.id).await.unwrap();
+            assert!(!svc2.has_fulltext_index("ext_plain"));
 
-        let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn hybrid_search_fuses_lexical_match_with_vector() {
-        let path = fixture_path();
-        // row-i: one-hot vector at i, text "text-i".
-        write_meta_fixture(&path, 20, 20);
-        let cat = catalog_manager_with_default().await;
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat,
-            axis_manager().await,
-        )
-        .with_axis_runtime_enabled(true);
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 20)
-                .with_text_column("text");
-        let ec = svc.register(spec).await.unwrap();
-        svc.build(&ec.id).await.unwrap();
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            // row-i: one-hot vector at i, text "text-i".
+            write_meta_fixture(&path, 20, 20);
+            let cat = catalog_manager_with_default().await;
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat,
+                axis_manager().await,
+            )
+            .with_axis_runtime_enabled(true);
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            )
+            .with_text_column("text");
+            let ec = svc.register(spec).await.unwrap();
+            svc.build(&ec.id).await.unwrap();
 
-        // Vector query points at row-3; lexical query is row-7's own text.
-        let mut qv = vec![0.0f32; 20];
-        qv[3] = 1.0;
+            // Vector query points at row-3; lexical query is row-7's own text.
+            let mut qv = vec![0.0f32; 20];
+            qv[3] = 1.0;
 
-        // Vector-only: nearest is row-3.
-        let vonly = svc.search(&ec.id, qv.clone(), 5).await.unwrap();
-        assert_eq!(
-            vonly[0].id, "row-3",
-            "vector-only top-1 is the nearest vector"
-        );
+            // Vector-only: nearest is row-3.
+            let vonly = svc.search(&ec.id, qv.clone(), 5).await.unwrap();
+            assert_eq!(
+                vonly[0].id, "row-3",
+                "vector-only top-1 is the nearest vector"
+            );
 
-        // Hybrid: fusion pulls in the lexical-only match (row-7) alongside row-3.
-        let hybrid = svc
-            .hybrid_search(&ec.id, qv, Some("text-7".to_string()), 5)
-            .await
-            .unwrap();
-        let ids: Vec<&str> = hybrid.iter().map(|h| h.id.as_str()).collect();
-        assert!(
-            ids.contains(&"row-7"),
-            "BM25 brought the lexical match into fused results: {ids:?}"
-        );
-        assert!(
-            ids.contains(&"row-3"),
-            "vector match retained in fused results: {ids:?}"
-        );
-        // Hits still carry federated props.
-        let row7 = hybrid.iter().find(|h| h.id == "row-7").unwrap();
-        assert!(row7.record.props.contains_key("text"));
+            // Hybrid: fusion pulls in the lexical-only match (row-7) alongside row-3.
+            let hybrid = svc
+                .hybrid_search(&ec.id, qv, Some("text-7".to_string()), 5)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = hybrid.iter().map(|h| h.id.as_str()).collect();
+            assert!(
+                ids.contains(&"row-7"),
+                "BM25 brought the lexical match into fused results: {ids:?}"
+            );
+            assert!(
+                ids.contains(&"row-3"),
+                "vector match retained in fused results: {ids:?}"
+            );
+            // Hits still carry federated props.
+            let row7 = hybrid.iter().find(|h| h.id == "row-7").unwrap();
+            assert!(row7.record.props.contains_key("text"));
 
-        let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn hybrid_search_lazily_rebuilds_bm25_after_restart() {
-        let path = fixture_path();
-        write_meta_fixture(&path, 20, 20);
-        let cat = catalog_manager_with_default().await;
-        let registry = Arc::new(ExternalCollectionRegistry::new());
-        let axis = axis_manager().await;
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let path = fixture_path();
+            write_meta_fixture(&path, 20, 20);
+            let cat = catalog_manager_with_default().await;
+            let registry = Arc::new(ExternalCollectionRegistry::new());
+            let axis = axis_manager().await;
 
-        // Build with the first service (BM25 populated in its in-memory map).
-        let svc1 = ExternalCollectionService::new(registry.clone(), cat.clone(), axis.clone())
-            .with_axis_runtime_enabled(true);
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 20)
-                .with_text_column("text");
-        let ec = svc1.register(spec).await.unwrap();
-        svc1.build(&ec.id).await.unwrap();
+            // Build with the first service (BM25 populated in its in-memory map).
+            let svc1 = ExternalCollectionService::new(registry.clone(), cat.clone(), axis.clone())
+                .with_axis_runtime_enabled(true);
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            )
+            .with_text_column("text");
+            let ec = svc1.register(spec).await.unwrap();
+            svc1.build(&ec.id).await.unwrap();
 
-        // Simulate a restart: a fresh service shares the durable registry + the
-        // (still-resident) IVF index, but starts with an EMPTY BM25 map.
-        let svc2 =
-            ExternalCollectionService::new(registry, cat, axis).with_axis_runtime_enabled(true);
-        assert!(
-            !svc2.has_fulltext_index("ext_docs"),
-            "fresh service starts without BM25"
-        );
+            // Simulate a restart: a fresh service shares the durable registry + the
+            // (still-resident) IVF index, but starts with an EMPTY BM25 map.
+            let svc2 =
+                ExternalCollectionService::new(registry, cat, axis).with_axis_runtime_enabled(true);
+            assert!(
+                !svc2.has_fulltext_index("ext_docs"),
+                "fresh service starts without BM25"
+            );
 
-        let mut qv = vec![0.0f32; 20];
-        qv[3] = 1.0;
-        let hybrid = svc2
-            .hybrid_search(&ec.id, qv, Some("text-7".to_string()), 5)
-            .await
-            .unwrap();
+            let mut qv = vec![0.0f32; 20];
+            qv[3] = 1.0;
+            let hybrid = svc2
+                .hybrid_search(&ec.id, qv, Some("text-7".to_string()), 5)
+                .await
+                .unwrap();
 
-        // The first hybrid query lazily rebuilt the BM25 index from the source,
-        // so fusion still surfaces the lexical-only match.
-        assert!(
-            svc2.has_fulltext_index("ext_docs"),
-            "first hybrid query rebuilt the BM25 index"
-        );
-        let ids: Vec<&str> = hybrid.iter().map(|h| h.id.as_str()).collect();
-        assert!(
-            ids.contains(&"row-7"),
-            "lazily-rebuilt BM25 fused the lexical match: {ids:?}"
-        );
-        assert!(ids.contains(&"row-3"), "vector match retained: {ids:?}");
+            // The first hybrid query lazily rebuilt the BM25 index from the source,
+            // so fusion still surfaces the lexical-only match.
+            assert!(
+                svc2.has_fulltext_index("ext_docs"),
+                "first hybrid query rebuilt the BM25 index"
+            );
+            let ids: Vec<&str> = hybrid.iter().map(|h| h.id.as_str()).collect();
+            assert!(
+                ids.contains(&"row-7"),
+                "lazily-rebuilt BM25 fused the lexical match: {ids:?}"
+            );
+            assert!(ids.contains(&"row-3"), "vector match retained: {ids:?}");
 
-        let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 
     #[tokio::test]
     async fn hybrid_search_with_weighted_fusion_returns_fused_hits() {
-        use crate::core::search::hybrid::FusionStrategy;
-        let path = fixture_path();
-        write_meta_fixture(&path, 20, 20);
-        let cat = catalog_manager_with_default().await;
-        let svc = ExternalCollectionService::new(
-            Arc::new(ExternalCollectionRegistry::new()),
-            cat,
-            axis_manager().await,
-        )
-        .with_axis_runtime_enabled(true);
-        let spec =
-            ExternalCollectionSpec::parquet("ext_docs", path.to_str().unwrap(), "id", "vector", 20)
-                .with_text_column("text");
-        let ec = svc.register(spec).await.unwrap();
-        svc.build(&ec.id).await.unwrap();
-
-        let mut qv = vec![0.0f32; 20];
-        qv[3] = 1.0;
-        // Weighted-linear (50/50) fusion also surfaces the lexical match.
-        let hits = svc
-            .hybrid_search_with_fusion(
-                &ec.id,
-                qv,
-                Some("text-7".to_string()),
-                5,
-                FusionStrategy::WeightedLinear {
-                    alpha: 0.5,
-                    bm25_normalize: true,
-                    vector_normalize: true,
-                },
+        crate::query::request_scope::with_internal_scope("test", async move {
+            use crate::core::search::hybrid::FusionStrategy;
+            let path = fixture_path();
+            write_meta_fixture(&path, 20, 20);
+            let cat = catalog_manager_with_default().await;
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat,
+                axis_manager().await,
             )
-            .await
-            .unwrap();
-        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
-        assert!(
-            ids.contains(&"row-7"),
-            "weighted fusion surfaces the lexical match: {ids:?}"
-        );
-        assert!(ids.contains(&"row-3"), "vector match retained: {ids:?}");
+            .with_axis_runtime_enabled(true);
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_docs",
+                path.to_str().unwrap(),
+                "id",
+                "vector",
+                20,
+            )
+            .with_text_column("text");
+            let ec = svc.register(spec).await.unwrap();
+            svc.build(&ec.id).await.unwrap();
 
-        let _ = std::fs::remove_file(&path);
+            let mut qv = vec![0.0f32; 20];
+            qv[3] = 1.0;
+            // Weighted-linear (50/50) fusion also surfaces the lexical match.
+            let hits = svc
+                .hybrid_search_with_fusion(
+                    &ec.id,
+                    qv,
+                    Some("text-7".to_string()),
+                    5,
+                    FusionStrategy::WeightedLinear {
+                        alpha: 0.5,
+                        bm25_normalize: true,
+                        vector_normalize: true,
+                    },
+                )
+                .await
+                .unwrap();
+            let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+            assert!(
+                ids.contains(&"row-7"),
+                "weighted fusion surfaces the lexical match: {ids:?}"
+            );
+            assert!(ids.contains(&"row-3"), "vector match retained: {ids:?}");
+
+            let _ = std::fs::remove_file(&path);
+        })
+        .await
     }
 }

@@ -20,6 +20,7 @@ path = "src/lib.rs"
 # (CatalogManager, CatalogTableSchema, TableIdentifier, …) live in proximadb-catalog.
 proximadb-catalog = { path = "../../control/proximadb-catalog" }
 proximadb-data-model = { path = "../../foundation/proximadb-data-model" }
+proximadb-tenant = { workspace = true }
 anyhow.workspace = true
 serde.workspace = true
 # parse_select_aliases is a thin wrapper over sqlparser-rs. Declared via the

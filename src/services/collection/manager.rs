@@ -405,6 +405,20 @@ impl CollectionService {
             .unwrap_or(Self::DEFAULT_VERSION_TENANT)
     }
 
+    /// Bump the corpus version of `name` for `tenant` and, when that is not the
+    /// default bucket, also for the default bucket: the name-keyed collection
+    /// cache ([`Self::collection`]) reads the default bucket, so a named
+    /// tenant's create or delete must invalidate it too. Returns `tenant`'s
+    /// new version.
+    async fn bump_corpus_versions(tenant: &str, name: &str) -> u64 {
+        let registry = crate::catalog::CorpusVersionRegistry::global();
+        let version = registry.bump(tenant, name).await;
+        if tenant != Self::DEFAULT_VERSION_TENANT {
+            let _ = registry.bump(Self::DEFAULT_VERSION_TENANT, name).await;
+        }
+        version
+    }
+
     async fn count_tenant_collections(&self, tenant_id: &str) -> Result<usize> {
         Ok(self
             .list_collections()
@@ -669,11 +683,10 @@ impl CollectionService {
         // Resolve within the request tenant (no context ⇒ deny). A collection
         // this tenant may not resolve is answered exactly like a missing one,
         // and nothing is touched.
-        if self
+        let Some(target) = self
             .get_collection_with_tenant_context(collection_name, tenant_context)
             .await?
-            .is_none()
-        {
+        else {
             return Ok(CollectionServiceResponse {
                 success: false,
                 collection: None,
@@ -681,9 +694,21 @@ impl CollectionService {
                 error_code: Some("COLLECTION_NOT_FOUND".to_string()),
                 processing_time_us: 0,
             });
-        }
+        };
 
         let response = self.delete_collection(collection_name).await?;
+        // The name-keyed cache is also keyed by id and by the name the caller
+        // used; invalidate every key the deleted collection can be read by.
+        if response.success {
+            let tenant = Self::version_tenant(tenant_context);
+            let mut keys = vec![target.id.clone()];
+            if let Some(config) = &target.config {
+                keys.push(config.name.clone());
+            }
+            for key in keys.iter().filter(|key| key.as_str() != collection_name) {
+                let _ = Self::bump_corpus_versions(tenant, key).await;
+            }
+        }
 
         // Bump the corpus_version for (tenant, collection) so corpus-version-keyed
         // caches (PlanCache, the per-tenant system-catalog cache) invalidate on
@@ -693,9 +718,7 @@ impl CollectionService {
         // too, keyed by the default bucket reads use.
         if response.success {
             let tenant = Self::version_tenant(tenant_context);
-            let version = crate::catalog::CorpusVersionRegistry::global()
-                .bump(tenant, collection_name)
-                .await;
+            let version = Self::bump_corpus_versions(tenant, collection_name).await;
             debug!(
                 "🔄 corpus_version bumped after delete: tenant={} collection={} version={}",
                 tenant, collection_name, version
@@ -1349,9 +1372,7 @@ impl CollectionService {
         // this bump — gets superseded immediately.
         {
             let tenant = Self::version_tenant(tenant_context);
-            let version = crate::catalog::CorpusVersionRegistry::global()
-                .bump(tenant, &config.name)
-                .await;
+            let version = Self::bump_corpus_versions(tenant, &config.name).await;
             debug!(
                 "🔄 corpus_version bumped after create: tenant={} collection={} version={}",
                 tenant, config.name, version
@@ -2544,6 +2565,10 @@ impl CollectionService {
                 existing
                     .properties
                     .insert("asset.kind".to_string(), "collection".to_string());
+                existing.properties.insert(
+                    proximadb_catalog::table_properties::COLLECTION_PROVENANCE_PROPERTY.to_string(),
+                    proximadb_catalog::table_properties::COLLECTION_PROVENANCE_VALUE.to_string(),
+                );
                 existing
                     .properties
                     .insert("asset.capability.vector".to_string(), "true".to_string());
@@ -2762,12 +2787,14 @@ async fn read_collection_asset(
         && catalog.table_exists(&table_id).await.unwrap_or(false)
     {
         let schema = catalog.get_table(&table_id).await?;
-        if let Some(collection) =
-            crate::storage::metadata::collection_mapping::collection_from_catalog_schema(
-                &table_id, &schema,
-            )?
-        {
-            return Ok(Some(collection));
+        match crate::storage::metadata::collection_mapping::collection_from_catalog_schema(
+            &table_id, &schema,
+        ) {
+            Ok(Some(collection)) => return Ok(Some(collection)),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(table = ?table_id, %error, "unreadable collection catalog entry; skipped");
+            }
         }
     }
 
@@ -2807,8 +2834,7 @@ async fn read_collections_from_catalog(
         namespaces.push(vec!["default".to_string()]);
     }
 
-    let mut collections = Vec::new();
-    let mut seen_ids = HashSet::new();
+    let mut collections: Vec<Collection> = Vec::new();
     for namespace in namespaces {
         let table_ids = match catalog.list_tables(&namespace).await {
             Ok(table_ids) => table_ids,
@@ -2820,18 +2846,43 @@ async fn read_collections_from_catalog(
                 Ok(schema) => schema,
                 Err(_) => continue,
             };
-            let Some(collection) =
-                crate::storage::metadata::collection_mapping::collection_from_catalog_schema(
+            // One unreadable entry never takes down the listing (or startup).
+            let collection =
+                match crate::storage::metadata::collection_mapping::collection_from_catalog_schema(
                     &table_id, &schema,
-                )?
-            else {
-                continue;
-            };
-            if seen_ids.insert(collection.id.clone()) {
-                collections.push(collection);
-            }
+                ) {
+                    Ok(Some(collection)) => collection,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::error!(table = ?table_id, %error, "unreadable collection catalog entry; skipped");
+                        continue;
+                    }
+                };
+            collections.push(collection);
         }
     }
+
+    // Entries that claim the same collection id must agree on its owner; if
+    // they do not, none is trusted. Otherwise the first is used.
+    let mut owners: std::collections::HashMap<String, HashSet<Option<String>>> =
+        std::collections::HashMap::new();
+    for collection in &collections {
+        owners
+            .entry(collection.id.clone())
+            .or_default()
+            .insert(proximadb_tenant::effective_owner(collection));
+    }
+    let mut seen_ids = HashSet::new();
+    collections.retain(|collection| {
+        if owners.get(&collection.id).is_some_and(|set| set.len() > 1) {
+            tracing::error!(
+                collection = %collection.id,
+                "catalog entries record this collection id with different owners; none is used"
+            );
+            return false;
+        }
+        seen_ids.insert(collection.id.clone())
+    });
 
     Ok(collections)
 }

@@ -43,6 +43,7 @@ pub mod tenant_posture;
 // through the injected `CatalogFilesystemResolver` port (no catalog->storage
 // up-edge).
 pub mod manager;
+pub mod table_properties;
 pub use manager::{
     CatalogFilesystemResolver, CatalogManager, TableNotVisible, TableOpLockRegistry,
 };

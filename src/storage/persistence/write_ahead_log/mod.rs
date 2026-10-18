@@ -2940,8 +2940,19 @@ impl WriteAheadLogManager {
                     }
                 }
 
+                // Deletion tombstones carry no props, so a bloom miss says
+                // nothing about them: a batch holding one must still reach the
+                // merge, where it suppresses the live copy of its record
+                // (invariant 16d). Its live records are still dropped by the
+                // exact per-record filter.
+                let holds_tombstones = batch
+                    .vector_records
+                    .iter()
+                    .any(|record| record.valid_to_ns == Some(0));
                 if should_include {
                     bloom_hits += 1;
+                    filtered_batches.push(batch);
+                } else if holds_tombstones {
                     filtered_batches.push(batch);
                 }
             } else {
@@ -4194,6 +4205,11 @@ mod td_flush_8_catalog_walk_tests {
         schema
             .properties
             .insert("collection.name".to_string(), "diag_coll".to_string());
+        // Written by the collection writer (as every real collection entry is).
+        schema.properties.insert(
+            proximadb_catalog::table_properties::COLLECTION_PROVENANCE_PROPERTY.to_string(),
+            proximadb_catalog::table_properties::COLLECTION_PROVENANCE_VALUE.to_string(),
+        );
         UnlistedDefaultNamespaceCatalog {
             table: TableIdentifier::new(vec!["default".to_string()], "diag_coll"),
             schema,

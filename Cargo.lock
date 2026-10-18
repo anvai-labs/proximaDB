@@ -7813,6 +7813,7 @@ dependencies = [
  "proximadb",
  "proximadb-catalog",
  "proximadb-data-model",
+ "proximadb-tenant",
  "serde",
  "sqlparser",
  "tempfile",

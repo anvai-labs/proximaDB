@@ -5442,7 +5442,7 @@ async fn fast_lane_schema_validation_rejects_null_for_not_null_column() {
         ]),
         ..Default::default()
     };
-    dml.validate_record_batch_against_schema("fast_lane_tbl", &[ok_record])
+    dml.validate_record_batch_against_schema("fast_lane_tbl", None, &[ok_record])
         .await
         .expect("conforming record must pass schema validation");
 
@@ -5462,7 +5462,7 @@ async fn fast_lane_schema_validation_rejects_null_for_not_null_column() {
         ..Default::default()
     };
     let err = dml
-        .validate_record_batch_against_schema("fast_lane_tbl", &[bad_record])
+        .validate_record_batch_against_schema("fast_lane_tbl", None, &[bad_record])
         .await;
     assert!(
         err.is_err(),
@@ -5518,7 +5518,7 @@ async fn fast_lane_schema_validation_skips_non_relational_collections() {
         )]),
         ..Default::default()
     };
-    dml.validate_record_batch_against_schema("unknown_collection", &[any_record])
+    dml.validate_record_batch_against_schema("unknown_collection", None, &[any_record])
         .await
         .expect("non-relational collection must skip schema validation");
 }
@@ -5851,7 +5851,7 @@ async fn dml_and_fast_lane_agree_on_not_null_constraint() {
         props: ok_props,
         ..Default::default()
     };
-    dml.validate_record_batch_against_schema("conf_tbl", &[ok_record])
+    dml.validate_record_batch_against_schema("conf_tbl", None, &[ok_record])
         .await
         .expect("fast-lane must accept conforming row");
 
@@ -5880,7 +5880,7 @@ async fn dml_and_fast_lane_agree_on_not_null_constraint() {
         ..Default::default()
     };
     let fast_lane_err = dml
-        .validate_record_batch_against_schema("conf_tbl", &[bad_record])
+        .validate_record_batch_against_schema("conf_tbl", None, &[bad_record])
         .await
         .expect_err("fast-lane must reject NULL for NOT NULL column");
 
@@ -5983,7 +5983,7 @@ async fn dml_and_fast_lane_agree_on_type_mismatch() {
         ..Default::default()
     };
     let fast_lane_err = dml
-        .validate_record_batch_against_schema("type_tbl", &[bad_record])
+        .validate_record_batch_against_schema("type_tbl", None, &[bad_record])
         .await
         .expect_err("fast-lane must reject ProximaValue::String for INTEGER column");
 

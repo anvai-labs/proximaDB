@@ -1196,7 +1196,8 @@ impl IcebergRestService {
         properties: HashMap<String, String>,
     ) -> CatalogTableSchema {
         let mut schema = CatalogTableSchema::new(table_name);
-        schema.properties = properties;
+        // System-written properties are never taken from a client request.
+        schema.properties = crate::table_properties::without_reserved_table_properties(properties);
 
         for (i, f) in iceberg_schema.fields.iter().enumerate() {
             let data_type = iceberg_type_to_catalog(&f.field_type);

@@ -545,6 +545,7 @@ impl ProximaFlightService {
     async fn catalog_arrow_schema_for_descriptor(
         catalog_manager: Option<&Arc<CatalogManager>>,
         descriptor: &FlightDescriptor,
+        tenant: &str,
     ) -> Result<Option<Arc<Schema>>> {
         let Some(catalog_manager) = catalog_manager else {
             return Ok(None);
@@ -553,7 +554,10 @@ impl ProximaFlightService {
             return Ok(None);
         };
 
-        let (catalog, table_id) = catalog_manager.resolve_table(&table_fqn).await?;
+        // Resolved within the caller's tenant, like every other table lookup.
+        let (catalog, table_id) = catalog_manager
+            .resolve_table_scoped(&table_fqn, Some(tenant))
+            .await?;
         let table_schema = catalog.get_table(&table_id).await?;
         Ok(Some(relational_schema_from_catalog(&table_schema)))
     }
@@ -1162,15 +1166,18 @@ impl ProximaFlightService {
     async fn records_for_write_batches(
         catalog_manager: Option<&Arc<CatalogManager>>,
         table_fqn: Option<&str>,
+        tenant_id: Option<&str>,
         operation: FlightWriteOperation,
         write_mode: WriteMode,
         batches: &[arrow_array::RecordBatch],
     ) -> Result<(Vec<ProximaRecord>, Option<CatalogBulkWriteResult>)> {
         if let (Some(catalog_manager), Some(table_fqn)) = (catalog_manager, table_fqn) {
             let service = CatalogBulkWriteService::with_defaults(catalog_manager.clone());
+            let tenant = proximadb_tenant::resolve_request_tenant(tenant_id);
             let (records, result) = service
                 .prepare_bulk_write(
                     table_fqn,
+                    &tenant,
                     batches,
                     Self::catalog_bulk_write_mode(operation, write_mode),
                 )
@@ -1208,6 +1215,7 @@ impl ProximaFlightService {
         let (mut records, catalog_result) = Self::records_for_write_batches(
             self.catalog_manager.as_ref(),
             table_fqn,
+            tenant_id,
             operation,
             write_mode,
             &batches,
@@ -1534,12 +1542,13 @@ impl FlightService for ProximaFlightService {
             crate::storage::tenant::TenantContext::for_tenant_id(&auth_context.tenant_id);
         let descriptor = request.into_inner();
 
-        if let Some(schema) =
-            Self::catalog_arrow_schema_for_descriptor(self.catalog_manager.as_ref(), &descriptor)
-                .await
-                .map_err(|e| {
-                    TonicStatus::internal(format!("Failed to resolve catalog schema: {}", e))
-                })?
+        if let Some(schema) = Self::catalog_arrow_schema_for_descriptor(
+            self.catalog_manager.as_ref(),
+            &descriptor,
+            &auth_context.tenant_id,
+        )
+        .await
+        .map_err(|e| TonicStatus::internal(format!("Failed to resolve catalog schema: {}", e)))?
         {
             let result = Self::schema_result_from_arrow_schema(&schema)
                 .map_err(|e| TonicStatus::internal(e.to_string()))?;

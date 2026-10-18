@@ -845,10 +845,11 @@ impl ParentTableResolver for CatalogManagerParentResolver {
     async fn resolve_parent_table(
         &self,
         references_table: &str,
+        tenant: Option<&str>,
     ) -> Result<Option<ResolvedParentTable>> {
         let (parent_catalog, parent_table_id) = self
             .catalog_manager
-            .resolve_table(references_table)
+            .resolve_table_scoped(references_table, tenant)
             .await
             .map_err(|err| {
                 anyhow!("FOREIGN KEY references table '{references_table}' which cannot be resolved: {err}")
@@ -920,19 +921,27 @@ pub struct DmlService {
 pub enum DeferredStatBump {
     RowCount {
         table: String,
+        /// The tenant the write acted as; the table resolves within it.
+        tenant: Option<String>,
         delta: i64,
     },
     NullCounts {
         table: String,
+        /// The tenant the write acted as; the table resolves within it.
+        tenant: Option<String>,
         columns: Vec<String>,
         null_counts: Vec<u64>,
     },
     MinMax {
         table: String,
+        /// The tenant the write acted as; the table resolves within it.
+        tenant: Option<String>,
         column_minmax: HashMap<String, (String, String)>,
     },
     Ndv {
         table: String,
+        /// The tenant the write acted as; the table resolves within it.
+        tenant: Option<String>,
         ndv_per_column: HashMap<String, u64>,
     },
 }
@@ -1229,25 +1238,39 @@ impl DmlService {
     pub async fn apply_deferred_stats(&self, bumps: Vec<DeferredStatBump>) {
         for bump in bumps {
             match bump {
-                DeferredStatBump::RowCount { table, delta } => {
-                    self.bump_row_count_stats(&table, delta).await
+                DeferredStatBump::RowCount {
+                    table,
+                    tenant,
+                    delta,
+                } => {
+                    self.bump_row_count_stats(&table, tenant.as_deref(), delta)
+                        .await
                 }
                 DeferredStatBump::NullCounts {
                     table,
+                    tenant,
                     columns,
                     null_counts,
                 } => {
-                    self.bump_column_null_counts(&table, &columns, &null_counts)
+                    self.bump_column_null_counts(&table, tenant.as_deref(), &columns, &null_counts)
                         .await
                 }
                 DeferredStatBump::MinMax {
                     table,
+                    tenant,
                     column_minmax,
-                } => self.bump_column_minmax(&table, column_minmax).await,
+                } => {
+                    self.bump_column_minmax(&table, tenant.as_deref(), column_minmax)
+                        .await
+                }
                 DeferredStatBump::Ndv {
                     table,
+                    tenant,
                     ndv_per_column,
-                } => self.bump_column_ndv(&table, ndv_per_column).await,
+                } => {
+                    self.bump_column_ndv(&table, tenant.as_deref(), ndv_per_column)
+                        .await
+                }
             }
         }
     }
@@ -2975,41 +2998,6 @@ impl DmlService {
         Ok((RelationalSelectAccessPath::TableScan, records))
     }
 
-    /// Get the current visible record for a cataloged table through the shared
-    /// table-record store boundary.
-    pub async fn get_table_record(
-        &self,
-        table_name: &str,
-        key: &str,
-        include_vector: bool,
-        include_props: bool,
-    ) -> Result<(CatalogTableSchema, Option<RichSearchResult>)> {
-        let (catalog, table_id) = self.catalog_manager.resolve_table(table_name).await?;
-
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
-
-        let table_schema = catalog.get_table(&table_id).await?;
-        let record = self
-            .record_store
-            .get_by_key(
-                &table_schema,
-                TableRecordGetRequest {
-                    table_id: table_id.name.clone(),
-                    key: key.to_string(),
-                    include_vector,
-                    include_props,
-                },
-                None,
-                #[cfg(feature = "abac-policy")]
-                &ReadContext::system(SystemReadReason::Statistics, "dml [CLIENT-PLACEHOLDER]"),
-            )
-            .await?;
-
-        Ok((table_schema, record))
-    }
-
     /// Explain table-to-table write routing without executing the write.
     pub async fn explain_table_write(
         &self,
@@ -3994,12 +3982,15 @@ impl DmlService {
             "Inserted rows"
         );
 
-        self.bump_row_count_stats(table_name, num_records as i64)
+        let stats_tenant = tenant_context.map(|t| t.tenant_id.as_str());
+        self.bump_row_count_stats(table_name, stats_tenant, num_records as i64)
             .await;
-        self.bump_column_null_counts(table_name, columns, &null_counts_per_column)
+        self.bump_column_null_counts(table_name, stats_tenant, columns, &null_counts_per_column)
             .await;
-        self.bump_column_minmax(table_name, column_minmax).await;
-        self.bump_column_ndv(table_name, column_ndv).await;
+        self.bump_column_minmax(table_name, stats_tenant, column_minmax)
+            .await;
+        self.bump_column_ndv(table_name, stats_tenant, column_ndv)
+            .await;
 
         let result =
             DmlResult::success(num_records as u64, format!("Inserted {} rows", num_records))
@@ -4312,8 +4303,12 @@ impl DmlService {
             "Deleted rows"
         );
 
-        self.bump_row_count_stats(table_name, -(deleted_count as i64))
-            .await;
+        self.bump_row_count_stats(
+            table_name,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+            -(deleted_count as i64),
+        )
+        .await;
 
         let result = DmlResult::success(
             deleted_count as u64,
@@ -4418,7 +4413,12 @@ impl DmlService {
         );
 
         // Only rows that did not exist grow the table; replaced rows do not.
-        self.bump_row_count_stats(table_name, new_rows as i64).await;
+        self.bump_row_count_stats(
+            table_name,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+            new_rows as i64,
+        )
+        .await;
 
         let result =
             DmlResult::success(num_records as u64, format!("Upserted {} rows", num_records))
@@ -4445,14 +4445,24 @@ impl DmlService {
     /// Errors are non-fatal: they are logged as warnings and do not fail the operation.
     /// Called by DML paths and by fast-lane (gRPC/REST/Arrow Flight) write paths for
     /// collections that are registered as relational tables in xCatalog.
-    pub(crate) async fn bump_row_count_stats(&self, table_name: &str, delta: i64) {
+    pub(crate) async fn bump_row_count_stats(
+        &self,
+        table_name: &str,
+        tenant: Option<&str>,
+        delta: i64,
+    ) {
         if self.defer_stat(|| DeferredStatBump::RowCount {
             table: table_name.to_string(),
+            tenant: tenant.map(str::to_string),
             delta,
         }) {
             return;
         }
-        let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
+        let Ok((catalog, table_id)) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant)
+            .await
+        else {
             return;
         };
         let mut stats = catalog.get_statistics(&table_id).await.unwrap_or_default();
@@ -4495,6 +4505,7 @@ impl DmlService {
     async fn bump_column_null_counts(
         &self,
         table_name: &str,
+        tenant: Option<&str>,
         columns: &[String],
         null_counts: &[u64],
     ) {
@@ -4503,12 +4514,17 @@ impl DmlService {
         }
         if self.defer_stat(|| DeferredStatBump::NullCounts {
             table: table_name.to_string(),
+            tenant: tenant.map(str::to_string),
             columns: columns.to_vec(),
             null_counts: null_counts.to_vec(),
         }) {
             return;
         }
-        let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
+        let Ok((catalog, table_id)) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant)
+            .await
+        else {
             return;
         };
         let mut stats = catalog.get_statistics(&table_id).await.unwrap_or_default();
@@ -4582,6 +4598,7 @@ impl DmlService {
     async fn bump_column_minmax(
         &self,
         table_name: &str,
+        tenant: Option<&str>,
         column_minmax: HashMap<String, (String, String)>,
     ) {
         if column_minmax.is_empty() {
@@ -4591,13 +4608,18 @@ impl DmlService {
             Some(queue) => {
                 queue.lock().push(DeferredStatBump::MinMax {
                     table: table_name.to_string(),
+                    tenant: tenant.map(str::to_string),
                     column_minmax,
                 });
                 return;
             }
             None => column_minmax,
         };
-        let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
+        let Ok((catalog, table_id)) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant)
+            .await
+        else {
             return;
         };
         let mut stats = catalog.get_statistics(&table_id).await.unwrap_or_default();
@@ -4673,7 +4695,12 @@ impl DmlService {
     /// Uses an additive estimate (assumes no overlap between batches), capped at the current
     /// table row count. This matches how simple columnar stats systems seed NDV before ANALYZE.
     /// Errors are non-fatal (logged as warnings).
-    async fn bump_column_ndv(&self, table_name: &str, ndv_per_column: HashMap<String, u64>) {
+    async fn bump_column_ndv(
+        &self,
+        table_name: &str,
+        tenant: Option<&str>,
+        ndv_per_column: HashMap<String, u64>,
+    ) {
         if ndv_per_column.is_empty() {
             return;
         }
@@ -4681,13 +4708,18 @@ impl DmlService {
             Some(queue) => {
                 queue.lock().push(DeferredStatBump::Ndv {
                     table: table_name.to_string(),
+                    tenant: tenant.map(str::to_string),
                     ndv_per_column,
                 });
                 return;
             }
             None => ndv_per_column,
         };
-        let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(table_name).await else {
+        let Ok((catalog, table_id)) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant)
+            .await
+        else {
             return;
         };
         let mut stats = catalog.get_statistics(&table_id).await.unwrap_or_default();
@@ -4717,9 +4749,13 @@ impl DmlService {
     pub async fn validate_record_batch_against_schema(
         &self,
         collection_name: &str,
+        tenant: Option<&str>,
         records: &[ProximaRecord],
     ) -> Result<()> {
-        let Ok((catalog, table_id)) = self.catalog_manager.resolve_table(collection_name).await
+        let Ok((catalog, table_id)) = self
+            .catalog_manager
+            .resolve_table_scoped(collection_name, tenant)
+            .await
         else {
             return Ok(());
         };
@@ -5917,8 +5953,12 @@ impl DmlService {
                             result.errors
                         ));
                     }
-                    self.bump_row_count_stats(&child_id.name, -(cascaded as i64))
-                        .await;
+                    self.bump_row_count_stats(
+                        &child_id.name,
+                        tenant_context.map(|t| t.tenant_id.as_str()),
+                        -(cascaded as i64),
+                    )
+                    .await;
                     // Recurse so grandchildren (and deeper) cascade too. Locks
                     // for the whole closure are already held by the entry. The
                     // call is boxed because async recursion requires it (the

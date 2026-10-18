@@ -810,13 +810,12 @@ impl CatalogManager {
         Ok((catalog, id))
     }
 
-    /// A request acting as `tenant` may resolve a catalog entry that records a
+    /// A request acting as `tenant` resolves a catalog entry that records a
     /// collection only when that collection is visible to it (the
-    /// `proximadb_tenant` ownership rule). Collection entries can sit in a
-    /// namespace shared by every tenant, so without this an unprefixed lookup
-    /// would reach another tenant's collection. Refused entries surface as
-    /// [`TableNotVisible`], which reads exactly like a missing table. Internal
-    /// resolution (`tenant` = `None`) is not filtered.
+    /// `proximadb_tenant` ownership rule — the same rule every collection
+    /// surface applies). Other entries surface as [`TableNotVisible`], which
+    /// reads exactly like a missing table. Internal resolution (`tenant` =
+    /// `None`) is not filtered.
     async fn ensure_visible_to(
         catalog: &dyn Catalog,
         id: &TableIdentifier,

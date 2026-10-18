@@ -73,6 +73,66 @@ mod tests {
         ),
     ];
 
+    /// Unscoped table resolution (`CatalogManager::resolve_table`). Request
+    /// paths resolve with `resolve_table_scoped` and the request tenant.
+    const ALLOWED_UNSCOPED_RESOLVE: &[(&str, usize, &str)] = &[
+        (
+            "crates/binding/proximadb-embedded/src/lib.rs",
+            1,
+            "embedded single-process library: no request tenant exists",
+        ),
+        (
+            "crates/binding/proximadb-embedded/src/python_dataframe.rs",
+            1,
+            "embedded single-process library: no request tenant exists",
+        ),
+        (
+            "crates/binding/proximadb-embedded/src/tests.rs",
+            1,
+            "unit tests",
+        ),
+        (
+            "crates/control/proximadb-catalog/src/fc_metamodel.rs",
+            1,
+            "metamodel name lookup within an explicit namespace (a different resolver)",
+        ),
+        (
+            "crates/control/proximadb-catalog/src/manager.rs",
+            1,
+            "resolve_table_scoped's own base resolution before tenant prefixing",
+        ),
+        (
+            "src/catalog/index_location_resolver.rs",
+            1,
+            "storage path resolution for a collection id already resolved by its caller",
+        ),
+        ("src/catalog/mod.rs", 5, "unit tests"),
+        (
+            "src/services/collection/manager.rs",
+            1,
+            "the internal collection lookup (collection_internal); request paths apply the \
+             ownership rule on its result",
+        ),
+        ("src/services/ddl/mod.rs", 5, "unit tests"),
+        ("src/services/dml/tests.rs", 20, "unit tests"),
+        (
+            "src/services/external_collection/service.rs",
+            1,
+            "unit test",
+        ),
+        (
+            "src/services/snapshot/coordinator.rs",
+            2,
+            "discovery projections for a collection the caller already resolved within its \
+             tenant, and background discovery",
+        ),
+        (
+            "src/storage/persistence/write_ahead_log/mod.rs",
+            1,
+            "internal WAL/recovery collection lookup; no request reaches it",
+        ),
+    ];
+
     fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
@@ -250,5 +310,10 @@ mod tests {
             d = "default"
         );
         assert_eq!(borrowed_defaults(&defaults), 1);
+    }
+
+    #[test]
+    fn unscoped_table_resolutions_are_all_listed() {
+        check(&format!(".resolve_{}(", "table"), ALLOWED_UNSCOPED_RESOLVE);
     }
 }

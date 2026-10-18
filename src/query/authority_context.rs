@@ -93,7 +93,12 @@ pub async fn resolve_catalog_authority_context(
     catalog_manager: &Arc<CatalogManager>,
     source: AuthoritySource,
 ) -> Result<ResolvedObjectContext> {
-    let (catalog, table_id) = catalog_manager.resolve_table(&source.source).await?;
+    // Resolved within the scope in force: a request's tenant, or unscoped for
+    // explicit internal execution; no scope is refused.
+    let tenant = crate::query::request_scope::resolution_tenant(&source.source)?;
+    let (catalog, table_id) = catalog_manager
+        .resolve_table_scoped(&source.source, tenant.as_deref())
+        .await?;
     let schema = catalog.get_table(&table_id).await?;
     Ok(resolved_object_from_catalog_schema(
         source, &table_id, &schema,

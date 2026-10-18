@@ -1161,6 +1161,7 @@ fn sql_error_to_api(error: anyhow::Error) -> ApiError {
 /// Return table-level xCatalog routing metadata for REST clients.
 pub async fn get_catalog_table_routing(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(query): Query<CatalogRoutingQuery>,
 ) -> ApiResult<Json<crate::services::CatalogIntrospectionResult>> {
     let sql = match query.table_name.as_deref().map(str::trim) {
@@ -1172,6 +1173,7 @@ pub async fn get_catalog_table_routing(
     };
 
     let result = crate::services::CatalogIntrospectionService::new(state.catalog_manager.clone())
+        .for_tenant(tenant.tenant_id)
         .execute_select(&sql)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?
@@ -1183,6 +1185,7 @@ pub async fn get_catalog_table_routing(
 /// Explain table-write route selection without executing the write.
 pub async fn explain_table_write_route(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(request): Json<TableWriteExplainRequest>,
 ) -> ApiResult<Json<crate::query::table_write_plan::TableWriteRouteExplanation>> {
     use crate::query::table_write_plan::{
@@ -1194,7 +1197,7 @@ pub async fn explain_table_write_route(
     let target_table_name = target.qualified_name();
     let (catalog, table_id) = state
         .catalog_manager
-        .resolve_table(&target_table_name)
+        .resolve_table_scoped(&target_table_name, Some(&tenant.tenant_id))
         .await
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
     if !catalog
@@ -1213,7 +1216,7 @@ pub async fn explain_table_write_route(
         .map_err(|error| ApiError::Internal(error.to_string()))?;
     let target_stats = catalog.get_statistics(&table_id).await.unwrap_or_default();
     let (source, source_schema, source_stats) =
-        resolve_table_write_explain_source(&state, &request).await?;
+        resolve_table_write_explain_source(&state, &tenant.tenant_id, &request).await?;
     let write_mode = parse_table_write_mode(request.write_mode.as_deref())?;
     let distribution = parse_distribution_mode(request.distribution.as_deref())?;
     let conflict_policy = if matches!(write_mode, WriteMode::Upsert | WriteMode::Merge) {
@@ -1255,6 +1258,7 @@ pub async fn explain_table_write_route(
 
 async fn resolve_table_write_explain_source(
     state: &AppState,
+    tenant: &str,
     request: &TableWriteExplainRequest,
 ) -> ApiResult<(
     crate::query::table_write_plan::ReadSource,
@@ -1285,7 +1289,7 @@ async fn resolve_table_write_explain_source(
             let table = logical_table_ref_from_name(table_name)?;
             let (catalog, table_id) = state
                 .catalog_manager
-                .resolve_table(&table.qualified_name())
+                .resolve_table_scoped(&table.qualified_name(), Some(tenant))
                 .await
                 .map_err(|error| ApiError::NotFound(error.to_string()))?;
             if !catalog

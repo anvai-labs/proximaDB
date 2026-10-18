@@ -609,7 +609,13 @@ impl RecordOpsService {
             if n > 0
                 && let Some(dml_svc) = self.get_dml_service()
             {
-                dml_svc.bump_row_count_stats(&collection_name, -n).await;
+                dml_svc
+                    .bump_row_count_stats(
+                        &collection_name,
+                        Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                        -n,
+                    )
+                    .await;
             }
         }
         Ok(result)
@@ -640,7 +646,11 @@ impl RecordOpsService {
         };
         if let Some(dml_svc) = self.get_dml_service()
             && let Err(e) = dml_svc
-                .validate_record_batch_against_schema(&collection_name, &request.records)
+                .validate_record_batch_against_schema(
+                    &collection_name,
+                    Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                    &request.records,
+                )
                 .await
         {
             return Ok(BatchOperationResult::failure(
@@ -682,7 +692,13 @@ impl RecordOpsService {
                 if result.success {
                     let n = result.vector_ids.len() as i64;
                     if let Some(dml_svc) = self.get_dml_service() {
-                        dml_svc.bump_row_count_stats(&collection_name, n).await;
+                        dml_svc
+                            .bump_row_count_stats(
+                                &collection_name,
+                                Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                                n,
+                            )
+                            .await;
                     }
                 }
                 Ok(result)
@@ -727,7 +743,11 @@ impl RecordOpsService {
         };
         if let Some(dml_svc) = self.get_dml_service()
             && let Err(e) = dml_svc
-                .validate_record_batch_against_schema(&collection_name, &request.records)
+                .validate_record_batch_against_schema(
+                    &collection_name,
+                    Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                    &request.records,
+                )
                 .await
         {
             return Ok(BatchOperationResult::failure(
@@ -771,7 +791,13 @@ impl RecordOpsService {
                 if result.success {
                     let n = result.vector_ids.len() as i64;
                     if let Some(dml_svc) = self.get_dml_service() {
-                        dml_svc.bump_row_count_stats(&collection_name, n).await;
+                        dml_svc
+                            .bump_row_count_stats(
+                                &collection_name,
+                                Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                                n,
+                            )
+                            .await;
                     }
                 }
                 Ok(result)
