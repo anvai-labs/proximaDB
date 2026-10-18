@@ -801,6 +801,10 @@ jobs:
         run: python3 scripts/check_orphan_rust_files.py
       - name: Test release-build-features negative controls
         run: python3 -m unittest discover -s tests/scripts -p 'test_release_build_features.py'
+      - name: Validate the release-evidence contract (release-smoke.yml)
+        run: python3 scripts/check_release_smoke.py
+      - name: Test release-evidence negative controls + script verdicts
+        run: python3 -m unittest discover -s tests/scripts -p 'test_release_smoke.py'
 
   repository-identity:
     name: Canonical Repository Identity
@@ -1758,6 +1762,9 @@ jobs:
           go test -v -count=1 -run '^TestOpenAPIContract|MatchesSpec|AllV2OperationsCovered' \
             ./proximadb/internal/rest/...
 
+      # `npm test` includes tests/package_entry.test.ts: every exports/main/
+      # module/types path must be in `npm pack --dry-run --json`, and both the
+      # require() and import() entries must load.
       - name: TypeScript contract gate
         if: matrix.sdk == 'typescript'
         working-directory: clients/nodejs-embedded

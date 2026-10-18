@@ -9341,6 +9341,7 @@ dependencies = [
  "clap",
  "hex",
  "libc",
+ "openssl",
  "proximadb",
  "proximadb-embedding",
  "proximadb-queue",

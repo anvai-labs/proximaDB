@@ -10,9 +10,9 @@ flowchart LR
   A --> D[macOS]
   A --> E[Docker]
 
-  B --> B1[RPM / DEB]
+  B --> B1[RPM / DEB / Homebrew]
   C --> C1[MSI]
-  D --> D1[Homebrew]
+  D --> D1[Docker or source]
   E --> E1[Docker Hub]
 
   style B1 fill:#4a90e2,color:#fff
@@ -25,7 +25,23 @@ flowchart LR
 
 ## Platform Packages
 
-### Linux (RPM - RHEL/CentOS/Fedora)
+### Linux requirements (archive, .deb, .rpm, Homebrew)
+
+The Linux x86_64 binaries are built against **glibc 2.28** with **OpenSSL
+statically linked**, so they need no system OpenSSL. Each package is installed,
+started and health-checked on these distributions for every release
+(`release-smoke.yml`, `packages` job):
+
+| Package | Minimum (verified) |
+|---|---|
+| `.rpm` | RHEL / Rocky / Alma **8** and 9, Fedora 41 |
+| `.deb` | **Debian 11** and 12, **Ubuntu 20.04**, 22.04, 24.04 |
+
+Older releases differ: **v0.4.1 and earlier** were built on Ubuntu 22.04 and
+need glibc 2.35 and `libssl.so.3` -- their `.el8.rpm` does **not** run on
+RHEL/Rocky 8 or 9, and their `.deb` needs Ubuntu 22.04+ / Debian 12+.
+
+### Linux (RPM - RHEL/Rocky/Alma 8+, Fedora)
 
 ```bash
 # Download
@@ -49,7 +65,7 @@ curl http://localhost:5678/health
 - Data: `/var/lib/proximadb/`
 - Logs: `/var/log/proximadb/`
 
-### Linux (DEB - Debian/Ubuntu)
+### Linux (DEB - Debian 11+, Ubuntu 20.04+)
 
 ```bash
 # Download
@@ -85,14 +101,18 @@ Start-Service proximadb
 - Config: `C:\ProgramData\ProximaDB\config.toml`
 - Data: `C:\ProgramData\ProximaDB\data\`
 
-### macOS (Homebrew)
+### Linux x86_64 (Homebrew)
+
+The release publishes a prebuilt server archive for **Linux x86_64 only**, and
+the Homebrew formula in the `anvai-labs/tap` tap installs exactly that archive.
+There is no macOS binary or formula: on macOS use Docker or build from source
+(below).
 
 ```bash
-# Install
-brew install proximadb
+brew install anvai-labs/tap/proximadb
 
-# Start service
-brew services start proximadb
+# Example configs are in $(brew --prefix)/share/proximadb/config; copy one, then
+proximadb-server --config <path-to-config.toml>
 
 # Verify
 curl http://localhost:5678/health
@@ -358,12 +378,11 @@ Stop-Service proximadb
 msiexec /x proximadb-0.2.0-x64.msi
 ```
 
-### macOS
+### Homebrew (Linux x86_64)
 
 ```bash
-brew services stop proximadb
-brew uninstall proximadb
-rm -rf /usr/local/var/proximadb
+brew uninstall anvai-labs/tap/proximadb
+# Data lives wherever your config's data_dir / storage urls point; remove it separately.
 ```
 
 ---

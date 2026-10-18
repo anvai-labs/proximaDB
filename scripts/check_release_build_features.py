@@ -72,6 +72,8 @@ TIMED_WORKFLOWS = RELEASE_WORKFLOWS + (
     ".github/workflows/prerelease-ci-v0.2.1-macos.yml",
     ".github/workflows/public-overflow-runner-smoke.yml",
     ".github/workflows/release-python.yml",
+    # Post-publish release evidence, called by release.yml (workflow_call).
+    ".github/workflows/release-smoke.yml",
     ".github/workflows/tier-config-fingerprint.yml",
     ".github/workflows/windows-compile-ratchet.yml",
 )
@@ -877,6 +879,73 @@ def check_npm_oidc_publish(msgs: list[str]) -> None:
             _fail(msgs, f"{rel}: job `{job}` must preflight the npm OIDC exchange (`POST {NPM_EXCHANGE_PATH}...`) before `npm publish` -- npm hides an exchange refusal behind ENEEDAUTH")
 
 
+# ---- Portable Linux binaries (v0.4.1: the .el8.rpm could not start on EL8/EL9) --
+# The x86_64 Linux archive is repackaged as the .deb, the .rpm and the Homebrew
+# formula, so it must run on the oldest distro any of them claims: glibc 2.28
+# (EL8) and whatever OpenSSL major the distro ships. v0.4.1 was built on
+# ubuntu-22.04 and needed GLIBC_2.35 + libssl.so.3.
+PORTABLE_BUILD = "scripts/build_portable_linux.sh"
+PORTABILITY_CHECK = "scripts/check_linux_portability.sh"
+LINUX_TARGET = "x86_64-unknown-linux-gnu"
+
+
+def _portable_image_digest() -> str | None:
+    """First 12 hex of the image digest pinned in build_portable_linux.sh."""
+    path = ROOT / PORTABLE_BUILD
+    if not path.exists():
+        return None
+    m = re.search(r"@sha256:([0-9a-f]{12})", path.read_text(encoding="utf-8"))
+    return m.group(1) if m else None
+
+
+def check_portable_linux_build(msgs: list[str]) -> None:
+    digest = _portable_image_digest()
+    if (ROOT / PORTABLE_BUILD).exists() and digest is None:
+        _fail(msgs, f"{PORTABLE_BUILD}: the build image is not pinned by @sha256 digest")
+    for rel in RELEASE_WORKFLOWS:
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines()
+        live = [l for l in lines if _live(l)]
+        if not any(PORTABLE_BUILD in l for l in live):
+            _fail(msgs, f"{rel}: the {LINUX_TARGET} binaries are not built by {PORTABLE_BUILD} "
+                        f"(manylinux_2_28 + vendored OpenSSL) -- they would need the build host's glibc/libssl")
+        # The Linux matrix entry's features must vendor OpenSSL.
+        for i, l in enumerate(lines):
+            if _live(l) and l.strip() == f"- target: {LINUX_TARGET}":
+                block = []
+                for nxt in lines[i + 1:]:
+                    if nxt.strip().startswith("- target:"):
+                        break
+                    block.append(nxt)
+                # Its rust-cache namespace must be its own and name the build
+                # image: a host target/ restored into the container reuses -sys
+                # objects built against the host's newer glibc.
+                prefixes = [_scalar(b.split("cache_prefix:", 1)[1]) for b in block
+                            if _live(b) and b.strip().startswith("cache_prefix:")]
+                if digest and (not prefixes or f"manylinux_2_28-{digest}" not in prefixes[0]):
+                    _fail(msgs, f"{rel}:{i + 1}: {LINUX_TARGET} `cache_prefix` {prefixes} must contain the "
+                                f"build image digest prefix `manylinux_2_28-{digest}` from {PORTABLE_BUILD}")
+                feats = [_scalar(m.group("rest")) for b in block if _live(b) and (m := FEATURES_RE.match(b))]
+                if not feats or "vendored-openssl" not in [f.strip() for f in feats[0].split(",")]:
+                    _fail(msgs, f"{rel}:{i + 1}: {LINUX_TARGET} features {feats} must include `vendored-openssl` "
+                                f"-- otherwise the binary links the build host's libssl")
+        if not any(_live(l) and "prefix-key:" in l and "matrix.cache_prefix" in l for l in lines):
+            _fail(msgs, f"{rel}: the build-binaries rust-cache prefix-key must be `${{{{ matrix.cache_prefix }}}}` "
+                        "so the portable Linux build never restores a host-built target/")
+    rel = ".github/workflows/release.yml"
+    path = ROOT / rel
+    if path.exists():
+        jobs = _jobs(path.read_text(encoding="utf-8").splitlines())
+        for job in ("build-binaries", "build-rpm", "build-deb"):
+            if not any(_live(b) and PORTABILITY_CHECK in b for b in jobs.get(job, [])):
+                _fail(msgs, f"{rel}: job `{job}` does not run {PORTABILITY_CHECK} on the Linux binaries it ships")
+    for script in (PORTABLE_BUILD, PORTABILITY_CHECK):
+        if not (ROOT / script).exists():
+            _fail(msgs, f"{script}: missing")
+
+
 def main() -> int:
     msgs: list[str] = []
     check_workflow_features(msgs)
@@ -888,6 +957,7 @@ def main() -> int:
     check_prerelease_gate(msgs)
     check_release_binary_reuse(msgs)
     check_npm_oidc_publish(msgs)
+    check_portable_linux_build(msgs)
     if msgs:
         print("release-build-features: FAILED")
         for m in msgs:
@@ -900,7 +970,8 @@ def main() -> int:
         "bounded, runtime config copied --chown, one release tag gated "
         "against every published manifest, every publish behind Pre-Release CI, "
         "release binaries reused from Pre-Release CI only after a SHA-256 check, "
-        "npm published by OIDC alone behind an exchange preflight)"
+        "npm published by OIDC alone behind an exchange preflight, Linux binaries "
+        "portable to glibc 2.28 with OpenSSL vendored)"
     )
     return 0
 
