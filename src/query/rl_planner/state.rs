@@ -239,7 +239,8 @@ impl PlannerState {
         features.push(if self.requested_exact { 1.0 } else { 0.0 });
 
         // Collection features (log-scaled for large values)
-        features.push((self.collection_size as f32).log10() / 9.0); // Max 1B vectors
+        // `max(1)`: log10(0) is -inf for an empty collection (TD-RLNAN-1).
+        features.push((self.collection_size.max(1) as f32).log10() / 9.0); // Max 1B vectors
         features.push(self.storage_engine as u8 as f32 / 5.0);
         features.push(self.num_storage_segments as f32 / 100.0);
         features.push(self.avg_vectors_per_segment as f32 / 100_000.0);
@@ -316,6 +317,15 @@ impl PlannerState {
         features.push(self.object_economy.zorder_code_quality);
         features.push(self.object_economy.zone_map_selectivity);
 
+        // TD-RLNAN-1: empty histories divide 0 by 0 and caller-supplied ratios
+        // can be NaN. A non-finite feature turns a learned weight into NaN,
+        // which persists as `null` and makes the saved policy unloadable, so
+        // every feature leaves here finite.
+        for feature in &mut features {
+            if !feature.is_finite() {
+                *feature = 0.0;
+            }
+        }
         features
     }
 

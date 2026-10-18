@@ -97,6 +97,175 @@ pub(crate) fn collection_schema_columns_to_catalog_columns(
         .collect()
 }
 
+/// Reserved-band ids below this are ProximaDB system columns (`oid`, `tenant_id`,
+/// `created_at_ns`, `updated_at_ns`, `props`); the `embedding` column is 20.
+const SYSTEM_COLUMN_ID_LIMIT: i32 = 20;
+const EMBEDDING_COLUMN_ID: i32 = 20;
+/// On a reserved column: the declared canonical column that folded into it
+/// (JSON `CollectionSchemaColumn`) and its position in the declared list.
+const DECLARED_COLUMN_PROPERTY: &str = "proxima.declared";
+const DECLARED_ORDINAL_PROPERTY: &str = "proxima.declared_ordinal";
+
+/// Merge the declared canonical columns into a schema whose reserved band is
+/// already in place, without ever producing a duplicate column name.
+///
+/// TD-GRPCCREATE-1: appending a canonical column that repeats a reserved
+/// column's name (the v1 `embedding` column, a v1 filterable column) made the
+/// schema invalid after the caller had dropped the catalog table, so the
+/// collection was lost. Now a colliding column that is *compatible* folds into
+/// the reserved column (which is what storage reads), recording the declaration
+/// on it so the typed catalog columns stay the one authority for the declared
+/// schema (ADR-048); an incompatible one is rejected before anything is dropped:
+///
+/// * a system column name (`oid`, `tenant_id`, `props`, timestamps) — rejected;
+/// * `embedding` — a dense vector whose dimension equals the collection's;
+/// * a filterable column — a declared type that narrows to the stored
+///   filterable type (`int32` folds into an `Int64` filterable column).
+///
+/// `canonical` must be the full declared list; earlier fold markers on the
+/// reserved band are cleared first.
+pub(crate) fn merge_canonical_band(
+    schema: &mut CatalogTableSchema,
+    canonical: Vec<CatalogColumn>,
+) -> Result<()> {
+    for column in schema
+        .columns
+        .iter_mut()
+        .filter(|c| c.id < CANONICAL_COLUMN_ID_BASE)
+    {
+        column.properties.remove(DECLARED_COLUMN_PROPERTY);
+        column.properties.remove(DECLARED_ORDINAL_PROPERTY);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for column in canonical {
+        if !seen.insert(column.name.clone()) {
+            anyhow::bail!("column '{}' is declared more than once", column.name);
+        }
+        let Some(reserved) = schema
+            .columns
+            .iter_mut()
+            .find(|c| c.id < CANONICAL_COLUMN_ID_BASE && c.name == column.name)
+        else {
+            schema.columns.push(column);
+            continue;
+        };
+        if reserved.id < SYSTEM_COLUMN_ID_LIMIT {
+            anyhow::bail!(
+                "column '{}' is a ProximaDB system column and cannot be declared in a schema",
+                column.name
+            );
+        }
+        if reserved.id == EMBEDDING_COLUMN_ID {
+            let collection_dim = reserved
+                .properties
+                .get("dimension")
+                .and_then(|d| d.parse::<usize>().ok());
+            match (&column.data_type, collection_dim) {
+                (ProximaType::DenseVector { dim, .. }, Some(expected)) if *dim == expected => {}
+                (ProximaType::DenseVector { dim, .. }, Some(expected)) => anyhow::bail!(
+                    "column 'embedding' has dimension {dim}, which conflicts with the collection \
+                     dimension {expected}"
+                ),
+                (other, _) => anyhow::bail!(
+                    "column 'embedding' must be a dense vector matching the collection, not {other:?}"
+                ),
+            }
+        } else {
+            // `String` has no arm in the shared partial mapping but IS the v1
+            // filterable vocabulary's string type (the default for gRPC
+            // `filterable_columns`), so it folds into a String filterable
+            // column. Anything else with no filterable projection (Struct,
+            // Map, SparseVector, …) cannot be stored in the filterable column
+            // and is rejected rather than silently accepted.
+            let filterable = match proximadb_runtime::handlers::proxima_type_to_filterable_type(
+                &column.data_type,
+            ) {
+                Some(data_type) => data_type,
+                None if matches!(column.data_type, ProximaType::String) => {
+                    FilterableDataType::FilterableString as i32
+                }
+                None => anyhow::bail!(
+                    "column '{}' is declared as {:?}, which cannot be stored in its filterable \
+                     column",
+                    column.name,
+                    column.data_type
+                ),
+            };
+            let narrowed = catalog_data_type(filterable);
+            if reserved.data_type != narrowed {
+                anyhow::bail!(
+                    "column '{}' is declared as {:?}, which conflicts with its filterable type {:?}",
+                    column.name,
+                    column.data_type,
+                    reserved.data_type
+                );
+            }
+        }
+        let declared = typed_band_columns(std::slice::from_ref(&column));
+        let (_, declared) = declared
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("column '{}' is not a canonical column", column.name))?;
+        let ordinal = column
+            .id
+            .checked_sub(CANONICAL_COLUMN_ID_BASE)
+            .ok_or_else(|| anyhow::anyhow!("column '{}' is not a canonical column", column.name))?;
+        reserved.properties.insert(
+            DECLARED_COLUMN_PROPERTY.to_string(),
+            serde_json::to_string(declared)?,
+        );
+        reserved
+            .properties
+            .insert(DECLARED_ORDINAL_PROPERTY.to_string(), ordinal.to_string());
+    }
+    Ok(())
+}
+
+/// The declared canonical columns a schema holds, as `CatalogColumn`s in the
+/// 200+ band: the typed band itself plus the declarations folded into reserved
+/// columns (TD-GRPCCREATE-1), each at `CANONICAL_COLUMN_ID_BASE + ordinal`.
+/// Used to carry the declared schema across a rebuild of the reserved band.
+pub(crate) fn declared_canonical_columns(columns: &[CatalogColumn]) -> Vec<CatalogColumn> {
+    let mut out: Vec<CatalogColumn> = columns
+        .iter()
+        .filter(|c| c.id >= CANONICAL_COLUMN_ID_BASE)
+        .cloned()
+        .collect();
+    for (ordinal, declared) in folded_declarations(columns) {
+        if let Some(mut column) =
+            collection_schema_columns_to_catalog_columns(std::slice::from_ref(&declared)).pop()
+        {
+            column.id = CANONICAL_COLUMN_ID_BASE + ordinal;
+            out.push(column);
+        }
+    }
+    out.sort_by_key(|c| c.id);
+    out
+}
+
+fn folded_declarations(
+    columns: &[CatalogColumn],
+) -> Vec<(i32, proximadb_runtime::CollectionSchemaColumn)> {
+    columns
+        .iter()
+        .filter(|c| c.id < CANONICAL_COLUMN_ID_BASE)
+        .filter_map(|c| {
+            let ordinal = c.properties.get(DECLARED_ORDINAL_PROPERTY)?.parse().ok()?;
+            let declared = serde_json::from_str::<proximadb_runtime::CollectionSchemaColumn>(
+                c.properties.get(DECLARED_COLUMN_PROPERTY)?,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    "corrupt proxima.declared marker on column '{}'; dropping it: {error}",
+                    c.name
+                );
+                error
+            })
+            .ok()?;
+            Some((ordinal, declared))
+        })
+        .collect()
+}
+
 /// ADR-048 P1: reverse — read the canonical schema from the typed 200+ columns
 /// (reserved v1 columns are excluded). Returns an empty vec when no canonical
 /// columns exist (legacy collection → caller falls back to the transitional
@@ -104,12 +273,24 @@ pub(crate) fn collection_schema_columns_to_catalog_columns(
 pub(crate) fn catalog_columns_to_collection_schema_columns(
     columns: &[CatalogColumn],
 ) -> Vec<proximadb_runtime::CollectionSchemaColumn> {
+    // TD-GRPCCREATE-1: declarations folded into reserved columns are part of
+    // the declared schema; return them in declared order with the typed band.
+    let mut ordered: Vec<(i32, proximadb_runtime::CollectionSchemaColumn)> =
+        typed_band_columns(columns);
+    ordered.extend(folded_declarations(columns));
+    ordered.sort_by_key(|(ordinal, _)| *ordinal);
+    ordered.into_iter().map(|(_, column)| column).collect()
+}
+
+fn typed_band_columns(
+    columns: &[CatalogColumn],
+) -> Vec<(i32, proximadb_runtime::CollectionSchemaColumn)> {
     columns
         .iter()
         .filter(|c| c.id >= CANONICAL_COLUMN_ID_BASE)
         .map(|c| {
             let bool_prop = |k: &str| c.properties.get(k).is_some_and(|v| v == "true");
-            proximadb_runtime::CollectionSchemaColumn {
+            let column = proximadb_runtime::CollectionSchemaColumn {
                 name: c.name.clone(),
                 data_type: c.data_type.clone(),
                 nullable: c.nullable,
@@ -126,7 +307,8 @@ pub(crate) fn catalog_columns_to_collection_schema_columns(
                     .properties
                     .get("proxima.max_length")
                     .and_then(|s| s.parse().ok()),
-            }
+            };
+            (c.id - CANONICAL_COLUMN_ID_BASE, column)
         })
         .collect()
 }
@@ -809,6 +991,215 @@ mod tests {
     }
 
     use super::*;
+
+    /// TD-GRPCCREATE-1: the reserved band built for a dim-3 collection with a
+    /// filterable `rank` (Int64) column.
+    fn reserved_band_dim3_with_rank() -> CatalogTableSchema {
+        let collection = Collection {
+            id: "c".to_string(),
+            config: Some(CollectionConfig {
+                name: "c".to_string(),
+                dimension: 3,
+                filterable_columns: vec![FilterableColumnSpec {
+                    name: "rank".to_string(),
+                    data_type: FilterableDataType::FilterableInteger as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        catalog_schema_from_collection(&collection).expect("reserved band")
+    }
+
+    fn canonical(name: &str, data_type: ProximaType) -> proximadb_runtime::CollectionSchemaColumn {
+        proximadb_runtime::CollectionSchemaColumn {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            indexed: false,
+            filterable: false,
+            text_storage: None,
+            max_length: None,
+        }
+    }
+
+    fn dense(dim: usize) -> ProximaType {
+        ProximaType::DenseVector {
+            element: proximadb_data_model::VectorElement::Float32,
+            dim,
+        }
+    }
+
+    #[test]
+    fn compatible_reserved_names_fold_and_reader_returns_declared_order() {
+        let mut schema = reserved_band_dim3_with_rank();
+        let before = schema.columns.len();
+        let columns = vec![
+            canonical("notes", ProximaType::String),
+            canonical("embedding", dense(3)),
+            canonical("rank", ProximaType::Int32), // narrows to the Int64 filterable column
+        ];
+        merge_canonical_band(
+            &mut schema,
+            collection_schema_columns_to_catalog_columns(&columns),
+        )
+        .expect("compatible columns merge");
+        assert_eq!(schema.columns.len(), before + 1, "only `notes` is appended");
+        let mut names: Vec<_> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), schema.columns.len(), "no duplicate names");
+        proximadb_catalog::schema::validate_schema(&schema).expect("merged schema is valid");
+
+        let read = catalog_columns_to_collection_schema_columns(&schema.columns);
+        assert_eq!(
+            read, columns,
+            "the reader returns every declared column, in order"
+        );
+
+        // Carried across a rebuild of the reserved band (upsert path).
+        let carried = declared_canonical_columns(&schema.columns);
+        let mut rebuilt = reserved_band_dim3_with_rank();
+        merge_canonical_band(&mut rebuilt, carried).expect("re-merge after rebuild");
+        assert_eq!(
+            catalog_columns_to_collection_schema_columns(&rebuilt.columns),
+            columns
+        );
+    }
+
+    #[test]
+    fn a_later_update_clears_earlier_fold_markers() {
+        let mut schema = reserved_band_dim3_with_rank();
+        merge_canonical_band(
+            &mut schema,
+            collection_schema_columns_to_catalog_columns(&[canonical("embedding", dense(3))]),
+        )
+        .expect("fold");
+        schema.columns.retain(|c| c.id < CANONICAL_COLUMN_ID_BASE);
+        merge_canonical_band(
+            &mut schema,
+            collection_schema_columns_to_catalog_columns(&[canonical(
+                "notes",
+                ProximaType::String,
+            )]),
+        )
+        .expect("second update");
+        let read: Vec<_> = catalog_columns_to_collection_schema_columns(&schema.columns)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            read,
+            vec!["notes".to_string()],
+            "the old `embedding` declaration is gone"
+        );
+    }
+
+    #[test]
+    fn duplicate_declarations_are_rejected() {
+        let mut schema = reserved_band_dim3_with_rank();
+        let err = merge_canonical_band(
+            &mut schema,
+            collection_schema_columns_to_catalog_columns(&[
+                canonical("embedding", dense(3)),
+                canonical("embedding", dense(3)),
+            ]),
+        )
+        .expect_err("a column declared twice");
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn conflicting_embedding_dimension_is_rejected() {
+        let mut schema = reserved_band_dim3_with_rank();
+        let err = merge_canonical_band(
+            &mut schema,
+            collection_schema_columns_to_catalog_columns(&[canonical("embedding", dense(768))]),
+        )
+        .expect_err("a 768-dim embedding conflicts with a dim-3 collection");
+        assert!(err.to_string().contains("768"), "{err}");
+    }
+
+    #[test]
+    fn system_column_names_are_rejected() {
+        for name in [
+            "oid",
+            "tenant_id",
+            "props",
+            "created_at_ns",
+            "updated_at_ns",
+        ] {
+            let mut schema = reserved_band_dim3_with_rank();
+            let err = merge_canonical_band(
+                &mut schema,
+                collection_schema_columns_to_catalog_columns(&[canonical(
+                    name,
+                    ProximaType::String,
+                )]),
+            )
+            .expect_err("system column names cannot be redeclared");
+            assert!(err.to_string().contains("system column"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn declared_string_folds_into_a_string_filterable_column() {
+        // The gRPC create path declares filterable columns as String.
+        let mut schema = reserved_band_dim3_with_rank();
+        // `rank` is Int64-filterable; add a String filterable column to fold into.
+        schema
+            .columns
+            .push(CatalogColumn::new(101, "tag", ProximaType::String));
+        merge_canonical_band(
+            &mut schema,
+            collection_schema_columns_to_catalog_columns(&[canonical("tag", ProximaType::String)]),
+        )
+        .expect("String folds into a String filterable column");
+    }
+
+    #[test]
+    fn types_with_no_filterable_projection_are_rejected() {
+        for data_type in [
+            ProximaType::SparseVector {
+                element: proximadb_data_model::VectorElement::Float32,
+            },
+            ProximaType::Map {
+                key: Box::new(ProximaType::String),
+                value: Box::new(ProximaType::String),
+            },
+            ProximaType::Struct { fields: vec![] },
+        ] {
+            let mut schema = reserved_band_dim3_with_rank();
+            schema
+                .columns
+                .push(CatalogColumn::new(101, "tag", ProximaType::String));
+            let err = merge_canonical_band(
+                &mut schema,
+                collection_schema_columns_to_catalog_columns(&[canonical(
+                    "tag",
+                    data_type.clone(),
+                )]),
+            )
+            .expect_err("no filterable projection");
+            assert!(
+                err.to_string()
+                    .contains("cannot be stored in its filterable column"),
+                "{data_type:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_filterable_type_is_rejected() {
+        let mut schema = reserved_band_dim3_with_rank();
+        let err = merge_canonical_band(
+            &mut schema,
+            collection_schema_columns_to_catalog_columns(&[canonical("rank", ProximaType::String)]),
+        )
+        .expect_err("rank is Int64 in the filterable band");
+        assert!(err.to_string().contains("rank"), "{err}");
+    }
 
     fn doc_collection_with_filterable(name: &str, field: &str, document: bool) -> Collection {
         Collection {

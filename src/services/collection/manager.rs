@@ -2608,14 +2608,12 @@ impl CollectionService {
                 .properties
                 .get(crate::storage::metadata::collection_mapping::CANONICAL_SCHEMA_PROPERTY)
                 .cloned();
-            preserved_canonical_columns = existing
-                .columns
-                .iter()
-                .filter(|c| {
-                    c.id >= crate::storage::metadata::collection_mapping::CANONICAL_COLUMN_ID_BASE
-                })
-                .cloned()
-                .collect();
+            // TD-GRPCCREATE-1: include declarations folded into reserved columns,
+            // which the rebuild below would otherwise lose.
+            preserved_canonical_columns =
+                crate::storage::metadata::collection_mapping::declared_canonical_columns(
+                    &existing.columns,
+                );
             if existing
                 .properties
                 .get("asset.kind")
@@ -2648,12 +2646,24 @@ impl CollectionService {
                     existing.location = schema.location.clone();
                 }
 
+                // TD-GRPCCREATE-1: validate before the drop (see below).
+                proximadb_catalog::schema::normalize_identity(&mut existing);
+                proximadb_catalog::schema::validate_schema(&existing)?;
                 let _ = catalog.drop_table(&identifier, false).await?;
                 catalog.create_table(&identifier, existing).await?;
                 return Ok(());
             }
-
-            let _ = catalog.drop_table(&identifier, false).await?;
+        }
+        // TD-GRPCCREATE-1: the rebuilt reserved band can now hold a name the
+        // declared schema also has (a column turned filterable). Merge with the
+        // same rule as `set_collection_schema_columns`, and validate BEFORE
+        // dropping the existing table: a rejected schema must never cost the
+        // collection its table.
+        if !preserved_canonical_columns.is_empty() {
+            crate::storage::metadata::collection_mapping::merge_canonical_band(
+                &mut schema,
+                preserved_canonical_columns,
+            )?;
         }
         if let Some(canonical) = preserved_canonical_schema {
             schema.properties.insert(
@@ -2661,8 +2671,10 @@ impl CollectionService {
                 canonical,
             );
         }
-        if !preserved_canonical_columns.is_empty() {
-            schema.columns.extend(preserved_canonical_columns);
+        proximadb_catalog::schema::normalize_identity(&mut schema);
+        proximadb_catalog::schema::validate_schema(&schema)?;
+        if catalog.table_exists(&identifier).await? {
+            let _ = catalog.drop_table(&identifier, false).await?;
         }
         catalog.create_table(&identifier, schema).await?;
         Ok(())
@@ -4980,13 +4992,21 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         schema
             .properties
             .remove(crate::storage::metadata::collection_mapping::CANONICAL_SCHEMA_PROPERTY);
-        if !columns.is_empty() {
-            schema.columns.extend(
-                crate::storage::metadata::collection_mapping::collection_schema_columns_to_catalog_columns(
-                    columns,
-                ),
-            );
-        }
+        // TD-GRPCCREATE-1: a column that repeats a reserved column's name folds
+        // into it when compatible (recorded on the reserved column, so the typed
+        // columns stay the one authority) and is rejected otherwise. Runs even
+        // for an empty list, to clear earlier fold markers.
+        crate::storage::metadata::collection_mapping::merge_canonical_band(
+            &mut schema,
+            crate::storage::metadata::collection_mapping::collection_schema_columns_to_catalog_columns(
+                columns,
+            ),
+        )?;
+        // Validate before the drop, exactly as `create_table` will (normalize,
+        // then validate): the catalog has no atomic replace, so a schema it would
+        // reject must never cost the existing table (TD-GRPCCREATE-1).
+        proximadb_catalog::schema::normalize_identity(&mut schema);
+        proximadb_catalog::schema::validate_schema(&schema)?;
         let _ = catalog.drop_table(&identifier, false).await?;
         catalog.create_table(&identifier, schema).await?;
         Ok(())

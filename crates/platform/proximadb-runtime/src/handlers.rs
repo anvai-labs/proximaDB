@@ -380,7 +380,10 @@ fn filterable_type_to_proxima_type(value: i32) -> Option<ProximaType> {
     }
 }
 
-fn proxima_type_to_filterable_type(value: &ProximaType) -> Option<i32> {
+/// The v1 filterable type a canonical column narrows to (`None` when it has no
+/// filterable projection). Shared so the catalog can tell whether a declared
+/// column is compatible with the filterable column already stored for it.
+pub fn proxima_type_to_filterable_type(value: &ProximaType) -> Option<i32> {
     let data_type = match value {
         ProximaType::Int8 | ProximaType::Int16 | ProximaType::Int32 | ProximaType::Int64 => {
             FilterableDataType::FilterableInteger
