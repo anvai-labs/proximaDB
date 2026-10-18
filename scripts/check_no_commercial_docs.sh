@@ -19,7 +19,7 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 PATTERN='\$[0-9]+(\.[0-9]+)?[[:space:]]*(per[[:space:]]*)?(TB|GB|MB|hour|hr|node|month|mo|credit|DBU|query|index|replica)|\$[0-9]+(\.[0-9]+)?[[:space:]]*[KMB]\b'
 
 # Exclude: archives (deferred) + the mechanism/boundary docs that use $ as design rationale.
-ALLOWLIST='/docs/(_archive|_internal/archive)/|/docs/12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19\.adoc|/docs/12-design/OUTGRESS_KOU_MULTICLOUD_COST_MODEL_2026_06_21\.adoc|/docs/12-design/OSS_ENTERPRISE_BOUNDARY_2026_06_17\.adoc|/scripts/check_no_commercial_docs\.sh'
+ALLOWLIST='/docs/12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19\.adoc|/docs/12-design/OUTGRESS_KOU_MULTICLOUD_COST_MODEL_2026_06_21\.adoc|/docs/12-design/OSS_ENTERPRISE_BOUNDARY_2026_06_17\.adoc|/scripts/check_no_commercial_docs\.sh'
 
 mapfile -t HITS < <(grep -rniE "$PATTERN" --include='*.adoc' --include='*.md' "$ROOT/docs" 2>/dev/null \
   | grep -vE "$ALLOWLIST" || true)

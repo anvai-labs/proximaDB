@@ -431,8 +431,7 @@ if len(vector) != dimension:
 
 ### Documentation
 - **Main Docs**: `/docs/`
-- **API Reference**: `/docs/reference/rest-api-specification.adoc`
-- **Performance Guide**: `/docs/performance/README.adoc`
+- **API Reference**: `docs/03-api-reference/index.md`
 
 ### Issues
 - Found a bug? [Report it](https://github.com/anvai-labs/proximaDB/issues)

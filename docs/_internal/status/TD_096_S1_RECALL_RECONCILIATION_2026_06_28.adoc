@@ -123,7 +123,7 @@ production-cloud-I/O measurement (the co-design dominant cost) require a
 **networked, spilled corpus** deployment — the embedded bench is structurally
 in-memory and cannot produce that evidence. The full first-principles resolution
 (workload → format → cost, the flag/io-trace substrate, the decision loop) is in
-link:STORAGE_FORMAT_DECISION_FRAMEWORK_2026_06_29.adoc[the Storage-Format
+link:../../12-design/STORAGE_FORMAT_DECISION_FRAMEWORK_2026_06_29.adoc[the Storage-Format
 Decision Framework].
 
 **Latent issue (separate, tracked in the framework doc):** AXIS Stage-2 returns 0
@@ -148,7 +148,7 @@ ANN-vs-scan I/O comparison; own investigation/PR.
   2 GETs @10K, 6 @100K). S2 latency/GET route-disclosure is **not justified for
   the warm path**; a meaningful SST-vs-HELIX + production-cloud comparison needs
   a networked/spilled corpus (the embedded bench is structurally in-memory). See
-  link:STORAGE_FORMAT_DECISION_FRAMEWORK_2026_06_29.adoc[the Storage-Format
+  link:../../12-design/STORAGE_FORMAT_DECISION_FRAMEWORK_2026_06_29.adoc[the Storage-Format
   Decision Framework] for the full data-driven resolution.
 
 == Provenance

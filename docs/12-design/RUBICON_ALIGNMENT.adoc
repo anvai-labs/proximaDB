@@ -429,7 +429,7 @@ adjacent literature touches on them:
 . arXiv:2604.21413 — Wenz, Treutwein, Arenja, Demiralp, Stonebraker
   2026, "An Alternate Agentic AI Architecture (It's About the Data)".
 . `docs/10-quality/TECHNICAL_DEBT.adoc` TD-050.
-. `PROXIMADB_RECOMMENDATIONS.md` §4.1.
+. `PROXIMADB_RECOMMENDATIONS.md` §4.1 (removed; in git history).
 . `src/query/unified/mod.rs` — existing federated query engine.
 . `src/query/unified/optimizer.rs` — `OptimizedPlan` shape.
 . `src/storage/engines/impls/eventlog/` — TD-010 event sourcing

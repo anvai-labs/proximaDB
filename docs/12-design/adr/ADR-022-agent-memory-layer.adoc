@@ -39,7 +39,7 @@ already ships the substrate an agent-memory layer needs:
 |===
 | Agent-memory primitive | Existing ProximaDB surface
 
-| Auditable retrieval / provenance | AQL + RUBICON audit trails — `src/query/aql/` (TD-050), `RUBICON_ALIGNMENT.adoc`
+| Auditable retrieval / provenance | AQL + RUBICON audit trails — `src/query/aql/` (TD-050), `docs/12-design/RUBICON_ALIGNMENT.adoc`
 | Salience / re-ranking | RERANK SRF — `crates/modalities/proximadb-rank-{core,features,onnx,profile,expr}`, `ProductionHybridBackend`
 | Entity-linking / graph memory | Graph RAG (RGL) + ORION — `src/graph/rag/` (TD-045)
 | Hybrid retrieval (semantic + lexical) | RRF + 11 fusion strategies — `src/core/search/hybrid/fusion.rs`; BM25 leg `crates/modalities/proximadb-rank-features/src/bm25.rs`

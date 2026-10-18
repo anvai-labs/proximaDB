@@ -14,6 +14,7 @@
 
 == 1. How the corpus is organised now
 
+* **2026-10-17 prune.** About 340 superseded or historical files were deleted rather than archived. That covers the `docs/_archive/` and `docs/_internal/archive/` trees, `docs/09-roadmap/`, the 2025 quarterly plans, completed-phase guides, old specifications, the stale feature dashboard and execution tracker, the superseded design-status index, the concept-level vision, the redundant `docs/INDEX.adoc`, orphan images and unused doc scripts. Git history keeps them. No file under `12-design/adr/`, `10-quality/td/` or `roadmap/techdebt/` was removed, and no dated `_internal/status/` record. An archived ADR-001 copy, an archived copy of the register and an uncited TD-007 plan note went with the archives. There is now one authority per question (see `docs/README.md`): the support contract, the vision, the roadmap, the system map, this ledger and the evidence ledger. Broken internal links went from 120 to 0.
 * **DONE / SUPERSEDED documents** have been compacted in place to a short `== History` record: what shipped, the decisive finding or lesson, and the PRs. Every file and ID was kept: about 254 TD ids are cited from code, and git history holds the full original text.
 * **PARTIAL documents** carry a `== History (shipped)` section for the done slices. Every open slice, gate and nuance is kept verbatim.
 * **OPEN / PROPOSED documents** are unchanged in substance. Only literal duplication was replaced by cross-links.
@@ -78,7 +79,7 @@ ADRs: 12 implemented, 3 superseded (ADR-008, ADR-031, ADR-057); the rest are acc
 | God-crate decomposition program | P2_GOD_CRATE_TEST_DECOMPOSITION (rationale + lessons) | TD-DECOMP-*, ROOT_CRATE_* plans
 | MLflow / model registry | XCATALOG_MLOPS_MODEL_REGISTRY | TD-MLOPS-*, MODEL_INPUT_CONTRACT
 | Vision | 00-product/VISION | 05-concepts/vision (superseded; keeps its unique sections)
-| Roadmap | STRATEGIC_ROADMAP | CURRENT_ROADMAP (superseded), VISION_SPRINT_ROADMAP
+| Roadmap | STRATEGIC_ROADMAP | (CURRENT_ROADMAP and VISION_SPRINT_ROADMAP removed 2026-10-17)
 |===
 
 == 5. Governance decisions the reconciliation surfaced

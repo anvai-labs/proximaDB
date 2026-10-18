@@ -9,7 +9,7 @@ flowchart LR
   C --> Q[":5433<br/>Postgres wire"]
   P --> R{Query router}
   Q --> R
-  R -->|vector / ANN| V[SST · HELIX · NOVA · VIPER]
+  R -->|vector / ANN| V["SST · HELIX · NOVA<br/>(VIPER: deprecated, existing collections only)"]
   R -->|relational / OLAP| D[DataFusion over Parquet]
   R -->|graph| G[ORION]
   V --> S[(Object storage)]

@@ -555,6 +555,6 @@ organization-wide adoption.
 
 _Last Updated_: October 2026 (horizon reconciliation only; vision text unchanged since June 2026)
 
-_Supersedes_: `docs/05-concepts/vision.adoc` (retained as historical context; its unique sections —
+_Supersedes_: the earlier concept-level vision (`docs/05-concepts/vision.adoc`, removed 2026-10-17 and kept in git history; its unique sections —
 executive one-pager, builder quickstart code, architecture approach, use-case portfolio,
 exploration prompts — are not duplicated here)

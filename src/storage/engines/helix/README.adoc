@@ -1149,7 +1149,7 @@ pca_retrain_interval_hours = 48     # Less frequent training
 
 == Future Enhancements
 
-**Planned Features** (see link:../../../../docs/09-roadmap/[Roadmap]):
+**Planned Features** (see link:../../../../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[Roadmap]):
 
 * **Multi-Resolution Hilbert Curves**: Adaptive resolution based on data density
 * **Online PCA Updates**: Incremental PCA without full retraining
@@ -1171,7 +1171,7 @@ pca_retrain_interval_hours = 48     # Less frequent training
 
 * HELIX Engine Deep Dive (to be created)
 * Storage Engines Overview
-* link:../../../../docs/09-roadmap/implementation/[Implementation Guides]
+* link:../../../../docs/12-design/README.adoc[Design index]
 * Performance Documentation
 
 **Academic Papers**:

@@ -9,7 +9,7 @@ Client -> [5678 REST/gRPC/Flight | 5433 pgwire | MCP] -> MultiServer -> Database
    SQL / query  ------> |  ComputeScheduler     | --parquet--> DataFusion (OLAP)
                         |  route_select()       |
                         +-----------------------+ --native---> Volcano (OLTP floor)
-                                                   --vector---> SST/HELIX/NOVA/VIPER
+                                                   --vector---> SST/HELIX/NOVA (+ VIPER, deprecated: existing collections only)
 ```
 ```
 UPSERT -> DmlService -> CanonicalWal -> [durable ACK]
