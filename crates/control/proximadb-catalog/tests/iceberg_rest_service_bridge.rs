@@ -86,4 +86,26 @@ async fn ensure_table_metadata_materializes_history_from_manifest_log() {
         .expect("ensure 2");
     assert_eq!(md2.snapshots.len(), 3);
     assert_eq!(md2.current_snapshot_id, md.current_snapshot_id);
+
+    // Another table recorded at the same location is served its own metadata,
+    // never the first table's.
+    let mut other_schema = CatalogTableSchema::new("other")
+        .with_column(CatalogColumn::new(1, "id", ProximaType::String))
+        .with_primary_key(vec!["id".to_string()]);
+    other_schema.location = Some(base.to_string());
+    let other_id = TableIdentifier::new(vec!["default".to_string()], "other".to_string());
+    let (other_md, other_location) = svc
+        .ensure_table_metadata(&other_id, &other_schema)
+        .await
+        .expect("ensure other");
+    assert_ne!(other_md.table_uuid, md.table_uuid);
+    assert!(
+        other_location.contains("/tables/other/"),
+        "{other_location}"
+    );
+    let (again, _) = svc
+        .ensure_table_metadata(&id, &schema)
+        .await
+        .expect("ensure 3");
+    assert_eq!(again.table_uuid, md.table_uuid);
 }

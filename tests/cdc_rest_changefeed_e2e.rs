@@ -50,6 +50,9 @@ impl Server {
             url: format!("file://{}", tmp.path().display()),
             ..Default::default()
         }];
+        // Anchor the system catalog to this test's directory (a CWD-relative
+        // default would share it with other runs).
+        config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}/wal", tmp.path().display());
         let mut db = ProximaDB::new(config).await?;

@@ -133,6 +133,58 @@ mod tests {
         ),
     ];
 
+    /// Direct catalog access (`CatalogManager::default_catalog`) bypasses the
+    /// tenant-scoped resolver. Every use is listed; request-facing ones state how
+    /// they scope to the request tenant.
+    const ALLOWED_DEFAULT_CATALOG: &[(&str, usize, &str)] = &[
+        (
+            "crates/control/proximadb-catalog/src/iceberg_rest_service.rs",
+            14,
+            "Iceberg REST: every method maps the namespace into the request tenant's \
+             (scoped_namespace) and checks visibility (visible_entry) before use",
+        ),
+        (
+            "crates/control/proximadb-catalog/src/manager.rs",
+            4,
+            "the resolver itself",
+        ),
+        (
+            "crates/control/proximadb-catalog/src/model_registry_service.rs",
+            1,
+            "model registry service owns tenant scoping of its own documents",
+        ),
+        ("src/catalog/mod.rs", 7, "unit tests"),
+        (
+            "src/cluster/primary_pod_registry.rs",
+            5,
+            "operator-only placement registry (internal)",
+        ),
+        ("src/database.rs", 2, "startup wiring"),
+        (
+            "src/network/rest/canonical/primary_pod.rs",
+            6,
+            "operator-only API (authorize_operator) over all tenants' placement, by design",
+        ),
+        ("src/network/shared_services.rs", 2, "startup wiring"),
+        (
+            "src/services/collection/manager.rs",
+            16,
+            "collection writer/reader internals; request paths apply the ownership rule",
+        ),
+        (
+            "src/services/ddl/mod.rs",
+            4,
+            "namespace DDL scoped via tenant_scoped_namespace, and unit tests",
+        ),
+        ("src/services/discovery/executor.rs", 1, "unit test"),
+        ("src/services/snapshot/coordinator.rs", 1, "unit test"),
+        (
+            "src/storage/persistence/write_ahead_log/mod.rs",
+            2,
+            "internal WAL/recovery catalog walk",
+        ),
+    ];
+
     fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
@@ -315,5 +367,13 @@ mod tests {
     #[test]
     fn unscoped_table_resolutions_are_all_listed() {
         check(&format!(".resolve_{}(", "table"), ALLOWED_UNSCOPED_RESOLVE);
+    }
+
+    #[test]
+    fn direct_default_catalog_access_is_all_listed() {
+        check(
+            &format!(".default_{}()", "catalog"),
+            ALLOWED_DEFAULT_CATALOG,
+        );
     }
 }

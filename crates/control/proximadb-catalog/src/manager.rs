@@ -770,6 +770,7 @@ impl CatalogManager {
             );
         }
         let (catalog, id) = self.resolve_table(fqn).await?;
+        let base_id = id.clone();
         let id = match tenant {
             Some(tenant) if !tenant.is_empty() => {
                 if id
@@ -806,8 +807,41 @@ impl CatalogManager {
                 return Ok((catalog, declared));
             }
         }
+        // A collection's catalog entry is recorded under the unprefixed
+        // identifier; a tenant whose own namespace has no entry of that name
+        // resolves to it when — and only when — it records a collection visible
+        // to the tenant (its owner).
+        if id != base_id
+            && !catalog.table_exists(&id).await.unwrap_or(false)
+            && Self::records_collection_visible_to(catalog.as_ref(), &base_id, tenant).await
+        {
+            return Ok((catalog, base_id));
+        }
         Self::ensure_visible_to(catalog.as_ref(), &id, fqn, tenant).await?;
         Ok((catalog, id))
+    }
+
+    /// Whether `id` exists and records a collection visible to `tenant`.
+    async fn records_collection_visible_to(
+        catalog: &dyn Catalog,
+        id: &TableIdentifier,
+        tenant: Option<&str>,
+    ) -> bool {
+        let Some(tenant) = tenant.filter(|tenant| !tenant.is_empty()) else {
+            return false;
+        };
+        if !catalog.table_exists(id).await.unwrap_or(false) {
+            return false;
+        }
+        let Ok(schema) = catalog.get_table(id).await else {
+            return false;
+        };
+        schema.properties.contains_key("collection.id")
+            && proximadb_tenant::collection_entry_visible_to(
+                schema.properties.get("owner").map(String::as_str),
+                schema.properties.get("tags").map(String::as_str),
+                Some(tenant),
+            )
     }
 
     /// A request acting as `tenant` resolves a catalog entry that records a

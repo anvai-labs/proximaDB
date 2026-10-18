@@ -4155,6 +4155,31 @@ impl DmlService {
         where_clause: Option<WhereClause>,
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
+        self.execute_delete_rows(table_name, where_clause, false, tenant_context)
+            .await
+    }
+
+    /// `TRUNCATE`: delete every row of `table_name`, resolved within
+    /// `tenant_context`, through the same path (locks, referential actions,
+    /// tombstones, statistics) as a DELETE.
+    pub async fn truncate_table(
+        &self,
+        table_name: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<DmlResult> {
+        self.execute_delete_rows(table_name, None, true, tenant_context)
+            .await
+    }
+
+    /// DELETE rows matching `where_clause`, or — only when `all_rows` is set
+    /// (TRUNCATE) — every row. A DELETE with neither is refused.
+    async fn execute_delete_rows(
+        &self,
+        table_name: &str,
+        where_clause: Option<WhereClause>,
+        all_rows: bool,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<DmlResult> {
         let (catalog, table_id) = self
             .catalog_manager
             .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
@@ -4174,6 +4199,26 @@ impl DmlService {
         let ids_to_delete = if let Some(ref wc) = where_clause {
             self.resolve_matching_ids(&table_schema, &table_id.name, wc, tenant_context)
                 .await?
+        } else if all_rows {
+            self.record_store
+                .scan_records_filtered(
+                    &table_schema,
+                    TableRecordScanRequest {
+                        filter: None,
+                        table_id: table_id.name.clone(),
+                        limit: None,
+                        include_vector: false,
+                        include_props: false,
+                    },
+                    None,
+                    tenant_context,
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(SystemReadReason::Statistics, "dml truncate"),
+                )
+                .await?
+                .into_iter()
+                .map(|record| record.oid)
+                .collect()
         } else {
             return Err(anyhow!(
                 "DELETE without WHERE clause is not allowed. Use WHERE primary key IN (...) to delete specific rows."

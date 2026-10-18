@@ -2916,6 +2916,13 @@ mod tests {
                 "props_auto_promotion",
                 "disabled",
             ),
+            // A quoted key names the property itself, without its quotes.
+            (
+                "ALTER TABLE logs SET (\"Collection.Id\" = '7')",
+                "logs",
+                "Collection.Id",
+                "7",
+            ),
         ];
 
         for (sql, expected_table, expected_key, expected_value) in cases {
@@ -3328,8 +3335,11 @@ impl SqlFrontendParser {
                                         },
                                         other => format!("{other}"),
                                     };
+                                    // The identifier's value (quotes removed), so a
+                                    // quoted key names the same property as an
+                                    // unquoted one.
                                     changes.push(AlterTableChange::SetTableOption {
-                                        key: key.to_string(),
+                                        key: key.value.clone(),
                                         value: value_str,
                                     });
                                 }

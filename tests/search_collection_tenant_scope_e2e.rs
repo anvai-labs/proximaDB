@@ -2117,3 +2117,242 @@ async fn catalog_entries_introspection_and_lifecycle_are_tenant_scoped() {
         failures.join("\n  ")
     );
 }
+
+/// The Iceberg REST catalog lists and resolves only the request tenant's
+/// namespaces and tables (another tenant's read like missing ones) and never
+/// drops a collection's entry; table properties set by ALTER cannot be
+/// reserved keys; TRUNCATE empties the tenant's own table; a named tenant
+/// reaches its own collection over SQL; and a default-tenant table keeps its
+/// columns and rows across a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn iceberg_catalog_alter_truncate_and_restart_are_tenant_scoped() {
+    let server = Server::start().await.expect("server start");
+    let rest_for = |server: &Server| Rest {
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .expect("http client"),
+        base: format!("http://127.0.0.1:{}", server.rest_port),
+    };
+    let rest = rest_for(&server);
+    rest.create(Some(GLOBEX), GLOBEX_DOCS).await;
+    rest.insert(Some(GLOBEX), GLOBEX_DOCS, GLOBEX).await;
+    let pg = |server: &Server, database: &'static str| {
+        let conn = format!(
+            "host=127.0.0.1 port={} user=postgres dbname={database} sslmode=disable",
+            server.pg_port
+        );
+        async move {
+            let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+                .await
+                .expect("pgwire connect");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+        }
+    };
+    let globex_pg = pg(&server, GLOBEX).await;
+    for sql in [
+        "CREATE TABLE gx_orders (id INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO gx_orders (id, note) VALUES (1, 'globex-row')",
+    ] {
+        globex_pg.simple_query(sql).await.expect("globex pgwire");
+    }
+    sleep(Duration::from_millis(300)).await;
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- Iceberg REST catalog as acme.
+    let ice = "/iceberg/v1/namespaces";
+    let (status, body) = rest.call(Some(ACME), reqwest::Method::GET, ice, None).await;
+    if body.contains(GLOBEX) {
+        failures.push(format!("iceberg namespaces as acme: {status} {body}"));
+    }
+    for (label, method, foreign, missing) in [
+        (
+            "list tables",
+            reqwest::Method::GET,
+            format!("{ice}/{GLOBEX}%1Fdefault/tables"),
+            format!("{ice}/nosuchns%1Fdefault/tables"),
+        ),
+        (
+            "load table",
+            reqwest::Method::GET,
+            format!("{ice}/{GLOBEX}%1Fdefault/tables/gx_orders"),
+            format!("{ice}/{GLOBEX}%1Fdefault/tables/missing_orders"),
+        ),
+        (
+            "load collection entry",
+            reqwest::Method::GET,
+            format!("{ice}/default/tables/{GLOBEX_DOCS}"),
+            format!("{ice}/default/tables/{MISSING_DOCS}"),
+        ),
+        (
+            "drop table",
+            reqwest::Method::DELETE,
+            format!("{ice}/{GLOBEX}%1Fdefault/tables/gx_orders"),
+            format!("{ice}/{GLOBEX}%1Fdefault/tables/missing_orders"),
+        ),
+        (
+            "drop collection entry",
+            reqwest::Method::DELETE,
+            format!("{ice}/default/tables/{GLOBEX_DOCS}"),
+            format!("{ice}/default/tables/{MISSING_DOCS}"),
+        ),
+    ] {
+        let foreign_seen = rest.call(Some(ACME), method.clone(), &foreign, None).await;
+        let missing_seen = rest.call(Some(ACME), method.clone(), &missing, None).await;
+        if foreign_seen.0 != missing_seen.0 || foreign_seen.0.is_success() {
+            failures.push(format!(
+                "iceberg {label} as acme: foreign {} {} vs missing {} {}",
+                foreign_seen.0, foreign_seen.1, missing_seen.0, missing_seen.1
+            ));
+        }
+        if foreign_seen.1.contains("globex-row") || foreign_seen.1.contains("tenant:") {
+            failures.push(format!(
+                "iceberg {label} as acme exposed: {}",
+                foreign_seen.1
+            ));
+        }
+    }
+    // The owner cannot drop its collection's entry through this API either.
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::DELETE,
+            &format!("{ice}/default/tables/{GLOBEX_DOCS}"),
+            None,
+        )
+        .await;
+    if status.is_success() {
+        failures.push(format!(
+            "iceberg dropped a collection entry: {status} {body}"
+        ));
+    }
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::GET,
+            &format!("/api/v2/collections/{GLOBEX_DOCS}"),
+            None,
+        )
+        .await;
+    if !status.is_success() {
+        failures.push(format!(
+            "globex collection after iceberg probes: {status} {body}"
+        ));
+    }
+    let rows = globex_pg
+        .simple_query("SELECT note FROM gx_orders")
+        .await
+        .map(|messages| format!("{messages:?}"))
+        .unwrap_or_else(|error| format!("error: {error}"));
+    if !rows.contains("globex-row") {
+        failures.push(format!("globex table after iceberg probes: {rows}"));
+    }
+
+    // --- ALTER TABLE cannot set reserved table properties, quoted or not.
+    let default_pg = pg(&server, "default").await;
+    for sql in [
+        "CREATE TABLE orders_d (id BIGINT PRIMARY KEY, note VARCHAR)",
+        "INSERT INTO orders_d (id, note) VALUES (1, 'first'), (2, 'second')",
+    ] {
+        default_pg.simple_query(sql).await.expect("default pgwire");
+    }
+    for option in [
+        "owner = 'x'",
+        "\"Tags\" = 'x'",
+        "\"collection.id\" = '1'",
+        "OWNER = 'x'",
+    ] {
+        if default_pg
+            .simple_query(&format!("ALTER TABLE orders_d SET ({option})"))
+            .await
+            .is_ok()
+        {
+            failures.push(format!("ALTER TABLE SET ({option}) accepted"));
+        }
+    }
+    if let Err(error) = default_pg
+        .simple_query("ALTER TABLE orders_d SET (custom_option = 'x')")
+        .await
+    {
+        failures.push(format!("ALTER TABLE SET of an ordinary option: {error}"));
+    }
+
+    // --- TRUNCATE empties the tenant's own table.
+    let acme_pg = pg(&server, ACME).await;
+    for sql in [
+        "CREATE TABLE ac_trunc (id INT PRIMARY KEY)",
+        "INSERT INTO ac_trunc (id) VALUES (1), (2)",
+    ] {
+        acme_pg.simple_query(sql).await.expect("acme pgwire");
+    }
+    match acme_pg.simple_query("TRUNCATE TABLE ac_trunc").await {
+        Ok(_) => {
+            let rows = acme_pg
+                .simple_query("SELECT id FROM ac_trunc")
+                .await
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+                        .count()
+                })
+                .unwrap_or(usize::MAX);
+            if rows != 0 {
+                failures.push(format!("TRUNCATE left {rows} row(s)"));
+            }
+        }
+        Err(error) => failures.push(format!("TRUNCATE of own table failed: {error}")),
+    }
+
+    // --- A named tenant reaches its own collection over SQL; others cannot.
+    rest.create(Some(ACME), "acme_vec").await;
+    rest.insert(Some(ACME), "acme_vec", ACME).await;
+    sleep(Duration::from_millis(300)).await;
+    if let Err(error) = acme_pg.simple_query("SELECT oid FROM acme_vec").await {
+        failures.push(format!("acme SQL on its own collection: {error}"));
+    }
+    let foreign = pg_outcome(&globex_pg, "SELECT oid FROM acme_vec", "acme_vec").await;
+    let missing = pg_outcome(&globex_pg, "SELECT oid FROM missing_vec", "missing_vec").await;
+    if foreign != missing {
+        failures.push(format!(
+            "globex SQL on acme's collection: {foreign:?} vs missing {missing:?}"
+        ));
+    }
+
+    // --- A default-tenant table keeps its columns and rows across a restart.
+    drop(globex_pg);
+    drop(acme_pg);
+    drop(default_pg);
+    let server = server.restart().await.expect("restart");
+    let default_pg = pg(&server, "default").await;
+    let rows = default_pg
+        .simple_query("SELECT id, note FROM orders_d")
+        .await
+        .map(|messages| format!("{messages:?}"))
+        .unwrap_or_else(|error| format!("error: {error}"));
+    if !rows.contains("first") || !rows.contains("second") {
+        failures.push(format!("default-tenant table after restart: {rows}"));
+    }
+    let rest = rest_for(&server);
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::GET,
+            &format!("/api/v2/collections/{GLOBEX_DOCS}"),
+            None,
+        )
+        .await;
+    if !status.is_success() {
+        failures.push(format!("globex collection after restart: {status} {body}"));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "iceberg catalog, ALTER, TRUNCATE and restart must be tenant-scoped:\n  {}",
+        failures.join("\n  ")
+    );
+}

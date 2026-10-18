@@ -1317,8 +1317,15 @@ impl ProximaDB {
 
         if let Some(planner) = query::rl_planner::get_rl_planner() {
             if std::path::Path::new(&policy_path).exists() {
-                planner.load_policy(&policy_path).await?;
-                tracing::info!("✅ RL policy loaded from {}", policy_path);
+                // A learned policy is a cache: an unreadable one never blocks startup.
+                match planner.load_policy(&policy_path).await {
+                    Ok(()) => tracing::info!("✅ RL policy loaded from {}", policy_path),
+                    Err(error) => tracing::warn!(
+                        path = %policy_path,
+                        %error,
+                        "RL policy could not be loaded; starting with a fresh policy"
+                    ),
+                }
             }
 
             let checkpoint_path = policy_path.clone();

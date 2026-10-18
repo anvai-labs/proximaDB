@@ -5777,14 +5777,7 @@ impl PostgresProtocol {
         }
         let tenant_ctx = crate::storage::tenant::context::TenantContext::for_tenant_id(&tenant);
         for table in tables {
-            let statement = crate::services::DmlStatement::Delete {
-                table_name: table.clone(),
-                where_clause: None,
-            };
-            if let Err(error) = dml_service
-                .execute_scoped(statement, Some(&tenant_ctx))
-                .await
-            {
+            if let Err(error) = dml_service.truncate_table(table, Some(&tenant_ctx)).await {
                 return self
                     .send_error("ERROR", "XX000", &format!("TRUNCATE failed: {error}"))
                     .await;

@@ -553,13 +553,73 @@ impl CollectionService {
         };
         proximadb_tenant::stamp_collection_owner(config, tenant);
         let name = config.name.clone();
-        record.updated_at = chrono::Utc::now().timestamp_millis();
-        self.upsert_collection_catalog_asset(&record, None)
+        if !self
+            .write_owner_metadata_in_place(&record)
             .await
-            .context("Failed to record collection owner")?;
+            .context("Failed to record collection owner")?
+        {
+            return Ok(false);
+        }
         let _ = crate::catalog::CorpusVersionRegistry::global()
             .bump(Self::DEFAULT_VERSION_TENANT, &name)
             .await;
+        Ok(true)
+    }
+
+    /// Write `record`'s owner metadata (the `owner` and `tags` properties) onto
+    /// its existing catalog entry and change nothing else: columns, layouts,
+    /// identity and every other property stay as they are. Only an entry that
+    /// records exactly this collection is touched. Returns whether it wrote.
+    async fn write_owner_metadata_in_place(&self, record: &Collection) -> Result<bool> {
+        let (Some(catalog_manager), Some(config)) = (&self.catalog_manager, record.config.as_ref())
+        else {
+            return Ok(false);
+        };
+        let catalog = catalog_manager.default_catalog().await?;
+        let identifier = Self::tenant_scoped_identifier(
+            self.tenant_namespaces_on(),
+            Self::collection_tenant_id(record).as_deref(),
+            crate::storage::metadata::collection_mapping::collection_table_identifier(config),
+        );
+        if !catalog.table_exists(&identifier).await? {
+            return Ok(false);
+        }
+        let mut schema = catalog.get_table(&identifier).await?;
+        if schema.properties.get("collection.id") != Some(&record.id) {
+            return Ok(false);
+        }
+        match &config.owner {
+            Some(owner) => {
+                schema.properties.insert("owner".to_string(), owner.clone());
+            }
+            None => {
+                schema.properties.remove("owner");
+            }
+        }
+        if config.tags.is_empty() {
+            schema.properties.remove("tags");
+        } else {
+            schema
+                .properties
+                .insert("tags".to_string(), config.tags.join(","));
+        }
+        // The full config is also recorded as JSON (the reader restores it from
+        // there); carry the same two fields into it and nothing else.
+        if let Some(json) = schema.properties.get("collection.config_json")
+            && let Ok(mut full) =
+                serde_json::from_str::<crate::proto::proximadb_v1::CollectionConfig>(json)
+        {
+            full.owner = config.owner.clone();
+            full.tags = config.tags.clone();
+            schema.properties.insert(
+                "collection.config_json".to_string(),
+                serde_json::to_string(&full).context("serializing collection config")?,
+            );
+        }
+        // No in-place update on the catalog trait: replace the entry with the
+        // same schema (the established drop+create pattern).
+        let _ = catalog.drop_table(&identifier, false).await?;
+        catalog.create_table(&identifier, schema).await?;
         Ok(true)
     }
 
@@ -585,8 +645,7 @@ impl CollectionService {
         }
         config.tags.push(marker.to_string());
         let name = config.name.clone();
-        record.updated_at = chrono::Utc::now().timestamp_millis();
-        self.upsert_collection_catalog_asset(&record, None)
+        self.write_owner_metadata_in_place(&record)
             .await
             .context("Failed to record collection owner backfill outcome")?;
         let _ = crate::catalog::CorpusVersionRegistry::global()
