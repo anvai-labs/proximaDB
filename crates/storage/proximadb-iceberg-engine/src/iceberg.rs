@@ -49,7 +49,27 @@ const MANIFEST_SCHEMA_JSON: &str = r#"
           "type": "record", "name": "r102", "fields": []
         }},
         {"name": "record_count", "type": "long", "field-id": 103},
-        {"name": "file_size_in_bytes", "type": "long", "field-id": 104}
+        {"name": "file_size_in_bytes", "type": "long", "field-id": 104},
+        {"name": "column_sizes", "default": null, "field-id": 108, "type": ["null", {
+          "type": "array", "logicalType": "map", "items": {"type": "record", "name": "k117_v118",
+            "fields": [{"name": "key", "type": "int", "field-id": 117},
+                       {"name": "value", "type": "long", "field-id": 118}]}}]},
+        {"name": "value_counts", "default": null, "field-id": 109, "type": ["null", {
+          "type": "array", "logicalType": "map", "items": {"type": "record", "name": "k119_v120",
+            "fields": [{"name": "key", "type": "int", "field-id": 119},
+                       {"name": "value", "type": "long", "field-id": 120}]}}]},
+        {"name": "null_value_counts", "default": null, "field-id": 110, "type": ["null", {
+          "type": "array", "logicalType": "map", "items": {"type": "record", "name": "k121_v122",
+            "fields": [{"name": "key", "type": "int", "field-id": 121},
+                       {"name": "value", "type": "long", "field-id": 122}]}}]},
+        {"name": "lower_bounds", "default": null, "field-id": 125, "type": ["null", {
+          "type": "array", "logicalType": "map", "items": {"type": "record", "name": "k126_v127",
+            "fields": [{"name": "key", "type": "int", "field-id": 126},
+                       {"name": "value", "type": "bytes", "field-id": 127}]}}]},
+        {"name": "upper_bounds", "default": null, "field-id": 128, "type": ["null", {
+          "type": "array", "logicalType": "map", "items": {"type": "record", "name": "k129_v130",
+            "fields": [{"name": "key", "type": "int", "field-id": 129},
+                       {"name": "value", "type": "bytes", "field-id": 130}]}}]}
       ]
     }}
   ]
@@ -80,11 +100,29 @@ const MANIFEST_LIST_SCHEMA_JSON: &str = r#"
 "#;
 
 /// Public description of one data file in a snapshot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct DataFileMeta {
     pub file_path: String,
     pub record_count: i64,
     pub file_size_in_bytes: i64,
+    /// Per-column file statistics (Iceberg `column_sizes` / `value_counts` /
+    /// `null_value_counts` / `lower_bounds` / `upper_bounds`), keyed by field id.
+    /// External engines prune whole data files with these at planning time,
+    /// before opening any Parquet footer.
+    pub column_stats: Vec<ColumnFileStats>,
+}
+
+/// Iceberg per-column metrics for one data file. Bounds use the spec's
+/// single-value binary serialization (see [`crate::iceberg::bound_bytes`]
+/// callers in the bridge); `None` = unknown (never prunes).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ColumnFileStats {
+    pub field_id: i32,
+    pub column_size: Option<i64>,
+    pub value_count: Option<i64>,
+    pub null_value_count: Option<i64>,
+    pub lower_bound: Option<Vec<u8>>,
+    pub upper_bound: Option<Vec<u8>>,
 }
 
 /// Public description of one manifest in a manifest list.
@@ -101,6 +139,53 @@ pub struct ManifestFileMeta {
 #[derive(Serialize, Deserialize)]
 struct AvroPartition {}
 
+/// `bytes` (de)serialization for Avro: serde's default `Vec<u8>` is a sequence,
+/// which Avro would encode as `array<int>`, not `bytes`.
+mod avro_bytes {
+    use serde::{Deserializer, Serializer, de};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> de::Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("bytes")
+            }
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(v)
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut out = Vec::new();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_bytes(V)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct AvroIntLong {
+    key: i32,
+    value: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AvroIntBytes {
+    key: i32,
+    #[serde(with = "avro_bytes")]
+    value: Vec<u8>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct AvroDataFile {
     content: i32,
@@ -109,6 +194,75 @@ struct AvroDataFile {
     partition: AvroPartition,
     record_count: i64,
     file_size_in_bytes: i64,
+    #[serde(default)]
+    column_sizes: Option<Vec<AvroIntLong>>,
+    #[serde(default)]
+    value_counts: Option<Vec<AvroIntLong>>,
+    #[serde(default)]
+    null_value_counts: Option<Vec<AvroIntLong>>,
+    #[serde(default)]
+    lower_bounds: Option<Vec<AvroIntBytes>>,
+    #[serde(default)]
+    upper_bounds: Option<Vec<AvroIntBytes>>,
+}
+
+fn long_map(
+    stats: &[ColumnFileStats],
+    pick: impl Fn(&ColumnFileStats) -> Option<i64>,
+) -> Option<Vec<AvroIntLong>> {
+    let v: Vec<AvroIntLong> = stats
+        .iter()
+        .filter_map(|c| {
+            pick(c).map(|value| AvroIntLong {
+                key: c.field_id,
+                value,
+            })
+        })
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+fn bytes_map(
+    stats: &[ColumnFileStats],
+    pick: impl Fn(&ColumnFileStats) -> Option<&Vec<u8>>,
+) -> Option<Vec<AvroIntBytes>> {
+    let v: Vec<AvroIntBytes> = stats
+        .iter()
+        .filter_map(|c| {
+            pick(c).map(|value| AvroIntBytes {
+                key: c.field_id,
+                value: value.clone(),
+            })
+        })
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+fn stats_from_avro(f: &AvroDataFile) -> Vec<ColumnFileStats> {
+    use std::collections::BTreeMap;
+    fn get(out: &mut BTreeMap<i32, ColumnFileStats>, id: i32) -> &mut ColumnFileStats {
+        out.entry(id).or_insert_with(|| ColumnFileStats {
+            field_id: id,
+            ..Default::default()
+        })
+    }
+    let mut out: BTreeMap<i32, ColumnFileStats> = BTreeMap::new();
+    for kv in f.column_sizes.iter().flatten() {
+        get(&mut out, kv.key).column_size = Some(kv.value);
+    }
+    for kv in f.value_counts.iter().flatten() {
+        get(&mut out, kv.key).value_count = Some(kv.value);
+    }
+    for kv in f.null_value_counts.iter().flatten() {
+        get(&mut out, kv.key).null_value_count = Some(kv.value);
+    }
+    for kv in f.lower_bounds.iter().flatten() {
+        get(&mut out, kv.key).lower_bound = Some(kv.value.clone());
+    }
+    for kv in f.upper_bounds.iter().flatten() {
+        get(&mut out, kv.key).upper_bound = Some(kv.value.clone());
+    }
+    out.into_values().collect()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,6 +310,11 @@ pub fn write_manifest(files: &[DataFileMeta], snapshot_id: i64) -> Result<Vec<u8
                 partition: AvroPartition {},
                 record_count: f.record_count,
                 file_size_in_bytes: f.file_size_in_bytes,
+                column_sizes: long_map(&f.column_stats, |c| c.column_size),
+                value_counts: long_map(&f.column_stats, |c| c.value_count),
+                null_value_counts: long_map(&f.column_stats, |c| c.null_value_count),
+                lower_bounds: bytes_map(&f.column_stats, |c| c.lower_bound.as_ref()),
+                upper_bounds: bytes_map(&f.column_stats, |c| c.upper_bound.as_ref()),
             },
         };
         writer
@@ -182,10 +341,12 @@ pub fn read_manifest(bytes: &[u8]) -> Result<Vec<DataFileMeta>, StorageError> {
         if entry.status == 2 {
             continue;
         }
+        let column_stats = stats_from_avro(&entry.data_file);
         out.push(DataFileMeta {
             file_path: entry.data_file.file_path,
             record_count: entry.data_file.record_count,
             file_size_in_bytes: entry.data_file.file_size_in_bytes,
+            column_stats,
         });
     }
     Ok(out)
@@ -379,13 +540,44 @@ mod tests {
                 file_path: "data/t/ns/tbl/data/part-0.parquet".into(),
                 record_count: 100,
                 file_size_in_bytes: 4096,
+                ..Default::default()
             },
             DataFileMeta {
                 file_path: "data/t/ns/tbl/data/part-1.parquet".into(),
                 record_count: 50,
                 file_size_in_bytes: 2048,
+                ..Default::default()
             },
         ]
+    }
+
+    #[test]
+    fn manifest_round_trips_column_metrics() {
+        let mut f = files();
+        f[0].column_stats = vec![
+            ColumnFileStats {
+                field_id: 1,
+                column_size: Some(512),
+                value_count: Some(100),
+                null_value_count: Some(3),
+                lower_bound: Some(7i64.to_le_bytes().to_vec()),
+                upper_bound: Some(900i64.to_le_bytes().to_vec()),
+            },
+            ColumnFileStats {
+                field_id: 2,
+                column_size: Some(64),
+                value_count: Some(100),
+                null_value_count: Some(0),
+                lower_bound: Some(b"AL".to_vec()),
+                upper_bound: None,
+            },
+        ];
+        let bytes = write_manifest(&f, 42).unwrap();
+        let back = read_manifest(&bytes).unwrap();
+        assert_eq!(
+            back, f,
+            "metrics survive the Avro round trip; absent maps stay absent"
+        );
     }
 
     #[test]

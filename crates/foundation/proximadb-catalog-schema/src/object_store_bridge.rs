@@ -80,6 +80,28 @@ pub trait ObjectStoreBridge: Send + Sync {
             .await
     }
 
+    /// Schema-explicit Parquet write that also declares the physical layout the
+    /// caller produced: `sort_columns` names the columns `records` are already
+    /// sorted by (ascending, nulls last). Warehouse bridges record it as Parquet
+    /// `sorting_columns` and use it to shape page index / Bloom placement.
+    ///
+    /// Default: ignores the hint and falls back to
+    /// [`write_records_to_parquet_with_schema`].
+    ///
+    /// [`write_records_to_parquet_with_schema`]: ObjectStoreBridge::write_records_to_parquet_with_schema
+    async fn write_records_to_parquet_with_layout(
+        &self,
+        path: &Path,
+        records: &[ProximaRecord],
+        schema: &ProximaSchema,
+        sort_columns: &[String],
+        tenant_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let _ = sort_columns;
+        self.write_records_to_parquet_with_schema(path, records, schema, tenant_id)
+            .await
+    }
+
     /// Fetches a specialized PAX block or Segment (SST, HELIX, etc.) from object storage
     /// into memory for high-performance Vector SIMD scans.
     async fn fetch_vector_segment(
