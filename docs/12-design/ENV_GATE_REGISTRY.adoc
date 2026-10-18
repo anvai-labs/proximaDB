@@ -170,6 +170,7 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_METERING_FLUSH_INTERVAL_SECS` | Durable `_metering` sink flush cadence (seconds) | 3600 (1 h) | opt-in tuning; TD-161 | `src/database.rs`
 | `PROXIMADB_METERING_KSU_GAUGE_INTERVAL_SECS` | Prometheus resident-storage KSU gauge poll interval (seconds) | 300 (5 min) | opt-in tuning; ADR-030 | `src/database.rs`
 | `PROXIMADB_NATIVE_ALLOW_GROUPED_AGG` | Opts grouped-aggregate plans into native routing (else routed to DataFusion) | OFF (any value set ⇒ allow) | opt-in; TD-OLAP-11 | `src/network/postgres/relational_pipeline.rs`
+| `PROXIMADB_NATIVE_FILTERED_SCAN` | Let the native engine serve filtered single-table parquet scans (exact FilterProject + row-group/page pruning) instead of declining to DataFusion. | OFF (opt-in until ledger parity, ADR-054) | opt-in; TD-OLAPFMT-6 | `src/network/postgres/relational_pipeline.rs`
 | `PROXIMADB_NATIVE_JOIN` | Enables native hash-join operator path | OFF | opt-in; ADR-054/TD-OLAP-11 | `src/query/execution/native_engine.rs`
 | `PROXIMADB_NATIVE_JOIN_SHADOW` | Runs native join as a shadow probe alongside DataFusion (measurement only) | OFF | eval; TD-OLAP-11 | `src/query/execution/native_shadow.rs`
 | `PROXIMADB_NATIVE_MORSEL` | Enables TD-OLAP-12 morsel-parallel scheduler for native pipelines | OFF | opt-in; TD-OLAP-12 | `src/query/execution/native_engine.rs`

@@ -19,7 +19,12 @@
 //! consume `RecordBatch`es, so DataFusion is not required to read parquet.
 //!
 //! Streams row groups lazily (bounded memory — one decoded batch in flight),
-//! never materializing the whole file; row-group zone-map pruning is a follow-on.
+//! never materializing the whole file. With pushed-down predicates it applies
+//! the engine-neutral Parquet pruning ladder (TD-OLAPFMT-2) — row-group footer bounds, then the
+//! page index as a `RowSelection` — via the same
+//! `proximadb_storage_common::parquet_page_prune` functions the DataFusion
+//! provider uses, so both engines read the same bytes. Pruning is a superset
+//! filter: exact filtering stays in the downstream `FilterProject`.
 
 use std::sync::Arc;
 
@@ -29,6 +34,10 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
+use parquet::file::metadata::PageIndexPolicy;
+use proximadb_storage_common::format_splits::ScalarPredicate;
+use proximadb_storage_common::parquet_page_prune::{page_row_selection, row_group_prunable};
 // arrow-rs 59.2 deprecated ParquetObjectReader (wants direct AsyncFileReader impls,
 // apache/arrow-rs#10308). Contained here; the migration is a tracked follow-up.
 #[allow(deprecated)]
@@ -57,6 +66,60 @@ pub(crate) struct ParquetScanOperator {
     /// `row_group_index % n == lane_id` — the disjoint partition this lane owns.
     /// `None` reads every row-group (the serial default).
     lane: Option<(usize, usize)>,
+    /// Conjunctive pruning predicates (column, predicate) from the scan's pushed
+    /// WHERE clause. Empty = read every row group in full.
+    predicates: Vec<(String, ScalarPredicate)>,
+}
+
+/// Row groups to read and the row selection over them, after footer and
+/// page-index pruning. `selection == None` reads the chosen groups in full.
+struct PrunedPlan {
+    row_groups: Vec<usize>,
+    selection: Option<RowSelection>,
+}
+
+/// Apply the pruning ladder to one file's metadata: drop row groups whose footer
+/// bounds exclude the predicates, then build the page-index selection for the
+/// survivors (concatenated in row-group order, as `with_row_groups` expects).
+/// Records the outcome into the active `IoTrace`.
+fn prune_file(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    file_schema: &arrow_schema::Schema,
+    candidates: Vec<usize>,
+    predicates: &[(String, ScalarPredicate)],
+) -> PrunedPlan {
+    let total = candidates.len() as u64;
+    let row_groups: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&rg| !row_group_prunable(metadata, file_schema, rg, predicates))
+        .collect();
+    crate::observability::io_trace::record_splits(total, total - row_groups.len() as u64);
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut any_skip = false;
+    for &rg in &row_groups {
+        let outcome = page_row_selection(metadata, file_schema, rg, predicates);
+        crate::observability::io_trace::record_page_prune(
+            outcome.pages_total,
+            outcome.pages_pruned,
+            outcome.rows_skipped,
+        );
+        match outcome.selection {
+            Some(sel) => {
+                any_skip = true;
+                selectors.extend(Vec::<RowSelector>::from(sel));
+            }
+            None => {
+                let rows = metadata.row_group(rg).num_rows().max(0) as usize;
+                if rows > 0 {
+                    selectors.push(RowSelector::select(rows));
+                }
+            }
+        }
+    }
+    PrunedPlan {
+        row_groups,
+        selection: any_skip.then(|| RowSelection::from(selectors)),
+    }
 }
 
 impl ParquetScanOperator {
@@ -73,7 +136,15 @@ impl ParquetScanOperator {
             output_schema,
             count_only: false,
             lane: None,
+            predicates: Vec::new(),
         }
+    }
+
+    /// Push conjunctive pruning predicates into the scan (row-group + page-index
+    /// skipping). The caller must still filter rows exactly downstream.
+    pub(crate) fn with_predicates(mut self, predicates: Vec<(String, ScalarPredicate)>) -> Self {
+        self.predicates = predicates;
+        self
     }
 
     /// Footer-elision constructor for unfiltered `COUNT(*)`: reads only the parquet
@@ -92,6 +163,7 @@ impl ParquetScanOperator {
             output_schema: Arc::new(arrow_schema::Schema::empty()),
             count_only: true,
             lane: None,
+            predicates: Vec::new(),
         }
     }
 
@@ -105,6 +177,7 @@ impl ParquetScanOperator {
             output_schema: self.output_schema.clone(),
             count_only: self.count_only,
             lane: Some((lane_id, n)),
+            predicates: self.predicates.clone(),
         }
     }
 }
@@ -166,10 +239,12 @@ impl ExecutionOperator for ParquetScanOperator {
         let store = self.store.clone();
         let projection = self.projection.clone();
         let lane = self.lane;
+        let predicates = Arc::new(self.predicates.clone());
         let stream = futures::stream::iter(self.files.clone().into_iter().map(Ok))
             .and_then(move |(path, size)| {
                 let store = store.clone();
                 let projection = projection.clone();
+                let predicates = predicates.clone();
                 async move {
                     // arrow-rs 59.2 deprecated ParquetObjectReader (wants direct AsyncFileReader impls,
                     // apache/arrow-rs#10308). Contained here; the migration is a tracked follow-up.
@@ -178,8 +253,15 @@ impl ExecutionOperator for ParquetScanOperator {
                     if let Some(sz) = size {
                         reader = reader.with_file_size(sz);
                     }
+                    // The page index is only worth loading when there is something
+                    // to prune with; `Optional` keeps index-less files readable.
+                    let options = if predicates.is_empty() {
+                        ArrowReaderOptions::new()
+                    } else {
+                        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional)
+                    };
                     let mut builder =
-                        ParquetRecordBatchStreamBuilder::new(reader)
+                        ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
                             .await
                             .map_err(|e| {
                                 ExecutionError::Execution(format!("parquet open {path}: {e}"))
@@ -191,10 +273,22 @@ impl ExecutionOperator for ParquetScanOperator {
                     }
                     // TD-OLAP-12: a lane reads only its share of the row-groups
                     // (`% n == lane_id`) — disjoint, so ∪ lanes == the full scan.
-                    if let Some((lane_id, n)) = lane {
-                        let ngroups = builder.metadata().num_row_groups();
-                        let mine: Vec<usize> = (0..ngroups).filter(|i| i % n == lane_id).collect();
-                        builder = builder.with_row_groups(mine);
+                    let ngroups = builder.metadata().num_row_groups();
+                    let mine: Vec<usize> = match lane {
+                        Some((lane_id, n)) => (0..ngroups).filter(|i| i % n == lane_id).collect(),
+                        None => (0..ngroups).collect(),
+                    };
+                    if predicates.is_empty() {
+                        if lane.is_some() {
+                            builder = builder.with_row_groups(mine);
+                        }
+                    } else {
+                        let file_schema = builder.schema().clone();
+                        let plan = prune_file(builder.metadata(), &file_schema, mine, &predicates);
+                        builder = builder.with_row_groups(plan.row_groups);
+                        if let Some(selection) = plan.selection {
+                            builder = builder.with_row_selection(selection);
+                        }
                     }
                     let inner = builder.build().map_err(|e| {
                         ExecutionError::Execution(format!("parquet build {path}: {e}"))
@@ -294,6 +388,62 @@ mod tests {
         assert_eq!(rows, 3, "all rows emitted");
         assert_eq!(cols, 2, "all columns emitted (no projection)");
         assert_eq!(op.output_schema().fields().len(), 2);
+    }
+
+    /// Pruning ladder on the native scan: a sorted key over 4 row groups of
+    /// 1,000 rows with 250-row pages. `k BETWEEN 1_600 AND 1_700` keeps one row
+    /// group (footer bounds) and, inside it, one page (page index) — 250 rows
+    /// decoded instead of 4,000, and every matching row still emitted.
+    #[tokio::test]
+    async fn predicates_prune_row_groups_and_pages_without_losing_matches() {
+        use proximadb_storage_common::format_splits::{ScalarPredicate, ScalarValue};
+        use proximadb_storage_common::parquet_write_policy::{
+            ParquetLayoutHints, ParquetWritePolicy,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("t.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..4_000).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+        let policy = ParquetWritePolicy {
+            row_group_rows: 1_000,
+            data_page_rows: 250,
+            ..ParquetWritePolicy::default()
+        };
+        let props = policy.writer_properties(&batch, &ParquetLayoutHints::default());
+        let f = std::fs::File::create(&file_path).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let store = Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).unwrap());
+        let size = std::fs::metadata(&file_path).unwrap().len();
+        let op = ParquetScanOperator::new(
+            store,
+            vec![(Path::from("t.parquet"), Some(size))],
+            None,
+            schema.clone(),
+        )
+        .with_predicates(vec![(
+            "k".to_string(),
+            ScalarPredicate::Between(ScalarValue::Int64(1_600), ScalarValue::Int64(1_700)),
+        )]);
+        let empty: BatchStream = Box::pin(futures::stream::empty());
+        let mut out = op.execute(empty).await.unwrap();
+        let mut keys = Vec::new();
+        while let Some(b) = out.next().await {
+            let b = b.unwrap();
+            let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            keys.extend(col.values().iter().copied());
+        }
+        assert_eq!(keys.len(), 250, "one row group, one page decoded");
+        assert!(
+            (1_600..=1_700).all(|k| keys.contains(&k)),
+            "no matching row lost"
+        );
     }
 
     /// End-to-end: a relational `PhysicalPlan::Scan` lowers over an injected
