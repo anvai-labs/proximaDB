@@ -117,6 +117,22 @@ pub fn proxima_records_to_parquet_bytes(
     record_batches_to_parquet_bytes(&[batch], arrow_schema, props)
 }
 
+/// Like [`proxima_records_to_parquet_bytes`], but the writer properties are derived
+/// from `policy` against the encoded batch itself (Bloom NDV sizing needs the data),
+/// so the file carries the warehouse layout: row groups, page index, declared sort
+/// order, and spec SBBF Bloom filters.
+pub fn proxima_records_to_parquet_bytes_with_policy(
+    records: &[ProximaRecord],
+    schema: &ProximaSchema,
+    policy: &crate::parquet_write_policy::ParquetWritePolicy,
+    hints: &crate::parquet_write_policy::ParquetLayoutHints,
+) -> Result<Vec<u8>, StorageError> {
+    let batch = proxima_records_to_record_batch(records, schema)?;
+    let props = policy.writer_properties(&batch, hints);
+    let arrow_schema = batch.schema();
+    record_batches_to_parquet_bytes(&[batch], arrow_schema, Some(props))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

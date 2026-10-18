@@ -2326,8 +2326,9 @@ impl DmlService {
         //     first DATE/TIMESTAMP column (the dominant analytical access shape).
         //     One sort at materialize time; ordering is reader-neutral
         //     (mixed-read-safe) and NULL-keyed rows sort last.
-        if let Some(cluster_col) = resolve_cluster_key(&schema) {
-            records.sort_by_cached_key(|rec| cluster_sort_key(rec, &cluster_col));
+        let cluster_col = resolve_cluster_key(&schema);
+        if let Some(cluster_col) = &cluster_col {
+            records.sort_by_cached_key(|rec| cluster_sort_key(rec, cluster_col));
         }
 
         // 3. Tenant-isolated object prefix (DrPathBuilder mandate: data/{tenant}/{ns}/{table}).
@@ -2377,8 +2378,17 @@ impl DmlService {
         //    multi-file/versioned snapshots (via the atomic manifest committer) are a
         //    follow-up that also needs manifest-aware reads.
         let data_object = object_store::path::Path::from(format!("{prefix}/data/part-0.parquet"));
+        //    The cluster sort is declared as Parquet `sorting_columns`, and the
+        //    warehouse write policy adds the page index + spec SBBF Bloom filters.
+        let sort_columns: Vec<String> = cluster_col.into_iter().collect();
         bridge
-            .write_records_to_parquet_with_schema(&data_object, &records, &schema, Some(tenant_id))
+            .write_records_to_parquet_with_layout(
+                &data_object,
+                &records,
+                &schema,
+                &sort_columns,
+                Some(tenant_id),
+            )
             .await?;
 
         // 5. Flip the catalog layout to a published Parquet projection at the location.

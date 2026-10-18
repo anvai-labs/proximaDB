@@ -98,6 +98,9 @@ fn run_duckdb(
     let arrow = stmt
         .query_arrow(duckdb::params![])
         .map_err(|e| ExecutionError::Execution(format!("duckdb execute: {e}")))?;
+    // Keep the result schema: an empty result yields zero batches but is still a
+    // valid answer (seven TPC-DS queries return no rows at small scale factors).
+    let duck_schema = arrow.get_schema();
     let duck_batches: Vec<duckdb::arrow::array::RecordBatch> = arrow.collect();
     let compute_ms = started.elapsed().as_millis() as u64;
     // Arrow → ExecutionPipelineResult (same bridge DataFusion uses). duckdb
@@ -108,10 +111,10 @@ fn run_duckdb(
         .iter()
         .map(ffi_batch_58_to_59)
         .collect::<Result<Vec<_>, ExecutionError>>()?;
-    let schema = batches
-        .first()
-        .map(|b| b.schema())
-        .ok_or_else(|| ExecutionError::Execution("duckdb returned no batches".to_string()))?;
+    let schema = match batches.first() {
+        Some(b) => b.schema(),
+        None => ffi_schema_58_to_59(duck_schema.as_ref())?,
+    };
     let result = super::native_engine::record_batches_to_pipeline_result(&schema, &batches);
     Ok((result, compute_ms))
 }
@@ -125,6 +128,21 @@ fn run_duckdb(
 /// `mem::transmute` compile-errors if the sizes ever diverge. The `release`
 /// callback is an `extern "C"` fn owned by the producing (duckdb) side and
 /// stays valid in-process; the importing side's `Drop` invokes it identically.
+/// Convert a duckdb (arrow 58) schema to the workspace arrow 59 schema across the
+/// stable Arrow C-data interface (see [`ffi_batch_58_to_59`]).
+fn ffi_schema_58_to_59(
+    schema: &duckdb::arrow::datatypes::Schema,
+) -> Result<arrow_schema::SchemaRef, ExecutionError> {
+    let ffi_schema = duckdb::arrow::ffi::FFI_ArrowSchema::try_from(schema)
+        .map_err(|e| ExecutionError::Execution(format!("duckdb arrow schema FFI: {e}")))?;
+    // SAFETY: identical `#[repr(C)]` layout in arrow 58.3 and 59.3 (C-data interface).
+    let schema_59: arrow::ffi::FFI_ArrowSchema = unsafe { std::mem::transmute(ffi_schema) };
+    Ok(std::sync::Arc::new(
+        arrow_schema::Schema::try_from(&schema_59)
+            .map_err(|e| ExecutionError::Execution(format!("duckdb arrow schema FFI: {e}")))?,
+    ))
+}
+
 fn ffi_batch_58_to_59(
     batch: &duckdb::arrow::array::RecordBatch,
 ) -> Result<arrow_array::RecordBatch, ExecutionError> {

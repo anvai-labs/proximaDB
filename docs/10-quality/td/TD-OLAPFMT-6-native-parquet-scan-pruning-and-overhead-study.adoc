@@ -1,0 +1,28 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-OLAPFMT-6: Native Parquet scan on the pruning ladder + dual-write overhead study
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Partial — native scan pruning + exact filtered scans landed 2026-10-18 behind `PROXIMADB_NATIVE_FILTERED_SCAN` (opt-in); promotion and SF≥1 study open
+| Priority | P1
+| Component | `src/query/execution/native_parquet_scan.rs` (no min/max row-group pruning today), `src/network/postgres/relational_pipeline.rs::shadow_probe_native_parquet` skip-guards
+| Relates to | ADR-054 (operator cutover, ledger-gated), ADR-052, TD-OLAP-15, TD-OLAPFMT-2
+|===
+
+Give the native Parquet scan the engine-neutral pruning ladder (row-group min/max, SBBF,
+`parquet_page_prune::page_row_selection`) and lift the "filtered scan" skip-guard so native gets
+TPC samples. Measure, at TPC-DS SF≥1: Bloom/page-index bytes, flush CPU, and per-query bytes/latency per
+engine; record in BENCHMARK_EVIDENCE.toml.
+
+== Landed (first slice, 2026-10-18)
+
+* `ParquetScanOperator::with_predicates`: footer row-group skip
+  (`parquet_page_prune::row_group_prunable`, new) + page-index `RowSelection`
+  (`page_row_selection`) — the same functions and semantics as the DataFusion provider;
+  recorded into IoTrace (`splits_*`, `pages_*`, `page_rows_skipped`).
+* Native lowering applies `Scan.predicate` exactly as a `FilterProject` above the injected
+  parquet source (pruning is a superset); expressions native cannot lower decline to DF.
+* `try_native_over_parquet` serves filtered single-table scans when
+  `PROXIMADB_NATIVE_FILTERED_SCAN=1` (default off until ledger parity, ADR-054 promotion).

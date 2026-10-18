@@ -156,7 +156,7 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_LEASE_MANIFEST_PRUNE_INTERVAL_SECS` | Prune loop sweep cadence (seconds) | 300 | opt-in tuning; — | `src/network/shared_services.rs`
 | `PROXIMADB_LEASE_MANIFEST_RETENTION` | Master switch for the lease-manifest prune loop | ON (kill-switch; set `0` to disable) | kill-switch; — | `src/network/shared_services.rs`
 | `PROXIMADB_MATERIALIZE_OBJECT_ID_PATHS` | Keys materialized table object path by stable object_id instead of table name | OFF | opt-in; ADR-031 | `src/services/dml/mod.rs`
-| `PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS` | Iceberg warehouse writer max row-group row count | 65,536 | opt-in tuning; — | `crates/storage/proximadb-iceberg-engine/src/lib.rs`
+| `PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS` | Warehouse Parquet writer max row-group row count | 65,536 | opt-in tuning; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
 | `PROXIMADB_MEMORY_POOL_SIZE_MB` | Global shared memory-pool size (MB) | smart default from system memory | opt-in tuning; — | `src/storage/engines/core/ops/performance_optimization.rs`
 | `PROXIMADB_METRICS_PORT` | **Not read by any code** (set only as a Dockerfile `ENV`); it was meant to override the Prometheus metrics port. Set the port in the config file. | config-file value | config-mirror; — | deploy/docker/Dockerfile
 | `PROXIMADB_MODE` | Container-plumbing deployment-mode selector. | config-file value | config-mirror; — | deploy/docker/Dockerfile
@@ -170,6 +170,7 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_METERING_FLUSH_INTERVAL_SECS` | Durable `_metering` sink flush cadence (seconds) | 3600 (1 h) | opt-in tuning; TD-161 | `src/database.rs`
 | `PROXIMADB_METERING_KSU_GAUGE_INTERVAL_SECS` | Prometheus resident-storage KSU gauge poll interval (seconds) | 300 (5 min) | opt-in tuning; ADR-030 | `src/database.rs`
 | `PROXIMADB_NATIVE_ALLOW_GROUPED_AGG` | Opts grouped-aggregate plans into native routing (else routed to DataFusion) | OFF (any value set ⇒ allow) | opt-in; TD-OLAP-11 | `src/network/postgres/relational_pipeline.rs`
+| `PROXIMADB_NATIVE_FILTERED_SCAN` | Let the native engine serve filtered single-table parquet scans (exact FilterProject + row-group/page pruning) instead of declining to DataFusion. | OFF (opt-in until ledger parity, ADR-054) | opt-in; TD-OLAPFMT-6 | `src/network/postgres/relational_pipeline.rs`
 | `PROXIMADB_NATIVE_JOIN` | Enables native hash-join operator path | OFF | opt-in; ADR-054/TD-OLAP-11 | `src/query/execution/native_engine.rs`
 | `PROXIMADB_NATIVE_JOIN_SHADOW` | Runs native join as a shadow probe alongside DataFusion (measurement only) | OFF | eval; TD-OLAP-11 | `src/query/execution/native_shadow.rs`
 | `PROXIMADB_NATIVE_MORSEL` | Enables TD-OLAP-12 morsel-parallel scheduler for native pipelines | OFF | opt-in; TD-OLAP-12 | `src/query/execution/native_engine.rs`
@@ -188,6 +189,16 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_OLAP_TABLE_CACHE` | Enables the table-OPEN cache | OFF (default-OFF-until-baked) | opt-in; TD-OLAP | `src/datafusion/engine_adapters/table_open_cache.rs`
 | `PROXIMADB_OTLP_ENDPOINT` | OTLP gRPC endpoint that arms the external metering push | unset ⇒ metering push inert (no-op) | opt-in; TD-161/ADR-027 | `crates/modalities/proximadb-observability-engine/src/metering_otlp.rs`
 | `PROXIMADB_PARQUET_FOOTER_HINT_KB` | Parquet footer prefetch size (KB) | 512 KiB | opt-in tuning; TD-OLAP-4 | `src/datafusion/engine_adapters/object_store_parquet_reader.rs`
+| `PROXIMADB_PARQUET_READ_BLOOM_DISABLE` | Disable probing persisted Parquet SBBF Bloom filters for `=`/`IN` split pruning when min/max cannot decide. | OFF (bloom probe ON) | kill-switch; TD-OLAPFMT-2 | `src/datafusion/engine_adapters/object_store_parquet_reader.rs`
+| `PROXIMADB_PARQUET_READ_PAGE_PRUNE_DISABLE` | Disable Parquet page-index (ColumnIndex/OffsetIndex) row selection for static WHERE predicates and join runtime filters. | OFF (page prune ON) | kill-switch; TD-OLAPFMT-2 | `src/datafusion/engine_adapters/object_store_parquet_reader.rs`
+| `PROXIMADB_PARQUET_WRITE_BLOOM_COLUMNS` | Comma-separated explicit Bloom-filter column allow-list (overrides type-based auto selection). | unset (auto: int/date/string/binary, minus leading sort key) | opt-in tuning; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_PARQUET_WRITE_BLOOM_DISABLE` | Disable writing spec SBBF Bloom filters into warehouse Parquet files. | OFF (bloom write ON) | kill-switch; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_PARQUET_WRITE_BLOOM_FPP` | Bloom false-positive probability for warehouse Parquet files. | 0.01 | opt-in tuning; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS` | Files with fewer rows get no Bloom filters. | 8,192 | opt-in tuning; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_PARQUET_WRITE_PAGE_INDEX_DISABLE` | Disable explicit page-level statistics (ColumnIndex) on warehouse Parquet writes. | OFF (page index ON) | kill-switch; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_PARQUET_WRITE_PAGE_ROWS` | Max rows per data page (page-index skip granularity). | 8,192 | opt-in tuning; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_PARQUET_WRITE_POLICY` | `legacy` restores the pre-TD-OLAPFMT-2 writer layout (row-group cap only) for A/B measurement. | unset (TD-OLAPFMT-2 policy) | bench A/B; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_PARQUET_WRITE_SORTING_DISABLE` | Disable declaring Parquet `sorting_columns` from the MATERIALIZE cluster key. | OFF (declared) | kill-switch; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
 | `PROXIMADB_PAX_ENCODE_THREADS` | flush encode-pool width (bounded scoped rayon pool; 1 = sequential) | cores/2, min 2 (query headroom) | opt-in tuning; TD-FLUSH-5 | `crates/storage/proximadb-block-format/src/coalesced_rabitq.rs`
 | `PROXIMADB_PAX_BLOCK_CLUSTER` | Sign-Gray block reclustering at flush/compaction | ON (kill-switch; `0/false/off/no` ⇒ insertion order) | kill-switch; TD-WLP | `src/storage/engines/sst/block_cluster.rs`
 | `PROXIMADB_PAX_BLOCK_SIZE` | Overrides PAX target block geometry (vectors/block) | None ⇒ writer default (`SST_DEFAULT_VECTORS_PER_BLOCK`) | opt-in tuning; TD-156/ADR-026 | `src/storage/engines/sst/flush/mod.rs`
