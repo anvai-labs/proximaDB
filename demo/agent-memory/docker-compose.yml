@@ -12,7 +12,9 @@ services:
     image: proximadb-agent-memory:latest
     container_name: proximadb-agent-memory
     ports:
-      - "5678:5678"
+      # Loopback only: the demo engine runs UNAUTHENTICATED — never expose
+      # it beyond the host (the container binds 0.0.0.0 inside its netns).
+      - "127.0.0.1:5678:5678"
     volumes:
       - ./data:/data
       - ./models:/var/lib/proximadb/models

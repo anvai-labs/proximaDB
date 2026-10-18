@@ -1,8 +1,13 @@
-# ProximaDB server WITH native ONNX embeddings — the production-shaped demo build.
-# Same stages as the root Dockerfile; the only delta is `--features onnx` so the
-# server embeds text server-side (BAAI/bge-small-en-v1.5) instead of requiring
-# client-supplied vectors. Model files are NOT baked in — mount them via
-# docker-compose.yml (fetch-models.sh downloads them).
+# ProximaDB server WITH native ONNX embeddings — the demo build.
+# Structurally modeled on the root Dockerfile but NOT identical to it:
+#   - builder: rust:1.99-slim (matches rust-toolchain.toml), g++ (ort links
+#     C++/libstdc++), no protoc/cmake — the onnx feature needs none of those
+#   - runtime: python:3.11-slim, libstdc++6, direct ENTRYPOINT (no supervisord)
+#   - config: demo/config/docker-config.toml (bind 0.0.0.0 in-container, all
+#     storage under /data for the mounted volume)
+# The delta to track when the root Dockerfile changes: toolchain pin, apt deps,
+# runtime layout, healthcheck. Model files are NOT baked in — mount them via
+# docker-compose.yml (fetch-models.sh downloads them, revision-pinned).
 #
 # Build context: repository root.   docker build -f demo/agent-memory/Dockerfile.onnx .
 
