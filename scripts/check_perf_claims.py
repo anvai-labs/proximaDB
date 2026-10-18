@@ -39,7 +39,6 @@ CAPABILITY_GLOBS = [
     "README.adoc",
     "SUPPORTED_SURFACE.md",
     "docs/README.md",
-    "docs/INDEX.adoc",
     "docs/05-concepts/*.adoc",
     "docs/05-concepts/*.md",
     "docs/02-guides/*.md",

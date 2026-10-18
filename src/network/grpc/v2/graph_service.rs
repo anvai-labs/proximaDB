@@ -25,13 +25,14 @@
 //!   Handlers pass tenant-CLEAN `graph_id`s and never bake the tenant into a user-visible
 //!   name — isolation is a namespace on the storage key, never a per-query predicate.
 //!
-//! ## Deferred RPCs
+//! ## Deferred RPCs (TD-124)
 //!
-//! The first surface ships the core graph operations (node/edge CRUD, node/edge
-//! queries, neighbors, traversal, shortest path, stats). StreamTraverse,
-//! connected-components/cycle analysis, unique-constraint DDL, batch create,
-//! ExecuteQuery (Cypher/Gremlin), ExecuteHybridQuery, and the retired
-//! PULSAR/QUASAR RPCs are deferred (tracked as a follow-up TD).
+//! Beyond the core graph operations (node/edge CRUD, node/edge queries,
+//! neighbors, traversal, shortest path, stats), this surface also serves
+//! StreamTraverse, connected-components/cycle analysis, unique-constraint DDL,
+//! batch create and ExecuteQuery (the supported Cypher subset). Still deferred:
+//! ExecuteHybridQuery (no v2 wire surface yet) and GREMLIN (reserved, unbacked).
+//! The retired PULSAR/QUASAR RPCs are intentionally not ported.
 
 use std::sync::Arc;
 use std::time::Instant;

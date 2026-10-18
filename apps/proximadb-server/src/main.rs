@@ -56,6 +56,7 @@ use proximadb::core::hardware_capabilities::initialize_hardware_capabilities;
 use tracing::{error, info, warn};
 
 mod storage_ownership;
+mod writer_epoch;
 
 /// Ensure all required directories exist based on configuration
 async fn ensure_required_directories(config: &proximadb::core::Config) -> anyhow::Result<()> {
@@ -340,6 +341,17 @@ async fn run(common: cli::CommonArgs, serve: cli::ServeArgs) -> anyhow::Result<(
     // (its env + config, absolute), so an offline backup run from another shell
     // can refuse instead of silently omitting it.
     durable_locations::record(&config)?;
+    // ADR-095 D1/D2: with `[oltp.durable_volume]`, prove every durable root is
+    // on the volume and win the writer epoch BEFORE any storage is opened, so a
+    // replaced machine never writes alongside a still-running previous owner.
+    // The watchdog it starts exits the process (code 75) if fenced.
+    let _writer_epoch = writer_epoch::acquire(&config).await?;
+    if let Some(guard) = &_writer_epoch {
+        info!(
+            epoch = guard.epoch,
+            "durable volume owned under writer epoch"
+        );
+    }
 
     // Publish the lifecycle record BEFORE any slow work. Recovery can run for
     // minutes on a large data dir and binds no socket until it finishes, so a

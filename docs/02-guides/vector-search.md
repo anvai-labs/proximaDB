@@ -39,27 +39,26 @@ REST v1 vector-shaped endpoints remain only as deprecated compatibility facades.
 ### Python SDK
 
 ```python
-from proximadb_sdk import ProximaDBClient, ProximaRecord
+from proximadb_sdk import ProximaDBClient, ProximaRecord, Protocol
 
-client = ProximaDBClient(url="http://localhost:5678")
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 
+client.create_collection("products", dimension=3, storage_engine="sst")
 client.insert_records("products", [
-    ProximaRecord(id="sku-1", vector=[0.1, 0.2, 0.3]).set_flexible("category", "Electronics")
+    ProximaRecord(id="sku-1", vector=[0.1, 0.2, 0.3])
+        .set_flexible("category", "Electronics")
+        .set_flexible("price", 79.0),
+    ProximaRecord(id="sku-2", vector=[0.3, 0.2, 0.1])
+        .set_flexible("category", "Books")
+        .set_flexible("price", 15.0),
 ])
 
 # Simple search
-results = client.search(
-    collection="products",
-    vector=[0.1, 0.2, 0.3],
-    top_k=10
-)
+results = client.search("products", vector=[0.1, 0.2, 0.3], top_k=10)
 
-# With filter
+# With an equality filter: use metadata_filter=, not filter= (TD-SDKERR-1)
 results = client.search(
-    collection="products",
-    vector=[0.1, 0.2, 0.3],
-    top_k=10,
-    filter={"category": "Electronics", "price": {"$lt": 100}}
+    "products", vector=[0.1, 0.2, 0.3], top_k=10, metadata_filter={"category": "Electronics"}
 )
 ```
 
@@ -71,9 +70,7 @@ curl -X POST http://localhost:5678/api/v2/collections/products/search \
   -d '{
     "vector": [0.1, 0.2, 0.3],
     "top_k": 10,
-    "filter": {
-      "category": "Electronics"
-    }
+    "filters": [{"field": "category", "op": "eq", "value": "Electronics"}]
   }'
 ```
 
@@ -83,80 +80,39 @@ curl -X POST http://localhost:5678/api/v2/collections/products/search \
 
 ### Metadata Filters
 
-```python
-# Exact match
-results = client.search(
-    collection="products",
-    vector=query_vector,
-    top_k=10,
-    filter={"status": "active"}
-)
+The Python SDK's `metadata_filter` supports equality only. For ranges and set membership, use the
+REST API's typed `filters`; conditions are combined with AND (there is no OR). Operators: `eq`,
+`neq`, `gt`, `gte`, `lt`, `lte`, `in`, `between` (with `value_upper`), `contains`,
+`starts_with` and `ends_with`.
 
-# Range queries
-results = client.search(
-    collection="products",
-    vector=query_vector,
-    top_k=10,
-    filter={
-        "price": {"$gte": 10, "$lte": 100},
-        "rating": {"$gt": 4.0}
-    }
-)
-
-# Logical operators
-results = client.search(
-    collection="products",
-    vector=query_vector,
-    top_k=10,
-    filter={
-        "$or": [
-            {"category": "Electronics"},
-            {"category": "Computers"}
-        ],
-        "stock": {"$gt": 0}
-    }
-)
+```bash
+# Price range and category membership
+curl -X POST http://localhost:5678/api/v2/collections/products/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [0.1, 0.2, 0.3],
+    "top_k": 10,
+    "filters": [
+      {"field": "price", "op": "gte", "value": 10},
+      {"field": "price", "op": "lte", "value": 100},
+      {"field": "category", "op": "in", "value": ["Electronics", "Computers"]}
+    ]
+  }'
 ```
 
-### Pre-filter vs Post-filter
+### How filters are applied
 
-```mermaid
-%%{init: {"theme": "neutral"}}%%
-flowchart TB
-    subgraph Pre["Pre-Filter (Default)"]
-        A1[Filter Candidates] --> A2[Vector Search]
-    end
-
-    subgraph Post["Post-Filter"]
-        B1[Vector Search] --> B2[Filter Results]
-    end
-
-    style A2 fill:#27ae60,color:#fff
-    style B1 fill:#e67e22,color:#fff
-```
-
-**Pre-filter** (default): Filter before search
-- ✅ Faster for selective filters
-- ✅ Lower compute cost
-- ❌ May miss results if filter removes nearest neighbors
-
-**Post-filter**: Search then filter
-- ✅ Guaranteed recall
-- ❌ Slower for non-selective filters
-- ❌ May return fewer than k results
+Today the vector engines apply property filters to the ANN candidates (post-filtering). When a
+filtered search returns fewer than `top_k` results, the REST response carries
+`predicate_shortfall` (`requested_k`, `returned_k`, `oversample_pool`,
+`"ann_filtering_mode": "post_filter"`). Ask for a larger `top_k` and trim in the client.
+Filter-aware ANN is tracked by TD-064.
 
 ```python
-# Pre-filter (default)
-results = client.search("products", vector=query_vector, top_k=10, filter={"status": "active"})
-
-# Post-filter
+# Over-fetch, then keep the first 10 matches
 results = client.search(
-    "products",
-    vector=query_vector,
-    top_k=100,  # Search more, filter after
-    filter={"status": "active"},
-    filter_mode="post"
-)
+    "products", vector=query_vector, top_k=100, metadata_filter={"status": "active"}
+)[:10]
 ```
 
 ---
@@ -165,29 +121,33 @@ results = client.search(
 
 ### Vector + Keyword
 
+`client.hybrid_search` returns no results today: it fails inside the SDK and returns an empty
+result instead of raising (TD-SDKERR-1). The call shape, for when it is fixed:
+
 ```python
-# Combine semantic and keyword search
+# Combine semantic and keyword search (reciprocal rank fusion by default)
 results = client.hybrid_search(
-    collection="products",
-    query_vector=[...],
-    query_text="wireless headphones",
-    alpha=0.7,  # 0.7 vector, 0.3 keyword
-    top_k=10
+    "products",
+    text_query="wireless headphones",
+    query_vector=query_vector,
+    top_k=10,
 )
 ```
 
 ### Weighted Scoring
 
+The SDK has no server-side scoring hook. Re-rank in the client:
+
 ```python
-# Custom scoring function
-results = client.search(
-    collection="products",
-    vector=query_vector,
-    top_k=10,
-    score_function=lambda score, metadata: (
-        score * 0.8 + metadata.get("popularity", 0) * 0.2
-    )
-)
+def prop(record, name, default=0.0):
+    value = record.metadata.get(name, default)
+    # Over REST, properties arrive as {"type": ..., "value": ...} cells (TD-SDKERR-1)
+    return value.get("value", default) if isinstance(value, dict) else value
+
+results = client.search("products", vector=query_vector, top_k=50)
+ranked = sorted(
+    results, key=lambda r: r.score * 0.8 + float(prop(r, "popularity")) * 0.2, reverse=True
+)[:10]
 ```
 
 ---
@@ -197,21 +157,21 @@ results = client.search(
 ### Bulk Insert
 
 ```python
-# Efficient bulk insert through the record API
+# Efficient bulk insert through the record API: one call, many records
+rows = [("1", [0.1, 0.2, 0.3], "A"), ("2", [0.3, 0.2, 0.1], "B")]
 client.insert_records("products", [
-    ProximaRecord(id="1", vector=v1).set_flexible("name", "A"),
-    ProximaRecord(id="2", vector=v2).set_flexible("name", "B"),
+    ProximaRecord(id=rid, vector=vec).set_flexible("name", name) for rid, vec, name in rows
 ])
 ```
 
 ### Bulk Search
 
 ```python
-# Search multiple queries at once
-results = client.batch_search(
-    collection="products",
-    query_vectors=[[...], [...], ...],
-    top_k=10
+# Search multiple queries at once: one result list per query
+results = client.search_batch(
+    "products",
+    [[0.1, 0.2, 0.3], [0.3, 0.2, 0.1]],
+    top_k=10,
 )
 ```
 
@@ -222,50 +182,57 @@ results = client.batch_search(
 ### Engine Selection
 
 ```python
-# SST: Write-heavy, real-time
-client.create_collection("events", dimension=384, engine="sst")
+# SST: the Supported engine (the Python SDK's default; use storage_engine=, not engine=)
+client.create_collection("events", dimension=384, storage_engine="sst")
 
-# HELIX: Read-optimized, spatial
-client.create_collection("locations", dimension=384, engine="helix")
-
-# VIPER: Analytics workloads
-client.create_collection("analytics", dimension=384, engine="viper")
+# HELIX (Beta): locality-ordered embeddings; measure recall against SST first
+client.create_collection("locations", dimension=384, storage_engine="helix")
 ```
 
 ### Index Parameters
 
-```python
-client.create_collection(
-    name="products",
-    dimension=384,
-    metric="cosine",
-    index_params={
-        "M": 16,      # HNSW connectivity
-        "ef_construction": 200  # Build-time accuracy
-    }
-)
+The Python SDK's `create_collection` does not apply index or quantization settings today: it
+accepts them and silently drops them (TD-SDKENG-1). Set them through the REST API, which stores
+them (check with `GET /api/v2/collections/<name>`):
 
-# Search-time accuracy
-results = client.search(
-    "products",
-    vector=query_vector,
-    top_k=10,
-    search_params={"ef": 100}  # Higher = more accurate, slower
-)
+```bash
+curl -X POST http://localhost:5678/api/v2/collections \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "products_hnsw",
+    "dimension": 384,
+    "engine": "sst",
+    "distance_metric": "cosine",
+    "index_configs": [{
+      "algorithm": "hnsw",
+      "is_primary": true,
+      "hnsw_config": {"m": 16, "ef_construction": 200, "ef_search": 100}
+    }]
+  }'
 ```
+
+`m` is graph connectivity, `ef_construction` build-time accuracy and `ef_search` query-time
+accuracy (higher is more accurate and slower). `search()` takes no per-query index parameters.
 
 ### Quantization
 
-```python
-# Reduce memory with quantization
-client.create_collection(
-    name="products",
-    dimension=384,
-    quantization={
-        "type": "product",  # PQ quantization
-        "bits": 8  # 8 bits per dimension
-    }
-)
+Quantization is on by default, tiered by dimension: under 64 dimensions `minimal`, 64 to 511
+`smart_defaults`, 512 and up `aggressive` (so typical 768- or 1536-dimension embeddings are
+aggressively quantized unless you say otherwise). Choose a strategy explicitly, and create an
+unquantized baseline to measure recall against:
+
+```bash
+# Strategies: smart_defaults, minimal, aggressive, custom_levels (the default depends on dimension)
+curl -X POST http://localhost:5678/api/v2/collections \
+  -H "Content-Type: application/json" \
+  -d '{"name": "products_aggressive", "dimension": 384, "engine": "sst",
+       "quantization": {"enabled": true, "strategy": "aggressive"}}'
+
+# Unquantized baseline
+curl -X POST http://localhost:5678/api/v2/collections \
+  -H "Content-Type: application/json" \
+  -d '{"name": "products_f32", "dimension": 384, "engine": "sst",
+       "quantization": {"enabled": false}}'
 ```
 
 ---
@@ -286,7 +253,7 @@ print(f"Search latency: {latency:.2f}ms")
 ### Metrics Endpoint
 
 ```bash
-curl http://localhost:5678/metrics | grep vector_search
+curl -sL http://localhost:5678/metrics/prometheus | grep proximadb_search_latency_seconds
 ```
 
 ---
@@ -301,39 +268,34 @@ curl http://localhost:5678/metrics | grep vector_search
 | **L2** | Image embeddings, unnormalized |
 | **Dot Product** | Pre-normalized vectors (fastest) |
 
-### 2. Filter Before Search
+### 2. Filter Selectively
 
 ```python
-# Good: Pre-filter selective condition
+# Good: a selective condition
 results = client.search(
     "products",
     vector=query_vector,
-    filter={"category": "Electronics"},  # Reduces search space
+    metadata_filter={"category": "Electronics"},
     top_k=10
 )
 
-# Avoid: Post-filter non-selective
-results = client.search(
-    "products",
-    vector=query_vector,
-    filter={"status": "active"},  # 99% of data
-    filter_mode="post",
-    top_k=10
-)
+# A filter that matches almost everything adds cost without narrowing the result;
+# leave it out
+results = client.search("products", vector=query_vector, top_k=10)
 ```
 
 ### 3. Batch When Possible
 
 ```python
-# Good: Bulk insert
+# ids, vectors and props are parallel lists from your pipeline
+# Good: one call for the batch
 client.insert_records("products", [
-    ProximaRecord(id=str(id_), vector=vector, flexible_fields=props)
-    for id_, vector, props in zip(ids, large_list, metadata)
+    ProximaRecord(id=str(i), vector=v, flexible_fields=p) for i, v, p in zip(ids, vectors, props)
 ])
 
-# Avoid: Loop insert
-for v, id in zip(vectors, ids):
-    client.insert_records("products", [ProximaRecord(id=str(id), vector=v)])  # Slow!
+# Avoid: one call per record
+for i, v in zip(ids, vectors):
+    client.insert_records("products", [ProximaRecord(id=str(i), vector=v)])  # Slow
 ```
 
 ### 4. Use Right Engine
@@ -341,12 +303,12 @@ for v, id in zip(vectors, ids):
 | Workload | Engine |
 |----------|--------|
 | Real-time ingest | SST |
-| Spatial / locality queries | HELIX |
-| Columnar analytics | VIPER |
-| Mixed read/write | NOVA |
+| Spatial / locality queries | HELIX (Beta) |
+| Analytical SQL | Relational table + `MATERIALIZE` (DataFusion), not a vector engine |
+| Mixed read/write | NOVA (Beta) |
 
 > **SWIFT and RAPTOR are experimental** (off by default behind the `experimental-engines`
-> cargo feature) and are not v0.2-supported — don't target them for production. For small or
+> cargo feature) and are not supported — don't target them for production. For small or
 > dynamic workloads use SST or NOVA. See
 > [Storage Engines](../05-concepts/storage-engines.adoc).
 
@@ -354,44 +316,42 @@ for v, id in zip(vectors, ids):
 
 ## Common Patterns
 
+
 ### Recommendation Engine
 
-```python
-# User-based collaborative filtering
-user_vector = get_user_embedding(user_id)
-results = client.search(
-    "products",
-    vector=user_vector,
-    top_k=20,
-    filter={"category": {"$ne": "purchased"}}
-)
+```bash
+# User-based collaborative filtering: exclude purchased items
+curl -X POST http://localhost:5678/api/v2/collections/products/search \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [0.1, 0.2, 0.3], "top_k": 20,
+       "filters": [{"field": "category", "op": "neq", "value": "purchased"}]}'
 ```
 
 ### Deduplication
 
-```python
-# Find near-duplicates
-results = client.search(
-    "documents",
-    vector=document_vector,
-    top_k=10,
-    filter={"checksum": {"$ne": doc_checksum}}
-)
-# If score > 0.95, likely duplicate
+```bash
+# Find near-duplicates of a document, excluding the document itself
+curl -X POST http://localhost:5678/api/v2/collections/documents/search \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [0.1, 0.2, 0.3], "top_k": 10,
+       "filters": [{"field": "checksum", "op": "neq", "value": "<doc checksum>"}]}'
+# A score above about 0.95 suggests a duplicate
 ```
 
 ### Face Recognition
 
+This assumes a `faces` collection exists. Searching a collection that does not exist currently
+leaves the SDK client unusable for the rest of the session (TD-SDKERR-1).
+
 ```python
-# Find similar faces
-results = client.search(
-    "faces",
-    vector=face_embedding,
-    top_k=5,
-    filter={"verified": True}
-)
-if results[0].score > 0.8:
-    return results[0].metadata["user_id"]
+def identify(face_embedding, threshold=0.8):
+    """Return the closest verified face's record id, or None."""
+    results = client.search(
+        "faces", vector=face_embedding, top_k=5, metadata_filter={"verified": True}
+    )
+    if results and results[0].score > threshold:
+        return results[0].id
+    return None
 ```
 
 ---

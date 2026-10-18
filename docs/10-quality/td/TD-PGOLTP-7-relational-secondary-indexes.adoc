@@ -1,0 +1,34 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-7: Relational secondary indexes and composite-PK point access
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open (filed 2026-10-16). Priority 7 of ADR-095.
+| Severity | Medium (performance). Non-PK OLTP predicates scan.
+| Component | `src/services/ddl/mod.rs` (`CREATE INDEX`), `src/services/record_store.rs`, `src/query/compute_scheduler.rs` / relational pipeline, ADR-094 Layer-B serving metadata
+| Realizes | ADR-095 D5
+| Relates to | TD-DML-2 (composite PK), TD-PGOLTP-1 (index entries ride the commit record)
+|===
+
+== Premise (to re-verify at start)
+
+`CREATE INDEX` is parsed (`sql_frontend/parser.rs`, `query/ddl_dml`). The record store has a
+UNIQUE index. Whether a non-unique relational secondary index exists **and is used by the
+planner** has not been verified. Check callers before building anything (filing rule 7).
+
+== Design
+
+* An index is an LSM index table `(index_key, pk) → ∅`. Entries are written inside `TxnCommit`
+  and flushed with the base, so the index is never stale. Reads apply the same snapshot
+  visibility as the base and re-check the base row (`is_dead`).
+* The planner chooses an index for equality and range predicates when the estimated selectivity
+  is below a measured crossover. The decision and the cost go into the route trace (ADR-064).
+* Composite-PK point lookup extends `point_lookup_relational` beyond `primary_key.first()`.
+
+== Acceptance
+
+* pgbench-style point UPDATE by a non-PK unique column touches O(1) segments, measured in the
+  I/O trace (requests and bytes), not by microbenchmark.
+* No index-only read ever returns a row that is dead in the base.

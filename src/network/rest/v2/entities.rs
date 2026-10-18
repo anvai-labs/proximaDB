@@ -388,7 +388,14 @@ pub async fn search_entities_v2(
             request.top_k as usize,
         )
         .await
-        .map_err(|e| err_internal("search entities", e))?;
+        .map_err(|e| {
+            // The fusion seed leg's wrong-dimension / empty / non-finite query
+            // vector or over-cap top_k is the client's argument (TD-SECSCAN-1 §5).
+            match crate::services::operations::vectors::client_argument_message(&e) {
+                Some(message) => ApiError::InvalidArgument(message),
+                None => err_internal("search entities", e),
+            }
+        })?;
 
     let results = hits
         .into_iter()

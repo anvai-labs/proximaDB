@@ -127,17 +127,17 @@ MATURITY_CONTRACT_RULES = [
             # Banner: register tracks implementation state, not support level.
             "This register tracks _implementation state_, not _product-support level_.",
             # Relabeled contradiction cells, each cross-linked to its support tier.
-            "_Experimental in v0.2 (see SUPPORTED_SURFACE)_",  # external catalogs (TD-002)
-            "_Beta in v0.2 (see SUPPORTED_SURFACE)_",          # mTLS / TST / event (TD-006/009/010)
-            "Not a v0.2 supported surface (see SUPPORTED_SURFACE)",  # framework integrations (TD-011)
+            "_Experimental today (see SUPPORTED_SURFACE)_",  # external catalogs (TD-002)
+            "_Beta today (see SUPPORTED_SURFACE)_",          # mTLS / TST / event (TD-006/009/010)
+            "Not a supported surface today (see SUPPORTED_SURFACE)",  # framework integrations (TD-011)
         ],
     },
     {
         "path": "docs/00-product/PRD.adoc",
         "required_substrings": [
-            "shippable/supported surface for v0.2 is defined by",  # precedence banner
-            "v0.2 status: Beta",                  # TST + Event P0 notes
-            "v0.2 status: not a Supported surface",  # Framework integrations P0 note
+            "shippable/supported surface is defined by",  # precedence banner
+            "status today: Beta",                  # TST + Event P0 notes
+            "status today: not a Supported surface",  # Framework integrations P0 note
         ],
     },
     {

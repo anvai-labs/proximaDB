@@ -1,0 +1,31 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SQLCOLL-1: collections created through REST or the SDK cannot be queried from SQL
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Reproduced against the 0.4.1 image.
+| Priority | **HIGH** — ADR-096 makes SQL the front door, but records written through REST or the SDK are invisible to it.
+| Component | pgwire relational front end and the collection catalog
+| Relates to | ADR-096, ADR-094 (one canonical record), TD-XMODAL-4 (vectors in SQL); roadmap v0.6
+|===
+
+== Problem
+
+A collection created through REST v2 or the Python SDK appears in `information_schema.tables`,
+but `SELECT * FROM <collection>` fails with `execution failed: Table '<collection>' does not
+exist`. `SHOW TABLES` returns one empty row, and `SELECT table_name FROM
+information_schema.tables` (or any `WHERE table_schema = 'public'`) returns no rows although
+`SELECT *` lists the collection. Every table created over pgwire is listed with `"dimension": 1`.
+In a table without a JSON or JSONB column (`(id INT PRIMARY KEY, embedding VECTOR(8))`,
+`(id VARCHAR, embedding VECTOR(8), payload TEXT)`) inserts are checked against that dimension and an
+`n`-dimensional vector fails; with a JSON or JSONB column (any key type, any vector column name, as in
+`tests/mem0_pgwire_filter_e2e.rs`) inserts and `<->` work. Plain relational tables created over
+pgwire work.
+
+== Fix
+
+Resolve collections as relational tables in the pgwire front end (the canonical record's
+relational projection, ADR-094), with an end-to-end test that writes over REST and reads the same
+rows over pgwire. Part of "Vectors and context inside SQL" (v0.6).

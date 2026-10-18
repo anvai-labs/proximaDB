@@ -1,0 +1,65 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-MEMTABLE-MVCC-1: the memtable's MVCC winner rule is not a total order, so a delete can be lost
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Not fixed; both failure modes verified by reading the code, not yet by an executable reproduction.
+| Priority | **HIGH**: a DELETE can lose to the live copy it is meant to supersede (invariant #16d) through every unflushed read of a vector collection: scan, by-key read and DML target selection.
+| Component | `src/storage/memtable/implementations/global_partitioned.rs`: `CollectionPartition::get_all_vectors`, `rebuild_scan_index` and `latest_version_by_id` (which `vector_by_id` delegates to), three hand-copies of one rule. The storage-inclusive surfaces (`documents()`, `list_all_records_with_tenant_context`, and the flushed-version choice in `read::vector()` via `read::freshest_version`) use a different rule: `updated_at_ns`, then `record_version`. Version assignment: `src/services/dml/mod.rs` (UPDATE, DELETE tombstone), `src/services/operations/vectors/write.rs` (`tombstone_records_for_ids`).
+| Relates to | link:TD-PGWIRE-VECDEL-1-vector-table-delete-still-visible.adoc[TD-PGWIRE-VECDEL-1] (found during its review). link:TD-PGOLTP-1-atomic-commit-record-group-commit.adoc[TD-PGOLTP-1] S3 (group commit would make same-millisecond batches routine). The canonical resolver in `crates/horizontal/proximadb-mvcc-resolution` (`MvccResolver`), which the memtable does not use.
+|===
+
+== The rule
+
+Per `oid`, the winner is the highest `record_version`, then the later **batch** timestamp truncated
+to **milliseconds**. Records are visited by iterating `wal_batches`, a `HashMap`. On a full tie the
+first record visited wins, because `is_newer` requires strictly greater values.
+
+== Failure mode 1: deterministic. A tombstone never beats a live row with `record_version > 0`
+
+* Delete tombstones are written at `record_version = 0`: `tombstone_records_for_ids` and the DML
+  `build_delete_tombstone_record` (no `record_version` option).
+* A live row carries `record_version > 0` in two cases:
+  ** **Every document on the canonical-vector route.** `DocumentRecord::new` and `from_tree` set
+     `version: 1` (`src/storage/document/mod.rs`), and `into_proxima_record` copies it into
+     `record_version`. So **every DocumentService document delete loses to its live copy** while
+     both are unflushed.
+  ** Any record with a client-supplied proto `version`
+     (`crates/foundation/proximadb-records/src/conversions.rs`, `record_version: v.version.unwrap_or(0)`).
+* Version beats timestamp, so those DELETEs always lose. The row stays visible to the scan and the
+  by-key read of the unflushed delta, and the client was told the delete succeeded.
+* **Surfaces now disagree.** `documents()` merges by `updated_at_ns` (TD-PGWIRE-VECDEL-1), so it
+  hides the deleted document, while get-by-id and scan of the same collection still return it.
+* This is the most severe case here. Consider raising it to BLOCKER for document workloads.
+
+== Failure mode 2: timing. Version-0 writes tie on version and are ordered only by millisecond
+
+* Ordinary writes are all version 0: INSERT leaves the default; DELETE tombstones are 0; and
+  UPDATE's `existing.version + 1` never fires for them, because the read side maps
+  `record_version == 0` to `version: None` (`vectors/legacy.rs`, `vector_record_to_rich_result`).
+* So writes to the same row are ordered only by batch millisecond. Two in the same millisecond tie
+  completely, and the winner is whichever batch the `HashMap` yields first.
+* That order can change when the map rehashes as unrelated batches arrive. A tied DELETE can
+  therefore appear applied and later **flip back** to visible.
+* Within one batch, duplicate oids are rejected on insert, and atomic group commit refuses vector
+  tables (`0A000`), so pgwire cannot reach the in-batch case today.
+* The cross-batch case needs two writes to one row within a millisecond. That is plausible for a
+  tight client loop over loopback with `TCP_NODELAY` in a release build.
+
+== Fix direction
+
+1. Give the three memtable copies and the storage-inclusive `read::is_fresher` one comparator.
+2. Make it a total order that reflects write order: compare `record_version`, then
+   `updated_at_ns` / `created_at_ns` (note that REST v2 records and v3 documents stamp these
+   truncated to milliseconds, so they cannot be the final tiebreak on their own) (the canonical `MvccResolver` already orders by version, then
+   `created_at_ns`, then `updated_at_ns`), then a per-partition monotonic batch sequence as the final
+   tiebreak. Never `HashMap` order.
+3. Decide the version semantics for deletes: a tombstone must supersede the live copy regardless of
+   the client-supplied version (for example `max(existing) + 1`, or tombstones win at equal-or-lower
+   version when they are newer). Do the same for UPDATE.
+4. Add executable reproductions: same-millisecond write-then-delete via the memtable API, and a
+   delete of a `version = 2` row via REST or gRPC.
+
+Track before TD-PGOLTP-1 S3 (group commit) lands.

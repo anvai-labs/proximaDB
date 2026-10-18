@@ -1461,12 +1461,13 @@ async fn flight_records_follow_live_row_policy_provision_and_revoke_inner() {
 //
 // SCOPE — same-tenant, deliberately. The cross-tenant variant is NOT written
 // here because it cannot pass yet: three live read paths still retain rows by
-// `record.tenant_id == tenant_context.tenant_id`
-// (src/services/operations/vectors/legacy.rs:1123/:1175/:1346), so a foreign
+// `record.tenant_id == tenant_context.tenant_id` (in
+// `VectorOperationsService`'s scan, unflushed-listing and storage-inclusive
+// list paths), so a foreign
 // grantee is admitted by the catalog and then filtered to zero rows. Writing
 // it now would produce a test that fails for reasons unrelated to grants. See
 // the 2026-08-07 addendum in TD-TENANT-2; that predicate is itself load-bearing
-// until the WAL read is tenant-keyed (`get_collection_vectors_raw` takes a bare
+// until the WAL read is tenant-keyed (the memtable readers take a bare
 // collection id), so it cannot simply be deleted either.
 // ===========================================================================
 

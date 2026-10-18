@@ -8,11 +8,11 @@ flowchart LR
   A[Choose OS] --> B[Linux]
   A --> C[Windows]
   A --> D[macOS]
-  A --> E[Docker]
+  A --> E[Any OS]
 
-  B --> B1[RPM / DEB]
-  C --> C1[MSI]
-  D --> D1[Homebrew]
+  B --> B1["RPM / DEB / tar.gz / Homebrew"]
+  C --> C1["MSI / zip"]
+  D --> D1["Docker or build from source"]
   E --> E1[Docker Hub]
 
   style B1 fill:#4a90e2,color:#fff
@@ -21,24 +21,70 @@ flowchart LR
   style E1 fill:#4a90e2,color:#fff
 ```
 
+Every release is published on
+[GitHub Releases](https://github.com/anvai-labs/proximaDB/releases) with RPM, DEB and MSI
+packages, Linux x86_64 and Windows x86_64 archives, and checksums; the server image is
+`vjsingh1984/proximadb` on Docker Hub, and the `anvai-labs/tap` Homebrew tap installs the Linux
+x86_64 archive. There is no native macOS package yet: on macOS use Docker or build from source.
+
+The snippets below resolve the latest release instead of hard-coding a version:
+
+```bash
+VERSION=$(curl -fsSL https://api.github.com/repos/anvai-labs/proximaDB/releases/latest \
+  | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+echo "Installing ProximaDB $VERSION"
+BASE=https://github.com/anvai-labs/proximaDB/releases/download/v$VERSION
+```
+
 ---
 
 ## Platform Packages
 
-### Linux (RPM - RHEL/CentOS/Fedora)
+### Linux requirements (archive, .deb, .rpm, Homebrew)
+
+The Linux x86_64 binaries are built against **glibc 2.28** with **OpenSSL
+statically linked**, so they need no system OpenSSL. Each package is installed
+and the server binary is started and health-checked on these distributions for every release
+(`release-smoke.yml`, `packages` job; the smoke runs the binary directly, not the systemd
+service):
+
+| Package | Minimum (verified) |
+|---|---|
+| `.rpm` | RHEL / Rocky / Alma **8** and 9, Fedora 41 |
+| `.deb` | **Debian 11** and 12, **Ubuntu 20.04**, 22.04, 24.04 |
+
+Older releases differ: **v0.4.1 and earlier** were built on Ubuntu 22.04 and
+need glibc 2.35 and `libssl.so.3` -- their `.el8.rpm` does **not** run on
+RHEL/Rocky 8 or 9, and their `.deb` needs Ubuntu 22.04+ / Debian 12+.
+
+> **Known issue (TD-PKG-1, fix scheduled for v0.5):** as shipped, the RPM/DEB service does not start
+> (the unit waits for a readiness signal the server never sends, the state directories are
+> root-owned, and the server's `./log` directory resolves to `/`), and the packaged config keeps all
+> data under `/tmp`, which the unit wipes on restart. Until it is fixed, apply this after installing:
+>
+> ```bash
+> sudo sed -i 's#/tmp/proximadb#/var/lib/proximadb#g' /etc/proximadb/config.toml
+> sudo chown -R proximadb:proximadb /var/lib/proximadb /var/log/proximadb
+> sudo mkdir -p /etc/systemd/system/proximadb.service.d
+> printf '[Service]\nType=simple\nWorkingDirectory=/var/lib/proximadb\n' \
+>   | sudo tee /etc/systemd/system/proximadb.service.d/override.conf
+> sudo systemctl daemon-reload
+> sudo systemctl reset-failed proximadb; sudo systemctl enable --now proximadb
+> ```
+>
+> Verified against the v0.4.1 `.deb` by running the server as the `proximadb` user with the same
+> config and working directory (write, restart, read back); not yet run under systemd itself. Logs
+> go to the journal and `/var/lib/proximadb/log/`. After an RPM upgrade (`rpm -Uvh`), re-apply
+> the workaround: the RPM may replace the edited config. Or use the [Linux archive](#linux-archive-any-distribution) or
+> [Docker](#docker).
+
+### Linux (RPM - RHEL/Rocky/Alma 8+, Fedora)
 
 ```bash
-# Download
-wget https://github.com/anvai-labs/proximaDB/releases/download/v0.2.0/proximadb-0.2.0-1.el8.x86_64.rpm
+wget "$BASE/proximadb-$VERSION-1.el8.x86_64.rpm"
+sudo rpm -ivh "proximadb-$VERSION-1.el8.x86_64.rpm"
 
-# Install
-sudo rpm -ivh proximadb-0.2.0-1.el8.x86_64.rpm
-
-# Start service
-sudo systemctl start proximadb
-sudo systemctl enable proximadb
-
-# Verify
+sudo systemctl enable --now proximadb
 curl http://localhost:5678/health
 ```
 
@@ -46,53 +92,68 @@ curl http://localhost:5678/health
 - Binaries: `/usr/bin/` (proximadb-server, proximadb-bench, proximadb-migrate)
 - Config: `/etc/proximadb/config.toml`
 - Service: `/usr/lib/systemd/system/proximadb.service`
-- Data: `/var/lib/proximadb/`
+- Data: `/var/lib/proximadb/` (after the TD-PKG-1 workaround above; the shipped config uses `/tmp`)
 - Logs: `/var/log/proximadb/`
 
-### Linux (DEB - Debian/Ubuntu)
+### Linux (DEB - Debian 11+, Ubuntu 20.04+)
 
 ```bash
-# Download
-wget https://github.com/anvai-labs/proximaDB/releases/download/v0.2.0/proximadb_0.2.0_amd64.deb
+wget "$BASE/proximadb_${VERSION}_amd64.deb"
+sudo dpkg -i "proximadb_${VERSION}_amd64.deb"
 
-# Install
-sudo dpkg -i proximadb_0.2.0_amd64.deb
-
-# Start service
-sudo systemctl start proximadb
-sudo systemctl enable proximadb
-
-# Verify
+sudo systemctl enable --now proximadb
 curl http://localhost:5678/health
+```
+
+### Linux (archive, any distribution)
+
+```bash
+wget "$BASE/proximadb-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+wget "$BASE/proximadb-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256"
+sha256sum -c "proximadb-$VERSION-x86_64-unknown-linux-gnu.tar.gz.sha256"
+tar xzf "proximadb-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+cd "proximadb-$VERSION-x86_64-unknown-linux-gnu"
+# The shipped config keeps every root under /tmp; move them somewhere durable first:
+sed -i 's#/tmp/proximadb#'"$HOME"'/proximadb-data#g' config/config.toml
+./proximadb-server --config config/config.toml
 ```
 
 ### Windows (MSI)
 
 ```powershell
-# Download from GitHub Releases
-# https://github.com/anvai-labs/proximaDB/releases/tag/v0.2.0
+# Download proximadb-<version>-x64.msi from GitHub Releases, then:
+msiexec /i proximadb-<version>-x64.msi
 
-# Double-click proximadb-0.2.0-x64.msi
-# Or install via command line:
-msiexec /i proximadb-0.2.0-x64.msi
-
-# Start service (optional)
-Start-Service proximadb
+# The MSI installs no Windows service yet (TD-PKG-2). From an elevated shell, edit
+# C:\Program Files\ProximaDB\config.toml so every /tmp/proximadb root points at a durable folder
+# (not yet verified on Windows), for example:
+#   data_dir     = "C:/ProgramData/ProximaDBData/data"
+#   metadata_url = "file:///C:/ProgramData/ProximaDBData/metadata"
+#   (and the same for storage_locations, global_manifest_url and the audit directory)
+# Then run the server from a writable directory (it creates .\log there):
+cd $env:LOCALAPPDATA
+& "C:\Program Files\ProximaDB\proximadb-server.exe" --config "C:\Program Files\ProximaDB\config.toml"
 ```
 
 **What gets installed:**
-- Program Files: `C:\Program Files\ProximaDB\`
-- Config: `C:\ProgramData\ProximaDB\config.toml`
-- Data: `C:\ProgramData\ProximaDB\data\`
+- Binaries and config: `C:\Program Files\ProximaDB\` (`config.toml` sits next to the binaries)
+- An empty `C:\ProgramData\ProximaDBData\`, which the shipped config does not use until you point
+  its roots there (TD-PKG-2)
 
-### macOS (Homebrew)
+### Linux x86_64 (Homebrew)
+
+The release publishes a prebuilt server archive for **Linux x86_64 only**, and
+the Homebrew formula in the `anvai-labs/tap` tap installs exactly that archive.
+There is no macOS binary or formula: on macOS use Docker or build from source
+(below).
 
 ```bash
-# Install
-brew install proximadb
+brew install anvai-labs/tap/proximadb
 
-# Start service
-brew services start proximadb
+# Example configs are in $(brew --prefix)/share/proximadb/config; copy one and move its storage
+# roots off /tmp first (TD-PKG-1), e.g.
+#   sed 's#/tmp/proximadb#'"$HOME"'/proximadb-data#g' <example>.toml > proximadb.toml
+proximadb-server --config proximadb.toml
 
 # Verify
 curl http://localhost:5678/health
@@ -104,18 +165,25 @@ curl http://localhost:5678/health
 
 ### Docker Hub
 
+> **Known issue (TD-PKG-3, fix scheduled for v0.5):** the image's built-in config keeps every
+> storage root under `/tmp/proximadb` inside the container, so data does not survive `docker rm`
+> even with a volume mounted. Until it is fixed, run it with a config that points the roots at the
+> image's volume (verified: a record written before `docker rm` is readable from a new container on
+> the same volume):
+
 ```bash
-# Pull and run
+# One-time: copy the image's config with every root moved to the volume
+docker run --rm --entrypoint cat vjsingh1984/proximadb:latest /config/config.toml \
+  | sed 's#/tmp/proximadb#/data/proximadb#g' > proximadb.toml
+
 docker run -d \
   --name proximadb \
   -p 5678:5678 \
-  -v proximadb-data:/var/lib/proximadb \
-  vjsingh1984/proximadb:latest
+  -v proximadb-data:/data/proximadb \
+  -v "$PWD/proximadb.toml:/config/config.toml:ro" \
+  vjsingh1984/proximadb:latest        # or a pinned tag, e.g. vjsingh1984/proximadb:<version>
 
-# Check logs
 docker logs -f proximadb
-
-# Verify
 curl http://localhost:5678/health
 ```
 
@@ -130,14 +198,14 @@ curl http://localhost:5678/health
 > ```
 >
 > Serving it from the host needs pgwire SCRAM (`TD-PGWIRE-AUTH-1`) *before* `[api]
-> pg_port` — setting `pg_port` alone makes the server fail closed at boot. Details:
-> `deploy/README.md`, `TD-PGWIRE-CONTAINER-1`.
+> pg_port` — setting `pg_port` alone makes the server fail closed at boot. Making the published
+> image reachable over pgwire is roadmap v0.5 (`TD-PGWIRE-CONTAINER-1`). Details:
+> `deploy/README.md`.
 
 ### Docker Compose
 
 ```yaml
 # docker-compose.yml
-version: '3.8'
 services:
   proximadb:
     image: vjsingh1984/proximadb:latest
@@ -145,7 +213,8 @@ services:
       - "5678:5678"  # Unified API
       # 5433 (pgwire) omitted on purpose — loopback-only in the container; see above.
     volumes:
-      - proximadb-data:/var/lib/proximadb
+      - proximadb-data:/data/proximadb             # the image's data directory
+      - ./proximadb.toml:/config/config.toml:ro    # roots moved to /data/proximadb (see above)
     environment:
       - RUST_LOG=info
     restart: unless-stopped
@@ -155,7 +224,7 @@ volumes:
 ```
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 ---
@@ -164,64 +233,43 @@ docker-compose up -d
 
 ### Prerequisites
 
-- Rust 1.88+ and Cargo
-- OpenSSL development libraries
-- Python 3.11+ (for Python SDK)
+- Rust: the repository pins its toolchain in `rust-toolchain.toml`; `rustup` installs it
+  automatically on first build.
+- OpenSSL development libraries and `pkg-config`
+- Python 3.11+ (for the Python SDK)
 
 ### Linux
 
 ```bash
-# Install dependencies
 sudo apt-get update
 sudo apt-get install -y pkg-config libssl-dev build-essential
 
-# Clone repository
 git clone https://github.com/anvai-labs/proximaDB.git
-cd proximadb
-
-# Build release
-cargo build --release
-
-# Run
+cd proximaDB
+cargo build --release --bin proximadb-server
 ./target/release/proximadb-server --config config/config.toml
 ```
 
 ### macOS
 
 ```bash
-# Install dependencies
 brew install openssl@3 pkg-config
 
-# Clone and build
 git clone https://github.com/anvai-labs/proximaDB.git
-cd proximadb
-
-# Set OpenSSL environment variables
+cd proximaDB
 export OPENSSL_DIR=$(brew --prefix openssl@3)
-export OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib
 export PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig
-
-# Build
-cargo build --release
-
-# Run
+cargo build --release --bin proximadb-server
 ./target/release/proximadb-server --config config/config.toml
 ```
 
 ### Windows
 
 ```powershell
-# Install Rust from https://rustup.rs/
-# Install Visual Studio Build Tools
-
-# Clone and build
+# Install Rust from https://rustup.rs/ and the Visual Studio Build Tools, then:
 git clone https://github.com/anvai-labs/proximaDB.git
-cd proximadb
-
-# Build
-cargo build --release
-
-# Run
+cd proximaDB
+cargo build --release --bin proximadb-server
 .\target\release\proximadb-server.exe --config config\config.toml
 ```
 
@@ -232,15 +280,15 @@ cargo build --release
 ### Default Configuration
 
 The default config file is installed at:
-- **Linux**: `/etc/proximadb/config.toml`
-- **Windows**: `C:\ProgramData\ProximaDB\config.toml`
-- **macOS**: `/usr/local/etc/proximadb/config.toml`
+- **Linux packages**: `/etc/proximadb/config.toml`
+- **Windows**: `C:\Program Files\ProximaDB\config.toml`
+- **From source**: `config/config.toml` in the repository
 
 ### Default Ports
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| **5678** | HTTP/2 | Unified REST + gRPC (+ Arrow Flight, experimental) |
+| **5678** | HTTP/2 | Unified REST + gRPC (+ Arrow Flight; Flight vector search is supported, Flight as a general customer transport is experimental) |
 | **5433** | PostgreSQL | SQL wire protocol. Binds `127.0.0.1` unless the listener authenticates (pgwire SCRAM, `TD-PGWIRE-AUTH-1`), so in a container it is not reachable through a published port. |
 
 ### Minimal Config
@@ -249,12 +297,12 @@ The default config file is installed at:
 [server]
 port = 5678
 
-[storage]
-default_engine = "sst"  # Options: sst, helix, viper, swift, nova, raptor
-
 [api]
-unified_mode = true  # Single port for all protocols
+unified_mode = true  # Single port for REST, gRPC and Arrow Flight
 ```
+
+Pass `"engine": "sst"` when you create a collection: a vector collection created without `engine` (and without an index or quantization) is auto-routed to HELIX, which is Beta. See the
+[storage engine guide](../05-concepts/storage-engines.adoc) before choosing another engine.
 
 ---
 
@@ -266,11 +314,11 @@ unified_mode = true  # Single port for all protocols
 curl http://localhost:5678/health
 ```
 
-**Response:**
+**Response** (the `version` field is the installed release):
 ```json
 {
   "status": "healthy",
-  "version": "0.2.0",
+  "version": "X.Y.Z",
   "uptime_seconds": 123.45
 }
 ```
@@ -285,6 +333,7 @@ curl -X POST http://localhost:5678/api/v2/collections \
     "name": "test",
     "dimension": 128,
     "distance_metric": "cosine",
+    "engine": "sst",
     "enable_proxima_record": true
   }'
 
@@ -298,26 +347,44 @@ curl http://localhost:5678/api/v2/collections
 
 ### Platform Packages
 
+Resolve `VERSION` and `BASE` as above, download the new package, then:
+
 ```bash
-# RPM
-sudo rpm -Uvh proximadb-0.2.1-1.el8.x86_64.rpm
-sudo systemctl restart proximadb
-
-# DEB
-sudo dpkg -i proximadb_0.2.1_amd64.deb
-sudo systemctl restart proximadb
-
-# MSI
-msiexec /x proximadb-0.2.0-x64.msi
-msiexec /i proximadb-0.2.1-x64.msi
+sudo rpm -Uvh "proximadb-$VERSION-1.el8.x86_64.rpm" && sudo systemctl restart proximadb   # RPM
+sudo dpkg -i "proximadb_${VERSION}_amd64.deb" && sudo systemctl restart proximadb          # DEB
 ```
+
+On Windows, run the new MSI; it upgrades the binaries in place.
 
 ### Docker
 
+> **Upgrading a container started without the config mount?** Its data lives only inside the
+> container (TD-PKG-3): do **not** `docker rm` it. Rescue it first and keep it at its original path
+> (the catalog stores absolute `/tmp/proximadb` paths, so copying the files into `/data/proximadb`
+> does not work). Verified with the 0.4.1 image: a record written before the rescue reads back:
+>
+> ```bash
+> docker stop proximadb
+> rm -rf ./proximadb-rescue   # docker cp nests the files if the target already exists
+> docker cp proximadb:/tmp/proximadb ./proximadb-rescue
+> docker volume create proximadb-legacy
+> docker run --rm -v proximadb-legacy:/dst -v "$PWD/proximadb-rescue:/src:ro" alpine \
+>   sh -c 'cp -a /src/. /dst/ && chown -R 999:999 /dst'
+> docker run -d --name proximadb-legacy -p 5678:5678 -v proximadb-legacy:/tmp/proximadb \
+>   "$(docker inspect -f '{{.Image}}' proximadb)"   # the exact image the old container ran
+> ```
+
+The rescued container must keep `-v proximadb-legacy:/tmp/proximadb` (and the built-in config) on
+every later upgrade; the steps below would start it empty. Moving it onto the `/data/proximadb`
+layout needs the migration tracked in TD-PKG-3.
+
+For a container started with the config mount above:
+
 ```bash
 docker pull vjsingh1984/proximadb:latest
-docker stop proximadb
-docker rm proximadb
+docker stop proximadb && docker rm proximadb
+# Re-run with the same -v proximadb-data:/data/proximadb and config mount as above.
+# Without the config mount the data was never on the volume (TD-PKG-3).
 docker run -d ... vjsingh1984/proximadb:latest
 ```
 
@@ -325,8 +392,7 @@ docker run -d ... vjsingh1984/proximadb:latest
 
 ```bash
 git pull origin main
-cargo build --release
-./target/release/proximadb-server --config config/config.toml
+cargo build --release --bin proximadb-server
 ```
 
 ---
@@ -336,8 +402,7 @@ cargo build --release
 ### Linux (RPM)
 
 ```bash
-sudo systemctl stop proximadb
-sudo systemctl disable proximadb
+sudo systemctl disable --now proximadb
 sudo rpm -e proximadb
 sudo rm -rf /var/lib/proximadb
 ```
@@ -345,8 +410,7 @@ sudo rm -rf /var/lib/proximadb
 ### Linux (DEB)
 
 ```bash
-sudo systemctl stop proximadb
-sudo systemctl disable proximadb
+sudo systemctl disable --now proximadb
 sudo dpkg -r proximadb
 sudo rm -rf /var/lib/proximadb
 ```
@@ -354,16 +418,15 @@ sudo rm -rf /var/lib/proximadb
 ### Windows
 
 ```powershell
-Stop-Service proximadb
-msiexec /x proximadb-0.2.0-x64.msi
+# Stop the server process, then
+# uninstall "ProximaDB" from Settings → Apps, or: msiexec /x proximadb-<version>-x64.msi
 ```
 
-### macOS
+### Homebrew (Linux x86_64)
 
 ```bash
-brew services stop proximadb
-brew uninstall proximadb
-rm -rf /usr/local/var/proximadb
+brew uninstall anvai-labs/tap/proximadb
+# Data lives wherever your config's data_dir / storage urls point; remove it separately.
 ```
 
 ---

@@ -2,7 +2,7 @@
 :toc: left
 :toclevels: 2
 :icons: font
-:last-updated: 2026-09-11
+:last-updated: 2026-10-17
 // status-as-of: 2026-09-11
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the support tiers against HEAD, then bump it.
@@ -15,7 +15,7 @@ Canonical product support contract for the ProximaDB working tree. This document
 This matrix is the product support contract.
 
 * Use link:./10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register] for the active backlog.
-* Use link:./_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] for sequencing and investment direction.
+* Use link:./_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] for sequencing; product direction is ADR-096.
 * Use link:./12-design/SUPPORTED_SURFACES.adoc[Supported Surfaces: API vs. Physical Projection Status] for the technical API/projection companion matrix.
 * Do not infer support level from code presence alone.
 ====
@@ -36,11 +36,11 @@ marking themselves historical, aspirational, or implementation-only:
 | System architecture (the whole-system view)
 | link:./12-design/SYSTEM_MAP_2026_05_30.adoc[SYSTEM_MAP_2026_05_30.adoc].
 
-| Active architectural pivot (current mandate)
-| link:./12-design/DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc[DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc].
+| Product direction (identity, front door, model breadth, planning frame)
+| link:./12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096], stated in link:./00-product/VISION.adoc[VISION.adoc]. The engineering mandates of the 2026-06-04 course correction (pgwire, object storage, engine routing) still apply; its "compete with warehouses" framing is superseded.
 
-| Release blockers / reconciliation
-| link:./_internal/status/MVP_RELEASE_READINESS_RECONCILIATION_2026_05_28.adoc[MVP_RELEASE_READINESS_RECONCILIATION_2026_05_28.adoc].
+| Sequencing and release exit criteria
+| link:./_internal/roadmap/STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP.adoc]; live implementation status per TD, indexed by link:./12-design/WORK_LEDGER_2026_10_15.adoc[the Work Ledger].
 
 | Performance / benchmark claims (what is *measured*)
 | link:./_internal/roadmap/BENCHMARK_EVIDENCE.toml[BENCHMARK_EVIDENCE.toml] — every external perf number maps to a runnable bench; only `status = "measured"` entries carry a dated artifact. Do not quote a perf figure as validated unless its ledger entry is `measured`.
@@ -154,7 +154,7 @@ query endpoint, and `/api/v2/query` is *not* SQL-over-REST. Route by language:
   through the same pipeline as pgwire (ComputeScheduler → DataFusion/Volcano);
   DDL/DML route through the same tenant-scoped `DdlService`/`DmlService` seams —
   all scoped to the `x-tenant-id` tenant (TD-064). This RPC is single-statement;
-  pgwire is also autocommit-only and rejects transaction control with SQLSTATE `0A000`.
+  multi-statement transactions are a pgwire capability (ADR-018 P2.D, see the note below).
 | Beta — programmatic SQL exists, but broader relational and cross-modal parity is not in the MVP corridor
 
 | *REST `POST /api/v2/query`* (unified query port)
@@ -332,8 +332,8 @@ for evidence/provenance, and event/history records for temporal state. The v1
 
 | Security runtime
 | Beta
-| JWT, API key, SSO hooks, mTLS identity, and CRL-backed revocation reload/freshness checks are present. Tenant assertions are reconciled with credential bindings on every network surface through one shared policy primitive (TD-TENANT-1, in `proximadb-tenant`): an assertion that contradicts an authenticated tenant binding is rejected (HTTP 403 / gRPC PERMISSION_DENIED / SQLSTATE 28000), except that an authenticated gateway principal may delegate a different acting tenant under `gateway-only`; the bare assertion (REST `X-Tenant-ID`, gRPC/Arrow Flight `x-tenant-id` metadata, pgwire startup `database` + tenant session vars) is governed by `HeaderTrustPolicy` (`open` default / `authenticated-only` in the multi-tenant strict preset / `gateway-only` for trusted-gateway delegation via a first-class gateway-principal role marker), configurable via `[security.tenant] header_trust` and overridable via `PROXIMADB_TENANT_HEADER_TRUST`. Rejections emit `proximadb::tenant_audit` warns. The entitlement claim (`x-tenant-tier` on REST, gRPC, and Arrow Flight; `proximadb_tier` pgwire startup param) is governed by the same ladder via `[security.tenant] tier_header_trust` / `PROXIMADB_TIER_HEADER_TRUST` (ADR-0053 W8): an untrusted claim is dropped — never a 4xx — and the tenant resolves its default tier; under strict policies the pgwire startup parameter is inert (trust auth carries no binding). Generic OIDC bearer authentication is supported via `[security.authentication.oidc]` (TD-SSO-1: Kanidm, Keycloak, Okta, Azure Entra ID, Google Workspace; JWKS-validated RS256/ES256, any-of audience list, issuer aliases for bare-hostname `iss` forms, nested claim paths for Keycloak `realm_access.roles`, custom CA for internal PKI, configurable clock-skew/JWKS-TTL/timeout; IdP role claims cross only through the sanitized seam — gateway/operator delegation markers plus an operator allowlist, everything else dropped). REST request rate limiting is opt-in via `PROXIMADB_REST_RATE_LIMIT_RPM` (TD-RATE-1; default off — unset adds no middleware layer; per observed client IP, `/health` exempt, process-global ceiling at 10x the per-IP cap). Deprecated claim use and dropped tier claims are metered (`proximadb_deprecated_claim_uses_total`, `proximadb_tier_claims_dropped_total`) — the Flight legacy-alias retirement gate is `increase(proximadb_deprecated_claim_uses_total[7d]) == 0`. Claim *names* come from one shared vocabulary across all four surfaces (TD-TENANT-3): `x-tenant-id` / `x-tenant-tier` are canonical everywhere, Arrow Flight additionally DETECTS three deprecated tenant-alias names (`x-proximadb-tenant-id`, `tenant-id`, `tenant_id`) for deprecation warning only — they no longer grant a tenant (honoring removed 2026-08-29; the names are deleted at the next release boundary), and a stamped tier claim is normalized to a canonical tier id at the boundary so an alias and its canonical spelling resolve to the same cache entitlement.
-| Security admin/status APIs and stronger online revocation policy are incomplete. pgwire authentication is dual-mode (TD-PGWIRE-AUTH-1): the dev default is trust, and `[security.authentication] enabled` (or `PROXIMADB_PGWIRE_AUTH=password`) requires SCRAM-SHA-256 — under SCRAM, strict policies AUTHENTICATE pgwire tenant selection and the `proximadb_tier` claim through the credential's binding instead of disabling them; under the dev trust default, authenticated-only and gateway-only still reject explicit non-default tenant assertions rather than authenticate them, the reserved literal `default` remains accepted, and an omitted startup database selects the configured default only in single-tenant mode. ADR-031 tenant stable-id minting behind the `TenantStableIdResolver` port is pending (TD-TENANT-1).
+| JWT, API key, SSO hooks and mTLS identity are present; certificate revocation is not checked (TD-SECOPS-1). Tenant assertions are reconciled with credential bindings on every network surface through one shared policy primitive (TD-TENANT-1, in `proximadb-tenant`): an assertion that contradicts an authenticated tenant binding is rejected (HTTP 403 / gRPC PERMISSION_DENIED / SQLSTATE 28000), except that an authenticated gateway principal may delegate a different acting tenant under `gateway-only`; the bare assertion (REST `X-Tenant-ID`, gRPC/Arrow Flight `x-tenant-id` metadata, pgwire startup `database` + tenant session vars) is governed by `HeaderTrustPolicy` (`open` default / `authenticated-only` in the multi-tenant strict preset / `gateway-only` for trusted-gateway delegation via a first-class gateway-principal role marker), configurable via `[security.tenant] header_trust` and overridable via `PROXIMADB_TENANT_HEADER_TRUST`. Rejections emit `proximadb::tenant_audit` warns. The entitlement claim (`x-tenant-tier` on REST, gRPC, and Arrow Flight; `proximadb_tier` pgwire startup param) is governed by the same ladder via `[security.tenant] tier_header_trust` / `PROXIMADB_TIER_HEADER_TRUST` (ADR-0053 W8): an untrusted claim is dropped — never a 4xx — and the tenant resolves its default tier; under strict policies the pgwire startup parameter is inert (trust auth carries no binding). Generic OIDC bearer authentication is supported via `[security.authentication.oidc]` (TD-SSO-1: Kanidm, Keycloak, Okta, Azure Entra ID, Google Workspace; JWKS-validated RS256/ES256, any-of audience list, issuer aliases for bare-hostname `iss` forms, nested claim paths for Keycloak `realm_access.roles`, custom CA for internal PKI, configurable clock-skew/JWKS-TTL/timeout; IdP role claims cross only through the sanitized seam — gateway/operator delegation markers plus an operator allowlist, everything else dropped). REST request rate limiting is opt-in via `PROXIMADB_REST_RATE_LIMIT_RPM` (TD-RATE-1; default off — unset adds no middleware layer; per observed client IP, `/health` exempt, process-global ceiling at 10x the per-IP cap). Deprecated claim use and dropped tier claims are metered (`proximadb_deprecated_claim_uses_total`, `proximadb_tier_claims_dropped_total`) — the Flight legacy-alias retirement gate is `increase(proximadb_deprecated_claim_uses_total[7d]) == 0`. Claim *names* come from one shared vocabulary across all four surfaces (TD-TENANT-3): `x-tenant-id` / `x-tenant-tier` are canonical everywhere, Arrow Flight additionally DETECTS three deprecated tenant-alias names (`x-proximadb-tenant-id`, `tenant-id`, `tenant_id`) for deprecation warning only — they no longer grant a tenant (honoring removed 2026-08-29; the names are deleted at the next release boundary), and a stamped tier claim is normalized to a canonical tier id at the boundary so an alias and its canonical spelling resolve to the same cache entitlement.
+| Security admin/status APIs and certificate revocation checking are absent (TD-SECOPS-1). pgwire authentication is dual-mode (TD-PGWIRE-AUTH-1): the dev default is trust, and `[security.authentication] enabled` (or `PROXIMADB_PGWIRE_AUTH=password`) requires SCRAM-SHA-256 — under SCRAM, strict policies AUTHENTICATE pgwire tenant selection and the `proximadb_tier` claim through the credential's binding instead of disabling them; under the dev trust default, authenticated-only and gateway-only still reject explicit non-default tenant assertions rather than authenticate them, the reserved literal `default` remains accepted, and an omitted startup database selects the configured default only in single-tenant mode. ADR-031 tenant stable-id minting behind the `TenantStableIdResolver` port is pending (TD-TENANT-1).
 
 | Hybrid retrieval
 | Beta
@@ -382,13 +382,13 @@ in the Current Matrix stay authoritative for API-level claims. `StorageEngineStr
 
 | SST
 | Supported
-| Default engine (`StorageEngineStrategy::Sst`, factory `create_sst`). Hybrid columnar OLTP/LSM over PAX blocks; serves the Supported vector surface.
+| Supported engine (`StorageEngineStrategy::Sst`, factory `create_sst`); REST/gRPC creates that omit the engine are auto-routed to HELIX until v0.5 (TD-ENGSEL-1). Hybrid columnar OLTP/LSM over PAX blocks; serves the Supported vector surface.
 | The safe default for adoption and examples.
 
 | VIPER
 | Deprecated
 | `Viper` variant, factory-reachable, ungated (stage 1). Columnar Parquet with advanced quantization; analytics-leaning. DEPRECATED per ADR-093 — staged retirement in progress (TD-VIPER-1).
-| Do NOT create new VIPER collections: use SST (default), NOVA (columnar-analytics vector), or the DataFusion/Parquet path (analytics). Existing collections remain readable; stage 2 rejects new selections at the collection boundary while preserving legacy reads, and stage 3 requires verified migration of all persisted VIPER collections before code removal.
+| Do NOT create new VIPER collections: use SST (Supported), NOVA (columnar-analytics vector), or the DataFusion/Parquet path (analytics). Existing collections remain readable; stage 2 rejects new selections at the collection boundary while preserving legacy reads, and stage 3 requires verified migration of all persisted VIPER collections before code removal.
 
 | HELIX
 | Beta
@@ -460,16 +460,20 @@ in the Current Matrix stay authoritative for API-level claims. `StorageEngineStr
 | Tier and scope per the "ORION graph operations" row above; not part of `StorageEngineStrategy`.
 |===
 
-== Not Supported in v0.2
+[[_not_supported_in_v0_2]]
+== Not Supported in the current release
 
-The v0.2 release ships **single-node**, **CRUD-only** writes, and **per-request** freshness/route
-controls. The items below are out of scope for v0.2; do not document, demo, or release-note them as
+This section was titled "Not Supported in v0.2"; API docs generated from the OpenAPI spec still
+cite that title.
+
+The current release ships **single-node**, **CRUD-only** writes, and **per-request** freshness/route
+controls. The items below are out of scope for the current release; do not document, demo, or release-note them as
 supported. The live source of truth for write contract is the
 `WriteContractHealth` block in route-health (`src/network/rest/v2/collections.rs:869-880`,
 GET `/api/v2/_diagnostics/collections/{collection_id}/route-health`):
 
 |===
-| Surface | Status in v0.2 | Live signal
+| Surface | Status | Live signal
 
 | Optimistic versioning (compare-and-set on insert/upsert)
 | Not supported
@@ -493,11 +497,11 @@ GET `/api/v2/_diagnostics/collections/{collection_id}/route-health`):
 | `FreshnessHealth.collection_level_modes_wired = false`
   (`src/network/rest/v2/collections.rs:1114-1126`). Per-request `freshness_mode`
   (`Strong`/`BoundedStale{max_staleness_ms}`/`StaleOk`) is honored;
-  collection-default is not catalog-persisted in v0.2. See TD-074.
+  collection-default is not catalog-persisted yet. See TD-074.
 
 | Filtered ANN per-collection policy
 | Not supported (default policy only)
-| `AnnFilteringPolicy` runs from the default in v0.2; per-collection catalog
+| `AnnFilteringPolicy` runs from the default today; per-collection catalog
   policy plumbing tracked in TD-073. A deterministic recall-band harness exists
   at `tests/filtered_ann_recall_bands.rs`, but it is intentionally ignored
   while ADR-011 remains Beta; no recall SLA is claimed.
@@ -511,9 +515,9 @@ GET `/api/v2/_diagnostics/collections/{collection_id}/route-health`):
 
 If a release note or SDK doc implies any of the above works, file a doc fix before the cut.
 
-== Experimental in v0.2 (do not market as implemented)
+== Experimental in the current release (do not market as implemented)
 
-These surfaces have code foundations but are not part of the v0.2 product story. Release collateral
+These surfaces have code foundations but are not part of the current product story. Release collateral
 must not list them under "supported", "production", or "ready":
 
 * Distributed cluster execution (Raft transport / remote execution placeholders).
@@ -521,7 +525,9 @@ must not list them under "supported", "production", or "ready":
 * Full SQL parity (ADR-018 Phase 2/3 — Postgres parity).
 * PostgreSQL-style OLTP/HTAP parity: full MVCC transactions, FK/PK/unique/check enforcement,
   native row/delta indexes, DataFusion snapshot-plus-delta reads, and distributed consistency gates
-  are tracked in TD-110 and are not part of v0.2.
+  are tracked in TD-110 and are not part of the current release. The storage and transaction design for
+  Postgres-compatible OLTP (atomic commit record, reattachable durable WAL volume with epoch
+  fencing, LSN-snapshot MVCC, row locks) is planned in ADR-095 (TD-PGOLTP-1..10).
 * External-table execution (Iceberg / Delta / Hudi as Proxima-owned hot authority).
 * Iceberg v3 interop _write/export_ — `ALTER TABLE … MATERIALIZE` over pgwire emits a
   spec-shaped Iceberg v3 table (`v*.metadata.json` referencing an Avro manifest list + manifest)
@@ -537,14 +543,17 @@ must not list them under "supported", "production", or "ready":
 * Trino / Spark compute adapters — _scaffolded_ (Spark JNI bridge per TD-097; Trino Flight per TD-098). Structural contract gates land in 2026-05-30 connector sprint (`tests/connectors_flight_contract.rs`); end-to-end wire impl deferred.
 * Hadoop InputFormat / OutputFormat — _write-side wire-true_ (`ProximaRecordWriter::flush_now` posts spec-true `/api/v2/.../records/batch`); read-side unblocked: the records-scan endpoint pages by cursor (TD-099; the cursor-identity 400 fixed 2026-08).
 * DuckDB connector — _Rust-side wire-true for bind / search / insert_ (`src/connectors/duckdb.rs`); DuckDB extension binary compilation + scan-via-Flight are separate follow-ups.
-* All "Not Supported in v0.2" items above.
+* All "Not Supported in the current release" items above.
 
 == Positioning Guidance
 
-ProximaDB should currently be positioned as a developer-first context database:
+ProximaDB is a SQL-first context engine on object storage (ADR-096). Position what is supported today
+within that direction:
 
 * MVP wedge: object-storage-native context serving for typed JSON properties and vector retrieval.
-* One canonical REST v2 record path with SST as the safe single-node default.
+* The SQL front door (pgwire) is the direction and is Beta today; it is not claimed as Supported until
+  it enters the MVP corridor (roadmap v1.0).
+* One canonical REST v2 record path with SST as the Supported single-node engine (set it explicitly until TD-ENGSEL-1 lands).
 * Best fit today for metadata-aware semantic retrieval without a separate vector/payload join.
 * Not yet a like-for-like replacement for best-in-class distributed vector, graph, document, or observability platforms.
 

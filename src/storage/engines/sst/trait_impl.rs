@@ -26,6 +26,7 @@ use tracing::{debug, info};
 
 use crate::core::search::results::OptimizedSearchRecord;
 use crate::storage::engines::sst::core::SstEngine;
+use crate::storage::engines::sst::{BACKGROUND_COMPACTION_HINT, COLLECTION_META_COMPLETE_HINT};
 use crate::storage::traits::{
     CompactionParameters, CompactionResult, FlushParameters, FlushResult, StorageFormatStrategy,
     StorageQueryContext, UnifiedStorageFormat,
@@ -184,6 +185,33 @@ impl UnifiedStorageFormat for SstEngine {
     async fn do_compact(&self, params: &CompactionParameters) -> Result<CompactionResult> {
         info!("🔄 SST: Starting compaction operation");
 
+        // TD-READFID-2 review: the compaction task fixes the output's base
+        // quant, rg layout and arming from the collection's catalog meta (tags +
+        // `pax_vector_quant`). A producer that cannot supply that meta must not
+        // enqueue a quant-deciding task on a guess — it defers to the
+        // meta-aware producers (the flush trigger, the background manager).
+        let collection_tags: &[String] = match params
+            .collection_config
+            .as_ref()
+            .and_then(|collection| collection.config.as_ref())
+        {
+            Some(config)
+                if params
+                    .hints
+                    .get(COLLECTION_META_COMPLETE_HINT)
+                    .and_then(|value| value.as_bool())
+                    != Some(false) =>
+            {
+                config.tags.as_slice()
+            }
+            _ => {
+                anyhow::bail!(
+                    "SST compaction declined: the caller supplied no catalog collection meta \
+                     (tags + pax_vector_quant), so the output encoding cannot be resolved; \
+                     deferring to a meta-aware compaction producer"
+                );
+            }
+        };
         let collection_id = params.get_collection_id()?;
         let collection_object_id = params.get_collection_object_id()?;
         let collection_dir = params.get_data_dir()?;
@@ -196,8 +224,32 @@ impl UnifiedStorageFormat for SstEngine {
             .as_ref()
             .map(|config| config.l0_file_threshold)
             .unwrap_or(self.config().compaction_threshold as usize);
+        // Only a BACKGROUND producer honours the per-collection arming +
+        // threshold cascade the flush trigger uses. An explicit operator
+        // request keeps its pre-existing semantics: never disarmed by
+        // `compaction:off` / `workload_profile:churn`, configured threshold.
+        let background = !params.force
+            && params
+                .hints
+                .get(BACKGROUND_COMPACTION_HINT)
+                .and_then(|value| value.as_bool())
+                == Some(true);
+        if background && !proximadb_storage_common::resolve_compaction_armed(collection_tags) {
+            return Ok(CompactionResult {
+                success: true,
+                collections_affected: vec![collection_id],
+                completed_at: chrono::Utc::now(),
+                engine_metrics: HashMap::from([(
+                    "task_enqueued".to_string(),
+                    serde_json::json!(false),
+                )]),
+                ..Default::default()
+            });
+        }
         let l0_threshold = if params.force {
             1
+        } else if background {
+            proximadb_storage_common::resolve_l0_threshold(collection_tags, configured_l0_threshold)
         } else {
             configured_l0_threshold
         };
@@ -226,12 +278,7 @@ impl UnifiedStorageFormat for SstEngine {
             });
         // TD-PAXRG-1: resolve the row-group switch from the collection's
         // `pax_rg_layout` tag (same precedence the flush seam applies).
-        let rg_tags = params
-            .collection_config
-            .as_ref()
-            .and_then(|c| c.config.as_ref())
-            .map(|cfg| cfg.tags.as_slice())
-            .unwrap_or(&[]);
+        let rg_tags = collection_tags;
         let enqueued = compaction
             .enqueue_due_compaction(
                 collection_object_id,
@@ -240,6 +287,10 @@ impl UnifiedStorageFormat for SstEngine {
                 l0_threshold,
                 precision_hint,
                 Some(super::flush::resolve_pax_rg_layout(rg_tags)),
+                // TD-READFID-2 review: same base-quant resolution as flush.
+                Some(super::flush::resolve_pax_vector_quant(
+                    params.collection_config.as_ref(),
+                )),
             )
             .await?;
 
@@ -637,13 +688,22 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let data_dir = directory.path().join("7").join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
+        // TD-READFID-2 review: SST compaction now requires the catalog meta
+        // (it fixes the output's base quant / rg layout / arming); a bare
+        // `data_dir` hint without it is declined — see the next test.
+        let meta = crate::proto::proximadb_v1::Collection {
+            id: "7".to_string(),
+            config: Some(crate::proto::proximadb_v1::CollectionConfig::default()),
+            storage_assignment: Some(crate::proto::proximadb_v1::StorageAssignment {
+                base_location: directory.path().to_string_lossy().into_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let params = CompactionParameters {
             collection_id: Some("7".to_string()),
             synchronous: true,
-            hints: HashMap::from([(
-                "data_dir".to_string(),
-                serde_json::json!(data_dir.to_string_lossy()),
-            )]),
+            collection_config: Some(meta),
             ..Default::default()
         };
 
@@ -655,6 +715,28 @@ mod tests {
             result.engine_metrics.get("task_enqueued"),
             Some(&serde_json::json!(false))
         );
+    }
+
+    /// TD-READFID-2 review: a producer with only a `data_dir` hint (no
+    /// catalog meta) is declined instead of compacting on a guessed encoding.
+    #[tokio::test]
+    async fn meta_less_explicit_compaction_is_declined() {
+        let engine = create_test_engine().await;
+        let directory = tempfile::tempdir().unwrap();
+        let params = CompactionParameters {
+            collection_id: Some("7".to_string()),
+            synchronous: true,
+            hints: HashMap::from([(
+                "data_dir".to_string(),
+                serde_json::json!(directory.path().to_string_lossy()),
+            )]),
+            ..Default::default()
+        };
+        let error = engine
+            .do_compact(&params)
+            .await
+            .expect_err("a meta-less compaction request must be declined");
+        assert!(error.to_string().contains("no catalog collection meta"));
     }
 
     async fn create_test_engine() -> SstEngine {

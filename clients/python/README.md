@@ -21,20 +21,20 @@ Extras compose, e.g. `pip install 'proximadb[embeddings,langchain,llama_index]'`
 ## Quickstart
 
 ```python
-from proximadb_sdk import ProximaDBClient
+from proximadb_sdk import ProximaDBClient, Protocol
 
-client = ProximaDBClient(url="http://localhost:5678")
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 client.create_collection("docs", dimension=384)
 client.insert("docs", vectors=[...], ids=[...])
-hits = client.search("docs", query=[...], top_k=5)
+hits = client.search("docs", vector=[...], top_k=5)
 ```
 
 Embedded (in-process, no server):
 
 ```python
-from proximadb_embedded import Client  # requires the [embedded] extra
+from proximadb_embedded import ProximaDB  # requires the [embedded] extra
 
-db = Client(data_dir="./data")
+db = ProximaDB(data_dirs="./data")
 ```
 
 ## Transports

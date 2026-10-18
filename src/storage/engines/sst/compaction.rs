@@ -211,6 +211,135 @@ pub struct SstCompactionTask {
     /// value is honored at BOTH compaction executors (spill + atomic/in-place)
     /// so an opted-out collection's rewrite output stays intent-matched.
     pub rg_layout: Option<bool>,
+    /// TD-READFID-2 review: the collection's base vector quant, resolved by the
+    /// task producer with the flush resolver (`resolve_pax_vector_quant`:
+    /// kill-switch / `pax_vector_format:off` -> RawF32 > `pax_vector_quant` >
+    /// env > RaBitQ). `None` = resolve with no collection config (env > RaBitQ),
+    /// exactly what flush does without a config. Compaction used to hardcode
+    /// RaBitQ, silently re-encoding an sq8 or RawF32 collection on its first
+    /// compaction.
+    pub vector_quant: Option<proximadb_block_format::VectorQuant>,
+}
+
+impl SstCompactionTask {
+    /// The collection's resolved base quant for this task's PAX output.
+    fn resolved_vector_quant(&self) -> proximadb_block_format::VectorQuant {
+        self.vector_quant
+            .unwrap_or_else(|| super::flush::resolve_pax_vector_quant(None))
+    }
+
+    /// Base quant and exact-tier decision for this task's PAX output, given
+    /// what its inputs declare (the intersection rule). Mirrors flush: a RawF32
+    /// base is already exact, so it never adds the duplicate tier. A RawF32
+    /// output is only written when every input is exact; otherwise it would
+    /// relabel lossy reconstructions as authoritative raw f32, so the output
+    /// falls back to the default RaBitQ (no tier). A non-vector compaction
+    /// (`carries_vectors == false`) has nothing to tier and logs nothing.
+    pub(crate) fn pax_output_encoding(
+        &self,
+        inputs: &crate::storage::engines::sst::segment_format::PaxCompactionInputTiers,
+    ) -> (proximadb_block_format::VectorQuant, bool) {
+        use proximadb_block_format::VectorQuant;
+        let quant = self.resolved_vector_quant();
+        if !inputs.carries_vectors {
+            return (quant, false);
+        }
+        if quant == VectorQuant::RawF32 {
+            if inputs.f32_tier {
+                return (VectorQuant::RawF32, false);
+            }
+            warn!(
+                output = %self.output_file.display(),
+                "compaction: collection resolves a RawF32 base but not every input is exact; \
+                 writing RaBitQ instead of relabelling lossy vectors as raw f32"
+            );
+            return (VectorQuant::RaBitQ, false);
+        }
+        (quant, inputs.f32_tier)
+    }
+
+    /// TD-READFID-2 review: a task derived from this one (the worker's
+    /// higher-level follow-up) must carry every collection-intent field the
+    /// producer resolved from the catalog meta. `check_compaction_needed` is
+    /// config-free and builds tasks with these unset, so without this an sq8
+    /// collection's L1->L2 compaction re-encoded as RaBitQ.
+    pub(crate) fn inherit_collection_intent(&mut self, origin: &SstCompactionTask) {
+        self.collection_identity = origin.collection_identity;
+        self.rg_layout = origin.rg_layout;
+        self.vector_quant = origin.vector_quant;
+        self.precision_hint = origin.precision_hint;
+        self.block_size_kb = origin.block_size_kb;
+        self.compression_config = origin.compression_config.clone();
+    }
+}
+
+/// Why a compaction was deliberately NOT performed. A declined task leaves
+/// every input authoritative; it is not an error and is not retried in a loop
+/// (the next trigger re-evaluates). Surfaced as
+/// `proximadb_compaction_declined_total{reason}` plus a rate-limited warn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionDeclineReason {
+    /// The local-spill executor writes coalesced RaBitQ only, and the
+    /// collection's base quant (e.g. SQ8) has no exact-preserving spill form.
+    SpillBaseQuantUnsupported,
+    /// A RawF32 collection's spill output would need every input to be exact
+    /// (RaBitQ + exact tier keeps the values); at least one input is lossy.
+    SpillInputsNotExact,
+}
+
+impl CompactionDeclineReason {
+    /// Stable metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SpillBaseQuantUnsupported => "spill_base_quant_unsupported",
+            Self::SpillInputsNotExact => "spill_inputs_not_exact",
+        }
+    }
+}
+
+/// Result of one compaction attempt that did not fail.
+#[derive(Debug, Clone)]
+pub enum CompactionOutcome {
+    /// The inputs were merged and retired.
+    Completed(SstCompactionStats),
+    /// The compaction was declined; inputs are untouched.
+    Declined(CompactionDeclineReason),
+}
+
+impl CompactionOutcome {
+    /// The stats of a completed compaction, `None` when declined.
+    pub fn completed(self) -> Option<SstCompactionStats> {
+        match self {
+            Self::Completed(stats) => Some(stats),
+            Self::Declined(_) => None,
+        }
+    }
+}
+
+/// Count a declined compaction and warn at most once a minute per process.
+fn record_compaction_declined(task: &SstCompactionTask, reason: CompactionDeclineReason) {
+    use std::sync::atomic::AtomicI64;
+    static LAST_WARN_SECS: AtomicI64 = AtomicI64::new(i64::MIN);
+    if let Some(counter) = crate::metrics::operational_metrics::COMPACTION_DECLINED_TOTAL.as_ref() {
+        counter.with_label_values(&[reason.label()]).inc();
+    }
+    let now = Utc::now().timestamp();
+    let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 60
+        && LAST_WARN_SECS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            collection_object_id = task.collection_object_id,
+            level = task.level,
+            input_files = task.input_files.len(),
+            reason = reason.label(),
+            "compaction declined for collection {}; inputs left authoritative \
+             (rate-limited: 1/min process-wide, see compaction_declined_total)",
+            task.collection_object_id
+        );
+    }
 }
 
 fn training_follow_up_threshold(
@@ -922,6 +1051,7 @@ impl Compaction {
         l0_threshold: usize,
         precision_hint: Option<proximadb_records::EmbeddingScalarType>,
         rg_layout: Option<bool>,
+        vector_quant: Option<proximadb_block_format::VectorQuant>,
     ) -> Result<bool> {
         let Some(mut task) = self
             .check_compaction_needed(
@@ -935,6 +1065,7 @@ impl Compaction {
             return Ok(false);
         };
         task.rg_layout = rg_layout;
+        task.vector_quant = vector_quant;
         task.collection_identity = collection_identity;
         // TD-COMPACT-6 D1: the worker clears the shared training_in_flight guard
         // for this collection on completion. It derives the collection dir from
@@ -1055,6 +1186,7 @@ impl Compaction {
                 compression_config: None, // Use server default
                 precision_hint,
                 rg_layout: None,
+                vector_quant: None,
             }));
         }
 
@@ -1218,7 +1350,20 @@ impl Compaction {
                     .perform_compaction_with_plan(&task, resource_plan)
                     .await
                 {
-                    Ok(compaction_stats) => {
+                    // Declined: inputs untouched, already counted + warned in
+                    // `record_compaction_declined`. No follow-up: the level
+                    // geometry did not change, so re-evaluating would only
+                    // re-decline in a loop.
+                    Ok(CompactionOutcome::Declined(reason)) => {
+                        debug!(
+                            collection_object_id = task.collection_object_id,
+                            reason = reason.label(),
+                            "Compaction declined for level {}",
+                            task.level
+                        );
+                        false
+                    }
+                    Ok(CompactionOutcome::Completed(compaction_stats)) => {
                         info!(
                             "Compaction completed for level {} in {}ms: {} files merged -> {}",
                             task.level,
@@ -1292,10 +1437,11 @@ impl Compaction {
                         .await
                     {
                         Ok(Some(mut follow_up)) => {
-                            // TD-PAXRG-1: the follow-up carries the ORIGINAL
-                            // task's rg resolution — the collection's intent
-                            // must not drift between compaction rounds.
-                            follow_up.rg_layout = task.rg_layout;
+                            // TD-PAXRG-1 / TD-READFID-2 review: the follow-up
+                            // carries the ORIGINAL task's collection intent (rg
+                            // layout, base quant, identity, …) — it must not
+                            // drift between compaction rounds.
+                            follow_up.inherit_collection_intent(&task);
                             let follow_up_level = follow_up.level;
                             match compaction.schedule_compaction(follow_up).await {
                                 Ok(true) => {
@@ -1397,7 +1543,7 @@ impl Compaction {
     /// Perform the actual compaction operation on a task, using this
     /// persistent instance's config + atomic coordinator. Called by the
     /// background workers (which hold an `Arc<Compaction>` clone).
-    async fn perform_compaction(&self, task: &SstCompactionTask) -> Result<SstCompactionStats> {
+    async fn perform_compaction(&self, task: &SstCompactionTask) -> Result<CompactionOutcome> {
         let config = self
             .config
             .compaction_config
@@ -1416,12 +1562,17 @@ impl Compaction {
         &self,
         task: &SstCompactionTask,
         plan: CompactionResourcePlan,
-    ) -> Result<SstCompactionStats> {
+    ) -> Result<CompactionOutcome> {
         if plan.mode == CompactionExecutionMode::LocalSpill {
-            return Ok(self
-                .perform_local_spill_compaction(task, plan)
-                .await?
-                .base_stats);
+            return Ok(
+                match self.perform_local_spill_compaction(task, plan).await? {
+                    Ok(stats) => CompactionOutcome::Completed(stats.base_stats),
+                    Err(reason) => {
+                        record_compaction_declined(task, reason);
+                        CompactionOutcome::Declined(reason)
+                    }
+                },
+            );
         }
         let enhanced_stats = self
             .perform_unified_canonical_compaction(
@@ -1432,7 +1583,7 @@ impl Compaction {
                 MergedVectorTracking::Disabled,
             )
             .await?;
-        Ok(enhanced_stats.base_stats)
+        Ok(CompactionOutcome::Completed(enhanced_stats.base_stats))
     }
 
     /// Retire immutable inputs only after their replacement is published (or
@@ -1583,10 +1734,59 @@ impl Compaction {
     /// Execute the bounded construction selected by dual-resource admission.
     /// Inputs remain authoritative until the final PAX has been uploaded and
     /// atomically published; every scratch owner is RAII-cleaned on error.
+    /// Local-spill executor entry. The spill writer emits coalesced RaBitQ, so
+    /// the collection's base quant decides admission BEFORE any scratch work:
+    /// * RaBitQ: compact; the exact tier follows the intersection rule.
+    /// * RawF32 (`pax_vector_format:off` / kill-switch): compact to RaBitQ +
+    ///   the exact tier when every input is exact — the values stay exact and
+    ///   only the encoding cost changes; otherwise decline.
+    /// * anything else (e.g. SQ8): decline — there is no spill form that keeps
+    ///   the collection's chosen base quant.
+    ///
+    /// A declined task is `Ok(Err(reason))` (typed, not an error); an input the
+    /// tier probe cannot read aborts with `Err` and keeps the inputs.
     async fn perform_local_spill_compaction(
         &self,
         task: &SstCompactionTask,
         plan: CompactionResourcePlan,
+    ) -> Result<std::result::Result<EnhancedSstCompactionStats, CompactionDeclineReason>> {
+        use proximadb_block_format::VectorQuant;
+        if compaction_output_format(&task.input_files) != BlockFormat::PaxBlock
+            || task
+                .input_files
+                .iter()
+                .any(|path| path.extension().and_then(|value| value.to_str()) != Some("pax"))
+        {
+            return Err(crate::core::StorageError::SstEngine(
+                "local-spill compaction currently requires PAX-only inputs".to_string(),
+            ));
+        }
+        let input_tiers = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers(
+            &self.filesystem_port(),
+            &task.input_files,
+        )
+        .await
+        .map_err(|error| {
+            crate::core::StorageError::SstEngine(format!(
+                "local-spill compaction aborted, inputs kept: {error}"
+            ))
+        })?;
+        let f32_tier = match task.resolved_vector_quant() {
+            VectorQuant::RaBitQ => input_tiers.f32_tier,
+            VectorQuant::RawF32 if input_tiers.f32_tier => true,
+            VectorQuant::RawF32 => return Ok(Err(CompactionDeclineReason::SpillInputsNotExact)),
+            _ => return Ok(Err(CompactionDeclineReason::SpillBaseQuantUnsupported)),
+        };
+        self.perform_local_spill_compaction_admitted(task, plan, f32_tier)
+            .await
+            .map(Ok)
+    }
+
+    async fn perform_local_spill_compaction_admitted(
+        &self,
+        task: &SstCompactionTask,
+        plan: CompactionResourcePlan,
+        f32_tier: bool,
     ) -> Result<EnhancedSstCompactionStats> {
         use crate::storage::engines::sst::compaction_spill::{
             ExternalClusterOutput, ExternalMvccOutput, SpillTaskScratch, cluster_external_mvcc,
@@ -1858,12 +2058,8 @@ impl Compaction {
                 SpillOrdering::Ivf(output) => Some(output.model().clone()),
                 SpillOrdering::Mvcc(_) => None,
             };
-            // TD-PAXRG-1: the exact tier follows the INTERSECTION rule — the
-            // spill executor must not silently drop it when every input is
-            // exact (same resolution the non-spill arms perform).
-            let f32_tier = crate::storage::engines::sst::segment_format::pax_inputs_have_f32_tier(
-                &task.input_files,
-            );
+            // TD-PAXRG-1 / TD-READFID-2: the exact tier was resolved by the
+            // spill entry from the inputs (intersection rule, port reads).
             let mut writer =
                 crate::storage::engines::sst::segment_format::pax_spill_compaction_writer(
                     Path::new(staged.local_path()),
@@ -1872,7 +2068,11 @@ impl Compaction {
                     1,
                     proximadb_block_format::VectorQuant::Sq8,
                     f32_tier,
-                    crate::storage::engines::sst::segment_format::rg_layout_enabled(),
+                    // TD-PAXRG-1: honour the producer-resolved rg switch
+                    // (tag > env > default), as the canonical arms now do.
+                    task.rg_layout.unwrap_or_else(
+                        crate::storage::engines::sst::segment_format::rg_layout_enabled,
+                    ),
                     target_block,
                     usize::try_from(mvcc_stats.output_records).map_err(|_| {
                         crate::core::StorageError::SstEngine(
@@ -2445,16 +2645,29 @@ impl Compaction {
                         std::fs::create_dir_all(parent)
                             .map_err(crate::core::StorageError::DiskIO)?;
                     }
-                    let f32_tier =
-                        crate::storage::engines::sst::segment_format::pax_inputs_have_f32_tier(
-                            &task.input_files,
-                        );
-                    // Preserve the source segments' tier-2 rerank quant (SQ8/FP16/f32)
-                    // through compaction — see `pax_inputs_rerank_quant`.
-                    let rerank_quant =
-                        crate::storage::engines::sst::segment_format::pax_inputs_rerank_quant(
-                            &task.input_files,
-                        );
+                    // TD-READFID-2: the exact tier (intersection rule) and the
+                    // source tier-2 rerank quant (SQ8/FP16/f32) are read from the
+                    // inputs through the filesystem port — inputs are storage
+                    // URLs, which `std::fs` cannot open.
+                    // A probe READ failure aborts here, before any output is
+                    // written or any input retired: classifying it as "not
+                    // exact" would publish a tierless output and delete the
+                    // only exact copies (TD-READFID-2 review).
+                    let input_tiers = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers_for_records(
+                        &self.filesystem_port(),
+                        &task.input_files,
+                        &records,
+                    )
+                    .await
+                    .map_err(|error| {
+                        crate::core::StorageError::SstEngine(format!(
+                            "compaction aborted, inputs kept: {error}"
+                        ))
+                    })?;
+                    let rerank_quant = input_tiers.rerank_quant;
+                    // TD-READFID-2 review: the collection's base quant, resolved
+                    // exactly as flush resolves it (never a hardcoded RaBitQ).
+                    let (base_quant, f32_tier) = task.pax_output_encoding(&input_tiers);
                     // TD-COMPACT-2 root cause: this argument is the collection's
                     // embedding-MODALITY count, not the record count. Passing
                     // `records.len()` made the block writer allocate one embedding
@@ -2486,13 +2699,14 @@ impl Compaction {
                                 &records,
                                 &collection_id,
                                 embedding_count,
-                                proximadb_block_format::VectorQuant::RaBitQ,
+                                base_quant,
                                 rerank_quant,
                                 f32_tier,
                                 None,
                                 cache_on_write.includes_survivors(),
                                 &shred_spec,
-                             task.output_file.to_str())
+                                task.output_file.to_str(),
+                                task.rg_layout)
                             .map_err(|e| {
                                 crate::core::StorageError::SstEngine(format!(
                                     "PAX compaction write failed: {e}"
@@ -2505,12 +2719,13 @@ impl Compaction {
                             &records,
                             &collection_id,
                             embedding_count,
-                            proximadb_block_format::VectorQuant::RaBitQ,
+                            base_quant,
                             rerank_quant,
                             f32_tier,
                             None,
                             &shred_spec,
-                         task.output_file.to_str())
+                            task.output_file.to_str(),
+                            task.rg_layout)
                         .map_err(|e| {
                             crate::core::StorageError::SstEngine(format!(
                                 "PAX compaction write failed: {e}"
@@ -2612,16 +2827,29 @@ impl Compaction {
                         std::fs::create_dir_all(parent)
                             .map_err(crate::core::StorageError::DiskIO)?;
                     }
-                    let f32_tier =
-                        crate::storage::engines::sst::segment_format::pax_inputs_have_f32_tier(
-                            &task.input_files,
-                        );
-                    // Preserve the source segments' tier-2 rerank quant (SQ8/FP16/f32)
-                    // through compaction — see `pax_inputs_rerank_quant`.
-                    let rerank_quant =
-                        crate::storage::engines::sst::segment_format::pax_inputs_rerank_quant(
-                            &task.input_files,
-                        );
+                    // TD-READFID-2: the exact tier (intersection rule) and the
+                    // source tier-2 rerank quant (SQ8/FP16/f32) are read from the
+                    // inputs through the filesystem port — inputs are storage
+                    // URLs, which `std::fs` cannot open.
+                    // A probe READ failure aborts here, before any output is
+                    // written or any input retired: classifying it as "not
+                    // exact" would publish a tierless output and delete the
+                    // only exact copies (TD-READFID-2 review).
+                    let input_tiers = crate::storage::engines::sst::segment_format::pax_compaction_input_tiers_for_records(
+                        &self.filesystem_port(),
+                        &task.input_files,
+                        &records,
+                    )
+                    .await
+                    .map_err(|error| {
+                        crate::core::StorageError::SstEngine(format!(
+                            "compaction aborted, inputs kept: {error}"
+                        ))
+                    })?;
+                    let rerank_quant = input_tiers.rerank_quant;
+                    // TD-READFID-2 review: the collection's base quant, resolved
+                    // exactly as flush resolves it (never a hardcoded RaBitQ).
+                    let (base_quant, f32_tier) = task.pax_output_encoding(&input_tiers);
                     // TD-COMPACT-2 root cause: embedding-MODALITY count, not the
                     // record count — see the atomic-path call above.
                     let embedding_count = records
@@ -2645,13 +2873,14 @@ impl Compaction {
                                 &records,
                                 &collection_id,
                                 embedding_count,
-                                proximadb_block_format::VectorQuant::RaBitQ,
+                                base_quant,
                                 rerank_quant,
                                 f32_tier,
                                 None,
                                 cache_on_write.includes_survivors(),
                                 &shred_spec,
-                             task.output_file.to_str())
+                                task.output_file.to_str(),
+                                task.rg_layout)
                             .map_err(|e| {
                                 crate::core::StorageError::SstEngine(format!(
                                     "PAX compaction write failed: {e}"
@@ -2664,12 +2893,13 @@ impl Compaction {
                             &records,
                             &collection_id,
                             embedding_count,
-                            proximadb_block_format::VectorQuant::RaBitQ,
+                            base_quant,
                             rerank_quant,
                             f32_tier,
                             None,
                             &shred_spec,
-                         task.output_file.to_str())
+                            task.output_file.to_str(),
+                            task.rg_layout)
                         .map_err(|e| {
                             crate::core::StorageError::SstEngine(format!(
                                 "PAX compaction write failed: {e}"
@@ -3222,6 +3452,72 @@ mod tests;
 mod compaction_format_tests {
     use super::BlockFormat;
     use super::compaction_output_format;
+    use super::{CompactionPriority, SstCompactionTask};
+    use std::path::PathBuf;
+
+    fn quant_task(vector_quant: Option<proximadb_block_format::VectorQuant>) -> SstCompactionTask {
+        SstCompactionTask {
+            collection_object_id: 7,
+            collection_identity: crate::core::stable_id::CollectionIdentity::default(),
+            level: 0,
+            input_files: Vec::new(),
+            input_bytes: 0,
+            output_file: PathBuf::from("/tmp/out.pax"),
+            priority: CompactionPriority::Medium,
+            block_size_kb: None,
+            compression_config: None,
+            precision_hint: None,
+            rg_layout: None,
+            vector_quant,
+        }
+    }
+
+    /// TD-READFID-2 review: the PAX output encoding follows the collection's
+    /// resolved base quant, never a hardcoded RaBitQ — and a RawF32 output is
+    /// only written when every input is exact, so lossy reconstructions are
+    /// never relabelled as authoritative raw f32.
+    #[test]
+    fn pax_output_encoding_follows_the_resolved_base_quant() {
+        use proximadb_block_format::VectorQuant;
+        let tiers =
+            |exact: bool| crate::storage::engines::sst::segment_format::PaxCompactionInputTiers {
+                f32_tier: exact,
+                rerank_quant: VectorQuant::Sq8,
+                carries_vectors: true,
+            };
+        assert_eq!(
+            quant_task(Some(VectorQuant::Sq8)).pax_output_encoding(&tiers(true)),
+            (VectorQuant::Sq8, true)
+        );
+        assert_eq!(
+            quant_task(Some(VectorQuant::Sq8)).pax_output_encoding(&tiers(false)),
+            (VectorQuant::Sq8, false)
+        );
+        assert_eq!(
+            quant_task(Some(VectorQuant::RaBitQ)).pax_output_encoding(&tiers(true)),
+            (VectorQuant::RaBitQ, true)
+        );
+        // RawF32 is already exact: no duplicate tier.
+        assert_eq!(
+            quant_task(Some(VectorQuant::RawF32)).pax_output_encoding(&tiers(true)),
+            (VectorQuant::RawF32, false)
+        );
+        // Lossy inputs must not be relabelled exact.
+        assert_eq!(
+            quant_task(Some(VectorQuant::RawF32)).pax_output_encoding(&tiers(false)),
+            (VectorQuant::RaBitQ, false)
+        );
+        // Non-vector compactions have nothing to tier (and must not warn).
+        let non_vector = crate::storage::engines::sst::segment_format::PaxCompactionInputTiers {
+            f32_tier: false,
+            rerank_quant: VectorQuant::Sq8,
+            carries_vectors: false,
+        };
+        assert_eq!(
+            quant_task(Some(VectorQuant::RawF32)).pax_output_encoding(&non_vector),
+            (VectorQuant::RawF32, false)
+        );
+    }
 
     /// M1-3 (ADR-049): compaction output format follows the INPUT segments' format
     /// — PAX is the only vector write format, so `.pax` inputs compact to `.pax`

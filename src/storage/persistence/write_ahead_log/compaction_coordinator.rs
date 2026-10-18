@@ -681,7 +681,12 @@ impl CompactionCoordinator {
             collection_id
         );
 
-        // Use SST's do_compact method through unified framework
+        // Use SST's do_compact method through unified framework.
+        // TD-READFID-2 review: this producer has only the collection id, not the
+        // catalog meta (tags + `pax_vector_quant`) that fixes the output's base
+        // quant / rg layout / arming, so `collection_config` stays `None` and the
+        // SST engine declines rather than guess; the flush trigger and the
+        // background manager are the meta-aware producers.
         let params = crate::storage::CompactionParameters {
             collection_id: Some(collection_id.to_string()),
             force: false,

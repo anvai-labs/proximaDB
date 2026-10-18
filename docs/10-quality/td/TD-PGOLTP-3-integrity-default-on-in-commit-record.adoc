@@ -1,0 +1,39 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-3: PK / UNIQUE / FK enforcement on by default, inside the commit record
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open (filed 2026-10-16). **Priority 3** of ADR-095.
+| Severity | High (compatibility). Duplicate primary keys are accepted in the default build.
+| Component | `Cargo.toml` (`oltp-integrity` feature), `src/network/shared_services.rs` (`open_shared_conditional_key_store`), `proximadb-cks-local`, `src/services/dml/mod.rs`, `src/services/record_store.rs` (unique index)
+| Realizes | ADR-095 D3 ("key-constraint log folded in"); ADR-072 F2/F5
+| Relates to | TD-OLTP-WIRING-1 (Done: wiring behind the feature), TD-DML-1, TD-DML-2 (composite-PK fencing)
+|===
+
+== Premise (verified 2026-10-16)
+
+* `oltp-integrity = ["dep:proximadb-cks-local"]` (root `Cargo.toml:881`) is **not** in `default`.
+* When enabled, claims persist to `<data_dir>/oltp-cks.wal`, a **second** log that is not atomic
+  with the record WAL. A crash between the two can leave a claimed key with no row, or a row with
+  no claim.
+
+== Design
+
+* Key claims and releases (PK, UNIQUE, FK existence, delete-tombstone) become entries of the
+  `TxnCommit` record (TD-PGOLTP-1). They are validated at COMMIT planning under the key locks
+  (TD-PGOLTP-4), using the memtable key index plus the flushed-segment bloom/PK range for the
+  existence check.
+* Retire the separate `oltp-cks.wal` with a one-time migration: replay it into the record WAL on
+  first boot, then rename it `.migrated`. This keeps the change mixed-read-safe.
+* Make enforcement **default ON** for relational tables. Vector collections are unchanged.
+* SQLSTATEs: `23505` unique_violation, `23503` foreign_key_violation, `23502` not_null_violation.
+
+== Acceptance
+
+* Two concurrent sessions inserting the same PK: exactly one succeeds, the other gets `23505`.
+  This holds across a crash at every injection point.
+* An FK insert referencing a row deleted in a concurrent committed transaction gets `23503`.
+* Composite PK (TD-DML-2) covered.
+* The ORM matrix (TD-PGOLTP-6) relies on these codes.

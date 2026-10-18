@@ -384,6 +384,18 @@ pub async fn search_entities(
             }))
         }
         Err(e) => {
+            // Wrong-dimension / empty / non-finite query vector or over-cap
+            // top_k: the client's argument (TD-SECSCAN-1 §5), not a server fault.
+            if let Some(message) = crate::services::operations::vectors::client_argument_message(&e)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Invalid search argument".to_string(),
+                        details: Some(message),
+                    }),
+                ));
+            }
             error!("Failed to search entities: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,0 +1,45 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-4: LSN snapshots, MVCC memtable, read-your-writes, and row-level locks
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open (filed 2026-10-16). **Priority 4** of ADR-095.
+| Severity | High (concurrency and isolation). Writers to one table serialize, REPEATABLE READ is unavailable, and a transaction cannot read its own writes.
+| Component | `src/storage/memtable/`, `src/services/record_store.rs`, `src/services/dml/mod.rs` (`acquire_table_dml_lock`, `op_locks`), `src/network/postgres/protocol.rs`, `src/query/execution/` (read path), ADR-046 merge read
+| Realizes | ADR-095 D4; ADR-018 P3.B
+| Relates to | ADR-046 / TD-LTAP-2 (LSN-coherent merge read), mandate #16 (read-path dead-record filtering)
+|===
+
+== Premise (verified 2026-10-16)
+
+* UPDATE takes `acquire_table_dml_lock(…, LockIntent::Write)` plus
+  `catalog_manager.op_locks().acquire(&table_id)` (`services/dml/mod.rs:3744-3747`): **one
+  writer per table**.
+* There is no version chain: the memtable holds one image per key.
+* The ADR-018 P2.D amendment documents "reads are store-only" inside a transaction.
+
+== Design
+
+* **Version chain per key** in the memtable, tagged with `commit_lsn`. Readers carry
+  `snapshot_lsn` and see the newest version with `commit_lsn ≤ snapshot_lsn`. The `is_dead`
+  predicate is applied afterwards (mandate #16a).
+* READ COMMITTED snapshots per statement; REPEATABLE READ per transaction, with
+  first-committer-wins at commit (`40001`).
+* **Write-set overlay** for read-your-writes on every read route (PK point, scan, DataFusion
+  provider). On the DataFusion route the overlay is an extra union input.
+* **Key-lock table** `(tenant, table, pk)` for UPDATE/DELETE/`SELECT … FOR UPDATE|SHARE`, with
+  `NOWAIT` (`55P03`), `SKIP LOCKED`, and deadlock detection (`40P01`). The table-level lock stays
+  for DDL and bulk writes only.
+* **Version GC** at flush, below the oldest active snapshot. `max_snapshot_age` bounds bloat, and
+  a snapshot that exceeds it fails with `40001` instead of growing memory without limit.
+
+== Acceptance
+
+* Isolation suite (TD-PGOLTP-6): no G0/G1a/G1b/G1c under READ COMMITTED; no lost update under
+  REPEATABLE READ; write skew documented as permitted under RR, as in Postgres.
+* Two sessions updating **different** rows of one table make progress concurrently. The
+  throughput scaling is measured under pgbench `-c 1/8/32`.
+* `SELECT … FOR UPDATE` blocks a second writer until COMMIT or ROLLBACK.
+* A memory bound under a long-running snapshot is demonstrated.

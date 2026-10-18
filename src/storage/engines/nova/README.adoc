@@ -558,7 +558,6 @@ if self.get_total_vectors() < 100_000 {
 
 * NOVA Engine Deep Dive
 * NOVA Operations Guide
-* link:../../../../docs/_internal/archive/technical/unified-quantization-guide.adoc[Quantization Guide]
 
 == See Also
 

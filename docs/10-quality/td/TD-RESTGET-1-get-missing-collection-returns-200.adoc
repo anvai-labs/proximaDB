@@ -1,0 +1,26 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RESTGET-1: REST v2 collection endpoints accept or invent data silently
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Reproduced against the 0.4.1 image.
+| Priority | **MEDIUM** — a misspelt setting is accepted and silently replaced.
+| Component | REST v2 `GET /api/v2/collections/{name}` and `POST /api/v2/collections` (request validation)
+| Relates to | TD-GRPCCREATE-1
+|===
+
+== Problem
+
+`GET /api/v2/collections/<nonexistent>` returns 200 with `engine: "auto"` and `dimension: 0`
+instead of 404, so clients cannot tell a missing collection from an empty one.
+
+On create, unknown fields are ignored (`"hnsw"` instead of `"hnsw_config"` creates an index with
+no parameters) and an invalid quantization `strategy` (for example `"scalar"`) is silently
+replaced by `smart_defaults`. Both reproduced against the 0.4.1 image.
+
+== Fix
+
+Return 404 with a specific error code; reject unknown fields and invalid enum values with 400;
+add contract tests.

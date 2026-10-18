@@ -540,7 +540,13 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
                 .fusion_service
                 .graph_fusion_search(params)
                 .await
-                .map_err(|e| entity_status("search entities (fusion)", e))?;
+                .map_err(|e| {
+                    // The fusion seed leg's client-argument error (TD-SECSCAN-1 §5).
+                    match crate::services::operations::vectors::client_argument_message(&e) {
+                        Some(message) => Status::invalid_argument(message),
+                        None => entity_status("search entities (fusion)", e),
+                    }
+                })?;
 
             // Project fused vector oids → entity nodes. The seam late-materializes
             // (oid + score only), so fetch the nodes for their metadata. Batched

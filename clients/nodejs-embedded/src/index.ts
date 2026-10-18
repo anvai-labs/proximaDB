@@ -50,7 +50,10 @@
 // VERSION
 // ============================================================================
 
-export const VERSION = "1.0.0";
+// The package version. Kept equal to package.json `version` by
+// scripts/version-sync.sh (`set` rewrites it, `check` fails on drift) and by
+// tests/package_entry.test.ts.
+export const VERSION = "0.4.1";
 
 // ============================================================================
 // TYPES

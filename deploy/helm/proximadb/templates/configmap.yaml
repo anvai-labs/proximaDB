@@ -12,6 +12,7 @@ data:
     data_dir = "{{ include "proximadb.dataDir" . }}"
 
     [storage]
+    # ignored by the server; the engine is chosen per collection (TD-ENGSEL-1)
     default_engine = "{{ .Values.proximadb.storage.defaultEngine }}"
     metadata_url = "file://{{ include "proximadb.dataDir" . }}/metadata"
 

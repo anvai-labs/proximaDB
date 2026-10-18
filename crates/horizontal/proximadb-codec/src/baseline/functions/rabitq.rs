@@ -387,7 +387,7 @@ impl RaBitQCode {
 /// estimator against an already-[`rotate_query`]'d query and return up to `pool` row
 /// indices ordered nearest-first (lower estimator score = nearer). This is the
 /// approximate prefilter; the caller reranks the returned candidates against the
-/// full-precision source (decoupled rerank, per RABITQ_ANN_INTEGRATION_SCOPING) — the
+/// full-precision source (decoupled rerank, per RABITQ_PAX_SEGMENT_MIGRATION_PLAN) — the
 /// codes alone are ~30× smaller and too coarse to be the final answer.
 pub fn rank_candidates(q_rotated: &[f32], codes: &[Option<RaBitQCode>], pool: usize) -> Vec<usize> {
     let lut = QueryLut::build(q_rotated);

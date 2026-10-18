@@ -67,9 +67,19 @@ azure = ["proximadb/azure"]
 gcp = ["proximadb/gcp"]
 # Convenience: all three cloud backends (mirrors the root crate's cloud-full).
 cloud-full = ["aws", "azure", "gcp"]
+# Statically link OpenSSL instead of the system libssl/libcrypto. `openssl-sys`
+# reaches the tree only transitively (reqwest 0.11 / lettre native-tls); the TLS
+# stack and its behaviour are unchanged (native-tls still finds the system CA
+# bundle via openssl-probe). The RELEASE binaries build with it so one archive
+# runs on every glibc >= 2.28 distro whatever OpenSSL major it ships
+# (scripts/build_portable_linux.sh). Off by default: dev and Docker builds keep
+# the system OpenSSL.
+vendored-openssl = ["dep:openssl", "openssl/vendored"]
 
 [dependencies]
 anyhow.workspace = true
+# Only for the `vendored-openssl` feature (see [features]).
+openssl = { version = "0.10", optional = true }
 clap.workspace = true
 proximadb = { path = "../../", default-features = false }
 proximadb-embedding = { path = "../../crates/modalities/proximadb-embedding" }
@@ -95,3 +105,5 @@ reqwest = { version = "0.11", features = ["json"] }
 serde_json.workspace = true
 tempfile.workspace = true
 uuid = { version = "1.0", features = ["v4"] }
+# ADR-095 OLTP crash/fencing e2e: drive the server over pgwire like a real client.
+tokio-postgres = "0.7"

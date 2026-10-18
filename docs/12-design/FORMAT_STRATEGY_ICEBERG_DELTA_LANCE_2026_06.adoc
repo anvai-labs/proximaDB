@@ -138,7 +138,7 @@ incremental read.
 
 === P3 — Wire RaBitQ into ANN search + f32 rerank  [SHIPPED — status 2026-10-15]
 
-_Shipped as the PAX RaBitQ→SQ8 cascade with rerank on the SST search path (`src/storage/engines/sst/search/mod.rs`; ADR-062 / TD-RDSTRAT-6; filter-aware variant #1520). Canonical plans: link:RABITQ_ANN_INTEGRATION_SCOPING_2026_06.adoc[RABITQ_ANN_INTEGRATION_SCOPING], link:RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc[RABITQ_PAX_SEGMENT_MIGRATION_PLAN]. Original plan:_
+_Shipped as the PAX RaBitQ→SQ8 cascade with rerank on the SST search path (`src/storage/engines/sst/search/mod.rs`; ADR-062 / TD-RDSTRAT-6; filter-aware variant #1520). Canonical plans: RABITQ_ANN_INTEGRATION_SCOPING (superseded by link:RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc[the PAX segment migration plan]), link:RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc[RABITQ_PAX_SEGMENT_MIGRATION_PLAN]. Original plan:_
 
 RaBitQ (~30×) kernel + length-renorm are built/tested but UNWIRED (reserved
 `quant_kind=2`). Populate codes on write; decode + length-renorm in the ANN scan; add a

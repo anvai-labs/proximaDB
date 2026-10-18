@@ -311,7 +311,7 @@ The **blocking** release gate is `.github/workflows/ci.yml`, aggregated by the `
 - `scripts/validate_capability_matrix.py` (capability + maturity-contract guard)
 - `scripts/check_workspace_boundaries.py` and `scripts/check_tenant_path_guard.py` (layering + DrPathBuilder mandate, via the Workspace Layering Check workflow)
 
-`.github/workflows/tdd.yml` is an **advisory** TDD suite (several steps are `continue-on-error`); a green `tdd.yml` is *not* the merge gate — `ci-success` is. Don't rely on tdd.yml to catch what the gate enforces.
+The merge gate is `CI Success` in `.github/workflows/ci.yml` — the only required check on develop, qa and main. The former advisory `tdd.yml` suite (several steps `continue-on-error`, unpinned toolchain, a duplicate of `ci.yml`) was deleted in the CI redesign (PR1, 2026-10).
 
 The local pre-push equivalent is:
 

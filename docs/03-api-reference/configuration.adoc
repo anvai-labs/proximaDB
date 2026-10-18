@@ -20,7 +20,7 @@ log_level = "info"
 grpc_port = 5679
 
 [storage]
-default_engine = "sst"
+# The vector engine is chosen per collection at create time (pass "engine": "sst"); there is no server-wide key.
 ----
 
 == Server
@@ -59,7 +59,7 @@ rate_limit = 1000
 [source,toml]
 ----
 [storage]
-default_engine = "sst"
+# The vector engine is chosen per collection at create time (pass "engine": "sst"); there is no server-wide key.
 metadata_url = "file:///var/lib/proximadb/metadata"
 
 [[storage.storage_locations]]
@@ -94,7 +94,7 @@ sync_mode = "async"
 [source,toml]
 ----
 [graph]
-default_engine = "orion"
+# ORION is the only graph runtime; there is no engine selection key.
 wal_enabled = true
 ----
 

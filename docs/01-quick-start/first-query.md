@@ -31,7 +31,7 @@ We'll build a simple product search that finds similar items using embeddings.
 ## Step 1: Install Python SDK
 
 ```bash
-pip install proximadb-sdk
+pip install proximadb
 ```
 
 ---
@@ -59,10 +59,10 @@ curl http://localhost:5678/health
 ## Step 3: Create Collection
 
 ```python
-from proximadb_sdk import ProximaDBClient, ProximaRecord
+from proximadb_sdk import ProximaDBClient, ProximaRecord, Protocol
 
 # Connect
-client = ProximaDBClient(url="http://localhost:5678")
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 
 # Create collection for products
 client.create_collection(
@@ -116,22 +116,24 @@ query = "audio accessories"
 query_embedding = encoder.encode([query])[0]
 
 results = client.search(
-    collection="products",
+    "products",
     vector=query_embedding.tolist(),
     top_k=3,
-    filter={"category": "Electronics"}  # Optional: filter by category
+    # Optional equality filter. Use metadata_filter=, not filter= (TD-SDKERR-1).
+    # metadata_filter={"category": "Electronics"},
 )
 
 print(f"\nQuery: '{query}'")
 print("Top results:")
 for i, result in enumerate(results, 1):
-    print(f"{i}. {result.metadata['name']}")
+    # Over REST, properties come back as {"type": ..., "value": ...} cells today (TD-SDKERR-1).
+    print(f"{i}. {result.metadata['name']['value']}")
     print(f"   Score: {result.score:.4f}")
-    print(f"   Price: ${result.metadata['price']}")
+    print(f"   Price: ${result.metadata['price']['value']}")
     print()
 ```
 
-**Output:**
+**Output** (scores and the third result vary with the model version):
 ```
 Query: 'audio accessories'
 Top results:
@@ -150,32 +152,25 @@ Top results:
 
 ---
 
-## Step 6: Multi-Model Query
+## Step 6: Query with SQL
 
-```python
-# Combine vector search with document lookup
-results = client.unified_query("""
-    SELECT p.name, p.price, p.category
-    FROM products p
-    VECTOR_SEARCH(p.name, 'audio accessories', 3) AS v
-    WHERE p.price < 100
-    ORDER BY v.score DESC
-""")
-
-for row in results:
-    print(f"{row.name}: ${row.price} ({row.category})")
-```
+SQL over the PostgreSQL wire protocol (port 5433) is the product's front door. Today it serves
+relational tables (see SQL Interface below). Collections created through REST or the SDK are not
+yet queryable from SQL, and vector search inside SQL lands in v0.6 (TD-XMODAL-4, TD-SQLCOLL-1).
+See the [PostgreSQL reference](../03-api-reference/postgres.adoc) for what is supported.
 
 ---
 
 ## Complete Example
 
+Run this against a fresh server (it creates `products`).
+
 ```python
-from proximadb_sdk import ProximaDBClient, ProximaRecord
+from proximadb_sdk import ProximaDBClient, ProximaRecord, Protocol
 from sentence_transformers import SentenceTransformer
 
 # Setup
-client = ProximaDBClient(url="http://localhost:5678")
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 encoder = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Create collection
@@ -202,12 +197,14 @@ query_emb = encoder.encode([query])[0]
 results = client.search("products", vector=query_emb.tolist(), top_k=2)
 
 for r in results:
-    print(f"{r.metadata['name']}: ${r.metadata['price']} (score: {r.score:.3f})")
+    print(f"{r.metadata['name']['value']}: ${r.metadata['price']['value']} (score: {r.score:.3f})")
 ```
 
 ---
 
 ## REST API Version
+
+Run this against a fresh server (it creates `products`).
 
 ```bash
 # Create collection
@@ -215,12 +212,13 @@ curl -X POST http://localhost:5678/api/v2/collections \
   -H "Content-Type: application/json" \
   -d '{
     "name": "products",
-    "dimension": 384,
+    "dimension": 3,
     "distance_metric": "cosine",
+    "engine": "sst",
     "enable_proxima_record": true
   }'
 
-# Insert records with embeddings (get embeddings from Python first)
+# Insert records (3-dimensional toy vectors; use your model's dimension in practice)
 curl -X POST http://localhost:5678/api/v2/collections/products/records/batch \
   -H "Content-Type: application/json" \
   -d '{
@@ -251,28 +249,20 @@ curl -X POST http://localhost:5678/api/v2/collections/products/search \
 > SCRAM and then set `[api] pg_port`. See `TD-PGWIRE-CONTAINER-1`.
 
 ```sql
--- Connect via psql
-psql -h localhost -p 5433 -U postgres
+-- Connect (from a locally run server, or inside the container's network namespace)
+-- psql -h 127.0.0.1 -p 5433 -U postgres -d proximadb
 
--- Create table
-CREATE TABLE products (
-    id SERIAL PRIMARY KEY,
-    name TEXT,
-    embedding VECTOR(384),
-    price NUMERIC
-);
+CREATE TABLE menu_items (id INT PRIMARY KEY, name TEXT, price NUMERIC);
 
--- Insert
-INSERT INTO products (name, embedding, price)
-VALUES ('Wireless Headphones', '[0.1, 0.2, ...]', 79.99);
+INSERT INTO menu_items (id, name, price)
+VALUES (1, 'Wireless Headphones', 79.99), (2, 'Coffee Maker', 49.99);
 
--- Search
-SELECT name, price,
-       embedding <-> '[0.1, 0.2, ...]' AS distance
-FROM products
-ORDER BY distance
-LIMIT 5;
+SELECT name, price FROM menu_items WHERE price < 60 ORDER BY price;
 ```
+
+`ORDER BY embedding <-> '<literal>'::vector LIMIT k` over collections created through REST or the
+SDK is Beta. `VECTOR(n)` columns created over pgwire work today only in tables that also have a JSON or JSONB column
+(TD-SQLCOLL-1).
 
 ---
 
@@ -297,7 +287,7 @@ curl http://localhost:5678/health
 ```python
 # Ensure embedding dimension matches collection dimension
 print(f"Model dimension: {len(encoder.encode('test'))}")
-print(f"Collection dimension: {collection.dimension}")
+print(f"Collection dimension: {client.get_collection('products').dimension}")
 ```
 
 **Import error:**

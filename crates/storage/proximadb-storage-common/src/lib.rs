@@ -46,6 +46,8 @@ pub mod observability_partitioning;
 pub mod observability_rollups;
 pub mod oid_position_resolver;
 pub mod oid_resolver_cache;
+pub mod parquet_page_prune;
+pub mod parquet_write_policy;
 pub mod pax_block;
 pub mod pax_striped_plan;
 pub mod proxima_arrow;

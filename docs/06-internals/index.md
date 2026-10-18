@@ -285,9 +285,13 @@ cargo llvm-cov --lib --html
   - Build, test (unit + integration + graph)
   - Coverage, Python SDK, Docker
 
-- **`tdd.yml`**: TDD-focused
-  - Nextest, flaky detection
-  - Coverage thresholds, benchmark regression
+- **`qa-gate.yml`**: develop→qa / qa→main conformance (TPC-H/DS over pgwire,
+  recall ratchets, object-store tiers, coverage ratchet)
+
+The former `tdd.yml` duplicated `ci.yml` on an unpinned toolchain with an
+all-`continue-on-error` integration job; it was deleted in the CI redesign
+(PR1, 2026-10). Flaky tests are surfaced by nextest's bounded retries
+(`.config/nextest.toml`), not by re-running the suite.
 
 ### CI Commands
 

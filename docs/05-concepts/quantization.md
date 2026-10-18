@@ -1,5 +1,13 @@
 # Quantization
 
+!!! warning "Examples on this page are not yet verified"
+    The code here has not been run against a released server, and some calls do not exist in the
+    SDK or fail as written. Treat it as illustrative until TD-SDKDOC-1 runs the docs' examples in
+    CI. The quick starts and the vector search guide are verified against the current release.
+    In particular, the Python SDK's `create_collection(quantization=...)` is silently dropped over
+    REST, raises over gRPC (the default transport), and rejects this page's `type` values
+    (TD-SDKENG-1); set quantization through the REST API's `quantization.strategy`.
+
 **Vector compression for memory efficiency**
 
 ```mermaid

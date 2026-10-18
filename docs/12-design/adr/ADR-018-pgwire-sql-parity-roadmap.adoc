@@ -440,6 +440,17 @@ following concrete semantics and honestly-documented divergences:
 * Any ERROR inside an active transaction fails it (25P02 until ROLLBACK), enforced centrally
   in the protocol error path so every statement path behaves identically.
 
+== Amendment 2026-10-16: P3.B storage design → ADR-095
+
+P3.B said real MVCC "likely" needs PAX row-visibility metadata plus a per-transaction snapshot
+manager. link:ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095] is that design, and
+it does not use PAX row-visibility metadata: the **snapshot is a commit LSN**, versions live in the
+memtable as per-key chains, and flushed segments are immutable with an LSN bound (ADR-046
+merge read). ADR-095 also closes the two P2.D divergences recorded above. A transaction becomes
+**one WAL commit record** (no partial durability after a mid-COMMIT failure, TD-PGOLTP-1), and
+reads overlay the transaction's own write set (TD-PGOLTP-4). Savepoints and transactional DDL
+(P3.B / P2.D residue) are TD-PGOLTP-9.
+
 == Sequencing rules
 
 1. **Phase 1 must ship before any metadata-in-OLTP work proceeds.**

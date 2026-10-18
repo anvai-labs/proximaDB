@@ -454,14 +454,14 @@ vectors-plus-lake framing -- and it costs nothing extra, the substrate already e
 | Recommendation | Tracked as
 
 | R0 Parity Sprint (audited 2026-05-28) | TD-093 Resolved (already wired); TD-092 re-scoped to BM25 auto-index on insert; dead `bm25_wrapper.rs` removed
-| R1 Continuous Discovery + atomic republish (+ trigger arm, recluster-first) | TD-086 (roadmap: new Phase 8 "Continuous Data Loop")
+| R1 Continuous Discovery + atomic republish (+ trigger arm, recluster-first) | TD-086 (roadmap: "Later — continuous discovery"; formerly Phase 8)
 | R2 Scale-to-zero cold path | TD-087
 | R3 Point-read I/O amplification (narrowed: S3 range-read over PAX OLTP) | TD-088
 | R4a Single-node scale-to-zero (unblocked) | TD-094
 | R4b Multi-node elastic modes + scheduler (blocked on TD-077) | TD-089 (realizes 2028 VISION serverless milestone)
 | R5 External Collection index-in-place | TD-090
 | R6 Lance interoperability | TD-091
-| CS/CD design principle | VISION.adoc "Design Principles" + STRATEGIC_ROADMAP Phase 8
+| CS/CD design principle | VISION.adoc "Design Principles" + STRATEGIC_ROADMAP ("Later")
 |===
 
 *Refined sequence (plan refinement 2026-05-28):* R0 Parity Sprint -> R2 + R3 (enablers) ->

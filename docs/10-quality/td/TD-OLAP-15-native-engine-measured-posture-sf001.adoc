@@ -13,6 +13,14 @@
 | Relates to | ADR-052 (bytes-scanned dominates cloud-OLAP cost), ADR-054 (native engine, progressive cutover), TD-OLAP-1 (the scan-wedge — "own the scan, reuse DF above"), TD-OLAP-2 (stats/CBO — the join-order gap behind the slow joins), TD-OLAP-3 (runtime-filter/bloom/zone-map pruning infra), TD-OLAP-4 (the ledger), TD-OLAP-11 (native hash join + the non-spilling aggregate gap), TD-OLAP-12 (morsel scheduler — the ClickBench win), TD-EXEC-1 (the 8 MB stack fix that made this harness runnable end-to-end).
 |===
 
+== Update (2026-10-18)
+
+The DataFusion-vs-DuckDB gap below was dominated by a table-open floor, not execution: the
+OLAP delta merge decoded the entire canonical WAL per table per query (never-written
+object_id key treated as "unknown" by the TD-OLAP-17 fast path). Fixed (TD-OLAPFMT-2 evidence); on TPC-DS
+SF 0.02 DataFusion's median fell from 11.8 s to 33 ms (DuckDB: 35 ms). See
+`docs/_internal/status/TPC_DS_SPEC_PRUNING_EVIDENCE_2026_10_18.adoc`.
+
 == The finding (2026-07-10)
 
 The SF=0.01 release comparison (`PROXIMADB_NATIVE_SHADOW=1`, the native-parquet shadow probe that re-runs every DataFusion-served parquet query on native-vectorized over the *same* plan + storage to record a `native-vectorized` compute sample) recorded **zero** `native-vectorized` samples across all 38 TPC-H/TPC-DS queries. The probe ran — it was wired (`relational_pipeline.rs:515`) — but **declined every query** via its skip-guards. Every query's served answer came from DataFusion (or, on the separate native/Volcano-over-PAX route, the old Volcano engine).

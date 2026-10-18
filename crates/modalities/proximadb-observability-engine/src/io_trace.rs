@@ -142,6 +142,15 @@ pub struct IoTrace {
     /// promotion gate consumes.
     splits_total: AtomicU64,
     splits_pruned: AtomicU64,
+    /// Of `splits_pruned`, splits skipped by a persisted Parquet SBBF Bloom
+    /// filter (spec `BloomFilterHeader`) where min/max could not decide.
+    bloom_splits_pruned: AtomicU64,
+    /// Page-index pruning (Parquet `ColumnIndex`/`OffsetIndex`): data pages
+    /// evaluated / excluded, and rows elided before decode inside surviving
+    /// row groups.
+    pages_total: AtomicU64,
+    pages_pruned: AtomicU64,
+    page_rows_skipped: AtomicU64,
     /// PAX cascade centroid block-prune outcome (TD-RDSTRAT-5 S3): `centroid_pruned_blocks`
     /// of `centroid_total_blocks` skipped by the VOE-directory centroid probe before
     /// scanning. Distinct from `splits_*` (row-group runtime filter) so the ratios
@@ -668,6 +677,21 @@ impl IoTrace {
         self.splits_pruned.fetch_add(pruned, Ordering::Relaxed);
     }
 
+    /// Record splits skipped by a persisted Parquet Bloom filter (a subset of
+    /// the `pruned` count passed to [`record_splits`](Self::record_splits)).
+    pub fn record_bloom_splits_pruned(&self, pruned: u64) {
+        self.bloom_splits_pruned
+            .fetch_add(pruned, Ordering::Relaxed);
+    }
+
+    /// Record a page-index pruning outcome for one row group read.
+    pub fn record_page_prune(&self, pages_total: u64, pages_pruned: u64, rows_skipped: u64) {
+        self.pages_total.fetch_add(pages_total, Ordering::Relaxed);
+        self.pages_pruned.fetch_add(pages_pruned, Ordering::Relaxed);
+        self.page_rows_skipped
+            .fetch_add(rows_skipped, Ordering::Relaxed);
+    }
+
     /// Record a PAX cascade centroid block-prune outcome (TD-RDSTRAT-5 S3): of
     /// `total` blocks in the segment, `pruned` were skipped by the centroid probe.
     pub fn record_centroid_prune(&self, total: u64, pruned: u64) {
@@ -978,6 +1002,10 @@ impl IoTrace {
             logical_striped_gets: self.logical_striped_gets.load(Ordering::Relaxed),
             splits_total: self.splits_total.load(Ordering::Relaxed),
             splits_pruned: self.splits_pruned.load(Ordering::Relaxed),
+            bloom_splits_pruned: self.bloom_splits_pruned.load(Ordering::Relaxed),
+            pages_total: self.pages_total.load(Ordering::Relaxed),
+            pages_pruned: self.pages_pruned.load(Ordering::Relaxed),
+            page_rows_skipped: self.page_rows_skipped.load(Ordering::Relaxed),
             centroid_total_blocks: self.centroid_total_blocks.load(Ordering::Relaxed),
             centroid_pruned_blocks: self.centroid_pruned_blocks.load(Ordering::Relaxed),
             ivf_cells_total: self.ivf_cells_total.load(Ordering::Relaxed),
@@ -1080,6 +1108,16 @@ pub struct IoTraceSnapshot {
     /// Splits skipped before fetch — with `splits_total`, the skip ratio.
     #[serde(default)]
     pub splits_pruned: u64,
+    /// Of `splits_pruned`, those skipped by a persisted Parquet SBBF Bloom filter.
+    #[serde(default)]
+    pub bloom_splits_pruned: u64,
+    /// Parquet page-index pruning: pages evaluated / excluded, rows elided.
+    #[serde(default)]
+    pub pages_total: u64,
+    #[serde(default)]
+    pub pages_pruned: u64,
+    #[serde(default)]
+    pub page_rows_skipped: u64,
     /// PAX cascade centroid block-prune (TD-RDSTRAT-5 S3): total blocks in the
     /// segment and how many the centroid probe skipped. `centroid_pruned_blocks > 0`
     /// proves the prune engaged (vs a silent full-scan fallback).
@@ -1404,6 +1442,18 @@ pub fn record_range_gets(gets: u64) {
 /// snapshot. Silently no-ops outside an active scope.
 pub fn record_splits(total: u64, pruned: u64) {
     let _ = IO_TRACE.try_with(|t| t.record_splits(total, pruned));
+}
+
+/// Record splits skipped by a persisted Parquet Bloom filter for the active
+/// query. Silently no-ops outside an active scope.
+pub fn record_bloom_splits_pruned(pruned: u64) {
+    let _ = IO_TRACE.try_with(|t| t.record_bloom_splits_pruned(pruned));
+}
+
+/// Record a Parquet page-index pruning outcome for the active query.
+/// Silently no-ops outside an active scope.
+pub fn record_page_prune(pages_total: u64, pages_pruned: u64, rows_skipped: u64) {
+    let _ = IO_TRACE.try_with(|t| t.record_page_prune(pages_total, pages_pruned, rows_skipped));
 }
 
 /// Record a PAX cascade centroid block-prune outcome for the active query

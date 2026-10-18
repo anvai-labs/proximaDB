@@ -287,8 +287,7 @@ def demo_migration_info():
     print("   - Rollback capability")
 
     print("\n3. Documentation:")
-    print("   - Migration Guide: docs/02-guides/sks_graph_first_migration_guide.adoc")
-    print("   - Status Document: SKS_GRAPH_FIRST_STATUS.md")
+    print("   - Graph engines guide: docs/06-internals/GRAPH_ENGINES_GUIDE.adoc")
 
     print("\n4. Zero Code Changes:")
     print("   - Same EntityStore trait interface")
@@ -354,13 +353,7 @@ def main():
         print("  ✓ Hybrid queries combine vector similarity + graph traversal")
         print("  ✓ Production ready with full test coverage (12/12 tests passing)")
         print("\nFor more information:")
-        print(
-            "  - Migration Guide: docs/02-guides/sks_graph_first_migration_guide.adoc"
-        )
-        print("  - Status Document: SKS_GRAPH_FIRST_STATUS.md")
-        print(
-            "  - Implementation Plan: docs/architecture/SKS_GRAPH_FIRST_IMPLEMENTATION_PLAN.adoc"
-        )
+        print("  - Graph engines guide: docs/06-internals/GRAPH_ENGINES_GUIDE.adoc")
 
         return 0
 

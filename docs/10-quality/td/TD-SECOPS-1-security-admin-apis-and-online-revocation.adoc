@@ -1,0 +1,27 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SECOPS-1: security admin/status APIs and online certificate revocation
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Carried from the removed best-in-class tracker ("Residual: security admin/status APIs + stronger online revocation (CRL/OCSP)"); TD-006 (mTLS) closed with this residual untracked.
+| Priority | **MEDIUM** — roadmap v1.0 ("security operations").
+| Component | `src/network/middleware/tls.rs`, `src/network/auth/config.rs` (`crl_path`), `crates/horizontal/proximadb-tls`, the admin surface
+| Relates to | TD-006 (closed: mTLS), TD-SSO-2 (multi-provider OIDC)
+|===
+
+== Problem
+
+mTLS is in place, but **certificate revocation is not checked at all in production**: `crl_path`
+is declared in `src/network/auth/config.rs` and never read; the rustls client verifier is built
+without CRLs; there is no distribution-point fetch and no OCSP; and the serial/fingerprint deny-list
+middleware (`tls_client_cert_middleware`) is not installed in any router. Operators also have no
+API to inspect or manage security state (certificates, keys, active identities).
+
+== Acceptance
+
+* Read-only security status APIs, tenant-scoped and authorized.
+* Local CRL loading (`crl_path`) wired into the client verifier, with reload.
+* Online revocation checking (CRL distribution points or OCSP) with a fail-closed option.
+* Tests that present a revoked certificate for each mechanism.

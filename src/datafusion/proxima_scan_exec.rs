@@ -72,6 +72,7 @@ use tracing::debug;
 
 use super::proxima_table_provider::EngineType;
 use crate::storage::formats::FileSplit;
+use proximadb_storage_common::format_splits::ScalarPredicate;
 
 // ============================================================================
 // Split Reader Trait
@@ -98,6 +99,21 @@ pub trait SplitReader: Send + Sync + Debug {
         projection: Option<&[usize]>,
         batch_size: usize,
     ) -> DFResult<SendableRecordBatchStream>;
+
+    /// Read a split under additional conjunctive pruning predicates resolved at
+    /// execute time (join runtime filters). Readers with sub-split pruning
+    /// (Parquet page index) narrow the decode to rows that can match; the
+    /// default ignores the hint. Exact filtering stays above the scan.
+    async fn read_split_with_predicates(
+        &self,
+        split: &FileSplit,
+        projection: Option<&[usize]>,
+        batch_size: usize,
+        runtime: &[(String, ScalarPredicate)],
+    ) -> DFResult<SendableRecordBatchStream> {
+        let _ = runtime;
+        self.read_split(split, projection, batch_size).await
+    }
 
     /// Get the schema for this reader.
     fn schema(&self) -> SchemaRef;
@@ -189,6 +205,21 @@ fn split_pruned_by_runtime_filters(
         }
     }
     false
+}
+
+/// The current conjunctive `(column, predicate)` view of the absorbed runtime
+/// filters (unresolved placeholders contribute nothing) — handed to the reader
+/// for page-level pruning inside each surviving split.
+fn resolved_runtime_predicates(
+    dynamic_filters: &[Arc<dyn PhysicalExpr>],
+) -> Vec<(String, ScalarPredicate)> {
+    let mut out = Vec::new();
+    for dynamic in dynamic_filters {
+        if let Ok(Some(resolved)) = dynamic.snapshot() {
+            out.extend(pruning_predicates(&resolved));
+        }
+    }
+    out
 }
 
 /// Gate for absorbing DataFusion's join runtime filters into the scan.
@@ -512,7 +543,13 @@ impl ExecutionPlan for ProximaScanExec {
                     // read inside `read_split` records NOWHERE (ambient
                     // snapshots saw 0 bytes — the measured attribution gap).
                     // `scope_with_handle` is the documented rebind seam.
-                    let read_fut = reader.read_split(&split, projection.as_deref(), batch_size);
+                    let runtime = resolved_runtime_predicates(&dynamic_filters);
+                    let read_fut = reader.read_split_with_predicates(
+                        &split,
+                        projection.as_deref(),
+                        batch_size,
+                        &runtime,
+                    );
                     match &trace {
                         Some(t) => {
                             crate::observability::io_trace::scope_with_handle(t.clone(), read_fut)

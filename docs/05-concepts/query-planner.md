@@ -1,5 +1,11 @@
 # Query Planner
 
+!!! warning "Examples on this page are not yet verified"
+    The code here has not been run against a released server, and some calls do not exist in the
+    SDK or fail as written. Treat it as illustrative until TD-SDKDOC-1 runs the docs' examples in
+    CI. The quick starts and the vector search guide are verified against the current release.
+    `client.query(...)` does not exist on the server SDK client.
+
 **How ProximaDB optimizes and executes queries**
 
 ```mermaid

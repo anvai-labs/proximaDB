@@ -198,6 +198,21 @@ impl Default for ExecutionConfig {
     }
 }
 
+/// The SQL vector-search node's result limit as the engine's `u16`
+/// `SearchParams::top_k`. Here `top_k` is the RESULT LIMIT, not a planning
+/// hint, so a value the `u16` cannot carry is an error — a bare `as u16`
+/// wrapped it (65,536 → 0, 70,000 → 4,464) and silently dropped results, and
+/// saturating would silently truncate them (TD-SECSCAN-1 §5). Reachable only
+/// when an operator raises `PROXIMADB_SEARCH_MAX_TOP_K` above 65,535.
+pub(crate) fn engine_result_limit(top_k: usize) -> Result<u16> {
+    u16::try_from(top_k).map_err(|_| {
+        anyhow!(
+            "vector search top_k={top_k} exceeds the storage engine's result limit of {}",
+            u16::MAX
+        )
+    })
+}
+
 impl FederatedExecutor {
     /// Create a new federated executor
     pub fn new(storage: Arc<MultiModelStorageFacade>) -> Self {
@@ -517,6 +532,11 @@ impl FederatedExecutor {
             Field::new("score", DataType::Float32, false),
         ]));
 
+        // Shared server top_k cap (TD-SECSCAN-1 §5), checked on the full
+        // `usize` BEFORE either leg narrows it (`as u32` below, the engine's
+        // `u16`): the SQL extension parse is not a capped boundary.
+        proximadb_search_types::top_k_limit::check_top_k(top_k as u64)?;
+
         let query_vector = self.resolve_query_vector(query_vector_source)?;
 
         if query_vector.is_empty() {
@@ -634,7 +654,7 @@ impl FederatedExecutor {
         };
 
         let search_params = Arc::new(SearchParams {
-            top_k: Some(top_k as u16),
+            top_k: Some(engine_result_limit(top_k)?),
             vector: Some(query_vector),
             ..Default::default()
         });
