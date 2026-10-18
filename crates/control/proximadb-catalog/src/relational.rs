@@ -180,6 +180,10 @@ pub struct RelationalRecordOptions {
     pub record_version: Option<u64>,
     /// Also project vector columns into `EmbeddingCell`s.
     pub include_vector_embeddings: bool,
+    /// Record id to use when the table declares no primary key: an UPDATE or
+    /// DELETE of a keyless row must keep the row's existing `oid` instead of
+    /// minting a new one (TD-RELIDEQ-1). Ignored when the table has a key.
+    pub record_id: Option<String>,
 }
 
 impl Default for RelationalRecordOptions {
@@ -195,6 +199,7 @@ impl Default for RelationalRecordOptions {
             valid_to_ns: None,
             record_version: None,
             include_vector_embeddings: true,
+            record_id: None,
         }
     }
 }
@@ -358,6 +363,7 @@ impl CatalogRow {
     ) -> Result<ProximaRecord> {
         let record_id = self
             .primary_key_string(schema)?
+            .or_else(|| options.record_id.clone())
             .unwrap_or_else(|| new_local_record_id(schema));
 
         let props = self
@@ -1007,6 +1013,72 @@ fn proxima_value_type_name(value: &ProximaValue) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-RELIDEQ-1: a keyless table's UPDATE/DELETE mutation must keep the
+    /// addressed row's oid (the `record_id` override), while a declared key
+    /// ignores the override (the key value is the oid).
+    #[test]
+    fn record_id_override_only_applies_to_keyless_tables() {
+        let keyless = CatalogTableSchema::new("keyless")
+            .with_column(CatalogColumn::new(1, "id", ProximaType::Int64))
+            .with_column(CatalogColumn::new(2, "name", ProximaType::String));
+        let mut values = std::collections::HashMap::new();
+        values.insert("id".to_string(), ProximaValue::Int64(7));
+        values.insert("name".to_string(), ProximaValue::String("a".to_string()));
+        let row = CatalogRow {
+            table: "keyless".to_string(),
+            values,
+        };
+
+        // Keyless: the override becomes the record id (a generated id otherwise).
+        let mutated = row
+            .to_mutation_record(
+                &keyless,
+                RelationalMutationKind::Update,
+                RelationalRecordOptions {
+                    record_id: Some("keyless:row:123".to_string()),
+                    ..RelationalRecordOptions::default()
+                },
+            )
+            .expect("keyless mutation");
+        assert_eq!(mutated.oid, "keyless:row:123");
+
+        let defaulted = row
+            .to_mutation_record(
+                &keyless,
+                RelationalMutationKind::Update,
+                RelationalRecordOptions::default(),
+            )
+            .expect("keyless mutation, default options");
+        assert_ne!(
+            defaulted.oid, "7",
+            "a keyless row never keys on its id value"
+        );
+        assert!(defaulted.oid.starts_with("keyless:row:"));
+
+        // Declared key: the encoded key is the record id; the override is ignored.
+        let keyed = CatalogTableSchema::new("keyed")
+            .with_column(CatalogColumn::new(1, "id", ProximaType::Int64).nullable(false))
+            .with_primary_key(vec!["id".to_string()]);
+        let mut values = std::collections::HashMap::new();
+        values.insert("id".to_string(), ProximaValue::Int64(7));
+        let row = CatalogRow {
+            table: "keyed".to_string(),
+            values,
+        };
+        let mutated = row
+            .to_mutation_record(
+                &keyed,
+                RelationalMutationKind::Update,
+                RelationalRecordOptions {
+                    record_id: Some("ignored".to_string()),
+                    ..RelationalRecordOptions::default()
+                },
+            )
+            .expect("keyed mutation");
+        assert_eq!(mutated.oid, "7", "the declared key value is the record id");
+    }
+
     use crate::{
         CatalogColumn, CatalogIndex, CatalogIndexType, ColumnConstraint, RelationalCapabilities,
     };

@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-18). Reproduced against the 0.4.1 image on independent servers.
+| Status | **Resolved (2026-10-18).** The key fast path falls back to the predicate scan when a fallback-key (`id`/`record_id`, no declared key) lookup misses, and keyless UPDATE/DELETE keep the row\'s existing `oid` via a `record_id` projection option. Pinned by `tests/pgwire_keyless_id_predicate_e2e.rs` (red on `develop`).
 | Priority | **HIGH** — silent wrong results on the most common SQL predicate, for reads and writes.
 | Component | conventional key fallback `schema_primary_key_column` (`src/services/record_store.rs`) used by `extract_pk_candidate_ids` in `DmlService` (`src/services/dml/mod.rs`); reached from the legacy pgwire relational reader `execute_relational_query` (`src/network/postgres/protocol.rs`) and from UPDATE/DELETE
 | Relates to | ADR-096 (SQL is the front door), TD-PGEXT-1; roadmap v0.5 "Read correctness"
@@ -40,6 +40,25 @@ does not show this: it describes the `ComputeScheduler` route, while this SELECT
 legacy reader `execute_relational_query`.
 
 == Fix
+
+Applied (2026-10-18):
+
+* `select_table_records_with_tree` and `resolve_matching_ids` still take the key fast path, but a
+  miss on the `id`/`record_id` fallback key (no declared key) now falls through to the full
+  predicate scan instead of returning the empty lookup result. A declared key keeps the fast path.
+* Keyless UPDATE and DELETE keep the addressed row's existing `oid`: `RelationalRecordOptions`
+  gained a `record_id` override used when the table declares no key, so the mutation supersedes
+  the row instead of minting a new identity (which silently duplicated UPDATEs and made DELETE
+  tombstones miss). `row_values_from_existing` reads the key column from `props` for a keyless
+  table (only a declared key lives in the oid), and a keyless table's `id`/`record_id` column can
+  be updated like any other column.
+* A declared primary key behaves exactly as before (control test).
+* The fenced CKS paths (`oltp-integrity` feature) are gated on a DECLARED key: a keyless table's
+  identity is its oid, so the INSERT claim, the DELETE release and the FK-existence probe no
+  longer key on the `id`/`record_id` fallback value (which nothing would release, making a
+  delete-then-reinsert of the same id fail with a spurious conflict).
+
+== Original proposal (implemented as the scan-fallback above)
 
 Make read and write agree: apply the fallback only where the write path also uses it, or have the
 key fast path fall back to a scan on a miss. Dropping the fallback outright risks
