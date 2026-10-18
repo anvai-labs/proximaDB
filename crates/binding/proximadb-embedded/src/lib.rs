@@ -1361,15 +1361,28 @@ impl EmbeddedProximaDB {
             ..Default::default()
         };
 
+        // When a tenant is configured, the creating tenant owns the collection
+        // (the same stamping the networked create path applies), so the
+        // tenant-scoped insert/get below resolve it.
+        let tenant_ctx = self.embedded_tenant_context();
         self.runtime.block_on(async {
-            let response = self
-                .shared_services
-                .collection_service
-                .create_collection(&collection_config)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::other(e.to_string()))
-                })?;
+            let response = match tenant_ctx.as_ref() {
+                Some(ctx) => {
+                    self.shared_services
+                        .collection_service
+                        .create_collection_with_tenant_context(&collection_config, Some(ctx))
+                        .await
+                }
+                None => {
+                    self.shared_services
+                        .collection_service
+                        .create_collection(&collection_config)
+                        .await
+                }
+            }
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::other(e.to_string()))
+            })?;
 
             // Check if the collection service returned an error in the response
             if !response.success {
