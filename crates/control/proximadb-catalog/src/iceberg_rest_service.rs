@@ -731,6 +731,19 @@ impl IcebergRestService {
         if !catalog.namespace_exists(&scoped).await? {
             return Err(Self::missing_namespace(&namespace));
         }
+        // A namespace that also holds entries this tenant cannot see is not the
+        // tenant's to configure.
+        for id in catalog.list_tables(&scoped).await? {
+            if Self::visible_entry(catalog.as_ref(), &id, tenant)
+                .await?
+                .is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "Bad request: namespace '{}' properties cannot be changed by this caller",
+                    namespace.join(".")
+                ));
+            }
+        }
 
         let updated_keys: Vec<String> = req.updates.keys().cloned().collect();
         let removed_keys = req.removals.clone();

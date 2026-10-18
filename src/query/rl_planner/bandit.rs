@@ -442,7 +442,9 @@ impl ContextualBanditPlanner {
     }
 
     /// Load planner state from file
-    pub async fn load_from_file(&mut self, path: &str) -> anyhow::Result<()> {
+    /// Returns whether a policy was loaded (`false` when the file was unreadable
+    /// and a fresh policy is kept).
+    pub async fn load_from_file(&mut self, path: &str) -> anyhow::Result<bool> {
         let json = tokio::fs::read_to_string(path).await?;
         // An unreadable policy is a learned cache, not data: start fresh rather
         // than fail startup.
@@ -454,7 +456,7 @@ impl ContextualBanditPlanner {
                     %error,
                     "RL planner policy file is invalid; starting with a fresh policy"
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
         loaded.make_finite();
@@ -474,7 +476,7 @@ impl ContextualBanditPlanner {
             self.action_stats.len(),
             self.total_updates
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Replace non-finite learned values: a non-finite weight becomes 0.0 and a
@@ -814,10 +816,11 @@ mod tests {
         .await
         .expect("write");
         let mut fresh = ContextualBanditPlanner::new(0.1, true);
-        fresh
+        let loaded = fresh
             .load_from_file(path)
             .await
             .expect("invalid file must not fail");
+        assert!(!loaded, "an invalid file is reported as not loaded");
         assert_eq!(fresh.total_updates(), 0);
     }
 }

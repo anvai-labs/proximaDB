@@ -283,6 +283,16 @@ pub fn scoped_resource_key(tenant: &str, name: &str) -> Result<String, ScopedKey
     Ok(format!("{tenant}/{name}"))
 }
 
+/// `{tenant}/{name}` for every tenant, the default included — for resources
+/// whose key becomes a storage path, where a bare default-tenant name could
+/// otherwise share a directory with a named tenant's resources. Both parts are
+/// validated as for [`scoped_resource_key`].
+pub fn tenant_qualified_key(tenant: &str, name: &str) -> Result<String, ScopedKeyError> {
+    validate_request_tenant(tenant).map_err(ScopedKeyError::Tenant)?;
+    validate_scoped_resource_name(name)?;
+    Ok(format!("{tenant}/{name}"))
+}
+
 /// Inverse of [`scoped_resource_key`] for keys visible to `tenant`: the clean name
 /// when `key` belongs to `tenant`, `None` otherwise.
 pub fn unscoped_resource_name<'a>(tenant: &str, key: &'a str) -> Option<&'a str> {
@@ -314,6 +324,17 @@ mod tests {
             scoped_resource_key("_sys", "docs"),
             Err(ScopedKeyError::Tenant(_))
         ));
+    }
+
+    #[test]
+    fn tenant_qualified_key_always_prefixes() {
+        assert_eq!(
+            tenant_qualified_key(DEFAULT_TENANT, "ns").unwrap(),
+            "default/ns"
+        );
+        assert_eq!(tenant_qualified_key("acme", "ns").unwrap(), "acme/ns");
+        assert!(tenant_qualified_key("acme", "globex/ns").is_err());
+        assert!(tenant_qualified_key("_sys", "ns").is_err());
     }
 
     #[test]

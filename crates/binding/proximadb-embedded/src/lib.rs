@@ -934,9 +934,11 @@ impl EmbeddedProximaDB {
             {
                 runtime.block_on(async {
                     match planner.load_policy(&policy_path).await {
-                        Ok(()) => {
+                        Ok(true) => {
                             tracing::info!("🎯 EMBEDDED: RL policy loaded from {}", policy_path);
                         }
+                        // Already reported (and reset) by the loader.
+                        Ok(false) => {}
                         Err(e) => {
                             tracing::debug!(
                                 "EMBEDDED: No existing RL policy (starting fresh): {}",

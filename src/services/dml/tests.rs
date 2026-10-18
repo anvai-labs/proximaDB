@@ -132,11 +132,21 @@ fn publish_ndv_statistics_feeds_distinct_count_overlay() {
         records.push(r);
     }
 
-    publish_ndv_statistics(table, &schema, &records);
+    publish_ndv_statistics(table, Some("acme"), &schema, &records);
+    let key = crate::core::statistics::table_statistics_key(Some("acme"), table);
+    // Another tenant's same-named table has no statistics from this one.
+    assert!(
+        statistics_registry()
+            .envelope(&crate::core::statistics::table_statistics_key(
+                Some("globex"),
+                table
+            ))
+            .is_none()
+    );
 
     // Write side: the registry envelope carries per-column distinct_estimate.
     let env = statistics_registry()
-        .envelope(table)
+        .envelope(&key)
         .expect("summary published by materialize");
     assert_eq!(env.record_count, 100);
     let ndv = |name: &str| {
@@ -161,7 +171,7 @@ fn publish_ndv_statistics_feeds_distinct_count_overlay() {
     let stats = statistics_from_splits(
         &[],
         arrow.as_ref(),
-        Some(table),
+        Some(&key),
         false,
         proximadb_data_model::StatsTrust::Trusted,
     );
@@ -177,7 +187,7 @@ fn publish_ndv_statistics_feeds_distinct_count_overlay() {
     assert!((col_ndv("created") as i64 - 10).abs() <= 2);
 
     // Cleanup the process-global registry so this test is order-independent.
-    statistics_registry().remove(table);
+    statistics_registry().remove(&key);
 }
 
 #[test]

@@ -2320,14 +2320,15 @@ pub async fn get_collection_statistics_v2(
             }
         })?;
 
-    let collection = resp.collection.unwrap_or_default();
+    // A collection this tenant cannot resolve reads exactly as a missing one;
+    // statistics are only ever read or written under its canonical id.
+    let collection = resp
+        .collection
+        .filter(|collection| !collection.id.is_empty())
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
     let config = collection.config.unwrap_or_default();
     let stats = collection.stats.unwrap_or_default();
-    let canonical_id = if collection.id.is_empty() {
-        collection_id.clone()
-    } else {
-        collection.id.clone()
-    };
+    let canonical_id = collection.id.clone();
 
     // TD-175: best-effort graph modality block from the engine's maintained
     // graph counters (the `get_stats` accessor); skipped when the collection has
@@ -2427,7 +2428,10 @@ pub async fn get_collection_route_health_v2(
             }
         })?;
 
-    let collection = resp.collection.unwrap_or_default();
+    let collection = resp
+        .collection
+        .filter(|collection| !collection.id.is_empty())
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
     let config = collection.config.unwrap_or_default();
     let stats = collection.stats.unwrap_or_default();
 
@@ -2792,7 +2796,10 @@ pub async fn post_collection_recall_tune_v2(
             }
         })?;
 
-    let collection = resp.collection.unwrap_or_default();
+    let collection = resp
+        .collection
+        .filter(|collection| !collection.id.is_empty())
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
     let config = collection.config.unwrap_or_default();
     let stats = collection.stats.unwrap_or_default();
 
@@ -3273,7 +3280,10 @@ pub async fn post_collection_recluster_v2(
                 }
             })?;
 
-        let collection = resp.collection.unwrap_or_default();
+        let collection = resp
+            .collection
+            .filter(|collection| !collection.id.is_empty())
+            .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
         let config = collection.config.unwrap_or_default();
 
         let Some(recall_target) =

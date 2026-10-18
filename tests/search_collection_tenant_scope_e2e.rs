@@ -2356,3 +2356,268 @@ async fn iceberg_catalog_alter_truncate_and_restart_are_tenant_scoped() {
         failures.join("\n  ")
     );
 }
+
+/// Statistics diagnostics, observability namespaces, prepared statements,
+/// shared Iceberg namespace properties and graph branch merges are each
+/// reachable only within the request tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn diagnostics_observability_and_prepared_statements_are_tenant_scoped() {
+    const VALUE: &str = "owner-column-value";
+    let server = Server::start().await.expect("server start");
+    let rest = Rest {
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .expect("http client"),
+        base: format!("http://127.0.0.1:{}", server.rest_port),
+    };
+    let globex_id = rest.create(Some(GLOBEX), GLOBEX_DOCS).await;
+    rest.insert(Some(GLOBEX), GLOBEX_DOCS, GLOBEX).await;
+    let conn = format!(
+        "host=127.0.0.1 port={} user=postgres dbname={GLOBEX} sslmode=disable",
+        server.pg_port
+    );
+    let (globex_pg, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .expect("pgwire connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    for sql in [
+        "CREATE TABLE gx_orders (id INT PRIMARY KEY, note TEXT)".to_string(),
+        format!("INSERT INTO gx_orders (id, note) VALUES (1, '{VALUE}'), (2, '{VALUE}-2')"),
+        "ALTER TABLE gx_orders MATERIALIZE".to_string(),
+    ] {
+        globex_pg.simple_query(&sql).await.expect("globex pgwire");
+    }
+    sleep(Duration::from_millis(300)).await;
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- Statistics diagnostics: foreign (by name or id) reads as missing.
+    let stats = |c: &str| format!("/api/v2/_diagnostics/collections/{c}/statistics");
+    for (label, foreign, missing) in [
+        (
+            "by table name",
+            "gx_orders".to_string(),
+            "missing_orders".to_string(),
+        ),
+        (
+            "by collection name",
+            GLOBEX_DOCS.to_string(),
+            MISSING_DOCS.to_string(),
+        ),
+        (
+            "by collection id",
+            globex_id.clone(),
+            MISSING_OBJECT_ID.to_string(),
+        ),
+    ] {
+        for tenant in [Some(ACME), None] {
+            compare_probe(
+                &mut failures,
+                VALUE,
+                &format!("statistics {label} as {tenant:?}"),
+                rest.call(tenant, reqwest::Method::GET, &stats(&foreign), None)
+                    .await,
+                rest.call(tenant, reqwest::Method::GET, &stats(&missing), None)
+                    .await,
+                &foreign,
+                &missing,
+                true,
+            );
+        }
+    }
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::GET,
+            &stats(GLOBEX_DOCS),
+            None,
+        )
+        .await;
+    if !status.is_success() {
+        failures.push(format!("statistics as owner: {status} {body}"));
+    }
+
+    // --- Observability namespaces.
+    let obs = "/api/v2/observability/namespaces";
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            obs,
+            Some(json!({ "name": "gx_logs" })),
+        )
+        .await;
+    assert!(status.is_success(), "globex namespace: {status} {body}");
+    let log = |message: &str| json!({ "message": message, "severity": "info" });
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            &format!("{obs}/gx_logs/logs"),
+            Some(log(VALUE)),
+        )
+        .await;
+    assert!(status.is_success(), "globex log: {status} {body}");
+    let search = json!({ "limit": 100 });
+    compare_probe(
+        &mut failures,
+        VALUE,
+        "observability log search as acme",
+        rest.call(
+            Some(ACME),
+            reqwest::Method::POST,
+            &format!("{obs}/gx_logs/logs/search"),
+            Some(search.clone()),
+        )
+        .await,
+        rest.call(
+            Some(ACME),
+            reqwest::Method::POST,
+            &format!("{obs}/missing_logs/logs/search"),
+            Some(search.clone()),
+        )
+        .await,
+        "gx_logs",
+        "missing_logs",
+        false,
+    );
+    let _ = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::POST,
+            &format!("{obs}/gx_logs/logs"),
+            Some(log("acme-line")),
+        )
+        .await;
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            &format!("{obs}/gx_logs/logs/search"),
+            Some(search.clone()),
+        )
+        .await;
+    if !status.is_success() || !body.contains(VALUE) || body.contains("acme-line") {
+        failures.push(format!(
+            "globex namespace after acme probes: {status} {body}"
+        ));
+    }
+
+    // --- Prepared statements belong to the tenant that prepared them.
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            "/api/v2/unified/prepare",
+            Some(json!({ "query": format!("SELECT * FROM {GLOBEX_DOCS}") })),
+        )
+        .await;
+    assert!(status.is_success(), "globex prepare: {status} {body}");
+    let statement_id = serde_json::from_str::<Value>(&body).expect("prepare json")["statement_id"]
+        .as_str()
+        .expect("statement id")
+        .to_string();
+    for (label, method, path) in [
+        (
+            "execute",
+            reqwest::Method::POST,
+            format!("/api/v2/unified/execute/{statement_id}"),
+        ),
+        (
+            "delete",
+            reqwest::Method::DELETE,
+            format!("/api/v2/unified/prepared/{statement_id}"),
+        ),
+    ] {
+        let body = (method == reqwest::Method::POST).then(|| json!({}));
+        let foreign = rest
+            .call(Some(ACME), method.clone(), &path, body.clone())
+            .await;
+        let missing_path = path.replace(&statement_id, "stmt_missing");
+        let missing = rest
+            .call(Some(ACME), method.clone(), &missing_path, body)
+            .await;
+        if foreign.0 != missing.0 || foreign.0.is_success() {
+            failures.push(format!(
+                "prepared {label} as acme: {} {} vs missing {} {}",
+                foreign.0, foreign.1, missing.0, missing.1
+            ));
+        }
+    }
+    let (status, body) = rest
+        .call(
+            Some(ACME),
+            reqwest::Method::POST,
+            "/api/v2/unified/prepared/stats",
+            Some(json!({ "statement_ids": [] })),
+        )
+        .await;
+    if body.contains("\"cached_statements\":1") {
+        failures.push(format!(
+            "prepared stats as acme count globex's: {status} {body}"
+        ));
+    }
+    let (status, body) = rest
+        .call(
+            Some(GLOBEX),
+            reqwest::Method::POST,
+            &format!("/api/v2/unified/execute/{statement_id}"),
+            Some(json!({})),
+        )
+        .await;
+    if status == reqwest::StatusCode::NOT_FOUND || body.contains("not found") {
+        failures.push(format!(
+            "globex statement after acme probes: {status} {body}"
+        ));
+    }
+
+    // --- Iceberg namespace properties on a namespace shared with other tenants.
+    rest.create(Some(ACME), "acme_shared_ns").await;
+    let (status, body) = rest
+        .call(
+            None,
+            reqwest::Method::POST,
+            "/iceberg/v1/namespaces/default/properties",
+            Some(json!({ "updates": { "k": "v" }, "removals": [] })),
+        )
+        .await;
+    if status.is_success() {
+        failures.push(format!(
+            "default tenant changed a shared namespace's properties: {status} {body}"
+        ));
+    }
+
+    // --- Graph branch merge resolves the collection within the tenant.
+    let merge = |c: &str| format!("/api/v2/collections/{c}/branches/b/merge");
+    compare_probe(
+        &mut failures,
+        VALUE,
+        "graph branch merge as acme",
+        rest.call(
+            Some(ACME),
+            reqwest::Method::POST,
+            &merge(GLOBEX_DOCS),
+            Some(json!({ "target_branch": "main", "dry_run": true, "tenant_id": GLOBEX })),
+        )
+        .await,
+        rest.call(
+            Some(ACME),
+            reqwest::Method::POST,
+            &merge(MISSING_DOCS),
+            Some(json!({ "target_branch": "main", "dry_run": true, "tenant_id": GLOBEX })),
+        )
+        .await,
+        GLOBEX_DOCS,
+        MISSING_DOCS,
+        true,
+    );
+
+    assert!(
+        failures.is_empty(),
+        "diagnostics, observability and prepared statements must be tenant-scoped:\n  {}",
+        failures.join("\n  ")
+    );
+}

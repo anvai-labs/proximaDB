@@ -5064,6 +5064,19 @@ impl PostgresProtocol {
         } else {
             namespace
         };
+        // Observability namespaces are tenant-qualified (the same key the REST
+        // surface uses): the session reads only its own tenant's namespaces.
+        let session_tenant = self.pgwire_resolve_read_tenant().await;
+        let scoped_namespace =
+            match proximadb_tenant::tenant_qualified_key(&session_tenant, namespace) {
+                Ok(key) => key,
+                Err(error) => {
+                    return self
+                        .send_error("ERROR", "42602", &format!("invalid namespace: {error}"))
+                        .await;
+                }
+            };
+        let namespace = scoped_namespace.as_str();
 
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let one_hour_ns = 3_600_000_000_000_i64;
@@ -5155,6 +5168,19 @@ impl PostgresProtocol {
         } else {
             namespace
         };
+        // Observability namespaces are tenant-qualified (the same key the REST
+        // surface uses): the session reads only its own tenant's namespaces.
+        let session_tenant = self.pgwire_resolve_read_tenant().await;
+        let scoped_namespace =
+            match proximadb_tenant::tenant_qualified_key(&session_tenant, namespace) {
+                Ok(key) => key,
+                Err(error) => {
+                    return self
+                        .send_error("ERROR", "42602", &format!("invalid namespace: {error}"))
+                        .await;
+                }
+            };
+        let namespace = scoped_namespace.as_str();
 
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let one_hour_ns = 3_600_000_000_000_i64;

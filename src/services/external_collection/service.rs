@@ -132,7 +132,16 @@ impl ExternalCollectionService {
     /// authority + a `VectorAnn` projection in `ExternalSnapshotRegistered`, and
     /// record it in the durable registry. Does **not** read or copy the source.
     pub async fn register(&self, spec: ExternalCollectionSpec) -> Result<ExternalCollection> {
-        if self.registry.get_by_name(&spec.name).is_some() {
+        // Registered for the tenant in scope (internal execution = the default
+        // tenant); names are unique per tenant.
+        let owner = crate::query::request_scope::resolution_tenant(&spec.name)?;
+        let owner_key = proximadb_tenant::resolve_request_tenant(owner.as_deref());
+        if self
+            .registry
+            .list_all()
+            .iter()
+            .any(|ec| ec.spec.name == spec.name && ec.visible_to(&owner_key))
+        {
             anyhow::bail!("external collection '{}' is already registered", spec.name);
         }
         let snapshot_id = snapshot_fingerprint(&spec.location)
@@ -196,7 +205,8 @@ impl ExternalCollectionService {
             .await
             .with_context(|| format!("catalog external collection '{}'", spec.name))?;
 
-        let ec = ExternalCollection::new(spec, snapshot_id);
+        let mut ec = ExternalCollection::new(spec, snapshot_id);
+        ec.tenant = owner;
         self.registry.upsert(ec.clone());
         Ok(ec)
     }
@@ -208,8 +218,7 @@ impl ExternalCollectionService {
         #[cfg(feature = "axis")]
         self.require_axis_runtime_enabled()?;
         let mut ec = self
-            .registry
-            .get(id)
+            .visible(id)
             .ok_or_else(|| anyhow::anyhow!("external collection '{id}' not found"))?;
         let collection_id = ec.spec.name.clone();
 
@@ -248,8 +257,7 @@ impl ExternalCollectionService {
     /// source fingerprint and compares it to the stored snapshot id.
     pub fn is_stale(&self, id: &str) -> Result<bool> {
         let ec = self
-            .registry
-            .get(id)
+            .visible(id)
             .ok_or_else(|| anyhow::anyhow!("external collection '{id}' not found"))?;
         let current = snapshot_fingerprint(&ec.spec.location)?;
         Ok(current != ec.snapshot_id)
@@ -264,8 +272,7 @@ impl ExternalCollectionService {
         #[cfg(feature = "axis")]
         self.require_axis_runtime_enabled()?;
         let mut ec = self
-            .registry
-            .get(id)
+            .visible(id)
             .ok_or_else(|| anyhow::anyhow!("external collection '{id}' not found"))?;
         let collection_id = ec.spec.name.clone();
         let current = snapshot_fingerprint(&ec.spec.location)?;
@@ -459,8 +466,7 @@ impl ExternalCollectionService {
         fusion: FusionStrategy,
     ) -> Result<Vec<ExternalHit>> {
         let ec = self
-            .registry
-            .get(id)
+            .visible(id)
             .ok_or_else(|| anyhow::anyhow!("external collection '{id}' not found"))?;
         if !ec.is_ready() {
             anyhow::bail!(
@@ -628,12 +634,34 @@ impl ExternalCollectionService {
 
     /// Look up a registry record by id.
     pub fn get(&self, id: &str) -> Option<ExternalCollection> {
-        self.registry.get(id)
+        self.visible(id)
     }
 
-    /// All registered external collections (newest first).
+    /// The registered external collections the scope in force may see
+    /// (newest first): a request sees only its tenant's; internal execution
+    /// sees all; no scope sees none.
     pub fn list(&self) -> Vec<ExternalCollection> {
-        self.registry.list_all()
+        let all = self.registry.list_all();
+        match crate::query::request_scope::current_scope() {
+            Some(crate::query::request_scope::RequestScope::Internal(_)) => all,
+            Some(crate::query::request_scope::RequestScope::Tenant(tenant)) => all
+                .into_iter()
+                .filter(|ec| ec.visible_to(&tenant))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The external collection `id` when the scope in force may see it.
+    fn visible(&self, id: &str) -> Option<ExternalCollection> {
+        let ec = self.registry.get(id)?;
+        match crate::query::request_scope::current_scope() {
+            Some(crate::query::request_scope::RequestScope::Internal(_)) => Some(ec),
+            Some(crate::query::request_scope::RequestScope::Tenant(tenant)) => {
+                ec.visible_to(&tenant).then_some(ec)
+            }
+            None => None,
+        }
     }
 
     /// Read the external-index projection (for EXPLAIN / route-health / tests).

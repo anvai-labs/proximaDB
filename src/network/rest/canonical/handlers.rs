@@ -707,10 +707,29 @@ fn sql_params_to_proxima_values(
 /// `tests/graph_branch_merge_rest_integration_test.rs`.
 pub async fn merge_graph_branch(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((collection, branch)): Path<(String, String)>,
     Json(request): Json<GraphBranchMergeRequest>,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
-    merge_graph_branch_inner(&state.data_dir, &collection, &branch, request).await
+    // The collection is resolved within the request tenant (another tenant's
+    // reads as missing); the tenant is never taken from the request body.
+    let visible = state
+        .collection_service
+        .collection_for_tenant(&collection, Some(&tenant.tenant_id))
+        .await
+        .map_err(|e| ApiError::Internal(format!("collection lookup failed: {e}")))?
+        .is_some();
+    if !visible {
+        return Err(ApiError::CollectionNotFound(collection));
+    }
+    merge_graph_branch_inner(
+        &state.data_dir,
+        &tenant.tenant_id,
+        &collection,
+        &branch,
+        request,
+    )
+    .await
 }
 
 /// Pure-logic core of the branch-merge handler. Decoupled from `AppState`
@@ -723,6 +742,7 @@ pub async fn merge_graph_branch(
 /// `origin = "branch_merge:<branch>:<request.target_branch>"`.
 pub async fn merge_graph_branch_inner(
     data_dir: &std::path::Path,
+    tenant: &str,
     collection: &str,
     branch: &str,
     request: GraphBranchMergeRequest,
@@ -766,7 +786,14 @@ pub async fn merge_graph_branch_inner(
                 err
             ))
         })?;
-    let collection_entries = filter_canonical_wal_for_collection(entries, collection);
+    // Only this tenant's entries (entries without a tenant are the default
+    // tenant's).
+    let collection_entries: Vec<_> = filter_canonical_wal_for_collection(entries, collection)
+        .into_iter()
+        .filter(|entry| {
+            proximadb_tenant::resolve_request_tenant(entry.tenant_id.as_deref()) == tenant
+        })
+        .collect();
     let report =
         crate::graph::merge::merge_branches(&collection_entries, branch, &request.target_branch)
             .ok_or_else(|| {
@@ -785,7 +812,7 @@ pub async fn merge_graph_branch_inner(
             collection,
             branch,
             &request.target_branch,
-            request.tenant_id.clone(),
+            Some(tenant.to_string()),
         )
         .await
         {
@@ -898,7 +925,8 @@ pub struct GraphBranchMergeRequest {
     /// Dry-run returns the ADR-012 merge report without writing a merge commit.
     #[serde(default = "default_graph_branch_merge_dry_run")]
     pub dry_run: bool,
-    /// Optional tenant ID for multi-tenant deployments.
+    /// Ignored: the merge acts as the request tenant. Kept so existing request
+    /// bodies still parse.
     pub tenant_id: Option<String>,
 }
 

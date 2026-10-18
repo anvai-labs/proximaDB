@@ -1319,7 +1319,9 @@ impl ProximaDB {
             if std::path::Path::new(&policy_path).exists() {
                 // A learned policy is a cache: an unreadable one never blocks startup.
                 match planner.load_policy(&policy_path).await {
-                    Ok(()) => tracing::info!("✅ RL policy loaded from {}", policy_path),
+                    Ok(true) => tracing::info!("✅ RL policy loaded from {}", policy_path),
+                    // Already reported (and reset) by the loader.
+                    Ok(false) => {}
                     Err(error) => tracing::warn!(
                         path = %policy_path,
                         %error,

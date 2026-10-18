@@ -249,12 +249,15 @@ pub(crate) fn cluster_sort_key(rec: &ProximaRecord, column: &str) -> (bool, i128
 /// materialized, so this seam covers the join-parallelism goal.)
 pub(crate) fn publish_ndv_statistics(
     table_name: &str,
+    tenant: Option<&str>,
     schema: &CatalogTableSchema,
     records: &[ProximaRecord],
 ) {
     use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
 
-    let mut summary = crate::core::statistics::StatisticsSummary::new(table_name);
+    let mut summary = crate::core::statistics::StatisticsSummary::new(
+        crate::core::statistics::table_statistics_key(tenant, table_name),
+    );
     summary.set_record_count(records.len() as u64);
     // Pre-compute (name, type-name) once per column. The type name only feeds
     // `is_numeric_type` (quantile tracking); the HLL distinct count is type-
@@ -2495,7 +2498,12 @@ impl DmlService {
         //     degrades to the pre-A2 `Absent` (never a wrong answer). Run only
         //     after the write + catalog flip succeed so stats describe data
         //     that actually landed. See `publish_ndv_statistics`.
-        publish_ndv_statistics(table_name, &schema, &records);
+        publish_ndv_statistics(
+            table_name,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+            &schema,
+            &records,
+        );
 
         // 6. Best-effort: also publish a spec-shaped Iceberg snapshot (v3) — Avro manifest
         //    + manifest list + TableMetadata under `{prefix}/metadata` — so EXTERNAL Iceberg

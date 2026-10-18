@@ -254,7 +254,7 @@ impl RLPlanner {
     }
 
     /// Load persisted policy from file
-    pub async fn load_policy(&self, path: &str) -> anyhow::Result<()> {
+    pub async fn load_policy(&self, path: &str) -> anyhow::Result<bool> {
         let mut bandit = self.bandit.write().await;
         bandit.load_from_file(path).await
     }
