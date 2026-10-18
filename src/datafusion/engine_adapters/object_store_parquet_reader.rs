@@ -2625,17 +2625,29 @@ mod tests {
         let query =
             format!("SELECT p0,p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11 FROM t WHERE k IN ({in_list})");
 
-        async fn measure(location: &str, on: bool, query: &str) -> (usize, u64, u64) {
+        async fn measure(
+            location: &str,
+            semijoin: bool,
+            spec_bloom: bool,
+            query: &str,
+        ) -> (usize, u64, u64) {
             // SAFETY: nextest runs each test in its own process; this test is the
-            // only code in it and toggles the flag single-threaded.
+            // only code in it and toggles the flags single-threaded.
             unsafe {
-                if on {
+                if semijoin {
                     std::env::set_var("PROXIMADB_DF_BLOOM_SEMIJOIN", "1");
                     std::env::set_var("PROXIMADB_DF_BLOOM_SEMIJOIN_MIN_KEYS", "4");
                 } else {
                     // Explicit opt-out: the gate defaults ON (ADR-056 MVP-1), so
                     // the "off" arm must set `=0`, not merely remove the var.
                     std::env::set_var("PROXIMADB_DF_BLOOM_SEMIJOIN", "0");
+                }
+                // The spec SBBF point probe also reads the persisted `k` blooms
+                // (default on); the min/max baseline must switch it off too.
+                if spec_bloom {
+                    std::env::remove_var("PROXIMADB_PARQUET_READ_BLOOM_DISABLE");
+                } else {
+                    std::env::set_var("PROXIMADB_PARQUET_READ_BLOOM_DISABLE", "1");
                 }
             }
             io_trace::scope(async move {
@@ -2659,11 +2671,13 @@ mod tests {
             .await
         }
 
-        let (rows_off, bytes_off, pruned_off) = measure(&location, false, &query).await;
-        let (rows_on, bytes_on, pruned_on) = measure(&location, true, &query).await;
+        let (rows_off, bytes_off, pruned_off) = measure(&location, false, false, &query).await;
+        let (rows_on, bytes_on, pruned_on) = measure(&location, true, false, &query).await;
+        let (rows_spec, bytes_spec, pruned_spec) = measure(&location, false, true, &query).await;
         unsafe {
             std::env::remove_var("PROXIMADB_DF_BLOOM_SEMIJOIN");
             std::env::remove_var("PROXIMADB_DF_BLOOM_SEMIJOIN_MIN_KEYS");
+            std::env::remove_var("PROXIMADB_PARQUET_READ_BLOOM_DISABLE");
         }
 
         let reduction = 100.0 * (bytes_off.saturating_sub(bytes_on)) as f64 / bytes_off as f64;
@@ -2688,6 +2702,20 @@ mod tests {
         assert!(
             bytes_on < bytes_off,
             "bloom must reduce metered bytes_read (off={bytes_off} on={bytes_on})"
+        );
+        // The spec SBBF point probe alone (semi-join gate off) reaches the same
+        // prune from the same persisted blooms, with the same rows.
+        assert_eq!(
+            rows_spec, rows_off,
+            "spec bloom probe must not change results"
+        );
+        assert_eq!(
+            pruned_spec, pruned_on,
+            "spec SBBF probe prunes rg0 like the semi-join path"
+        );
+        assert!(
+            bytes_spec < bytes_off,
+            "spec bloom must reduce metered bytes_read (off={bytes_off} spec={bytes_spec})"
         );
     }
 
