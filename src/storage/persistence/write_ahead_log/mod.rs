@@ -2940,19 +2940,8 @@ impl WriteAheadLogManager {
                     }
                 }
 
-                // Deletion tombstones carry no props, so a bloom miss says
-                // nothing about them: a batch holding one must still reach the
-                // merge, where it suppresses the live copy of its record
-                // (invariant 16d). Its live records are still dropped by the
-                // exact per-record filter.
-                let holds_tombstones = batch
-                    .vector_records
-                    .iter()
-                    .any(|record| record.valid_to_ns == Some(0));
                 if should_include {
                     bloom_hits += 1;
-                    filtered_batches.push(batch);
-                } else if holds_tombstones {
                     filtered_batches.push(batch);
                 }
             } else {

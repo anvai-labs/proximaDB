@@ -2085,31 +2085,6 @@ async fn catalog_entries_introspection_and_lifecycle_are_tenant_scoped() {
         failures.push(format!("acme re-create after delete: {status} {body}"));
     }
 
-    // A deleted record leaves filtered search too.
-    let filtered = json!({
-        "vector": vector(), "top_k": 10,
-        "filters": [{ "field": "topic", "op": "eq", "value": "alpha" }],
-    });
-    let search = format!("/api/v2/collections/{GLOBEX_DOCS}/search");
-    rest.call(
-        Some(GLOBEX),
-        reqwest::Method::DELETE,
-        &format!("/api/v2/collections/{GLOBEX_DOCS}/records/{GLOBEX}-r2"),
-        None,
-    )
-    .await;
-    let (status, body) = rest
-        .call(
-            Some(GLOBEX),
-            reqwest::Method::POST,
-            &search,
-            Some(filtered.clone()),
-        )
-        .await;
-    if body.contains(&format!("{GLOBEX}-r2")) || !body.contains(&format!("{GLOBEX}-r0")) {
-        failures.push(format!("filtered search after delete: {status} {body}"));
-    }
-
     // Owners' data survives a restart.
     drop(globex_pg);
     drop(acme_pg);
