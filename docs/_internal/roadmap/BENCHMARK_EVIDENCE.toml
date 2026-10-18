@@ -591,56 +591,15 @@ id = "tst_ohlc_latency"
 claim = "Sub-millisecond OHLC bar queries (TST engine)"
 metric = "ohlc_query_latency_ms"
 status = "aspirational"
-asserted_in = []
+asserted_in = ["docs/11-usecases/IBKRTRADING_DOGFOOD.adoc:272"]
 bench_source = ""
 bench_command = ""
 artifact = ""
 hardware = ""
 date = ""
 version = ""
-notes = "No longer asserted in the PRD (rewritten for ADR-096, 2026-10-17). PRD acceptance criterion for the Beta TST engine. No benchmark under benches/ measures OHLC query latency."
+notes = "Success criterion of the ibkrtrading use case (ADR-096 D2 moved trading-specific targets out of the PRD). No benchmark under benches/ measures OHLC query latency; Beta TST engine."
 
-[[claims]]
-id = "tst_ingest_rate"
-claim = ">100K bars/second sustained ingest (TST engine)"
-metric = "tst_ingest_bars_per_sec"
-status = "aspirational"
-asserted_in = []
-bench_source = ""
-bench_command = ""
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "No longer asserted in the PRD (rewritten for ADR-096, 2026-10-17). PRD acceptance criterion; no TST ingest benchmark exists."
-
-[[claims]]
-id = "recovery_time"
-claim = "<5s recovery"
-metric = "recovery_time_s"
-status = "aspirational"
-asserted_in = []
-bench_source = ""
-bench_command = ""
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "No longer asserted in the PRD (rewritten for ADR-096, 2026-10-17). Platform-engineer requirement; recovery time is not benchmarked."
-
-[[claims]]
-id = "asof_join_latency"
-claim = "ASOF join point-in-time lookup performance (TST engine)"
-metric = "asof_join_latency_ms"
-status = "aspirational"
-asserted_in = []
-bench_source = ""
-bench_command = ""
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "No longer asserted in the PRD (rewritten for ADR-096, 2026-10-17). PRD acceptance criterion for the Beta TST engine; no ASOF-join benchmark exists."
 
 [[claims]]
 id = "cloud_latency"
