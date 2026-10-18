@@ -1307,9 +1307,10 @@ impl ProximaDB {
             return Ok(());
         }
 
-        let policy_path = rl_config.log_path.clone().unwrap_or_else(|| {
-            format!("{}/rl_policy.json", self._config.server.data_dir.display())
-        });
+        // TD-RLNAN-1: the policy has its own file. `rl_config.log_path` is the
+        // execution logger's JSONL file; using it here wrote policy JSON into the
+        // log, so the policy never parsed back.
+        let policy_path = format!("{}/rl_policy.json", self._config.server.data_dir.display());
         self.rl_policy_path = Some(policy_path.clone());
 
         query::rl_planner::init_rl_planner(rl_config.clone());
@@ -1317,8 +1318,28 @@ impl ProximaDB {
 
         if let Some(planner) = query::rl_planner::get_rl_planner() {
             if std::path::Path::new(&policy_path).exists() {
-                planner.load_policy(&policy_path).await?;
-                tracing::info!("✅ RL policy loaded from {}", policy_path);
+                match planner.load_policy(&policy_path).await {
+                    Ok(()) => tracing::info!("✅ RL policy loaded from {}", policy_path),
+                    // TD-RLNAN-1: learned tuning state must never stop the server
+                    // from starting; set it aside and learn afresh.
+                    Err(error) => {
+                        match query::rl_planner::set_aside_unreadable_policy(&policy_path).await {
+                            Ok(aside) => tracing::warn!(
+                                "RL policy at {} could not be loaded ({error}); moved to {} and \
+                                 starting with a fresh policy",
+                                policy_path,
+                                aside
+                            ),
+                            // Even moving it aside must not stop the server (read-only
+                            // data dir, cross-device path): learn afresh in memory.
+                            Err(rename_error) => tracing::warn!(
+                                "RL policy at {} could not be loaded ({error}) or moved aside \
+                                 ({rename_error}); starting with a fresh in-memory policy",
+                                policy_path
+                            ),
+                        }
+                    }
+                }
             }
 
             let checkpoint_path = policy_path.clone();

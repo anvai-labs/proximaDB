@@ -2696,6 +2696,12 @@ impl DmlService {
         // returns empty under top-level OR, so `id = 5 OR status = 'x'` correctly scans).
         // Each candidate is re-checked against the FULL tree before counting as a match.
         let pk_candidates = self.extract_pk_candidate_ids(where_clause, table_schema)?;
+        // TD-RELIDEQ-1: with no declared key the "key" is the `id`/`record_id`
+        // fallback, which equals the record oid only for collections written
+        // through the record API. A keyless pgwire row has a generated oid, so a
+        // miss there proves nothing: fall through to the predicate scan.
+        let key_is_declared = Self::table_declares_primary_key(table_schema);
+        let mut fallback_key_missed = false;
         if !pk_candidates.is_empty() {
             let cap = limit.unwrap_or(usize::MAX);
             let mut records = Vec::new();
@@ -2722,6 +2728,7 @@ impl DmlService {
                     )
                     .await?
                 else {
+                    fallback_key_missed |= !key_is_declared;
                     continue;
                 };
                 let record = Self::rich_result_to_record(rich);
@@ -2729,7 +2736,9 @@ impl DmlService {
                     records.push(record);
                 }
             }
-            return Ok((RelationalSelectAccessPath::PrimaryKeyLookup, records));
+            if !fallback_key_missed {
+                return Ok((RelationalSelectAccessPath::PrimaryKeyLookup, records));
+            }
         }
 
         // TD-127 secondary-index fast-path: a single-column equality / IN-list on
@@ -4214,7 +4223,9 @@ impl DmlService {
         // (same insert-path builder → matching tenant_id + typed PK), applied
         // after the record store confirms the delete. Full PK tuple (TD-DML-2).
         let cks_tombstone_ids: Vec<proximadb_storage_ports::Identity> =
-            if self.conditional_key_store.is_some() {
+            if self.conditional_key_store.is_some()
+                && Self::table_declares_primary_key(&table_schema)
+            {
                 // TD-DML-2: composite PKs are fenced on their full tuple, so
                 // their deletes must release the full-tuple identity too.
                 let pk_cols = Self::primary_key_columns(&table_schema);
@@ -4870,6 +4881,28 @@ impl DmlService {
         table_schema: &CatalogTableSchema,
         now_ns: i64,
     ) -> Result<ProximaRecord> {
+        // TD-RELIDEQ-1: a table with no declared key addresses its rows by
+        // `oid` (here `key_value`); there is no key tuple to decode.
+        if !Self::table_declares_primary_key(table_schema) {
+            let row = CatalogRow {
+                table: table_schema.name.clone(),
+                values: HashMap::new(),
+            };
+            return row.to_mutation_record(
+                table_schema,
+                RelationalMutationKind::Delete,
+                RelationalRecordOptions {
+                    method: Some("sql_delete".to_string()),
+                    origin: Some("delete".to_string()),
+                    created_at_ns: Some(now_ns),
+                    updated_at_ns: Some(now_ns),
+                    valid_to_ns: Some(0),
+                    include_vector_embeddings: false,
+                    record_id: Some(key_value.to_string()),
+                    ..RelationalRecordOptions::default()
+                },
+            );
+        }
         let primary_key_columns = Self::primary_key_columns(table_schema);
         if primary_key_columns.is_empty() {
             return Err(anyhow!(
@@ -5018,7 +5051,9 @@ impl DmlService {
                     table_schema.name
                 ));
             };
-            if primary_key_column.as_deref() == Some(column_name.as_str()) {
+            if primary_key_column.as_deref() == Some(column_name.as_str())
+                && Self::table_declares_primary_key(table_schema)
+            {
                 return Err(anyhow!(
                     "UPDATE cannot modify primary key column '{}'",
                     column_name
@@ -5083,6 +5118,9 @@ impl DmlService {
                 created_at_ns,
                 updated_at_ns: Some(updated_at_ns),
                 record_version: existing.version.map(|version| version as u64 + 1),
+                // TD-RELIDEQ-1: a keyless row keeps its oid (ignored when the
+                // table declares a key, whose value is the oid).
+                record_id: Some(existing.id.clone()),
                 ..RelationalRecordOptions::default()
             },
         )
@@ -5096,7 +5134,11 @@ impl DmlService {
         let mut row_values = HashMap::new();
 
         for column in &table_schema.columns {
-            if primary_key_column.as_deref() == Some(column.name.as_str()) {
+            // TD-RELIDEQ-1: only a declared key lives in the oid; a keyless
+            // table's `id`/`record_id` fallback column is an ordinary column.
+            if primary_key_column.as_deref() == Some(column.name.as_str())
+                && Self::table_declares_primary_key(table_schema)
+            {
                 row_values.insert(
                     column.name.clone(),
                     Self::primary_key_string_to_proxima_value(
@@ -5310,7 +5352,15 @@ impl DmlService {
                 // (D3). NB: the claim and the later `write_mutations` row write
                 // are not yet a single atomic apply — that is the D11
                 // append-only-MVCC follow-up.
-                let is_live = if let Some(cks) = &self.conditional_key_store {
+                // TD-RELIDEQ-1: CKS fences the DECLARED key's value. A keyless
+                // table's identity is its oid (a generated id), so claiming by
+                // the `id`/`record_id` fallback value would fence an identity
+                // nothing ever releases — take the legacy probe instead.
+                let is_live = if let Some(cks) = self
+                    .conditional_key_store
+                    .as_ref()
+                    .filter(|_| Self::table_declares_primary_key(table_schema))
+                {
                     use proximadb_storage_ports::{Generation, Identity, Oid, PutOutcome};
                     // Key on the F0 typed, order-preserving codec built from the
                     // row's typed PK tuple (every PK column, in catalog order —
@@ -6050,7 +6100,13 @@ impl DmlService {
                 // references the parent's FULL PK in order (checked above), and
                 // the parent claim is keyed on that full tuple (TD-DML-2), so
                 // single- and multi-column FKs both resolve through the CKS.
-                let referenced_exists = if let Some(cks) = self.conditional_key_store.as_ref() {
+                // TD-RELIDEQ-1: only a parent with a DECLARED key is fenced in
+                // the CKS; a keyless parent resolves through the record store.
+                let referenced_exists = if let Some(cks) = self
+                    .conditional_key_store
+                    .as_ref()
+                    .filter(|_| Self::table_declares_primary_key(&parent_schema))
+                {
                     let id = proximadb_storage_ports::Identity::from_bytes(
                         proximadb_data_model::key_codec::encode_identity(
                             &record.tenant_id,
@@ -6118,6 +6174,10 @@ impl DmlService {
         // sound under a top-level conjunction — see `extract_pk_candidate_ids`),
         // fetch them by key and keep only those that ALSO satisfy the full tree.
         let pk_candidates = self.extract_pk_candidate_ids(where_clause, table_schema)?;
+        // TD-RELIDEQ-1: see `select_table_records_with_tree` — a miss on the
+        // `id`/`record_id` fallback key falls through to the predicate scan.
+        let key_is_declared = Self::table_declares_primary_key(table_schema);
+        let mut fallback_key_missed = false;
         if !pk_candidates.is_empty() {
             let mut ids = Vec::new();
             for candidate in pk_candidates {
@@ -6140,6 +6200,7 @@ impl DmlService {
                     )
                     .await?
                 else {
+                    fallback_key_missed |= !key_is_declared;
                     continue;
                 };
                 let record = Self::rich_result_to_record(rich);
@@ -6147,7 +6208,9 @@ impl DmlService {
                     ids.push(record.oid);
                 }
             }
-            return Ok(ids);
+            if !fallback_key_missed {
+                return Ok(ids);
+            }
         }
 
         // No PK predicate: push the full predicate tree into the store scan.
@@ -6245,6 +6308,15 @@ impl DmlService {
         Ok(crate::services::record_store::proxima_value_to_unique_text(
             &value,
         ))
+    }
+
+    /// Whether the table declares a primary key. Without one,
+    /// `schema_primary_key_column` falls back to a column named `id` or
+    /// `record_id`, which is NOT the record oid for a keyless relational row
+    /// (TD-RELIDEQ-1).
+    fn table_declares_primary_key(table_schema: &CatalogTableSchema) -> bool {
+        !table_schema.primary_key.is_empty()
+            || !table_schema.relational_capabilities.primary_key.is_empty()
     }
 
     fn extract_pk_candidate_ids(
