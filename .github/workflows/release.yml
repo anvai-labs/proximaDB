@@ -46,9 +46,12 @@
 #   │     tag; its trusted publisher is bound to that file name.)            │
 #   │     ├── publish-crates    crates.io (stable only)                      │
 #   │     ├── publish-npm       npm via OIDC (stable only)                   │
-#   │     └── update-homebrew   Homebrew formula artifact                    │
+#   │     └── update-homebrew   anvai-labs/homebrew-tap PR (HOMEBREW_TAP_TOKEN)│
 #   ├─────────────────────────────────────────────────────────────────────────┤
-#   │  5. VERIFY             Post-release installation verification          │
+#   │  5. VERIFY             Registries list the version (verify-release),   │
+#   │                        then release-smoke.yml installs + exercises     │
+#   │                        every published artifact and proves the tag is  │
+#   │                        a QA-proven qa->main merge (release evidence)   │
 #   ├─────────────────────────────────────────────────────────────────────────┤
 #   │  6. CLEANUP            Remove workflow artifacts                       │
 #   └─────────────────────────────────────────────────────────────────────────┘
@@ -166,11 +169,20 @@ jobs:
 
       - name: Extract Version
         id: version
+        # Inputs reach the shell through env, never `${{ }}` interpolation: a
+        # dispatch input is attacker-shaped text, and interpolated into the
+        # script it is code. The version is then validated as semver.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_PRERELEASE: ${{ inputs.prerelease }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-            PRERELEASE="${{ inputs.prerelease }}"
-            DRY_RUN="${{ inputs.dry_run }}"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$IN_VERSION"
+            PRERELEASE="$IN_PRERELEASE"
+            DRY_RUN="$IN_DRY_RUN"
           else
             # Extract version from tag (remove 'v' prefix)
             VERSION="${GITHUB_REF#refs/tags/v}"
@@ -182,6 +194,12 @@ jobs:
             fi
             DRY_RUN="false"
           fi
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release version '${VERSION}' is not semver X.Y.Z[-pre]"
+            exit 1
+          fi
+          case "$PRERELEASE" in true|false) ;; *) echo "::error::prerelease must be true/false"; exit 1 ;; esac
+          case "$DRY_RUN" in true|false) ;; *) echo "::error::dry_run must be true/false"; exit 1 ;; esac
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
           echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
@@ -236,10 +254,20 @@ jobs:
       matrix:
         include:
           # Linux x86_64 (glibc)
+          # Built in the manylinux_2_28 container with OpenSSL vendored
+          # (scripts/build_portable_linux.sh), so the archive, .deb, .rpm and
+          # Homebrew formula run on glibc >= 2.28 with any system OpenSSL.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             archive: tar.gz
-            features: "cloud-full"
+            features: "cloud-full,vendored-openssl"
+            # Own rust-cache namespace, keyed on the build image digest: a host
+            # (glibc 2.35) target/ restored into the manylinux_2_28 build would
+            # reuse -sys objects compiled against the newer glibc (cargo's
+            # fingerprints match) and fail the portability check. Must carry
+            # the first 12 hex of PORTABLE_IMAGE's digest in
+            # scripts/build_portable_linux.sh (check_release_build_features).
+            cache_prefix: "v1-rust-x86_64-unknown-linux-gnu-manylinux_2_28-1e7b8460ad8f"
 
           # Linux x86_64 (musl - static) - DISABLED for v0.2.0
           # Target installation issue - requires manual musl target setup
@@ -270,6 +298,7 @@ jobs:
             os: windows-2022
             archive: zip
             features: "cloud-full"
+            cache_prefix: "v1-rust-x86_64-pc-windows-msvc"
 
     steps:
       - name: Checkout
@@ -343,13 +372,18 @@ jobs:
         if: steps.fetch.outcome != 'success'
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-${{ matrix.target }}"
+          prefix-key: "${{ matrix.cache_prefix }}"
           shared-key: "release"
 
       - name: Build Binaries
         if: steps.fetch.outcome != 'success'
         run: |
           FEATURES="${{ matrix.features }}"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            # glibc 2.28 + vendored OpenSSL; fails unless the result is portable.
+            bash scripts/build_portable_linux.sh "$FEATURES"
+            exit 0
+          fi
           if [ -n "$FEATURES" ]; then
             FEATURES_FLAG="--features $FEATURES"
           else
@@ -413,6 +447,16 @@ jobs:
           "$($hash.Hash.ToLower())  ${ARCHIVE_NAME}.zip" | Out-File -Encoding ascii "${ARCHIVE_NAME}.zip.sha256"
 
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}.zip" >> $env:GITHUB_ENV
+
+      # Whether fetched from Pre-Release CI or rebuilt: the archive every Linux
+      # package repackages must run on glibc 2.28 without a system OpenSSL.
+      - name: Linux binaries are portable (glibc <= 2.28, no system OpenSSL)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          mkdir -p portable-check
+          tar -xzf "$ARCHIVE_NAME" -C portable-check --strip-components=1
+          bash scripts/check_linux_portability.sh portable-check
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v7
@@ -505,7 +549,12 @@ jobs:
           mkdir -p rpm_build/var/log/proximadb
           mkdir -p rpm_build/tmp
 
-          tar -xzf binary/proximadb-*.tar.gz -C rpm_build/usr/bin --strip-components=1
+          # Only the three binaries go to /usr/bin (the archive's README,
+          # LICENSE and config/ used to land there too); config ships as
+          # /etc/proximadb/config.toml below.
+          tar -xzf binary/proximadb-*.tar.gz -C rpm_build/usr/bin --strip-components=1 \
+            --wildcards '*/proximadb-server' '*/proximadb-bench' '*/proximadb-migrate'
+          bash scripts/check_linux_portability.sh rpm_build/usr/bin
           cp config/config.toml rpm_build/etc/proximadb/
           cp deploy/packaging/systemd/proximadb.service rpm_build/usr/lib/systemd/system/
           cp deploy/packaging/scripts/postinstall.sh rpm_build/tmp/postinstall.sh
@@ -520,6 +569,7 @@ jobs:
             --license "Apache-2.0" \
             --vendor "ProximaDB" \
             --rpm-dist "el8" \
+            --depends xz-libs \
             --after-install rpm_build/tmp/postinstall.sh \
             --before-remove rpm_build/tmp/preremove.sh \
             rpm_build/=/
@@ -562,7 +612,12 @@ jobs:
           mkdir -p deb_build/tmp
           mkdir -p deb_build/lib/systemd/system
 
-          tar -xzf binary/proximadb-*.tar.gz -C deb_build/usr/bin --strip-components=1
+          # Only the three binaries go to /usr/bin (the archive's README,
+          # LICENSE and config/ used to land there too); config ships as
+          # /etc/proximadb/config.toml below.
+          tar -xzf binary/proximadb-*.tar.gz -C deb_build/usr/bin --strip-components=1 \
+            --wildcards '*/proximadb-server' '*/proximadb-bench' '*/proximadb-migrate'
+          bash scripts/check_linux_portability.sh deb_build/usr/bin
           cp config/config.toml deb_build/etc/proximadb/
           cp deploy/packaging/systemd/proximadb.service deb_build/lib/systemd/system/
           cp deploy/packaging/scripts/postinstall.sh deb_build/tmp/postinstall.sh
@@ -578,6 +633,7 @@ jobs:
             --license "Apache-2.0" \
             --vendor "ProximaDB" \
             --deb-priority "optional" \
+            --depends liblzma5 \
             --after-install deb_build/tmp/postinstall.sh \
             --before-remove deb_build/tmp/preremove.sh \
             deb_build/=/
@@ -942,13 +998,13 @@ jobs:
 
           #### Platform Packages (RPM/DEB/MSI)
 
-          **Linux (RPM - RHEL/CentOS/Fedora):**
+          **Linux (RPM - RHEL/Rocky/Alma 8+, Fedora; glibc 2.28, OpenSSL built in):**
           ```bash
           sudo rpm -ivh proximadb-${{ needs.prepare.outputs.version }}-1.el8.x86_64.rpm
           sudo systemctl start proximadb
           ```
 
-          **Linux (DEB - Debian/Ubuntu):**
+          **Linux (DEB - Debian 11+, Ubuntu 20.04+):**
           ```bash
           sudo dpkg -i proximadb_${{ needs.prepare.outputs.version }}_amd64.deb
           sudo systemctl start proximadb
@@ -1142,6 +1198,10 @@ jobs:
         run: |
           npm ci
           npm run build
+          # Every path package.json routes a consumer to must be in the tarball,
+          # require() and import() must both load, VERSION == package.json
+          # (v0.4.1 shipped an `import` target that did not exist).
+          npx vitest run tests/package_entry.test.ts
 
       # Idempotent: the tag's version may already be on npm (manual bootstrap
       # publish, or a re-run after a partial failure) — skip, don't fail.
@@ -1267,70 +1327,60 @@ jobs:
           exit 1
 
   # ============================================================================
-  # UPDATE HOMEBREW FORMULA - macOS package manager
+  # UPDATE HOMEBREW FORMULA - anvai-labs/homebrew-tap Formula/proximadb.rb
   # ============================================================================
+  # Users install with `brew install anvai-labs/tap/proximadb` (Linux x86_64:
+  # the only unix archive this workflow builds). This job used to write a
+  # formula with NO sha256 and macOS/aarch64 urls for archives that are never
+  # built, and only uploaded it as a workflow artifact -- nothing reached the
+  # tap. Now:
+  #   1. scripts/release_homebrew_formula.py rewrites the tap's CURRENT formula
+  #      (url + sha256 only) for the archive the release actually has, with the
+  #      sha256 checked against SHA256SUMS.txt AND the downloaded bytes;
+  #   2. with the HOMEBREW_TAP_TOKEN secret (a fine-grained PAT on
+  #      anvai-labs/homebrew-tap: Contents + Pull requests read/write), it opens
+  #      a PR on the tap, waits for the tap's `CI Success` (brew audit + install
+  #      tests) and merges it. The tap's main is protected by that check, so the
+  #      formula only lands if brew can install it.
+  #   Without the secret the rendered formula is still uploaded and the step
+  #   summary says the tap was not updated (its own 6-hourly update-data-tools
+  #   workflow will open the same PR); release-smoke.yml's `homebrew` job stays
+  #   strict and reports the tap as stale until it lands.
   update-homebrew:
-    timeout-minutes: 30
+    timeout-minutes: 90
     name: Update Homebrew Formula
     needs: [prepare, create-release]
     runs-on: ubuntu-latest
     if: needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true'
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAP: anvai-labs/homebrew-tap
+      FORMULA: Formula/proximadb.rb
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Generate Homebrew Formula
+      - name: Render the formula for this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
-          cat << EOF > proximadb.rb
-          class Proximadb < Formula
-            desc "Multi-model vector database for AI applications"
-            homepage "https://github.com/${{ github.repository }}"
-            version "$VERSION"
-            license "Apache-2.0"
-
-            on_macos do
-              on_intel do
-                url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/proximadb-$VERSION-x86_64-apple-darwin.tar.gz"
-                # sha256 will be updated after release
-              end
-              on_arm do
-                url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/proximadb-$VERSION-aarch64-apple-darwin.tar.gz"
-                # sha256 will be updated after release
-              end
-            end
-
-            on_linux do
-              on_intel do
-                url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/proximadb-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
-                # sha256 will be updated after release
-              end
-              on_arm do
-                url "https://github.com/${{ github.repository }}/releases/download/v$VERSION/proximadb-$VERSION-aarch64-unknown-linux-gnu.tar.gz"
-                # sha256 will be updated after release
-              end
-            end
-
-            def install
-              bin.install "proximadb-server"
-              bin.install "proximadb-bench"
-              bin.install "proximadb-migrate"
-              etc.install "config" => "proximadb"
-            end
-
-            service do
-              run [opt_bin/"proximadb-server", "--config", etc/"proximadb/config.toml"]
-              keep_alive true
-              working_dir var/"proximadb"
-              log_path var/"log/proximadb.log"
-              error_log_path var/"log/proximadb.error.log"
-            end
-
-            test do
-              system bin/"proximadb-server", "--version"
-            end
-          end
-          EOF
+          set -euo pipefail
+          # The tap is public: read its current formula without the tap token.
+          # ONLY a 404 means "no formula yet"; any other error (rate limit,
+          # 5xx) fails here rather than resetting the tap to the template.
+          if gh api "repos/${TAP}/contents/${FORMULA}" --jq .content > tap.b64 2> tap.err; then
+            base64 -d tap.b64 > tap-current.rb
+            BASE=(--base tap-current.rb)
+          elif grep -q 'HTTP 404' tap.err; then
+            echo "::warning::${TAP} has no ${FORMULA}; rendering a fresh formula"
+            BASE=()
+          else
+            echo "::error::cannot read ${TAP}/${FORMULA}: $(cat tap.err)"
+            exit 1
+          fi
+          python3 scripts/release_homebrew_formula.py --repo "${{ github.repository }}" \
+            --version "$VERSION" "${BASE[@]}" --out proximadb.rb
+          cat proximadb.rb
 
       - name: Upload Homebrew Formula
         uses: actions/upload-artifact@v7
@@ -1338,6 +1388,12 @@ jobs:
           name: homebrew-formula
           path: proximadb.rb
           retention-days: 30
+
+      - name: Publish to the tap (PR, tap CI, merge)
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: bash scripts/release_homebrew_publish.sh "$TAP" "$FORMULA" "$VERSION" proximadb.rb \
+          "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   # ============================================================================
   # DRY RUN SUMMARY - Report when running in dry-run mode
@@ -1528,6 +1584,34 @@ jobs:
             exit 1
           fi
           echo "All registries serve ${VERSION}."
+
+  # ============================================================================
+  # RELEASE SMOKE - evidence that the PUBLISHED artifacts are QA-based and work
+  # ============================================================================
+  # `verify-release` only proves crates.io and npm LIST the version. This calls
+  # release-smoke.yml, which installs every published artifact from its registry
+  # (Docker Hub, GitHub Release binary, PyPI x2, npm, crates.io, Homebrew tap),
+  # exercises it against a live server, and proves the tag is a QA-proven
+  # qa->main merge. It is a `workflow_call`, not a `workflow_run`, on purpose: a
+  # red smoke must turn THIS run red, and a workflow_run would leave it green.
+  # PyPI is published by release-python.yml in parallel, so the registry wait is
+  # long (150 min) and bounded.
+  release-smoke:
+    name: Release Smoke (evidence)
+    # `needs` orders the smoke after every publish; `always()` makes it run even
+    # when one of them failed (a Homebrew tap merge, an npm publish), so the
+    # evidence for every OTHER channel is still produced and the failed
+    # channel's own smoke job reports it. Pinned by scripts/check_release_smoke.py.
+    needs: [prepare, create-release, verify-release, update-homebrew]
+    if: always() && needs.create-release.result == 'success' && needs.prepare.outputs.dry_run != 'true' && needs.prepare.outputs.prerelease != 'true'
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      registry_wait_minutes: '150'
 
   # ============================================================================
   # CLEANUP - Remove old artifacts

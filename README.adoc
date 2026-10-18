@@ -6,10 +6,12 @@
 [.lead]
 **Object-storage-native context serving for SQL, JSON, and vectors**
 
-ProximaDB is a Rust database that keeps **one governed record** on object storage and serves it
-through standard interfaces: PostgreSQL wire, REST, gRPC and Arrow Flight. Each workload runs on
-an engine built for it: vector search, SQL analytics, document, graph and time series today, and
-Postgres-compatible OLTP next.
+ProximaDB is a **SQL-first context engine on object storage**, written in Rust. It keeps **one
+governed record** on object storage and serves it through standard interfaces. PostgreSQL wire is
+the front door, and vectors, JSON and relationships are first-class inside SQL. REST, gRPC and
+Arrow Flight serve SDKs and services. Relational, vector, document and graph views are
+projections of that one record, and the engine routes each query to the executor that fits it.
+Postgres-compatible OLTP is next (link:docs/12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[direction: ADR-096]).
 
 What you can adopt **today** is narrower than that vision, and it is stated exactly: one typed
 record and one canonical REST API for metadata-aware vector retrieval. Every other capability
@@ -57,7 +59,7 @@ flowchart TB
   subgraph Engines["Engine per workload"]
     VEC["Vector / ANN<br/>SST · HELIX · NOVA"]
     OLAP["SQL analytics<br/>DataFusion"]
-    OLTP["SQL OLTP<br/>txns · row locks"]
+    OLTP["SQL OLTP<br/>transactions (ADR-095)"]
     DOC["Document"]
     GRAPH["Graph · ORION"]
     TS["Time series · events"]
@@ -100,7 +102,7 @@ transactions over pgwire work today at Beta._
 
 | Vector CRUD + search with metadata filters (REST v2, gRPC v2)
 | *Supported*
-| SST is the default engine. Filters apply on both scan and vector search.
+| SST is the Supported engine (pass `"engine": "sst"`; omitting it auto-routes to Beta HELIX until v0.5, TD-ENGSEL-1). Filters apply on both scan and vector search.
 
 | Hybrid retrieval (dense + BM25, RRF / weighted fusion)
 | Beta
@@ -108,7 +110,7 @@ transactions over pgwire work today at Beta._
 
 | PostgreSQL wire (pgwire)
 | Beta
-| ANSI SQL for psql/JDBC/ORM clients, SCRAM-SHA-256 auth, pgvector `<->` operator. `BEGIN` / `COMMIT` / `ROLLBACK` run per ADR-018 P2.D. With the opt-in `[oltp] atomic_commit`, COMMIT is all-or-nothing (one WAL group frame, ADR-095). Without it, a mid-COMMIT failure can leave earlier statements durable. In both modes, statements inside a transaction do not see its own writes until COMMIT. Savepoints and DDL inside a transaction return `0A000`. OLTP parity is planned in link:docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095].
+| ANSI SQL for psql and other simple-query clients (extended-protocol drivers fail on many queries today: asyncpg on relational SELECTs, psycopg 3 on parameterized and repeated queries; JDBC untested; TD-PGEXT-1), SCRAM-SHA-256 auth; `ORDER BY embedding <-> '<literal>'::vector LIMIT k` over REST-created collections (Beta). `VECTOR(n)` columns created over pgwire work only in tables that also have a JSON or JSONB column (TD-SQLCOLL-1); projected distances and `vector_search()` arrive in v0.6 (TD-XMODAL-4). `BEGIN` / `COMMIT` / `ROLLBACK` run per ADR-018 P2.D. With the opt-in `[oltp] atomic_commit`, COMMIT is all-or-nothing (one WAL group frame, ADR-095). Without it, a mid-COMMIT failure can leave earlier statements durable. In both modes, statements inside a transaction do not see its own writes until COMMIT. Savepoints and DDL inside a transaction return `0A000`. OLTP parity is planned in link:docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095].
 
 | SQL analytics (DataFusion over Parquet / Iceberg)
 | Beta
@@ -116,7 +118,7 @@ transactions over pgwire work today at Beta._
 
 | Federated SQL functions (`VECTOR_SEARCH`, `GRAPH_QUERY`, `DOCUMENT_QUERY`, `LOGS`, `METRICS`)
 | Beta
-| Strongest on function-backed sources.
+| Through `POST /api/v2/unified/federated`. Only `VECTOR_SEARCH` and `DOCUMENT_QUERY` run; `VECTOR_SEARCH` repeats a collection's first result (TD-FEDVEC-1).
 
 | Document, graph (ORION), observability, time series / events
 | Beta
@@ -190,8 +192,23 @@ flowchart LR
 
 ---
 
+[[roadmap]]
+== Roadmap
+
+One plan, by release (link:docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP]); each
+release closes on executable exit criteria:
+
+* **v0.5 — Correct and durable.** One total order for record versions on every read surface; group
+  commit and REST/gRPC writes on the atomic path; bounded memtable and WAL; tenant safety on every
+  surface.
+* **v0.6 — Vectors and context inside SQL.** One vector-SQL plan, hybrid retrieval, documents and
+  graph as projections, ORM compatibility; VIPER, SWIFT and RAPTOR removed.
+* **v0.7 — Evidence on real object stores.** Crash/restart and economic suites on a cloud store;
+  published, ledger-backed comparisons.
+* **v1.0 — SQL front door in the supported promise.** pgwire SQL and transactions become Supported.
+
 [[oltp-roadmap]]
-== Roadmap: Postgres-Compatible OLTP on Object Storage
+=== Postgres-Compatible OLTP on Object Storage
 
 *Planned — link:docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095].*
 The goal is to serve OLTP SQL with PostgreSQL semantics while data stays on object storage. Only
@@ -289,7 +306,7 @@ cargo run --release --bin proximadb-server   # REST/gRPC/Flight on 5678, pgwire 
 curl -X POST http://localhost:5678/api/v2/collections/docs/search \
   -H "Content-Type: application/json" \
   -d '{
-    "query_vector": [0.1, 0.2, 0.3],
+    "vector": [0.1, 0.2, 0.3],
     "top_k": 10,
     "filters": [
       {"field": "category", "op": "eq", "value": "tech"}
@@ -348,29 +365,23 @@ curl -X POST http://localhost:5678/api/v2/unified/federated \
 
 == SQL Extensions (Beta)
 
-ProximaDB extends standard SQL with functions for each data model. All of these are Beta.
+These table functions run through the federated query endpoint
+(`POST /api/v2/unified/federated`, shown above), not over pgwire. They belong to the legacy
+federated path that TD-FEDPATH-1 isolates; the direction is standard SQL over pgwire (ADR-096,
+TD-XMODAL-4). Known defect: `VECTOR_SEARCH` returns a collection's first query's rows on every
+later call (TD-FEDVEC-1).
 
 [source,sql]
 ----
--- Vector: pgvector-compatible operator, or the explicit function
-SELECT * FROM products ORDER BY embedding <-> '[0.1,0.2,0.3]'::vector LIMIT 10;
+-- Vector
 SELECT * FROM VECTOR_SEARCH('products', '[0.1, 0.2, 0.3]', 10);
 
--- Graph: embedded openCypher subset
-SELECT * FROM GRAPH_QUERY('MATCH (a:Person {name: "Alice"})-[:KNOWS*2]->(fof) RETURN fof');
-
--- Document: JSON path filter
+-- Document: JSON path filter (the document collection must exist)
 SELECT * FROM DOCUMENT_QUERY('orders', 'status = "pending"');
-
--- Observability
-SELECT * FROM LOGS('production') WHERE timestamp > now() - interval '1h';
-SELECT * FROM METRICS('system') WHERE metric_name = 'cpu_usage';
-
--- Cross-model: similar products with their reviews
-SELECT v.product_id, v.score, d.review_text
-FROM VECTOR_SEARCH('products', '[0.1,0.2]', 10) v
-JOIN LATERAL DOCUMENT_QUERY('reviews', 'product_id = "' || v.product_id || '"') d ON true;
 ----
+
+`GRAPH_QUERY`, `LOGS`, `METRICS` and cross-model joins through this endpoint do not work as
+documented today.
 
 ---
 

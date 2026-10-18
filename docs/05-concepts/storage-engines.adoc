@@ -3,167 +3,96 @@
 :toclevels: 3
 :icons: font
 :source-highlighter: rouge
-:last-updated: June 2026
+:last-updated: 2026-10-17
 
 [.lead]
-Choose the vector storage engine that fits your workload. Engines are pluggable and optimized for different access patterns.
+Choose the vector storage engine for a collection. Tiers come from
+link:../SUPPORTED_SURFACE.adoc[the support contract]; this page carries no performance numbers
+(see <<performance>>).
 
-== Quick Decision Matrix
+== Engines at a glance
 
-[cols="1,2,1,1,1,1,1", options="header"]
+[cols="1,1,3", options="header"]
 |===
-| Engine | Best For | Write Latency | Search Latency | Memory | Throughput | Recall
+| Engine | Tier | Use it for
 
 | **SST**
-| Real-time ingestion, streaming data
-| ~5ms (P99)
-| ~5-15ms
-| Medium
-| High (100K+ ops/s)
-| 95%+
+| Supported
+| Every new collection unless you have measured a reason to choose otherwise (pass `engine="sst"`: omitting it auto-routes to HELIX until v0.5, TD-ENGSEL-1): real-time ingestion
+and search, filtered vector search, PAX segments on object storage.
 
 | **HELIX**
-| Semantic search, clustered embeddings
-| ~20ms
-| ~10-20ms
-| Medium
-| Medium
-| 98%+
-
-| **VIPER**
-| Analytics, batch processing, Parquet integration
-| ~100ms+
-| ~80-100ms
-| Low
-| High (batch)
-| 99%+
+| Beta
+| High-dimensional embeddings where locality ordering (PCA + Hilbert) helps. Measure recall on your
+own data first: HELIX recall is open work (TD-HELIX-1..3), and roadmap v0.6 either fixes or
+demotes it.
 
 | **NOVA**
-| Mixed read/write workloads
-| ~30ms
-| ~100ms
-| Medium
-| Medium
-| 97%+
+| Beta
+| Mixed read/write workloads with progressive columnar layout.
+
+| **VIPER**
+| Deprecated (ADR-093)
+| Existing collections only. New VIPER selections are rejected; removal is roadmap v0.6.
+
+| **SWIFT**, **RAPTOR**
+| Experimental, off by default
+| Not for product use; deleted in roadmap v0.6 (ADR-006).
 |===
 
-[WARNING]
+[NOTE]
 ====
-**SWIFT and RAPTOR are gated behind the `experimental-engines` Cargo feature
-in v0.2 and are disabled by default.** Selecting them on a stock build returns
-an error from the engine factory; they are not part of the v0.2 supported
-surface. For production single-node workloads in v0.2, use **SST**, **HELIX**,
-**VIPER**, or **NOVA**. See `Cargo.toml` `[features]` and
-link:../SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`].
+**Analytics is not an engine choice.** For analytical SQL (scans, joins, aggregates), use a
+relational table over pgwire and `ALTER TABLE … MATERIALIZE` it: the planner then routes
+analytical queries to DataFusion over Parquet (ADR-052). Vector engines serve similarity search.
 ====
 
-== Decision Flowchart
+== Decision flowchart
 
 [source,mermaid]
 ----
 %%{init: {"theme": "neutral"}}%%
 flowchart TD
-    A[What is your primary workload?] --> B{Write-heavy?}
-    B -->|Yes| C{Need real-time search?}
-    B -->|No| D{Read pattern?}
-
-    C -->|Yes| SST[SST Engine]
-    C -->|No, batch OK| VIPER[VIPER Engine]
-
-    D -->|Semantic similarity| HELIX[HELIX Engine]
-    D -->|Analytics queries| VIPER
-    D -->|Mixed queries| E{Dataset size?}
-
-    E -->|Small / medium| NOVA[NOVA Engine]
-    E -->|Large, >1M| SST[SST Engine]
-
+    A[New collection] --> B{Analytical SQL over rows?}
+    B -->|Yes| SQL["Relational table + MATERIALIZE<br/>(DataFusion over Parquet)"]
+    B -->|No: vector / context search| SST["SST (Supported)<br/>pass engine=sst"]
+    SST --> C{Measured a need SST does not meet?}
+    C -->|High-dim locality| HELIX["HELIX (Beta)<br/>check recall first"]
+    C -->|Mixed read/write layout| NOVA["NOVA (Beta)"]
+    C -->|No| SST2[Stay on SST]
     style SST fill:#4a90e2,color:#fff
-    style HELIX fill:#2e5c8a,color:#fff
-    style VIPER fill:#1a3a5c,color:#fff
-    style NOVA fill:#3d7ab8,color:#fff
+    style SST2 fill:#4a90e2,color:#fff
+    style SQL fill:#2e5c8a,color:#fff
 ----
 
-== Use Case Recommendations
+== Use case recommendations
 
-=== Real-Time Applications
+=== Real-time and RAG applications
 
-**Recommended: SST Engine**
+**Recommended: SST**
 
-Best for:
-
-* Chat applications with embedding-based search
-* Real-time recommendation systems
-* Streaming data ingestion (IoT, logs)
-* High-concurrency workloads
+Chat and agent memory, real-time recommendation, streaming ingestion, document and knowledge-base
+retrieval with metadata filters.
 
 [source,python]
 ----
-from proximadb_sdk import ProximaDBClient
+from proximadb_sdk import ProximaDBClient, Protocol
 
-client = ProximaDBClient("http://localhost:5678")
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 
-# SST is the default engine for write-heavy workloads
-client.create_collection(
-    name="chat_embeddings",
-    dimension=1536,
-    engine="sst",
-    engine_config={
-        "compression": "lz4",  # Fast compression for real-time
-        "flush_threshold_mb": 64,
-        "bloom_filter_fpp": 0.01
-    }
-)
-----
-
-=== Semantic Search Applications
-
-**Recommended: HELIX Engine**
-
-Best for:
-
-* Document similarity search
-* Image/video embedding search
-* Knowledge base retrieval
-* RAG (Retrieval Augmented Generation)
-
-[source,python]
-----
+# SST is the Supported engine (the Python SDK sends it by default)
 client.create_collection(
     name="knowledge_base",
     dimension=768,
-    engine="helix",
-    engine_config={
-        "pca_dimensions": 64,  # Reduce dimensions for faster search
-        "hilbert_bits": 16,    # Locality-preserving encoding
-        "cluster_size": 256    # Vectors per cluster
-    }
+    storage_engine="sst",
 )
 ----
 
-=== Analytics and Batch Processing
+=== When to evaluate HELIX or NOVA
 
-**Recommended: VIPER Engine**
-
-Best for:
-
-* Data warehouse integration
-* Parquet file ingestion
-* Large-scale batch analytics
-* Columnar query patterns
-
-[source,python]
-----
-client.create_collection(
-    name="analytics_vectors",
-    dimension=512,
-    engine="viper",
-    engine_config={
-        "compression": "zstd",  # High compression ratio
-        "row_group_size": 100000,
-        "enable_statistics": True
-    }
-)
-----
+Only after measuring SST on your own data with the
+link:../02-guides/vector-index-selection-and-benchmarking.md[index selection and benchmarking guide].
+Both are Beta: compare recall and per-query I/O against SST before switching.
 
 === Experimental Engines (SWIFT, RAPTOR)
 
@@ -171,8 +100,7 @@ client.create_collection(
 ====
 **SWIFT and RAPTOR are experimental and OFF by default.** They live behind the
 `experimental-engines` cargo feature; a stock build rejects them at the engine
-factory with "Use SST, VIPER, HELIX, or NOVA instead." They are *not* part of the
-v0.2 supported surface. Enable only with `cargo build --features experimental-engines`.
+factory. They are *not* part of the supported surface and are deleted in roadmap release v0.6. Enable only with `cargo build --features experimental-engines`.
 ====
 
 When enabled, they target two niches not covered by the supported engines:
@@ -185,7 +113,7 @@ When enabled, they target two niches not covered by the supported engines:
 
 Config knobs and bench numbers for both appear in the SWIFT/RAPTOR subsections of the
 Engine Configuration Reference and Performance Benchmarks below (clearly marked experimental).
-Do not build production v0.2 collections on these engines.
+Do not build production collections on these engines.
 
 == Engine Configuration Reference
 
@@ -248,7 +176,7 @@ Do not build production v0.2 collections on these engines.
 | false
 |===
 
-=== VIPER Engine Options
+=== VIPER Engine Options (deprecated — existing collections only)
 
 [cols="2,1,3,2", options="header"]
 |===
@@ -277,7 +205,7 @@ Do not build production v0.2 collections on these engines.
 
 === SWIFT Engine Options (experimental — off by default)
 
-NOTE: SWIFT requires `--features experimental-engines` and is not a v0.2 supported engine.
+NOTE: SWIFT requires `--features experimental-engines` and is not a supported engine.
 
 [cols="2,1,3,2", options="header"]
 |===
@@ -323,7 +251,7 @@ NOTE: SWIFT requires `--features experimental-engines` and is not a v0.2 support
 
 === RAPTOR Engine Options (experimental — off by default)
 
-NOTE: RAPTOR requires `--features experimental-engines` and is not a v0.2 supported engine.
+NOTE: RAPTOR requires `--features experimental-engines` and is not a supported engine.
 
 [cols="2,1,3,2", options="header"]
 |===
@@ -345,39 +273,15 @@ NOTE: RAPTOR requires `--features experimental-engines` and is not a v0.2 suppor
 | 0.3
 |===
 
-== Performance Benchmarks
+[[performance]]
+== Performance
 
-NOTE: SWIFT and RAPTOR rows below are **experimental** (off by default) and are shown for
-reference only; they are not part of the v0.2 supported surface. Treat all figures as
-internal reference points, not a published SLA (see link:../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE]).
-
-=== Latency Comparison (10K vectors, 128 dimensions)
-
-[cols="1,1,1,1,1", options="header"]
-|===
-| Engine | Insert P99 | Search P99 | Batch Insert (1K) | Batch Search (100)
-
-| SST | 5.3ms | 12.4ms | 42ms | 89ms
-| HELIX | 21ms | 13.2ms | 180ms | 95ms
-| VIPER | 89ms | 89.5ms | 320ms | 210ms
-| SWIFT | 15ms | 4.8ms | 145ms | 38ms
-| NOVA | 28ms | 101.6ms | 220ms | 380ms
-| RAPTOR | 9.4ms | 9.3ms | 78ms | 72ms
-|===
-
-=== Throughput Comparison (sustained load)
-
-[cols="1,1,1,1", options="header"]
-|===
-| Engine | Writes/sec | Searches/sec | Memory (10K vectors)
-
-| SST | 50,000 | 8,000 | 45 MB
-| HELIX | 5,000 | 6,000 | 52 MB
-| VIPER | 1,000 | 3,000 | 28 MB
-| SWIFT | 10,000 | 15,000 | 120 MB
-| NOVA | 8,000 | 2,500 | 48 MB
-| RAPTOR | 25,000 | 10,000 | 55 MB
-|===
+This page carries no performance numbers. Any figure for an engine is a claim only when it is a
+measured entry in the evidence ledger (`docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`) with a
+runnable benchmark behind it; see
+link:../02-guides/vector-index-selection-and-benchmarking.md[Vector Index Selection & Benchmarking]
+to reproduce measurements on your own data. (The latency and throughput tables previously here had
+no ledger entries and were removed on 2026-10-17.)
 
 == Changing Engines
 
@@ -393,11 +297,12 @@ Engines cannot be changed in-place. To migrate:
 
 [source,python]
 ----
-# Export from SST collection
-vectors = client.get_all_vectors("old_collection")
+# Export from the SST collection (pseudocode: page through the records with the REST scan
+# endpoint or the Arrow Flight export in the Arrow export guide)
+vectors = export_all_records("old_collection")
 
 # Create new HELIX collection
-client.create_collection("new_collection", dimension=768, engine="helix")
+client.create_collection("new_collection", dimension=768, storage_engine="helix")
 
 # Import through the canonical record API
 client.insert_records("new_collection", vectors)

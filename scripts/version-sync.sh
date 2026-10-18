@@ -77,6 +77,13 @@ else: print("")' "$file" 2>/dev/null || echo "<UNPARSEABLE-$file>")
     python_init)
       out=$(grep '__version__' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/')
       ;;
+    # `export const VERSION = "X.Y.Z";` in the npm client's entry. It was a
+    # hand-written "1.0.0" that no gate watched, so the package published as
+    # 0.4.1 told callers it was 1.0.0 (found by release-smoke.yml).
+    ts_version_const)
+      out=$(grep -E '^export const VERSION = "[^"]*";' "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+      [ -n "$out" ] || out="<MISSING-export-const-VERSION>"
+      ;;
     # `tr -d '\r'` is load-bearing: `.*` captures to end of line, so on a CRLF
     # file the value carried a trailing CR and a CORRECT version read as a
     # mismatch against the expected one. (`set` normalises line endings, so it
@@ -296,6 +303,7 @@ cmd_check() {
     "deploy/helm/proximadb/Chart.yaml:yaml_appversion"
     "ui/package.json:package_json"
     "clients/nodejs-embedded/package.json:package_json"
+    "clients/nodejs-embedded/src/index.ts:ts_version_const"
     # The npm lockfiles record the package's OWN version (top-level and
     # packages[""]), and `npm ci` hard-fails when it disagrees with
     # package.json: "npm error `npm ci` can only install packages when your
@@ -934,6 +942,8 @@ PYEOF
   # 12. clients/nodejs-embedded/package.json (first version field)
   perl -i -pe 's/"version": ".*"/"version": "'"$version"'"/ if 1..m/"version":/ && /"version":/' "$REPO_ROOT/clients/nodejs-embedded/package.json"
   echo "  [SET]  clients/nodejs-embedded/package.json -> $version"
+  perl -i -pe 's/^export const VERSION = ".*";/export const VERSION = "'"$version"'";/' "$REPO_ROOT/clients/nodejs-embedded/src/index.ts"
+  echo "  [SET]  clients/nodejs-embedded/src/index.ts VERSION -> $version"
 
   # 13. The npm lockfiles' own version fields. These used to be LAST; the pom
   #     write now sits after them (and before the lock refresh), so "last" is no

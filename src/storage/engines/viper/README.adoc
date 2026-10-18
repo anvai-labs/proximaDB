@@ -500,7 +500,6 @@ enable_dictionary = true
 
 * VIPER Engine Deep Dive
 * Hybrid Columnar Engines
-* link:../../../../docs/_internal/archive/technical/unified-quantization-guide.adoc[Quantization Guide]
 
 == See Also
 

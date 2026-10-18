@@ -24,7 +24,7 @@
 //! ### 1. **Storage Engines** (`engines/`)
 //! Six specialized engines for different workloads:
 //! - **SST**: Hybrid columnar (ProximaBlocks) for OLTP, real-time queries
-//! - **VIPER**: Columnar Parquet for analytics
+//! - **VIPER**: Columnar Parquet (deprecated, ADR-093; existing collections only)
 //! - **NOVA**: Hybrid quantized columnar
 //! - **SWIFT**: High-speed hierarchical blocks
 //! - **PRISM**: Tree-based with Proxima
@@ -129,7 +129,7 @@
 //!
 //! ```toml
 //! [storage]
-//! default_engine = "sst"  # or "viper", "nova", etc.
+//! # The engine is chosen per collection at create time (default: "sst").
 //! data_directory = "/data/proximadb"
 //!
 //! # WAL configuration

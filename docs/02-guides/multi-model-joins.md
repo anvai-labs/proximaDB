@@ -2,6 +2,15 @@
 
 **Query vectors, documents, graphs, and logs together**
 
+!!! warning "Legacy federated syntax"
+    The `VECTOR_SEARCH` / `DOCUMENT_QUERY` / `GRAPH_QUERY` / `METRICS` syntax on this page belongs
+    to the legacy federated query path that TD-FEDPATH-1 isolates. It is not the product direction:
+    vectors, JSON and graph are being brought into standard SQL instead (ADR-096; TD-XMODAL-4).
+    What is supported today is decided by the support contract (`docs/SUPPORTED_SURFACE.adoc`).
+    `fusion_search` exists on the embedded `proximadb_embedded.ProximaDB`, not on the server SDK
+    client; the examples on this page are not yet verified (TD-SDKDOC-1). Federated
+    `VECTOR_SEARCH` repeats a collection's first result (TD-FEDVEC-1).
+
 ```mermaid
 %%{init: {"theme": "neutral"}}%%
 flowchart TB
@@ -111,21 +120,8 @@ JOIN METRICS('app-metrics', 'cpu_usage > 80') AS m
 
 ## Python SDK
 
-```python
-from proximadb_sdk import ProximaDBClient
-
-client = ProximaDBClient(url="http://localhost:5678")
-
-# Multi-model query
-results = client.unified_query("""
-    SELECT v.product_id, v.score, d.content
-    FROM VECTOR_SEARCH('products', ?1, 10) AS v
-    JOIN DOCUMENT_QUERY('docs', 'id = "' || v.product_id || '"') AS d
-""", params=[my_vector])
-
-for row in results:
-    print(f"Product {row.product_id}: {row.content} (score: {row.score})")
-```
+The Python SDK has no method for this syntax. Native cross-modal queries go to
+`POST /api/v2/query`; see the query surface table in the support contract.
 
 ---
 

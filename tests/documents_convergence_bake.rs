@@ -77,6 +77,10 @@ impl TestServer {
         }];
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}/wal", data_path.display());
+        // TD-CONV-1: the default metadata_url is CWD-relative, so concurrent
+        // bake servers shared one system-catalog WAL and a restarted server
+        // could come back without its collection ("Collection ... not found").
+        config.storage.metadata_url = format!("file://{}/metadata", data_path.display());
         config
     }
 

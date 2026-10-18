@@ -8,7 +8,7 @@ Date: 2026-05-18 +
 Relocated: 2026-05-26 — moved from `docs/12-design/` to
 `docs/06-internals/` so the design folder holds only design blueprints,
 ADRs, and architecture anchors per
-`docs/12-design/DOCUMENTATION_CONSOLIDATION_AND_ARCHIVE_PLAN_2026_05_22.adoc`.
+`docs/12-design/WORK_LEDGER_2026_10_15.adoc`.
 This file is execution guardrails / code-review guidance derived from
 the canonical spec, not the spec itself. +
 Canonical spec: `roadmap/MULTIMODAL_OVERHAUL_SPEC_2026_05_08.adoc` +

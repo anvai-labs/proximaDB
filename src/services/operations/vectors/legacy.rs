@@ -1176,9 +1176,15 @@ impl VectorOperationsService {
             .await?
             .to_string();
 
+        // MVCC winner selection per oid BEFORE dead filtering (invariant #16d,
+        // TD-PGWIRE-VECDEL-1). The raw delta holds every physical version: a
+        // DELETE's tombstone is newer than the live copy it supersedes, so
+        // filtering the raw delta for dead records dropped the tombstone and
+        // kept the stale live copy (and an UPDATE returned old + new). This
+        // scan does no cross-source merge, so it must not read the raw delta.
         let mut records = self
             .wal_manager
-            .get_collection_vectors_raw(&collection_id)
+            .get_collection_vectors(&collection_id)
             .await?;
         if let Some(tenant_context) = tenant_context {
             records.retain(|record| {
@@ -1186,8 +1192,8 @@ impl VectorOperationsService {
             });
         }
         // Defense-in-depth: drop dead records (tombstone / TTL-expired) using
-        // the canonical ProximaRecord::is_dead on valid_to_ns (ns). The WAL
-        // memtable already filters these, but this guarantees no scan ever
+        // the canonical ProximaRecord::is_dead on valid_to_ns (ns). Winner
+        // selection already drops tombstoned winners; this guarantees no scan
         // leaks a deleted/expired row regardless of the upstream path.
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1228,9 +1234,13 @@ impl VectorOperationsService {
             .validate_tenant_collection_access(collection_id, tenant_context)
             .await?
             .to_string();
+        // The RAW reader, as documented above: the deduplicating reader drops a
+        // tombstoned winner, so the merge never saw the unflushed delete and a
+        // flushed live copy came back (#16d). Superseded versions are fine
+        // here: the merge keeps the freshest per id by `updated_at_ns`.
         let mut records = self
             .wal_manager
-            .get_collection_vectors(&collection_id)
+            .get_collection_vectors_raw(&collection_id)
             .await?;
         if let Some(tenant_context) = tenant_context {
             records.retain(|record| {
@@ -1392,9 +1402,14 @@ impl VectorOperationsService {
 
         // WAL/memtable (unflushed) + flushed storage. Storage is best-effort:
         // an engine that doesn't implement read_all_records returns empty.
+        //
+        // The RAW unflushed delta, tombstones included (#16d, TD-PGWIRE-VECDEL-1):
+        // the deduplicating reader drops a tombstoned winner, so an unflushed
+        // delete never met its flushed live copy below and the merge resurrected
+        // it. Dead records are dropped AFTER the merge.
         let wal_records = self
             .wal_manager
-            .get_collection_vectors(&collection_id)
+            .get_collection_vectors_raw(&collection_id)
             .await?;
         // Resolve the collection's data location from the same catalog-carried
         // typed identity used by flush and point lookup. Manually composing
@@ -1439,19 +1454,46 @@ impl VectorOperationsService {
         // so the freshest version (WAL) wins ties.
         let mut by_oid: std::collections::HashMap<String, ProximaRecord> =
             std::collections::HashMap::with_capacity(wal_records.len() + storage_records.len());
+        // Storage can hold several flushed versions of one oid (an update and
+        // the version it replaced, flushed together). Keep the freshest; a
+        // blind insert kept whichever the scan yielded last.
         for record in storage_records {
-            by_oid.insert(record.oid.clone(), record);
-        }
-        for record in wal_records {
             match by_oid.get(&record.oid) {
-                Some(existing) if existing.updated_at_ns > record.updated_at_ns => {}
+                Some(existing) if !super::read::is_fresher(&record, existing) => {}
                 _ => {
                     by_oid.insert(record.oid.clone(), record);
                 }
             }
         }
+        // The raw WAL delta can hold several versions of one oid: resolve them
+        // among themselves first (`is_fresher`, so `record_version` breaks an
+        // `updated_at_ns` tie), then let the WAL winner beat storage on ties.
+        let mut wal_by_oid: std::collections::HashMap<String, ProximaRecord> =
+            std::collections::HashMap::with_capacity(wal_records.len());
+        for record in wal_records {
+            match wal_by_oid.get(&record.oid) {
+                Some(existing) if !super::read::is_fresher(&record, existing) => {}
+                _ => {
+                    wal_by_oid.insert(record.oid.clone(), record);
+                }
+            }
+        }
+        for (oid, record) in wal_by_oid {
+            match by_oid.get(&oid) {
+                Some(existing) if existing.updated_at_ns > record.updated_at_ns => {}
+                _ => {
+                    by_oid.insert(oid, record);
+                }
+            }
+        }
 
-        let mut records: Vec<ProximaRecord> = by_oid.into_values().collect();
+        // Canonical dead filter on the merged set (#16a): a winning tombstone or
+        // TTL-expired version hides the id, including a flushed live copy.
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let mut records: Vec<ProximaRecord> = by_oid
+            .into_values()
+            .filter(|record| !record.is_dead(now_ns))
+            .collect();
         if let Some(tenant_context) = tenant_context {
             records.retain(|record| {
                 record.tenant_id.is_empty() || record.tenant_id == tenant_context.tenant_id
@@ -6082,6 +6124,74 @@ mod index_first_search_tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// Insert `v1` + `v2`, then delete `v1`. A real ms gap separates the two
+    /// writes: the memtable's MVCC winner rule breaks `record_version` ties by
+    /// millisecond batch timestamp (residual hazard, TD-PGWIRE-VECDEL-1).
+    async fn insert_two_then_delete_first(service: &VectorOperationsService) {
+        service
+            .insert_records_with_tenant_context(
+                "1001",
+                vec![
+                    record_with_vector("v1", vec![1.0, 2.0, 3.0]),
+                    record_with_vector("v2", vec![4.0, 5.0, 6.0]),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        service
+            .delete_records_with_tenant_context("1001", vec!["v1".to_string()], None)
+            .await
+            .unwrap();
+    }
+
+    /// TD-PGWIRE-VECDEL-1: the scan behind vector-profile table reads must do
+    /// per-oid winner selection BEFORE dead filtering, so a delete's tombstone
+    /// suppresses the live copy it supersedes (invariant #16d).
+    #[tokio::test]
+    async fn scan_hides_a_deleted_record_and_returns_one_version_per_oid() {
+        let (service, _temp_dir) = create_test_service().await.unwrap();
+        cache_test_collection(&service, 1001, 3);
+        insert_two_then_delete_first(&service).await;
+
+        let mut ids: Vec<String> = service
+            .scan_records_with_tenant_context("1001", None, false, false, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["v2".to_string()]);
+    }
+
+    /// The unflushed half of the storage-inclusive `documents()` merge must
+    /// RETAIN tombstones: the merge needs the unflushed delete to suppress a
+    /// still-flushed live copy (#16d). It read the deduplicating reader, which
+    /// drops a tombstoned winner, so a flushed-then-deleted document came back.
+    #[tokio::test]
+    async fn unflushed_raw_listing_retains_the_delete_tombstone() {
+        let (service, _temp_dir) = create_test_service().await.unwrap();
+        cache_test_collection(&service, 1001, 3);
+        insert_two_then_delete_first(&service).await;
+
+        let records = service
+            .list_unflushed_raw_with_tenant_context("1001", None)
+            .await
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|r| r.oid == "v1" && r.valid_to_ns == Some(0)),
+            "the delete tombstone for v1 must reach the documents() merge; got {:?}",
+            records
+                .iter()
+                .map(|r| (r.oid.as_str(), r.valid_to_ns))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

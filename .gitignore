@@ -381,7 +381,6 @@ FINAL_*.md
 GRPC_*.md
 TEST_*.md
 WAL_*.md
-!docs/_archive/design/2026-05/GRPC_MIGRATION_PROGRESS_2026_05_14.md
 
 # Generated HTML reports
 reports/

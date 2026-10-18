@@ -2,6 +2,9 @@
 
 This document acts as the index and unified trajectory guide for all Autonomous AI Agents operating in the ProximaDB workspace.
 
+## Product Direction
+ProximaDB is a SQL-first context engine on object storage (ADR-096): pgwire is the front door, vectors/JSON/graph are first-class inside SQL, and every data model is a projection of one canonical record. Take direction from `docs/12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc` and pick work from the current release in `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`.
+
 ## Primary Instructions
 Depending on your identity, read the corresponding mandate file first:
 *   **Gemini Models:** Read `GEMINI.md`
@@ -49,7 +52,7 @@ ProximaDB is undergoing a massive architectural shift to support a robust SaaS M
 
 1.  **Intelligent Multi-Engine Routing:** We do not have a single physical execution layer. We route queries based on workload profiles.
     *   **DataFusion & Polars:** Used for analytical (OLAP) and standard relational workloads over decoupled Object Storage (Iceberg/Parquet). OLAP execution = DataFusion's vectorized kernels behind the `ComputeBackend` seam per **ADR-052** (Accepted 2026-07-04): the native investment is the PAX-native SCAN operator (TD-OLAP-1) feeding Arrow `RecordBatch`es into DataFusion. Native HashAgg/HashJoin/Sort are NOT an open build target: ADR-054 (Accepted 2026-07-09) reversed ADR-052's blanket prohibition only for an operator plane behind contracts — default-OFF, promoted solely through the TD-OLAP-4 ledger gate (TD-OLAP-10..13) — so add native operators only under ADR-054, never ad hoc. The seam keeps the backend swappable (no `datafusion::` outside the adapter allow-list, ADR-039), but swapping is an option held open, not a build target; the `NATIVE_OLAP_ENGINE_BLUEPRINT_2026_06_22.adoc` §3/§4-P3 native-operator end-state is superseded by ADR-052 (see `docs/12-design/adr/ADR-052-analytics-execution-competitiveness-codesign.adoc`).
-    *   **Volcano & Specialized Engines (SST, HELIX, VIPER, SWIFT, NOVA, RAPTOR):** Used for low-latency point lookups (OLTP) and high-performance Vector/ANN searches over PAX block formats.
+    *   **Volcano & Specialized Engines (SST Supported, auto default from v0.5 per TD-ENGSEL-1; HELIX, NOVA Beta; VIPER deprecated; SWIFT/RAPTOR experimental, deleted in v0.6):** Used for low-latency point lookups (OLTP) and high-performance Vector/ANN searches over PAX block formats.
 2.  **SaaS Mandates:**
     *   **Isolation:** Multi-tenant path isolation via `DrPathBuilder` is mandatory. Do not write to root directories or raw schema locations.
     *   **Billing:** Code boundaries crossing into I/O or heavy compute must accept `TenantContext` to emit Prometheus metrics for billing.

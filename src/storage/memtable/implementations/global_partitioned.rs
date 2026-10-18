@@ -314,12 +314,30 @@ impl CollectionPartition {
     /// - `Some(ProximaRecord)` - Latest valid version of the vector
     /// - `None` - Vector not found, expired, or deleted
     fn vector_by_id(&self, vector_id: &str) -> Option<ProximaRecord> {
+        let record = self.latest_version_by_id(vector_id)?;
+        // Check if it's expired via valid_to_ns
+        let current_time_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let is_expired = record.valid_to_ns.map(|expires| expires < current_time_ns);
+        if is_expired.unwrap_or(false) {
+            tracing::debug!("🗑️ Vector {} found but expired (tombstone)", vector_id);
+            return None; // Logically deleted
+        }
+        Some(record)
+    }
+
+    /// The MVCC winner for `vector_id` in this partition, WITHOUT dead
+    /// filtering: a winning tombstone or TTL-expired version is returned as-is.
+    ///
+    /// A caller that falls back to flushed storage on a miss needs this to tell
+    /// "deleted here" from "not here": `vector_by_id` returns `None` for both,
+    /// so an unflushed delete fell through to the flushed live copy and the
+    /// by-id read resurrected it (#16d, TD-PGWIRE-VECDEL-1).
+    fn latest_version_by_id(&self, vector_id: &str) -> Option<ProximaRecord> {
         // Skip if no ID provided (immutable vectors don't have IDs)
         if vector_id.is_empty() {
             return None;
         }
 
-        let current_time_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let mut latest_record: Option<(ProximaRecord, u64, u64)> = None; // (record, sequence, record_version)
 
         // Search through all batches to find the latest version
@@ -349,20 +367,7 @@ impl CollectionPartition {
             }
         }
 
-        // Check the latest record we found
-        if let Some((record, _, _)) = latest_record {
-            // Check if it's expired via valid_to_ns
-            let is_expired = record.valid_to_ns.map(|expires| expires < current_time_ns);
-
-            if is_expired.unwrap_or(false) {
-                tracing::debug!("🗑️ Vector {} found but expired (tombstone)", vector_id);
-                return None; // Logically deleted
-            }
-
-            return Some(record);
-        }
-
-        None
+        latest_record.map(|(record, _, _)| record)
     }
 
     /// Clear batches up to sequence number within this collection
@@ -1054,6 +1059,19 @@ impl GlobalPartitionedMemtable {
         } else {
             Ok(None)
         }
+    }
+
+    /// The unflushed MVCC winner for `vector_id`, tombstones and TTL-expired
+    /// versions included. See [`CollectionPartition::latest_version_by_id`].
+    pub async fn latest_version_by_id(
+        &self,
+        collection_id: &str,
+        vector_id: &str,
+    ) -> Result<Option<ProximaRecord>> {
+        let collections = self.collections.read().await;
+        Ok(collections
+            .get(collection_id)
+            .and_then(|partition| partition.latest_version_by_id(vector_id)))
     }
 
     /// Get all vectors for a specific collection (MODERN - returns ProximaRecord directly)

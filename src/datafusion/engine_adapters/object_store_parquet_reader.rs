@@ -31,9 +31,11 @@ use object_store::path::Path;
 use parquet::arrow::ProjectionMask;
 // arrow-rs 59.2 deprecated ParquetObjectReader (wants direct AsyncFileReader impls,
 // apache/arrow-rs#10308). Contained here; the migration is a tracked follow-up.
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
 #[allow(deprecated)]
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::bloom_filter::Sbbf;
+use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use proximadb_bloom::{BloomFilterBuilder, BloomFilterStrategy, CoreBloomFilterConfig};
@@ -42,6 +44,7 @@ use proximadb_storage_common::format_splits::{
     ColumnBounds, FileSplit, ScalarPredicate, ScalarValue, SplitStatistics, SplitType,
 };
 use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
+use proximadb_storage_common::parquet_page_prune::page_row_selection;
 use url::Url;
 
 use super::super::physical_filter_translate::df_scalar_value;
@@ -158,6 +161,108 @@ impl SemijoinConfig {
     }
 }
 
+/// Parquet spec-structure pruning switches (both default ON; files without the
+/// structure simply prune nothing; kill-switches per ENV_GATE_REGISTRY rule 3):
+///
+/// * page-index (`ColumnIndex`/`OffsetIndex`) row selection inside each
+///   surviving row group, for static WHERE predicates and resolved join runtime
+///   filters alike — off with `PROXIMADB_PARQUET_READ_PAGE_PRUNE_DISABLE=1`.
+/// * persisted SBBF Bloom probes for equality / IN predicates of any size when
+///   min/max cannot decide — off with `PROXIMADB_PARQUET_READ_BLOOM_DISABLE=1`
+///   (the large-IN semi-join path keeps its own gate, `PROXIMADB_DF_BLOOM_SEMIJOIN`).
+#[derive(Clone, Copy, Debug)]
+struct SpecPruneConfig {
+    page_prune: bool,
+    bloom_read: bool,
+}
+
+impl SpecPruneConfig {
+    fn from_env() -> Self {
+        let disabled = |name: &str| {
+            std::env::var(name).is_ok_and(|v| {
+                v == "1"
+                    || v.eq_ignore_ascii_case("true")
+                    || v.eq_ignore_ascii_case("on")
+                    || v.eq_ignore_ascii_case("yes")
+            })
+        };
+        Self {
+            page_prune: !disabled("PROXIMADB_PARQUET_READ_PAGE_PRUNE_DISABLE"),
+            bloom_read: !disabled("PROXIMADB_PARQUET_READ_BLOOM_DISABLE"),
+        }
+    }
+}
+
+/// Conjunctive `(column, predicate)` pairs from pushed-down WHERE filters —
+/// the engine-neutral vocabulary page-index pruning evaluates. OR trees and
+/// unrecognized shapes contribute nothing (conservative).
+fn conjunctive_predicates(filters: &[Expr]) -> Vec<(String, ScalarPredicate)> {
+    fn walk(expr: &Expr, out: &mut Vec<(String, ScalarPredicate)>) {
+        match expr {
+            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+                walk(&binary.left, out);
+                walk(&binary.right, out);
+            }
+            Expr::BinaryExpr(binary) => {
+                if let Some(pair) = comparison_predicate(&binary.left, binary.op, &binary.right) {
+                    out.push(pair);
+                }
+            }
+            Expr::InList(list) if !list.negated => {
+                if let Some(column) = column_name(&list.expr) {
+                    let values: Vec<ScalarValue> =
+                        list.list.iter().filter_map(literal_value).collect();
+                    if values.len() == list.list.len() && !values.is_empty() {
+                        out.push((column, ScalarPredicate::In(values)));
+                    }
+                }
+            }
+            Expr::Between(between) if !between.negated => {
+                if let (Some(column), Some(low), Some(high)) = (
+                    column_name(&between.expr),
+                    literal_value(&between.low),
+                    literal_value(&between.high),
+                ) {
+                    out.push((column, ScalarPredicate::Between(low, high)));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for filter in filters {
+        walk(filter, &mut out);
+    }
+    out
+}
+
+/// Positive point probes — `col = literal` and `col IN (literals)` reachable
+/// through AND/OR — that a persisted SBBF can answer. Duplicates are harmless.
+fn collect_point_probes(expr: &Expr, out: &mut Vec<(String, Vec<ScalarValue>)>) {
+    match expr {
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            collect_point_probes(&binary.left, out);
+            collect_point_probes(&binary.right, out);
+        }
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            if let Some((column, ScalarPredicate::Equal(value))) =
+                comparison_predicate(&binary.left, binary.op, &binary.right)
+            {
+                out.push((column, vec![value]));
+            }
+        }
+        Expr::InList(list) if !list.negated => {
+            if let Some(column) = column_name(&list.expr) {
+                let values: Vec<ScalarValue> = list.list.iter().filter_map(literal_value).collect();
+                if values.len() == list.list.len() && !values.is_empty() {
+                    out.push((column, values));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Canonical key family a split's keys were encoded with. Stored so the in-list
 /// bloom encodes its values into the *same* byte layout — a cross-family
 /// encoding mismatch must never silently drop a matching key (a false-negative
@@ -198,7 +303,9 @@ struct InlistBloom {
 /// Native Parquet row-group bloom filter for one join-key column.
 #[derive(Debug)]
 struct RowGroupBloom {
-    family: KeyFamily,
+    /// Arrow type of the column — selects the Parquet *physical* encoding the
+    /// SBBF hashed (see [`sbbf_probe_bytes`]).
+    data_type: DataType,
     filter: Sbbf,
 }
 
@@ -228,6 +335,8 @@ type RowGroupBloomCache = HashMap<(String, usize, String), Option<Arc<RowGroupBl
 /// built from this query's predicates, plus the cached split key sets.
 struct BloomPruneView<'a> {
     min_keys: usize,
+    /// Probe persisted SBBFs for equality / IN of any size (`SpecPruneConfig`).
+    point_bloom: bool,
     inlist_blooms: &'a HashMap<String, InlistBloom>,
     row_group_blooms: &'a RowGroupBloomCache,
     split_keys: &'a SplitKeyCache,
@@ -324,6 +433,47 @@ fn probe_key_bytes(family: KeyFamily, value: &ScalarValue) -> Option<Vec<u8>> {
     }
 }
 
+/// Bytes a spec SBBF hashed for `value` in a column of Arrow type `dt`: the
+/// Parquet spec hashes the *plain-encoded physical value* with XXH64 — 4-byte
+/// LE for INT32-backed types (8/16/32-bit ints, unsigned ≤32-bit reinterpreted,
+/// DATE), 8-byte LE for INT64-backed types, raw bytes for BYTE_ARRAY. Probing an
+/// INT32 column with widened 8-byte keys would miss every value and wrongly
+/// prune, so this must follow the physical type, unlike [`probe_key_bytes`].
+/// Floats (±0 / NaN ambiguity), booleans, and out-of-range literals decline
+/// (`None` → the split is kept).
+fn sbbf_probe_bytes(dt: &DataType, value: &ScalarValue) -> Option<Vec<u8>> {
+    match (dt, value) {
+        (DataType::Int8, ScalarValue::Int64(i)) => i8::try_from(*i)
+            .ok()
+            .map(|v| (v as i32).to_le_bytes().to_vec()),
+        (DataType::Int16, ScalarValue::Int64(i)) => i16::try_from(*i)
+            .ok()
+            .map(|v| (v as i32).to_le_bytes().to_vec()),
+        (DataType::Int32 | DataType::Date32, ScalarValue::Int64(i)) => {
+            i32::try_from(*i).ok().map(|v| v.to_le_bytes().to_vec())
+        }
+        (DataType::UInt8, ScalarValue::Int64(i)) => u8::try_from(*i)
+            .ok()
+            .map(|v| (v as i32).to_le_bytes().to_vec()),
+        (DataType::UInt16, ScalarValue::Int64(i)) => u16::try_from(*i)
+            .ok()
+            .map(|v| (v as i32).to_le_bytes().to_vec()),
+        (DataType::UInt32, ScalarValue::Int64(i)) => {
+            u32::try_from(*i).ok().map(|v| v.to_le_bytes().to_vec())
+        }
+        (DataType::Int64 | DataType::Date64, ScalarValue::Int64(i)) => {
+            Some(i.to_le_bytes().to_vec())
+        }
+        (DataType::UInt64, ScalarValue::Int64(i)) => {
+            u64::try_from(*i).ok().map(|v| v.to_le_bytes().to_vec())
+        }
+        (DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View, ScalarValue::String(s)) => {
+            Some(s.as_bytes().to_vec())
+        }
+        _ => None,
+    }
+}
+
 /// Build a bloom over the probe-side in-list `values` for a column of the given
 /// key `family`, sized for a low false-positive rate so split-key testing prunes
 /// reliably. Values that cannot be encoded into the family are skipped (they
@@ -369,7 +519,7 @@ fn bloom_prunes_split(inlist: &InlistBloom, split_keys: &SplitKeys) -> bool {
 fn parquet_bloom_prunes_split(row_group_bloom: &RowGroupBloom, values: &[ScalarValue]) -> bool {
     let mut checked_any = false;
     for value in values {
-        let Some(bytes) = probe_key_bytes(row_group_bloom.family, value) else {
+        let Some(bytes) = sbbf_probe_bytes(&row_group_bloom.data_type, value) else {
             return false;
         };
         checked_any = true;
@@ -424,6 +574,10 @@ pub struct ObjectStoreParquetSplitReader {
     schema: SchemaRef,
     store: Arc<dyn ObjectStore>,
     file_sizes: HashMap<String, u64>,
+    /// Conjunctive WHERE predicates pushed into this scan, evaluated against the
+    /// page index of each row group read (empty = no page pruning).
+    static_predicates: Vec<(String, ScalarPredicate)>,
+    page_prune: bool,
 }
 
 #[async_trait]
@@ -433,6 +587,21 @@ impl SplitReader for ObjectStoreParquetSplitReader {
         split: &FileSplit,
         projection: Option<&[usize]>,
         batch_size: usize,
+    ) -> DFResult<SendableRecordBatchStream> {
+        self.read_split_with_predicates(split, projection, batch_size, &[])
+            .await
+    }
+
+    /// Read one row group, decoding only the pages the page index cannot rule
+    /// out under the static WHERE predicates plus `runtime` (resolved join
+    /// runtime filters). Rows outside the selection are elided before decode;
+    /// exact filtering still happens above the scan.
+    async fn read_split_with_predicates(
+        &self,
+        split: &FileSplit,
+        projection: Option<&[usize]>,
+        batch_size: usize,
+        runtime: &[(String, ScalarPredicate)],
     ) -> DFResult<SendableRecordBatchStream> {
         let row_group_index = match &split.split_type {
             SplitType::RowGroup {
@@ -448,11 +617,52 @@ impl SplitReader for ObjectStoreParquetSplitReader {
         let path = Path::from(split.file_path.as_str());
         let file_size = self.file_sizes.get(&split.file_path).copied();
         let reader = parquet_reader(self.store.clone(), path, file_size);
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        let predicates: Vec<(String, ScalarPredicate)> = if self.page_prune {
+            self.static_predicates
+                .iter()
+                .chain(runtime.iter())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // The page index sits just before the footer, so the footer-size hint
+        // usually covers it — no extra dependent round-trip. `Optional`: files
+        // written without one read exactly as before.
+        let options = if predicates.is_empty() {
+            ArrowReaderOptions::new()
+        } else {
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional)
+        };
+        let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
             .await
             .map_err(|e| df_err("parquet open", e))?;
 
         let out_schema = project_schema(&self.schema, projection);
+
+        if !predicates.is_empty() {
+            let file_schema = builder.schema().clone();
+            let outcome = page_row_selection(
+                builder.metadata(),
+                &file_schema,
+                row_group_index,
+                &predicates,
+            );
+            crate::observability::io_trace::record_page_prune(
+                outcome.pages_total,
+                outcome.pages_pruned,
+                outcome.rows_skipped,
+            );
+            if let Some(selection) = outcome.selection {
+                if !selection.selects_any() {
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        out_schema,
+                        futures::stream::empty(),
+                    )));
+                }
+                builder = builder.with_row_selection(selection);
+            }
+        }
 
         // TRUE projection PUSHDOWN: fetch only the projected column chunks, not
         // all columns (TD-OLAP-4 co-design — a query touching 3 of 105 columns
@@ -906,15 +1116,37 @@ impl ObjectStoreParquetTable {
         self.prune_splits(filters, SemijoinConfig::from_env()).len()
     }
 
-    fn reader(&self) -> Arc<ObjectStoreParquetSplitReader> {
+    fn reader(
+        &self,
+        filters: &[Expr],
+        spec: SpecPruneConfig,
+    ) -> Arc<ObjectStoreParquetSplitReader> {
         Arc::new(ObjectStoreParquetSplitReader {
             schema: self.schema.clone(),
             store: self.store.clone(),
             file_sizes: self.file_sizes.clone(),
+            static_predicates: if spec.page_prune {
+                conjunctive_predicates(filters)
+            } else {
+                Vec::new()
+            },
+            page_prune: spec.page_prune,
         })
     }
 
     fn prune_splits(&self, filters: &[Expr], cfg: SemijoinConfig) -> Vec<FileSplit> {
+        self.prune_splits_with(filters, cfg, SpecPruneConfig::from_env())
+            .0
+    }
+
+    /// Prune splits; also returns how many of the skips needed a Bloom filter
+    /// (min/max alone would have kept them).
+    fn prune_splits_with(
+        &self,
+        filters: &[Expr],
+        cfg: SemijoinConfig,
+        spec: SpecPruneConfig,
+    ) -> (Vec<FileSplit>, usize) {
         // Build this query's per-column in-list blooms once (cheap; reused across
         // every split), then hold the split-key cache for the whole pass.
         let inlist_blooms = if cfg.enabled {
@@ -922,7 +1154,13 @@ impl ObjectStoreParquetTable {
         } else {
             HashMap::new()
         };
-        let guard = if inlist_blooms.is_empty() {
+        let have_row_group_blooms = spec.bloom_read
+            && self
+                .row_group_bloom_cache
+                .lock()
+                .map(|c| c.values().any(Option::is_some))
+                .unwrap_or(false);
+        let guard = if inlist_blooms.is_empty() && !have_row_group_blooms {
             None
         } else {
             self.split_key_cache
@@ -934,19 +1172,32 @@ impl ObjectStoreParquetTable {
             .as_ref()
             .map(|(split_keys, row_group_blooms)| BloomPruneView {
                 min_keys: cfg.min_keys,
+                point_bloom: spec.bloom_read,
                 inlist_blooms: &inlist_blooms,
                 row_group_blooms,
                 split_keys,
             });
-        self.splits
+        let mut bloom_pruned = 0usize;
+        let kept = self
+            .splits
             .iter()
             .filter(|split| {
-                !filters
+                let pruned = filters
                     .iter()
-                    .any(|filter| filter_prunes_split(split, filter, view.as_ref()))
+                    .any(|filter| filter_prunes_split(split, filter, view.as_ref()));
+                if pruned
+                    && view.is_some()
+                    && !filters
+                        .iter()
+                        .any(|filter| filter_prunes_split(split, filter, None))
+                {
+                    bloom_pruned += 1;
+                }
+                !pruned
             })
             .cloned()
-            .collect()
+            .collect();
+        (kept, bloom_pruned)
     }
 
     /// Resolve a column name to its canonical bloom key family via the table
@@ -991,7 +1242,15 @@ impl ObjectStoreParquetTable {
     /// split's distinct join-key set via a projected read of just that column.
     /// Splits the zone-map already prunes are skipped, so extra metadata/key
     /// reads are paid only where the bloom can actually help.
-    async fn prepare_split_keys(&self, filters: &[Expr], cfg: SemijoinConfig) {
+    async fn prepare_split_keys(
+        &self,
+        filters: &[Expr],
+        cfg: SemijoinConfig,
+        spec: SpecPruneConfig,
+    ) {
+        if spec.bloom_read {
+            self.prefetch_point_probe_blooms(filters).await;
+        }
         if !cfg.enabled {
             return;
         }
@@ -1077,6 +1336,61 @@ impl ObjectStoreParquetTable {
         }
     }
 
+    /// Spec SBBF prefetch for point probes (`col = v`, `col IN (..)` of any
+    /// size): for each split the min/max zone map cannot prune, load that
+    /// column's persisted row-group Bloom filter into the cache so the
+    /// synchronous pruning pass can test the probe values. Only columns whose
+    /// chunk metadata advertises a Bloom filter are fetched.
+    async fn prefetch_point_probe_blooms(&self, filters: &[Expr]) {
+        let mut probes: Vec<(String, Vec<ScalarValue>)> = Vec::new();
+        for filter in filters {
+            collect_point_probes(filter, &mut probes);
+        }
+        if probes.is_empty() {
+            return;
+        }
+        let mut wanted: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for split in &self.splits {
+            let Some(rg) = row_group_index(split) else {
+                continue;
+            };
+            for (column, values) in &probes {
+                let predicate = if values.len() == 1 {
+                    ScalarPredicate::Equal(values[0].clone())
+                } else {
+                    ScalarPredicate::In(values.clone())
+                };
+                if split.can_prune_scalar(column, &predicate) {
+                    continue;
+                }
+                let key = (split.file_path.clone(), rg, column.clone());
+                let known = self
+                    .row_group_bloom_cache
+                    .lock()
+                    .map(|cache| cache.contains_key(&key))
+                    .unwrap_or(true);
+                if !known {
+                    wanted
+                        .entry((split.file_path.clone(), column.clone()))
+                        .or_default()
+                        .push(rg);
+                }
+            }
+        }
+        for ((file_path, column), mut row_groups) in wanted {
+            row_groups.sort_unstable();
+            row_groups.dedup();
+            let blooms = self
+                .read_row_group_blooms(&file_path, &column, &row_groups)
+                .await;
+            if let Ok(mut cache) = self.row_group_bloom_cache.lock() {
+                for (rg, bloom) in blooms {
+                    cache.insert((file_path.clone(), rg, column.clone()), bloom);
+                }
+            }
+        }
+    }
+
     /// Read native Parquet row-group bloom filters for one join-key column.
     /// This is the preferred semi-join pruning substrate: the bloom lives in
     /// row-group metadata, so the scan can skip a data row group without first
@@ -1090,9 +1404,7 @@ impl ObjectStoreParquetTable {
         let Some(field_index) = self.schema.index_of(column).ok() else {
             return row_groups.iter().map(|&rg| (rg, None)).collect();
         };
-        let Some(family) = column_key_family(self.schema.field(field_index).data_type()) else {
-            return row_groups.iter().map(|&rg| (rg, None)).collect();
-        };
+        let data_type = self.schema.field(field_index).data_type().clone();
         let path = Path::from(file_path);
         let file_size = self.file_sizes.get(file_path).copied();
         let reader = parquet_reader(self.store.clone(), path, file_size);
@@ -1100,13 +1412,28 @@ impl ObjectStoreParquetTable {
             return row_groups.iter().map(|&rg| (rg, None)).collect();
         };
         let mut out = Vec::with_capacity(row_groups.len());
+        let metadata = stream_builder.metadata().clone();
         for &rg_index in row_groups {
+            let advertised = metadata
+                .row_groups()
+                .get(rg_index)
+                .and_then(|rg| rg.columns().get(field_index))
+                .is_some_and(|c| c.bloom_filter_offset().is_some());
+            if !advertised {
+                out.push((rg_index, None));
+                continue;
+            }
             let bloom = stream_builder
                 .get_row_group_column_bloom_filter(rg_index, field_index)
                 .await
                 .ok()
                 .flatten()
-                .map(|filter| Arc::new(RowGroupBloom { family, filter }));
+                .map(|filter| {
+                    Arc::new(RowGroupBloom {
+                        data_type: data_type.clone(),
+                        filter,
+                    })
+                });
             out.push((rg_index, bloom));
         }
         out
@@ -1208,11 +1535,14 @@ impl TableProvider for ObjectStoreParquetTable {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let target_partitions = state.config().target_partitions();
         let semijoin_cfg = SemijoinConfig::from_env();
-        // TD-OLAP-3 bloom semi-join (default-OFF): prefetch per-split join-key
-        // sets for high-NDV in-lists so `prune_splits` can skip fact splits whose
-        // collapsed min/max window cannot. No-op when disabled/absent.
-        self.prepare_split_keys(filters, semijoin_cfg).await;
-        let pruned = self.prune_splits(filters, semijoin_cfg);
+        let spec_cfg = SpecPruneConfig::from_env();
+        // TD-OLAP-3 bloom semi-join + spec SBBF point probes: prefetch per-split
+        // Bloom filters (persisted) or join-key sets (fallback) so `prune_splits`
+        // can skip splits whose min/max window cannot. No-op when absent.
+        self.prepare_split_keys(filters, semijoin_cfg, spec_cfg)
+            .await;
+        let (pruned, bloom_pruned) = self.prune_splits_with(filters, semijoin_cfg, spec_cfg);
+        crate::observability::io_trace::record_bloom_splits_pruned(bloom_pruned as u64);
         // Skip-ratio evidence for the runtime-filter promotion gate
         // (TD-OLAP-3/TD-OLAP-4): candidate vs pruned splits, per query.
         crate::observability::io_trace::record_splits(
@@ -1234,7 +1564,7 @@ impl TableProvider for ObjectStoreParquetTable {
         let exec = ProximaScanExec::builder()
             .schema(self.schema.clone())
             .splits(pruned)
-            .reader(self.reader())
+            .reader(self.reader(filters, spec_cfg))
             .projection(projection.cloned())
             .filters(filters.to_vec())
             .limit(limit)
@@ -1334,9 +1664,24 @@ fn filter_prunes_split(split: &FileSplit, expr: &Expr, view: Option<&BloomPruneV
                 filter_prunes_split(split, &binary.left, view)
                     && filter_prunes_split(split, &binary.right, view)
             }
-            _ => comparison_predicate(&binary.left, binary.op, &binary.right)
-                .map(|(column, predicate)| split.can_prune_scalar(&column, &predicate))
-                .unwrap_or(false),
+            _ => {
+                let Some((column, predicate)) =
+                    comparison_predicate(&binary.left, binary.op, &binary.right)
+                else {
+                    return false;
+                };
+                if split.can_prune_scalar(&column, &predicate) {
+                    return true;
+                }
+                // Equality inside [min,max]: a persisted SBBF can still prove the
+                // value absent from this row group.
+                if let ScalarPredicate::Equal(value) = &predicate
+                    && let Some(bloom) = persisted_bloom(split, &column, view)
+                {
+                    return parquet_bloom_prunes_split(bloom, std::slice::from_ref(value));
+                }
+                false
+            }
         },
         Expr::IsNull(inner) => column_name(inner)
             .map(|column| split.can_prune_scalar(&column, &ScalarPredicate::IsNull))
@@ -1359,6 +1704,13 @@ fn filter_prunes_split(split: &FileSplit, expr: &Expr, view: Option<&BloomPruneV
             // Min/max zone-map first (cheap; exact for splits with a narrow key
             // range).
             if split.can_prune_scalar(&column, &ScalarPredicate::In(values.clone())) {
+                return true;
+            }
+            // Spec SBBF point probe (any list size): prune iff every value is
+            // definitely absent from the row group's persisted Bloom filter.
+            if let Some(bloom) = persisted_bloom(split, &column, view)
+                && parquet_bloom_prunes_split(bloom, &values)
+            {
                 return true;
             }
             // High-NDV semi-join fallback (TD-OLAP-3): the zone-map collapses
@@ -1393,6 +1745,23 @@ fn filter_prunes_split(split: &FileSplit, expr: &Expr, view: Option<&BloomPruneV
         }
         _ => false,
     }
+}
+
+/// The persisted row-group SBBF for `column` of this split, when the view
+/// enables point-bloom probing and the prefetch loaded one.
+fn persisted_bloom<'a>(
+    split: &FileSplit,
+    column: &str,
+    view: Option<&'a BloomPruneView<'a>>,
+) -> Option<&'a RowGroupBloom> {
+    let view = view?;
+    if !view.point_bloom {
+        return None;
+    }
+    let rg = row_group_index(split)?;
+    view.row_group_blooms
+        .get(&(split.file_path.clone(), rg, column.to_string()))?
+        .as_deref()
 }
 
 fn comparison_predicate(
@@ -1943,7 +2312,9 @@ mod tests {
 
         // With split keys prefetched: rg0 is also pruned — each of its odd keys
         // misses the even-keyed in-list bloom.
-        table.prepare_split_keys(&filters, on).await;
+        table
+            .prepare_split_keys(&filters, on, SpecPruneConfig::from_env())
+            .await;
         assert_eq!(
             table.prune_splits(&filters, on).len(),
             0,
@@ -1973,7 +2344,9 @@ mod tests {
             enabled: true,
             min_keys: 4,
         };
-        table.prepare_split_keys(&filters, on).await;
+        table
+            .prepare_split_keys(&filters, on, SpecPruneConfig::from_env())
+            .await;
         let survivors = table.prune_splits(&filters, on);
         assert_eq!(survivors.len(), 1, "rg0 contains matches and must survive");
         assert_eq!(
@@ -2071,7 +2444,9 @@ mod tests {
             enabled: true,
             min_keys: 4,
         };
-        table.prepare_split_keys(&filters, on).await;
+        table
+            .prepare_split_keys(&filters, on, SpecPruneConfig::from_env())
+            .await;
         let survivors = table.prune_splits(&filters, on);
         assert_eq!(
             survivors.len(),
@@ -2100,7 +2475,9 @@ mod tests {
             enabled: true,
             min_keys: 1000, // above the 150-key list → gated out
         };
-        table.prepare_split_keys(&filters, cfg).await;
+        table
+            .prepare_split_keys(&filters, cfg, SpecPruneConfig::from_env())
+            .await;
         assert_eq!(
             table.prune_splits(&filters, cfg).len(),
             1,
@@ -2194,7 +2571,9 @@ mod tests {
             min_keys: 4,
         };
 
-        table.prepare_split_keys(&filters, cfg).await;
+        table
+            .prepare_split_keys(&filters, cfg, SpecPruneConfig::from_env())
+            .await;
         let survivors = table.prune_splits(&filters, cfg);
         assert_eq!(
             survivors.len(),
@@ -2249,17 +2628,29 @@ mod tests {
         let query =
             format!("SELECT p0,p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11 FROM t WHERE k IN ({in_list})");
 
-        async fn measure(location: &str, on: bool, query: &str) -> (usize, u64, u64) {
+        async fn measure(
+            location: &str,
+            semijoin: bool,
+            spec_bloom: bool,
+            query: &str,
+        ) -> (usize, u64, u64) {
             // SAFETY: nextest runs each test in its own process; this test is the
-            // only code in it and toggles the flag single-threaded.
+            // only code in it and toggles the flags single-threaded.
             unsafe {
-                if on {
+                if semijoin {
                     std::env::set_var("PROXIMADB_DF_BLOOM_SEMIJOIN", "1");
                     std::env::set_var("PROXIMADB_DF_BLOOM_SEMIJOIN_MIN_KEYS", "4");
                 } else {
                     // Explicit opt-out: the gate defaults ON (ADR-056 MVP-1), so
                     // the "off" arm must set `=0`, not merely remove the var.
                     std::env::set_var("PROXIMADB_DF_BLOOM_SEMIJOIN", "0");
+                }
+                // The spec SBBF point probe also reads the persisted `k` blooms
+                // (default on); the min/max baseline must switch it off too.
+                if spec_bloom {
+                    std::env::remove_var("PROXIMADB_PARQUET_READ_BLOOM_DISABLE");
+                } else {
+                    std::env::set_var("PROXIMADB_PARQUET_READ_BLOOM_DISABLE", "1");
                 }
             }
             io_trace::scope(async move {
@@ -2283,11 +2674,13 @@ mod tests {
             .await
         }
 
-        let (rows_off, bytes_off, pruned_off) = measure(&location, false, &query).await;
-        let (rows_on, bytes_on, pruned_on) = measure(&location, true, &query).await;
+        let (rows_off, bytes_off, pruned_off) = measure(&location, false, false, &query).await;
+        let (rows_on, bytes_on, pruned_on) = measure(&location, true, false, &query).await;
+        let (rows_spec, bytes_spec, pruned_spec) = measure(&location, false, true, &query).await;
         unsafe {
             std::env::remove_var("PROXIMADB_DF_BLOOM_SEMIJOIN");
             std::env::remove_var("PROXIMADB_DF_BLOOM_SEMIJOIN_MIN_KEYS");
+            std::env::remove_var("PROXIMADB_PARQUET_READ_BLOOM_DISABLE");
         }
 
         let reduction = 100.0 * (bytes_off.saturating_sub(bytes_on)) as f64 / bytes_off as f64;
@@ -2313,5 +2706,171 @@ mod tests {
             bytes_on < bytes_off,
             "bloom must reduce metered bytes_read (off={bytes_off} on={bytes_on})"
         );
+        // The spec SBBF point probe alone (semi-join gate off) reaches the same
+        // prune from the same persisted blooms, with the same rows.
+        assert_eq!(
+            rows_spec, rows_off,
+            "spec bloom probe must not change results"
+        );
+        assert_eq!(
+            pruned_spec, pruned_on,
+            "spec SBBF probe prunes rg0 like the semi-join path"
+        );
+        assert!(
+            bytes_spec < bytes_off,
+            "spec bloom must reduce metered bytes_read (off={bytes_off} spec={bytes_spec})"
+        );
+    }
+
+    fn eq_i64(column: &str, value: i64) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(Column::from_name(column))),
+            Operator::Eq,
+            Box::new(Expr::Literal(DfScalarValue::Int64(Some(value)), None)),
+        ))
+    }
+
+    /// Two INT32 row groups with identical [0,199] min/max: rg0 holds the even
+    /// keys, rg1 the odd keys, each with a persisted spec SBBF. A point probe
+    /// for an odd key must prune rg0 via its Bloom filter and KEEP rg1 — which
+    /// only holds if the probe hashes the 4-byte INT32 physical value (probing
+    /// with widened 8-byte keys misses every value and would wrongly prune
+    /// both: the encoding regression this guards).
+    #[tokio::test]
+    async fn sbbf_point_probe_prunes_int32_row_group_and_keeps_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let props = WriterProperties::builder()
+            .set_column_bloom_filter_enabled(ColumnPath::from("k"), true)
+            .set_column_bloom_filter_fpp(ColumnPath::from("k"), 0.000_001)
+            .set_column_bloom_filter_max_ndv(ColumnPath::from("k"), 128)
+            .build();
+        let file = std::fs::File::create(data_dir.join("part-0.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        for parity in [0, 1] {
+            let mut keys: Vec<i32> = (0..100).map(|i| 2 * i + parity).collect();
+            // Pin both row groups to the same [0,199] window.
+            keys.push(if parity == 0 { 198 } else { 0 });
+            keys.push(if parity == 0 { 0 } else { 199 });
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::Int32Array::from(keys))],
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+
+        let location = format!("file://{}", tmp.path().display());
+        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        let spec = SpecPruneConfig {
+            page_prune: false,
+            bloom_read: true,
+        };
+        let off = SemijoinConfig {
+            enabled: false,
+            min_keys: 256,
+        };
+        for filters in [vec![eq_i64("k", 51)], vec![in_list_i64("k", &[3, 51, 77])]] {
+            table.prepare_split_keys(&filters, off, spec).await;
+            let (survivors, bloom_pruned) = table.prune_splits_with(&filters, off, spec);
+            assert_eq!(survivors.len(), 1, "even-key row group pruned by its SBBF");
+            assert_eq!(
+                row_group_index(&survivors[0]),
+                Some(1),
+                "odd-key row group kept"
+            );
+            assert_eq!(
+                bloom_pruned, 1,
+                "the skip is attributed to the Bloom filter"
+            );
+        }
+
+        // With the probe disabled, min/max alone cannot prune either group.
+        let disabled = SpecPruneConfig {
+            page_prune: false,
+            bloom_read: false,
+        };
+        let (survivors, bloom_pruned) = table.prune_splits_with(&[eq_i64("k", 51)], off, disabled);
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(bloom_pruned, 0);
+    }
+
+    /// End-to-end page-index pruning through `scan()`: a file written by the
+    /// warehouse write policy (one 20k-row group, 1k-row pages, sorted key)
+    /// answers a narrow range query by decoding only the overlapping pages —
+    /// correct result, ≥ 18k rows elided before decode.
+    #[tokio::test]
+    async fn page_index_prunes_rows_inside_a_surviving_row_group() {
+        use proximadb_storage_common::parquet_write_policy::{
+            ParquetLayoutHints, ParquetWritePolicy,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let k: Vec<i64> = (0..20_000).collect();
+        let v: Vec<i64> = (0..20_000).map(|i| i % 7).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(k)), Arc::new(Int64Array::from(v))],
+        )
+        .unwrap();
+        let policy = ParquetWritePolicy {
+            row_group_rows: 20_000,
+            data_page_rows: 1_000,
+            ..ParquetWritePolicy::default()
+        };
+        let hints = ParquetLayoutHints {
+            sort_columns: vec!["k".to_string()],
+        };
+        let props = policy.writer_properties(&batch, &hints);
+        let file = std::fs::File::create(data_dir.join("part-0.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let location = format!("file://{}", tmp.path().display());
+        let (sum, skipped, pages_pruned) = crate::observability::io_trace::scope(async move {
+            let ctx = SessionContext::new();
+            register_object_store_parquet_location(
+                &ctx,
+                "t",
+                &location,
+                None,
+                proximadb_data_model::StatsTrust::Trusted,
+            )
+            .await
+            .unwrap();
+            let batches = ctx
+                .sql("SELECT sum(v) AS s FROM t WHERE k >= 5100 AND k < 5600")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let col = batches[0].column(0);
+            let sum = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| a.value(0))
+                .unwrap();
+            let snap = crate::observability::io_trace::snapshot().expect("in scope");
+            (sum, snap.page_rows_skipped, snap.pages_pruned)
+        })
+        .await;
+        let expected: i64 = (5_100..5_600).map(|i: i64| i % 7).sum();
+        assert_eq!(sum, expected, "page pruning must not change results");
+        assert!(
+            skipped >= 19_000,
+            "only the [5000,6000) page is decoded; skipped={skipped}"
+        );
+        assert!(pages_pruned >= 19, "pages_pruned={pages_pruned}");
     }
 }

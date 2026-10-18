@@ -191,6 +191,18 @@ pub trait TableWalAppender: Send + Sync {
     fn collection_max_sequence_for(&self, _collection_id: &str) -> Option<u64> {
         None
     }
+
+    /// `true` when the appender maintains a watermark for EVERY collection it
+    /// has ever written (on append and on recovery), so a `None` from
+    /// [`collection_max_sequence_for`](Self::collection_max_sequence_for) means
+    /// "this collection has no entries" rather than "unknown". Lets the change
+    /// feed skip the O(WAL) decode for never-written keys — e.g. the
+    /// object_id-keyed half of the ADR-031 dual-read, which otherwise decoded the
+    /// whole WAL per table per OLAP query (measured: ~99.7% of DataFusion query
+    /// time at TPC-DS SF 0.02).
+    fn tracks_collection_high_water(&self) -> bool {
+        false
+    }
 }
 
 /// Physical writer route selected from xCatalog table metadata.
@@ -1306,8 +1318,9 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
             .await
     }
 
-    /// The tenant-filtered feed routes to the same store as the unfiltered one;
-    /// without this override the routing store would serve nothing for it.
+    /// Forward the tenant-scoped feed too: the trait default would fall back to the
+    /// tenant-agnostic `read_changes_since`, leaking another tenant's changes into
+    /// the OLAP read-merge whenever this router is the store in use.
     async fn read_changes_since_scoped(
         &self,
         collection_id: &str,
@@ -1821,6 +1834,16 @@ pub struct DirectWalTableRecordStore {
 }
 
 impl DirectWalTableRecordStore {
+    /// TD-OLAP-17 fast path: no entry for `collection_id` can exceed `since_lsn`
+    /// when its watermark is at/below it, or when the appender tracks every
+    /// collection and has none for this one.
+    fn change_feed_is_empty(&self, collection_id: &str, since_lsn: u64) -> bool {
+        match self.wal_appender.collection_max_sequence_for(collection_id) {
+            Some(max) => max <= since_lsn,
+            None => self.wal_appender.tracks_collection_high_water(),
+        }
+    }
+
     /// Create a direct writer that routes every `(tenant, collection)` partition
     /// to the single supplied `storage`. This is the non-isolated shape used by
     /// single-tenant unit tests and callers that intentionally share one store;
@@ -2428,9 +2451,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // TD-OLAP-17 fast-path: skip the O(WAL) scan when the collection's
         // high-water hasn't advanced past `since_lsn` (no entry can satisfy
         // `sequence_number > since_lsn`). `None` ⇒ appender doesn't track ⇒ scan.
-        if let Some(max) = self.wal_appender.collection_max_sequence_for(collection_id)
-            && max <= since_lsn
-        {
+        if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
         let entries = self.wal_appender.read_all_entries().await?;
@@ -2456,9 +2477,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // TD-OLAP-17 fast-path (tenant-agnostic): the collection high-water is a
         // sufficient condition for emptiness across ALL tenants — if no entry for
         // this collection exceeds `since_lsn`, the tenant filter cannot add any.
-        if let Some(max) = self.wal_appender.collection_max_sequence_for(collection_id)
-            && max <= since_lsn
-        {
+        if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
         let entries = self.wal_appender.read_all_entries().await?;

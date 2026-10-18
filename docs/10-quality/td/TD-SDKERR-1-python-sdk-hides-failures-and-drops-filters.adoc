@@ -1,0 +1,42 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SDKERR-1: the Python SDK hides failures and silently switches to a local store
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Reproduced against the 0.4.1 image with the repository SDK and the released `proximadb==0.4.1`.
+| Priority | **HIGH** — failed writes and empty results with no error.
+| Component | `clients/python/src/proximadb_sdk/` (gRPC insert result mapping, sticky local fallback in `search_single`, `filter=` keyword collision, REST property cells)
+| Relates to | TD-GRPCCREATE-1, TD-SDKENG-1, TD-SDKDOC-1
+|===
+
+== Problem
+
+* A failed gRPC insert is returned as `success=0 failed=1 errors=[]` with no exception, although
+  the raw response carries `RECORD_INSERT_FAILED`.
+* Any exception inside `search` (`unified_client.py`, `search_single`) activates a local
+  in-memory fallback, and the fallback is sticky: every later search on that client hits the empty
+  local store and returns `[]` or raises `Collection '<name>' not found`, with no error from the
+  server. Verified: after one failed call, an unfiltered search of a populated collection
+  returned `[]`.
+* Any keyword argument `search()` does not declare lands in `**kwargs` and is passed to the
+  adapter, which raises `TypeError` (`filter=` collides with the internal argument; `filter_mode=`,
+  `search_params=` and `score_function=` are unexpected), which then triggers the sticky fallback
+  above. `metadata_filter={...}` (equality) works over
+  both REST and gRPC.
+* Over REST, search results expose properties as `{"type": ..., "value": ...}` cells, not plain
+  values (gRPC returns plain values); the docs read `['value']` until this is fixed.
+
+* `hybrid_search` over REST logs `Failed to query documents: 'ProximaDBClient' object has no
+  attribute '_session'` (hundreds of error lines per call, plus a `search_vectors` warning) and
+  returns `{'results': []}` instead of raising.
+* Constructing a client with `api_key=` logs a warning `Authentication setup failed: 'AuthResult' object has
+  no attribute 'success'`.
+
+== Fix
+
+Raise on any failed record (or return the per-record errors); never fall back to a local store
+without an explicit opt-in; accept `filter=` as an alias of `metadata_filter=` (or reject unknown
+keyword arguments); return plain property values on both transports. Test each against a live
+server.

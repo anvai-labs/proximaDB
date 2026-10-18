@@ -424,7 +424,6 @@ bloom_filter_fp_rate = 0.001  # Lower false positive rate (larger bloom filter)
 
 * SST Engine Deep Dive
 * Modularization Summary
-* link:../../../../docs/_internal/archive/technical/platform_architecture.adoc[Platform Architecture]
 
 == See Also
 

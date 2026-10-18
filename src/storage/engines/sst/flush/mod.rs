@@ -938,6 +938,11 @@ impl SstEngine {
                                 .map(|cfg| cfg.tags.as_slice())
                                 .and_then(pax_rg_layout_tag)
                                 .or_else(|| Some(resolve_pax_rg_layout(&[]))),
+                            // TD-READFID-2 review: compaction re-encodes with
+                            // the SAME base quant this flush resolved, so an
+                            // sq8 / `pax_vector_format:off` collection is not
+                            // silently rewritten as RaBitQ.
+                            Some(resolve_pax_vector_quant(params.collection_config.as_ref())),
                         )
                         .await
                 }
@@ -1352,7 +1357,7 @@ fn collection_pax_format_tag(
 /// (defensive against a typo'd config); only the deployment default (no config,
 /// no env) is RaBitQ. The kill-switch / opt-out are mirrored here (not just at
 /// the flush call site) so the precedence is unit-testable.
-fn resolve_pax_vector_quant(
+pub(crate) fn resolve_pax_vector_quant(
     collection_config: Option<&crate::proto::proximadb_v1::Collection>,
 ) -> proximadb_block_format::VectorQuant {
     use proximadb_block_format::VectorQuant;

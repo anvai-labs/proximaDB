@@ -573,6 +573,7 @@ impl FilesystemFactory {
         // counters keep counting the inner backend. Unset = byte-identical.
         let fs: Arc<dyn FileSystem> = if std::env::var_os("PROXIMADB_TEST_FS_DELETE_FAIL_FIRST")
             .is_some()
+            || proximadb_storage_filesystem_types::faults::read_fault_requested()
         {
             Arc::new(proximadb_storage_filesystem_types::faults::FaultInjectingFileSystem::new(fs))
         } else {

@@ -51,36 +51,23 @@ use parquet::arrow::ProjectionMask;
 // apache/arrow-rs#10308). Contained here; the migration is a tracked follow-up.
 #[allow(deprecated)]
 use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::file::properties::WriterProperties;
 use proximadb_kernel::error::StorageError;
 use proximadb_object_store::ProximaObjectStore;
 use proximadb_records::ProximaRecord;
 use proximadb_storage_common::object_store_bridge::{CommitOutcome, ObjectStoreBridge};
+use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::infer_proxima_schema_strict;
-use proximadb_storage_common::proxima_parquet::proxima_records_to_parquet_bytes;
+use proximadb_storage_common::proxima_parquet::proxima_records_to_parquet_bytes_with_policy;
 use proximadb_storage_common::proxima_schema::ProximaSchema;
 
-/// Parquet writer configuration for the warehouse publication tier
-/// (MATERIALIZE snapshots + Iceberg interop files).
-///
-/// The load-bearing setting is the row-group cap: the Arrow default is
-/// 1,048,576 rows, which packs every table below ~1M rows into a SINGLE row
-/// group — one split, whole-domain min/max, and zone-map/runtime-filter
-/// pruning provably cannot skip anything (measured 0% in
-/// `docs/_internal/status/TPC_PERF_GATE_EVIDENCE_2026_07_04.adoc`). The
-/// default of 65,536 rows approximates the co-design blueprint's 8–16 MiB
-/// scan/aggregate geometry for typical fact rows; override per deployment
-/// with `PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS`. Row-group count is reader
-/// geometry, not a format change — mixed-read-safe by construction.
-fn warehouse_writer_properties() -> WriterProperties {
-    let rows = std::env::var("PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(65_536);
-    WriterProperties::builder()
-        .set_max_row_group_row_count(Some(rows))
-        .build()
+/// Parquet writer policy for the warehouse publication tier (MATERIALIZE
+/// snapshots + Iceberg interop files): row groups, page index, declared sort
+/// order and spec SBBF Bloom filters — see
+/// [`proximadb_storage_common::parquet_write_policy`]. Environment-overridable
+/// (`PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS`, `PROXIMADB_PARQUET_*`); every setting
+/// yields a plain, mixed-read-safe Parquet file.
+fn warehouse_write_policy() -> ParquetWritePolicy {
+    ParquetWritePolicy::from_env()
 }
 
 /// Spec-shaped Iceberg v2 manifest / manifest-list (Avro) + TableMetadata (JSON) content.
@@ -88,6 +75,8 @@ pub mod iceberg;
 /// Iceberg-style atomic manifest commits (optimistic concurrency via `put_if_absent`).
 pub mod manifest;
 pub mod metadata;
+/// Parquet footer → Iceberg manifest column metrics.
+pub mod stats;
 
 /// Map a Parquet read/decode failure into a [`StorageError`] with operation context.
 fn read_err(context: &str, e: impl std::fmt::Display) -> StorageError {
@@ -146,16 +135,17 @@ impl IcebergObjectStoreBridge {
             .collect())
     }
 
-    /// Row count of a Parquet object, read from the footer metadata only (no row data).
-    async fn parquet_num_rows(&self, path: &Path) -> Result<i64, StorageError> {
-        // arrow-rs 59.2 deprecated ParquetObjectReader (wants direct AsyncFileReader impls,
-        // apache/arrow-rs#10308). Contained here; the migration is a tracked follow-up.
+    /// Footer metadata of a Parquet object (no row data).
+    async fn parquet_footer(
+        &self,
+        path: &Path,
+    ) -> Result<std::sync::Arc<parquet::file::metadata::ParquetMetaData>, StorageError> {
         #[allow(deprecated)]
         let reader = ParquetObjectReader::new(self.store.store(), self.full_object_path(path));
         let builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .map_err(|e| read_err("open parquet footer", e))?;
-        Ok(builder.metadata().file_metadata().num_rows())
+        Ok(builder.metadata().clone())
     }
 
     /// Publish a snapshot as **spec-shaped Iceberg** (v3 by default): write an Avro manifest
@@ -185,11 +175,20 @@ impl IcebergObjectStoreBridge {
                 continue;
             }
             let size = self.store.object_size(key).await?;
-            let record_count = self.parquet_num_rows(key).await.unwrap_or(0);
+            // Record count + Iceberg column metrics from the footer (one read);
+            // an unreadable footer degrades to count 0 / no metrics (never wrong).
+            let (record_count, column_stats) = match self.parquet_footer(key).await {
+                Ok(meta) => (
+                    meta.file_metadata().num_rows(),
+                    stats::iceberg_column_stats(&meta, fields),
+                ),
+                Err(_) => (0, Vec::new()),
+            };
             data_files.push(iceberg::DataFileMeta {
                 file_path: key.as_ref().to_string(),
                 record_count,
                 file_size_in_bytes: size as i64,
+                column_stats,
             });
         }
         let added_records: i64 = data_files.iter().map(|f| f.record_count).sum();
@@ -352,10 +351,32 @@ impl ObjectStoreBridge for IcebergObjectStoreBridge {
         path: &Path,
         records: &[ProximaRecord],
         schema: &ProximaSchema,
+        tenant_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.write_records_to_parquet_with_layout(path, records, schema, &[], tenant_id)
+            .await
+    }
+
+    /// Layout-aware write: the warehouse policy plus the caller's sort order
+    /// (declared as Parquet `sorting_columns`). The single I/O boundary is one
+    /// atomic object `put`.
+    async fn write_records_to_parquet_with_layout(
+        &self,
+        path: &Path,
+        records: &[ProximaRecord],
+        schema: &ProximaSchema,
+        sort_columns: &[String],
         _tenant_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        let bytes =
-            proxima_records_to_parquet_bytes(records, schema, Some(warehouse_writer_properties()))?;
+        let hints = ParquetLayoutHints {
+            sort_columns: sort_columns.to_vec(),
+        };
+        let bytes = proxima_records_to_parquet_bytes_with_policy(
+            records,
+            schema,
+            &warehouse_write_policy(),
+            &hints,
+        )?;
         self.store.put(path, Bytes::from(bytes)).await
     }
 

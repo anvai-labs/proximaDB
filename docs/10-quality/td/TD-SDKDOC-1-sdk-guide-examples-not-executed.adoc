@@ -1,0 +1,25 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SDKDOC-1: SDK guide examples are not executed
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17).
+| Priority | **MEDIUM** — repeated reviews found examples that fail as written.
+| Component | `docs/02-guides/sdk-python-guide.adoc`, `docs/01-quick-start/*.md`, `docs/05-concepts/*.adoc`
+| Relates to | TD-SDKERR-1, TD-SDKENG-1, TD-GRPCCREATE-1
+|===
+
+== Problem
+
+Doc examples drifted from the SDK: `FilterBuilder().add`, `create_nodes`/`create_edges`/`traverse`,
+`GraphAnalytics.semantic_traverse` (a duplicated keyword argument, which is a SyntaxError),
+`knowledge_graph_search` arguments, `client.search(collection=...)`, AutoML parameters and
+`create_graph(engine=...)`. Fixing them by review alone has taken several passes.
+
+== Fix
+
+Extract the Python blocks from the quick starts and the SDK guide and run them in CI against a
+server started from the release image (a doc-smoke lane), so an example that fails as written fails
+the build. Blocks that are illustrative are marked and skipped explicitly.

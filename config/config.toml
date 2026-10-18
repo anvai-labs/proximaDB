@@ -573,7 +573,8 @@ allowed_cn_patterns = []
 default_roles = ["reader"]
 # Reject expired client certificates
 reject_expired = true
-# Check certificate revocation (requires CRL/OCSP configuration)
+# Certificate revocation is not enforced: the checking middleware is not installed and no CRL is
+# loaded, so this setting has no effect today (TD-SECOPS-1).
 check_revocation = false
 
 # Map certificate CNs to user IDs

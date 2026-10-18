@@ -1,0 +1,34 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-OLAPFMT-3: Incremental Parquet publication for the optional second representation
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open — reference implementation exists off-tree (`handoff/reference/p2-publisher.patch`); needs rework before merge
+| Priority | P2
+| Relates to | ADR-094 D1 ("a second representation is optional, catalog-expressed and cost-justified") and D2 (multi-layout catalog, additive MATERIALIZE); TD-USUB-1/4
+|===
+
+== Why
+
+ADR-094 lands relational tables in Parquet Layer A (one copy). Tables that land in PAX
+(vector / multimodal) can still carry an *optional* Parquet OLAP representation (ADR-094 D1/D2),
+today produced only by `ALTER TABLE … MATERIALIZE` — a full, in-memory O(table) rewrite. Measured:
+the TPC-DS ledger at SF 0.05 is OOM-killed (13.7 GB RSS) inside MATERIALIZE on a 15 GB host.
+
+== Design (reference implementation, 2026-10-18)
+
+`refresh_parquet_publication`: append an insert-only delta after the published `snapshot_lsn` as
+`part-<lsn>.parquet` (spec layout, TD-OLAPFMT-2) and advance the snapshot — O(delta); fall back to
+the full rewrite when the delta contains deletes, updates of published rows, or keys changed twice.
+`base_max_lsn` guards the MATERIALIZE scan window; unpublished orphan parts are removed before the
+next append; opt-in background driver.
+
+== Rework required before merge
+
+The reference classifies insert-vs-update from the **full WAL history**. On develop the WAL is
+truncated behind manifest durability (TD-USUB-1), so that history is incomplete and an update of a
+flushed row would be misread as an insert (duplicate row). Replace the history check with a probe
+of the published representation (key min/max + SBBF from TD-OLAPFMT-2, or a published key set),
+and register the publication as an *additional* catalog layout per ADR-094 D2.

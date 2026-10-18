@@ -320,7 +320,7 @@ does not acquire a support tier merely by appearing in the repository.
 
 === Supported Default
 
-* **SST** - ✅ Supported default storage engine for the canonical single-node vector path.
+* **SST** - ✅ Supported storage engine for the canonical single-node vector path (set it explicitly over REST/gRPC until it becomes the automatic default in v0.5, TD-ENGSEL-1).
 * **Canonical REST `/api/v2` vector CRUD/search** - ✅ Supported. Other
   query languages and modality projections retain their own tiers below.
 
@@ -335,7 +335,7 @@ does not acquire a support tier merely by appearing in the repository.
   storage is not yet the default authority across all server wiring.
 * **Graph query** - 🟡 Beta for the documented openCypher subset.
 * **Security runtime** - 🟡 Beta; authentication mechanisms exist, but
-  admin/status APIs, stronger online revocation, and pgwire credential binding
+  admin/status APIs, certificate revocation checking (none today, TD-SECOPS-1), and pgwire credential binding
   remain incomplete.
 * **PostgreSQL wire protocol** - 🟡 Beta on port 5433 (autocommit SQL
   subset). *Loopback-only unless the listener authenticates:* under the trust

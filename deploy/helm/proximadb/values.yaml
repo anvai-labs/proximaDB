@@ -46,8 +46,7 @@ proximadb:
 
   # Storage configuration
   storage:
-    # Default storage engine (sst, helix, viper, swift, nova, raptor)
-    defaultEngine: "sst"
+    defaultEngine: "sst"  # not read by the server; engine is chosen per collection (TD-ENGSEL-1)
     # Data directory inside the container
     dataDir: "/data/proximadb"
     # WAL configuration

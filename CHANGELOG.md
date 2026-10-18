@@ -2,7 +2,24 @@
 
 All notable changes to ProximaDB will be documented in this file.
 
-## [0.4.0] - unreleased
+## [0.4.1] - 2026-10-16
+
+### Fixed
+- WAL replay honours a config-file `wal_local_dir`, so acknowledged writes survive a crash (TD-WAL-5, critical).
+- `fp32` point reads are byte-exact after flush (TD-READFID-1).
+- UPSERT enforces UNIQUE constraints, the constraint key store (CKS) and foreign keys through the INSERT sequence (TD-DML-1, TD-DML-2).
+- pgwire COPY and the DML primary-pod gate resolve the write tenant (TD-PGWIRE-COPY-1).
+
+### Security
+- One shared `top_k` cap on every search surface; wrong-dimension query vectors are client errors, not a kernel abort; IMDSv2-only AWS probes (TD-SECSCAN-1).
+- rustls 0.23.46 for RUSTSEC-2026-0346..0349, with the CryptoProvider installed at boot; GCS client upgrade closes a jsonwebtoken advisory (TD-RUSTDEP-1).
+- Admin UI moved to Vite and self-hosts its editor runtime (TD-UICDN-1).
+
+### Added
+- Offline cold backup and restore server subcommands.
+- One tag `vX.Y.Z` releases every registry at one version (TD-RELTAG-1).
+
+## [0.4.0] - 2026-10-11
 
 Storage-substrate release: **172** commits since the `v0.3.0` tag, counted at
 this release branch's merge-base; 174 on `develop` at the time of writing, and

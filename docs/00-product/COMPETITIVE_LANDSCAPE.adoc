@@ -9,8 +9,10 @@ support claims defer to link:../SUPPORTED_SURFACE.adoc[the support contract].
 
 == The Thesis
 
-AI agents assemble context rather than retrieve an isolated vector. ProximaDB's executable MVP
-thesis is therefore one governed record carrying identity, typed JSON properties, and an embedding,
+AI agents assemble context rather than retrieve an isolated vector. ProximaDB's direction is a
+SQL-first context engine on object storage (link:../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096]):
+Postgres-compatible SQL in which vectors, JSON and relationships are first-class. Its executable MVP
+thesis is one governed record carrying identity, typed JSON properties, and an embedding,
 served by metadata scan and vector retrieval through one canonical API. Workload-specific graph,
 document, temporal, and observability projections remain the longer-term architecture; they do not
 enter the customer promise until recovery and conformance are proven.
@@ -20,6 +22,13 @@ enter the customer promise until recovery and conformance are proven.
 [cols="1,2,2", options="header"]
 |===
 | Category | Representative systems | Limitation ProximaDB addresses
+
+| Postgres with pgvector; serverless Postgres
+| Supabase, Neon, Amazon Aurora (and Aurora Serverless), Azure Database for PostgreSQL, pgvector on any Postgres
+| The most direct comparison for the SQL front door. These products own the Postgres ecosystem and
+its OLTP maturity. ProximaDB's bet is data on object storage as the primary copy, vectors and JSON
+as first-class projections of one record rather than an extension column, and per-query economics;
+it must match their correctness before it can argue cost (ADR-095).
 
 | Vector and hybrid retrieval
 | Pinecone, Milvus, Weaviate, Qdrant, pgvector, Elasticsearch
@@ -51,8 +60,9 @@ SQL-subset conformance gates close.
 == Honest Positioning
 
 Per the link:../SUPPORTED_SURFACE.adoc[support contract]'s own positioning guidance,
-ProximaDB is currently a *developer-first context database*: one system for vectors,
-operational documents, graph context, and telemetry on the single-node developer path.
+ProximaDB is a SQL-first context engine whose *supported* path today is narrower: typed JSON
+properties and vector retrieval through the canonical REST API on a single node, with pgwire SQL
+at Beta.
 It is "not yet a like-for-like replacement for best-in-class distributed vector, graph,
 document, or observability platforms." For petabyte-scale batch analytics, use a
 warehouse (Snowflake, BigQuery, Databricks) today; for general-purpose OLTP with complex

@@ -1866,10 +1866,37 @@ fn elidable_aggregate_batch(
     .ok()
 }
 
-/// Does any `Scan` in the plan carry a pushed-down `predicate`? Native's scan does
-/// NOT apply `Scan.predicate` (no predicate pushdown yet), so it would count/aggregate
-/// the UNFILTERED rows — a wrong result. Filtered scans route to DataFusion (which
-/// applies the predicate + prunes row groups) until native gains predicate pushdown.
+/// Opt-in gate for native filtered parquet scans (see `try_native_over_parquet`).
+#[cfg(feature = "datafusion-integration")]
+fn native_filtered_scan_enabled() -> bool {
+    std::env::var("PROXIMADB_NATIVE_FILTERED_SCAN").is_ok_and(|v| {
+        v == "1"
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("on")
+            || v.eq_ignore_ascii_case("yes")
+    })
+}
+
+/// The pushed-down predicate of the plan's single `Scan`, if any (descends the
+/// same single-input chain as [`plan_scan_has_predicate`]; joins/unions → None).
+#[cfg(feature = "datafusion-integration")]
+fn single_scan_predicate(plan: &PhysicalPlan) -> Option<&proximadb_relational_types::Expr> {
+    match plan {
+        PhysicalPlan::Scan { predicate, .. } => predicate.as_ref(),
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Project { input, .. }
+        | PhysicalPlan::Aggregate { input, .. }
+        | PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Distinct { input, .. }
+        | PhysicalPlan::AssertMaxOneRow { input } => single_scan_predicate(input),
+        _ => None,
+    }
+}
+
+/// Does any `Scan` in the plan carry a pushed-down `predicate`? Native applies it
+/// only on the injected-parquet path (FilterProject above the pruning scan, behind
+/// `PROXIMADB_NATIVE_FILTERED_SCAN`); otherwise filtered scans route to DataFusion.
 #[cfg(feature = "datafusion-integration")]
 fn plan_scan_has_predicate(plan: &PhysicalPlan) -> bool {
     match plan {
@@ -1995,12 +2022,20 @@ async fn try_native_over_parquet(
         tracing::debug!(target: "proximadb::native_route", "native SKIP grouped-aggregate: {sqlp}");
         return None;
     }
-    // Skip filtered scans: native does not apply a pushed-down `Scan.predicate`,
-    // so it would (wrongly) aggregate the unfiltered rows. Route to DataFusion.
-    if plan_scan_has_predicate(&physical) {
-        tracing::debug!(target: "proximadb::native_route", "native SKIP filtered-scan (no native predicate pushdown): {sqlp}");
+    // Filtered scans: native applies the pushed `Scan.predicate` exactly (a
+    // FilterProject above the injected parquet source) and prunes row groups /
+    // pages with the engine-neutral pruning ladder (TD-OLAPFMT-2). Opt-in until the TPC ledger
+    // shows parity (ADR-054 promotion rule): `PROXIMADB_NATIVE_FILTERED_SCAN=1`.
+    let scan_predicate = single_scan_predicate(&physical);
+    if plan_scan_has_predicate(&physical)
+        && (!native_filtered_scan_enabled() || scan_predicate.is_none())
+    {
+        tracing::debug!(target: "proximadb::native_route", "native SKIP filtered-scan (PROXIMADB_NATIVE_FILTERED_SCAN off): {sqlp}");
         return None;
     }
+    let prune_predicates = scan_predicate
+        .map(crate::query::execution::native_scan::expr_to_prune_predicates)
+        .unwrap_or_default();
     tracing::debug!(target: "proximadb::native_route", "native RUN: {sqlp}");
     // Open the same parquet DataFusion read (table-OPEN cache is warm from its run).
     let table = match crate::datafusion::engine_adapters::ObjectStoreParquetTable::open(location)
@@ -2095,7 +2130,8 @@ async fn try_native_over_parquet(
                     files,
                     Some(projection),
                     out_schema,
-                ),
+                )
+                .with_predicates(prune_predicates),
             )
         };
     native_result(

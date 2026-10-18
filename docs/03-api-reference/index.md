@@ -126,17 +126,16 @@ psql -h localhost -p 5433 -U postgres
 ### SQL Extensions
 
 ```sql
--- Vector search with <-> operator
+-- Beta: nearest neighbours of a collection created through REST or the SDK
 SELECT * FROM products
-ORDER BY embedding <-> '[0.1, 0.2, ...]'
+ORDER BY embedding <-> '[0.1, 0.2, 0.3]'::vector
 LIMIT 10;
-
--- Create table with vector column
-CREATE TABLE items (
-    id SERIAL PRIMARY KEY,
-    embedding VECTOR(384)
-);
 ```
+
+Only this `ORDER BY embedding <-> '<literal>'::vector LIMIT k` form works today. Projecting the
+distance as a column returns a wrong result (TD-PGVEC-1); the `vector_search()` table function
+over pgwire and `VECTOR(n)` columns created over pgwire do not work yet (TD-XMODAL-4,
+TD-SQLCOLL-1).
 
 **Full docs**: SQL and PostgreSQL wire coverage is tracked in [Supported Surface](../SUPPORTED_SURFACE.adoc).
 
@@ -187,10 +186,10 @@ results = collection.search(
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROXIMADB_PORT` | `5678` | Unified API port |
-| `PROXIMADB_DATA_DIR` | `/var/lib/proximadb` | Data directory |
+| `PROXIMADB_PORT` | — | Not read by the server; set `[server] port` in `config.toml` |
+| `PROXIMADB_DATA_DIR` | — | Not read by the config loader; set `data_dir` and the other storage roots in `config.toml` (TD-PKG-3) |
 | `RUST_LOG` | `info` | Log level |
-| `PROXIMADB_ENGINE` | `sst` | Default storage engine |
+| `PROXIMADB_ENGINE` | — | Not read by the server; choose the engine per collection (TD-ENGSEL-1) |
 
 ### Config File
 
@@ -200,7 +199,7 @@ port = 5678
 host = "0.0.0.0"
 
 [storage]
-default_engine = "sst"
+# The vector engine is chosen per collection at create time (pass "engine": "sst"); there is no server-wide key.
 data_dir = "/var/lib/proximadb"
 
 [api]
@@ -251,7 +250,7 @@ prometheus_port = 9090
 ```json
 {
   "status": "healthy",
-  "version": "0.2.0",
+  "version": "X.Y.Z",
   "uptime_seconds": 1234.56
 }
 ```

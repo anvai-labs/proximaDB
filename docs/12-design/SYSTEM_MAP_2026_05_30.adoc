@@ -14,7 +14,8 @@ Date: 2026-09-11 (filename `SYSTEM_MAP_2026_05_30` is the original; content trac
 Cost spine: the multi-engine routing + cache policy shown here is co-optimized against the *measured
 per-query I/O trace* across the five physical dimensions — see
 `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (the unified cost objective the `ComputeScheduler`
-minimizes), `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc` (the strategic pivot),
+minimizes), `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc` (the engineering mandates; product
+direction is `adr/ADR-096-product-direction-sql-first-context-engine.adoc`),
 and ADR-052 (single-node analytics competitiveness: DataFusion/vectorized OLAP plus PAX-native scans
 before distributed/MPP claims). +
 Scope: One recursive whole-system view — workspace layers, `src/` modules, storage/access-method
@@ -100,7 +101,7 @@ flowchart TB
   subgraph EXEC[Physical Execution]
     VOL["Native Volcano<br/>fresh relational / OLTP / WAL+RecordStorage"]:::svc
     DF["DataFusionLocal<br/>OLAP/parquet path; vector_search UDTF; distributed adapter planned"]:::svc
-    VEC["Vector engines<br/>SST, HELIX, VIPER, SWIFT, NOVA, RAPTOR"]:::svc
+    VEC["Vector engines<br/>SST, HELIX, NOVA<br/>VIPER deprecated · SWIFT, RAPTOR experimental"]:::svc
     MOD["Modality runtimes<br/>document, ORION graph, observability, queue, rank"]:::svc
     IDX["AXIS / DiskANN indexes<br/>HNSW, IVF, PQ, Annoy, LSH, geo"]:::svc
     CMP["compute/<br/>distance, SIMD, quantization"]:::svc
@@ -335,7 +336,7 @@ flowchart TB
 
   subgraph DATAEXEC[Data & Execution]
     direction TB
-    STO["storage/<br/>vector engines: SST·HELIX·VIPER·SWIFT·NOVA·RAPTOR<br/>time/event foundations · WAL · persistence · filesystem · document/sdp"]:::sub
+    STO["storage/<br/>vector engines: SST·HELIX·NOVA<br/>(VIPER deprecated · SWIFT·RAPTOR experimental, deleted in v0.6)<br/>time/event foundations · WAL · persistence · filesystem · document/sdp"]:::sub
     CMP["compute/<br/>distance (L2/cos/dot) · SIMD detect · quantization/unified"]:::sub
     IDX["index/<br/>AXIS (HNSW·IVF·PQ·Annoy·LSH) · DiskANN · geo"]:::sub
     GRA["graph/<br/>ORION · CSR projections · rag/ (RGL)<br/>distributed/tiered policy via relational/storage substrate"]:::sub

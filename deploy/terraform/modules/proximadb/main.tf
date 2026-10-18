@@ -89,7 +89,7 @@ variable "metrics_port" {
 }
 
 variable "storage_engine" {
-  description = "Default storage engine (sst, helix, viper, swift, nova, raptor)"
+  description = "Not read by the server; the engine is chosen per collection (TD-ENGSEL-1)"
   type        = string
   default     = "sst"
 }
@@ -126,6 +126,8 @@ locals {
     PROXIMADB_ARROW_IPC_PORT     = tostring(var.arrow_ipc_port)
     PROXIMADB_METRICS_PORT       = tostring(var.metrics_port)
     PROXIMADB_DATA_DIR           = "/data/proximadb"
+    # Not read by the server (only PROXIMADB_BIND_ADDRESS is, via entrypoint.sh); kept for
+    # compatibility. See TD-ENGSEL-1 and TD-PKG-3.
     PROXIMADB_DEFAULT_ENGINE     = var.storage_engine
     PROXIMADB_WAL_ENABLED        = "true"
   }

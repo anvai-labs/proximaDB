@@ -1,0 +1,32 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-ENGSEL-1: a vector collection created without an engine gets HELIX (Beta), not SST
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Decided: SST becomes the automatic default (owner decision, 2026-10-17). Reproduced: a REST v2 create without `engine` reported `"engine":"auto"` and listed as `"helix"` immediately (server log: `chosen_engine=Helix reason="vector_no_index_route_helix"`).
+| Priority | **HIGH** — the default path lands users on a Beta engine with open recall TDs, while the support contract and the MVP corridor promise SST.
+| Component | `src/services/collection/engine_selector.rs` (`infer_storage_engine`, branch (4): vector collection with no index and no quantization → HELIX)
+| Relates to | TD-HELIX-1..3 (HELIX recall), `MVP_TRUST_CORRIDOR.toml` (its smokes pass `"engine": "sst"` explicitly), ADR-096; roadmap v0.5
+|===
+
+== Problem
+
+`infer_storage_engine` routes a vector collection with no index and no quantization to HELIX
+("so the Hilbert-sorted block layout delivers usable recall without an external index"). HELIX is
+Beta and has open recall defects. The corridor holds only because its smokes set the engine.
+
+== Notes
+
+* Only REST and gRPC creates that omit the engine are affected. The Python SDK sends
+  `storage_engine=SST` by default, so SDK users already get SST (but see TD-SDKENG-1).
+* Branch (4) is reached only when no index, quantization, recall target or index policy is set and
+  automatic index selection is on; each of those routes to SST.
+* The server's VIPER rejection message (`src/services/collection/manager.rs`) says "use SST
+  (default)"; update it with the fix.
+
+== Fix
+
+Route the unspecified case to SST; keep HELIX as an explicit opt-in. Add a test that a create
+without `engine` yields SST, and a corridor smoke that omits `engine`.

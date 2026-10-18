@@ -1,0 +1,49 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RELIDEQ-1: `WHERE id = <value>` (or `record_id`) misses rows in a table without a primary key
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-18). Reproduced against the 0.4.1 image on independent servers.
+| Priority | **HIGH** — silent wrong results on the most common SQL predicate, for reads and writes.
+| Component | conventional key fallback `schema_primary_key_column` (`src/services/record_store.rs`) used by `extract_pk_candidate_ids` in `DmlService` (`src/services/dml/mod.rs`); reached from the legacy pgwire relational reader `execute_relational_query` (`src/network/postgres/protocol.rs`) and from UPDATE/DELETE
+| Relates to | ADR-096 (SQL is the front door), TD-PGEXT-1; roadmap v0.5 "Read correctness"
+|===
+
+== Problem
+
+[source,sql]
+----
+CREATE TABLE u (id INT, name TEXT);
+INSERT INTO u VALUES (1, 'a'), (2, 'b');
+SELECT name FROM u WHERE id = 2;      -- no rows (should be 'b')
+SELECT count(*) FROM u WHERE id = 2;  -- 1
+SELECT name FROM u WHERE id >= 2;     -- 'b'
+UPDATE u SET name = 'z' WHERE id = 2; -- UPDATE 0, row unchanged
+DELETE FROM u WHERE id = 1;           -- DELETE 0, row kept
+----
+
+`id = 1::int8`, `IN (1)`, `IN (1,2)`, `id = 1 AND name = 'a'` and a `TEXT` id also return no
+rows, and a column named `record_id` behaves the same. With a declared primary key (on `id` or on
+another column), or with the column named anything other than `id` or `record_id`, the result is
+correct for SELECT. For UPDATE and DELETE, a differently named column fails loudly instead of
+silently, so only declaring a primary key fixes writes.
+
+Cause (traced with `RUST_LOG=proximadb=debug`): `schema_primary_key_column` treats a column named
+`id` or `record_id` as the primary key when none is declared, and the SELECT / UPDATE / DELETE fast
+path (`extract_pk_candidate_ids`, then `get_by_key`) looks the value up as the record `oid`. The
+write path derives the `oid` from the declared key only (`effective_primary_key`,
+`crates/control/proximadb-catalog/src/relational.rs`), so a keyless row's `oid` is a generated id;
+the lookup misses and, because candidates were found, there is no fallback to a scan. `EXPLAIN`
+does not show this: it describes the `ComputeScheduler` route, while this SELECT runs through the
+legacy reader `execute_relational_query`.
+
+== Fix
+
+Make read and write agree: apply the fallback only where the write path also uses it, or have the
+key fast path fall back to a scan on a miss. Dropping the fallback outright risks
+auto-registered vector-collection schemas whose `oid` really is the `id` value
+(`src/services/dml/mod.rs`), so check SQL point lookups on those first. Add end-to-end pgwire tests
+for SELECT, UPDATE and DELETE on both table shapes and both column names, asserting the rows and
+row counts.

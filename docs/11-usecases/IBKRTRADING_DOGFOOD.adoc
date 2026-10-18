@@ -4,6 +4,14 @@
 :icons: font
 :sectnums:
 
+[NOTE]
+====
+*Status (2026-10-17, link:../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] D2):*
+this is one design-partner use case, not the product's anchor or a release gate. Its requirements
+(embedded mode, sub-millisecond time-series reads, MiFID II audit) do not set the roadmap's
+priority order; integrated validation remains TD-030. The plan below is the original blueprint.
+====
+
 == Executive Summary
 
 ibkrtrading is an event-driven algorithmic trading system built in Rust with 16 crates, connecting to Interactive Brokers TWS/Gateway for stocks, crypto, forex, and options trading. It currently uses 3 separate databases (PostgreSQL, SQLite, JSONL) plus external services (Prometheus, Jaeger). The goal is to replace all data stores with a single ProximaDB embedded instance, proving the "Context Database" architecture in production trading.

@@ -36,6 +36,8 @@ services:
       # See docs/10-quality/td/TD-PGWIRE-CONTAINER-1-pgwire-unreachable-in-a-container-without-auth.adoc
     volumes:
       - proximadb-data:/data/proximadb
+      # WARNING (TD-PKG-3): config/config.toml keeps every storage root under /tmp/proximadb, so
+      # data does not reach the volume. Use a copy with the roots moved to /data/proximadb.
       - ../../config/config.toml:/config/config.toml:ro
     environment:
       - RUST_LOG=info

@@ -1,0 +1,43 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-077: distributed transport and failover verification
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). The ID was cited as the blocker for all multi-node work since May 2026 but had never been filed; this file gives those citations a record.
+| Priority | **MEDIUM** now; it becomes the gating item after v1.0 (roadmap "Later": scale out).
+| Component | the `cluster` cargo feature (Experimental, opt-in); partition leases; the coordinator's RPC fan-out; Raft election, heartbeat, state machine and snapshots
+| Relates to | TD-089 (multi-node elastic compute modes — blocked on this), the removed vision sprint plan's M9 (multi-node failure injection), `SUPPORTED_SURFACE.adoc` near-term exit criterion "distributed claims backed by real transport and failover verification", ADR-096 (sequenced after v1.0)
+|===
+
+== What exists
+
+The pieces below are documented elsewhere as present; none is Supported:
+
+* the `cluster` feature is opt-in and Experimental in the support contract;
+* partition leases are wired in production paths;
+* the coordinator fans writes out over RPC; local writes go through the service layer;
+* Raft election, heartbeat, state machine and snapshots exist; their transport is not
+  productized.
+
+== What is missing
+
+* A production transport between nodes for distributed reads, writes and replication, with
+  tenant identity and metering carried across it.
+* Failover that is verified, not assumed: multi-node failure-injection tests (node loss, network
+  partition, slow follower) that assert no acknowledged write is lost and no split-brain write is
+  acknowledged.
+* A declared consistency model for multi-node reads.
+
+== Acceptance
+
+* A multi-node failure-injection suite runs in CI's heavier tier and passes.
+* The support contract can move distributed execution from Experimental only on that evidence.
+* TD-089 (elastic compute modes) is unblocked.
+
+== Sequencing
+
+Deliberately after v1.0 (ADR-096): single-node correctness, durability and evidence on object
+storage come first. ADR-095's reattachable-volume model covers single-writer recovery without
+this TD.
