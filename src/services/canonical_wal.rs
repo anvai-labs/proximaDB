@@ -454,6 +454,10 @@ impl TableWalAppender for FramedTableWalAppender {
     fn collection_max_sequence_for(&self, collection_id: &str) -> Option<u64> {
         self.collection_max.lock().get(collection_id).copied()
     }
+
+    fn tracks_collection_high_water(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory `TableWalAppender` used when no on-disk canonical WAL is
@@ -578,6 +582,10 @@ impl TableWalAppender for MemoryTableWalAppender {
 
     fn collection_max_sequence_for(&self, collection_id: &str) -> Option<u64> {
         self.collection_max.lock().get(collection_id).copied()
+    }
+
+    fn tracks_collection_high_water(&self) -> bool {
+        true
     }
 }
 
