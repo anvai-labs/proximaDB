@@ -1,0 +1,45 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PKG-1: the Linux packages' service cannot start, and their config would lose data
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Found by reading the unit file, the packaged config and the code; not reproduced on an installed package.
+| Priority | **HIGH** — the documented RPM/DEB install path does not work as written.
+| Component | `deploy/packaging/systemd/proximadb.service`; `.github/workflows/release.yml` (RPM/DEB steps copy `config/config.toml` to `/etc/proximadb/`)
+| Relates to | ADR-096 durable outcome 1 ("`docker run` / install to a working query"); roadmap v0.5
+|===
+
+== Problems
+
+* **The service never becomes ready.** The unit declares `Type=notify`, but the server never sends
+  a systemd readiness notification (no `sd_notify` / `READY=1` anywhere in the code). `systemctl
+  start` therefore waits for the start timeout and fails.
+* **The packaged config keeps data in `/tmp`.** The packages ship `config/config.toml`, which sets
+  `data_dir = "/tmp/proximadb/data"` and `metadata_url = "file:///tmp/proximadb/metadata"`. The unit
+  sets `PrivateTmp=true`, so each service restart gets an empty `/tmp`: data does not survive a
+  restart, although the docs say it lives in `/var/lib/proximadb`. The other roots are in `/tmp`
+  too: the three `storage_locations`, `wal_config.global_manifest_url` and the audit directory.
+* **The state directories are root-owned.** In the shipped `.deb`, `/var/lib/proximadb` and
+  `/var/log/proximadb` are owned by root (dpkg creates them from the payload before postinst, and
+  `postinstall.sh` chowns only when the directory does not exist), so the `proximadb` user cannot
+  write there. The RPM payload carries the same directories.
+* **The server panics at startup under the unit.** The unit sets no `WorkingDirectory`, so the cwd
+  is `/`; the server creates `./log` and its rolling log appender `expect()`s, which fails under
+  `ProtectSystem=strict` for a non-root user. This crash comes before the `Type=notify` timeout.
+* *Minor:* the packages extract the whole archive into `/usr/bin` (`/usr/bin/config/`,
+  `/usr/bin/README.adoc`, `/usr/bin/LICENSE`) and ship `/tmp/postinstall.sh` and
+  `/tmp/preremove.sh` as payload files.
+* **The Linux archive and the Homebrew formula ship the same `/tmp`-rooted configs.** The
+  release copies the whole `config/` directory into the archive (`release.yml`, `cp -r config`),
+  and the Homebrew formula installs it under `$(brew --prefix)/share/proximadb/config`; most of
+  those example configs keep their roots under `/tmp`. The fix must cover them too.
+
+== Fix
+
+* Use `Type=simple` (or implement `sd_notify` readiness) and set `WorkingDirectory`.
+* Make the state directories owned by the service user in postinst unconditionally.
+* Ship a packaging-specific config whose data, metadata and WAL roots are under
+  `/var/lib/proximadb`, and test the installed package end to end (install, start, write, restart,
+  read) in the release workflow.

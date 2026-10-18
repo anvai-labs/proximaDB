@@ -23,7 +23,7 @@ flowchart LR
 
 | Method | OS | Time | Best For |
 |--------|-------|------|----------|
-| [Platform Package](./install.md#platform-packages) | Linux, Windows | 2 min | Production |
+| [Platform Package](./install.md#platform-packages) | Linux, Windows | 2 min | Servers (see the known issues in the guide) |
 | [Docker](./install.md#docker) | Any | 1 min | Testing, dev |
 | [From Source](./install.md#from-source) | Any | 10 min | Development |
 
@@ -32,15 +32,16 @@ flowchart LR
 ## Quick Test (Docker)
 
 ```bash
-# 1. Run ProximaDB
-docker run -d -p 5678:5678 --name proximadb vjsingh1984/proximadb:latest
+# 1. Run ProximaDB (a throwaway trial: this container keeps its data inside itself, TD-PKG-3;
+#    for data that survives the container, follow the Docker section of the installation guide)
+docker run -d -p 5678:5678 --name proximadb-trial vjsingh1984/proximadb:latest
 
 # 2. Wait for startup (5 seconds)
 sleep 5
 
 # 3. Verify it's running
 curl http://localhost:5678/health
-# {"status":"healthy","version":"0.2.0"}
+# {"status":"healthy","version":"<installed release>"}
 
 # 4. Create a canonical record collection
 curl -X POST http://localhost:5678/api/v2/collections \
@@ -49,6 +50,7 @@ curl -X POST http://localhost:5678/api/v2/collections \
     "name": "demo",
     "dimension": 3,
     "distance_metric": "cosine",
+    "engine": "sst",
     "enable_proxima_record": true
   }'
 
@@ -76,10 +78,10 @@ curl -X POST http://localhost:5678/api/v2/collections/demo/search \
 ## Python SDK
 
 ```python
-from proximadb_sdk import ProximaDBClient, ProximaRecord
+from proximadb_sdk import ProximaDBClient, ProximaRecord, Protocol
 
 # Connect
-client = ProximaDBClient(url="http://localhost:5678")
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 
 # Create collection
 client.create_collection(
@@ -111,27 +113,21 @@ for result in results:
 > a container — there, reach it from inside the container's network namespace, or enable
 > SCRAM and then set `[api] pg_port`. See `TD-PGWIRE-CONTAINER-1`.
 
-```bash
-# Connect via psql (PostgreSQL wire protocol)
-psql -h localhost -p 5433 -U postgres
+```sql
+-- Connect (from a locally run server, or inside the container's network namespace)
+-- psql -h 127.0.0.1 -p 5433 -U postgres -d proximadb
 
-# Create table with vector column
-CREATE TABLE products (
-    id SERIAL PRIMARY KEY,
-    name TEXT,
-    embedding VECTOR(128)
-);
+CREATE TABLE catalog_items (id INT PRIMARY KEY, name TEXT, price NUMERIC);
 
-# Insert
-INSERT INTO products (name, embedding)
-VALUES ('Product A', '[0.1, 0.2, ...]');
+INSERT INTO catalog_items (id, name, price)
+VALUES (1, 'Wireless Headphones', 79.99), (2, 'Coffee Maker', 49.99);
 
-# Search with <-> operator
-SELECT name, embedding <-> '[0.1, 0.2, ...]' AS distance
-FROM products
-ORDER BY distance
-LIMIT 5;
+SELECT name, price FROM catalog_items WHERE price < 60 ORDER BY price;
 ```
+
+`ORDER BY embedding <-> '<literal>'::vector LIMIT k` over collections created through REST or the
+SDK is Beta. `VECTOR(n)` columns created over pgwire work today only in tables that also have a JSON or JSONB column
+(TD-SQLCOLL-1).
 
 ---
 
@@ -159,7 +155,7 @@ kill -9 <PID>
 ```bash
 # Check logs
 sudo journalctl -u proximadb -f  # Linux
-docker logs proximadb              # Docker
+docker logs proximadb-trial        # Docker (quick test)
 ```
 
 **Can't connect?**

@@ -38,25 +38,12 @@
 
 ADRs: 12 implemented, 3 superseded (ADR-008, ADR-031, ADR-057); the rest are accepted-with-open-phases or proposed (§5 lists the ones whose status lags reality).
 
-== 3. Highest-priority open work (detail lives in each TD)
+== 3. Highest-priority open work
 
-[cols="2,4,1", options="header"]
-|===
-| ID | What remains | Severity
-| TD-WAL-5 | A config-file `wal_local_dir` can lose acknowledged writes on a crash shortly after the ack; write and replay need one resolver | CRITICAL
-| TD-READFID-1 | A point read returns an SQ8-lossy vector after flush on an `fp32` collection | HIGH
-| TD-SECSCAN-1 | Unclamped `top_k` on Flight/gRPC (DoS), external-collection tenant isolation, IMDSv1, ReDoS | HIGH
-| TD-AUTHZ-1 / TD-TENANT-2 | Grant-aware cross-tenant catalog seam; anonymous `record_store` `get_by_key`; retire the per-row tenant predicate | HIGH
-| TD-PGWIRE-VECTENANT-1 | pgwire vector/document/graph collections sit outside the TD-064 tenant boundary | HIGH
-| TD-USUB-1 (+15/17/18) | Obligation drain, prefix registration, production wiring, 2b WAL truncation, 2c compaction. *The drain's safety argument relied on the segment-name nonce that #1953 removed — re-argue before implementing.* | HIGH
-| TD-USUB-2 / TD-USUB-3 | Native-provider default-ON (a window function is silently wrong while the gate is off); ABAC becomes effective with it | HIGH
-| TD-DML-1 / TD-DML-2 | UPSERT skips UNIQUE/CKS/FK; composite PK into the (now live) CKS | HIGH
-| TD-CONV-1 / TD-CONV-2 | Relative `metadata_url` is resolved against the CWD; Iceberg-store DROP doesn't purge | HIGH
-| TD-HELIX-1/2/3 | HELIX ~2% recall in the all-engines bench; 953 MiB cold load; dedup scan empty after flush | HIGH (HELIX)
-| TD-IVF-2 / TD-COMPACT-2 / TD-COMPACT-10/11 | Trainer allocation, streaming merge, SIFT1M / 10M evidence | P0
-| TD-CACHE-9 / TD-OLAP-2 / TD-OLAP-4 / TD-OLAP-11 | SIFT1M cache acceptance; SegmentStatistics; SF1/SF10 ledger; grace spill | P0
-| TD-NET-1 S3 | Startup self-check (a loopback Flight call verifies the instance id) | P0-class
-|===
+The priority order is the roadmap's next release: link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP]
+§"v0.5 — Correct and durable". This ledger used to keep its own top-priority table; within two days
+five of its rows were stale (TD-WAL-5, TD-DML-1, TD-DML-2 and TD-READFID-1 resolved, TD-ABAC-11 done),
+so it no longer duplicates the roadmap (ADR-096 D5).
 
 == 4. Canonical map — where each overlapping topic lives
 
@@ -78,11 +65,21 @@ ADRs: 12 implemented, 3 superseded (ADR-008, ADR-031, ADR-057); the rest are acc
 | Embedding precision | EMBEDDING_PRECISION_LLD | HLD, INTEGRATION_PLAN and memos (now history)
 | God-crate decomposition program | P2_GOD_CRATE_TEST_DECOMPOSITION (rationale + lessons) | TD-DECOMP-*, ROOT_CRATE_* plans
 | MLflow / model registry | XCATALOG_MLOPS_MODEL_REGISTRY | TD-MLOPS-*, MODEL_INPUT_CONTRACT
-| Vision | 00-product/VISION | 05-concepts/vision (superseded; keeps its unique sections)
-| Roadmap | STRATEGIC_ROADMAP | (CURRENT_ROADMAP and VISION_SPRINT_ROADMAP removed 2026-10-17)
+| Product direction | ADR-096, stated in 00-product/VISION | PRD (requirements only), course correction (history plus engineering mandates)
+| Roadmap (release-based) | STRATEGIC_ROADMAP | VISION horizon, PRD release table and numbered phases (all removed 2026-10-17)
 |===
 
 == 5. Governance decisions the reconciliation surfaced
+
+[NOTE]
+====
+*Resolved 2026-10-17 by ADR-096 and owner decisions:* ADR-094, 023, 030, 036, 055, 089 and 091
+are Accepted; SWIFT and RAPTOR are deleted in roadmap v0.6 (ADR-006 §3); the Raft, DiskANN and
+serverless date conflicts are gone because only the release-based roadmap carries sequencing;
+the roadmap's self-contradicting MVP list was removed. Still open below: ADR-021 (gated on P9),
+the TD-181 id collision in ADR-039, unfiled TD-XMODAL-1/2/3/5 and TD-SC-1..5, and the code-comment
+drift items.
+====
 
 * **Agent rules vs ADR-054.** The committed seeds said "do NOT build native HashAgg/HashJoin/Sort", but ADR-054 (Accepted 2026-07-09) reversed that for a default-off, ledger-gated operator plane. *Fixed in this pass:* all three seeds now state the ADR-054 rule. Local CLAUDE/GEMINI/AGENTS.md copies should be re-synced from the seeds.
 * **ADRs whose status lags reality.**

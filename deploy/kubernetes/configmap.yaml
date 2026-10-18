@@ -15,7 +15,7 @@ data:
 
   # Storage configuration
   PROXIMADB_DATA_DIR: "/data/proximadb"
-  PROXIMADB_DEFAULT_ENGINE: "sst"
+  PROXIMADB_DEFAULT_ENGINE: "sst"  # not read by the server; engine is chosen per collection (TD-ENGSEL-1)
   PROXIMADB_WAL_ENABLED: "true"
 
   # Logging

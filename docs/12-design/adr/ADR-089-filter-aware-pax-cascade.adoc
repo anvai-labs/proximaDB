@@ -8,7 +8,7 @@
 
 == Status
 
-Proposed (2026-08-06). Phases are individually evidence-gated (see TD-FPRUNE-1);
+Accepted (owner decision 2026-10-17, ADR-096 reconcile; its phase gates remain evidence-gated per TD-FPRUNE-1). Formerly: Proposed (2026-08-06). Phases are individually evidence-gated (see TD-FPRUNE-1);
 acceptance follows the P1 measurement, not this filing.
 
 *Reconciled 2026-10-15:* P1 (#1520 stage-F row allow-set + row-restricted RaBitQ/SQ8) and P2 shipped; `FILTERED_CASCADE` is **default-ON**, `FOOTER_STATS` default-OFF; open: corridor-benchmark gate, P3, P4 (TD-FPRUNE-1 Partial). The P1 measurement acceptance condition appears met — owner decision needed on Accepted.

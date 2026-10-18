@@ -1,0 +1,26 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-FEDVEC-1: federated VECTOR_SEARCH repeats a collection's first result
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-18). Reproduced against the 0.4.1 image.
+| Priority | **HIGH** — wrong results with no error.
+| Component | `POST /api/v2/unified/federated` (`VECTOR_SEARCH` table function, legacy federated path)
+| Relates to | TD-FEDPATH-1 (isolate the legacy federated paths), TD-XMODAL-4
+|===
+
+== Problem
+
+On a fresh server, the first `VECTOR_SEARCH('products', '[0,0,1]', 1)` is correct. Later calls with
+a different vector or `k` (`'[1,0,0]', 1`, `'[0,1,0]', 2`) return the same rows, with
+`results_scanned: 1` and `cache_hit: false`; vectors of the wrong dimension also return those rows
+instead of an error. The stuck rows are per collection: a first query on a second collection is
+correct and then sticks too. REST `/search` with the same vectors is correct.
+
+== Fix
+
+Find what the federated context reuses between queries (plan, result or bound parameters), add a
+test that issues two different `VECTOR_SEARCH` queries and asserts different results, and reject a
+dimension mismatch. If the legacy path is retired under TD-FEDPATH-1 first, delete the endpoint.

@@ -1,0 +1,45 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GRPCCREATE-1: a collection created over gRPC cannot store records
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Reproduced against the 0.4.1 image.
+| Priority | **HIGH** — the Python SDK prefers gRPC by default, so every Python quick start stored nothing.
+| Component | gRPC v2 CreateCollection handler (collection registration vs record-store table creation)
+| Relates to | TD-SDKERR-1 (the failure is hidden), TD-ENGSEL-1; roadmap v0.5
+|===
+
+== Problem
+
+After a Python SDK `CreateCollection` over gRPC succeeds, every later insert fails: the server logs
+`Failed to process rich record batch: Collection <id> not found` and
+`Table 'default.<name>' not found`, and the REST v2 collection listing omits the collection. (A
+REST `GET` of the name returns 200, but that proves nothing: see TD-RESTGET-1.) A gRPC insert into a
+collection created over REST succeeds, so the defect is on the create side.
+
+Mechanism (confirmed by an end-to-end test that creates over raw gRPC and fails on `develop`, so
+the server alone is at fault; the test ships with the fix): the gRPC handler provisions storage through the v1 bridge, then persists
+a canonical schema whose columns always include `embedding` (and any filterable columns).
+`set_collection_schema_columns` (`src/services/collection/manager.rs`) keeps the reserved band,
+which already holds the v1 `embedding` column, appends the canonical columns, **drops the catalog
+table, and only then** calls `create_table`, whose validation rejects the duplicate name
+(`Duplicate column name: embedding`). The table is gone; the failure is only logged.
+
+The same path breaks REST. Reproduced twice on 0.4.1: create with
+`{"dimension": 3, "engine": "sst", "enable_proxima_record": true}`, then
+`PUT /api/v2/collections/<name>/schema` with
+`{"columns": [{"name": "embedding", "data_type": "vector", "vector_dimension": 3},
+{"name": "category", "data_type": "text", "filterable": true}]}`: the PUT returns 500
+(`Duplicate column name: embedding`) and every later insert fails with "Collection <id> not
+found". The destruction happens when the PUT reaches a collection with no records yet: after a
+first insert, the same PUT returns the same 500 but leaves the collection usable.
+
+== Fix
+
+In `set_collection_schema_columns`: skip canonical columns whose name a reserved column already
+has, and validate the schema before dropping the table so an invalid schema can never destroy one.
+The fix PR adds `tests/grpc_created_collection_e2e.rs` (create over gRPC, then insert, search and
+list over gRPC and REST). Any other caller of the same function (for example CreateSchema) gets the same
+protection.

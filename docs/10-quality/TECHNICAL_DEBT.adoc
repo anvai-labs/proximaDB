@@ -24,12 +24,12 @@ legacy wording where scopes overlap.
 This register tracks _implementation state_, not _product-support level_.
 link:../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] is the authoritative product-support contract
 and wins for any customer, release-note, or marketing claim. A "Resolved" status here means the code
-path is complete in the working tree — it does *not* by itself make a capability a Supported v0.2 surface.
+path is complete in the working tree — it does *not* by itself make a capability a Supported surface.
 
 *Support-tier anchors* (the controlling tiers in `SUPPORTED_SURFACE.adoc`, repeated here so the
-honesty guard cannot drift): external catalogs are _Experimental in v0.2 (see SUPPORTED_SURFACE)_;
-mTLS and the time-series / event-sourcing foundations are _Beta in v0.2 (see SUPPORTED_SURFACE)_;
-framework integrations ship in the SDK but are Not a v0.2 supported surface (see SUPPORTED_SURFACE).
+honesty guard cannot drift): external catalogs are _Experimental today (see SUPPORTED_SURFACE)_;
+mTLS and the time-series / event-sourcing foundations are _Beta today (see SUPPORTED_SURFACE)_;
+framework integrations ship in the SDK but are Not a supported surface today (see SUPPORTED_SURFACE).
 ====
 
 [NOTE]
@@ -121,7 +121,7 @@ NOTE: `Pri` = product priority (CRIT/HIGH/MED/LOW). The status line in the `Note
 | *Foundation landed 2026-06-17 (`1233de45d`):* pg_type/pg_namespace/pg_class/pg_attribute/pg_constraint views + unit tests. Residual: pg_index canonical view + live ORM round-trip (SQLAlchemy/JDBC). `catalog_introspection.rs`; plan `TD_120_*`.
 
 | TD-115 | Cost-based multi-engine dispatch | HIGH | Partial | D4 | PERF
-| `ComputeScheduler::route_select()` hardcodes Native(Volcano) for every SELECT; analytical scans/joins/aggregates over Parquet forced through row executor. → enrich `QueryShape` (cardinality/selectivity/partitions), `cost_model.rs` selectivity-crossover, set `parquet_backed`, `SET compute_engine` override. Depends on live DataFusion path. Plan `TD_115_*`.
+| *Reconciled 2026-10-17:* `route_select()` routes OLAP-shaped queries over Parquet-backed tables to DataFusion (P1) and everything else to native Volcano; route-cost overrides activate only by explicit typed intent until comparable route-cost evidence exists. `parquet_backed` drives the route, and a flag-gated measured-cost override (`PROXIMADB_ROUTE_COST_OVERRIDE`) and the DuckDB primary exist. Open: turn measured-cost routing on by default once comparable route-cost evidence exists. Depends on live DataFusion path. Plan `TD_115_*`.
 |===
 
 === B. Cross-Modal Fusion Seam
@@ -199,7 +199,7 @@ Co-design D1/D3 work — the dominant cloud-DB cost term. See `PROXIMADB_AS_LAKE
 | First cold query pulls pure object-store data; a full HNSW (~340 GB for 1B×768) takes minutes from S3. → cold-load ordering that pulls a compact binary/RaBitQ rep first (~1/30th), two-stage rerank, IVF-prune bytes-touched; recall envelope via `RecallProbeGate` + TD-064 disclosure. Lakebase R2.
 
 | TD-078 | External-table federated execution (Iceberg/Delta/Hudi as hot authority) | MED | Open | D1 | REL
-| Adapters exist as interop modes, not Proxima-owned hot authority with full ACID+ANN+RLS; several paths return "not yet supported". v0.2 = Experimental external-authority modes. Acceptance: authority-mode catalog field + federated route-health + EXPLAIN external-authority disclosure.
+| Adapters exist as interop modes, not Proxima-owned hot authority with full ACID+ANN+RLS; several paths return "not yet supported". Today = Experimental external-authority modes. Acceptance: authority-mode catalog field + federated route-health + EXPLAIN external-authority disclosure.
 
 | TD-090 | External Collection — ProximaDB-owned indexes over external-resident data | MED | Partial | D1 | COST
 | Build/maintain vector+inverted+JSON indexes over data left in place in an external lake ("one data, one index, no dual-write"). → authority sub-mode; index-staleness-vs-source-commit freshness; lets TD-086 cover lake-resident data. Gated for Lance by TD-091. Lakebase R5.

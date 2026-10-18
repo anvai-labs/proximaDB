@@ -15,7 +15,7 @@ Developer‑first REST API reference. Base URL: `http://localhost:5678`.
 
 [WARNING]
 ====
-**Not supported in v0.2** (the live source of truth is the `writes` block on
+**Not supported today** (the live source of truth is the `writes` block on
 the route-health diagnostic endpoint `GET /api/v2/_diagnostics/collections/:id/route-health`):
 
 * Optimistic versioning / compare-and-set on insert or upsert.
@@ -24,7 +24,7 @@ the route-health diagnostic endpoint `GET /api/v2/_diagnostics/collections/:id/r
 * Patch / partial-record update.
 * Collection-default freshness mode (per-request `freshness_mode` only).
 
-Search-side limits in v0.2:
+Search-side limits today:
 
 * `top_k` is capped at **10000** by default on EVERY search surface (REST,
   gRPC, Arrow Flight, pgwire), not REST alone. Override via env var
@@ -32,7 +32,7 @@ Search-side limits in v0.2:
   (HTTP 400 / `INVALID_ARGUMENT`).
 
 See link:../SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`] "Not Supported
-in v0.2" for the full list and TD pointers.
+in the current release" for the full list and TD pointers.
 ====
 
 === Key Differentiator
@@ -80,10 +80,12 @@ curl -X POST http://localhost:5678/api/v2/collections \
   -H "Content-Type: application/json" \
   -d '{
     "name": "docs",
+    "dimension": 3,
+    "engine": "sst",
+    "enable_proxima_record": true,
     "schema": {
-      "fields": [
-        {"name": "embedding", "type": "vector", "dimension": 768},
-        {"name": "category", "type": "string"}
+      "columns": [
+        {"name": "category", "data_type": "text", "filterable": true}
       ]
     }
   }'
@@ -99,7 +101,7 @@ curl -X POST http://localhost:5678/api/v2/collections/docs/records/batch \
     "records": [
       {
         "id": "doc_1",
-        "embedding": [0.1, 0.2],
+        "vector": [0.1, 0.2, 0.3],
         "props": {"category": "tech"}
       }
     ]
@@ -113,9 +115,9 @@ curl -X POST http://localhost:5678/api/v2/collections/docs/records/batch \
 curl -X POST http://localhost:5678/api/v2/collections/docs/search \
   -H "Content-Type: application/json" \
   -d '{
-    "vector": [0.1, 0.2],
+    "vector": [0.1, 0.2, 0.3],
     "top_k": 10,
-    "filter": {"category": "tech"}
+    "filters": [{"field": "category", "op": "eq", "value": "tech"}]
   }'
 ----
 
@@ -334,11 +336,18 @@ curl -X POST http://localhost:5678/api/v2/query \
 
 ==== SQL Extensions
 
+[WARNING]
+====
+This is the legacy federated path (TD-FEDPATH-1). Only `VECTOR_SEARCH` and `DOCUMENT_QUERY` (with
+an existing document collection) are known to work, and `VECTOR_SEARCH` repeats a collection's first
+result on every later call (TD-FEDVEC-1). The cross-model examples below are not verified
+(TD-SDKDOC-1). For pgvector `<->`, use pgwire (see the PostgreSQL reference).
+====
+
 |===
 | Extension | Syntax | Example
 
 | Vector Search | `VECTOR_SEARCH(collection, vector, top_k)` | `SELECT * FROM VECTOR_SEARCH('products', '[0.1,0.2]', 10)`
-| pgvector Distance | `embedding <-> '[...]'::vector` | `SELECT * FROM products ORDER BY embedding <-> '[0.1,0.2]'::vector LIMIT 10`
 | Graph Query | `GRAPH_QUERY('cypher')` | `SELECT * FROM GRAPH_QUERY('MATCH (a)-[:KNOWS]->(b) RETURN b.name')`
 | Document Query | `DOCUMENT_QUERY(collection, filter)` | `SELECT * FROM DOCUMENT_QUERY('orders', 'status = "pending"')`
 | Log Query | `LOGS(namespace)` | `SELECT * FROM LOGS('production') WHERE timestamp > now() - interval '1h'`

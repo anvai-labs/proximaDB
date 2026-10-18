@@ -50,15 +50,22 @@ Release and deployment assets should stay under `deploy/`. Avoid adding new root
 
 ```bash
 # Pull and run
-docker run -d \
+# The built-in config keeps data in /tmp inside the container (TD-PKG-3); mount a config whose
+# roots point at the volume:
+docker run --rm --entrypoint cat vjsingh1984/proximadb:latest /config/config.toml \
+  | sed 's#/tmp/proximadb#/data/proximadb#g' > proximadb.toml
+docker run -d --name proximadb \
   -p 5678:5678 \
-  -v proximadb-data:/data \
+  -v proximadb-data:/data/proximadb \
+  -v "$PWD/proximadb.toml:/config/config.toml:ro" \
   vjsingh1984/proximadb:latest
 
-# Or build locally
-cd deploy/docker
-docker build -t proximadb:local .
-docker run -d -p 5678:5678 proximadb:local
+# Or build locally (from the repository root, where proximadb.toml was created). The repository
+# has no .dockerignore, so the build context includes target/ and .git; in a working checkout,
+# run `cargo clean` first or expect a very large context.
+docker build -t proximadb:local -f deploy/docker/Dockerfile .
+docker run -d --name proximadb -p 5678:5678 -v proximadb-data:/data/proximadb \
+  -v "$PWD/proximadb.toml:/config/config.toml:ro" proximadb:local
 ```
 
 > **pgwire (5433) is not published, and publishing it would not help.** The entrypoint
@@ -69,6 +76,10 @@ docker run -d -p 5678:5678 proximadb:local
 > [Reaching pgwire](#postgresql-wire-protocol-pgwire-is-loopback-only-in-the-container).
 
 ### Docker Compose (Development)
+
+`deploy/docker/docker-compose.yml` mounts `config/config.toml`, whose storage roots are under
+`/tmp/proximadb`, so this stack keeps no data across `down`/`up` (TD-PKG-3). Replace that mount
+with a `proximadb.toml` created as above for data that must survive.
 
 ```bash
 cd deploy/docker
@@ -259,13 +270,13 @@ refuses the listener and the server exits 1. Tracked in
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PROXIMADB_BIND_ADDRESS` | `0.0.0.0` | Listen address |
-| `PROXIMADB_REST_PORT` | `5678` | REST API port |
-| `PROXIMADB_GRPC_PORT` | `5679` | gRPC API port (legacy multi-port mode) |
-| `PROXIMADB_ARROW_IPC_PORT` | `5680` | Arrow IPC port (legacy multi-port mode) |
-| `PROXIMADB_METRICS_PORT` | `9090` | Metrics port |
-| `PROXIMADB_DATA_DIR` | `/data/proximadb` | Data directory |
-| `PROXIMADB_DEFAULT_ENGINE` | `sst` | Default storage engine |
-| `PROXIMADB_WAL_ENABLED` | `true` | Enable WAL |
+| `PROXIMADB_REST_PORT` | `5678` | Not read by the server; set the port in `config.toml` |
+| `PROXIMADB_GRPC_PORT` | `5679` | Not read by the server |
+| `PROXIMADB_ARROW_IPC_PORT` | `5680` | Not read by the server |
+| `PROXIMADB_METRICS_PORT` | `9090` | Not read by the server |
+| `PROXIMADB_DATA_DIR` | `/data/proximadb` | Not read by the config loader; set the storage roots in `config.toml` (TD-PKG-3) |
+| `PROXIMADB_DEFAULT_ENGINE` | — | Not read by the server; choose the engine per collection (`"engine": "sst"`, TD-ENGSEL-1) |
+| `PROXIMADB_WAL_ENABLED` | `true` | Not read by the server |
 | `RUST_LOG` | `info` | Log level |
 
 ### Storage Engines

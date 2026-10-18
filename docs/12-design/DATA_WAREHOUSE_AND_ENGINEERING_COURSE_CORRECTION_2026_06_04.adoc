@@ -8,17 +8,23 @@
 [.lead]
 This document defines a strategic course correction for ProximaDB's architecture, shifting focus towards direct competition with enterprise data warehouses (Snowflake, Databricks, BigQuery, Trino) and modern distributed data engineering engines (Spark, Ray). While the vector and multi-modal capabilities remain important, the foundational MVP and initial product wedge will now explicitly prioritize relational semantics, object-storage-first decoupled architecture, and Rust-native distributed execution.
 
-[NOTE]
+[IMPORTANT]
 ====
-**Storage-format clauses partially superseded by ADR-027 (2026-06-26).** The storage-layer
-positions in this doc — Parquet/Iceberg as the *OLAP base/publication tier*, DataFusion as
-*"strategically non-negotiable"*, PAX as a *"specialized layout / projection"* — are partially
-superseded by `adr/ADR-027-unified-storage-and-metering-substrate.adoc`, which makes **PAX the
-single internal columnar format** and demotes Parquet/DataFusion to the **interop seam + interim
-warehouse executor** (the native engine scans PAX per
-`NATIVE_OLAP_ENGINE_BLUEPRINT_2026_06_22.adoc`). The multi-engine **routing** decision (§3) and
-the pgwire/object-store-first wedge are **unchanged**. See ADR-027 §"Reconciliation with the
-2026-06-04 course-correction".
+**Read this as history plus mandates, not as the current direction (2026-10-17).**
+
+* *Framing superseded by* link:adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096]:
+  ProximaDB is a SQL-first context engine on object storage, not a direct competitor to Snowflake,
+  Databricks or Trino. Analytical SQL is a capability measured by TPC-H/TPC-DS conformance.
+* *Still in force:* PostgreSQL wire as the front door (§1.1), relational semantics first (§1.2),
+  object storage first (§1.3), multi-engine routing (§5) and the operational SaaS mandates (§10).
+* *Superseded:* the warehouse-competitor framing (lead, §1, §9), the Rust-native MPP build-out
+  (§1.4, §3; sequenced after v1.0, TD-077) and the phase plan in §6 (replaced by the release-based
+  roadmap).
+* *Storage clauses superseded in turn:* ADR-027 made PAX the single internal format and planned a
+  native OLAP engine; ADR-052 then kept DataFusion as the OLAP executor (no native
+  HashAgg/HashJoin/Sort; the native investment is the PAX scan), and ADR-094 settled the format
+  question as *format follows modality* (relational → Parquet-encoded layer, vector → PAX).
+  Read those ADRs for the current storage and execution design.
 ====
 
 == 1. Strategic Shifts

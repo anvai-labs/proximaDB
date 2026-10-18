@@ -1,0 +1,25 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-FEDPATH-1: isolate the legacy federated query paths behind flags
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Carried from the removed vision sprint plan's M1 ("Remaining: legacy federated paths are not yet isolated behind flags"); no TD owned it.
+| Priority | **MEDIUM** — roadmap v0.6 ("one query path").
+| Component | the federated SQL function path (`VECTOR_SEARCH`, `GRAPH_QUERY`, `DOCUMENT_QUERY`, `LOGS`, `METRICS` over `POST /api/v2/query`) alongside the canonical pgwire → `ComputeScheduler::route_select` pipeline
+| Relates to | ADR-052 and ADR-064 (one engine-selection seam), TD-XMODAL-4 (one canonical vector-SQL plan), ADR-096 D1
+|===
+
+== Problem
+
+ADR-096 makes SQL over pgwire the front door, with one engine-selection seam
+(`ComputeScheduler::route_select`). The older federated function path still runs as a parallel
+execution path. Two paths for the same question means two places for a correctness fix to land.
+
+== Acceptance
+
+* Every query shape the federated path serves is either reachable through the canonical pipeline
+  or explicitly kept, behind a named flag, with a reason.
+* The flag defaults off once parity tests pass, and the support contract says which path is
+  canonical.

@@ -18,7 +18,9 @@ cargo run --release --bin proximadb-server
 
 [source,bash]
 ----
-docker run -it --rm \
+# A throwaway run: data stays inside the container (TD-PKG-3). For persistent data, see the
+# Docker section of the installation guide.
+docker run -it --rm --name proximadb \
   -p 5678:5678 \
   vjsingh1984/proximadb:latest
 ----

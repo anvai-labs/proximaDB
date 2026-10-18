@@ -27,14 +27,13 @@ link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc] marks **Beta** or **Ex
 
 === Known loose ends (verify each against current text; do not blindly edit)
 
-* `docs/00-product/PRD.adoc:34` — positioning line "...sub-millisecond latency in a single Rust
-  binary." Aspirational; soften to low-latency / single-node phrasing or route to a measured
-  ledger entry.
-* `docs/00-product/PRD.adoc:56`, `:109`, `:117` (now `:67`, `:120`, `:128`; still present 2026-10-15) — "sub-millisecond OHLC" / "10x faster" claims
-  for the trading persona. These are not in the measured ledger; qualify or remove the hard
-  numbers.
-* `docs/00-product/VISION.adoc:71`, `docs/00-product/COMPETITIVE_LANDSCAPE.adoc:34` —
-  "sub-millisecond vector search" as a competitive descriptor. Soften to non-numeric language.
+* Closed 2026-10-17 by the ADR-096 rewrite: the PRD positioning line, the PRD trading-persona
+  "sub-millisecond OHLC" / "10x faster" claims, and the VISION / COMPETITIVE_LANDSCAPE
+  "sub-millisecond" descriptors are gone; trading-specific targets moved to the use-case catalog
+  (ADR-096 D2).
+* Remaining: `docs/11-usecases/IBKRTRADING_DOGFOOD.adoc:272` lists "Sub-ms OHLC queries" as a
+  use-case success criterion. It is tracked as an aspirational target in the evidence ledger
+  (`tst_ohlc_latency`), not a product claim.
 
 === Authority rules (load-bearing — read before editing)
 

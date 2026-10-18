@@ -17,7 +17,7 @@ but the optimizer currently routes through the default `AnnFilteringPolicy` rath
 catalog-resolved per-collection policy. Per-collection policy plumbing is tracked in **TD-073** and
 deferred to a release after v0.2. Differential recall across selectivity bands is verified by
 `tests/filtered_ann_recall_bands.rs` for low/medium/high bands; no recall SLA is claimed in v0.2.
-See link:../../SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`] "Not Supported in v0.2"
+See link:../../SUPPORTED_SURFACE.adoc#_not_supported_in_v0_2[`docs/SUPPORTED_SURFACE.adoc`] "Not Supported in the current release"
 ("Filtered ANN per-collection policy").
 ====
 
