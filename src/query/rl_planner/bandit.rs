@@ -63,8 +63,13 @@ impl BetaDistribution {
 
     /// Update with observed reward
     pub fn update(&mut self, reward: f32) {
+        // TD-RLNAN-1: a non-finite reward would poison the posterior for good.
+        if !reward.is_finite() {
+            return;
+        }
         // Convert reward [0, 1] to success/failure counts
         // Higher reward = more success weight
+        let reward = reward.clamp(0.0, 1.0);
         self.alpha += reward as f64;
         self.beta += (1.0 - reward) as f64;
     }
@@ -110,9 +115,17 @@ impl ContextWeights {
 
     /// Update weights with gradient step
     pub fn update(&mut self, features: &[f32], error: f64) {
+        // TD-RLNAN-1: skip any step that would make a weight non-finite; a NaN
+        // weight is persisted as `null` and the policy no longer loads.
+        if !error.is_finite() {
+            return;
+        }
         for (i, f) in features.iter().enumerate() {
             if i < self.weights.len() {
-                self.weights[i] += self.learning_rate * error * (*f as f64);
+                let next = self.weights[i] + self.learning_rate * error * (*f as f64);
+                if next.is_finite() {
+                    self.weights[i] = next;
+                }
             }
         }
     }
@@ -375,6 +388,12 @@ impl ContextualBanditPlanner {
 
     /// Update planner with observed reward
     pub fn update(&mut self, state: &PlannerState, action: &ExecutionAction, reward: f32) {
+        // TD-RLNAN-1: one finite, clamped reward feeds both the posterior and
+        // the gradient step.
+        if !reward.is_finite() {
+            return;
+        }
+        let reward = reward.clamp(0.0, 1.0);
         let action_id = action.to_action_id();
         let features = state.as_feature_vector();
 
@@ -693,6 +712,60 @@ mod tests {
 
         // Should have visited multiple actions
         assert!(visited.len() > 1);
+    }
+
+    /// TD-RLNAN-1: a search on an empty collection (collection_size = 0) made
+    /// the log-scaled feature -inf, the gradient step turned a weight into NaN,
+    /// serde_json wrote it as `null`, and the next boot refused to load the
+    /// policy ("invalid type: null, expected f64"), so the server would not start.
+    #[tokio::test]
+    async fn empty_collection_update_keeps_policy_loadable() {
+        let mut planner = ContextualBanditPlanner::new(0.1, true);
+        let state = PlannerState {
+            collection_size: 0,
+            ..PlannerState::default()
+        };
+        let action = planner.select_action(&state);
+        for reward in [0.8, 0.2, f32::NAN, f32::INFINITY, 0.5] {
+            planner.update(&state, &action, reward);
+        }
+        assert!(
+            planner
+                .context_weights
+                .values()
+                .all(|w| w.weights.iter().all(|x| x.is_finite())),
+            "learned weights must stay finite"
+        );
+        assert!(
+            planner
+                .action_stats
+                .values()
+                .all(|b| b.alpha.is_finite() && b.beta.is_finite()),
+            "reward statistics must stay finite"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rl_policy.json");
+        let path = path.to_str().expect("utf-8 path");
+        planner.save_to_file(path).await.expect("save");
+        let mut loaded = ContextualBanditPlanner::new(0.1, true);
+        loaded
+            .load_from_file(path)
+            .await
+            .expect("a saved policy must load back");
+    }
+
+    #[test]
+    fn feature_vector_is_finite_for_degenerate_state() {
+        let state = PlannerState {
+            collection_size: 0,
+            filter_selectivity: f32::NAN,
+            ..PlannerState::default()
+        };
+        assert!(
+            state.as_feature_vector().iter().all(|f| f.is_finite()),
+            "every feature must be finite"
+        );
     }
 
     #[tokio::test]

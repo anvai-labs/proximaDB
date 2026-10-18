@@ -273,6 +273,21 @@ impl RLPlanner {
     }
 }
 
+/// Move an unreadable persisted policy out of the way and return where it went.
+///
+/// The policy is learned tuning state, not user data: a server must not refuse
+/// to start because it cannot parse it (TD-RLNAN-1 — 0.4.x could persist a NaN
+/// weight as `null`). The file is kept beside the original for diagnosis.
+pub async fn set_aside_unreadable_policy(path: &str) -> anyhow::Result<String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let aside = format!("{path}.unreadable-{stamp}");
+    tokio::fs::rename(path, &aside).await?;
+    Ok(aside)
+}
+
 impl Default for RLPlanner {
     fn default() -> Self {
         Self::new(RLPlannerConfig::default())
@@ -282,6 +297,31 @@ impl Default for RLPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-RLNAN-1: a 0.4.x policy with a NaN weight was written as `null`; it
+    /// must be set aside so the server can start with a fresh policy.
+    #[tokio::test]
+    async fn unreadable_policy_is_set_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rl_policy.json");
+        let path = path.to_str().expect("utf-8 path").to_string();
+        tokio::fs::write(
+            &path,
+            r#"{"context_weights": {"1": {"weights": [null], "learning_rate": 0.01}}}"#,
+        )
+        .await
+        .expect("write");
+
+        let planner = RLPlanner::default();
+        assert!(
+            planner.load_policy(&path).await.is_err(),
+            "a policy with a null weight does not load"
+        );
+
+        let aside = set_aside_unreadable_policy(&path).await.expect("set aside");
+        assert!(!std::path::Path::new(&path).exists(), "original moved away");
+        assert!(std::path::Path::new(&aside).exists(), "kept for diagnosis");
+    }
 
     #[tokio::test]
     async fn test_rl_planner_creation() {
