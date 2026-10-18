@@ -14,7 +14,7 @@ services:
     ports:
       - "5678:5678"
     volumes:
-      - ./data:/var/lib/proximadb/data
+      - ./data:/data
       - ./models:/var/lib/proximadb/models
     environment:
       PROXIMADB_EMBED_MODEL_DIR: /var/lib/proximadb/models

@@ -6,10 +6,10 @@
 #
 # Build context: repository root.   docker build -f demo/agent-memory/Dockerfile.onnx .
 
-FROM rust:1.95-slim AS builder
+FROM rust:1.99-slim AS builder
 WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates g++ \
+    && rm -rf /var/lib/apt/lists/*  # g++: the onnx feature links C++ (ort/onnxruntime -> -lstdc++)
 COPY . .
 # GHA-style resource caps — keeps the build inside laptop memory.
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
@@ -19,14 +19,16 @@ ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
 RUN cargo build --release -p proximadb-server --jobs=2 --features onnx
 
 FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3 libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1001 -s /bin/bash proximadb
 WORKDIR /app
 COPY --from=builder /build/target/release/proximadb-server /app/proximadb-server
-COPY config /app/config
-RUN mkdir -p /var/lib/proximadb/models /var/lib/proximadb/data \
-    && chown -R proximadb:proximadb /app /var/lib/proximadb
+COPY demo/config/docker-config.toml /app/config/config.toml
+# Container-tuned: binds 0.0.0.0 and keeps ALL storage (metadata, collections,
+# manifest) under /data so the mounted volume actually persists demo data.
+RUN mkdir -p /var/lib/proximadb/models /data \
+    && chown -R proximadb:proximadb /app /var/lib/proximadb /data
 USER proximadb
 ENV PROXIMADB_EMBED_MODEL_DIR=/var/lib/proximadb/models \
     PROXIMADB_TOKENIZER_PATH=/var/lib/proximadb/models/tokenizer.json
@@ -34,4 +36,4 @@ EXPOSE 5678 5679
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 \
   CMD curl -sf http://localhost:5678/health || exit 1
 ENTRYPOINT ["/app/proximadb-server"]
-CMD ["--config", "/app/config/config.toml", "--port", "5678", "--data-dir", "/var/lib/proximadb/data"]
+CMD ["--config", "/app/config/config.toml", "--port", "5678"]
