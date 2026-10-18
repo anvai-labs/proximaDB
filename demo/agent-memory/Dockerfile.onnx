@@ -24,9 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd -m -u 1001 -s /bin/bash proximadb
 WORKDIR /app
 COPY --from=builder /build/target/release/proximadb-server /app/proximadb-server
-COPY config /app/config
-RUN mkdir -p /var/lib/proximadb/models /var/lib/proximadb/data \
-    && chown -R proximadb:proximadb /app /var/lib/proximadb
+COPY demo/config/docker-config.toml /app/config/config.toml
+# Container-tuned: binds 0.0.0.0 and keeps ALL storage (metadata, collections,
+# manifest) under /data so the mounted volume actually persists demo data.
+RUN mkdir -p /var/lib/proximadb/models /data \
+    && chown -R proximadb:proximadb /app /var/lib/proximadb /data
 USER proximadb
 ENV PROXIMADB_EMBED_MODEL_DIR=/var/lib/proximadb/models \
     PROXIMADB_TOKENIZER_PATH=/var/lib/proximadb/models/tokenizer.json
@@ -34,4 +36,4 @@ EXPOSE 5678 5679
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 \
   CMD curl -sf http://localhost:5678/health || exit 1
 ENTRYPOINT ["/app/proximadb-server"]
-CMD ["sh", "-c", "sed -i 's/^bind_address = \"127.0.0.1\"/bind_address = \"0.0.0.0\"/; s#^data_dir = .*#data_dir = \"/var/lib/proximadb/data\"#' /app/config/config.toml && exec /app/proximadb-server --config /app/config/config.toml --port 5678"]
+CMD ["--config", "/app/config/config.toml", "--port", "5678"]

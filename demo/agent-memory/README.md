@@ -49,6 +49,10 @@ performs on its ingest path.
 
 ## Honest notes
 
+- Records persist on the `./data` volume (`metadata`, `collections`, `manifest` — all under
+  `/data` via the container-tuned config). The BM25 leg of hybrid search is **in-process by
+  engine design**: it starts empty each boot and is re-fed by `run.sh`'s idempotent seed —
+  re-running the demo after a restart restores text search in seconds without re-ingest.
 - The published lean image (`docker.io/vjsingh1984/proximadb`) builds **without**
   the `onnx` feature — hence the local build step here (`Dockerfile.onnx` is the
   root Dockerfile plus `--features onnx`). First build takes a while (Rust);
